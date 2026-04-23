@@ -1,27 +1,27 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::constants::{UDP_BUFFER_SIZE, listen_backoff};
 use crate::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
-    HASH_WIDTH_IN_BYTES,
+    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic,
+    read_auth, read_hello,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoff;
+use anyhow::{Context, Result, anyhow, bail};
+use backon::BackoffBuilder;
+use backon::ExponentialBuilder;
 
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
-use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -45,11 +45,13 @@ pub async fn run_server(
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     let config = match config.server {
-            Some(config) => config,
-            None => {
-                return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
-            }
-        };
+        Some(config) => config,
+        None => {
+            return Err(anyhow!(
+                "Try to run as a server, but the configuration is missing. Please add the `[server]` block"
+            ));
+        }
+    };
 
     match config.transport.transport_type {
         TransportType::Tcp => {
@@ -146,11 +148,9 @@ impl<T: 'static + Transport> Server<T> {
         info!("Listening at {}", self.config.bind_addr);
 
         // Retry at least every 100ms
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_millis(100),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
+        let backoff_builder =
+            ExponentialBuilder::default().with_max_delay(Duration::from_millis(100));
+        let mut backoff = backoff_builder.build();
 
         // Wait for connections and shutdown signals
         loop {
@@ -164,7 +164,7 @@ impl<T: 'static + Transport> Server<T> {
                                 // If it is an IO error, then it's possibly an
                                 // EMFILE. So sleep for a while and retry
                                 // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
-                                if let Some(d) = backoff.next_backoff() {
+                                if let Some(d) = backoff.next() {
                                     error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
                                     time::sleep(d).await;
                                 } else {
@@ -177,7 +177,7 @@ impl<T: 'static + Transport> Server<T> {
                             // the transport layer, so just ignore it
                         }
                         Ok((conn, addr)) => {
-                            backoff.reset();
+                            backoff = backoff_builder.build();
 
                             // Do transport handshake with a timeout
                             match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
@@ -293,7 +293,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         protocol::CURRENT_PROTO_VERSION,
         nonce.clone().try_into().unwrap(),
     );
-    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+    conn.write_all(&postcard::to_stdvec(&hello_send).unwrap())
         .await?;
     conn.flush().await?;
 
@@ -301,7 +301,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&postcard::to_stdvec(&Ack::ServiceNotExist).unwrap())
                 .await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
@@ -320,7 +320,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+        conn.write_all(&postcard::to_stdvec(&Ack::AuthFailed).unwrap())
             .await?;
         debug!(
             "Expect {}, but got {}",
@@ -343,7 +343,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+        conn.write_all(&postcard::to_stdvec(&Ack::Ok).unwrap())
             .await?;
         conn.flush().await?;
 
@@ -506,8 +506,8 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
+        let create_ch_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat).unwrap();
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -552,11 +552,15 @@ fn tcp_listen_and_send(
     let (tx, rx) = mpsc::channel(CHAN_SIZE);
 
     tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
-        }, |e, duration| {
-            error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
+        let l = retry_notify_with_deadline(
+            listen_backoff(),
+            || async { TcpListener::bind(&addr).await },
+            |e: &std::io::Error, duration| {
+                error!("{:#}. Retry in {:?}", e, duration);
+            },
+            &mut shutdown_rx,
+        )
+        .await
         .with_context(|| "Failed to listen for the service");
 
         let l: TcpListener = match l {
@@ -570,11 +574,9 @@ fn tcp_listen_and_send(
         info!("Listening at {}", &addr);
 
         // Retry at least every 1s
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(1),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
+        let backoff_builder = ExponentialBuilder::default()
+            .with_max_delay(Duration::from_secs(1));
+        let mut backoff = backoff_builder.build();
 
         // Wait for visitors and the shutdown signal
         loop {
@@ -585,7 +587,7 @@ fn tcp_listen_and_send(
                             // `l` is a TCP listener so this must be a IO error
                             // Possibly a EMFILE. So sleep for a while
                             error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
+                            if let Some(d) = backoff.next() {
                                 time::sleep(d).await;
                             } else {
                                 // This branch will never be reached for current backoff policy
@@ -601,7 +603,7 @@ fn tcp_listen_and_send(
                                 break;
                             }
 
-                            backoff.reset();
+                            backoff = backoff_builder.build();
 
                             debug!("New visitor from {}", addr);
 
@@ -630,7 +632,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp).unwrap();
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
@@ -667,8 +669,8 @@ async fn run_udp_connection_pool<T: Transport>(
 
     let l = retry_notify_with_deadline(
         listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
+        || async { UdpSocket::bind(&bind_addr).await },
+        |e: &std::io::Error, duration| {
             warn!("{:#}. Retry in {:?}", e, duration);
         },
         &mut shutdown_rx,
@@ -678,7 +680,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp).unwrap();
 
     // Receive one data channel
     let mut conn = data_ch_rx

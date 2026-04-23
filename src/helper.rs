@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
-use backoff::{backoff::Backoff, Notify};
+use backon::Retryable;
 use socket2::{SockRef, TcpKeepalive};
 use std::{future::Future, net::SocketAddr, time::Duration};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::{
-    net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{TcpStream, ToSocketAddrs, UdpSocket, lookup_host},
     sync::broadcast,
 };
 use tracing::trace;
@@ -28,8 +28,7 @@ pub fn try_set_tcp_keepalive(
 
     trace!(
         "Set TCP keepalive {:?} {:?}",
-        keepalive_duration,
-        keepalive_interval
+        keepalive_duration, keepalive_interval
     );
 
     Ok(s.set_tcp_keepalive(&keepalive)?)
@@ -38,7 +37,7 @@ pub fn try_set_tcp_keepalive(
 #[allow(dead_code)]
 pub fn feature_not_compile(feature: &str) -> ! {
     panic!(
-        "The feature '{}' is not compiled in this binary. Please re-compile rathole",
+        "The feature '{}' is not compiled in this binary. Please re-compile molehill",
         feature
     )
 }
@@ -46,7 +45,7 @@ pub fn feature_not_compile(feature: &str) -> ! {
 #[allow(dead_code)]
 pub fn feature_neither_compile(feature1: &str, feature2: &str) -> ! {
     panic!(
-        "Neither of the feature '{}' or '{}' is compiled in this binary. Please re-compile rathole",
+        "Neither of the feature '{}' or '{}' is compiled in this binary. Please re-compile molehill",
         feature1, feature2
     )
 }
@@ -65,7 +64,6 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
-
     let (socket_addr, bind_addr);
 
     match prefer_ipv6 {
@@ -76,7 +74,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 SocketAddr::V4(_) => "0.0.0.0:0",
                 SocketAddr::V6(_) => ":::0",
             };
-        },
+        }
         true => {
             let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
@@ -85,7 +83,7 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
                 Some(socket_addr_ipv6) => {
                     socket_addr = *socket_addr_ipv6;
                     bind_addr = ":::0";
-                },
+                }
                 None => {
                     let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
                     match socket_addr_ipv4 {
@@ -159,22 +157,22 @@ pub async fn tcp_connect_with_proxy(
     }
 }
 
-// Wrapper of retry_notify
-pub async fn retry_notify_with_deadline<I, E, Fn, Fut, B, N>(
+// Wrapper of retry with shutdown deadline
+pub async fn retry_notify_with_deadline<I, E, Op, Fut, B, N>(
     backoff: B,
-    operation: Fn,
+    operation: Op,
     notify: N,
     deadline: &mut broadcast::Receiver<bool>,
 ) -> Result<I>
 where
     E: std::error::Error + Send + Sync + 'static,
-    B: Backoff,
-    Fn: FnMut() -> Fut,
-    Fut: Future<Output = std::result::Result<I, backoff::Error<E>>>,
-    N: Notify<E>,
+    B: backon::BackoffBuilder,
+    Op: Fn() -> Fut,
+    Fut: Future<Output = std::result::Result<I, E>>,
+    N: Fn(&E, Duration) + Send + Sync,
 {
     tokio::select! {
-        v = backoff::future::retry_notify(backoff, operation, notify) => {
+        v = operation.retry(backoff).notify(notify) => {
             v.map_err(anyhow::Error::new)
         }
         _ = deadline.recv() => {

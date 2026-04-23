@@ -1,13 +1,13 @@
 use crate::config::{TlsConfig, TransportConfig};
 use crate::helper::host_port_pair;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::fs;
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio_native_tls::native_tls::{self, Certificate, Identity};
 pub(crate) use tokio_native_tls::TlsStream;
+use tokio_native_tls::native_tls::{self, Certificate, Identity};
 use tokio_native_tls::{TlsAcceptor, TlsConnector};
 
 #[derive(Debug)]

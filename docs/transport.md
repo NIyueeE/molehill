@@ -1,6 +1,6 @@
 # Security
 
-By default, `rathole` forwards traffic as it is. Different options can be enabled to secure the traffic.
+By default, `molehill` forwards traffic as it is. Different options can be enabled to secure the traffic.
 
 ## TLS
 
@@ -37,7 +37,7 @@ Creating self-signed certificate with one's own CA is a non-trival task. However
 
 ### Rustls Support
 
-`rathole` provides optional `rustls` support. [Build Guide](build-guide.md) demostrated this.
+`molehill` provides optional `rustls` support. [Build Guide](build-guide.md) demostrated this.
 
 One difference is that, the crate we use for loading PKCS#12 archives can only handle limited types of PBE algorithms. We only support PKCS#12 archives that they (crate `p12`) support. So we need to specify the legacy format (openssl 1.x format) when creating the PKCS#12 archive.
 
@@ -53,20 +53,20 @@ openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certf
 
 In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweigt, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
 
-`rathole` comes with a reasonable default configuration for noise protocol. You can a glimpse of the minimal [example](../examples/noise_nk) for how it will look like.
+`molehill` comes with a reasonable default configuration for noise protocol. You can a glimpse of the minimal [example](../examples/noise_nk) for how it will look like.
 
-The default noise protocol that `rathole` uses, which is `Noise_NK_25519_ChaChaPoly_BLAKE2s`, providing the authentication of the server, just like TLS with properly configured certificates. So MITM is no more a problem.
+The default noise protocol that `molehill` uses, which is `Noise_NK_25519_ChaChaPoly_BLAKE2s`, providing the authentication of the server, just like TLS with properly configured certificates. So MITM is no more a problem.
 
 To use it, a X25519 keypair is needed.
 
 #### Generate a Keypair
 
-1. Run `rathole --genkey`, which will generate a keypair using the default X25519 algorithm.
+1. Run `molehill --genkey`, which will generate a keypair using the default X25519 algorithm.
 
 It emits:
 
 ```sh
-$ rathole --genkey
+$ molehill --genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 
@@ -94,11 +94,11 @@ type = "noise"
 local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 ```
 
-Then `rathole` will run under the protection of the Noise Protocol.
+Then `molehill` will run under the protection of the Noise Protocol.
 
 ## Specifying the Pattern of Noise Protocol
 
-The default configuration of Noise Protocol that comes with `rathole` satifies most use cases, which is described above. But there're other patterns that can be useful.
+The default configuration of Noise Protocol that comes with `molehill` satifies most use cases, which is described above. But there're other patterns that can be useful.
 
 ### No Authentication
 

@@ -6,13 +6,14 @@ use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use p12::PFX;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 pub(crate) use tokio_rustls::TlsStream;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub struct TlsTransport {
@@ -56,19 +57,15 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
     let cert = if let Some(path) = config.trusted_root.as_ref() {
-        rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(path).unwrap()))
-            .map(|cert| cert.unwrap())
-            .next()
-            .with_context(|| "Failed to read certificate")?
+        CertificateDer::from_pem_file(path).with_context(|| "Failed to read certificate")?
     } else {
         // read from native
-        match rustls_native_certs::load_native_certs() {
-            Ok(certs) => certs.into_iter().next().unwrap(),
-            Err(e) => {
-                eprintln!("Failed to load native certs: {}", e);
-                return Ok(None);
-            }
+        let result = rustls_native_certs::load_native_certs();
+        if result.certs.is_empty() {
+            eprintln!("Failed to load native certs: no certificates found");
+            return Ok(None);
         }
+        result.certs.into_iter().next().unwrap()
     };
 
     let mut root_certs = RootCertStore::empty();

@@ -1,4 +1,4 @@
-# rathole configuration can put in one file as long as running mode is specified via cli
+# molehill configuration can put in one file as long as running mode is specified via cli
 
 [client]
 remote_addr = "localhost:2333"

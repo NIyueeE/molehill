@@ -1,22 +1,20 @@
 # Internals
 
-![overview](./img/overview.png)
-
 ## Conceptions
 ### Service
 The entity whose traffic needs to be forwarded
 
 ### Server
-The host that runs `rathole` in the server mode
+The host that runs `molehill` in the server mode
 
 ### Client
-The host behind the NAT that runs `rathole` in the client mode. It has some services that need to be forwarded.
+The host behind the NAT that runs `molehill` in the client mode. It has some services that need to be forwarded.
 
 ### Visitor
 Who visists a *service*, via the *server*
 
 ### Control Channel
-A control channel is a TCP connection between the *server* and the *client* that only carries `rathole` control commands for one *service*.
+A control channel is a TCP connection between the *server* and the *client* that only carries `molehill` control commands for one *service*.
 
 ### Data Channel
 
@@ -26,7 +24,7 @@ A data channel is a TCP connection between the *server* and the *client* that on
 
 *TODO: Add more details about the protocol*
 
-When `rathole` starts in the client mode, it creates connections to `server.common.bind_addr` for each service. These connection acts as control channels.
+When `molehill` starts in the client mode, it creates connections to `server.common.bind_addr` for each service. These connection acts as control channels.
 
 When a control channel starts, the server challenge the client by a nonce, the client is required to authenticate as the service it wants to represent. Then the forwarding of that service is set up.
 

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -330,9 +330,9 @@ impl Config {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {:?}", path))?;
-        Config::from_str(&s).with_context(|| {
-            "Configuration is invalid. Please refer to the configuration specification."
-        })
+        Config::from_str(&s).with_context(
+            || "Configuration is invalid. Please refer to the configuration specification.",
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::{
-    config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
     Config,
+    config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
 };
 use anyhow::{Context, Result};
 use std::{
