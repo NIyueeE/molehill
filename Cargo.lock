@@ -1410,7 +1410,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "molehill"
+name = "molehill-rathole"
 version = "0.6.0"
 dependencies = [
  "anyhow",

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use molehill::{Cli, run};
+use molehill_rathole::{Cli, run};
 use std::io::IsTerminal;
 use tokio::{signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
