@@ -247,7 +247,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           push: true
-          platforms: linux/amd64, linux/arm64, linux/armhf, linux/armv7
+          platforms: linux/amd64, linux/arm64
           tags: ghcr.io/niyueee/molehill:latest, ghcr.io/niyueee/molehill:${{ github.ref_name }}
 
   publish-crate:
