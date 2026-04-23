@@ -37,26 +37,27 @@ cargo test --verbose
 # Run tests with rustls
 cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
 
-# Run a specific integration test
-cargo test --test integration_test <test_name>
+# Run a specific integration test by function name
+cargo test --test integration_test tcp
+cargo test --test integration_test udp
 
 # Run a specific unit test
 cargo test <test_name>
 ```
 
+Integration tests spawn their own echo/pingpong servers internally (see `tests/common/mod.rs`). They do not require external services to be running.
+
 ### Lint
 
 ```bash
+# Run all checks at once (requires just, cargo-audit, cargo-machete)
+just check
+
+# Individual checks
 cargo clippy -- -D warnings
-
-# Check formatting
 cargo fmt --check
-
-# Check for unused dependencies
-cargo install cargo-machete --locked && cargo machete
-
-# Security audit
 cargo audit
+cargo machete
 
 # Check all feature combinations
 cargo install cargo-hack
@@ -66,8 +67,9 @@ cargo hack check --feature-powerset --no-dev-deps --mutually-exclusive-features 
 ### Run
 
 ```bash
-# Generate a Noise keypair
+# Generate a Noise keypair (default x25519; optionally pass x448)
 ./molehill --genkey
+./molehill --genkey x448
 
 # Run as server
 ./molehill server.toml
@@ -160,3 +162,9 @@ RUST_LOG=debug ./molehill config.toml
 GitHub Actions in `.github/workflows/`:
 - `ci.yml`: Lints (clippy, fmt, cargo-hack, cargo-machete, cargo-audit), builds for Linux/Windows/macOS (x86_64 + aarch64), runs tests
 - `release.yml`: Cross-compiles for 14+ targets, publishes Docker images and crates.io
+
+## Additional Documentation
+
+- `docs/transport.md`: Detailed TLS and Noise Protocol setup, including certificate generation and keypair configuration.
+- `docs/build-guide.md`: Build customization, rustls support, and binary size minimization.
+- `docs/internals.md`: Conceptual overview of control/data channels and forwarding process.
