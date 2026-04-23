@@ -18,9 +18,7 @@
 
 <p align="center">A community-maintained fork of <a href="https://github.com/rapiz1/rathole">rathole</a>.</p>
 
-<p align="center">[English](README.md) | [简体中文](README-zh.md)</p>
-
-<p align="center">A secure, stable and high-performance reverse proxy for NAT traversal, written in Rust</p>
+[English](README.md) | [简体中文](README-zh.md)
 
 molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
 

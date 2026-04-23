@@ -18,9 +18,7 @@
 
 <p align="center">[rathole](https://github.com/rapiz1/rathole) 的社区维护 fork 版本。</p>
 
-<p align="center">[English](README.md) | [简体中文](README-zh.md)</p>
-
-<p align="center">安全、稳定、高性能的内网穿透工具，用 Rust 语言编写</p>
+[English](README.md) | [简体中文](README-zh.md)
 
 molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://github.com/inconshreveable/ngrok)，可以让 NAT 后的设备上的服务通过具有公网 IP 的服务器暴露在公网上。
 
@@ -32,7 +30,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
   - [Configuration](#configuration)
     - [Logging](#logging)
     - [Tuning](#tuning)
-  - [Development Status](#development-status)
+  - [Planning](#planning)
 
 <!-- /TOC -->
 
@@ -122,7 +120,7 @@ type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp
 
 [client.transport.tcp] # Optional. Also affects `noise` and `tls`
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
+nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
 keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
 
@@ -142,7 +140,7 @@ tls = true # If `true` then it will use settings in `client.transport.tls`
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
+nodelay = true # Optional. Override the `client.transport.nodelay` per service
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 
 [client.services.service2] # Multiple services can be defined
@@ -203,11 +201,6 @@ RUST_LOG=error ./molehill config.toml
 
 如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
 
-## Development Status
+## Planning
 
-`molehill` 正在积极开发中
-
-- [x] 支持 TLS
-- [x] 支持 UDP
-- [x] 热重载
-- [ ] 用于配置的 HTTP APIs
+- [ ] HTTP APIs for configuration
