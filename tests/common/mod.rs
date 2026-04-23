@@ -14,26 +14,26 @@ pub async fn run_molehill_server(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = molehill::Cli {
+    let cli = molehill_rathole::Cli {
         config_path: Some(PathBuf::from(config_path)),
         server: true,
         client: false,
         ..Default::default()
     };
-    molehill::run(cli, shutdown_rx).await
+    molehill_rathole::run(cli, shutdown_rx).await
 }
 
 pub async fn run_molehill_client(
     config_path: &str,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let cli = molehill::Cli {
+    let cli = molehill_rathole::Cli {
         config_path: Some(PathBuf::from(config_path)),
         server: false,
         client: true,
         ..Default::default()
     };
-    molehill::run(cli, shutdown_rx).await
+    molehill_rathole::run(cli, shutdown_rx).await
 }
 
 pub mod tcp {
@@ -81,7 +81,7 @@ pub mod tcp {
 }
 
 pub mod udp {
-    use molehill::UDP_BUFFER_SIZE;
+    use molehill_rathole::UDP_BUFFER_SIZE;
     use tokio::net::UdpSocket;
     use tracing::debug;
 
