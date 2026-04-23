@@ -1,11 +1,11 @@
 [package]
-name = "rathole"
-version = "0.5.0"
-edition = "2021"
-authors = ["Yujia Qiao <code@rapiz.me>"]
-description = "A reverse proxy for NAT traversal"
+name = "molehill"
+version = "0.6.0"
+edition = "2024"
+authors = ["niyue <n1yu3@proton.me>"]
+description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok. Fork of https://github.com/rathole-org/rathole"
 license = "Apache-2.0"
-repository = "https://github.com/rapiz1/rathole"
+repository = "https://github.com/NIyueeE/molehill"
 readme = "README.md"
 build = "build.rs"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
@@ -29,7 +29,6 @@ client = []
 native-tls = ["tokio-native-tls"]
 rustls = [
     "tokio-rustls",
-    "rustls-pemfile",
     "rustls-native-certs",
     "p12",
 ]
@@ -86,16 +85,16 @@ codegen-units = 1
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = { version = "1", features = ["serde"] }
-clap = { version = "3.0", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 toml = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 sha2 = "0.10"
-bincode = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 lazy_static = "1.4"
 hex = "0.4"
 rand = "0.8"
-backoff = { version = "0.4", features = ["tokio"] }
+backon = "1.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 socket2 = { version = "0.4", features = ["all"] }
@@ -109,7 +108,6 @@ notify = { version = "5.0.0-pre.13", optional = true }
 console-subscriber = { version = "0.1", optional = true, features = [
     "parking_lot",
 ] }
-atty = "0.2"
 async-http-proxy = { version = "1.2", features = [
     "runtime-tokio",
     "basic-auth",
@@ -121,18 +119,13 @@ tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
 futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
-tokio-rustls = { version = "0.25", optional = true }
-rustls-native-certs = { version = "0.7", optional = true }
-rustls-pemfile = { version = "2.0", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 p12 = { version = "0.6.3", optional = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [build-dependencies]
-vergen = { version = "7.4.2", default-features = false, features = [
-    "build",
-    "git",
-    "cargo",
-] }
+vergen = { version = "8", default-features = false, features = ["build", "git", "gitcl", "cargo"] }
 anyhow = "1.0"

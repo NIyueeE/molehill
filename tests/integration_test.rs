@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use common::{run_rathole_client, PING, PONG};
+use common::{PING, PONG, run_molehill_client};
 use rand::Rng;
 use std::time::Duration;
 use tokio::{
@@ -11,7 +11,7 @@ use tokio::{
 use tracing::{debug, info, instrument};
 use tracing_subscriber::EnvFilter;
 
-use crate::common::run_rathole_server;
+use crate::common::run_molehill_server;
 
 mod common;
 
@@ -131,7 +131,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     // Start the client
     info!("start the client");
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_molehill_client(config_path, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -142,7 +142,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     // Start the server
     info!("start the server");
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_molehill_server(config_path, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -163,7 +163,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
-        run_rathole_client(config_path, client_shutdown_rx)
+        run_molehill_client(config_path, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -184,7 +184,7 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
-        run_rathole_server(config_path, server_shutdown_rx)
+        run_molehill_server(config_path, server_shutdown_rx)
             .await
             .unwrap();
     });

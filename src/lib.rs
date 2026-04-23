@@ -60,8 +60,8 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
-    if args.genkey.is_some() {
-        return genkey(args.genkey.unwrap());
+    if let Some(curve) = args.genkey {
+        return genkey(curve);
     }
 
     // Raise `nofile` limit on linux and mac
@@ -167,8 +167,8 @@ mod tests {
 
     #[test]
     fn test_determine_run_mode() {
-        use config::*;
         use RunMode::*;
+        use config::*;
 
         struct T {
             cfg_s: bool,

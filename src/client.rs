@@ -3,23 +3,23 @@ use crate::config_watcher::{ClientServiceChange, ConfigChange};
 use crate::helper::udp_connect;
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
-    DataChannelCmd, UdpTraffic, CURRENT_PROTO_VERSION, HASH_WIDTH_IN_BYTES,
+    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
+    UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
-use anyhow::{anyhow, bail, Context, Result};
-use backoff::backoff::Backoff;
-use backoff::future::retry_notify;
-use backoff::ExponentialBackoff;
+use anyhow::{Context, Result, anyhow, bail};
+use backon::BackoffBuilder;
+use backon::ExponentialBuilder;
+use backon::Retryable;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration, Instant};
-use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
+use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "noise")]
 use crate::transport::NoiseTransport;
@@ -28,7 +28,7 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{run_control_chan_backoff, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT};
+use crate::constants::{UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff};
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -178,26 +178,21 @@ async fn do_data_channel_handshake<T: Transport>(
     args: Arc<RunDataChannelArgs<T>>,
 ) -> Result<T::Stream> {
     // Retry at least every 100ms, at most for 10 seconds
-    let backoff = ExponentialBackoff {
-        max_interval: Duration::from_millis(100),
-        max_elapsed_time: Some(Duration::from_secs(10)),
-        ..Default::default()
-    };
+    let backoff = ExponentialBuilder::default()
+        .with_max_delay(Duration::from_millis(100))
+        .with_total_delay(Some(Duration::from_secs(10)));
 
     // Connect to remote_addr
-    let mut conn: T::Stream = retry_notify(
-        backoff,
-        || async {
-            args.connector
-                .connect(&args.remote_addr)
-                .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
-                .map_err(backoff::Error::transient)
-        },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-    )
+    let mut conn: T::Stream = (|| async {
+        args.connector
+            .connect(&args.remote_addr)
+            .await
+            .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+    })
+    .retry(backoff)
+    .notify(|e: &anyhow::Error, duration| {
+        warn!("{:#}. Retry in {:?}", e, duration);
+    })
     .await?;
 
     T::hint(&conn, args.socket_opts);
@@ -205,7 +200,8 @@ async fn do_data_channel_handshake<T: Transport>(
     // Send nonce
     let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&bincode::serialize(&hello).unwrap()).await?;
+    conn.write_all(&postcard::to_stdvec(&hello).unwrap())
+        .await?;
     conn.flush().await?;
 
     Ok(conn)
@@ -227,7 +223,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service.local_addr, args.service.prefer_ipv6)
+                .await?;
         }
     }
     Ok(())
@@ -255,7 +252,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
 #[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str, prefer_ipv6: bool) -> Result<()> {
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    local_addr: &str,
+    prefer_ipv6: bool,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -417,7 +418,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         debug!("Sending hello");
         let hello_send =
             Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        conn.write_all(&postcard::to_stdvec(&hello_send).unwrap())
             .await?;
         conn.flush().await?;
 
@@ -437,7 +438,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&bincode::serialize(&auth).unwrap()).await?;
+        conn.write_all(&postcard::to_stdvec(&auth).unwrap()).await?;
         conn.flush().await?;
 
         // Read ack
@@ -507,7 +508,8 @@ impl ControlChannelHandle {
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
+        let backoff_builder = run_control_chan_backoff(service.retry_interval.unwrap());
+        let mut retry_backoff = backoff_builder.build();
 
         let mut s = ControlChannel {
             digest,
@@ -533,10 +535,10 @@ impl ControlChannelHandle {
 
                     if start.elapsed() > Duration::from_secs(3) {
                         // The client runs for at least 3 secs and then disconnects
-                        retry_backoff.reset();
+                        retry_backoff = backoff_builder.build();
                     }
 
-                    if let Some(duration) = retry_backoff.next_backoff() {
+                    if let Some(duration) = retry_backoff.next() {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
                     } else {

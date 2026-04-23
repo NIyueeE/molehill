@@ -26,6 +26,6 @@ If you encountered a panic, please re-run with `RUST_BACKTRACE=1` to provide the
 
 **Environment:**
  - OS: <!-- Please fill in distribution if you're using linux-->
-- `rathole --version` output: 
+- `molehill --version` output: 
 - CPU architecture:
 - rustc version:

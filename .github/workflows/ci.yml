@@ -1,4 +1,4 @@
-name: Rust
+name: CI
 
 on:
   pull_request:
@@ -16,24 +16,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lints:
-    name: Lints
+  check:
+    name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          components: clippy
-      - uses: Swatinem/rust-cache@v1
-      - name: Clippy
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check
+      - name: cargo clippy
         run: cargo clippy -- -D warnings
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo audit
+        uses: actions-rust-lang/audit@v1
+      - name: cargo machete
+        run: cargo install cargo-machete --locked && cargo machete
       - name: Setup cargo-hack
         run: cargo install cargo-hack
       - name: Check all features
         run: >
           cargo hack check --feature-powerset --no-dev-deps
           --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with native-tls
+        run: cargo test --verbose
+      - name: Run tests with rustls
+        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
 
   build:
     name: Build for ${{ matrix.target }}
@@ -42,31 +61,25 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            exe: rathole
+            exe: molehill
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
-            exe: rathole.exe
+            exe: molehill.exe
             target: x86_64-pc-windows-msvc
           - os: macos-latest
-            exe: rathole
+            exe: molehill
             target: x86_64-apple-darwin
           - os: macos-latest
-            exe: rathole
+            exe: molehill
             target: aarch64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build
-      - name: Run tests with native-tls
-        run: cargo test --verbose
-      - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - uses: actions/upload-artifact@v4
         with:
-          name: rathole-${{ matrix.target }}
+          name: molehill-${{ matrix.target }}
           path: target/debug/${{ matrix.exe }}

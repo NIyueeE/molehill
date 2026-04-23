@@ -3,112 +3,158 @@ name: Release
 on:
   push:
     tags:
-      - "*"
+      - "v*"
 
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.5.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Cross build for ${{ matrix.target }}
+  check:
+    name: Pre-release checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify version matches Cargo.toml
+        run: |
+          CARGO_VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG="${{ steps.meta.outputs.tag }}"
+          TAG_VERSION="${TAG#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Mismatch: Cargo.toml version=$CARGO_VERSION, tag=$TAG_VERSION"
+            exit 1
+          fi
+      - name: cargo audit
+        uses: actions-rust-lang/audit@v1
+
+  build:
+    name: Build for ${{ matrix.target }}
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            exe: rathole
+            exe: molehill
             cross: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            exe: rathole
+            exe: molehill
             cross: false
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabihf
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mips-unknown-linux-gnu
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mips-unknown-linux-musl
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mipsel-unknown-linux-gnu
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mipsel-unknown-linux-musl
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mips64-unknown-linux-gnuabi64
-            exe: rathole
+            exe: molehill
             cross: true
           - os: ubuntu-latest
             target: mips64el-unknown-linux-gnuabi64
-            exe: rathole
+            exe: molehill
             cross: true
 
           - os: macos-latest
             target: x86_64-apple-darwin
-            exe: rathole
+            exe: molehill
             cross: false
-          
+
           - os: macos-latest
             target: aarch64-apple-darwin
-            exe: rathole
+            exe: molehill
             cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            exe: rathole.exe
+            exe: molehill.exe
             cross: false
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           profile: minimal
-          default: true
-      
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install OpenSSL
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install pkg-config libssl-dev
       - name: Install OpenSSL
         if: matrix.os == 'macos-latest'
         run: brew install openssl@3
-      
+
       # Native build
       - name: Install target
         if: matrix.cross == false
         run: rustup target add ${{ matrix.target }}
       - name: Run tests
         if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose 
+        run: cargo test --release --target ${{ matrix.target }} --verbose
       - name: Build release
-        if: matrix.cross == false 
+        if: matrix.cross == false
         run: cargo build --release --target ${{ matrix.target }}
 
       # Cross build
       - name: Install cross
         if: matrix.cross
-        run: cargo install --version 0.2.5 cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - name: Run tests
         if: matrix.cross
         run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
@@ -117,61 +163,122 @@ jobs:
         run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
 
       - name: Run UPX
-        # Upx may not support some platforms. Ignore the errors
         continue-on-error: true
-        # Disable upx for mips. See https://github.com/upx/upx/issues/387
         if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'mips')
-        uses: crazy-max/ghaction-upx@v1
+        uses: crazy-max/ghaction-upx@v4
         with:
           version: v4.0.2
           files: target/${{ matrix.target }}/release/${{ matrix.exe }}
           args: -q --best --lzma
-      - uses: actions/upload-artifact@v4
+
+      - name: Package
+        shell: bash
+        run: |
+          tag="${{ steps.meta.outputs.tag }}"
+          name="molehill-${tag}-${{ matrix.target }}"
+          mkdir -p "$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$name/"
+          cp LICENSE README.md README-zh.md "$name/" 2>/dev/null || true
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            powershell -Command "Compress-Archive -Path '$name' -DestinationPath '${name}.zip'"
+          else
+            tar czf "${name}.tar.gz" "$name"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: rathole-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
-      - name: Zip Release
-        uses: TheDoctor0/zip-release@0.6.1
-        with:
-          type: zip
-          filename: rathole-${{ matrix.target }}.zip
-          directory: target/${{ matrix.target }}/release/
-          path: ${{ matrix.exe }}
-      - name: Publish
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: target/${{ matrix.target }}/release/rathole-${{ matrix.target }}.zip
-          generate_release_notes: true
-          draft: true
-  docker:
-    name: Publish to Docker Hub
-    if: startsWith(github.ref, 'refs/tags/')
+          name: ${{ matrix.target }}
+          path: |
+            molehill-*.tar.gz
+            molehill-*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
     runs-on: ubuntu-latest
-    needs: release
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
+      - uses: actions/checkout@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${TAG#v}"
+          awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" CHANGELOG.md > release_notes.md
+          if [ -s release_notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            rm -f release_notes.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          files: dist/*
+          generate_release_notes: ${{ steps.changelog.outputs.found != 'true' }}
+          body_path: ${{ steps.changelog.outputs.found == 'true' && 'release_notes.md' || '' }}
+          draft: true
+
+  docker:
+    name: Publish to GHCR
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push
         id: docker_build
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v7
         with:
           push: true
           platforms: linux/amd64, linux/arm64, linux/armhf, linux/armv7
-          tags: rapiz1/rathole:latest, rapiz1/rathole:${{ github.ref_name }}
+          tags: ghcr.io/NIyueeE/molehill:latest, ghcr.io/NIyueeE/molehill:${{ github.ref_name }}
+
   publish-crate:
     name: Publish to crates.io
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
     runs-on: ubuntu-latest
-    needs: release
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           profile: minimal
       - name: Publish

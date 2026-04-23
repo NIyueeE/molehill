@@ -5,12 +5,12 @@ COPY . .
 ARG FEATURES
 RUN cargo build --locked --release --features ${FEATURES:-default}
 RUN mkdir -p build-out/
-RUN cp target/release/rathole build-out/
+RUN cp target/release/molehill build-out/
 
 
 
 FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
-COPY --from=builder /home/rust/src/build-out/rathole .
+COPY --from=builder /home/rust/src/build-out/molehill .
 USER 1000:1000
-ENTRYPOINT ["./rathole"]
+ENTRYPOINT ["./molehill"]

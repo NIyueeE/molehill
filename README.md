@@ -1,47 +1,55 @@
-# rathole
+<p align="center">
+  <img src="https://raw.githubusercontent.com/NIyueeE/molehill/main/assets/molehill.svg" width="81" height="81">
+</p>
 
-![rathole-logo](./docs/img/rathole-logo.png)
+<h1 align="center">molehill</h1>
 
-[![GitHub stars](https://img.shields.io/github/stars/rapiz1/rathole)](https://github.com/rapiz1/rathole/stargazers)
-[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/rapiz1/rathole)](https://github.com/rapiz1/rathole/releases)
-![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/rapiz1/rathole/rust.yml?branch=main)
-[![GitHub all releases](https://img.shields.io/github/downloads/rapiz1/rathole/total)](https://github.com/rapiz1/rathole/releases)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rapiz1/rathole)](https://hub.docker.com/r/rapiz1/rathole)
-[![Join the chat at https://gitter.im/rapiz1/rathole](https://badges.gitter.im/rapiz1/rathole.svg)](https://gitter.im/rapiz1/rathole?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/NIyueeE/molehill.svg"></a>
+  <img src="https://img.shields.io/github/v/release/NIyueeE/molehill.svg">
+  <img src="https://img.shields.io/badge/rust-1.95.0+-93450a.svg">
+  <img src="https://github.com/NIyueeE/molehill/actions/workflows/ci.yml/badge.svg">
+</p>
+<p align="center">
+  <img src="https://img.shields.io/github/stars/NIyueeE/molehill.svg">
+  <img src="https://img.shields.io/github/forks/NIyueeE/molehill.svg">
+  <img src="https://img.shields.io/github/last-commit/NIyueeE/molehill.svg">
+</p>
 
-[English](README.md) | [简体中文](README-zh.md)
+<p align="center">A community-maintained fork of <a href="https://github.com/rapiz1/rathole">rathole</a>.</p>
 
-A secure, stable and high-performance reverse proxy for NAT traversal, written in Rust
+<p align="center">[English](README.md) | [简体中文](README-zh.md)</p>
 
-rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
+<p align="center">A secure, stable and high-performance reverse proxy for NAT traversal, written in Rust</p>
+
+molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
 
 <!-- TOC -->
 
-- [rathole](#rathole)
+- [molehill](#molehill)
   - [Features](#features)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
     - [Logging](#logging)
     - [Tuning](#tuning)
-  - [Benchmark](#benchmark)
   - [Planning](#planning)
 
 <!-- /TOC -->
 
 ## Features
 
-- **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections. See [Benchmark](#benchmark)
-- **Low Resource Consumption** Consumes much fewer memory than similar tools. See [Benchmark](#benchmark). [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
+- **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
+- **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
 
 ## Quickstart
 
-A full-powered `rathole` can be obtained from the [release](https://github.com/rapiz1/rathole/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**. A [Docker image](https://hub.docker.com/r/rapiz1/rathole) is also available.
+A full-powered `molehill` can be obtained from the [release](https://github.com/NIyueeE/molehill/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**.
 
-The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
+The usage of `molehill` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 
-To use `rathole`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.
+To use `molehill`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.
 
 Assuming you have a NAS at home behind the NAT, and want to expose its ssh service to the Internet:
 
@@ -52,7 +60,7 @@ Create `server.toml` with the following content and accommodate it to your needs
 ```toml
 # server.toml
 [server]
-bind_addr = "0.0.0.0:2333" # `2333` specifies the port that rathole listens for clients
+bind_addr = "0.0.0.0:2333" # `2333` specifies the port that molehill listens for clients
 
 [server.services.my_nas_ssh]
 token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to an arbitrary value.
@@ -62,7 +70,7 @@ bind_addr = "0.0.0.0:5202" # `5202` specifies the port that exposes `my_nas_ssh`
 Then run:
 
 ```bash
-./rathole server.toml
+./molehill server.toml
 ```
 
 2. On the host which is behind the NAT (your NAS)
@@ -82,20 +90,20 @@ local_addr = "127.0.0.1:22" # The address of the service that needs to be forwar
 Then run:
 
 ```bash
-./rathole client.toml
+./molehill client.toml
 ```
 
 3. Now the client will try to connect to the server `myserver.com` on port `2333`, and any traffic to `myserver.com:5202` will be forwarded to the client's port `22`.
 
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
-To run `rathole` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+To run `molehill` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
 
 ## Configuration
 
-`rathole` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in [Quickstart](#quickstart).
+`molehill` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in [Quickstart](#quickstart).
 
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `rathole --server config.toml` and on the client side, run `rathole --client config.toml` to explicitly tell `rathole` the running mode.
+But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `molehill --server config.toml` and on the client side, run `molehill --client config.toml` to explicitly tell `molehill` the running mode.
 
 Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
 
@@ -178,37 +186,22 @@ bind_addr = "0.0.0.1:8082"
 
 ### Logging
 
-`rathole`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
+`molehill`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
 
 ```shell
-RUST_LOG=error ./rathole config.toml
+RUST_LOG=error ./molehill config.toml
 ```
 
-will run `rathole` with only error level logging.
+will run `molehill` with only error level logging.
 
 If `RUST_LOG` is not present, the default logging level is `info`.
 
 ### Tuning
 
-From v0.4.7, rathole enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
+From v0.4.7, molehill enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
-
-## Benchmark
-
-rathole has similar latency to [frp](https://github.com/fatedier/frp), but can handle a more connections, provide larger bandwidth, with less memory usage.
-
-For more details, see the separate page [Benchmark](./docs/benchmark.md).
-
-**However, don't take it from here that `rathole` can magically make your forwarded service faster several times than before.** The benchmark is done on local loopback, indicating the performance when the task is cpu-bounded. One can gain quite a improvement if the network is not the bottleneck. Unfortunately, that's not true for many users. In that case, the main benefit is lower resource consumption, while the bandwidth and the latency may not improved significantly.
-
-![http_throughput](./docs/img/http_throughput.svg)
-![tcp_bitrate](./docs/img/tcp_bitrate.svg)
-![udp_bitrate](./docs/img/udp_bitrate.svg)
-![mem](./docs/img/mem-graph.png)
 
 ## Planning
 
 - [ ] HTTP APIs for configuration
-
-[Out of Scope](./docs/out-of-scope.md) lists features that are not planned to be implemented and why.

@@ -2,7 +2,7 @@ use core::result::Result;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
@@ -15,12 +15,12 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
-use super::tls::get_tcpstream;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
 use super::tls::TlsStream;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use super::tls::get_tcpstream;
 
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
-use tokio_tungstenite::{accept_async_with_config, client_async_with_config, WebSocketStream};
+use tokio_tungstenite::{WebSocketStream, accept_async_with_config, client_async_with_config};
 use tokio_util::io::StreamReader;
 use url::Url;
 
@@ -94,9 +94,7 @@ impl Stream for StreamWrapper {
         match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
-            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
                     Poll::Ready(Some(Ok(Bytes::from(b))))
@@ -147,26 +145,24 @@ impl AsyncWrite for WebsocketTunnel {
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
         let sw = self.get_mut().inner.get_mut();
-        ready!(Pin::new(&mut sw.inner)
-            .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+        ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(Error::other))?;
 
         match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_close(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
