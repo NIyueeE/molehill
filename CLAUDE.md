@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 molehill is a secure, stable, and high-performance reverse proxy for NAT traversal, written in Rust. It allows services behind a NAT/firewall to be exposed to the internet via a publicly accessible server. Think of it as a Rust alternative to frp or ngrok.
 
-- **Language**: Rust (Edition 2021)
-- **Toolchain**: Pinned to `1.71.0` in `rust-toolchain`
+- **Language**: Rust (Edition 2024)
+- **Toolchain**: Pinned to `1.95.0` in `rust-toolchain.toml`
 - **License**: Apache-2.0
 
 ## Common Commands
@@ -37,14 +37,26 @@ cargo test --verbose
 # Run tests with rustls
 cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
 
-# Run a specific test
+# Run a specific integration test
 cargo test --test integration_test <test_name>
+
+# Run a specific unit test
+cargo test <test_name>
 ```
 
 ### Lint
 
 ```bash
 cargo clippy -- -D warnings
+
+# Check formatting
+cargo fmt --check
+
+# Check for unused dependencies
+cargo install cargo-machete --locked && cargo machete
+
+# Security audit
+cargo audit
 
 # Check all feature combinations
 cargo install cargo-hack
@@ -116,6 +128,7 @@ RUST_LOG=debug ./molehill config.toml
    - When a visitor connects to the server's `bind_addr`, the server sends `CreateDataChannel` via the control channel
    - Client connects back to create a data channel
    - Server also pre-creates data channels to reduce latency
+   - For UDP services, traffic is framed with a `UdpHeader` (source address + length) and sent over the data channel
 
 4. **Config Watcher**: `lib.rs` spawns a `ConfigWatcherHandle` that monitors the config file. General config changes trigger a full restart; service-level changes are sent via an mpsc channel to the running instance for hot updates.
 
@@ -145,5 +158,5 @@ RUST_LOG=debug ./molehill config.toml
 ## CI/CD
 
 GitHub Actions in `.github/workflows/`:
-- `rust.yml`: Lints (clippy, cargo-hack), builds for Linux/Windows/macOS (x86_64 + aarch64), runs tests
+- `ci.yml`: Lints (clippy, fmt, cargo-hack, cargo-machete, cargo-audit), builds for Linux/Windows/macOS (x86_64 + aarch64), runs tests
 - `release.yml`: Cross-compiles for 14+ targets, publishes Docker images and crates.io

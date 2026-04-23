@@ -26,7 +26,7 @@ server = []
 client = []
 
 # TLS support
-native-tls = ["tokio-native-tls"]
+native-tls = ["tokio-native-tls", "openssl"]
 rustls = [
     "tokio-rustls",
     "rustls-native-certs",
