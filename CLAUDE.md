@@ -97,20 +97,25 @@ RUST_LOG=debug ./molehill config.toml
 
 ### Source Structure
 
-- `src/main.rs`: Entry point — CLI parsing (clap), signal handling, logging setup
-- `src/lib.rs`: Library root — run mode detection, main event loop, config watcher coordination
+Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the older `mod.rs` convention.
+
+- `src/main.rs`: Binary entry point — CLI parsing (clap), signal handling, logging setup
+- `src/lib.rs`: Library root — re-exports public API, run mode detection, main event loop
 - `src/cli.rs`: CLI argument definitions
-- `src/config.rs`: Configuration parsing and validation (TOML)
-- `src/config_watcher.rs`: Hot-reload config file watcher (behind `hot-reload` feature)
 - `src/protocol.rs`: Wire protocol definitions (Hello, Auth, Ack, ControlChannelCmd, DataChannelCmd)
-- `src/client.rs`: Client mode implementation
-- `src/server.rs`: Server mode implementation
-- `src/transport/`: Transport layer implementations
-  - `mod.rs`: `Transport` trait definition
+- `src/common.rs` + `src/common/`: Shared utilities
+  - `constants.rs`, `helper.rs`, `multi_map.rs`
+- `src/config.rs` + `src/config/`: Configuration
+  - `parsing.rs`: TOML parsing and validation
+  - `watcher.rs`: Hot-reload config file watcher (behind `hot-reload` feature)
+- `src/core.rs` + `src/core/`: Client and server implementations
+  - `client.rs`: Client mode (feature-gated on `client`)
+  - `server.rs`: Server mode (feature-gated on `server`)
+- `src/transport.rs` + `src/transport/`: Transport layer
   - `tcp.rs`: Plain TCP transport
   - `native_tls.rs` / `rustls.rs`: TLS transports (mutually exclusive features)
   - `noise.rs`: Noise Protocol transport
-  - `websocket.rs`: WebSocket transport
+  - `websocket.rs`: WebSocket transport (feature-gated)
 
 ### Key Design Patterns
 
