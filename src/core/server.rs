@@ -1,8 +1,8 @@
+use crate::common::constants::{UDP_BUFFER_SIZE, listen_backoff};
+use crate::common::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::common::multi_map::MultiMap;
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
-use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{UDP_BUFFER_SIZE, listen_backoff};
-use crate::helper::{retry_notify_with_deadline, write_and_flush};
-use crate::multi_map::MultiMap;
+use crate::config::{ConfigChange, ServerServiceChange};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic,
@@ -65,7 +65,7 @@ pub async fn run_server(
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::helper::feature_neither_compile("native-tls", "rustls")
+            crate::common::helper::feature_neither_compile("native-tls", "rustls")
         }
         TransportType::Noise => {
             #[cfg(feature = "noise")]
@@ -74,7 +74,7 @@ pub async fn run_server(
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
-            crate::helper::feature_not_compile("noise")
+            crate::common::helper::feature_not_compile("noise")
         }
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
@@ -83,7 +83,10 @@ pub async fn run_server(
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+            crate::common::helper::feature_neither_compile(
+                "websocket-native-tls",
+                "websocket-rustls",
+            )
         }
     }
 

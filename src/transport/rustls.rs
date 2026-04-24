@@ -1,5 +1,5 @@
+use crate::common::helper::host_port_pair;
 use crate::config::{TlsConfig, TransportConfig};
-use crate::helper::host_port_pair;
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use std::fmt::Debug;
 use std::fs;

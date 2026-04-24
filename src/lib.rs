@@ -1,32 +1,26 @@
 mod cli;
+mod common;
 mod config;
-mod config_watcher;
-mod constants;
-mod helper;
-mod multi_map;
+mod core;
 mod protocol;
 mod transport;
 
 pub use cli::Cli;
 use cli::KeypairType;
+pub use common::constants::UDP_BUFFER_SIZE;
 pub use config::Config;
-pub use constants::UDP_BUFFER_SIZE;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
 #[cfg(feature = "client")]
-mod client;
-#[cfg(feature = "client")]
-use client::run_client;
+use core::run_client;
 
 #[cfg(feature = "server")]
-mod server;
-#[cfg(feature = "server")]
-use server::run_server;
+use core::run_server;
 
-use crate::config_watcher::{ConfigChange, ConfigWatcherHandle};
+use crate::config::{ConfigChange, ConfigWatcherHandle};
 
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
@@ -56,7 +50,7 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 
 #[cfg(not(feature = "noise"))]
 fn genkey(curve: Option<KeypairType>) -> Result<()> {
-    crate::helper::feature_not_compile("nosie")
+    crate::common::helper::feature_not_compile("nosie")
 }
 
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
@@ -124,13 +118,13 @@ async fn run_instance(
         RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
         RunMode::Client => {
             #[cfg(not(feature = "client"))]
-            crate::helper::feature_not_compile("client");
+            crate::common::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
             run_client(config, shutdown_rx, service_update).await
         }
         RunMode::Server => {
             #[cfg(not(feature = "server"))]
-            crate::helper::feature_not_compile("server");
+            crate::common::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
             run_server(config, shutdown_rx, service_update).await
         }
