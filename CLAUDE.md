@@ -45,7 +45,7 @@ cargo test --test integration_test udp
 cargo test <test_name>
 ```
 
-Integration tests spawn their own echo/pingpong servers internally (see `tests/common/mod.rs`). They do not require external services to be running.
+Integration tests spawn their own echo/pingpong servers internally (see `tests/common/mod.rs`). Test fixture configs live in `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/`. They do not require external services to be running.
 
 ### Lint
 
@@ -67,14 +67,18 @@ cargo hack check --feature-powerset --no-dev-deps --mutually-exclusive-features 
 ### Run
 
 ```bash
-# Generate a Noise keypair (default x25519; optionally pass x448)
-./molehill --genkey
-./molehill --genkey x448
+# Run from source (development)
+cargo run -- server.toml
+cargo run -- client.toml
 
-# Run as server
+# Generate a Noise keypair (requires `noise` feature; default x25519; optionally pass x448)
+cargo run -- --genkey
+cargo run --features noise -- --genkey x448
+
+# Run compiled binary as server
 ./molehill server.toml
 
-# Run as client
+# Run compiled binary as client
 ./molehill client.toml
 
 # Run with explicit mode (when config has both client and server)
@@ -99,6 +103,7 @@ RUST_LOG=debug ./molehill config.toml
 
 Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the older `mod.rs` convention.
 
+- `build.rs`: Build metadata injection via `vergen` (git SHA, build timestamp, cargo features, target triple)
 - `src/main.rs`: Binary entry point — CLI parsing (clap), signal handling, logging setup
 - `src/lib.rs`: Library root — re-exports public API, run mode detection, main event loop
 - `src/cli.rs`: CLI argument definitions
@@ -158,8 +163,9 @@ Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the old
 
 ## Build Profiles
 
-- `release`: `lto = true`, `codegen-units = 1`, `strip = true`
-- `minimal`: Inherits release, `opt-level = "z"` for smallest binary size
+- `dev`: `panic = "abort"` (no unwind on panic for faster dev iteration)
+- `release`: `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`
+- `minimal`: Inherits release, `opt-level = "z"` for smallest binary size (~500KiB)
 - `bench`: `debug = 1`
 
 ## CI/CD
@@ -173,3 +179,10 @@ GitHub Actions in `.github/workflows/`:
 - `docs/transport.md`: Detailed TLS and Noise Protocol setup, including certificate generation and keypair configuration.
 - `docs/build-guide.md`: Build customization, rustls support, and binary size minimization.
 - `docs/internals.md`: Conceptual overview of control/data channels and forwarding process.
+
+## Known TODOs
+
+Items deferred from previous sessions (non-feat items are done):
+
+- `src/config/parsing.rs:137` — Add PSK (pre-shared key) support to Noise protocol config
+- `src/core/server.rs:671` — Add load balancing for the UDP connection pool

@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
 use backon::ExponentialBuilder;
 
-use rand::RngCore;
+use rand::TryRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,22 +162,20 @@ impl<T: 'static + Transport> Server<T> {
                 ret = self.transport.accept(&l) => {
                     match ret {
                         Err(err) => {
-                            // Detects whether it's an IO error
-                            if let Some(err) = err.downcast_ref::<io::Error>() {
-                                // If it is an IO error, then it's possibly an
-                                // EMFILE. So sleep for a while and retry
-                                // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
+                            if should_retry_accept(&err) {
                                 if let Some(d) = backoff.next() {
                                     error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
                                     time::sleep(d).await;
                                 } else {
-                                    // This branch will never be executed according to the current retry policy
                                     error!("Too many retries. Aborting...");
                                     break;
                                 }
+                            } else if let Some(e) = err.downcast_ref::<io::Error>() {
+                                // Transient connection-level errors (ECONNABORTED, ECONNRESET, etc.)
+                                // don't affect the listener, just ignore
+                                debug!("Accept interrupted: {e}");
                             }
-                            // If it's not an IO error, then it comes from
-                            // the transport layer, so just ignore it
+                            // Non-IO errors from the transport layer are silently ignored
                         }
                         Ok((conn, addr)) => {
                             backoff = backoff_builder.build();
@@ -289,7 +287,8 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Generate a nonce
     let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    let mut rng = rand::rngs::SysRng;
+    rng.try_fill_bytes(&mut nonce)?;
 
     // Send hello
     let hello_send = Hello::ControlChannelHello(
@@ -716,4 +715,21 @@ async fn run_udp_connection_pool<T: Transport>(
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+/// Returns `true` if the error is a transient resource exhaustion error (EMFILE, ENFILE, ENOMEM, ENOBUFS)
+/// that warrants sleeping before retrying the accept loop.
+fn should_retry_accept(err: &anyhow::Error) -> bool {
+    let Some(io_err) = err.downcast_ref::<io::Error>() else {
+        return false;
+    };
+    if cfg!(unix) {
+        matches!(
+            io_err.raw_os_error(),
+            Some(24) | Some(23) | Some(12) | Some(105) // EMFILE, ENFILE, ENOMEM, ENOBUFS
+        )
+    } else {
+        // On non-Unix, treat all IO errors as potentially transient
+        io_err.kind() == io::ErrorKind::OutOfMemory || io_err.kind() == io::ErrorKind::StorageFull
+    }
 }

@@ -43,8 +43,15 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     );
     let keypair = builder.generate_keypair()?;
 
-    println!("Private Key:\n{}\n", base64::encode(keypair.private));
-    println!("Public Key:\n{}", base64::encode(keypair.public));
+    use base64::Engine;
+    println!(
+        "Private Key:\n{}\n",
+        base64::engine::general_purpose::STANDARD.encode(&keypair.private)
+    );
+    println!(
+        "Public Key:\n{}",
+        base64::engine::general_purpose::STANDARD.encode(&keypair.public)
+    );
     Ok(())
 }
 
@@ -59,7 +66,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     }
 
     // Raise `nofile` limit on linux and mac
-    fdlimit::raise_fd_limit();
+    let _ = fdlimit::raise_fd_limit();
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
     let config_path = args.config_path.as_ref().unwrap();

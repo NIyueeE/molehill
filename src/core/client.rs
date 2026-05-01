@@ -269,8 +269,6 @@ async fn run_data_channel_for_udp<T: Transport>(
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
 
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
     let (mut rd, mut wr) = io::split(conn);
 
     // Keep sending items from the outbound channel to the server

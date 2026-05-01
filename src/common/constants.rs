@@ -1,8 +1,10 @@
 use backon::ExponentialBuilder;
 use std::time::Duration;
 
-// FIXME: Determine reasonable size
-/// UDP MTU. Currently far larger than necessary
+/// Receive buffer size for UDP sockets.
+///
+/// Covers the maximum Ethernet payload (1500) with IP/UDP header overhead
+/// plus some headroom, while remaining safe for stack allocation.
 pub const UDP_BUFFER_SIZE: usize = 2048;
 pub const UDP_SENDQ_SIZE: usize = 1024;
 pub const UDP_TIMEOUT: u64 = 60;
