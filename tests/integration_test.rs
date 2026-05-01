@@ -1,6 +1,5 @@
 use anyhow::{Ok, Result};
 use common::{PING, PONG, run_molehill_client};
-use rand::Rng;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -57,7 +56,9 @@ async fn tcp() -> Result<()> {
     test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
 
     #[cfg(any(
-         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         // macOS native-tls (Security Framework) pops up a GUI dialog for
+         // self-signed certificates, so only rustls works there without
+         // manual intervention.
          all(target_os = "macos", feature = "rustls"),
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
@@ -98,7 +99,9 @@ async fn udp() -> Result<()> {
     test("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
 
     #[cfg(any(
-         // FIXME: Self-signed certificate on macOS nativetls requires manual interference.
+         // macOS native-tls (Security Framework) pops up a GUI dialog for
+         // self-signed certificates, so only rustls works there without
+         // manual intervention.
          all(target_os = "macos", feature = "rustls"),
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
@@ -241,7 +244,7 @@ async fn tcp_echo_hitter(addr: &'static str) -> Result<()> {
     let mut wr = [0u8; 1024];
     let mut rd = [0u8; 1024];
     for _ in 0..100 {
-        rand::thread_rng().fill(&mut wr);
+        rand::fill(&mut wr);
         conn.write_all(&wr).await?;
         conn.read_exact(&mut rd).await?;
         assert_eq!(wr, rd);
@@ -257,7 +260,7 @@ async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
     let mut wr = [0u8; 128];
     let mut rd = [0u8; 128];
     for _ in 0..3 {
-        rand::thread_rng().fill(&mut wr);
+        rand::fill(&mut wr);
 
         conn.send(&wr).await?;
         debug!("send");

@@ -1,6 +1,6 @@
+use crate::common::helper::udp_connect;
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
-use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::udp_connect;
+use crate::config::{ClientServiceChange, ConfigChange};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
@@ -28,7 +28,9 @@ use crate::transport::TlsTransport;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 use crate::transport::WebsocketTransport;
 
-use crate::constants::{UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff};
+use crate::common::constants::{
+    UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff,
+};
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -54,7 +56,7 @@ pub async fn run_client(
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::helper::feature_neither_compile("native-tls", "rustls")
+            crate::common::helper::feature_neither_compile("native-tls", "rustls")
         }
         TransportType::Noise => {
             #[cfg(feature = "noise")]
@@ -63,7 +65,7 @@ pub async fn run_client(
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(feature = "noise"))]
-            crate::helper::feature_not_compile("noise")
+            crate::common::helper::feature_not_compile("noise")
         }
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
@@ -72,7 +74,10 @@ pub async fn run_client(
                 client.run(shutdown_rx, update_rx).await
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+            crate::common::helper::feature_neither_compile(
+                "websocket-native-tls",
+                "websocket-rustls",
+            )
         }
     }
 }
@@ -264,8 +269,6 @@ async fn run_data_channel_for_udp<T: Transport>(
     // The channel stores UdpTraffic that needs to be sent to the server
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
 
-    // FIXME: https://github.com/tokio-rs/tls/issues/40
-    // Maybe this is our concern
     let (mut rd, mut wr) = io::split(conn);
 
     // Keep sending items from the outbound channel to the server

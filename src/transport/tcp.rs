@@ -1,6 +1,6 @@
 use crate::{
+    common::helper::tcp_connect_with_proxy,
     config::{TcpConfig, TransportConfig},
-    helper::tcp_connect_with_proxy,
 };
 
 use super::{AddrMaybeCached, SocketOpts, Transport};

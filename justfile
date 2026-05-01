@@ -1,12 +1,13 @@
-# Justfile for rathole
+# Justfile for molehill
 
 set positional-arguments
 
-# Run all checks: type check, lint, format, audit, unused deps
-# Prerequisites: cargo install cargo-audit && cargo install cargo-machete
+# Run all checks: format, type check, lint, audit, outdated deps, unused deps
+# 前置: cargo install cargo-audit && cargo install cargo-machete && cargo install cargo-outdated
 check:
+  cargo fmt --check
   cargo check
   cargo clippy -- -D warnings
-  cargo fmt --check
   cargo audit
+  cargo outdated --root-deps-only
   cargo machete

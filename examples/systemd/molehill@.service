@@ -1,5 +1,5 @@
 [Unit]
-Description=Rathole Server Service
+Description=Molehill Service (%i)
 After=network.target
 
 [Service]
@@ -9,9 +9,9 @@ RestartSec=5s
 LimitNOFILE=1048576
 
 # with root
-ExecStart=/usr/bin/rathole -s /etc/rathole/%i.toml
+ExecStart=/usr/bin/molehill /etc/molehill/%i.toml
 # without root
-# ExecStart=%h/.local/bin/rathole -s %h/.local/etc/rathole/%i.toml
+# ExecStart=%h/.local/bin/molehill %h/.local/etc/molehill/%i.toml
 
 [Install]
 WantedBy=multi-user.target

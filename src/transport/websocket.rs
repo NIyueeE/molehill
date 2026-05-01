@@ -22,7 +22,6 @@ use super::tls::get_tcpstream;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{WebSocketStream, accept_async_with_config, client_async_with_config};
 use tokio_util::io::StreamReader;
-use url::Url;
 
 #[derive(Debug)]
 enum TransportStream {
@@ -97,7 +96,7 @@ impl Stream for StreamWrapper {
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Error::other(err)))),
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
+                    Poll::Ready(Some(Ok(b)))
                 } else {
                     Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
@@ -147,7 +146,7 @@ impl AsyncWrite for WebsocketTunnel {
         let sw = self.get_mut().inner.get_mut();
         ready!(Pin::new(&mut sw.inner).poll_ready(cx).map_err(Error::other))?;
 
-        match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
+        match Pin::new(&mut sw.inner).start_send(Message::Binary(Bytes::copy_from_slice(buf))) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(e) => Poll::Ready(Err(Error::other(e))),
         }
@@ -190,10 +189,7 @@ impl Transport for WebsocketTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
-        let conf = WebSocketConfig {
-            write_buffer_size: 0,
-            ..WebSocketConfig::default()
-        };
+        let conf = WebSocketConfig::default().write_buffer_size(0);
         let sub = match wsconfig.tls {
             true => SubTransport::Secure(TlsTransport::new(config)?),
             false => SubTransport::Insecure(TcpTransport::new(config)?),
@@ -234,12 +230,11 @@ impl Transport for WebsocketTransport {
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
         let u = format!("ws://{}", &addr.addr.as_str());
-        let url = Url::parse(&u).unwrap();
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
             SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
         };
-        let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
+        let (wsstream, _) = client_async_with_config(&u, tstream, Some(self.conf))
             .await
             .expect("failed to connect");
         let tun = WebsocketTunnel {
