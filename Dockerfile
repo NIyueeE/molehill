@@ -3,7 +3,7 @@ RUN apt update && apt install -y libssl-dev
 WORKDIR /home/rust/src
 COPY . .
 ARG FEATURES
-RUN cargo build --locked --release --features ${FEATURES:-default}
+RUN cargo build --release --features ${FEATURES:-default}
 RUN mkdir -p build-out/
 RUN cp target/release/molehill build-out/
 
