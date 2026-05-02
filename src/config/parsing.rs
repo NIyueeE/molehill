@@ -134,7 +134,9 @@ pub struct NoiseConfig {
     pub pattern: String,
     pub local_private_key: Option<MaskedString>,
     pub remote_public_key: Option<String>,
-    // TODO: Maybe psk can be added
+    pub psk: Option<MaskedString>,
+    #[serde(default)]
+    pub psk_location: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -492,5 +494,144 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_masked_string_debug() {
+        let s = MaskedString::from("secret-token");
+        assert_eq!(format!("{:?}", s), "MASKED");
+        assert_eq!(&*s, "secret-token");
+    }
+
+    #[test]
+    fn test_noise_config_with_psk() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
+psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+psk_location = 0
+"#;
+        assert!(Config::from_str(config).is_ok());
+    }
+
+    #[test]
+    fn test_noise_config_with_default_psk_location() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
+psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+"#;
+        assert!(Config::from_str(config).is_ok());
+    }
+
+    #[test]
+    fn test_prefer_ipv6_config() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+prefer_ipv6 = true
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+prefer_ipv6 = true
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let client = cfg.client.unwrap();
+        assert!(client.prefer_ipv6.unwrap());
+        assert!(client.services["test"].prefer_ipv6);
+    }
+
+    #[test]
+    fn test_prefer_ipv6_defaults_false() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let client = cfg.client.unwrap();
+        assert!(!client.prefer_ipv6.unwrap_or(false));
+        assert!(!client.services["test"].prefer_ipv6);
+    }
+
+    #[test]
+    fn test_proxy_socks5() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.transport]
+type = "tcp"
+
+[client.transport.tcp]
+proxy = "socks5://127.0.0.1:1080"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+"#;
+        Config::from_str(config).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_http() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.transport]
+type = "tcp"
+
+[client.transport.tcp]
+proxy = "http://user:pass@proxy.example.com:8080"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+"#;
+        Config::from_str(config).unwrap();
+    }
+
+    #[test]
+    fn test_proxy_invalid_scheme() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.transport]
+type = "tcp"
+
+[client.transport.tcp]
+proxy = "https://127.0.0.1:443"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+"#;
+        assert!(Config::from_str(config).is_err());
     }
 }

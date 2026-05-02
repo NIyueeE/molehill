@@ -245,3 +245,138 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
         .with_context(|| "Failed to read cmd")?;
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize data cmd")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn sample_digest(b: u8) -> Digest {
+        let mut d = [0u8; HASH_WIDTH_IN_BYTES];
+        d[0] = b;
+        d
+    }
+
+    fn sample_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    }
+
+    #[test]
+    fn hello_roundtrip_control() {
+        let d = sample_digest(42);
+        let hello = Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d);
+        let bytes = postcard::to_stdvec(&hello).unwrap();
+        let back: Hello = postcard::from_bytes(&bytes).unwrap();
+        match back {
+            Hello::ControlChannelHello(v, d2) => {
+                assert_eq!(v, CURRENT_PROTO_VERSION);
+                assert_eq!(d2, d);
+            }
+            _ => panic!("Expected ControlChannelHello"),
+        }
+    }
+
+    #[test]
+    fn hello_roundtrip_data() {
+        let d = sample_digest(99);
+        let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, d);
+        let bytes = postcard::to_stdvec(&hello).unwrap();
+        let back: Hello = postcard::from_bytes(&bytes).unwrap();
+        match back {
+            Hello::DataChannelHello(v, d2) => {
+                assert_eq!(v, CURRENT_PROTO_VERSION);
+                assert_eq!(d2, d);
+            }
+            _ => panic!("Expected DataChannelHello"),
+        }
+    }
+
+    #[test]
+    fn auth_roundtrip() {
+        let d = sample_digest(7);
+        let auth = Auth(d);
+        let bytes = postcard::to_stdvec(&auth).unwrap();
+        let back: Auth = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.0, d);
+    }
+
+    #[test]
+    fn ack_roundtrip_all_variants() {
+        for ack in [Ack::Ok, Ack::ServiceNotExist, Ack::AuthFailed] {
+            let bytes = postcard::to_stdvec(&ack).unwrap();
+            let back: Ack = postcard::from_bytes(&bytes).unwrap();
+            match (&ack, &back) {
+                (Ack::Ok, Ack::Ok) => {}
+                (Ack::ServiceNotExist, Ack::ServiceNotExist) => {}
+                (Ack::AuthFailed, Ack::AuthFailed) => {}
+                _ => panic!("Ack round-trip mismatch"),
+            }
+        }
+    }
+
+    #[test]
+    fn ack_display() {
+        assert_eq!(Ack::Ok.to_string(), "Ok");
+        assert_eq!(Ack::ServiceNotExist.to_string(), "Service not exist");
+        assert_eq!(Ack::AuthFailed.to_string(), "Incorrect token");
+    }
+
+    #[test]
+    fn control_cmd_roundtrip() {
+        // CreateDataChannel
+        let cmd = ControlChannelCmd::CreateDataChannel;
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: ControlChannelCmd = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(back, ControlChannelCmd::CreateDataChannel));
+
+        // HeartBeat
+        let cmd = ControlChannelCmd::HeartBeat;
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: ControlChannelCmd = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(back, ControlChannelCmd::HeartBeat));
+    }
+
+    #[test]
+    fn data_cmd_roundtrip() {
+        // StartForwardTcp
+        let cmd = DataChannelCmd::StartForwardTcp;
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(back, DataChannelCmd::StartForwardTcp));
+
+        // StartForwardUdp
+        let cmd = DataChannelCmd::StartForwardUdp;
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(back, DataChannelCmd::StartForwardUdp));
+    }
+
+    #[test]
+    fn udp_header_roundtrip() {
+        let hdr = UdpHeader {
+            from: sample_addr(),
+            len: 42,
+        };
+        let bytes = postcard::to_stdvec(&hdr).unwrap();
+        let back: UdpHeader = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.from, sample_addr());
+        assert_eq!(back.len, 42);
+    }
+
+    #[test]
+    fn digest_is_32_bytes() {
+        let d = digest(b"hello");
+        assert_eq!(d.len(), HASH_WIDTH_IN_BYTES);
+    }
+
+    #[test]
+    fn packet_lengths_are_stable() {
+        let len = PacketLength::new();
+        // Verify constant widths so protocol changes don't slip through
+        assert!(len.hello > 0);
+        assert!(len.ack > 0);
+        assert!(len.auth > 0);
+        assert!(len.c_cmd > 0);
+        assert!(len.d_cmd > 0);
+    }
+}

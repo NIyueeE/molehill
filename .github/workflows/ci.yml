@@ -84,6 +84,9 @@ jobs:
         with:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: cargo test --verbose
       - name: Build
         run: cargo build
       - name: Smoke test
