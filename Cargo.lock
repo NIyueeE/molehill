@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "molehill-rathole"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "async-http-proxy",
