@@ -14,6 +14,7 @@ pub struct NoiseTransport {
     params: NoiseParams,
     local_private_key: Vec<u8>,
     remote_public_key: Option<Vec<u8>>,
+    psk: Option<(u8, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for NoiseTransport {
@@ -25,8 +26,12 @@ impl std::fmt::Debug for NoiseTransport {
 impl NoiseTransport {
     fn builder(&self) -> Builder<'_> {
         let builder = Builder::new(self.params.clone()).local_private_key(&self.local_private_key);
-        match &self.remote_public_key {
+        let builder = match &self.remote_public_key {
             Some(x) => builder.remote_public_key(x),
+            None => builder,
+        };
+        match &self.psk {
+            Some((loc, key)) => builder.psk(*loc, key),
             None => builder,
         }
     }
@@ -65,12 +70,24 @@ impl Transport for NoiseTransport {
 
         let params: NoiseParams = config.pattern.parse()?;
 
+        let psk = match &config.psk {
+            Some(psk_b64) => {
+                let psk_location = config.psk_location.unwrap_or(0);
+                let psk_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(psk_b64.as_bytes())
+                    .with_context(|| "Failed to decode psk")?;
+                Some((psk_location, psk_bytes))
+            }
+            None => None,
+        };
+
         Ok(NoiseTransport {
             tcp,
             config,
             params,
             local_private_key,
             remote_public_key,
+            psk,
         })
     }
 

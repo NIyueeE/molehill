@@ -115,11 +115,12 @@ remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+prefer_ipv6 = false # Optional. Prefer IPv6 when resolving remote addresses. Default: false
 
 [client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
+type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
 
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
+[client.transport.tcp] # Optional. TCP socket options (also apply to `tls` and `noise` transports)
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
 nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
 keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
@@ -133,9 +134,11 @@ hostname = "example.com" # Optional. The hostname that the client uses to valida
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
+psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
 [client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
+tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `client.transport.tls`). Set to `false` for plain WebSocket.
 
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -143,6 +146,7 @@ token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 nodelay = true # Optional. Override the `client.transport.nodelay` per service
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+prefer_ipv6 = false # Optional. Override the `client.prefer_ipv6` per service
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
@@ -161,19 +165,21 @@ keepalive_secs = 20
 keepalive_interval = 8
 
 [server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
+pkcs12 = "identity.pfx" # Necessary. pkcs12 file of server's certificate and private key
 pkcs12_password = "password" # Necessary. Password of the pkcs12 file
 
 [server.transport.noise] # Same as `[client.transport.noise]`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
+psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
 [server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
+tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `server.transport.tls`). Set to `false` for plain WebSocket.
 
 [server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
+type = "tcp" # Optional. Same as the client `[client.services.X.type]`
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
 nodelay = true # Optional. Same as the client

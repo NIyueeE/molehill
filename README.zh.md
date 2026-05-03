@@ -110,72 +110,78 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
 
 ```toml
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
+remote_addr = "example.com:2333" # 必填。服务端地址
+default_token = "default_token_if_not_specify" # 可选。服务的默认 token，当服务未单独设置时使用
+heartbeat_timeout = 40 # 可选。设为 0 禁用应用层心跳检测。该值必须大于 `server.heartbeat_interval`。默认：40 秒
+retry_interval = 1 # 可选。连接服务端失败后的重试间隔。默认：1 秒
+prefer_ipv6 = false # 可选。解析远程地址时优先使用 IPv6。默认：false
 
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise"]. Default: "tcp"
+[client.transport] # 整个块都是可选的。指定使用的传输协议
+type = "tcp" # 可选。可选值：["tcp", "tls", "noise", "websocket"]。默认："tcp"
 
-[client.transport.tcp] # Optional. Also affects `noise` and `tls`
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
+[client.transport.tcp] # 可选。TCP socket 选项（对 `tls` 和 `noise` 传输同样生效）
+proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。连接服务端使用的代理。支持 `http` 和 `socks5`
+nodelay = true # 可选。是否启用 TCP_NODELAY，启用可降低延迟但会减少带宽。默认：true
+keepalive_secs = 20 # 可选。设置 `tcp_keepalive_time`。默认：20 秒
+keepalive_interval = 8 # 可选。设置 `tcp_keepalive_intvl`。默认：8 秒
 
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
+[client.transport.tls] # 必填（当 `type` 为 "tls" 时）
+trusted_root = "ca.pem" # 必填。签署服务端证书的 CA 证书
+hostname = "example.com" # 可选。客户端验证证书时使用的主机名。不设置则回退到 `client.remote_addr`
 
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
+[client.transport.noise] # Noise 协议。详见 `docs/transport.md`
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如上所示
+local_private_key = "key_encoded_in_base64" # 可选
+remote_public_key = "key_encoded_in_base64" # 可选
+psk = "key_encoded_in_base64" # 可选。预共享密钥（32 字节，base64 编码）。使用前 pattern 须包含 PSK 修饰符（如 Noise_KKpsk0_...）
+psk_location = 0 # 可选。PSK 在 pattern 中的槽位索引。默认：0
 
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `client.transport.tls`
+[client.transport.websocket] # 必填（当 `type` 为 "websocket" 时）
+tls = true # 必填。设为 `true` 启用 WebSocket 上的 TLS（使用 `client.transport.tls` 中的配置）。设为 `false` 使用普通 WebSocket。
 
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
+[client.services.service1] # 需要转发的服务。服务名 `service1` 可任意修改，只要与服务端配置一致
+type = "tcp" # 可选。需要转发的协议。可选值：["tcp", "udp"]。默认："tcp"
+token = "whatever" # 必填（如果 `client.default_token` 未设置）
+local_addr = "127.0.0.1:1081" # 必填。需要转发的服务地址
+nodelay = true # 可选。为当前服务单独覆盖 `client.transport.nodelay`
+retry_interval = 1 # 可选。连接服务端的重试间隔。默认：继承全局配置
+prefer_ipv6 = false # 可选。为当前服务单独覆盖 `client.prefer_ipv6`
 
-[client.services.service2] # Multiple services can be defined
+[client.services.service2] # 可以定义多个服务
 local_addr = "127.0.0.1:1082"
 
 [server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+bind_addr = "0.0.0.0:2333" # 必填。服务端监听客户端连接的地址。通常只需修改端口
+default_token = "default_token_if_not_specify" # 可选
+heartbeat_interval = 30 # 可选。应用层心跳发送间隔。设为 0 禁用。默认：30 秒
 
-[server.transport] # Same as `[client.transport]`
+[server.transport] # 与 `[client.transport]` 相同
 type = "tcp"
 
-[server.transport.tcp] # Same as the client
+[server.transport.tcp] # 与客户端相同
 nodelay = true
 keepalive_secs = 20
 keepalive_interval = 8
 
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
+[server.transport.tls] # 必填（当 `type` 为 "tls" 时）
+pkcs12 = "identity.pfx" # 必填。服务端证书和私钥的 pkcs12 文件
+pkcs12_password = "password" # 必填。pkcs12 文件的密码
 
-[server.transport.noise] # Same as `[client.transport.noise]`
+[server.transport.noise] # 与 `[client.transport.noise]` 相同
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
+psk = "key_encoded_in_base64" # 可选。预共享密钥（32 字节，base64 编码）。使用前 pattern 须包含 PSK 修饰符（如 Noise_KKpsk0_...）
+psk_location = 0 # 可选。PSK 在 pattern 中的槽位索引。默认：0
 
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # If `true` then it will use settings in `server.transport.tls`
+[server.transport.websocket] # 必填（当 `type` 为 "websocket" 时）
+tls = true # 必填。设为 `true` 启用 WebSocket 上的 TLS（使用 `server.transport.tls` 中的配置）。设为 `false` 使用普通 WebSocket。
 
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
+[server.services.service1] # 服务名必须与客户端保持一致
+type = "tcp" # 可选。与客户端 `[client.services.X.type]` 相同
+token = "whatever" # 必填（如果 `server.default_token` 未设置）
+bind_addr = "0.0.0.0:8081" # 必填。暴露服务的公网地址。通常只需修改端口
+nodelay = true # 可选。与客户端相同
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"

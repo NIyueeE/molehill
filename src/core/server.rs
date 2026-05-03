@@ -667,30 +667,72 @@ async fn run_udp_connection_pool<T: Transport>(
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    // TODO: Load balance
-
-    let l = retry_notify_with_deadline(
-        listen_backoff(),
-        || async { UdpSocket::bind(&bind_addr).await },
-        |e: &std::io::Error, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-        &mut shutdown_rx,
-    )
-    .await
-    .with_context(|| "Failed to listen for the service")?;
+    let l = Arc::new(
+        retry_notify_with_deadline(
+            listen_backoff(),
+            || async { UdpSocket::bind(&bind_addr).await },
+            |e: &std::io::Error, duration| {
+                warn!("{:#}. Retry in {:?}", e, duration);
+            },
+            &mut shutdown_rx,
+        )
+        .await
+        .with_context(|| "Failed to listen for the service")?,
+    );
 
     info!("Listening at {}", &bind_addr);
 
     let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp).unwrap();
 
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
+    let mut set = tokio::task::JoinSet::new();
 
+    // Spawn one worker per data channel. Multiple workers concurrently
+    // read from the same UDP socket, distributing traffic across channels.
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+            maybe_chan = data_ch_rx.recv() => {
+                match maybe_chan {
+                    Some(mut conn) => {
+                        if let Err(e) = write_and_flush(&mut conn, &cmd).await {
+                            error!("Failed to init UDP channel: {:#}", e);
+                            continue;
+                        }
+                        let l = Arc::clone(&l);
+                        let shutdown = shutdown_rx.resubscribe();
+                        set.spawn(async move {
+                            if let Err(e) = udp_forward_worker::<T>(l, conn, shutdown).await {
+                                error!("UDP worker exited: {:#}", e);
+                            }
+                        });
+                    }
+                    None => break,
+                }
+            }
+            Some(result) = set.join_next() => {
+                if let Err(e) = result {
+                    error!("UDP worker panicked: {:?}", e);
+                }
+            }
+        }
+    }
+
+    // Drop the socket and task set immediately so the port is released
+    // before a replacement pool tries to bind.
+    drop(l);
+    drop(set);
+
+    debug!("UDP pool dropped");
+    Ok(())
+}
+
+async fn udp_forward_worker<T: Transport>(
+    l: Arc<UdpSocket>,
+    mut conn: T::Stream,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
@@ -698,22 +740,17 @@ async fn run_udp_connection_pool<T: Transport>(
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
-            },
-
+            }
             // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
                 let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
                 l.send_to(&t.data, t.from).await?;
             }
-
             _ = shutdown_rx.recv() => {
                 break;
             }
         }
     }
-
-    debug!("UDP pool dropped");
-
     Ok(())
 }
 

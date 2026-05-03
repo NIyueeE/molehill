@@ -1,6 +1,6 @@
 [package]
 name = "molehill-rathole"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 authors = ["niyue <n1yu3@proton.me>"]
 description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok. Fork of https://github.com/rathole-org/rathole"
