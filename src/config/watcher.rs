@@ -1,14 +1,16 @@
-use crate::{
-    Config,
-    config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig},
-};
-use anyhow::{Context, Result};
-use std::{
-    collections::HashMap,
-    env,
-    path::{Path, PathBuf},
-};
+use crate::Config;
+#[cfg(feature = "notify")]
+use crate::config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig};
+#[cfg(feature = "notify")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
+#[cfg(feature = "notify")]
+use std::collections::HashMap;
+#[cfg(feature = "notify")]
+use std::env;
+use std::path::{Path, PathBuf};
 use tokio::sync::{broadcast, mpsc};
+#[cfg(feature = "notify")]
 use tracing::{error, info, instrument};
 
 #[cfg(feature = "notify")]
@@ -17,22 +19,27 @@ use notify::{EventKind, RecursiveMode, Watcher};
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
+    #[cfg(feature = "notify")]
     ServerChange(ServerServiceChange),
+    #[cfg(feature = "notify")]
     ClientChange(ClientServiceChange),
 }
 
+#[cfg(feature = "notify")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientServiceChange {
     Add(ClientServiceConfig),
     Delete(String),
 }
 
+#[cfg(feature = "notify")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ServerServiceChange {
     Add(ServerServiceConfig),
     Delete(String),
 }
 
+#[cfg(feature = "notify")]
 trait InstanceConfig: Clone {
     type ServiceConfig: PartialEq + Eq + Clone;
     fn equal_without_service(&self, rhs: &Self) -> bool;
@@ -41,6 +48,7 @@ trait InstanceConfig: Clone {
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig>;
 }
 
+#[cfg(feature = "notify")]
 impl InstanceConfig for ServerConfig {
     type ServiceConfig = ServerServiceConfig;
     fn equal_without_service(&self, rhs: &Self) -> bool {
@@ -67,6 +75,7 @@ impl InstanceConfig for ServerConfig {
     }
 }
 
+#[cfg(feature = "notify")]
 impl InstanceConfig for ClientConfig {
     type ServiceConfig = ClientServiceConfig;
     fn equal_without_service(&self, rhs: &Self) -> bool {
@@ -105,7 +114,7 @@ impl ConfigWatcherHandle {
         // Initial start
         event_tx
             .send(ConfigChange::General(Box::new(origin_cfg.clone())))
-            .unwrap();
+            .map_err(|e| anyhow!("Failed to send the initial config event: {}", e))?;
 
         tokio::spawn(config_watcher(
             path.to_owned(),
@@ -145,7 +154,9 @@ async fn config_watcher(
     } else {
         env::current_dir()?.join(path)
     };
-    let parent_path = path.parent().expect("config file should have a parent dir");
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| anyhow!("Config file has no parent directory: {}", path.display()))?;
     let path_clone = path.clone();
     let mut watcher =
         notify::recommended_watcher(move |res: Result<notify::Event, _>| match res {
@@ -199,6 +210,7 @@ async fn config_watcher(
     Ok(())
 }
 
+#[cfg(feature = "notify")]
 fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     if old == new {
         return None;
@@ -213,21 +225,22 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     let mut ret = vec![];
 
     if old.server != new.server {
-        match calculate_instance_config_events(
-            old.server.as_ref().unwrap(),
-            new.server.as_ref().unwrap(),
-        ) {
-            Some(mut v) => ret.append(&mut v),
+        match old.server.as_ref().zip(new.server.as_ref()) {
+            Some((old_s, new_s)) => match calculate_instance_config_events(old_s, new_s) {
+                Some(mut v) => ret.append(&mut v),
+                None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
+            },
+            // One side lacks the server block: fall back to a full restart
             None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
     }
 
     if old.client != new.client {
-        match calculate_instance_config_events(
-            old.client.as_ref().unwrap(),
-            new.client.as_ref().unwrap(),
-        ) {
-            Some(mut v) => ret.append(&mut v),
+        match old.client.as_ref().zip(new.client.as_ref()) {
+            Some((old_c, new_c)) => match calculate_instance_config_events(old_c, new_c) {
+                Some(mut v) => ret.append(&mut v),
+                None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
+            },
             None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
     }
@@ -235,6 +248,7 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     Some(ret)
 }
 
+#[cfg(feature = "notify")]
 // None indicates a General change needed
 fn calculate_instance_config_events<T: InstanceConfig>(
     old: &T,
@@ -262,6 +276,7 @@ fn calculate_instance_config_events<T: InstanceConfig>(
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use crate::config::ServerConfig;
 
     use super::*;

@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::trace;
 
+use crate::common::constants::UDP_BUFFER_SIZE;
+
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const PROTO_V1: u8 = 1u8;
@@ -72,13 +74,14 @@ pub struct UdpTraffic {
 }
 
 impl UdpTraffic {
+    #[cfg(feature = "client")]
     pub async fn write<T: AsyncWrite + Unpin>(&self, writer: &mut T) -> Result<()> {
         let hdr = UdpHeader {
             from: self.from,
             len: self.data.len() as UdpPacketLen,
         };
 
-        let v = postcard::to_stdvec(&hdr).unwrap();
+        let v = postcard::to_stdvec(&hdr)?;
 
         trace!("Write {:?} of length {}", hdr, v.len());
         writer.write_u8(v.len() as u8).await?;
@@ -100,7 +103,7 @@ impl UdpTraffic {
             len: data.len() as UdpPacketLen,
         };
 
-        let v = postcard::to_stdvec(&hdr).unwrap();
+        let v = postcard::to_stdvec(&hdr)?;
 
         trace!("Write {:?} of length {}", hdr, v.len());
         writer.write_u8(v.len() as u8).await?;
@@ -123,6 +126,13 @@ impl UdpTraffic {
 
         trace!("hdr {:?}", hdr);
 
+        // A UDP payload larger than the receive buffer cannot originate from
+        // this implementation; reject it to avoid oversized allocations and
+        // desynchronizing the stream.
+        if hdr.len > UDP_BUFFER_SIZE as UdpPacketLen {
+            bail!("UDP packet length {} exceeds the buffer size", hdr.len);
+        }
+
         let mut data = BytesMut::new();
         data.resize(hdr.len as usize, 0);
         reader.read_exact(&mut data).await?;
@@ -142,12 +152,18 @@ pub fn digest(data: &[u8]) -> Digest {
 
 struct PacketLength {
     hello: usize,
+    #[cfg(feature = "client")]
     ack: usize,
+    #[cfg(feature = "server")]
     auth: usize,
+    #[cfg(feature = "client")]
     c_cmd: usize,
+    #[cfg(feature = "client")]
     d_cmd: usize,
 }
 
+// Infallible: serializing compile-time-known fixed-size values
+#[allow(clippy::unwrap_used)]
 impl PacketLength {
     pub fn new() -> PacketLength {
         let username = "default";
@@ -155,21 +171,28 @@ impl PacketLength {
         let hello = postcard::to_stdvec(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
             .unwrap()
             .len();
+        #[cfg(feature = "client")]
         let c_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)
             .unwrap()
             .len();
+        #[cfg(feature = "client")]
         let d_cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)
             .unwrap()
             .len();
-        let ack = Ack::Ok;
-        let ack = postcard::to_stdvec(&ack).unwrap().len();
+        #[cfg(feature = "client")]
+        let ack = postcard::to_stdvec(&Ack::Ok).unwrap().len();
 
+        #[cfg(feature = "server")]
         let auth = postcard::to_stdvec(&Auth(d)).unwrap().len();
         PacketLength {
             hello,
+            #[cfg(feature = "client")]
             ack,
+            #[cfg(feature = "server")]
             auth,
+            #[cfg(feature = "client")]
             c_cmd,
+            #[cfg(feature = "client")]
             d_cmd,
         }
     }
@@ -210,6 +233,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     Ok(hello)
 }
 
+#[cfg(feature = "server")]
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
     let mut buf = vec![0u8; PACKET_LEN.auth];
     conn.read_exact(&mut buf)
@@ -218,6 +242,7 @@ pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resul
     postcard::from_bytes(&buf).with_context(|| "Failed to deserialize auth")
 }
 
+#[cfg(feature = "client")]
 pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
     let mut bytes = vec![0u8; PACKET_LEN.ack];
     conn.read_exact(&mut bytes)
@@ -226,6 +251,7 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
+#[cfg(feature = "client")]
 pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<ControlChannelCmd> {
@@ -236,6 +262,7 @@ pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize control cmd")
 }
 
+#[cfg(feature = "client")]
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
@@ -248,6 +275,7 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

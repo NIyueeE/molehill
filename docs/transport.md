@@ -1,47 +1,54 @@
-# Security
+# Transport
 
-By default, `molehill` forwards traffic as it is. Different options can be enabled to secure the traffic.
+By default, `molehill` forwards traffic as it is (plain TCP). Different `transport` configurations can be enabled to secure the traffic. The `type` of `[client.transport]` and `[server.transport]` must match on both sides.
 
 ## TLS
 
-Checkout the [example](../examples/tls)
+TLS is the drop-in choice when you already have certificates, e.g. from a public CA or Let's Encrypt. See the [example](../examples/tls).
 
 ### Client
 
-Normally, a self-signed certificate is used. In this case, the client needs to trust the CA. `trusted_root` is the path to the root CA's certificate PEM file.
-`hostname` is the hostname that the client used to validate aginst the certificate that the server presents. Note that it does not have to be the same with the `remote_addr` in `[client]`.
+Normally a self-signed certificate is used, in which case the client needs to trust the CA. `trusted_root` is the path to the root CA's certificate PEM file. `hostname` is the hostname that the client uses to validate against the certificate that the server presents; it does not have to be the same as `client.remote_addr`.
 
 ```toml
+[client.transport]
+type = "tls"
+
 [client.transport.tls]
-trusted_root = "example/tls/rootCA.crt"
+trusted_root = "examples/tls/rootCA.crt"
 hostname = "localhost"
 ```
 
+If `trusted_root` is omitted, the system certificate store is used, which works for publicly trusted certificates.
+
 ### Server
 
-PKCS#12 archives are needed to run the server.
-
-It can be created using openssl like:
+A PKCS#12 archive is needed on the server side. It can be created with openssl:
 
 ```sh
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt
 ```
 
-Aruguments are:
+Arguments:
 
-- `-inkey`: Server Private Key
-- `-in`: Server Certificate
-- `-certfile`: CA Certificate
+- `-inkey`: Server private key
+- `-in`: Server certificate
+- `-certfile`: CA certificate
 
-Creating self-signed certificate with one's own CA is a non-trival task. However, a script is provided under tls example folder for reference.
+Creating a self-signed certificate with one's own CA is a non-trivial task; a script is provided in the [tls example folder](../examples/tls) for reference.
 
-### Rustls Support
+```toml
+[server.transport]
+type = "tls"
 
-`molehill` provides optional `rustls` support. [Build Guide](build-guide.md) demostrated this.
+[server.transport.tls]
+pkcs12 = "identity.pfx"
+pkcs12_password = "password"
+```
 
-One difference is that, the crate we use for loading PKCS#12 archives can only handle limited types of PBE algorithms. We only support PKCS#12 archives that they (crate `p12`) support. So we need to specify the legacy format (openssl 1.x format) when creating the PKCS#12 archive.
+### Rustls support
 
-In short, the command used with openssl 3 to create the PKCS#12 archive with `rustls` support is:
+`molehill` provides optional `rustls` support; see the [build guide](build-guide.md). One difference is that the crate used for loading PKCS#12 archives only handles limited types of PBE algorithms, so the archive must be created in the legacy (openssl 1.x) format. With openssl 3, add `-legacy`:
 
 ```sh
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
@@ -49,21 +56,15 @@ openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certf
 
 ## Noise Protocol
 
-### Quickstart for the Noise Protocl
+The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight, easy-to-configure drop-in replacement of TLS: no self-signed certificates are needed to secure the connection.
 
-In one word, the [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweigt, easy to configure and drop-in replacement of TLS. No need to create a self-sign certificate to secure the connection.
+`molehill` comes with a reasonable default configuration; see the minimal [example](../examples/noise_nk). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server (like TLS with properly configured certificates), so MITM is no longer a problem.
 
-`molehill` comes with a reasonable default configuration for noise protocol. You can a glimpse of the minimal [example](../examples/noise_nk) for how it will look like.
+To use it, an X25519 keypair is needed.
 
-The default noise protocol that `molehill` uses, which is `Noise_NK_25519_ChaChaPoly_BLAKE2s`, providing the authentication of the server, just like TLS with properly configured certificates. So MITM is no more a problem.
+### Generate a keypair
 
-To use it, a X25519 keypair is needed.
-
-#### Generate a Keypair
-
-1. Run `molehill --genkey`, which will generate a keypair using the default X25519 algorithm.
-
-It emits:
+Run `molehill --genkey`, which generates a keypair using the default X25519 algorithm (pass `x448` for X448):
 
 ```sh
 $ molehill --genkey
@@ -76,65 +77,82 @@ GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
 
 (WARNING: Don't use the keypair from the Internet, including this one)
 
-2. The server should keep the private key to identify itself. And the client should keep the public key, which is used to verify whether the peer is the authentic server.
-
-So relevant snippets of configuration are:
+The server keeps the private key to identify itself, and the client keeps the public key to verify the server:
 
 ```toml
-# Client Side Configuration
+# Client side
 [client.transport]
 type = "noise"
 [client.transport.noise]
 remote_public_key = "GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE="
 
-# Server Side Configuration
+# Server side
 [server.transport]
 type = "noise"
 [server.transport.noise]
 local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 ```
 
-Then `molehill` will run under the protection of the Noise Protocol.
+### Specifying the pattern
 
-## Specifying the Pattern of Noise Protocol
+The default pattern satisfies most use cases, but other patterns can be useful:
 
-The default configuration of Noise Protocol that comes with `molehill` satifies most use cases, which is described above. But there're other patterns that can be useful.
-
-### No Authentication
-
-This configuration provides encryption of the traffic but provides no authentication, which means it's vulnerable to MITM attack, but is resistent to the sniffing and replay attack. If MITM attack is not one of the concerns, this is more convenient to use.
+**No authentication** (`Noise_XX_...`): encrypts traffic but provides no authentication, so it is vulnerable to MITM attacks while resisting sniffing and replay attacks. Use it when MITM is not a concern:
 
 ```toml
-# Server Side Configuration
 [server.transport.noise]
 pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
 
-# Client Side Configuration
 [client.transport.noise]
 pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
 ```
 
-### Bidirectional Authentication
+**Bidirectional authentication** (`Noise_KK_...`): both sides authenticate each other:
 
 ```toml
-# Server Side Configuration
 [server.transport.noise]
 pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "server-priv-key-here"
 remote_public_key = "client-pub-key-here"
 
-# Client Side Configuration
 [client.transport.noise]
 pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
 local_private_key = "client-priv-key-here"
 remote_public_key = "server-pub-key-here"
 ```
 
-### Other Patterns
+### Pre-shared keys
+
+`psk` and `psk_location` add a pre-shared key to the handshake. The pattern must include a PSK modifier (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`), the key must be 32 bytes base64-encoded, and both sides must use the same `psk` and `psk_location`:
+
+```toml
+[server.transport.noise]
+pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "server-priv-key-here"
+remote_public_key = "client-pub-key-here"
+psk = "the-same-32-byte-key-in-base64"
+psk_location = 0
+
+[client.transport.noise]
+pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
+local_private_key = "client-priv-key-here"
+remote_public_key = "server-pub-key-here"
+psk = "the-same-32-byte-key-in-base64"
+psk_location = 0
+```
+
+### Other patterns
 
 To find out which pattern to use, refer to:
 
 - [7.5. Interactive handshake patterns (fundamental)](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
 - [8. Protocol names and modifiers](https://noiseprotocol.org/noise.html#protocol-names-and-modifiers)
 
-Note that PSKs are not supported currently. Free to open an issue if you need it.
+## WebSocket
+
+The `websocket` transport tunnels the molehill protocol over WebSocket, which can help when only HTTP(S) traffic is allowed. Set `type = "websocket"` on both sides and configure the block:
+
+```toml
+[client.transport.websocket] # or [server.transport.websocket]
+tls = true # Necessary. TLS on the WebSocket connection (uses the TLS settings above); set to false for plain WebSocket
+```

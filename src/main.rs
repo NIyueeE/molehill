@@ -1,8 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use molehill_rathole::{Cli, run};
+#[cfg(not(feature = "console"))]
 use std::io::IsTerminal;
 use tokio::{signal, sync::broadcast};
+use tracing::{debug, info};
+#[cfg(not(feature = "console"))]
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -13,13 +16,15 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
             // Something really weird happened. So just panic
-            panic!("Failed to listen for the ctrl-c signal: {:?}", e);
+            eprintln!("Failed to listen for the ctrl-c signal: {:?}", e);
+            std::process::exit(1);
         }
 
         if let Err(e) = shutdown_tx.send(true) {
             // shutdown signal must be catched and handle properly
             // `rx` must not be dropped
-            panic!("Failed to send shutdown signal: {:?}", e);
+            eprintln!("Failed to send shutdown signal: {:?}", e);
+            std::process::exit(1);
         }
     });
 
@@ -38,9 +43,21 @@ async fn main() -> Result<()> {
             .with_env_filter(
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
             )
+            .with_timer(tracing_subscriber::fmt::time::SystemTime)
             .with_ansi(is_atty)
             .init();
     }
+
+    info!(
+        "molehill v{} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_DESCRIBE").unwrap_or("no-git-info"),
+        option_env!("VERGEN_CARGO_TARGET_TRIPLE").unwrap_or("unknown-target"),
+    );
+    debug!(
+        "Built with features: {}",
+        option_env!("VERGEN_CARGO_FEATURES").unwrap_or("none")
+    );
 
     run(args, shutdown_rx).await
 }

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-05
+
+### Added
+
+- Strict lint rules in `Cargo.toml`: `unwrap_used`, `expect_used`, `panic`, `dbg_macro`, and `undocumented_unsafe_blocks` are denied; `unsafe_code` is warned
+- Complete configuration example covering every option in `examples/full/`
+- Container deployment examples (Docker/Podman Compose and Podman Quadlet) in `examples/container/`
+- Startup log banner with version, git describe, and target triple; timestamps on log lines
+- Detailed usage guide, usage notes, and troubleshooting section in `docs/configuration.md`
+
+### Changed
+
+- Container image is now assembled from the release build's static musl binaries on a `scratch` base (~8 MiB) instead of compiling inside the builder stage
+- x86_64/aarch64 musl release artifacts now build with the full rustls feature set (static, OpenSSL-free)
+- CI updated to `actions/checkout@v7` and the `stable` toolchain
+- Client logs show the service name and remote address instead of a hex digest
+- `docs/transport.md` and `docs/internals.md` rewritten to match the current implementation (Noise PSK, connection pooling, heartbeat, hot reload)
+- README restructured with a Deployment section and a documentation index; `README.zh.md` synced to the new structure
+- Updated dependencies (anyhow, vergen, tokio, clap, openssl, etc.)
+
+### Fixed
+
+- Config validation now rejects proxies without host/port and `remote_addr` without a port at startup instead of panicking at runtime
+- UDP packet headers declaring a length above the receive buffer are rejected instead of causing oversized allocations
+- TCP and UDP integration tests no longer share exposed ports, eliminating flaky parallel test failures
+- Release packages now include the Chinese README (`README.zh.md` instead of the non-existent `README-zh.md`)
+- Expired TLS test certificates regenerated
+- Removed regenerable TLS key files from the repository (kept in `.gitignore`)
+- Log message typos (`Shutting down gracefully`, `identity`)
+
 ## [0.6.2] - 2026-05-02
 
 ### Added

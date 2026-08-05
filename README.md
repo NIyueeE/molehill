@@ -18,7 +18,7 @@
 
 <p align="center">A community-maintained fork of <a href="https://github.com/rapiz1/rathole">rathole</a>.</p>
 
-[English](README.md) | [简体中文](README-zh.md)
+[English](README.md) | [简体中文](README.zh.md)
 
 molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
 
@@ -27,9 +27,12 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - [molehill](#molehill)
   - [Features](#features)
   - [Quickstart](#quickstart)
+  - [Deployment](#deployment)
+    - [Binary](#binary)
+    - [systemd](#systemd)
+    - [Container](#container)
   - [Configuration](#configuration)
-    - [Logging](#logging)
-    - [Tuning](#tuning)
+  - [Documentation](#documentation)
   - [Planning](#planning)
 
 <!-- /TOC -->
@@ -95,116 +98,62 @@ Then run:
 
 So you can `ssh myserver.com:5202` to ssh to your NAS.
 
-To run `molehill` run as a background service on Linux, checkout the [systemd examples](./examples/systemd).
+To run `molehill` as a background service on Linux, checkout the
+[systemd examples](./examples/systemd) or the
+[container examples](./examples/container).
 
 ## Configuration
 
-`molehill` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in [Quickstart](#quickstart).
+`molehill` determines the running mode (server/client) from the config file
+automatically, or you can force it with `--server` / `--client`. The full
+configuration specification, logging and tuning options are documented in
+[Configuration](./docs/configuration.md). [Example configs](./examples) for
+various scenarios are also available.
 
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `molehill --server config.toml` and on the client side, run `molehill --client config.toml` to explicitly tell `molehill` the running mode.
+## Deployment
 
-Before heading to the full configuration specification, it's recommend to skim [the configuration examples](./examples) to get a feeling of the configuration format.
+### Binary
 
-See [Transport](./docs/transport.md) for more details about encryption and the `transport` block.
+Download a pre-built binary for your platform from the
+[release page](https://github.com/NIyueeE/molehill/releases), or
+[build from source](./docs/build-guide.md) for other platforms and
+minimal-sized binaries.
 
-Here is the full configuration specification:
-
-```toml
-[client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
-heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
-prefer_ipv6 = false # Optional. Prefer IPv6 when resolving remote addresses. Default: false
-
-[client.transport] # The whole block is optional. Specify which transport to use
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
-
-[client.transport.tcp] # Optional. TCP socket options (also apply to `tls` and `noise` transports)
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. The proxy used to connect to the server. `http` and `socks5` is supported.
-nodelay = true # Optional. Determine whether to enable TCP_NODELAY, if applicable, to improve the latency but decrease the bandwidth. Default: true
-keepalive_secs = 20 # Optional. Specify `tcp_keepalive_time` in `tcp(7)`, if applicable. Default: 20 seconds
-keepalive_interval = 8 # Optional. Specify `tcp_keepalive_intvl` in `tcp(7)`, if applicable. Default: 8 seconds
-
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
-
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `client.transport.tls`). Set to `false` for plain WebSocket.
-
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
-prefer_ipv6 = false # Optional. Override the `client.prefer_ipv6` per service
-
-[client.services.service2] # Multiple services can be defined
-local_addr = "127.0.0.1:1082"
-
-[server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
-
-[server.transport] # Same as `[client.transport]`
-type = "tcp"
-
-[server.transport.tcp] # Same as the client
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identity.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
-
-[server.transport.noise] # Same as `[client.transport.noise]`
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `server.transport.tls`). Set to `false` for plain WebSocket.
-
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]`
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
-
-[server.services.service2]
-bind_addr = "0.0.0.1:8082"
+```bash
+./molehill server.toml   # on the public server
+./molehill client.toml   # on the device behind NAT
 ```
 
-### Logging
+### systemd
 
-`molehill`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
+The [systemd examples](./examples/systemd) show how to run molehill as a
+systemd service, both as root and rootless, including multiple instances.
 
-```shell
-RUST_LOG=error ./molehill config.toml
+### Container
+
+Official multi-arch images (linux/amd64, linux/arm64) are published to
+`ghcr.io/niyueee/molehill`. The image is a single static musl binary on
+`scratch` (~8 MiB), runs as non-root UID 1000, and bundles CA certificates
+for TLS verification.
+
+```bash
+docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
+  ghcr.io/niyueee/molehill:latest server.toml
 ```
 
-will run `molehill` with only error level logging.
+The image contains no configuration — mount your config file and pass its
+name as the argument. See the [container examples](./examples/container)
+for Docker Compose (`compose.yaml` / `compose.bridge.yaml`) and Podman
+Quadlet (`molehill-server.container` / `molehill-client.container`)
+deployments.
 
-If `RUST_LOG` is not present, the default logging level is `info`.
+## Documentation
 
-### Tuning
-
-From v0.4.7, molehill enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
-
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
+- [Configuration](./docs/configuration.md) — full configuration specification, logging, tuning
+- [Transport](./docs/transport.md) — TLS and Noise Protocol setup
+- [Build guide](./docs/build-guide.md) — build customization, rustls support, minimal binary
+- [Internals](./docs/internals.md) — how control/data channels work
+- [Examples](./examples) — configs for common scenarios
 
 ## Planning
 

@@ -1,13 +1,22 @@
-use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "server")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
+#[cfg(feature = "server")]
 use backon::Retryable;
 use socket2::{SockRef, TcpKeepalive};
-use std::{future::Future, net::SocketAddr, time::Duration};
+#[cfg(feature = "server")]
+use std::future::Future;
+#[cfg(feature = "client")]
+use std::net::SocketAddr;
+use std::time::Duration;
+#[cfg(feature = "server")]
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::{
-    net::{TcpStream, ToSocketAddrs, UdpSocket, lookup_host},
-    sync::broadcast,
-};
+use tokio::net::TcpStream;
+#[cfg(feature = "client")]
+use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
+#[cfg(feature = "server")]
+use tokio::sync::broadcast;
 use tracing::trace;
 use url::Url;
 
@@ -36,20 +45,23 @@ pub fn try_set_tcp_keepalive(
 
 #[allow(dead_code)]
 pub fn feature_not_compile(feature: &str) -> ! {
-    panic!(
+    eprintln!(
         "The feature '{}' is not compiled in this binary. Please re-compile molehill",
         feature
-    )
+    );
+    std::process::exit(1);
 }
 
 #[allow(dead_code)]
 pub fn feature_neither_compile(feature1: &str, feature2: &str) -> ! {
-    panic!(
+    eprintln!(
         "Neither of the feature '{}' or '{}' is compiled in this binary. Please re-compile molehill",
         feature1, feature2
-    )
+    );
+    std::process::exit(1);
 }
 
+#[cfg(feature = "client")]
 pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
     lookup_host(addr)
         .await?
@@ -58,10 +70,13 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
 }
 
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
-    let semi = s.rfind(':').expect("missing semicolon");
+    let semi = s
+        .rfind(':')
+        .ok_or_else(|| anyhow!("Address is missing the port: {}", s))?;
     Ok((&s[..semi], s[semi + 1..].parse()?))
 }
 
+#[cfg(feature = "client")]
 /// Create a UDP socket and connect to `addr`
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
     let (socket_addr, bind_addr);
@@ -100,7 +115,6 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
     };
     let s = UdpSocket::bind(bind_addr).await?;
     s.connect(socket_addr).await?;
-    s.connect(socket_addr).await?;
     Ok(s)
 }
 
@@ -112,11 +126,13 @@ pub async fn tcp_connect_with_proxy(
 ) -> Result<TcpStream> {
     if let Some(url) = proxy {
         let addr = &addr.addr;
-        let mut s = TcpStream::connect((
-            url.host_str().expect("proxy url should have host field"),
-            url.port().expect("proxy url should have port field"),
-        ))
-        .await?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("Proxy URL is missing the host: {}", url))?;
+        let port = url
+            .port()
+            .ok_or_else(|| anyhow!("Proxy URL is missing the port: {}", url))?;
+        let mut s = TcpStream::connect((host, port)).await?;
 
         let auth = if !url.username().is_empty() || url.password().is_some() {
             Some(async_socks5::Auth {
@@ -146,7 +162,7 @@ pub async fn tcp_connect_with_proxy(
                     None => http_connect_tokio(&mut s, host, port).await?,
                 }
             }
-            _ => panic!("unknown proxy scheme"),
+            scheme => return Err(anyhow!("Unknown proxy scheme: {}", scheme)),
         }
         Ok(s)
     } else {
@@ -158,6 +174,7 @@ pub async fn tcp_connect_with_proxy(
 }
 
 // Wrapper of retry with shutdown deadline
+#[cfg(feature = "server")]
 pub async fn retry_notify_with_deadline<I, E, Op, Fut, B, N>(
     backoff: B,
     operation: Op,
@@ -181,6 +198,7 @@ where
     }
 }
 
+#[cfg(feature = "server")]
 pub async fn write_and_flush<T>(conn: &mut T, data: &[u8]) -> Result<()>
 where
     T: AsyncWrite + Unpin,

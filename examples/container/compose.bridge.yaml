@@ -1,0 +1,35 @@
+# Bridge-network variant of compose.yaml.
+#
+# Use this when host networking is not available (e.g. Docker Desktop on
+# macOS/Windows). The server's ports are published explicitly.
+#
+# Note: with bridge networking the client reaches the server through the
+# compose network DNS name, so set `remote_addr = "molehill-server:2333"`
+# in client.toml instead of a public hostname.
+#
+# Usage:
+#   docker compose -f compose.bridge.yaml up -d
+
+services:
+  molehill-server:
+    image: ghcr.io/niyueee/molehill:latest
+    container_name: molehill-server
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ./server.toml:/app/server.toml:ro
+    command: server.toml
+    ports:
+      - "2333:2333" # Control channel (clients connect here)
+      - "5202:5202" # Exposed SSH service
+
+  molehill-client:
+    image: ghcr.io/niyueee/molehill:latest
+    container_name: molehill-client
+    restart: unless-stopped
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ./client.toml:/app/client.toml:ro
+    command: client.toml

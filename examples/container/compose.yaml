@@ -1,0 +1,35 @@
+# molehill container deployment with Docker Compose or Podman Compose.
+#
+# Usage:
+#   docker compose up -d        (or: podman compose up -d)
+#
+# The image does not bundle any configuration: the *.toml files in this
+# directory are mounted read-only into the containers.
+#
+# Host networking is used because the server must expose arbitrary service
+# ports (e.g. 5202) and the client only dials out. This works on Linux with
+# both Docker and Podman. For bridge networking (e.g. Docker Desktop),
+# see compose.bridge.yaml.
+
+services:
+  molehill-server:
+    image: ghcr.io/niyueee/molehill:latest
+    container_name: molehill-server
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ./server.toml:/app/server.toml:ro
+    command: server.toml
+
+  molehill-client:
+    image: ghcr.io/niyueee/molehill:latest
+    container_name: molehill-client
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ./client.toml:/app/client.toml:ro
+    command: client.toml

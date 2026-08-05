@@ -1,0 +1,11 @@
+[client]
+remote_addr = "example.com:2333"
+default_token = "123"
+
+[client.transport]
+type = "tcp"
+[client.transport.tcp]
+proxy = "socks5://127.0.0.1"
+
+[client.services.foo]
+local_addr = "127.0.0.1:80"

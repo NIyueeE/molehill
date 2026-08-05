@@ -11,3 +11,8 @@ check:
   cargo audit
   cargo outdated --root-deps-only
   cargo machete
+
+# 启用 pre-commit 钩子（首次克隆后执行一次）
+init-hooks:
+    git config core.hooksPath .githooks
+    

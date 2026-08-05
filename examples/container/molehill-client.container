@@ -1,0 +1,33 @@
+# Podman Quadlet: run the molehill client as a systemd service.
+#
+# Root install:
+#   sudo cp molehill-client.container /etc/containers/systemd/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now molehill-client
+#
+# Rootless install (change WantedBy= to default.target):
+#   mkdir -p ~/.config/containers/systemd
+#   cp molehill-client.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now molehill-client
+
+[Unit]
+Description=Molehill client (container)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/niyueee/molehill:latest
+# Host path of the config file; mounted read-only.
+Volume=/etc/molehill/client.toml:/app/client.toml:ro
+# Host networking lets the client reach the public server directly.
+Network=host
+Environment=RUST_LOG=info
+# Argument passed to the image entrypoint (./molehill).
+Exec=client.toml
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

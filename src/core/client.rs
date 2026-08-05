@@ -1,10 +1,12 @@
 use crate::common::helper::udp_connect;
+#[cfg(feature = "notify")]
+use crate::config::ClientServiceChange;
+use crate::config::ConfigChange;
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
-use crate::config::{ClientServiceChange, ConfigChange};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
-    UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
+    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, UdpTraffic,
+    read_ack, read_control_cmd, read_data_cmd, read_hello,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -151,6 +153,7 @@ impl<T: 'static + Transport> Client<T> {
 
     async fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
+            #[cfg(feature = "notify")]
             ConfigChange::ClientChange(client_change) => match client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
@@ -192,7 +195,7 @@ async fn do_data_channel_handshake<T: Transport>(
         args.connector
             .connect(&args.remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+            .with_context(|| format!("Failed to connect to {}", args.remote_addr))
     })
     .retry(backoff)
     .notify(|e: &anyhow::Error, duration| {
@@ -203,10 +206,8 @@ async fn do_data_channel_handshake<T: Transport>(
     T::hint(&conn, args.socket_opts);
 
     // Send nonce
-    let v: &[u8; HASH_WIDTH_IN_BYTES] = args.session_key[..].try_into().unwrap();
-    let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, v.to_owned());
-    conn.write_all(&postcard::to_stdvec(&hello).unwrap())
-        .await?;
+    let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, args.session_key);
+    conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
 
     Ok(conn)
@@ -414,15 +415,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
             .transport
             .connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
 
         // Send hello
         debug!("Sending hello");
-        let hello_send =
-            Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest[..].try_into().unwrap());
-        conn.write_all(&postcard::to_stdvec(&hello_send).unwrap())
-            .await?;
+        let hello_send = Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest);
+        conn.write_all(&postcard::to_stdvec(&hello_send)?).await?;
         conn.flush().await?;
 
         // Read hello
@@ -436,12 +435,17 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
         // Send auth
         debug!("Sending auth");
-        let mut concat = Vec::from(self.service.token.as_ref().unwrap().as_bytes());
+        let token = self
+            .service
+            .token
+            .as_ref()
+            .ok_or_else(|| anyhow!("Service {} has no token", self.service.name))?;
+        let mut concat = Vec::from(token.as_bytes());
         concat.extend_from_slice(&nonce);
 
         let session_key = protocol::digest(&concat);
         let auth = Auth(session_key);
-        conn.write_all(&postcard::to_stdvec(&auth).unwrap()).await?;
+        conn.write_all(&postcard::to_stdvec(&auth)?).await?;
         conn.flush().await?;
 
         // Read ack
@@ -455,7 +459,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         }
 
         // Channel ready
-        info!("Control channel established");
+        info!("Control channel established, remote {}", self.remote_addr);
 
         // Socket options for the data channel
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
@@ -485,7 +489,10 @@ impl<T: 'static + Transport> ControlChannel<T> {
                     }
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
-                    return Err(anyhow!("Heartbeat timed out"))
+                    return Err(anyhow!(
+                        "Heartbeat timed out after {} seconds",
+                        self.heartbeat_timeout
+                    ))
                 }
                 _ = &mut self.shutdown_rx => {
                     break;
@@ -508,10 +515,12 @@ impl ControlChannelHandle {
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
-        info!("Starting {}", hex::encode(digest));
+        info!("Starting service {}", service.name);
+        debug!("Service digest: {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let backoff_builder = run_control_chan_backoff(service.retry_interval.unwrap());
+        // Config validation fills `retry_interval` from the global default
+        let backoff_builder = run_control_chan_backoff(service.retry_interval.unwrap_or(1));
         let mut retry_backoff = backoff_builder.build();
 
         let mut s = ControlChannel {
@@ -545,8 +554,10 @@ impl ControlChannelHandle {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
                     } else {
-                        // Should never reach
-                        panic!("{:#}. Break", err);
+                        // Should never be reached with the current backoff policy,
+                        // but keep the channel alive instead of panicking.
+                        warn!("{:#}. Backoff exhausted, retrying in 1s", err);
+                        time::sleep(Duration::from_secs(1)).await;
                     }
 
                     start = Instant::now();

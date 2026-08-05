@@ -1,5 +1,11 @@
-use crate::common::helper::{to_socket_addr, try_set_tcp_keepalive};
-use crate::config::{ClientServiceConfig, ServerServiceConfig, TcpConfig, TransportConfig};
+#[cfg(feature = "client")]
+use crate::common::helper::to_socket_addr;
+use crate::common::helper::try_set_tcp_keepalive;
+#[cfg(feature = "client")]
+use crate::config::ClientServiceConfig;
+#[cfg(feature = "server")]
+use crate::config::ServerServiceConfig;
+use crate::config::{TcpConfig, TransportConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::fmt::{Debug, Display};
@@ -21,6 +27,7 @@ pub struct AddrMaybeCached {
 }
 
 impl AddrMaybeCached {
+    #[cfg(feature = "client")]
     pub fn new(addr: &str) -> AddrMaybeCached {
         AddrMaybeCached {
             addr: addr.to_string(),
@@ -28,6 +35,7 @@ impl AddrMaybeCached {
         }
     }
 
+    #[cfg(feature = "client")]
     pub async fn resolve(&mut self) -> Result<()> {
         match to_socket_addr(&self.addr).await {
             Ok(s) => {
@@ -60,10 +68,14 @@ pub trait Transport: Debug + Send + Sync {
         Self: Sized;
     /// Provide the transport with socket options, which can be handled at the need of the transport
     fn hint(conn: &Self::Stream, opts: SocketOpts);
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor>;
     /// accept must be cancel safe
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream>;
 }
 
@@ -139,6 +151,7 @@ impl SocketOpts {
         }
     }
 
+    #[cfg(feature = "client")]
     pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
         SocketOpts {
             nodelay: cfg.nodelay,
@@ -146,6 +159,7 @@ impl SocketOpts {
         }
     }
 
+    #[cfg(feature = "server")]
     pub fn from_server_cfg(cfg: &ServerServiceConfig) -> SocketOpts {
         SocketOpts {
             nodelay: cfg.nodelay,

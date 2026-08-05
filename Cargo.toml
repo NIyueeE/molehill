@@ -1,6 +1,6 @@
 [package]
 name = "molehill-rathole"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2024"
 authors = ["niyue <n1yu3@proton.me>"]
 description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok. Fork of https://github.com/rathole-org/rathole"
@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/NIyueeE/molehill"
 readme = "README.md"
 build = "build.rs"
-include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
+include = ["src/**/*", "tests/**", "LICENSE", "README.md", "build.rs"]
 
 [[bin]]
 name = "molehill"
@@ -130,6 +130,22 @@ p12 = { version = "0.6.3", optional = true }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [build-dependencies]
-vergen = { version = "10.0.0-beta.8", default-features = false, features = ["build", "cargo"] }
-vergen-gitcl = { version = "10.0.0-beta.8", default-features = false, features = ["build", "cargo"] }
+vergen = { version = "10.0.2", default-features = false, features = ["build", "cargo"] }
+vergen-gitcl = { version = "10.0.2", default-features = false, features = ["build", "cargo"] }
 anyhow = "1.0"
+
+[lints.rust]
+# Confine unsafe code to the audited module that opts in explicitly
+unsafe_code = "warn"
+# cross's musl linker wrapper prints trace output to stderr; real linker
+# errors still fail the build
+linker_messages = "allow"
+
+[lints.clippy]
+# No panics or debug leftovers in production code; every unsafe block must
+# carry a SAFETY comment
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"

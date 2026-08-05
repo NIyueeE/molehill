@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(feature = "client", feature = "server")),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
+
 mod cli;
 mod common;
 mod config;
@@ -10,7 +15,7 @@ use cli::KeypairType;
 pub use common::constants::UDP_BUFFER_SIZE;
 pub use config::Config;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
@@ -22,8 +27,10 @@ use core::run_server;
 
 use crate::config::{ConfigChange, ConfigWatcherHandle};
 
+#[cfg(feature = "noise")]
 const DEFAULT_CURVE: KeypairType = KeypairType::X25519;
 
+#[cfg(feature = "noise")]
 fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
     match curve {
         KeypairType::X25519 => "25519",
@@ -56,7 +63,7 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 }
 
 #[cfg(not(feature = "noise"))]
-fn genkey(curve: Option<KeypairType>) -> Result<()> {
+fn genkey(_curve: Option<KeypairType>) -> Result<()> {
     crate::common::helper::feature_not_compile("nosie")
 }
 
@@ -69,7 +76,11 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     let _ = fdlimit::raise_fd_limit();
 
     // Spawn a config watcher. The watcher will send a initial signal to start the instance with a config
-    let config_path = args.config_path.as_ref().unwrap();
+    let config_path = args
+        .config_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing config path"))?;
+    info!("Using config {}", config_path.display());
     let mut cfg_watcher = ConfigWatcherHandle::new(config_path, shutdown_rx).await?;
 
     // shutdown_tx owns the instance
@@ -101,6 +112,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                     service_update_tx,
                 ));
             }
+            #[cfg(feature = "notify")]
             ev => {
                 info!("Service change detected. {:?}", ev);
                 if let Some((_, service_update_tx)) = &last_instance {
@@ -122,14 +134,16 @@ async fn run_instance(
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
-        RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
+        RunMode::Undetermine => Err(anyhow!("Cannot determine running as a server or a client")),
         RunMode::Client => {
+            info!("Running as a client");
             #[cfg(not(feature = "client"))]
             crate::common::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
             run_client(config, shutdown_rx, service_update).await
         }
         RunMode::Server => {
+            info!("Running as a server");
             #[cfg(not(feature = "server"))]
             crate::common::helper::feature_not_compile("server");
             #[cfg(feature = "server")]
@@ -164,6 +178,7 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
 
     #[test]

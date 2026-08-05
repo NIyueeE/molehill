@@ -1,3 +1,8 @@
+// This module is the only place in the codebase that uses unsafe code:
+// raw pointers provide shared ownership of heap-allocated items between two
+// hash maps. Every unsafe block below carries a SAFETY comment.
+#![allow(unsafe_code)]
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -16,6 +21,7 @@ struct RawItem<K1, K2, V>(*mut (K1, K2, V));
 // SAFETY: `RawItem` only gives out shared/mutable references to the inner
 // tuple, and access is serialized through `&self` / `&mut self` on `MultiMap`.
 unsafe impl<K1, K2, V> Send for RawItem<K1, K2, V> {}
+// SAFETY: See above — all access to the inner tuple goes through `MultiMap`.
 unsafe impl<K1, K2, V> Sync for RawItem<K1, K2, V> {}
 
 /// MultiMap is a hash map that can index an item by two keys
@@ -39,6 +45,7 @@ struct Key<T>(*const T);
 // pointee is the heap-allocated item owned by the map itself. Access to the
 // map is serialized through `&self` / `&mut self`.
 unsafe impl<T> Send for Key<T> {}
+// SAFETY: See above — `Key` is never shared outside `MultiMap`.
 unsafe impl<T> Sync for Key<T> {}
 
 impl<T> Borrow<T> for Key<T> {

@@ -1,0 +1,44 @@
+# Complete client configuration example.
+# Every option is documented in docs/configuration.md.
+
+[client]
+remote_addr = "myserver.com:2333" # Necessary. The address of the server
+default_token = "default_token_if_not_specify" # Optional. Default token for services without their own
+heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. Must be greater than `server.heartbeat_interval`. Default: 40 seconds
+retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
+prefer_ipv6 = false # Optional. Prefer IPv6 when resolving remote addresses. Default: false
+
+[client.transport] # Optional. The whole block is optional
+type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
+
+[client.transport.tcp] # Optional. TCP socket options (also apply to `tls` and `noise`)
+proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect to the server via a proxy. `socks5` and `http` are supported
+nodelay = true # Optional. TCP_NODELAY. Default: true
+keepalive_secs = 20 # Optional. `tcp_keepalive_time` in `tcp(7)`. Default: 20 seconds
+keepalive_interval = 8 # Optional. `tcp_keepalive_intvl` in `tcp(7)`. Default: 8 seconds
+
+[client.transport.tls] # Necessary only if `type` is "tls"
+trusted_root = "ca.pem" # The CA that signed the server's certificate
+hostname = "example.com" # Optional. Certificate hostname; falls back to `client.remote_addr`
+
+[client.transport.noise] # Necessary only if `type` is "noise". See docs/transport.md
+pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
+local_private_key = "key_encoded_in_base64" # Optional
+remote_public_key = "key_encoded_in_base64" # Optional
+psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+
+[client.transport.websocket] # Necessary only if `type` is "websocket"
+tls = true # Necessary. Enable TLS on the WebSocket connection (uses `client.transport.tls`); set to false for plain WebSocket
+
+[client.services.ssh] # A service to forward. The name must match the server side
+type = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
+token = "whatever" # Necessary if `client.default_token` is not set
+local_addr = "127.0.0.1:22" # Necessary. The address of the local service
+nodelay = true # Optional. Override `client.transport.nodelay` per service
+retry_interval = 1 # Optional. Override the global `client.retry_interval` per service
+prefer_ipv6 = false # Optional. Override `client.prefer_ipv6` per service
+
+[client.services.dns] # A UDP service example
+type = "udp"
+local_addr = "127.0.0.1:53"

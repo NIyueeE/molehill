@@ -1,8 +1,10 @@
 use crate::common::constants::{UDP_BUFFER_SIZE, listen_backoff};
 use crate::common::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::common::multi_map::MultiMap;
+use crate::config::ConfigChange;
+#[cfg(feature = "notify")]
+use crate::config::ServerServiceChange;
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
-use crate::config::{ConfigChange, ServerServiceChange};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic,
@@ -207,7 +209,7 @@ impl<T: 'static + Transport> Server<T> {
                 },
                 // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
-                    info!("Shuting down gracefully...");
+                    info!("Shutting down gracefully...");
                     break;
                 },
                 e = update_rx.recv() => {
@@ -225,6 +227,7 @@ impl<T: 'static + Transport> Server<T> {
 
     async fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
+            #[cfg(feature = "notify")]
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
                     let hash = protocol::digest(cfg.name.as_bytes());
@@ -286,24 +289,20 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     T::hint(&conn, SocketOpts::for_control_channel());
 
     // Generate a nonce
-    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
+    let mut nonce = [0u8; HASH_WIDTH_IN_BYTES];
     let mut rng = rand::rngs::SysRng;
     rng.try_fill_bytes(&mut nonce)?;
 
     // Send hello
-    let hello_send = Hello::ControlChannelHello(
-        protocol::CURRENT_PROTO_VERSION,
-        nonce.clone().try_into().unwrap(),
-    );
-    conn.write_all(&postcard::to_stdvec(&hello_send).unwrap())
-        .await?;
+    let hello_send = Hello::ControlChannelHello(protocol::CURRENT_PROTO_VERSION, nonce);
+    conn.write_all(&postcard::to_stdvec(&hello_send)?).await?;
     conn.flush().await?;
 
     // Lookup the service
     let service_config = match services.read().await.get(&service_digest) {
         Some(v) => v,
         None => {
-            conn.write_all(&postcard::to_stdvec(&Ack::ServiceNotExist).unwrap())
+            conn.write_all(&postcard::to_stdvec(&Ack::ServiceNotExist)?)
                 .await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
@@ -313,8 +312,12 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let service_name = &service_config.name;
 
     // Calculate the checksum
-    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
-    concat.append(&mut nonce);
+    let token = service_config
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow!("Service {} has no token", service_name))?;
+    let mut concat = Vec::from(token.as_bytes());
+    concat.extend_from_slice(&nonce);
 
     // Read auth
     let protocol::Auth(d) = read_auth(&mut conn).await?;
@@ -322,7 +325,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     // Validate
     let session_key = protocol::digest(&concat);
     if session_key != d {
-        conn.write_all(&postcard::to_stdvec(&Ack::AuthFailed).unwrap())
+        conn.write_all(&postcard::to_stdvec(&Ack::AuthFailed)?)
             .await?;
         debug!(
             "Expect {}, but got {}",
@@ -345,8 +348,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         }
 
         // Send ack
-        conn.write_all(&postcard::to_stdvec(&Ack::Ok).unwrap())
-            .await?;
+        conn.write_all(&postcard::to_stdvec(&Ack::Ok)?).await?;
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
@@ -508,8 +510,8 @@ impl<T: Transport> ControlChannel<T> {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel).unwrap();
-        let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat).unwrap();
+        let create_ch_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)?;
+        let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -634,7 +636,7 @@ async fn run_tcp_connection_pool<T: Transport>(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
-    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp).unwrap();
+    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)?;
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
         loop {
@@ -682,7 +684,7 @@ async fn run_udp_connection_pool<T: Transport>(
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp).unwrap();
+    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp)?;
 
     let mut set = tokio::task::JoinSet::new();
 

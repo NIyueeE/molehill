@@ -1,0 +1,6 @@
+[server]
+bind_addr = "0.0.0.0:2333" # Port that the server listens for clients
+
+[server.services.my_nas_ssh]
+token = "use_a_secret_that_only_you_know" # Change to a secret that only you know
+bind_addr = "0.0.0.0:5202" # Port that exposes the SSH service to the Internet

@@ -37,13 +37,20 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
     if let Some(pkcs12_path) = config.pkcs12.as_ref() {
         let buf = fs::read(pkcs12_path)?;
         let pfx = PFX::parse(buf.as_slice())?;
-        let pass = config.pkcs12_password.as_ref().unwrap();
+        let pass = config
+            .pkcs12_password
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing `pkcs12_password`"))?;
 
         let certs = pfx.cert_bags(pass)?;
         let keys = pfx.key_bags(pass)?;
 
         let chain: Vec<CertificateDer> = certs.into_iter().map(CertificateDer::from).collect();
-        let key = PrivatePkcs8KeyDer::from(keys.into_iter().next().unwrap());
+        let key = keys
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No private key in the PKCS#12 file"))?;
+        let key = PrivatePkcs8KeyDer::from(key);
 
         Ok(Some(
             ServerConfig::builder()
@@ -65,11 +72,15 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
             eprintln!("Failed to load native certs: no certificates found");
             return Ok(None);
         }
-        result.certs.into_iter().next().unwrap()
+        result
+            .certs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No native certificates found"))?
     };
 
     let mut root_certs = RootCertStore::empty();
-    root_certs.add(cert).unwrap();
+    root_certs.add(cert)?;
 
     Ok(Some(
         ClientConfig::builder()
@@ -91,12 +102,8 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
+        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
+        let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
             tcp,
@@ -125,14 +132,21 @@ impl Transport for TlsTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
-        let conn = self.tls_acceptor.as_ref().unwrap().accept(conn).await?;
+        let acceptor = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| anyhow!("TLS acceptor is not initialized"))?;
+        let conn = acceptor.accept(conn).await?;
         Ok(tokio_rustls::TlsStream::Server(conn))
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let conn = self.tcp.connect(addr).await?;
 
-        let connector = self.connector.as_ref().unwrap();
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| anyhow!("TLS connector is not initialized"))?;
 
         let host_name = self
             .config
@@ -148,6 +162,7 @@ impl Transport for TlsTransport {
     }
 }
 
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
-    &s.get_ref().0
+    s.get_ref().0
 }

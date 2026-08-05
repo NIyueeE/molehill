@@ -23,10 +23,10 @@ jobs:
     name: Pre-release checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95.0"
+          toolchain: "stable"
       - name: Resolve tag
         id: meta
         run: |
@@ -62,22 +62,31 @@ jobs:
             target: x86_64-unknown-linux-musl
             exe: molehill
             cross: false
+            # Full rustls feature set: static musl binary, no OpenSSL.
+            # Used as the linux/amd64 container image artifact.
+            features: server,client,rustls,noise,websocket-rustls,hot-reload
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             exe: molehill
             cross: true
+            # Same feature set as x86_64 musl so the linux/arm64 container
+            # image artifact is feature-consistent with linux/amd64.
+            features: server,client,rustls,noise,websocket-rustls,hot-reload
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             exe: molehill
             cross: true
+            features: embedded
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabihf
             exe: molehill
             cross: true
+            features: embedded
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
             exe: molehill
             cross: true
+            features: embedded
 
           - os: macos-latest
             target: x86_64-apple-darwin
@@ -94,11 +103,10 @@ jobs:
             exe: molehill.exe
             cross: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95.0"
-          profile: minimal
+          toolchain: "stable"
 
       - name: Resolve tag
         id: meta
@@ -126,10 +134,10 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Run tests
         if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose
+        run: cargo test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
       - name: Build release
         if: matrix.cross == false
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
 
       # Cross build
       - name: Install cross
@@ -139,10 +147,10 @@ jobs:
           tool: cross
       - name: Run tests
         if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
+        run: cross test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
       - name: Build release
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
+        run: cross build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
 
       - name: Run UPX
         continue-on-error: true
@@ -160,7 +168,7 @@ jobs:
           name="molehill-${tag}-${{ matrix.target }}"
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$name/"
-          cp LICENSE README.md README-zh.md "$name/" 2>/dev/null || true
+          cp LICENSE README.md README.zh.md "$name/" 2>/dev/null || true
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             powershell -Command "Compress-Archive -Path '$name' -DestinationPath '${name}.zip'"
           else
@@ -181,7 +189,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -228,7 +236,7 @@ jobs:
           draft: true
 
   docker:
-    name: Publish to GHCR
+    name: Publish to GHCR (scratch image from build artifacts)
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
@@ -236,7 +244,24 @@ jobs:
       packages: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Prepare image context
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p img/bin/amd64 img/bin/arm64
+          tar xzf "dist/molehill-${tag}-x86_64-unknown-linux-musl.tar.gz" -C img/bin/amd64 --strip-components=1
+          tar xzf "dist/molehill-${tag}-aarch64-unknown-linux-musl.tar.gz" -C img/bin/arm64 --strip-components=1
+          cp /etc/ssl/certs/ca-certificates.crt img/bin/amd64/
+          cp /etc/ssl/certs/ca-certificates.crt img/bin/arm64/
+          cp Containerfile img/Dockerfile
+          file img/bin/amd64/molehill img/bin/arm64/molehill
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Login to GHCR
@@ -249,6 +274,7 @@ jobs:
         id: docker_build
         uses: docker/build-push-action@v7
         with:
+          context: img
           push: true
           platforms: linux/amd64, linux/arm64
           tags: ghcr.io/niyueee/molehill:latest, ghcr.io/niyueee/molehill:${{ github.ref_name }}
@@ -259,11 +285,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.95.0"
-          profile: minimal
+          toolchain: "stable"
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}

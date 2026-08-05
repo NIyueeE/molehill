@@ -275,6 +275,14 @@ impl Config {
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        // The port is required, e.g. "example.com:2333"
+        if client.remote_addr.rfind(':').is_none() {
+            bail!(
+                "client.remote_addr is missing the port: {}",
+                client.remote_addr
+            );
+        }
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
@@ -295,15 +303,19 @@ impl Config {
     }
 
     fn validate_transport_config(config: &TransportConfig, is_server: bool) -> Result<()> {
-        config
-            .tcp
-            .proxy
-            .as_ref()
-            .map_or(Ok(()), |u| match u.scheme() {
-                "socks5" => Ok(()),
-                "http" => Ok(()),
-                _ => Err(anyhow!(format!("Unknown proxy scheme: {}", u.scheme()))),
-            })?;
+        config.tcp.proxy.as_ref().map_or(Ok(()), |u| {
+            match u.scheme() {
+                "socks5" | "http" => {}
+                scheme => bail!("Unknown proxy scheme: {}", scheme),
+            }
+            if u.host_str().is_none() {
+                bail!("Proxy URL is missing the host: {}", u);
+            }
+            if u.port().is_none() {
+                bail!("Proxy URL is missing the port: {}", u);
+            }
+            Ok(())
+        })?;
         match config.transport_type {
             TransportType::Tcp => Ok(()),
             TransportType::Tls => {
@@ -340,6 +352,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use std::{fs, path::PathBuf};
 
@@ -448,7 +461,10 @@ mod tests {
 
     #[test]
     fn test_validate_client_config() -> Result<()> {
-        let mut cfg = ClientConfig::default();
+        let mut cfg = ClientConfig {
+            remote_addr: "example.com:2333".into(),
+            ..Default::default()
+        };
 
         cfg.services.insert(
             "foo1".into(),

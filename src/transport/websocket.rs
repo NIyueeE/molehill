@@ -26,14 +26,15 @@ use tokio_util::io::StreamReader;
 #[derive(Debug)]
 enum TransportStream {
     Insecure(TcpStream),
-    Secure(TlsStream<TcpStream>),
+    // Boxed: TlsStream is much larger than TcpStream (see clippy::large_enum_variant)
+    Secure(Box<TlsStream<TcpStream>>),
 }
 
 impl TransportStream {
     fn get_tcpstream(&self) -> &TcpStream {
         match self {
             TransportStream::Insecure(s) => s,
-            TransportStream::Secure(s) => get_tcpstream(s),
+            TransportStream::Secure(s) => get_tcpstream(s.as_ref()),
         }
     }
 }
@@ -46,7 +47,7 @@ impl AsyncRead for TransportStream {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_read(cx, buf),
-            TransportStream::Secure(s) => Pin::new(s).poll_read(cx, buf),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -59,14 +60,14 @@ impl AsyncWrite for TransportStream {
     ) -> Poll<Result<usize, std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_write(cx, buf),
-            TransportStream::Secure(s) => Pin::new(s).poll_write(cx, buf),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_flush(cx),
-            TransportStream::Secure(s) => Pin::new(s).poll_flush(cx),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -76,7 +77,7 @@ impl AsyncWrite for TransportStream {
     ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             TransportStream::Insecure(s) => Pin::new(s).poll_shutdown(cx),
-            TransportStream::Secure(s) => Pin::new(s).poll_shutdown(cx),
+            TransportStream::Secure(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -219,7 +220,7 @@ impl Transport for WebsocketTransport {
     async fn handshake(&self, conn: Self::RawStream) -> anyhow::Result<Self::Stream> {
         let tsream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.handshake(conn).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.handshake(conn).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.handshake(conn).await?)),
         };
         let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
@@ -229,14 +230,14 @@ impl Transport for WebsocketTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
-        let u = format!("ws://{}", &addr.addr.as_str());
+        let u = format!("ws://{}", addr.addr.as_str());
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
-            SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
+            SubTransport::Secure(t) => TransportStream::Secure(Box::new(t.connect(addr).await?)),
         };
         let (wsstream, _) = client_async_with_config(&u, tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .map_err(|e| anyhow!("Failed to connect to {}: {}", u, e))?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use anyhow::{Ok, Result};
 use common::{PING, PONG, run_molehill_client};
 use std::time::Duration;
@@ -16,14 +18,20 @@ mod common;
 
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
-const ECHO_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2334";
-const PINGPONG_SERVER_ADDR_EXPOSED: &str = "127.0.0.1:2335";
 const HITTER_NUM: usize = 4;
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
     Tcp,
     Udp,
+}
+
+// The tcp and udp tests run in parallel and must not share exposed ports
+fn exposed_addrs(t: Type) -> (&'static str, &'static str) {
+    match t {
+        Type::Tcp => ("127.0.0.1:2334", "127.0.0.1:2335"),
+        Type::Udp => ("127.0.0.1:2336", "127.0.0.1:2337"),
+    }
 }
 
 fn init() {
@@ -152,11 +160,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     time::sleep(Duration::from_millis(2500)).await; // Wait for the client to retry
 
     info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    echo_hitter(exposed_addrs(t).0, t).await.unwrap();
     info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-        .await
-        .unwrap();
+    pingpong_hitter(exposed_addrs(t).1, t).await.unwrap();
 
     // Simulate the client crash and restart
     info!("shutdown the client");
@@ -173,11 +179,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     time::sleep(Duration::from_secs(1)).await; // Wait for the client to start
 
     info!("echo");
-    echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+    echo_hitter(exposed_addrs(t).0, t).await.unwrap();
     info!("pingpong");
-    pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-        .await
-        .unwrap();
+    pingpong_hitter(exposed_addrs(t).1, t).await.unwrap();
 
     // Simulate the server crash and restart
     info!("shutdown the server");
@@ -200,13 +204,11 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     for _ in 0..HITTER_NUM / 2 {
         v.push(tokio::spawn(async move {
-            echo_hitter(ECHO_SERVER_ADDR_EXPOSED, t).await.unwrap();
+            echo_hitter(exposed_addrs(t).0, t).await.unwrap();
         }));
 
         v.push(tokio::spawn(async move {
-            pingpong_hitter(PINGPONG_SERVER_ADDR_EXPOSED, t)
-                .await
-                .unwrap();
+            pingpong_hitter(exposed_addrs(t).1, t).await.unwrap();
         }));
     }
 

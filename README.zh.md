@@ -18,30 +18,33 @@
 
 <p align="center">[rathole](https://github.com/rapiz1/rathole) 的社区维护 fork 版本。</p>
 
-[English](README.md) | [简体中文](README-zh.md)
+[English](README.md) | [简体中文](README.zh.md)
 
-molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://github.com/inconshreveable/ngrok)，可以让 NAT 后的设备上的服务通过具有公网 IP 的服务器暴露在公网上。
+molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://github.com/inconshreveable/ngrok)，可以将 NAT 后的设备上的服务通过具有公网 IP 的服务器暴露到互联网。
 
 <!-- TOC -->
 
 - [molehill](#molehill)
-  - [Features](#features)
-  - [Quickstart](#quickstart)
-  - [Configuration](#configuration)
-    - [Logging](#logging)
-    - [Tuning](#tuning)
-  - [Planning](#planning)
+  - [特性](#特性)
+  - [快速开始](#快速开始)
+  - [部署](#部署)
+    - [二进制](#二进制)
+    - [systemd](#systemd)
+    - [容器](#容器)
+  - [配置](#配置)
+  - [文档](#文档)
+  - [规划](#规划)
 
 <!-- /TOC -->
 
-## Features
+## 特性
 
 - **高性能** 具有更高的吞吐量，高并发下更稳定。
 - **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
 - **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
 - **热重载** 支持配置文件热重载，动态修改端口转发服务。HTTP API 正在开发中。
 
-## Quickstart
+## 快速开始
 
 一个全功能的 `molehill` 可以从 [release](https://github.com/NIyueeE/molehill/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
 
@@ -61,7 +64,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 bind_addr = "0.0.0.0:2333" # `2333` 配置了服务端监听客户端连接的端口
 
 [server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 用于验证的 token
+token = "use_a_secret_that_only_you_know" # 用于验证客户端身份的 token，改为只有你知道的任意值
 bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网的端口
 ```
 
@@ -71,142 +74,77 @@ bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网
 ./molehill server.toml
 ```
 
-2. 在 NAT 后面的主机（你的 NAS）上
+2. 在 NAT 后面的主机上（你的 NAS）
 
-创建 `client.toml`，内容如下，并根据你的需要进行调整。
+创建 `client.toml`，内容如下，并根据你的需要调整。
 
 ```toml
 # client.toml
 [client]
-remote_addr = "myserver.com:2333" # 服务器的地址。端口必须与 `server.bind_addr` 中的端口相同。
+remote_addr = "myserver.com:2333" # 服务器的地址，端口必须和 `server.bind_addr` 中的端口一致
+
 [client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 必须与服务器相同以通过验证
-local_addr = "127.0.0.1:22" # 需要被转发的服务的地址
+token = "use_a_secret_that_only_you_know" # 必须和服务端一致才能通过验证
+local_addr = "127.0.0.1:22" # 需要被转发的服务地址
 ```
 
-然后运行：
+然后运行:
 
 ```bash
 ./molehill client.toml
 ```
 
-3. 现在 `molehill` 客户端会连接运行在 `myserver.com:2333`的 `molehill` 服务器，任何到 `myserver.com:5202` 的流量将被转发到客户端所在主机的 `22` 端口。
+3. 现在客户端会尝试连接服务器的 `myserver.com:2333`，任何访问 `myserver.com:5202` 的流量都会被转发到客户端的 `22` 端口。
 
-所以你可以 `ssh myserver.com:5202` 来 ssh 到你的 NAS。
+这样你就可以通过 `ssh myserver.com:5202` 来 ssh 到你的 NAS。
 
-[Systemd examples](./examples/systemd) 中提供了一些让 `molehill` 在 Linux 上作为后台服务运行的配置示例。
+如果想在 Linux 上把 `molehill` 作为后台服务运行，可以参考
+[systemd 示例](./examples/systemd) 或
+[容器示例](./examples/container)。
 
-## Configuration
+## 配置
 
-如果只有一个 `[server]` 和 `[client]` 块存在的话，`molehill` 可以根据配置文件的内容自动决定在服务器模式或客户端模式下运行，就像 [Quickstart](#quickstart) 中的例子。
+`molehill` 会根据配置文件自动判断运行模式（server/client），也可以通过 `--server` / `--client` 强制指定。完整的配置规范、日志和调优选项见
+[配置文档](./docs/configuration.md)。[示例配置](./examples) 覆盖了各种常见场景。
 
-但 `[client]` 和 `[server]` 块也可以放在一个文件中。然后在服务器端，运行 `molehill --server config.toml`。在客户端，运行 `molehill --client config.toml` 来明确告诉 `molehill` 运行模式。
+## 部署
 
-**推荐首先查看 [examples](./examples) 中的配置示例来快速理解配置格式**，如果有不清楚的地方再查阅完整配置格式。
+### 二进制
 
-关于如何配置 Noise Protocol 和 TLS 来进行加密传输，参见 [Transport](./docs/transport.md)。
+从 [release 页面](https://github.com/NIyueeE/molehill/releases) 下载对应平台的预编译二进制，或者
+[从源码编译](./docs/build-guide.md) 获取其他平台和最小化的二进制。
 
-下面是完整的配置格式。
-
-```toml
-[client]
-remote_addr = "example.com:2333" # 必填。服务端地址
-default_token = "default_token_if_not_specify" # 可选。服务的默认 token，当服务未单独设置时使用
-heartbeat_timeout = 40 # 可选。设为 0 禁用应用层心跳检测。该值必须大于 `server.heartbeat_interval`。默认：40 秒
-retry_interval = 1 # 可选。连接服务端失败后的重试间隔。默认：1 秒
-prefer_ipv6 = false # 可选。解析远程地址时优先使用 IPv6。默认：false
-
-[client.transport] # 整个块都是可选的。指定使用的传输协议
-type = "tcp" # 可选。可选值：["tcp", "tls", "noise", "websocket"]。默认："tcp"
-
-[client.transport.tcp] # 可选。TCP socket 选项（对 `tls` 和 `noise` 传输同样生效）
-proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。连接服务端使用的代理。支持 `http` 和 `socks5`
-nodelay = true # 可选。是否启用 TCP_NODELAY，启用可降低延迟但会减少带宽。默认：true
-keepalive_secs = 20 # 可选。设置 `tcp_keepalive_time`。默认：20 秒
-keepalive_interval = 8 # 可选。设置 `tcp_keepalive_intvl`。默认：8 秒
-
-[client.transport.tls] # 必填（当 `type` 为 "tls" 时）
-trusted_root = "ca.pem" # 必填。签署服务端证书的 CA 证书
-hostname = "example.com" # 可选。客户端验证证书时使用的主机名。不设置则回退到 `client.remote_addr`
-
-[client.transport.noise] # Noise 协议。详见 `docs/transport.md`
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如上所示
-local_private_key = "key_encoded_in_base64" # 可选
-remote_public_key = "key_encoded_in_base64" # 可选
-psk = "key_encoded_in_base64" # 可选。预共享密钥（32 字节，base64 编码）。使用前 pattern 须包含 PSK 修饰符（如 Noise_KKpsk0_...）
-psk_location = 0 # 可选。PSK 在 pattern 中的槽位索引。默认：0
-
-[client.transport.websocket] # 必填（当 `type` 为 "websocket" 时）
-tls = true # 必填。设为 `true` 启用 WebSocket 上的 TLS（使用 `client.transport.tls` 中的配置）。设为 `false` 使用普通 WebSocket。
-
-[client.services.service1] # 需要转发的服务。服务名 `service1` 可任意修改，只要与服务端配置一致
-type = "tcp" # 可选。需要转发的协议。可选值：["tcp", "udp"]。默认："tcp"
-token = "whatever" # 必填（如果 `client.default_token` 未设置）
-local_addr = "127.0.0.1:1081" # 必填。需要转发的服务地址
-nodelay = true # 可选。为当前服务单独覆盖 `client.transport.nodelay`
-retry_interval = 1 # 可选。连接服务端的重试间隔。默认：继承全局配置
-prefer_ipv6 = false # 可选。为当前服务单独覆盖 `client.prefer_ipv6`
-
-[client.services.service2] # 可以定义多个服务
-local_addr = "127.0.0.1:1082"
-
-[server]
-bind_addr = "0.0.0.0:2333" # 必填。服务端监听客户端连接的地址。通常只需修改端口
-default_token = "default_token_if_not_specify" # 可选
-heartbeat_interval = 30 # 可选。应用层心跳发送间隔。设为 0 禁用。默认：30 秒
-
-[server.transport] # 与 `[client.transport]` 相同
-type = "tcp"
-
-[server.transport.tcp] # 与客户端相同
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[server.transport.tls] # 必填（当 `type` 为 "tls" 时）
-pkcs12 = "identity.pfx" # 必填。服务端证书和私钥的 pkcs12 文件
-pkcs12_password = "password" # 必填。pkcs12 文件的密码
-
-[server.transport.noise] # 与 `[client.transport.noise]` 相同
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # 可选。预共享密钥（32 字节，base64 编码）。使用前 pattern 须包含 PSK 修饰符（如 Noise_KKpsk0_...）
-psk_location = 0 # 可选。PSK 在 pattern 中的槽位索引。默认：0
-
-[server.transport.websocket] # 必填（当 `type` 为 "websocket" 时）
-tls = true # 必填。设为 `true` 启用 WebSocket 上的 TLS（使用 `server.transport.tls` 中的配置）。设为 `false` 使用普通 WebSocket。
-
-[server.services.service1] # 服务名必须与客户端保持一致
-type = "tcp" # 可选。与客户端 `[client.services.X.type]` 相同
-token = "whatever" # 必填（如果 `server.default_token` 未设置）
-bind_addr = "0.0.0.0:8081" # 必填。暴露服务的公网地址。通常只需修改端口
-nodelay = true # 可选。与客户端相同
-
-[server.services.service2]
-bind_addr = "0.0.0.1:8082"
+```bash
+./molehill server.toml   # 在公网服务器上
+./molehill client.toml   # 在 NAT 后的设备上
 ```
 
-### Logging
+### systemd
 
-`molehill`，像许多其他 Rust 程序一样，使用环境变量来控制日志级别。
+[systemd 示例](./examples/systemd) 演示了如何把 molehill 作为 systemd 服务运行，包含 root 和 rootless 两种方式，以及多实例管理。
 
-支持的 Logging Level 有 `info`, `warn`, `error`, `debug`, `trace`
+### 容器
 
-比如将日志级别设置为 `error`:
+官方多架构镜像（linux/amd64、linux/arm64）发布在
+`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 8 MiB），以非 root UID 1000 运行，并内置了 CA 证书用于 TLS 验证。
 
-```shell
-RUST_LOG=error ./molehill config.toml
+```bash
+docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
+  ghcr.io/niyueee/molehill:latest server.toml
 ```
 
-如果 `RUST_LOG` 不存在，默认的日志级别是 `info`。
+镜像内不包含任何配置——挂载你的配置文件，并把文件名作为参数传入。更多部署方式见
+[容器示例](./examples/container)，包括 Docker Compose（`compose.yaml` / `compose.bridge.yaml`）和 Podman
+Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
-### Tuning
+## 文档
 
-从 v0.4.7 开始, molehill 默认启用 TCP_NODELAY。这能够减少延迟并使交互式应用受益，比如 RDP，Minecraft 服务器。但它会减少一些带宽。
+- [配置文档](./docs/configuration.md) — 完整的配置规范、日志和调优
+- [传输层](./docs/transport.md) — TLS 和 Noise Protocol 配置
+- [构建指南](./docs/build-guide.md) — 构建定制、rustls 支持、最小化二进制
+- [内部原理](./docs/internals.md) — 控制通道和数据通道的工作原理
+- [示例](./examples) — 常见场景的配置
 
-如果带宽更重要，比如网盘类应用，TCP_NODELAY 仍然可以通过配置 `nodelay = false` 关闭。
+## 规划
 
-## Planning
-
-- [ ] HTTP APIs for configuration
+- [ ] 配置的 HTTP API

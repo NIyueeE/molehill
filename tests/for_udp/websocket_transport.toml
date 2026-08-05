@@ -25,7 +25,7 @@ tls = false
 
 [server.services.echo] 
 type = "udp"
-bind_addr = "0.0.0.0:2334" 
+bind_addr = "0.0.0.0:2336" 
 [server.services.pingpong] 
 type = "udp"
-bind_addr = "0.0.0.0:2335" 
+bind_addr = "0.0.0.0:2337" 
