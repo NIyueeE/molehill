@@ -151,20 +151,32 @@ impl SocketOpts {
         }
     }
 
+    /// Socket options for the legs of a forwarded service: the data channels
+    /// on both ends and, on the server, the visitor-facing sockets.
+    ///
+    /// Defaults are latency-friendly: when the per-service `nodelay` option is
+    /// unset, TCP_NODELAY is enabled (Nagle off) — otherwise interactive
+    /// traffic like SSH suffers Nagle x delayed-ACK stalls. TCP keepalive is
+    /// also enabled by default so pooled idle data channels don't hand out
+    /// silently-dead connections to visitors.
+    fn for_service(nodelay: Option<bool>) -> SocketOpts {
+        SocketOpts {
+            nodelay: Some(nodelay.unwrap_or(DEFAULT_NODELAY)),
+            keepalive: Some(Keepalive {
+                keepalive_secs: DEFAULT_KEEPALIVE_SECS,
+                keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            }),
+        }
+    }
+
     #[cfg(feature = "client")]
     pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
-        SocketOpts {
-            nodelay: cfg.nodelay,
-            ..SocketOpts::none()
-        }
+        Self::for_service(cfg.nodelay)
     }
 
     #[cfg(feature = "server")]
     pub fn from_server_cfg(cfg: &ServerServiceConfig) -> SocketOpts {
-        SocketOpts {
-            nodelay: cfg.nodelay,
-            ..SocketOpts::none()
-        }
+        Self::for_service(cfg.nodelay)
     }
 
     pub fn apply(&self, conn: &TcpStream) {

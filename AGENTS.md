@@ -237,4 +237,4 @@ GitHub Actions in `.github/workflows/`:
 
 ## Known TODOs
 
-No deferred items.
+Deferred items are tracked in the "Planning" section of `README.md` (e.g. HTTP API, configurable UDP buffer size, visitor IP allowlist, UDP idle timeout, per-service connection limits).

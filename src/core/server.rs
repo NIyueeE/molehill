@@ -1,4 +1,4 @@
-use crate::common::constants::{UDP_BUFFER_SIZE, listen_backoff};
+use crate::common::constants::{TCP_COPY_BUFFER_SIZE, UDP_BUFFER_SIZE, listen_backoff};
 use crate::common::helper::{retry_notify_with_deadline, write_and_flush};
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
@@ -7,19 +7,20 @@ use crate::config::ServerServiceChange;
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, UdpTraffic,
-    read_auth, read_hello,
+    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN,
+    UdpTraffic, read_auth, read_hello,
 };
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
 use backon::ExponentialBuilder;
+use bytes::BytesMut;
 
 use rand::TryRng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
@@ -431,11 +432,15 @@ where
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
+        // Socket options for visitor-facing connections (nodelay + keepalive
+        // defaults, overridable per service)
+        let sock_opts = SocketOpts::from_server_cfg(&service);
         match service.service_type {
             ServiceType::Tcp => tokio::spawn(
                 async move {
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
+                        sock_opts,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -457,7 +462,7 @@ where
                         shutdown_rx_clone,
                     )
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
+                    .with_context(|| "Failed to run UDP connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -550,6 +555,7 @@ impl<T: Transport> ControlChannel<T> {
 
 fn tcp_listen_and_send(
     addr: String,
+    sock_opts: SocketOpts,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> mpsc::Receiver<TcpStream> {
@@ -611,6 +617,10 @@ fn tcp_listen_and_send(
 
                             debug!("New visitor from {}", addr);
 
+                            // The visitor socket gets the same latency-friendly
+                            // defaults as the rest of the forwarding path
+                            sock_opts.apply(&incoming);
+
                             // Send the visitor to the connection pool
                             let _ = tx.send(incoming).await;
                         }
@@ -631,11 +641,13 @@ fn tcp_listen_and_send(
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
+    sock_opts: SocketOpts,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    let mut visitor_rx =
+        tcp_listen_and_send(bind_addr, sock_opts, data_ch_req_tx.clone(), shutdown_rx);
     let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)?;
 
     'pool: while let Some(mut visitor) = visitor_rx.recv().await {
@@ -643,7 +655,13 @@ async fn run_tcp_connection_pool<T: Transport>(
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        let _ = copy_bidirectional_with_sizes(
+                            &mut ch,
+                            &mut visitor,
+                            TCP_COPY_BUFFER_SIZE,
+                            TCP_COPY_BUFFER_SIZE,
+                        )
+                        .await;
                     });
                     break;
                 } else {
@@ -736,17 +754,24 @@ async fn udp_forward_worker<T: Transport>(
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let mut buf = [0u8; UDP_BUFFER_SIZE];
+    // Scratch buffers reused across datagrams so the hot path allocates nothing.
+    let mut tx_scratch = BytesMut::with_capacity(MAX_UDP_HEADER_LEN + UDP_BUFFER_SIZE);
+    let mut rx_scratch = BytesMut::with_capacity(MAX_UDP_HEADER_LEN + UDP_BUFFER_SIZE);
     loop {
         tokio::select! {
             // Forward inbound traffic to the client
             val = l.recv_from(&mut buf) => {
                 let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+                UdpTraffic::write_frame(&mut conn, &mut tx_scratch, from, &buf[..n]).await?;
             }
             // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
+                // `Ok(None)` means an oversized packet was dropped; keep going.
+                if let Some((from, len)) =
+                    UdpTraffic::read_slice(&mut conn, hdr_len?, &mut rx_scratch).await?
+                {
+                    l.send_to(&rx_scratch[..len], from).await?;
+                }
             }
             _ = shutdown_rx.recv() => {
                 break;

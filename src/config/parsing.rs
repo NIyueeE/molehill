@@ -68,6 +68,7 @@ pub struct ClientServiceConfig {
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl ClientServiceConfig {
@@ -90,6 +91,71 @@ pub enum ServiceType {
 
 fn default_service_type() -> ServiceType {
     Default::default()
+}
+
+/// How the client probes the local service of a TCP service
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthCheckType {
+    /// Establish a TCP connection to the service
+    #[default]
+    #[serde(rename = "tcp")]
+    Tcp,
+    /// Send an HTTP GET request and accept any 2xx/3xx response
+    #[serde(rename = "http")]
+    Http,
+}
+
+const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
+const DEFAULT_HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_HEALTH_CHECK_MAX_FAILED: u32 = 1;
+const DEFAULT_HEALTH_CHECK_HTTP_PATH: &str = "/";
+
+fn default_health_check_type() -> HealthCheckType {
+    Default::default()
+}
+
+fn default_health_check_interval() -> u64 {
+    DEFAULT_HEALTH_CHECK_INTERVAL_SECS
+}
+
+fn default_health_check_timeout() -> u64 {
+    DEFAULT_HEALTH_CHECK_TIMEOUT_SECS
+}
+
+fn default_health_check_max_failed() -> u32 {
+    DEFAULT_HEALTH_CHECK_MAX_FAILED
+}
+
+fn default_health_check_http_path() -> String {
+    DEFAULT_HEALTH_CHECK_HTTP_PATH.to_string()
+}
+
+/// Health check of a client-side service (TCP services only).
+///
+/// The client probes `local_addr` every `interval` seconds with a timeout of
+/// `timeout` seconds. After `max_failed` consecutive failed probes the service
+/// is declared unhealthy and its control channel is dropped, which removes the
+/// service from the server (visitors then fail fast instead of being forwarded
+/// to a dead local service). Once a probe succeeds again the client
+/// re-registers the service automatically.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthCheckConfig {
+    #[serde(rename = "type", default = "default_health_check_type")]
+    pub check_type: HealthCheckType,
+    /// Probe interval in seconds. Default: 10
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u64,
+    /// Probe timeout in seconds. Default: 3
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u64,
+    /// Consecutive failures before the service is declared unhealthy.
+    /// Default: 1
+    #[serde(default = "default_health_check_max_failed")]
+    pub max_failed: u32,
+    /// Path for `http` probes. Default: "/"
+    #[serde(default = "default_health_check_http_path")]
+    pub http_path: String,
 }
 
 /// Per service config
@@ -294,6 +360,33 @@ impl Config {
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
+            }
+            if let Some(hc) = &s.health_check {
+                if s.service_type != ServiceType::Tcp {
+                    bail!(
+                        "health_check is only supported for TCP services, but service {} is {:?}",
+                        name,
+                        s.service_type
+                    );
+                }
+                if hc.interval == 0 {
+                    bail!(
+                        "health_check.interval must be greater than 0 for service {}",
+                        name
+                    );
+                }
+                if hc.timeout == 0 {
+                    bail!(
+                        "health_check.timeout must be greater than 0 for service {}",
+                        name
+                    );
+                }
+                if hc.max_failed == 0 {
+                    bail!(
+                        "health_check.max_failed must be greater than 0 for service {}",
+                        name
+                    );
+                }
             }
         }
 
@@ -558,6 +651,93 @@ pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
 psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 "#;
         assert!(Config::from_str(config).is_ok());
+    }
+
+    #[test]
+    fn test_health_check_config() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let hc = cfg
+            .client
+            .as_ref()
+            .unwrap()
+            .services
+            .get("test")
+            .unwrap()
+            .health_check
+            .as_ref()
+            .unwrap();
+        assert_eq!(hc.check_type, HealthCheckType::Http);
+        assert_eq!(hc.interval, 5);
+        assert_eq!(hc.timeout, 2);
+        assert_eq!(hc.max_failed, 3);
+        assert_eq!(hc.http_path, "/healthz");
+    }
+
+    #[test]
+    fn test_health_check_defaults() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+health_check = {}
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let hc = cfg
+            .client
+            .as_ref()
+            .unwrap()
+            .services
+            .get("test")
+            .unwrap()
+            .health_check
+            .as_ref()
+            .unwrap();
+        assert_eq!(hc.check_type, HealthCheckType::Tcp);
+        assert_eq!(hc.interval, DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+        assert_eq!(hc.timeout, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS);
+        assert_eq!(hc.max_failed, DEFAULT_HEALTH_CHECK_MAX_FAILED);
+        assert_eq!(hc.http_path, DEFAULT_HEALTH_CHECK_HTTP_PATH);
+    }
+
+    #[test]
+    fn test_health_check_rejected_on_udp_service() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+type = "udp"
+token = "t"
+local_addr = "127.0.0.1:53"
+health_check = { interval = 5 }
+"#;
+        assert!(Config::from_str(config).is_err());
+    }
+
+    #[test]
+    fn test_health_check_rejects_zero_values() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+
+[client.services.test]
+token = "t"
+local_addr = "127.0.0.1:80"
+health_check = { interval = 0 }
+"#;
+        assert!(Config::from_str(config).is_err());
     }
 
     #[test]

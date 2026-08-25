@@ -33,7 +33,6 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
     - [容器](#容器)
   - [配置](#配置)
   - [文档](#文档)
-  - [规划](#规划)
 
 <!-- /TOC -->
 
@@ -42,7 +41,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 - **高性能** 具有更高的吞吐量，高并发下更稳定。
 - **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
 - **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
-- **热重载** 支持配置文件热重载，动态修改端口转发服务。HTTP API 正在开发中。
+- **热重载** 支持配置文件热重载，动态修改端口转发服务。
 
 ## 快速开始
 
@@ -145,6 +144,4 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 - [内部原理](./docs/internals.md) — 控制通道和数据通道的工作原理
 - [示例](./examples) — 常见场景的配置
 
-## 规划
-
-- [ ] 配置的 HTTP API
+计划中的工作和将来的设计文档统一收录在 [`HANDOFF.md`](./HANDOFF.md)。

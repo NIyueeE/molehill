@@ -1,12 +1,15 @@
-use crate::common::helper::udp_connect;
+use crate::common::helper::{host_port_pair, udp_connect};
 #[cfg(feature = "notify")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
-use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
+use crate::config::{
+    ClientConfig, ClientServiceConfig, Config, HealthCheckConfig, HealthCheckType, ServiceType,
+    TransportType,
+};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
-    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, UdpTraffic,
-    read_ack, read_control_cmd, read_data_cmd, read_hello,
+    self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, MAX_UDP_HEADER_LEN,
+    UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
 };
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,9 +20,9 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
@@ -31,7 +34,7 @@ use crate::transport::TlsTransport;
 use crate::transport::WebsocketTransport;
 
 use crate::common::constants::{
-    UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff,
+    TCP_COPY_BUFFER_SIZE, UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT, run_control_chan_backoff,
 };
 
 // The entrypoint of running a client
@@ -223,7 +226,8 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            let sock_opts = SocketOpts::from_client_cfg(&args.service);
+            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr, sock_opts).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
@@ -241,13 +245,23 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
 async fn run_data_channel_for_tcp<T: Transport>(
     mut conn: T::Stream,
     local_addr: &str,
+    sock_opts: SocketOpts,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    // The leg towards the local service needs explicit socket options;
+    // without them Nagle stays enabled and interactive traffic stalls.
+    sock_opts.apply(&local);
+    let _ = copy_bidirectional_with_sizes(
+        &mut conn,
+        &mut local,
+        TCP_COPY_BUFFER_SIZE,
+        TCP_COPY_BUFFER_SIZE,
+    )
+    .await;
     Ok(())
 }
 
@@ -272,12 +286,14 @@ async fn run_data_channel_for_udp<T: Transport>(
 
     let (mut rd, mut wr) = io::split(conn);
 
-    // Keep sending items from the outbound channel to the server
+    // Keep sending items from the outbound channel to the server.
+    // The scratch buffer is reused across packets: each datagram is framed
+    // into it once and emitted with a single write (single TLS/Noise record).
     tokio::spawn(async move {
+        let mut scratch = BytesMut::with_capacity(MAX_UDP_HEADER_LEN + UDP_BUFFER_SIZE);
         while let Some(t) = outbound_rx.recv().await {
             trace!("outbound {:?}", t);
-            if let Err(e) = t
-                .write(&mut wr)
+            if let Err(e) = UdpTraffic::write_frame(&mut wr, &mut scratch, t.from, &t.data)
                 .await
                 .with_context(|| "Failed to forward UDP traffic to the server")
             {
@@ -288,11 +304,16 @@ async fn run_data_channel_for_udp<T: Transport>(
     });
 
     loop {
-        // Read a packet from the server
+        // Read a packet from the server. `Ok(None)` means an oversized packet
+        // was dropped; the stream stays in sync, so just keep going.
         let hdr_len = rd.read_u8().await?;
-        let packet = UdpTraffic::read(&mut rd, hdr_len)
+        let packet = match UdpTraffic::read(&mut rd, hdr_len)
             .await
-            .with_context(|| "Failed to read UDPTraffic from the server")?;
+            .with_context(|| "Failed to read UDPTraffic from the server")?
+        {
+            Some(packet) => packet,
+            None => continue,
+        };
         let m = port_map.read().await;
 
         if m.get(&packet.from).is_none() {
@@ -403,11 +424,13 @@ struct ControlChannel<T: Transport> {
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
     shutdown_tx: oneshot::Sender<u8>,
+    // Stops the health-check task; dropped together with the handle
+    health_stop_tx: oneshot::Sender<u8>,
 }
 
 impl<T: 'static + Transport> ControlChannel<T> {
     #[instrument(skip_all)]
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self, mut health_rx: Option<&mut watch::Receiver<bool>>) -> Result<()> {
         let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
         remote_addr.resolve().await?;
 
@@ -497,6 +520,15 @@ impl<T: 'static + Transport> ControlChannel<T> {
                 _ = &mut self.shutdown_rx => {
                     break;
                 }
+                changed = health_changed(health_rx.as_deref_mut()), if health_rx.is_some() => {
+                    if changed == Some(false) {
+                        // The local service went down: drop this channel. The
+                        // retry loop in `ControlChannelHandle::new` waits for
+                        // the service to recover before reconnecting.
+                        debug!("Local service is unhealthy, dropping the control channel");
+                        break;
+                    }
+                }
             }
         }
 
@@ -518,10 +550,30 @@ impl ControlChannelHandle {
         info!("Starting service {}", service.name);
         debug!("Service digest: {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Dropped together with the handle so the health task never leaks
+        let (health_stop_tx, health_stop_rx) = oneshot::channel();
 
         // Config validation fills `retry_interval` from the global default
         let backoff_builder = run_control_chan_backoff(service.retry_interval.unwrap_or(1));
-        let mut retry_backoff = backoff_builder.build();
+
+        // Health-check wiring. The watch starts healthy and is flipped by the
+        // health task when the local service goes down/up. The control channel
+        // task drops the channel while unhealthy (which removes the service
+        // from the server) and reconnects once the service recovers.
+        let mut health_rx = match service.health_check.clone() {
+            Some(hc) => {
+                let (health_tx, health_rx) = watch::channel(true);
+                tokio::spawn(run_health_check(
+                    hc,
+                    service.local_addr.clone(),
+                    service.name.clone(),
+                    health_tx,
+                    health_stop_rx,
+                ));
+                Some(health_rx)
+            }
+            None => None,
+        };
 
         let mut s = ControlChannel {
             digest,
@@ -535,42 +587,327 @@ impl ControlChannelHandle {
         tokio::spawn(
             async move {
                 let mut start = Instant::now();
+                let mut retry_backoff = backoff_builder.build();
 
-                while let Err(err) = s
-                    .run()
-                    .await
-                    .with_context(|| "Failed to run the control channel")
-                {
-                    if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) {
-                        break;
+                loop {
+                    // Wait until the local service is healthy again (a no-op
+                    // when no health check is configured). While the service
+                    // is down no control channel is kept on the server, so
+                    // visitors fail fast instead of being forwarded to a dead
+                    // local service.
+                    if let Some(health_rx) = &mut health_rx {
+                        while !*health_rx.borrow() {
+                            if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty)
+                            {
+                                return;
+                            }
+                            // Poll once per second so that shutdown signals
+                            // are still noticed while waiting for recovery.
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(1), health_rx.changed())
+                                    .await;
+                        }
                     }
 
-                    if start.elapsed() > Duration::from_secs(3) {
-                        // The client runs for at least 3 secs and then disconnects
-                        retry_backoff = backoff_builder.build();
-                    }
+                    match s
+                        .run(health_rx.as_mut())
+                        .await
+                        .with_context(|| "Failed to run the control channel")
+                    {
+                        Ok(()) => {
+                            if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty)
+                            {
+                                return;
+                            }
+                            // `run` returned because the local service became
+                            // unhealthy; wait for recovery in the loop above.
+                        }
+                        Err(err) => {
+                            if s.shutdown_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty)
+                            {
+                                return;
+                            }
 
-                    if let Some(duration) = retry_backoff.next() {
-                        error!("{:#}. Retry in {:?}...", err, duration);
-                        time::sleep(duration).await;
-                    } else {
-                        // Should never be reached with the current backoff policy,
-                        // but keep the channel alive instead of panicking.
-                        warn!("{:#}. Backoff exhausted, retrying in 1s", err);
-                        time::sleep(Duration::from_secs(1)).await;
-                    }
+                            if start.elapsed() > Duration::from_secs(3) {
+                                // The client runs for at least 3 secs and then disconnects
+                                retry_backoff = backoff_builder.build();
+                            }
 
-                    start = Instant::now();
+                            if let Some(duration) = retry_backoff.next() {
+                                error!("{:#}. Retry in {:?}...", err, duration);
+                                time::sleep(duration).await;
+                            } else {
+                                // Should never be reached with the current backoff policy,
+                                // but keep the channel alive instead of panicking.
+                                warn!("{:#}. Backoff exhausted, retrying in 1s", err);
+                                time::sleep(Duration::from_secs(1)).await;
+                            }
+
+                            start = Instant::now();
+                        }
+                    }
                 }
             }
             .instrument(Span::current()),
         );
 
-        ControlChannelHandle { shutdown_tx }
+        ControlChannelHandle {
+            shutdown_tx,
+            health_stop_tx,
+        }
     }
 
     fn shutdown(self) {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
+        let _ = self.health_stop_tx.send(0u8);
+    }
+}
+
+// Awaits the next health-state change. Returns `None` when there is no health
+// monitor (or it has exited, which only happens on shutdown).
+async fn health_changed(rx: Option<&mut watch::Receiver<bool>>) -> Option<bool> {
+    let rx = rx?;
+    rx.changed().await.ok().map(|()| *rx.borrow())
+}
+
+// Probes the local service of a service and flips `health_tx` whenever the
+// healthy state changes. Exits when the handle is dropped (`shutdown_rx`
+// closes), at which point the control channel task stops watching health.
+#[instrument(skip_all, fields(service = %service_name))]
+async fn run_health_check(
+    cfg: HealthCheckConfig,
+    local_addr: String,
+    service_name: String,
+    health_tx: watch::Sender<bool>,
+    mut shutdown_rx: oneshot::Receiver<u8>,
+) {
+    let mut consecutive_failures: u32 = 0;
+    let mut healthy = true;
+    loop {
+        // Probe immediately on start, then once per interval
+        let ok = tokio::time::timeout(
+            Duration::from_secs(cfg.timeout),
+            health_probe(&cfg, &local_addr),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+
+        consecutive_failures = if ok {
+            0
+        } else {
+            consecutive_failures.saturating_add(1)
+        };
+        let new_healthy = consecutive_failures < cfg.max_failed;
+        if new_healthy != healthy {
+            healthy = new_healthy;
+            let _ = health_tx.send(healthy);
+            if healthy {
+                info!("Local service is healthy again, re-registering the service");
+            } else {
+                warn!(
+                    "Local service is unhealthy ({} consecutive failures), removing the service from the server",
+                    consecutive_failures
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = &mut shutdown_rx => return,
+            _ = time::sleep(Duration::from_secs(cfg.interval)) => {}
+        }
+    }
+}
+
+// Probe the local service. Returns Ok(()) when it is reachable.
+async fn health_probe(cfg: &HealthCheckConfig, local_addr: &str) -> Result<()> {
+    match cfg.check_type {
+        HealthCheckType::Tcp => {
+            let _ = TcpStream::connect(local_addr).await?;
+            Ok(())
+        }
+        HealthCheckType::Http => {
+            let mut stream = TcpStream::connect(local_addr).await?;
+            let (host, port) = host_port_pair(local_addr)?;
+            let req = format!(
+                "GET {} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+                cfg.http_path, host, port
+            );
+            stream.write_all(req.as_bytes()).await?;
+            stream.flush().await?;
+
+            // Read until the status line is available
+            let mut buf = Vec::with_capacity(256);
+            let mut chunk = [0u8; 256];
+            loop {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.contains(&b'\n') || buf.len() >= 4096 {
+                    break;
+                }
+            }
+
+            let status = String::from_utf8_lossy(&buf)
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
+            if (200..400).contains(&status) {
+                Ok(())
+            } else {
+                bail!("HTTP health check returned status {}", status)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn health_cfg(check_type: HealthCheckType) -> HealthCheckConfig {
+        HealthCheckConfig {
+            check_type,
+            interval: 1,
+            timeout: 1,
+            max_failed: 1,
+            http_path: "/".to_string(),
+        }
+    }
+
+    // Serves a fixed HTTP response. The request is read first: closing a
+    // socket with unread data sends RST on Windows instead of FIN, which
+    // would surface as a connection-reset error in the probe.
+    fn spawn_http_server(listener: TcpListener, response: &'static [u8]) {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = response.to_vec();
+                tokio::spawn(async move {
+                    let mut req = [0u8; 1024];
+                    let _ = s.read(&mut req).await;
+                    let _ = s.write_all(&response).await;
+                    let _ = s.flush().await;
+                });
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_ok() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(
+            health_probe(&health_cfg(HealthCheckType::Tcp), &addr)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        // A port that was just released must refuse connections
+        assert!(
+            health_probe(&health_cfg(HealthCheckType::Tcp), &addr)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_http_ok() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        spawn_http_server(listener, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+
+        assert!(
+            health_probe(&health_cfg(HealthCheckType::Http), &addr)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn health_probe_http_5xx_is_unhealthy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        spawn_http_server(
+            listener,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        );
+
+        assert!(
+            health_probe(&health_cfg(HealthCheckType::Http), &addr)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_flips_state_and_recovers() {
+        // The service is up at first
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (health_tx, mut health_rx) = watch::channel(true);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        tokio::spawn(run_health_check(
+            health_cfg(HealthCheckType::Tcp),
+            addr.clone(),
+            "test".to_string(),
+            health_tx,
+            shutdown_rx,
+        ));
+
+        // Healthy at start, still healthy after a few probes
+        assert!(*health_rx.borrow());
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(*health_rx.borrow());
+
+        // The service goes down: the state must flip to unhealthy
+        drop(listener);
+        tokio::time::timeout(Duration::from_secs(5), health_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!*health_rx.borrow());
+
+        // The service comes back: the state must flip to healthy again.
+        // Re-binding the just-released port can briefly fail on some
+        // platforms, so retry.
+        let listener = {
+            let mut rebound = None;
+            for _ in 0..20 {
+                match TcpListener::bind(&addr).await {
+                    Ok(l) => {
+                        rebound = Some(l);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+            rebound.expect("failed to rebind the released port")
+        };
+        tokio::time::timeout(Duration::from_secs(5), health_rx.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(*health_rx.borrow());
+        drop(listener);
+
+        // Dropping the sender stops the health task
+        drop(shutdown_tx);
     }
 }

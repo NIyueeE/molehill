@@ -38,6 +38,7 @@ local_addr = "127.0.0.1:22" # Necessary. The address of the local service
 nodelay = true # Optional. Override `client.transport.nodelay` per service
 retry_interval = 1 # Optional. Override the global `client.retry_interval` per service
 prefer_ipv6 = false # Optional. Override `client.prefer_ipv6` per service
+health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Remove the service from the server while the local service is down (see docs/configuration.md)
 
 [client.services.dns] # A UDP service example
 type = "udp"

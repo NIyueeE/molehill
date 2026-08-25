@@ -33,7 +33,6 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
     - [Container](#container)
   - [Configuration](#configuration)
   - [Documentation](#documentation)
-  - [Planning](#planning)
 
 <!-- /TOC -->
 
@@ -42,7 +41,7 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
-- **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
+- **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
 
 ## Quickstart
 
@@ -155,6 +154,4 @@ deployments.
 - [Internals](./docs/internals.md) — how control/data channels work
 - [Examples](./examples) — configs for common scenarios
 
-## Planning
-
-- [ ] HTTP APIs for configuration
+Planned work and future design documents are tracked in [`HANDOFF.md`](./HANDOFF.md).

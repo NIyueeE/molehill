@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-08-25
+
+### Added
+
+- Client-side health check (`health_check`) for TCP services: the client probes the local service and, after `max_failed` consecutive failures, drops the service's control channel so the server stops serving it and visitors fail fast; the service is re-registered automatically once it recovers. Supports `tcp` and `http` probe types with configurable `interval`, `timeout`, `max_failed`, and `http_path`
+- `HANDOFF.md` now holds all planned work and future design documents (data-channel multiplexing, configurable pool sizes, QUIC transport, buffer pooling, single control channel, and the former README planning items); the README planning section was removed in favor of it
+
+### Changed
+
+- TCP_NODELAY is now enabled by default on every leg of a forwarded service (both ends of data channels, visitor-facing sockets, and the client's connection to the local service) instead of only on the outer transport connections; the per-service `nodelay` option still allows opting out
+- TCP keepalive (20s/8s) is enabled by default on data channels and visitor sockets, so pooled idle channels that were silently dropped by NATs/middleboxes are detected instead of being handed to visitors
+- The bidirectional TCP copy buffer is raised from tokio's 8 KiB default to 32 KiB per direction (`copy_bidirectional_with_sizes`)
+- UDP datagrams are now framed into a reused buffer and emitted with a single write (one TLS/Noise record per packet) instead of three writes with per-packet heap allocations; the server's receive path no longer allocates per packet
+- UDP packets larger than the 2048-byte buffer are now dropped in-stream (the channel stays usable) instead of tearing down the whole data channel
+
+### Fixed
+
+- The UDP connection pool logged "Failed to run TCP connection pool" as its error context
+- Upgraded `h2` to 0.4.16 to fix RUSTSEC-2026-0258 (unbounded empty DATA frames; `h2` is pulled in by the optional console feature's hyper/tonic chain)
+
 ## [0.6.3] - 2026-08-05
 
 ### Added

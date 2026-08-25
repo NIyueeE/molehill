@@ -2,7 +2,7 @@ pub mod parsing;
 pub mod watcher;
 
 #[cfg(any(feature = "client", feature = "notify"))]
-pub use parsing::{ClientConfig, ClientServiceConfig};
+pub use parsing::{ClientConfig, ClientServiceConfig, HealthCheckConfig, HealthCheckType};
 pub use parsing::{Config, ServiceType, TcpConfig, TransportConfig, TransportType};
 #[cfg(any(feature = "server", feature = "notify"))]
 pub use parsing::{ServerConfig, ServerServiceConfig};

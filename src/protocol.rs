@@ -1,12 +1,12 @@
 pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
 use anyhow::{Context, Result, bail};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::common::constants::UDP_BUFFER_SIZE;
 
@@ -67,80 +67,152 @@ struct UdpHeader {
     len: UdpPacketLen,
 }
 
+/// Upper bound of the encoded size of a [`UdpHeader`]: an address tag plus at
+/// most 16 bytes of IP, a port and a varint length always fit well below this.
+pub const MAX_UDP_HEADER_LEN: usize = 32;
+
+// The owned-payload variant is only used on the client side; the server reads
+// through the zero-allocation `read_slice` path instead.
+#[cfg_attr(not(feature = "client"), allow(dead_code))]
 #[derive(Debug)]
 pub struct UdpTraffic {
     pub from: SocketAddr,
     pub data: Bytes,
 }
 
-impl UdpTraffic {
-    #[cfg(feature = "client")]
-    pub async fn write<T: AsyncWrite + Unpin>(&self, writer: &mut T) -> Result<()> {
-        let hdr = UdpHeader {
-            from: self.from,
-            len: self.data.len() as UdpPacketLen,
-        };
+/// Frame one datagram into `scratch` as `[hdr_len u8][header][payload]`.
+///
+/// The wire format is unchanged; the point is that the whole datagram is
+/// emitted with a single buffer and therefore a single `write_all` (and a
+/// single TLS/Noise record), with no per-packet heap allocation when callers
+/// reuse the same scratch buffer.
+fn encode_udp_frame(scratch: &mut BytesMut, from: SocketAddr, data: &[u8]) -> Result<()> {
+    let hdr = UdpHeader {
+        from,
+        len: data.len() as UdpPacketLen,
+    };
 
-        let v = postcard::to_stdvec(&hdr)?;
+    scratch.clear();
+    scratch.reserve(1 + MAX_UDP_HEADER_LEN + data.len());
 
-        trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
+    // Encode the header into a stack buffer, then assemble the whole frame
+    // `[hdr_len u8][header][payload]` in the scratch buffer so the datagram
+    // is emitted with a single `write_all` and no per-packet heap allocation.
+    let prefix_pos = scratch.len();
+    scratch.put_u8(0); // placeholder, fixed up below
+    let mut hdr_buf = [0u8; MAX_UDP_HEADER_LEN];
+    let encoded =
+        postcard::to_slice(&hdr, &mut hdr_buf).with_context(|| "Failed to serialize UdpHeader")?;
+    debug_assert!(encoded.len() <= MAX_UDP_HEADER_LEN && encoded.len() <= u8::MAX as usize);
+    scratch.extend_from_slice(encoded);
+    let hdr_len = scratch.len() - prefix_pos - 1;
+    scratch[prefix_pos] = hdr_len as u8;
 
-        writer.write_all(&self.data).await?;
+    trace!("Write {:?} of length {}", hdr, hdr_len);
+    scratch.extend_from_slice(data);
+    Ok(())
+}
 
-        Ok(())
+async fn read_udp_header<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpHeader> {
+    if hdr_len as usize > MAX_UDP_HEADER_LEN {
+        bail!(
+            "UDP header length {} exceeds the maximum of {}, the stream is corrupt",
+            hdr_len,
+            MAX_UDP_HEADER_LEN
+        );
     }
+    let mut buf = [0u8; MAX_UDP_HEADER_LEN];
+    reader
+        .read_exact(&mut buf[..hdr_len as usize])
+        .await
+        .with_context(|| "Failed to read udp header")?;
 
-    #[allow(dead_code)]
-    pub async fn write_slice<T: AsyncWrite + Unpin>(
+    postcard::from_bytes(&buf[..hdr_len as usize])
+        .with_context(|| "Failed to deserialize UdpHeader")
+}
+
+/// Drain the payload of an oversized datagram so that the stream framing stays
+/// in sync, then report the packet as dropped.
+async fn skip_oversized_payload<T: AsyncRead + Unpin>(
+    reader: &mut T,
+    len: u16,
+    from: SocketAddr,
+) -> Result<()> {
+    warn!("Dropping oversized UDP packet from {from}, {len} bytes");
+    // Bounded by `u16::MAX`, so this cannot grow unreasonably.
+    let mut sink = vec![0u8; len as usize];
+    // Note: tokio's `read_exact` resolves to `io::Result<usize>` (bytes read)
+    reader
+        .read_exact(&mut sink)
+        .await
+        .with_context(|| "Failed to skip oversized udp payload")?;
+    Ok(())
+}
+
+impl UdpTraffic {
+    /// Frame one datagram and send it with a **single** `write_all`.
+    ///
+    /// Callers should reuse the same `scratch` buffer across packets to avoid
+    /// per-packet allocations.
+    #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
+    pub async fn write_frame<T: AsyncWrite + Unpin>(
         writer: &mut T,
+        scratch: &mut BytesMut,
         from: SocketAddr,
         data: &[u8],
     ) -> Result<()> {
-        let hdr = UdpHeader {
-            from,
-            len: data.len() as UdpPacketLen,
-        };
-
-        let v = postcard::to_stdvec(&hdr)?;
-
-        trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
-
-        writer.write_all(data).await?;
-
+        encode_udp_frame(scratch, from, data)?;
+        writer.write_all(scratch).await?;
         Ok(())
     }
 
-    pub async fn read<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpTraffic> {
-        let mut buf = vec![0; hdr_len as usize];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .with_context(|| "Failed to read udp header")?;
-
-        let hdr: UdpHeader =
-            postcard::from_bytes(&buf).with_context(|| "Failed to deserialize UdpHeader")?;
-
-        trace!("hdr {:?}", hdr);
+    /// Read one framed datagram into an owned buffer.
+    ///
+    /// Returns `Ok(None)` if an oversized datagram was received: its payload is
+    /// drained (keeping the stream in sync) and only that packet is dropped,
+    /// instead of tearing down the whole data channel.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    pub async fn read<T: AsyncRead + Unpin>(
+        reader: &mut T,
+        hdr_len: u8,
+    ) -> Result<Option<UdpTraffic>> {
+        let hdr = read_udp_header(reader, hdr_len).await?;
 
         // A UDP payload larger than the receive buffer cannot originate from
-        // this implementation; reject it to avoid oversized allocations and
-        // desynchronizing the stream.
+        // this implementation; drop it while keeping the stream usable.
         if hdr.len > UDP_BUFFER_SIZE as UdpPacketLen {
-            bail!("UDP packet length {} exceeds the buffer size", hdr.len);
+            skip_oversized_payload(reader, hdr.len, hdr.from).await?;
+            return Ok(None);
         }
 
-        let mut data = BytesMut::new();
-        data.resize(hdr.len as usize, 0);
+        let mut data = BytesMut::zeroed(hdr.len as usize);
         reader.read_exact(&mut data).await?;
 
-        Ok(UdpTraffic {
+        Ok(Some(UdpTraffic {
             from: hdr.from,
             data: data.freeze(),
-        })
+        }))
+    }
+
+    /// Zero-allocation variant of [`UdpTraffic::read`] for consumers that use
+    /// the payload immediately: on success the payload occupies
+    /// `scratch[..len]`. The oversized-packet policy is identical.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub async fn read_slice<T: AsyncRead + Unpin>(
+        reader: &mut T,
+        hdr_len: u8,
+        scratch: &mut BytesMut,
+    ) -> Result<Option<(SocketAddr, usize)>> {
+        let hdr = read_udp_header(reader, hdr_len).await?;
+
+        if hdr.len > UDP_BUFFER_SIZE as UdpPacketLen {
+            skip_oversized_payload(reader, hdr.len, hdr.from).await?;
+            return Ok(None);
+        }
+
+        scratch.resize(hdr.len as usize, 0);
+        reader.read_exact(&mut scratch[..]).await?;
+        Ok(Some((hdr.from, hdr.len as usize)))
     }
 }
 
@@ -386,9 +458,97 @@ mod tests {
             len: 42,
         };
         let bytes = postcard::to_stdvec(&hdr).unwrap();
+        assert!(bytes.len() <= MAX_UDP_HEADER_LEN);
         let back: UdpHeader = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.from, sample_addr());
         assert_eq!(back.len, 42);
+    }
+
+    #[tokio::test]
+    async fn udp_frame_roundtrip() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64 * 1024);
+        let mut scratch = BytesMut::new();
+
+        UdpTraffic::write_frame(&mut tx, &mut scratch, sample_addr(), b"hello")
+            .await
+            .unwrap();
+
+        // The whole datagram must be emitted as a single buffer: one length
+        // prefix byte plus the encoded header plus the payload.
+        let hdr_len = scratch[0] as usize;
+        assert!(hdr_len > 0);
+        assert_eq!(scratch.len(), 1 + hdr_len + b"hello".len());
+
+        let hdr_len = rx.read_u8().await.unwrap();
+        let packet = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        assert_eq!(packet.from, sample_addr());
+        assert_eq!(&packet.data[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn udp_oversized_packet_is_dropped_without_desync() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(128 * 1024);
+        let mut scratch = BytesMut::new();
+
+        // A normal frame, then one claiming a payload above UDP_BUFFER_SIZE,
+        // then another normal frame. The receiver must drop only the middle
+        // one and stay in sync with the stream.
+        UdpTraffic::write_frame(&mut tx, &mut scratch, sample_addr(), b"first")
+            .await
+            .unwrap();
+
+        let oversized_len = UDP_BUFFER_SIZE as u16 + 1;
+        let hdr = UdpHeader {
+            from: sample_addr(),
+            len: oversized_len,
+        };
+        let encoded = postcard::to_stdvec(&hdr).unwrap();
+        tx.write_u8(encoded.len() as u8).await.unwrap();
+        tx.write_all(&encoded).await.unwrap();
+        tx.write_all(&vec![0u8; oversized_len as usize])
+            .await
+            .unwrap();
+
+        UdpTraffic::write_frame(&mut tx, &mut scratch, sample_addr(), b"last")
+            .await
+            .unwrap();
+
+        let hdr_len = rx.read_u8().await.unwrap();
+        let first = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        assert_eq!(&first.data[..], b"first");
+
+        let hdr_len = rx.read_u8().await.unwrap();
+        assert!(UdpTraffic::read(&mut rx, hdr_len).await.unwrap().is_none());
+
+        let hdr_len = rx.read_u8().await.unwrap();
+        let last = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        assert_eq!(&last.data[..], b"last");
+    }
+
+    #[tokio::test]
+    async fn udp_read_slice_roundtrip_zero_alloc_path() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64 * 1024);
+        let mut scratch = BytesMut::new();
+
+        UdpTraffic::write_frame(&mut tx, &mut scratch, sample_addr(), &[7u8; 100])
+            .await
+            .unwrap();
+
+        let hdr_len = rx.read_u8().await.unwrap();
+        let mut payload = BytesMut::new();
+        let (from, len) = UdpTraffic::read_slice(&mut rx, hdr_len, &mut payload)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, sample_addr());
+        assert_eq!(len, 100);
+        assert_eq!(&payload[..len], &[7u8; 100]);
     }
 
     #[test]

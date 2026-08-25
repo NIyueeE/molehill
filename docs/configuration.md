@@ -62,9 +62,10 @@ tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection 
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Override the `client.transport.nodelay` per service
+nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 prefer_ipv6 = false # Optional. Override the `client.prefer_ipv6` per service
+health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Probes the local service and removes it from the server while it is down (see "Health check" below)
 
 [client.services.service2] # Multiple services can be defined
 local_addr = "127.0.0.1:1082"
@@ -100,7 +101,7 @@ tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection 
 type = "tcp" # Optional. Same as the client `[client.services.X.type]`
 token = "whatever" # Necessary if `server.default_token` not set
 bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client
+nodelay = true # Optional. Same as the client. Default: true even when unset; set `false` to disable
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
@@ -120,9 +121,11 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 ## Tuning
 
-From v0.4.7, molehill enables TCP_NODELAY by default, which should benefit the latency and interactive applications like rdp, Minecraft servers. However, it slightly decreases the bandwidth.
+From v0.4.7, molehill enables TCP_NODELAY by default on the transport-level connections, and now by default on every leg of a forwarded service as well: both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false`.
+TCP keepalive is also enabled by default on these sockets (20s idle time, 8s probe interval), so pooled data channels that were silently dropped by NATs or middleboxes are detected instead of being handed out to visitors.
+
+If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service.
 
 ## Usage notes
 
@@ -144,10 +147,17 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 - `client.heartbeat_timeout` must be greater than `server.heartbeat_interval`, otherwise the client treats a healthy server as dead and reconnects in a loop.
 - Set `heartbeat_interval = 0` to disable heartbeats (then set `heartbeat_timeout = 0` as well).
 
+### Health check
+
+- `health_check` is optional and only supported on TCP services. It makes the client probe `local_addr` every `interval` seconds (default 10) with a `timeout` of `timeout` seconds (default 3). After `max_failed` consecutive failed probes (default 1) the service is declared unhealthy: its control channel is dropped, so the server stops serving it and visitors fail fast instead of being forwarded to a dead local service. Once a probe succeeds again, the client re-registers the service automatically.
+- Two probe types: `type = "tcp"` (default) opens a TCP connection to the service; `type = "http"` sends an HTTP GET to `http_path` (default `/`) and accepts any 2xx/3xx response.
+- Example: `health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }`.
+
 ### UDP services
 
-- UDP datagrams are limited by the internal buffer size (2048 bytes); larger datagrams are truncated. This fits typical DNS/NTP/game traffic but not jumbo payloads.
+- UDP datagrams are limited by the internal buffer size (2048 bytes); larger datagrams are dropped (the packet is discarded and the channel stays usable). This fits typical DNS/NTP/game traffic but not jumbo payloads.
 - UDP forwarding is connectionless: the client maps visitor addresses to local sockets and cleans up idle mappings after 60 seconds.
+- `health_check` does not apply to UDP services.
 
 ### Transport specifics
 
