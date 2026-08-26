@@ -31,12 +31,12 @@ To enable this, disable the default features and enable `rustls` feature. And fo
 You can also use command line option for this. For example, to replace all default features with `rustls`:
 
 ```sh
-cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
 ```
 
 Feature `rustls` and `websocket-rustls` cannot be enabled with `native-tls` and `websocket-native-tls` at the same time, as they are mutually exclusive. Enabling both will result in a compile error.
 
-(Note that default features contains `native-tls` and `websocket-native-tls`.)
+(Note that the default feature set also contains `multiplex`.)
 
 ## Minimalize the binary
 

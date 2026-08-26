@@ -40,14 +40,38 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 - **高性能** 具有更高的吞吐量，高并发下更稳定。
 - **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
-- **安全性** 每个服务单独强制鉴权。Server 和 Client 负责各自的配置。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
-- **热重载** 支持配置文件热重载，动态修改端口转发服务。
+- **客户端声明服务** 从 v0.7 起，服务端不再需要逐服务配置：客户端声明要暴露的内容（包括公网端口），服务端只通过 `allow_ports` 白名单和共享 `default_token` 执行策略。
+- **多路复用** 默认情况下，每个服务的数据通道都作为 yamux 流跑在一条隧道连接上，省去每条连接的握手并显著减少文件描述符。设置 `mux = false` 可恢复每条通道一条连接的模式（未编译 `multiplex` 特性的精简构建始终使用该模式）。
+- **安全性** 共享 token 强制鉴权，`allow_ports` 白名单限制客户端可暴露的端口。使用 Noise Protocol 可以简单地配置传输加密，而不需要自签证书。同时也支持 TLS。
+- **热重载** 支持配置文件热重载，动态添加或移除端口转发服务。
+
+## 基准测试
+
+与上一版本及 frp 的回环对比（明文 TCP，单机拓扑
+`访客 -> 服务端 -> 客户端 -> 后端`）。各工具吞吐均打满回环带宽——
+真正的差异在每条连接的路径开销：
+
+![Benchmark: molehill v0.7.0 vs v0.6.4 vs frp 0.71.0](assets/benchmark-v0.7.0.png)
+
+| 工具 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存（平均 RSS） | 占 frp 比例 |
+|---|---|---|---|---|---|---|
+| **molehill 0.7.0**（mux，默认） | 49.8 | 63.8 | **0.249 ms** | 0.319 ms | **16.9 MiB** | **35.8%** |
+| molehill 0.7.0（`mux = false`） | 50.1 | 63.7 | 0.218 ms | 0.259 ms | 16.8 MiB | 35.7% |
+| molehill 0.6.4 | 51.3 | 64.0 | 0.239 ms | 0.325 ms | 16.5 MiB | 35.0% |
+| frp 0.71.0 | 49.3 | 64.0 | 0.380 ms | 0.594 ms | 47.1 MiB | 100% |
+
+- 多路复用开启（默认）时，连接路径延迟比 frp **p50 低约 35%，p99 低约 46%**。
+- 内存为服务端 + 客户端在回环 iperf3 流量下采样的常驻内存（RSS）；
+  molehill 的内存占用约为 frp 的 **35%**（越低越好）。
+- 吞吐已打满回环、各工具统计上无差异，仅作为上限参考。
+- 复现方式：`benches/scripts/bench/run_bench.sh`
+  （原始数据 `benches/scripts/bench/results-v0.7.0.json`，绘图 `plot_bench.py`）。
 
 ## 快速开始
 
 一个全功能的 `molehill` 可以从 [release](https://github.com/NIyueeE/molehill/releases) 页面下载。或者 [从源码编译](docs/build-guide.md) **获取其他平台和最小化的二进制文件**。
 
-`molehill` 的使用和 frp 非常类似，如果你有后者的使用经验，那配置对你来说非常简单，区别只是转发服务的配置分离到了服务端和客户端，并且必须要设置 token。
+`molehill` 的使用和 frp 非常类似：转发服务由客户端声明，服务端只配置共享 token 和端口策略。
 
 使用 molehill 需要一个有公网 IP 的服务器，和一个在 NAT 或防火墙后的设备，其中有些服务需要暴露在互联网上。
 
@@ -61,10 +85,8 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 # server.toml
 [server]
 bind_addr = "0.0.0.0:2333" # `2333` 配置了服务端监听客户端连接的端口
-
-[server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 用于验证客户端身份的 token，改为只有你知道的任意值
-bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网的端口
+default_token = "change-me" # 共享 token，客户端必须一致
+allow_ports = ["5202"] # 允许客户端注册的公网端口
 ```
 
 然后运行:
@@ -81,10 +103,11 @@ bind_addr = "0.0.0.0:5202" # `5202` 配置了将 `my_nas_ssh` 暴露给互联网
 # client.toml
 [client]
 remote_addr = "myserver.com:2333" # 服务器的地址，端口必须和 `server.bind_addr` 中的端口一致
+default_token = "change-me" # 必须和服务端一致才能通过验证
 
 [client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # 必须和服务端一致才能通过验证
 local_addr = "127.0.0.1:22" # 需要被转发的服务地址
+remote_bind_addr = "0.0.0.0:5202" # 在服务端暴露的公网地址
 ```
 
 然后运行:
@@ -125,7 +148,7 @@ local_addr = "127.0.0.1:22" # 需要被转发的服务地址
 ### 容器
 
 官方多架构镜像（linux/amd64、linux/arm64）发布在
-`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 8 MiB），以非 root UID 1000 运行，并内置了 CA 证书用于 TLS 验证。
+`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 8 MiB），以非 root UID 1000 运行，内置了 CA 证书用于 TLS 验证，并且与常规发布构建使用相同的默认特性集（包含多路复用）。
 
 ```bash
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \

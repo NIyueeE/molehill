@@ -30,6 +30,8 @@ jobs:
         run: cargo check
       - name: cargo clippy
         run: cargo clippy -- -D warnings
+      - name: cargo clippy (server+client only, no hot-reload/multiplex)
+        run: cargo clippy --all-targets --no-default-features --features server,client -- -D warnings
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo audit
@@ -52,12 +54,34 @@ jobs:
         with:
           toolchain: "stable"
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests with native-tls
-        run: cargo test --verbose
+      - name: Run tests with native-tls (multiplex is in the default feature set)
+        run: cargo test --verbose -- --test-threads=1
       - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload -- --test-threads=1
+      - name: Run tests with rustls + multiplex
+        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex -- --test-threads=1
       - name: Run tests with embedded (noise-only)
-        run: cargo test --verbose --no-default-features --features embedded
+        run: cargo test --verbose --no-default-features --features embedded -- --test-threads=1
+      - name: Run lib tests with server+client only (no hot-reload/multiplex)
+        run: cargo test --lib --verbose --no-default-features --features server,client
+
+  size:
+    name: Minimal build size
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "stable"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build minimal profile (must not include multiplex)
+        run: cargo build --profile minimal --no-default-features --features client
+      - name: Record binary size
+        run: |
+          ls -la target/minimal/molehill
+          SIZE=$(stat -c%s target/minimal/molehill)
+          echo "minimal binary size: $SIZE bytes"
+          echo "$SIZE" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build for ${{ matrix.target }}
@@ -86,7 +110,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         if: matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --verbose
+        run: cargo test --verbose -- --test-threads=1
       - name: Build
         run: cargo build
       - name: Smoke test

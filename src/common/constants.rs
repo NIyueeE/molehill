@@ -1,11 +1,12 @@
 use backon::ExponentialBuilder;
 use std::time::Duration;
 
-/// Receive buffer size for UDP sockets.
+/// Default receive buffer size for UDP sockets.
 ///
 /// Covers the maximum Ethernet payload (1500) with IP/UDP header overhead
-/// plus some headroom, while remaining safe for stack allocation.
-pub const UDP_BUFFER_SIZE: usize = 2048;
+/// plus some headroom. Configurable per service (`udp_buffer_size`); the wire
+/// format carries a `u16` length, so any value up to 65535 is compatible.
+pub const DEFAULT_UDP_BUFFER_SIZE: usize = 2048;
 
 /// Per-direction userspace buffer for bidirectional TCP copying.
 ///
@@ -17,15 +18,16 @@ pub const UDP_BUFFER_SIZE: usize = 2048;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const TCP_COPY_BUFFER_SIZE: usize = 32 * 1024;
 
-#[cfg(feature = "client")]
-pub const UDP_SENDQ_SIZE: usize = 1024;
-#[cfg(feature = "client")]
-pub const UDP_TIMEOUT: u64 = 60;
+/// Default number of pre-established data channels per TCP service.
+pub const DEFAULT_TCP_POOL_SIZE: u16 = 8;
+/// Default number of pre-established data channels per UDP service.
+pub const DEFAULT_UDP_POOL_SIZE: u16 = 2;
 
-#[cfg(feature = "server")]
-pub fn listen_backoff() -> ExponentialBuilder {
-    ExponentialBuilder::default().with_max_delay(Duration::from_secs(1))
-}
+/// Default queue size for outbound UDP datagrams per data channel.
+pub const DEFAULT_UDP_SENDQ_SIZE: usize = 1024;
+/// Default idle timeout (seconds) after which an inactive UDP peer mapping is
+/// cleaned up on the client side.
+pub const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
 
 #[cfg(feature = "client")]
 pub fn run_control_chan_backoff(interval: u64) -> ExponentialBuilder {

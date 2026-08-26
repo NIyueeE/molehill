@@ -8,20 +8,51 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
 
-use crate::common::constants::UDP_BUFFER_SIZE;
+use crate::config::ServiceType;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
+const _PROTO_V1: u8 = 1u8;
+const PROTO_V2: u8 = 2u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
 
+/// The client-driven service registration sent right after the control
+/// channel authentication succeeds.
+///
+/// The server owns no per-service configuration: everything needed to expose
+/// a service (its name, type and public bind address) is declared by the
+/// client and validated against the server-side policy (`allow_ports`,
+/// `max_pool_size`).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ServiceRegistration {
+    pub name: String,
+    pub service_type: ServiceType,
+    /// Public address the service is exposed at, chosen by the client.
+    pub bind_addr: SocketAddr,
+    /// Requested number of pre-established data channels. The server clamps
+    /// this to `[server].max_pool_size`.
+    pub pool_size: u16,
+    /// Receive buffer size for UDP datagrams of this service. Ignored for
+    /// TCP services. Wire-compatible up to `u16::MAX`.
+    pub udp_buffer_size: u16,
+}
+
+/// Hard upper bound for the encoded size of a [`ServiceRegistration`] frame.
+pub const MAX_REGISTRATION_LEN: usize = 1024;
+
+/// Variant names mirror the wire contract and stay stable across versions.
+#[allow(clippy::enum_variant_names)]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
     ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
     DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
+    /// The opening half of a *multiplexed data tunnel*: after this hello the
+    /// connection upgrades to yamux and every subsequent data channel is a
+    /// stream inside it. See the `multiplex` feature.
+    DataChannelTunnelHello(ProtocolVersion, Digest),
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -30,8 +61,11 @@ pub struct Auth(pub Digest);
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Ack {
     Ok,
-    ServiceNotExist,
     AuthFailed,
+    /// The client's service registration was rejected by the server policy
+    /// (port not allowed, port already in use, ...). The payload is a
+    /// human-readable reason for the client to log.
+    RegisterRejected(String),
 }
 
 impl std::fmt::Display for Ack {
@@ -41,8 +75,8 @@ impl std::fmt::Display for Ack {
             "{}",
             match self {
                 Ack::Ok => "Ok",
-                Ack::ServiceNotExist => "Service not exist",
                 Ack::AuthFailed => "Incorrect token",
+                Ack::RegisterRejected(reason) => reason,
             }
         )
     }
@@ -168,19 +202,21 @@ impl UdpTraffic {
 
     /// Read one framed datagram into an owned buffer.
     ///
-    /// Returns `Ok(None)` if an oversized datagram was received: its payload is
-    /// drained (keeping the stream in sync) and only that packet is dropped,
-    /// instead of tearing down the whole data channel.
+    /// `max_len` is the receiver's configured UDP buffer size: datagrams
+    /// larger than it cannot be handled and are dropped in-stream (payload is
+    /// drained so the framing stays in sync) instead of tearing down the data
+    /// channel.
     #[cfg_attr(not(feature = "client"), allow(dead_code))]
     pub async fn read<T: AsyncRead + Unpin>(
         reader: &mut T,
         hdr_len: u8,
+        max_len: usize,
     ) -> Result<Option<UdpTraffic>> {
         let hdr = read_udp_header(reader, hdr_len).await?;
 
         // A UDP payload larger than the receive buffer cannot originate from
         // this implementation; drop it while keeping the stream usable.
-        if hdr.len > UDP_BUFFER_SIZE as UdpPacketLen {
+        if hdr.len > max_len as UdpPacketLen {
             skip_oversized_payload(reader, hdr.len, hdr.from).await?;
             return Ok(None);
         }
@@ -202,10 +238,11 @@ impl UdpTraffic {
         reader: &mut T,
         hdr_len: u8,
         scratch: &mut BytesMut,
+        max_len: usize,
     ) -> Result<Option<(SocketAddr, usize)>> {
         let hdr = read_udp_header(reader, hdr_len).await?;
 
-        if hdr.len > UDP_BUFFER_SIZE as UdpPacketLen {
+        if hdr.len > max_len as UdpPacketLen {
             skip_oversized_payload(reader, hdr.len, hdr.from).await?;
             return Ok(None);
         }
@@ -282,16 +319,9 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
     let hello = postcard::from_bytes(&buf).with_context(|| "Failed to deserialize hello")?;
 
     match hello {
-        Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `molehill`.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
-        Hello::DataChannelHello(v, _) => {
+        Hello::ControlChannelHello(v, _)
+        | Hello::DataChannelHello(v, _)
+        | Hello::DataChannelTunnelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
                     "Protocol version mismatched. Expected {}, got {}. Please update `molehill`.",
@@ -314,6 +344,9 @@ pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resul
     postcard::from_bytes(&buf).with_context(|| "Failed to deserialize auth")
 }
 
+/// Fixed-size acks (auth result) keep using `read_ack`; variable-size ones
+/// (`RegisterRejected` carries a reason string) are exchanged through
+/// u16-length-prefixed frames via the helpers below.
 #[cfg(feature = "client")]
 pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
     let mut bytes = vec![0u8; PACKET_LEN.ack];
@@ -321,6 +354,94 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
         .await
         .with_context(|| "Failed to read ack")?;
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize ack")
+}
+
+/// Send a [`ServiceRegistration`] as a u16-length-prefixed frame.
+#[cfg(feature = "client")]
+pub async fn write_registration<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    reg: &ServiceRegistration,
+) -> Result<()> {
+    let payload = postcard::to_stdvec(reg).with_context(|| "Failed to serialize registration")?;
+    anyhow::ensure!(
+        payload.len() <= MAX_REGISTRATION_LEN,
+        "Registration message too large: {} bytes",
+        payload.len()
+    );
+    conn.write_u16(payload.len() as u16)
+        .await
+        .with_context(|| "Failed to write registration length")?;
+    conn.write_all(&payload)
+        .await
+        .with_context(|| "Failed to write registration")?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Read a framed [`ServiceRegistration`] sent by [`write_registration`].
+#[cfg(feature = "server")]
+pub async fn read_registration<T: AsyncRead + AsyncWrite + Unpin>(
+    conn: &mut T,
+) -> Result<ServiceRegistration> {
+    let len = conn
+        .read_u16()
+        .await
+        .with_context(|| "Failed to read registration length")?;
+    anyhow::ensure!(
+        len <= MAX_REGISTRATION_LEN as UdpPacketLen,
+        "Registration message too large: {} bytes",
+        len
+    );
+    let mut buf = vec![0u8; len as usize];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read registration")?;
+    let reg: ServiceRegistration =
+        postcard::from_bytes(&buf).with_context(|| "Failed to deserialize registration")?;
+    anyhow::ensure!(
+        !reg.name.is_empty(),
+        "Registration has an empty service name"
+    );
+    Ok(reg)
+}
+
+/// Read the framed registration result ack sent by the server after a
+/// [`write_registration`].
+#[cfg(feature = "client")]
+pub async fn read_register_result<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
+    let len = conn
+        .read_u16()
+        .await
+        .with_context(|| "Failed to read register result length")?;
+    anyhow::ensure!(
+        len <= MAX_REGISTRATION_LEN as UdpPacketLen,
+        "Register result too large: {} bytes",
+        len
+    );
+    let mut buf = vec![0u8; len as usize];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read register result")?;
+    postcard::from_bytes(&buf).with_context(|| "Failed to deserialize register result")
+}
+
+/// Send the framed registration result ack.
+#[cfg(feature = "server")]
+pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ack) -> Result<()> {
+    let payload = postcard::to_stdvec(ack).with_context(|| "Failed to serialize ack")?;
+    anyhow::ensure!(
+        payload.len() <= MAX_REGISTRATION_LEN,
+        "Register result too large: {} bytes",
+        payload.len()
+    );
+    conn.write_u16(payload.len() as u16)
+        .await
+        .with_context(|| "Failed to write register result length")?;
+    conn.write_all(&payload)
+        .await
+        .with_context(|| "Failed to write register result")?;
+    conn.flush().await?;
+    Ok(())
 }
 
 #[cfg(feature = "client")]
@@ -402,13 +523,17 @@ mod tests {
 
     #[test]
     fn ack_roundtrip_all_variants() {
-        for ack in [Ack::Ok, Ack::ServiceNotExist, Ack::AuthFailed] {
+        for ack in [
+            Ack::Ok,
+            Ack::AuthFailed,
+            Ack::RegisterRejected("port not allowed".to_string()),
+        ] {
             let bytes = postcard::to_stdvec(&ack).unwrap();
             let back: Ack = postcard::from_bytes(&bytes).unwrap();
             match (&ack, &back) {
                 (Ack::Ok, Ack::Ok) => {}
-                (Ack::ServiceNotExist, Ack::ServiceNotExist) => {}
                 (Ack::AuthFailed, Ack::AuthFailed) => {}
+                (Ack::RegisterRejected(a), Ack::RegisterRejected(b)) => assert_eq!(a, b),
                 _ => panic!("Ack round-trip mismatch"),
             }
         }
@@ -417,8 +542,28 @@ mod tests {
     #[test]
     fn ack_display() {
         assert_eq!(Ack::Ok.to_string(), "Ok");
-        assert_eq!(Ack::ServiceNotExist.to_string(), "Service not exist");
         assert_eq!(Ack::AuthFailed.to_string(), "Incorrect token");
+        assert_eq!(
+            Ack::RegisterRejected("Port 80 is privileged".to_string()).to_string(),
+            "Port 80 is privileged"
+        );
+    }
+
+    #[test]
+    fn registration_roundtrip() {
+        let reg = ServiceRegistration {
+            name: "ssh".to_string(),
+            service_type: crate::config::ServiceType::Tcp,
+            bind_addr: sample_addr(),
+            pool_size: 8,
+            udp_buffer_size: 2048,
+        };
+        let bytes = postcard::to_stdvec(&reg).unwrap();
+        assert!(bytes.len() <= MAX_REGISTRATION_LEN);
+        let back: ServiceRegistration = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.name, "ssh");
+        assert_eq!(back.bind_addr, sample_addr());
+        assert_eq!(back.pool_size, 8);
     }
 
     #[test]
@@ -482,7 +627,14 @@ mod tests {
         assert_eq!(scratch.len(), 1 + hdr_len + b"hello".len());
 
         let hdr_len = rx.read_u8().await.unwrap();
-        let packet = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        let packet = UdpTraffic::read(
+            &mut rx,
+            hdr_len,
+            crate::common::constants::DEFAULT_UDP_BUFFER_SIZE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(packet.from, sample_addr());
         assert_eq!(&packet.data[..], b"hello");
     }
@@ -501,7 +653,7 @@ mod tests {
             .await
             .unwrap();
 
-        let oversized_len = UDP_BUFFER_SIZE as u16 + 1;
+        let oversized_len = crate::common::constants::DEFAULT_UDP_BUFFER_SIZE as u16 + 1;
         let hdr = UdpHeader {
             from: sample_addr(),
             len: oversized_len,
@@ -518,14 +670,37 @@ mod tests {
             .unwrap();
 
         let hdr_len = rx.read_u8().await.unwrap();
-        let first = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        let first = UdpTraffic::read(
+            &mut rx,
+            hdr_len,
+            crate::common::constants::DEFAULT_UDP_BUFFER_SIZE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&first.data[..], b"first");
 
         let hdr_len = rx.read_u8().await.unwrap();
-        assert!(UdpTraffic::read(&mut rx, hdr_len).await.unwrap().is_none());
+        assert!(
+            UdpTraffic::read(
+                &mut rx,
+                hdr_len,
+                crate::common::constants::DEFAULT_UDP_BUFFER_SIZE
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
 
         let hdr_len = rx.read_u8().await.unwrap();
-        let last = UdpTraffic::read(&mut rx, hdr_len).await.unwrap().unwrap();
+        let last = UdpTraffic::read(
+            &mut rx,
+            hdr_len,
+            crate::common::constants::DEFAULT_UDP_BUFFER_SIZE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&last.data[..], b"last");
     }
 
@@ -542,10 +717,15 @@ mod tests {
 
         let hdr_len = rx.read_u8().await.unwrap();
         let mut payload = BytesMut::new();
-        let (from, len) = UdpTraffic::read_slice(&mut rx, hdr_len, &mut payload)
-            .await
-            .unwrap()
-            .unwrap();
+        let (from, len) = UdpTraffic::read_slice(
+            &mut rx,
+            hdr_len,
+            &mut payload,
+            crate::common::constants::DEFAULT_UDP_BUFFER_SIZE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(from, sample_addr());
         assert_eq!(len, 100);
         assert_eq!(&payload[..len], &[7u8; 100]);

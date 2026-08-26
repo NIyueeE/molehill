@@ -83,7 +83,7 @@ pub mod tcp {
 }
 
 pub mod udp {
-    use molehill_rathole::UDP_BUFFER_SIZE;
+    use molehill_rathole::DEFAULT_UDP_BUFFER_SIZE;
     use tokio::net::UdpSocket;
     use tracing::debug;
 
@@ -93,7 +93,7 @@ pub mod udp {
         let l = UdpSocket::bind(addr).await?;
         debug!("UDP echo server listening");
 
-        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let mut buf = [0u8; DEFAULT_UDP_BUFFER_SIZE];
         loop {
             let (n, addr) = l.recv_from(&mut buf).await?;
             debug!("Get {:?} from {}", &buf[..n], addr);
@@ -104,7 +104,7 @@ pub mod udp {
     pub async fn pingpong_server<A: ToSocketAddrs>(addr: A) -> Result<()> {
         let l = UdpSocket::bind(addr).await?;
 
-        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let mut buf = [0u8; DEFAULT_UDP_BUFFER_SIZE];
         loop {
             let (n, addr) = l.recv_from(&mut buf).await?;
             assert_eq!(&buf[..n], PING.as_bytes());

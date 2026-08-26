@@ -2,11 +2,7 @@
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
-#[cfg(feature = "server")]
-use backon::Retryable;
 use socket2::{SockRef, TcpKeepalive};
-#[cfg(feature = "server")]
-use std::future::Future;
 #[cfg(feature = "client")]
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,8 +11,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(feature = "client")]
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
-#[cfg(feature = "server")]
-use tokio::sync::broadcast;
 use tracing::trace;
 use url::Url;
 
@@ -174,30 +168,6 @@ pub async fn tcp_connect_with_proxy(
 }
 
 // Wrapper of retry with shutdown deadline
-#[cfg(feature = "server")]
-pub async fn retry_notify_with_deadline<I, E, Op, Fut, B, N>(
-    backoff: B,
-    operation: Op,
-    notify: N,
-    deadline: &mut broadcast::Receiver<bool>,
-) -> Result<I>
-where
-    E: std::error::Error + Send + Sync + 'static,
-    B: backon::BackoffBuilder,
-    Op: Fn() -> Fut,
-    Fut: Future<Output = std::result::Result<I, E>>,
-    N: Fn(&E, Duration) + Send + Sync,
-{
-    tokio::select! {
-        v = operation.retry(backoff).notify(notify) => {
-            v.map_err(anyhow::Error::new)
-        }
-        _ = deadline.recv() => {
-            Err(anyhow!("shutdown"))
-        }
-    }
-}
-
 #[cfg(feature = "server")]
 pub async fn write_and_flush<T>(conn: &mut T, data: &[u8]) -> Result<()>
 where

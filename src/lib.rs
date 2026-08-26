@@ -7,12 +7,13 @@ mod cli;
 mod common;
 mod config;
 mod core;
+pub mod logging;
 mod protocol;
 mod transport;
 
 pub use cli::Cli;
 use cli::KeypairType;
-pub use common::constants::UDP_BUFFER_SIZE;
+pub use common::constants::DEFAULT_UDP_BUFFER_SIZE;
 pub use config::Config;
 
 use anyhow::{Result, anyhow};

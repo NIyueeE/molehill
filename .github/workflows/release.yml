@@ -64,14 +64,14 @@ jobs:
             cross: false
             # Full rustls feature set: static musl binary, no OpenSSL.
             # Used as the linux/amd64 container image artifact.
-            features: server,client,rustls,noise,websocket-rustls,hot-reload
+            features: server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             exe: molehill
             cross: true
             # Same feature set as x86_64 musl so the linux/arm64 container
             # image artifact is feature-consistent with linux/amd64.
-            features: server,client,rustls,noise,websocket-rustls,hot-reload
+            features: server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             exe: molehill
@@ -278,6 +278,12 @@ jobs:
           push: true
           platforms: linux/amd64, linux/arm64
           tags: ghcr.io/niyueee/molehill:latest, ghcr.io/niyueee/molehill:${{ github.ref_name }}
+      - name: Smoke test pushed container image
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 ghcr.io/niyueee/molehill:${{ github.ref_name }}
+          docker run --rm ghcr.io/niyueee/molehill:${{ github.ref_name }} --help
+          docker buildx imagetools inspect ghcr.io/niyueee/molehill:${{ github.ref_name }}
 
   publish-crate:
     name: Publish to crates.io

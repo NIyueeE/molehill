@@ -3,9 +3,12 @@ pub mod watcher;
 
 #[cfg(any(feature = "client", feature = "notify"))]
 pub use parsing::{ClientConfig, ClientServiceConfig, HealthCheckConfig, HealthCheckType};
-pub use parsing::{Config, ServiceType, TcpConfig, TransportConfig, TransportType};
-#[cfg(any(feature = "server", feature = "notify"))]
-pub use parsing::{ServerConfig, ServerServiceConfig};
+// Public API re-exports: some names are only consumed by feature-gated
+// modules, so client-only builds would otherwise warn about `ServerConfig`.
+#[allow(unused_imports)]
+pub use parsing::{
+    Config, MaskedString, ServerConfig, ServiceType, TcpConfig, TransportConfig, TransportType,
+};
 // Only used by the TLS transports, which are not compiled in embedded builds
 #[cfg(any(feature = "native-tls", feature = "rustls"))]
 pub use parsing::TlsConfig;
@@ -17,5 +20,3 @@ pub use watcher::{ConfigChange, ConfigWatcherHandle};
 // Service-level change events, consumed by the matching run mode
 #[cfg(all(feature = "client", feature = "notify"))]
 pub use watcher::ClientServiceChange;
-#[cfg(all(feature = "server", feature = "notify"))]
-pub use watcher::ServerServiceChange;

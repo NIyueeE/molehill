@@ -22,11 +22,11 @@ cargo build --release
 cargo build --profile minimal --no-default-features --features client
 
 # Build with rustls instead of native-tls
-cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
 
 # Container image (packages a pre-built static musl binary into a scratch image)
 cargo build --release --target x86_64-unknown-linux-musl \
-  --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+  --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
 mkdir -p img/bin/amd64
 cp target/x86_64-unknown-linux-musl/release/molehill img/bin/amd64/
 cp /etc/ssl/certs/ca-certificates.crt img/bin/amd64/
@@ -141,11 +141,11 @@ Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the old
   - `helper.rs`: DNS resolution, keepalive, UDP connect, retry helpers
   - `multi_map.rs`: Multi-value hash map (used in server for connection pools)
 - `src/config.rs` + `src/config/`: Configuration
-  - `parsing.rs`: TOML parsing/validation with serde. Key types: `Config`, `ClientConfig`, `ServerConfig`, `ClientServiceConfig`, `ServerServiceConfig`. Uses `MaskedString` to avoid leaking tokens in debug logs.
+  - `parsing.rs`: TOML parsing/validation with serde. Key types: `Config`, `ClientConfig`, `ServerConfig`, `ClientServiceConfig`, `PortRange`. The server owns no per-service config; clients register services at runtime against the server's `allow_ports` policy. Uses `MaskedString` to avoid leaking tokens in debug logs.
   - `watcher.rs`: Hot-reload file watcher (behind `hot-reload` feature). Sends `ConfigChange` variants over an mpsc channel.
 - `src/core.rs` + `src/core/`: Client and server implementations
   - `client.rs`: Client mode (feature-gated on `client`). `Client<T: Transport>` generic struct. Handles control channel setup, authentication, data channel requests from server.
-  - `server.rs`: Server mode (feature-gated on `server`). `Server<T: Transport>` generic struct. Listens for visitors, creates data channels, manages connection pools. Key constants: `TCP_POOL_SIZE=8`, `UDP_POOL_SIZE=2`, `CHAN_SIZE=2048`.
+  - `server.rs`: Server mode (feature-gated on `server`). `Server<T: Transport>` generic struct. Validates client registrations, binds service endpoints eagerly, manages connection pools. Pool sizes are per-service registration values clamped by `[server].max_pool_size`; `CHAN_SIZE=2048`.
 - `src/transport.rs` + `src/transport/`: Transport layer
   - `tcp.rs`: Plain TCP transport
   - `native_tls.rs` / `rustls.rs`: TLS transports (mutually exclusive features via compile_error! macro)
@@ -166,13 +166,12 @@ Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the old
    - `hot-reload`: Config file watching
    - `embedded`: Minimal feature set for embedded devices
 
-4. **Protocol Flow**:
-   - Client establishes a control channel to the server for each service
-   - Server challenges client with a nonce; client authenticates with a service token
-   - When a visitor connects to the server's `bind_addr`, the server sends `CreateDataChannel` via the control channel
-   - Client connects back to create a data channel
-   - Server also pre-creates data channels to reduce latency
-   - For UDP services, traffic is framed with a `UdpHeader` (source address + length) and sent over the data channel
+4. **Protocol Flow** (v2):
+   - Client establishes a control channel per service; server sends a nonce challenge; client answers with `sha256(default_token || nonce)`
+   - After auth the client sends a framed `RegisterService` message; the server validates against `allow_ports`, binds eagerly, and replies with a framed ack (`RegisterRejected(reason)` on failure)
+   - When a visitor connects, the server sends `CreateDataChannel` via the control channel; the client opens a data channel back (a plain transport connection or a tunnel stream)
+   - The server pre-creates data channels (pool) to reduce visitor latency
+   - For UDP services, traffic is framed with a `UdpHeader` (source address + length); oversized datagrams are dropped in-stream
 
 5. **Config Watcher**: `lib.rs` spawns a `ConfigWatcherHandle` that monitors the config file. General config changes trigger a full restart; service-level changes are sent via an mpsc channel to the running instance for hot updates.
 
@@ -180,7 +179,11 @@ Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the old
 
 7. **Proxy Support**: Outbound connections can go through SOCKS5 or HTTP CONNECT proxies, configured via the `proxy` field on `TcpConfig`. Handled transparently during transport connection.
 
-8. **Connection Pooling**: The server maintains pools of pre-established data channels (`TCP_POOL_SIZE = 8` for TCP, `UDP_POOL_SIZE = 2` for UDP) to reduce connection latency for new visitors.
+8. **Connection Pooling**: Each registered service keeps a pool of pre-established data channels (per-service `pool_size`, default 8 for TCP / 2 for UDP, clamped by `[server].max_pool_size`) to reduce connection latency for new visitors.
+
+9. **Dynamic Service Registration** (v0.7+): clients declare services — name, type, `remote_bind_addr`, pool size — in a framed `RegisterService` message sent right after authentication. The server validates against `allow_ports`/privileged ports/conflicts, binds the endpoint, and replies with a framed ack; rejections carry a human-readable reason and are permanent for that run. Protocol version is v2 with hard mismatch rejection.
+
+10. **Multiplexing** (`multiplex` feature, in the default feature set): after registering, a client with `mux = true` (the default) dials an extra tunnel connection announced via `Hello::DataChannelTunnelHello`; both ends upgrade it to a yamux session and every subsequent data channel is a stream (`src/transport/multiplex.rs`). The server adapts per connection, so no cross-end mux configuration is required. Window/stream-count setters must respect upstream's invariant (see `mux_config`). yamux opens outbound streams lazily (SYN rides on the first outbound frame), so the client driver sends a zero-length kick before handing out each stream — pooled streams read first (`StartForward*`) and would otherwise never be announced. `mux = false` keeps the one-connection-per-channel path, and the integration matrix runs every transport through both.
 
 ## Feature Flags
 
@@ -194,6 +197,7 @@ Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the old
 | `websocket-native-tls` | WebSocket transport with native-tls |
 | `websocket-rustls` | WebSocket transport with rustls |
 | `hot-reload` | Configuration file hot-reloading |
+| `multiplex` | yamux data-channel multiplexing over one tunnel connection (in `default`; excluded from `minimal`/`embedded`) |
 | `embedded` | Minimal feature set for embedded devices |
 | `console` | Tokio console debugging support |
 
@@ -235,6 +239,14 @@ GitHub Actions in `.github/workflows/`:
 - `docs/build-guide.md`: Build customization, rustls support, and binary size minimization.
 - `docs/internals.md`: Conceptual overview of control/data channels and forwarding process.
 
-## Known TODOs
+## Done in 0.7.0 / Remaining TODOs
 
-Deferred items are tracked in the "Planning" section of `README.md` (e.g. HTTP API, configurable UDP buffer size, visitor IP allowlist, UDP idle timeout, per-service connection limits).
+Shipped in 0.7.0: dynamic client-side service registration with `allow_ports`
+policy, configurable pool sizes, `udp_buffer_size`/`udp_idle_timeout`/
+`udp_sendq_size`, colored span-aware logging, and yamux multiplexing
+(`multiplex` feature in the default set, `mux = true` by default; `mux =
+false` retains the one-connection-per-channel path).
+
+Still deferred (see `HANDOFF.md`): HTTP API for configuration, visitor IP
+allowlist, per-service bandwidth limiting, QUIC transport, single-control-
+channel consolidation.

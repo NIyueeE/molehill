@@ -1,12 +1,12 @@
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
+default_token = "default_token_if_not_specify" # Necessary. Must match `[server].default_token`
 heartbeat_timeout = 40 # Optional. Must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. Default: 1 second
 prefer_ipv6 = false # Optional. Default: false
 
 [client.transport]
-type = "tcp" # Optional. Possible values: ["tcp", "tls"]. Default: "tcp"
+type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
 
 [client.transport.tcp] # Optional. TCP socket options (also apply to `tls` and `noise`)
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect through a proxy
@@ -28,21 +28,28 @@ psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 [client.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # Necessary. TLS on the WebSocket connection
 
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
+[client.services.service1]
+type = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 prefer_ipv6 = false # Optional. If the client prefers to use IPv6 when connecting to the server (e.g.: When the client is behind an ISP's NAT). Default: false
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
-nodelay = true # Optional. Override the global `nodelay` per service
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
+remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server
+nodelay = true # Optional. Override the default nodelay behavior per service
 retry_interval = 1 # Optional. Override the global `retry_interval` per service
+pool_size = 8 # Optional. Requested number of pre-established data channels. Default: 8 for TCP, 2 for UDP
 
-[client.services.service2] # Multiple services can be defined
-type = "udp" # Optional. A UDP service
+[client.services.service2]
+type = "udp"
 local_addr = "127.0.0.1:1082"
+remote_bind_addr = "0.0.0.0:8082"
+udp_buffer_size = 2048 # Optional. Receive buffer size for datagrams in bytes. Default: 2048, max 65535
+udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped. Default: 60
+udp_sendq_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change. 
-default_token = "default_token_if_not_specify" # Optional
+bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients.
+default_token = "default_token_if_not_specify" # Necessary. Must match `[client].default_token`
+allow_ports = ["6000-6999", "8080-8090"] # Necessary to enable dynamic registration. Empty or missing = all registrations rejected. Privileged ports (<1024) must be listed explicitly
+max_pool_size = 16 # Optional. Upper bound applied to every service's requested pool_size. Default: no limit
 heartbeat_interval = 30 # Optional. Default: 30 seconds
 
 [server.transport]
@@ -59,20 +66,10 @@ pkcs12_password = "password" # Necessary. Password of the pkcs12 file
 
 [server.transport.noise] # Same as `[client.transport.noise]`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64" 
-remote_public_key = "key_encoded_in_base64" 
+local_private_key = "key_encoded_in_base64"
+remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
 [server.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # Necessary. TLS on the WebSocket connection
-
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]
-token = "whatever" # Necesary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change. 
-nodelay = true # Optional. Override the global `nodelay` per service
-
-[server.services.service2] 
-type = "udp" # Optional. A UDP service
-bind_addr = "0.0.0.1:8082"

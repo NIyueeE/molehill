@@ -8,32 +8,39 @@ Before heading to the full configuration specification, it's recommend to skim [
 
 See [Transport](./transport.md) for more details about encryption and the `transport` block.
 
-## How to configure
+## How to configure (v0.7+ model)
 
-The client and server configs must agree on three things:
+Since v0.7 the **client owns the service definitions** and the server owns
+only the policy:
 
-1. **The transport type**: `[client.transport].type` and `[server.transport].type` must be identical.
-2. **The service names**: `[client.services.<name>]` and `[server.services.<name>]` must use the same `<name>` on both sides.
-3. **The tokens**: each service's token on the client side must equal the one on the server side (or both sides use the same `default_token`).
+- The client declares each forwarded service in its own config — including
+  the public address it should be exposed at (`remote_bind_addr`).
+- The server has **no** per-service configuration. When a client connects, it
+  registers its services at runtime; the server validates every registration
+  against its `allow_ports` whitelist before exposing anything.
+- Both sides authenticate with one shared secret (`default_token`).
 
 A typical setup:
 
 1. Pick a transport — `tcp` (plain), `tls`, `noise`, or `websocket` — and generate any keys or certificates it needs (see [Transport](./transport.md)).
-2. Write `server.toml` with `[server]`, `[server.transport]`, and one `[server.services.<name>]` block per service. `server.bind_addr` is the address clients connect to; each service's `bind_addr` is the port visitors will use.
-3. Write `client.toml` with `[client]`, `[client.transport]`, and matching `[client.services.<name>]` blocks. `client.remote_addr` must point at the server's `bind_addr` (host:port); `local_addr` is where the local service listens.
+2. Write `server.toml`: `[server]` with `bind_addr`, `default_token` and the `allow_ports` whitelist. That's all.
+3. Write `client.toml`: `[client]` with `remote_addr` + the same `default_token`, and one `[client.services.<name>]` block per service: `local_addr` (where your service listens) and `remote_bind_addr` (the public endpoint).
 4. Start the server first, then the client. Both run indefinitely; the client retries automatically while the server is unreachable.
 
-A complete, ready-to-use example covering every option is in [examples/full](../examples/full/).
+> **Migrating from ≤0.6**: delete the whole `[server.services.*]` section; move each service's `bind_addr` into the client's `remote_bind_addr`; replace per-service tokens with `default_token`; add `allow_ports` on the server. Both ends must be upgraded together (the protocol version changed).
 
 Here is the full configuration specification:
 
 ```toml
 [client]
 remote_addr = "example.com:2333" # Necessary. The address of the server
-default_token = "default_token_if_not_specify" # Optional. The default token of services, if they don't define their own ones
+default_token = "change-me" # Necessary. Must match `[server].default_token`
 heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.heartbeat_interval`. Default: 40 seconds
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: 1 second
 prefer_ipv6 = false # Optional. Prefer IPv6 when resolving remote addresses. Default: false
+mux = true # Optional. Multiplex every data channel over one physical connection (yamux). Enabled by default when the `multiplex` feature is compiled in (it is part of the default feature set). Set to false to restore one-connection-per-channel behavior
+mux_receive_window = 67108864 # Optional. Upper bound of the total yamux receive window per tunnel connection, in bytes. Only with `multiplex`. Default: rust-yamux default (1 GiB)
+mux_max_streams = 512 # Optional. Maximum concurrent streams per tunnel connection. Only with `multiplex`. Default: 512
 
 [client.transport] # The whole block is optional. Specify which transport to use
 type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
@@ -58,22 +65,32 @@ psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 [client.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `client.transport.tls`). Set to `false` for plain WebSocket.
 
-[client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
+[client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-token = "whatever" # Necessary if `client.default_token` not set
-local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
+remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
 nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 prefer_ipv6 = false # Optional. Override the `client.prefer_ipv6` per service
+pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`
 health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Probes the local service and removes it from the server while it is down (see "Health check" below)
 
 [client.services.service2] # Multiple services can be defined
+type = "udp"
 local_addr = "127.0.0.1:1082"
+remote_bind_addr = "0.0.0.0:8082"
+udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
+udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client. Default: 60
+udp_sendq_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be change.
-default_token = "default_token_if_not_specify" # Optional
+default_token = "change-me" # Necessary. Must match `[client].default_token`
+allow_ports = ["6000-6999", "8080"] # Necessary to enable dynamic registration. Empty or missing: ALL registrations are rejected. Privileged ports (<1024) must be listed explicitly
+max_pool_size = 16 # Optional. Upper bound applied to every service's requested pool_size. Default: no limit
 heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeat. Set to 0 to disable sending heartbeat. Default: 30 seconds
+mux_receive_window = 67108864 # Optional. Server-side total yamux receive window per tunnel connection. Only with `multiplex`. Default: rust-yamux default (1 GiB)
+mux_max_streams = 512 # Optional. Server-side maximum concurrent streams per tunnel connection. Only with `multiplex`. Default: 512
 
 [server.transport] # Same as `[client.transport]`
 type = "tcp"
@@ -96,16 +113,47 @@ psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
 [server.transport.websocket] # Necessary if `type` is "websocket"
 tls = true # Necessary. Set to `true` to enable TLS on the WebSocket connection (uses settings from `server.transport.tls`). Set to `false` for plain WebSocket.
-
-[server.services.service1] # The service name must be identical to the client side
-type = "tcp" # Optional. Same as the client `[client.services.X.type]`
-token = "whatever" # Necessary if `server.default_token` not set
-bind_addr = "0.0.0.0:8081" # Necessary. The address of the service is exposed at. Generally only the port needs to be change.
-nodelay = true # Optional. Same as the client. Default: true even when unset; set `false` to disable
-
-[server.services.service2]
-bind_addr = "0.0.0.1:8082"
 ```
+
+## Dynamic service registration
+
+There are no `[server.services.*]` blocks anymore. The lifecycle is:
+
+1. The client authenticates with `default_token`.
+2. For each configured service the client sends a `RegisterService` message:
+   name, type, `remote_bind_addr`, `pool_size`.
+3. The server validates:
+   - **whitelist**: the requested port must be covered by `allow_ports`;
+     an empty/missing `allow_ports` rejects *every* registration (this is
+     how you disable the feature entirely);
+   - **privileged ports**: ports below 1024 must be listed explicitly;
+   - **conflicts**: if the port is already bound, the registration fails
+     with `Port already in use`.
+4. On success the server binds the port immediately and starts forwarding.
+
+Rejections are permanent for that service run: the client logs the exact
+reason from the server and gives up until you fix the configuration or
+restart it. Service names must be unique per server; re-registration from a
+restarting client takes over cleanly.
+
+## Multiplexing (`multiplex` feature)
+
+The `multiplex` feature is part of the default feature set. With `mux = true`
+(the default), each service opens **one extra connection** after registering
+— the *tunnel* — and every subsequent data channel becomes a yamux stream
+inside it. This removes the per-connection TCP + TLS/Noise handshake latency
+and cuts FD usage under many concurrent visitors.
+
+- The decision belongs to the client alone (`mux = true/false`); the server
+  adapts per connection automatically.
+- `mux = false` restores the one-connection-per-channel path (used by the
+  integration matrix to keep both data paths continuously verified).
+- Stream receive windows auto-tune towards the bandwidth-delay product
+  (rust-yamux), so high-BDP links are not throttled like with stock yamux.
+- `mux_receive_window` / `mux_max_streams` bound the buffering and stream
+  count per tunnel; sensible defaults apply when unset.
+- Building without the feature removes the option entirely and always uses
+  the one-connection-per-channel path.
 
 ## Logging
 
@@ -119,6 +167,8 @@ will run `molehill` with only error level logging.
 
 If `RUST_LOG` is not present, the default logging level is `info`.
 
+Log lines carry colored levels (red ERROR, yellow WARN, green INFO, cyan DEBUG, purple TRACE) and the active span context, e.g. `handle{service=ssh}:`, so every line of a busy server tells you which service produced it. Colors are enabled only on terminals; redirected output stays plain (also honoring `NO_COLOR`). At `debug`/`trace` level the source module is appended to each line.
+
 ## Tuning
 
 From v0.4.7, molehill enables TCP_NODELAY by default on the transport-level connections, and now by default on every leg of a forwarded service as well: both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
@@ -131,13 +181,14 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 
 ### Network requirements
 
-- The **server** must be reachable from the Internet: `server.bind_addr` and every service `bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server).
+- The **server** must be reachable from the Internet: `server.bind_addr` and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server).
 - The **client** only needs outbound access to `server.bind_addr`; no inbound port is required behind the NAT.
 - `client.remote_addr` must use the same port as `server.bind_addr`.
 
 ### Security
 
-- Tokens are mandatory and per-service. Use long random values; both sides must agree on them.
+- The shared token is mandatory. Use long random values.
+- `allow_ports` is your authorization boundary: only list what clients genuinely need. Without it, the server exposes nothing regardless of what clients request.
 - The config file contains tokens in plain text, so restrict its permissions (e.g. `chmod 600 config.toml`). Tokens are masked (`MASKED`) in logs.
 - Use the `noise` or `tls` transport when traffic traverses untrusted networks; plain `tcp` forwards unencrypted.
 - The PKCS#12 file and Noise private keys are secrets too.
@@ -155,36 +206,38 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 
 ### UDP services
 
-- UDP datagrams are limited by the internal buffer size (2048 bytes); larger datagrams are dropped (the packet is discarded and the channel stays usable). This fits typical DNS/NTP/game traffic but not jumbo payloads.
-- UDP forwarding is connectionless: the client maps visitor addresses to local sockets and cleans up idle mappings after 60 seconds.
+- The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535); larger datagrams are dropped while the channel stays usable. Configure it identically on the service and remember that the server enforces its own copy received at registration time.
+- UDP forwarding is connectionless: the client maps visitor addresses to local sockets and cleans up idle mappings after `udp_idle_timeout` seconds (default 60).
 - `health_check` does not apply to UDP services.
 
 ### Transport specifics
 
 - **TLS**: with rustls builds, the server's PKCS#12 archive must use legacy PBE algorithms (with openssl 3, add `-legacy` when creating it). The client either pins `trusted_root` or falls back to the system certificate store.
 - **Noise**: generate keypairs with `molehill --genkey`. The server holds `local_private_key`; the client holds the server's `remote_public_key`. A `psk` must be 32 bytes, base64-encoded, identical on both sides, and the pattern must include a PSK modifier.
-- **Proxy**: `proxy` only applies to the client's outbound connection to the server. Both `socks5` and `http` (CONNECT), with optional basic auth, are supported.
+- **Proxy**: `proxy` only applies to the client's outbound connections to the server (control channel, tunnel, and non-multiplexed data channels). Both `socks5` and `http` (CONNECT), with optional basic auth, are supported.
 
 ### Hot reload
 
-- Editing the config file while running: general changes (transport, addresses, tokens) restart the instance; adding, removing, or modifying a service applies without a restart.
+- Editing the client config while running: general changes (transport, addresses, tokens, mux settings) restart the instance; adding, removing, or modifying a service applies without a restart (services are unregistered/re-registered over the existing control channels).
 - Keep the file valid while editing — an invalid config is rejected at startup or reload, and the previous state keeps running.
 
 ### Multiple services and instances
 
-- One client config can forward many services (multiple `[client.services.<name>]` blocks), and several clients can connect to the same server for different services.
+- One client config can forward many services (multiple `[client.services.<name>]` blocks), and several clients can connect to the same server. Each registered service name must be unique across all clients of a server.
 - To run several independent molehill pairs on one host, use different ports for `bind_addr` and separate config files (the systemd examples show templated instances).
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `Authentication failed: <service>` on the client | Token mismatch between client and server for that service. |
-| `No such a service` / handshake rejected | Service names differ between the two configs. |
+| `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
+| `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
+| `Protocol version mismatched ... Please update` | One side runs an older molehill. Upgrade both ends together (protocol v2 since 0.7.0). |
+| `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `remote_addr` port, or `server.bind_addr` not reachable. |
 | Repeated `Heartbeat timed out` | `heartbeat_timeout <= heartbeat_interval`, or the network path drops the connection. |
 | TLS `certificate verify failed` | `trusted_root`/`hostname` mismatch, expired certificate, or missing `trusted_root` for a self-signed setup. |
 | Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
 | `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |
-| UDP traffic not flowing | Check `type = "udp"` on both sides; remember the 2048-byte datagram limit; idle mappings time out after 60 seconds. |
+| UDP traffic not flowing | Check `type = "udp"`; datagrams larger than `udp_buffer_size` are dropped; idle mappings time out after `udp_idle_timeout` seconds. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |

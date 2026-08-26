@@ -1,12 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use molehill_rathole::{Cli, run};
-#[cfg(not(feature = "console"))]
-use std::io::IsTerminal;
+use molehill_rathole::{Cli, logging, run};
 use tokio::{signal, sync::broadcast};
 use tracing::{debug, info};
-#[cfg(not(feature = "console"))]
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,16 +32,8 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(feature = "console"))]
     {
-        let is_atty = std::io::stdout().is_terminal();
-
-        let level = "info"; // if RUST_LOG not present, use `info` level
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
-            )
-            .with_timer(tracing_subscriber::fmt::time::SystemTime)
-            .with_ansi(is_atty)
-            .init();
+        // Colored levels + span context; ANSI only on a TTY (respects NO_COLOR)
+        logging::init("info");
     }
 
     info!(

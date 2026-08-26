@@ -5,7 +5,8 @@ default_token = "123"
 [client.services.iperf3-udp]
 type = "udp"
 local_addr = "127.0.0.1:80"
-
+remote_bind_addr = "0.0.0.0:5202"
 [client.services.iperf3-tcp]
 type = "tcp"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:5202"

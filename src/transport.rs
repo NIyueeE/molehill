@@ -3,8 +3,6 @@ use crate::common::helper::to_socket_addr;
 use crate::common::helper::try_set_tcp_keepalive;
 #[cfg(feature = "client")]
 use crate::config::ClientServiceConfig;
-#[cfg(feature = "server")]
-use crate::config::ServerServiceConfig;
 use crate::config::{TcpConfig, TransportConfig};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -107,6 +105,11 @@ mod websocket;
 #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
 pub use websocket::WebsocketTransport;
 
+#[cfg(feature = "multiplex")]
+pub(crate) mod multiplex;
+#[cfg(feature = "multiplex")]
+pub(crate) use multiplex::MuxStream;
+
 #[derive(Debug, Clone, Copy)]
 struct Keepalive {
     // tcp_keepalive_time if the underlying protocol is TCP
@@ -159,7 +162,7 @@ impl SocketOpts {
     /// traffic like SSH suffers Nagle x delayed-ACK stalls. TCP keepalive is
     /// also enabled by default so pooled idle data channels don't hand out
     /// silently-dead connections to visitors.
-    fn for_service(nodelay: Option<bool>) -> SocketOpts {
+    pub fn for_service(nodelay: Option<bool>) -> SocketOpts {
         SocketOpts {
             nodelay: Some(nodelay.unwrap_or(DEFAULT_NODELAY)),
             keepalive: Some(Keepalive {
@@ -171,11 +174,6 @@ impl SocketOpts {
 
     #[cfg(feature = "client")]
     pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
-        Self::for_service(cfg.nodelay)
-    }
-
-    #[cfg(feature = "server")]
-    pub fn from_server_cfg(cfg: &ServerServiceConfig) -> SocketOpts {
         Self::for_service(cfg.nodelay)
     }
 

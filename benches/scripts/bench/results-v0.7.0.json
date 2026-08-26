@@ -1,0 +1,86 @@
+{
+  "meta": {
+    "date": "2026-08-26",
+    "reps": 3,
+    "seconds_per_rep": 8,
+    "latency_samples": 300,
+    "topology": "loopback visitor->server->client->backend",
+    "transport": "plain tcp",
+    "frp_version": "0.71.0",
+    "memory_samples_interval_s": 0.5
+  },
+  "results": {
+    "molehill 0.7.0 (mux)": {
+      "throughput_1stream_gbps": 49.827,
+      "throughput_8streams_gbps": 63.823,
+      "echo_rtt_ms": {
+        "p50": 0.249,
+        "p95": 0.289,
+        "p99": 0.319,
+        "mean": 0.251
+      },
+      "memory_rss_kb": {
+        "server_avg_kb": 8764,
+        "client_avg_kb": 8500,
+        "total_avg_kb": 17264,
+        "total_peak_kb": 17424,
+        "samples": 24,
+        "pct_of_frp": 35.8
+      }
+    },
+    "molehill 0.7.0 (mux=off)": {
+      "throughput_1stream_gbps": 50.099,
+      "throughput_8streams_gbps": 63.672,
+      "echo_rtt_ms": {
+        "p50": 0.218,
+        "p95": 0.246,
+        "p99": 0.259,
+        "mean": 0.218
+      },
+      "memory_rss_kb": {
+        "server_avg_kb": 8816,
+        "client_avg_kb": 8412,
+        "total_avg_kb": 17228,
+        "total_peak_kb": 17372,
+        "samples": 24,
+        "pct_of_frp": 35.7
+      }
+    },
+    "molehill 0.6.4": {
+      "throughput_1stream_gbps": 51.251,
+      "throughput_8streams_gbps": 63.95,
+      "echo_rtt_ms": {
+        "p50": 0.239,
+        "p95": 0.291,
+        "p99": 0.325,
+        "mean": 0.244
+      },
+      "memory_rss_kb": {
+        "server_avg_kb": 8556,
+        "client_avg_kb": 8328,
+        "total_avg_kb": 16884,
+        "total_peak_kb": 17028,
+        "samples": 24,
+        "pct_of_frp": 35.0
+      }
+    },
+    "frp 0.71.0": {
+      "throughput_1stream_gbps": 49.338,
+      "throughput_8streams_gbps": 63.981,
+      "echo_rtt_ms": {
+        "p50": 0.38,
+        "p95": 0.468,
+        "p99": 0.594,
+        "mean": 0.39
+      },
+      "memory_rss_kb": {
+        "server_avg_kb": 28348,
+        "client_avg_kb": 19876,
+        "total_avg_kb": 48224,
+        "total_peak_kb": 48224,
+        "samples": 24,
+        "pct_of_frp": 100.0
+      }
+    }
+  }
+}

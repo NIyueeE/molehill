@@ -14,11 +14,23 @@ use tracing_subscriber::EnvFilter;
 
 use crate::common::run_molehill_server;
 
+use std::path::PathBuf;
+
+#[cfg(feature = "multiplex")]
+use std::{
+    fs,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
 mod common;
 
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const HITTER_NUM: usize = 4;
+
+#[cfg(feature = "multiplex")]
+static MUX_CONFIG_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 enum Type {
@@ -43,6 +55,48 @@ fn init() {
         .try_init();
 }
 
+/// Materialize a copy of `config_path` with `[client].mux` pinned to `mux`.
+///
+/// Fixtures intentionally omit `mux` so they follow the compiled-in default
+/// (`true` with the `multiplex` feature). The explicit `mux = false` copy is
+/// what gives the integration matrix its non-multiplexed leg. The copy lives
+/// in the system temp dir and is removed after the scenario.
+#[cfg(feature = "multiplex")]
+fn write_mux_variant(config_path: &str, mux: bool) -> Result<PathBuf> {
+    let source = Path::new(config_path);
+    let contents = fs::read_to_string(source)?;
+    let mut doc: toml::Value = toml::from_str(&contents)?;
+    let client = doc
+        .get_mut("client")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("Test fixture {config_path} has no [client] table"))?;
+    client.insert("mux".to_owned(), toml::Value::Boolean(mux));
+
+    let stem = source
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("integration");
+    let variant = std::env::temp_dir().join(format!(
+        "molehill_it_{stem}_{}_{}.toml",
+        std::process::id(),
+        MUX_CONFIG_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&variant, toml::to_string(&doc)?)?;
+    Ok(variant)
+}
+
+/// Run one transport fixture through the full lifecycle with the default
+/// mux setting, then (when the feature is compiled in) again with mux
+/// explicitly disabled. This is the `{transport} × {mux±}` matrix.
+async fn test_transport(config_path: &'static str, t: Type) -> Result<()> {
+    test(config_path, t, None).await?;
+
+    #[cfg(feature = "multiplex")]
+    test(config_path, t, Some(false)).await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn tcp() -> Result<()> {
     init();
@@ -61,7 +115,7 @@ async fn tcp() -> Result<()> {
         }
     });
 
-    test("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
+    test_transport("tests/for_tcp/tcp_transport.toml", Type::Tcp).await?;
 
     #[cfg(any(
          // macOS native-tls (Security Framework) pops up a GUI dialog for
@@ -71,17 +125,17 @@ async fn tcp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
+    test_transport("tests/for_tcp/tls_transport.toml", Type::Tcp).await?;
 
     #[cfg(feature = "noise")]
-    test("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
+    test_transport("tests/for_tcp/noise_transport.toml", Type::Tcp).await?;
 
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
+    test_transport("tests/for_tcp/websocket_transport.toml", Type::Tcp).await?;
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
+    test_transport("tests/for_tcp/websocket_tls_transport.toml", Type::Tcp).await?;
 
     Ok(())
 }
@@ -104,7 +158,7 @@ async fn udp() -> Result<()> {
         }
     });
 
-    test("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
+    test_transport("tests/for_udp/tcp_transport.toml", Type::Udp).await?;
 
     #[cfg(any(
          // macOS native-tls (Security Framework) pops up a GUI dialog for
@@ -114,35 +168,50 @@ async fn udp() -> Result<()> {
          // On other OS accept run with either
          all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
      ))]
-    test("tests/for_udp/tls_transport.toml", Type::Udp).await?;
+    test_transport("tests/for_udp/tls_transport.toml", Type::Udp).await?;
 
     #[cfg(feature = "noise")]
-    test("tests/for_udp/noise_transport.toml", Type::Udp).await?;
+    test_transport("tests/for_udp/noise_transport.toml", Type::Udp).await?;
 
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_transport.toml", Type::Udp).await?;
+    test_transport("tests/for_udp/websocket_transport.toml", Type::Udp).await?;
 
     #[cfg(not(target_os = "macos"))]
     #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-    test("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
+    test_transport("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
     Ok(())
 }
 
 #[instrument]
-async fn test(config_path: &'static str, t: Type) -> Result<()> {
+async fn test(config_path: &'static str, t: Type, mux: Option<bool>) -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
         // Skip the test if the client or the server is not enabled
         return Ok(());
     }
+
+    // `None` uses the fixture as-is (compiled-in mux default). When the
+    // multiplex feature is present, `Some(false)` materializes an explicit
+    // no-mux copy so both data paths are exercised.
+    #[cfg(feature = "multiplex")]
+    let (run_config, variant) = match mux {
+        Some(mux) => {
+            let path = write_mux_variant(config_path, mux)?;
+            (path.to_string_lossy().into_owned(), Some(path))
+        }
+        None => (config_path.to_owned(), None),
+    };
+    #[cfg(not(feature = "multiplex"))]
+    let (run_config, _variant) = (config_path.to_owned(), None::<PathBuf>);
 
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
 
     // Start the client
     info!("start the client");
+    let client_config = run_config.clone();
     let client = tokio::spawn(async move {
-        run_molehill_client(config_path, client_shutdown_rx)
+        run_molehill_client(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -152,8 +221,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     // Start the server
     info!("start the server");
+    let server_config = run_config.clone();
     let server = tokio::spawn(async move {
-        run_molehill_server(config_path, server_shutdown_rx)
+        run_molehill_server(&server_config, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -171,8 +241,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     info!("restart the client");
     let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client_config = run_config.clone();
     let client = tokio::spawn(async move {
-        run_molehill_client(config_path, client_shutdown_rx)
+        run_molehill_client(&client_config, client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -190,8 +261,9 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
 
     info!("restart the server");
     let server_shutdown_rx = server_shutdown_tx.subscribe();
+    let server_config = run_config.clone();
     let server = tokio::spawn(async move {
-        run_molehill_server(config_path, server_shutdown_rx)
+        run_molehill_server(&server_config, server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -222,6 +294,11 @@ async fn test(config_path: &'static str, t: Type) -> Result<()> {
     client_shutdown_tx.send(true)?;
 
     let _ = tokio::join!(server, client);
+
+    #[cfg(feature = "multiplex")]
+    if let Some(path) = variant {
+        let _ = fs::remove_file(path);
+    }
 
     Ok(())
 }

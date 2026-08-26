@@ -1,6 +1,6 @@
 [client]
 remote_addr = "myserver.com:2333" # Your public server address
-
+default_token = "use_a_secret_that_only_you_know"
 [client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Must match the server side
 local_addr = "127.0.0.1:22" # Address of the service to be forwarded
+remote_bind_addr = "0.0.0.0:5202"

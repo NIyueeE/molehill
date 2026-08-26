@@ -1,0 +1,4 @@
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+allow_ports = ["6999-6000"]

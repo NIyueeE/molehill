@@ -1,0 +1,8 @@
+# The legacy `[server.services.*]` blocks were removed in 0.7.0
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+allow_ports = ["6000-6999"]
+
+[server.services.foo]
+bind_addr = "0.0.0.0:6080"

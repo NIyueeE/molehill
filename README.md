@@ -40,14 +40,42 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
-- **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
+- **Client-Authoritative Services** Since v0.7 the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
+- **Multiplexing** Every data channel rides as a yamux stream over one tunnel connection by default — no per-connection handshakes and dramatically fewer file descriptors. Set `mux = false` for the one-connection-per-channel path; builds without the `multiplex` feature (e.g. `embedded`/`minimal`) always use that path.
+- **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
+
+## Benchmarks
+
+Loopback comparison against the previous release and frp (plain TCP,
+`visitor -> server -> client -> backend` on one machine). Throughput
+saturates loopback for every tool — the differentiator is per-connection
+path overhead:
+
+![Benchmark: molehill v0.7.0 vs v0.6.4 vs frp 0.71.0](assets/benchmark-v0.7.0.png)
+
+| Tool | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) | % of frp |
+|---|---|---|---|---|---|---|
+| **molehill 0.7.0** (mux, default) | 49.8 | 63.8 | **0.249 ms** | 0.319 ms | **16.9 MiB** | **35.8%** |
+| molehill 0.7.0 (`mux = false`) | 50.1 | 63.7 | 0.218 ms | 0.259 ms | 16.8 MiB | 35.7% |
+| molehill 0.6.4 | 51.3 | 64.0 | 0.239 ms | 0.325 ms | 16.5 MiB | 35.0% |
+| frp 0.71.0 | 49.3 | 64.0 | 0.380 ms | 0.594 ms | 47.1 MiB | 100% |
+
+- With multiplexing on (default): **~35% lower p50** and **~46% lower p99**
+  connection-path latency than frp.
+- Memory is the resident set size (RSS) of server + client sampled while
+  serving loopback iperf3 traffic; molehill uses roughly **35% of frp's
+  memory** (lower is better).
+- Throughput is loopback-saturated and statistically identical across tools —
+  treat it as a ceiling sanity check, not a differentiator.
+- Reproduce: `benches/scripts/bench/run_bench.sh` (raw data in
+  `benches/scripts/bench/results-v0.7.0.json`, chart via `plot_bench.py`).
 
 ## Quickstart
 
 A full-powered `molehill` can be obtained from the [release](https://github.com/NIyueeE/molehill/releases) page. Or [build from source](docs/build-guide.md) **for other platforms and minimizing the binary**.
 
-The usage of `molehill` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
+Like frp, all service definitions live on the client side; the server only sets policy (a shared token and the `allow_ports` whitelist).
 
 To use `molehill`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.
 
@@ -60,11 +88,11 @@ Create `server.toml` with the following content and accommodate it to your needs
 ```toml
 # server.toml
 [server]
-bind_addr = "0.0.0.0:2333" # `2333` specifies the port that molehill listens for clients
+bind_addr = "0.0.0.0:2333" # Port that molehill listens for clients
+default_token = "use_a_secret_that_only_you_know" # Shared secret with your clients
 
-[server.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Token that is used to authenticate the client for the service. Change to an arbitrary value.
-bind_addr = "0.0.0.0:5202" # `5202` specifies the port that exposes `my_nas_ssh` to the Internet
+# Master switch for dynamic registrations: only ports covered here can be claimed by clients
+allow_ports = ["5202"]
 ```
 
 Then run:
@@ -80,12 +108,18 @@ Create `client.toml` with the following content and accommodate it to your needs
 ```toml
 # client.toml
 [client]
-remote_addr = "myserver.com:2333" # The address of the server. The port must be the same with the port in `server.bind_addr`
+remote_addr = "myserver.com:2333" # The address of the server. The port must match `server.bind_addr`
+default_token = "use_a_secret_that_only_you_know" # Must match the server's `default_token`
 
 [client.services.my_nas_ssh]
-token = "use_a_secret_that_only_you_know" # Must be the same with the server to pass the validation
-local_addr = "127.0.0.1:22" # The address of the service that needs to be forwarded
+local_addr = "127.0.0.1:22" # The local service to forward
+remote_bind_addr = "0.0.0.0:5202" # The public port to expose it at on the server
 ```
+
+At startup the client registers `my_nas_ssh` on the server, which validates
+the port against `allow_ports` and starts forwarding. Adding or removing
+services in `client.toml` applies live via hot reload — no server-side edit
+needed.
 
 Then run:
 
@@ -132,8 +166,9 @@ systemd service, both as root and rootless, including multiple instances.
 
 Official multi-arch images (linux/amd64, linux/arm64) are published to
 `ghcr.io/niyueee/molehill`. The image is a single static musl binary on
-`scratch` (~8 MiB), runs as non-root UID 1000, and bundles CA certificates
-for TLS verification.
+`scratch` (~8 MiB), runs as non-root UID 1000, bundles CA certificates for
+TLS verification, and includes the same default feature set as the regular
+release builds (multiplexing enabled).
 
 ```bash
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \

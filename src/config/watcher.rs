@@ -1,6 +1,6 @@
 use crate::Config;
 #[cfg(feature = "notify")]
-use crate::config::{ClientConfig, ClientServiceConfig, ServerConfig, ServerServiceConfig};
+use crate::config::{ClientConfig, ClientServiceConfig};
 #[cfg(feature = "notify")]
 use anyhow::Context;
 use anyhow::{Result, anyhow};
@@ -20,8 +20,6 @@ use notify::{EventKind, RecursiveMode, Watcher};
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
     #[cfg(feature = "notify")]
-    ServerChange(ServerServiceChange),
-    #[cfg(feature = "notify")]
     ClientChange(ClientServiceChange),
 }
 
@@ -33,46 +31,12 @@ pub enum ClientServiceChange {
 }
 
 #[cfg(feature = "notify")]
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum ServerServiceChange {
-    Add(ServerServiceConfig),
-    Delete(String),
-}
-
-#[cfg(feature = "notify")]
 trait InstanceConfig: Clone {
     type ServiceConfig: PartialEq + Eq + Clone;
     fn equal_without_service(&self, rhs: &Self) -> bool;
     fn service_delete_change(s: String) -> ConfigChange;
     fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange;
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig>;
-}
-
-#[cfg(feature = "notify")]
-impl InstanceConfig for ServerConfig {
-    type ServiceConfig = ServerServiceConfig;
-    fn equal_without_service(&self, rhs: &Self) -> bool {
-        let left = ServerConfig {
-            services: Default::default(),
-            ..self.clone()
-        };
-
-        let right = ServerConfig {
-            services: Default::default(),
-            ..rhs.clone()
-        };
-
-        left == right
-    }
-    fn service_delete_change(s: String) -> ConfigChange {
-        ConfigChange::ServerChange(ServerServiceChange::Delete(s))
-    }
-    fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange {
-        ConfigChange::ServerChange(ServerServiceChange::Add(cfg))
-    }
-    fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
-        &self.services
-    }
 }
 
 #[cfg(feature = "notify")]
@@ -224,17 +188,6 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
 
     let mut ret = vec![];
 
-    if old.server != new.server {
-        match old.server.as_ref().zip(new.server.as_ref()) {
-            Some((old_s, new_s)) => match calculate_instance_config_events(old_s, new_s) {
-                Some(mut v) => ret.append(&mut v),
-                None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
-            },
-            // One side lacks the server block: fall back to a full restart
-            None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
-        }
-    }
-
     if old.client != new.client {
         match old.client.as_ref().zip(new.client.as_ref()) {
             Some((old_c, new_c)) => match calculate_instance_config_events(old_c, new_c) {
@@ -274,170 +227,33 @@ fn calculate_instance_config_events<T: InstanceConfig>(
     Some(deletions.chain(addition).collect())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "notify"))]
 mod test {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    use crate::config::ServerConfig;
-
     use super::*;
-
-    // macro to create map or set literal
-    macro_rules! collection {
-        // map-like
-        ($($k:expr => $v:expr),* $(,)?) => {{
-            use std::iter::{Iterator, IntoIterator};
-            Iterator::collect(IntoIterator::into_iter([$(($k, $v),)*]))
-        }};
-    }
 
     #[test]
     fn test_calculate_events() {
-        struct Test {
-            old: Config,
-            new: Config,
-        }
-
-        let tests = [
-            Test {
-                old: Config {
-                    server: Some(Default::default()),
-                    client: None,
-                },
-                new: Config {
-                    server: Some(Default::default()),
-                    client: Some(Default::default()),
-                },
-            },
-            Test {
-                old: Config {
-                    server: Some(ServerConfig {
-                        bind_addr: String::from("127.0.0.1:2334"),
-                        ..Default::default()
-                    }),
-                    client: None,
-                },
-                new: Config {
-                    server: Some(ServerConfig {
-                        bind_addr: String::from("127.0.0.1:2333"),
-                        services: collection!(String::from("foo") => Default::default()),
-                        ..Default::default()
-                    }),
-                    client: None,
-                },
-            },
-            Test {
-                old: Config {
-                    server: Some(Default::default()),
-                    client: None,
-                },
-                new: Config {
-                    server: Some(ServerConfig {
-                        services: collection!(String::from("foo") => Default::default()),
-                        ..Default::default()
-                    }),
-                    client: None,
-                },
-            },
-            Test {
-                old: Config {
-                    server: Some(ServerConfig {
-                        services: collection!(String::from("foo") => Default::default()),
-                        ..Default::default()
-                    }),
-                    client: None,
-                },
-                new: Config {
-                    server: Some(Default::default()),
-                    client: None,
-                },
-            },
-            Test {
-                old: Config {
-                    server: Some(ServerConfig {
-                        services: collection!(String::from("foo1") => ServerServiceConfig::with_name("foo1"), String::from("foo2") => ServerServiceConfig::with_name("foo2")),
-                        ..Default::default()
-                    }),
-                    client: Some(ClientConfig {
-                        services: collection!(String::from("foo1") => ClientServiceConfig::with_name("foo1"), String::from("foo2") => ClientServiceConfig::with_name("foo2")),
-                        ..Default::default()
-                    }),
-                },
-                new: Config {
-                    server: Some(ServerConfig {
-                        services: collection!(String::from("bar1") => ServerServiceConfig::with_name("bar1"), String::from("foo2") => ServerServiceConfig::with_name("foo2")),
-                        ..Default::default()
-                    }),
-                    client: Some(ClientConfig {
-                        services: collection!(String::from("bar1") => ClientServiceConfig::with_name("bar1"), String::from("bar2") => ClientServiceConfig::with_name("bar2")),
-                        ..Default::default()
-                    }),
-                },
-            },
-        ];
-
-        let mut expected = [
-            vec![ConfigChange::General(Box::new(tests[0].new.clone()))],
-            vec![ConfigChange::General(Box::new(tests[1].new.clone()))],
-            vec![ConfigChange::ServerChange(ServerServiceChange::Add(
-                Default::default(),
-            ))],
-            vec![ConfigChange::ServerChange(ServerServiceChange::Delete(
-                String::from("foo"),
-            ))],
-            vec![
-                ConfigChange::ServerChange(ServerServiceChange::Delete(String::from("foo1"))),
-                ConfigChange::ServerChange(ServerServiceChange::Add(
-                    tests[4].new.server.as_ref().unwrap().services["bar1"].clone(),
-                )),
-                ConfigChange::ClientChange(ClientServiceChange::Delete(String::from("foo1"))),
-                ConfigChange::ClientChange(ClientServiceChange::Delete(String::from("foo2"))),
-                ConfigChange::ClientChange(ClientServiceChange::Add(
-                    tests[4].new.client.as_ref().unwrap().services["bar1"].clone(),
-                )),
-                ConfigChange::ClientChange(ClientServiceChange::Add(
-                    tests[4].new.client.as_ref().unwrap().services["bar2"].clone(),
-                )),
-            ],
-        ];
-
-        assert_eq!(tests.len(), expected.len());
-
-        for i in 0..tests.len() {
-            let mut actual = calculate_events(&tests[i].old, &tests[i].new).unwrap();
-
-            let get_key = |x: &ConfigChange| -> String {
-                match x {
-                    ConfigChange::General(_) => String::from("g"),
-                    ConfigChange::ServerChange(sc) => match sc {
-                        ServerServiceChange::Add(c) => "s_add_".to_owned() + &c.name,
-                        ServerServiceChange::Delete(s) => "s_del_".to_owned() + s,
-                    },
-                    ConfigChange::ClientChange(sc) => match sc {
-                        ClientServiceChange::Add(c) => "c_add_".to_owned() + &c.name,
-                        ClientServiceChange::Delete(s) => "c_del_".to_owned() + s,
-                    },
-                }
-            };
-
-            actual.sort_by_cached_key(get_key);
-            expected[i].sort_by_cached_key(get_key);
-
-            assert_eq!(actual, expected[i]);
-        }
-
-        // No changes
+        // Server-block-only changes always trigger a full restart (the server
+        // has no per-service config anymore); client service changes are
+        // forwarded as incremental events.
+        let old = Config {
+            server: Some(Default::default()),
+            client: None,
+        };
+        let new = Config {
+            server: Some(Default::default()),
+            client: Some(Default::default()),
+        };
         assert_eq!(
-            calculate_events(
-                &Config {
-                    server: Default::default(),
-                    client: None,
-                },
-                &Config {
-                    server: Default::default(),
-                    client: None,
-                },
-            ),
-            None
+            calculate_events(&old, &new),
+            Some(vec![ConfigChange::General(Box::new(new.clone()))])
         );
+
+        let server_a = Config {
+            server: Some(Default::default()),
+            client: None,
+        };
+        assert_eq!(calculate_events(&server_a, &server_a), None);
     }
 }

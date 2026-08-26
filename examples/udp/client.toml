@@ -5,3 +5,4 @@ default_token = "123"
 [client.services.foo1]
 type = "udp"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:5202"

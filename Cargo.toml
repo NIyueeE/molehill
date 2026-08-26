@@ -1,6 +1,6 @@
 [package]
 name = "molehill-rathole"
-version = "0.6.4"
+version = "0.7.0"
 edition = "2024"
 authors = ["niyue <n1yu3@proton.me>"]
 description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok. Fork of https://github.com/rathole-org/rathole"
@@ -22,6 +22,7 @@ default = [
     "noise",
     "websocket-native-tls",
     "hot-reload",
+    "multiplex",
 ]
 
 # Run as a server
@@ -58,6 +59,9 @@ websocket-rustls = [
 
 # Configuration hot-reload support
 hot-reload = ["notify"]
+
+# Multiplex many data channels over one physical connection (yamux)
+multiplex = ["dep:yamux", "tokio-util/compat"]
 
 # Default feature releasing embedded devices
 # Cross-compiling with tls is hard. So we don't :(
@@ -100,6 +104,8 @@ rand = "0.10"
 backon = "1.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Colored log levels for the custom log formatter (see `src/logging.rs`)
+nu-ansi-term = "0.50"
 socket2 = { version = "0.6", features = ["all"] }
 fdlimit = "0.3"
 async-trait = "0.1"
@@ -119,6 +125,7 @@ async-socks5 = "0.6"
 url = { version = "2.2", features = ["serde"] }
 tokio-tungstenite = { version = "0.29", optional = true }
 tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
+yamux = { version = "0.14", optional = true }
 futures-core = { version = "0.3.28", optional = true }
 futures-sink = { version = "0.3.28", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }

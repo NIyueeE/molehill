@@ -2,11 +2,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
 use url::Url;
 
+use crate::common::constants::{
+    DEFAULT_TCP_POOL_SIZE, DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS,
+    DEFAULT_UDP_POOL_SIZE, DEFAULT_UDP_SENDQ_SIZE,
+};
 use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
 
 /// Application-layer heartbeat interval in secs
@@ -53,8 +58,12 @@ pub enum TransportType {
     Websocket,
 }
 
-/// Per service config
-/// All Option are optional in configuration but must be Some value in runtime
+/// Per service config (client side).
+///
+/// The client is authoritative: each service declares the public address it
+/// wants to be exposed at (`remote_bind_addr`) and the server validates the
+/// request against its policy. All `Option`s are optional in configuration
+/// but must be `Some` at runtime (validation fills in the defaults).
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientServiceConfig {
@@ -63,12 +72,26 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
+    /// The public address (e.g. `"0.0.0.0:6022"`) this service is exposed at
+    /// on the server. Required.
+    pub remote_bind_addr: String,
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
-    pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
     pub health_check: Option<HealthCheckConfig>,
+    /// Requested number of pre-established data channels.
+    /// Defaults: 8 for TCP, 2 for UDP. The server clamps it to
+    /// `[server].max_pool_size`.
+    pub pool_size: Option<u16>,
+    /// Receive buffer size for UDP datagrams in bytes. Default: 2048,
+    /// maximum 65535 (bounded by the wire format's `u16` length).
+    pub udp_buffer_size: Option<u16>,
+    /// Seconds of inactivity after which a UDP peer mapping is cleaned up on
+    /// the client side. Default: 60.
+    pub udp_idle_timeout: Option<u64>,
+    /// Queue size for outbound UDP datagrams per data channel. Default: 1024.
+    pub udp_sendq_size: Option<u16>,
 }
 
 impl ClientServiceConfig {
@@ -158,28 +181,72 @@ pub struct HealthCheckConfig {
     pub http_path: String,
 }
 
-/// Per service config
-/// All Option are optional in configuration but must be Some value in runtime
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ServerServiceConfig {
-    #[serde(rename = "type", default = "default_service_type")]
-    pub service_type: ServiceType,
-    #[serde(skip)]
-    pub name: String,
-    pub bind_addr: String,
-    pub token: Option<MaskedString>,
-    pub nodelay: Option<bool>,
+/// A closed port range parsed from a config string, either `"8080"` or
+/// `"6000-6999"`. Used by `[server].allow_ports`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
 }
 
-impl ServerServiceConfig {
-    pub fn with_name(name: &str) -> ServerServiceConfig {
-        ServerServiceConfig {
-            name: name.to_string(),
-            ..Default::default()
+impl PortRange {
+    fn parse(s: &str) -> Result<PortRange> {
+        let s = s.trim();
+        if s.is_empty() {
+            bail!("Empty port range");
+        }
+        match s.split_once('-') {
+            None => {
+                let start = s
+                    .parse::<u16>()
+                    .with_context(|| format!("Invalid port: {s}"))?;
+                Ok(PortRange { start, end: start })
+            }
+            Some((a, b)) => {
+                let start = a
+                    .trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("Invalid port: {a}"))?;
+                let end = b
+                    .trim()
+                    .parse::<u16>()
+                    .with_context(|| format!("Invalid port: {b}"))?;
+                if start > end {
+                    bail!("Port range start {} is greater than end {}", start, end);
+                }
+                Ok(PortRange { start, end })
+            }
+        }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        self.start <= port && port <= self.end
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
         }
     }
 }
+
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        PortRange::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for PortRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
@@ -270,7 +337,8 @@ fn default_client_retry_interval() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub remote_addr: String,
-    pub default_token: Option<MaskedString>,
+    /// Shared secret, must match `[server].default_token`. Required.
+    pub default_token: MaskedString,
     pub prefer_ipv6: Option<bool>,
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
@@ -279,18 +347,105 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
+    /// Multiplex every data channel of this client over one physical
+    /// connection (yamux). Requires the `multiplex` feature. Default: true.
+    #[cfg(feature = "multiplex")]
+    #[serde(default = "default_mux_enabled")]
+    pub mux: bool,
+    /// Upper bound for the total yamux receive window across all streams of a
+    /// tunnel connection, in bytes. Only meaningful with `multiplex`.
+    #[cfg(feature = "multiplex")]
+    pub mux_receive_window: Option<usize>,
+    /// Maximum number of concurrent streams per tunnel connection. Only
+    /// meaningful with `multiplex`.
+    #[cfg(feature = "multiplex")]
+    pub mux_max_streams: Option<usize>,
+}
+
+#[cfg(feature = "multiplex")]
+fn default_mux_enabled() -> bool {
+    true
+}
+
+impl ClientConfig {
+    /// Whether data channels should be multiplexed over one connection.
+    /// Always `false` without the `multiplex` feature.
+    #[allow(unreachable_code)]
+    pub fn mux_enabled(&self) -> bool {
+        #[cfg(feature = "multiplex")]
+        return self.mux;
+        #[cfg(not(feature = "multiplex"))]
+        let _ = self;
+        false
+    }
+
+    /// Total yamux receive window per tunnel connection.
+    #[allow(unreachable_code)]
+    pub fn mux_receive_window(&self) -> Option<usize> {
+        #[cfg(feature = "multiplex")]
+        return self.mux_receive_window;
+        #[cfg(not(feature = "multiplex"))]
+        None
+    }
+
+    /// Maximum concurrent streams per tunnel connection.
+    #[allow(unreachable_code)]
+    pub fn mux_max_streams(&self) -> Option<usize> {
+        #[cfg(feature = "multiplex")]
+        return self.mux_max_streams;
+        #[cfg(not(feature = "multiplex"))]
+        None
+    }
+}
+
+impl ServerConfig {
+    /// Server-side yamux receive window for tunnel connections.
+    #[allow(unreachable_code)]
+    pub fn mux_receive_window(&self) -> Option<usize> {
+        #[cfg(feature = "multiplex")]
+        return self.mux_receive_window;
+        #[cfg(not(feature = "multiplex"))]
+        None
+    }
+
+    /// Server-side maximum concurrent streams per tunnel connection.
+    #[allow(unreachable_code)]
+    pub fn mux_max_streams(&self) -> Option<usize> {
+        #[cfg(feature = "multiplex")]
+        return self.mux_max_streams;
+        #[cfg(not(feature = "multiplex"))]
+        None
+    }
 }
 
 fn default_heartbeat_interval() -> u64 {
     DEFAULT_HEARTBEAT_INTERVAL_SECS
 }
 
+/// The server owns no per-service configuration. Services are registered at
+/// runtime by clients and validated against the policy below.
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
-    pub default_token: Option<MaskedString>,
-    pub services: HashMap<String, ServerServiceConfig>,
+    /// Shared secret used to authenticate control channels. Required.
+    pub default_token: MaskedString,
+    /// Port ranges a client may claim for its services, e.g.
+    /// `["6000-6999", "8080"]`. This is the master switch for dynamic
+    /// registration: when empty or missing, **all** registrations are
+    /// rejected. Privileged ports (<1024) must be listed explicitly.
+    #[serde(default)]
+    pub allow_ports: Vec<PortRange>,
+    /// Upper bound applied to every service's requested `pool_size`.
+    pub max_pool_size: Option<u16>,
+    /// Upper bound for the total yamux receive window the server advertises
+    /// per tunnel connection, in bytes. Only meaningful with `multiplex`.
+    #[cfg(feature = "multiplex")]
+    pub mux_receive_window: Option<usize>,
+    /// Maximum number of concurrent streams per tunnel connection. Only
+    /// meaningful with `multiplex`.
+    #[cfg(feature = "multiplex")]
+    pub mux_max_streams: Option<usize>,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
@@ -324,15 +479,8 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
-        // Validate services
-        for (name, s) in &mut server.services {
-            s.name = name.clone();
-            if s.token.is_none() {
-                s.token = server.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
-            }
+        if server.default_token.is_empty() {
+            bail!("`[server].default_token` must not be empty");
         }
 
         Config::validate_transport_config(&server.transport, true)?;
@@ -349,15 +497,14 @@ impl Config {
             );
         }
 
+        if client.default_token.is_empty() {
+            bail!("`[client].default_token` must not be empty");
+        }
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
-            if s.token.is_none() {
-                s.token = client.default_token.clone();
-                if s.token.is_none() {
-                    bail!("The token of service {} is not set", name);
-                }
-            }
+
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
             }
@@ -387,6 +534,41 @@ impl Config {
                         name
                     );
                 }
+            }
+
+            // The public endpoint is client-declared and required.
+            let bind: SocketAddr = s.remote_bind_addr.parse().with_context(|| {
+                format!(
+                    "service {}: invalid `remote_bind_addr`: {:?}. It must be a socket address like \"0.0.0.0:6022\"",
+                    name, s.remote_bind_addr
+                )
+            })?;
+            if bind.port() == 0 {
+                bail!("service {}: `remote_bind_addr` port must not be 0", name);
+            }
+
+            // Fill in runtime defaults.
+            if s.pool_size.is_none() {
+                s.pool_size = Some(match s.service_type {
+                    ServiceType::Tcp => DEFAULT_TCP_POOL_SIZE,
+                    ServiceType::Udp => DEFAULT_UDP_POOL_SIZE,
+                });
+            }
+            if s.udp_buffer_size.is_none() {
+                s.udp_buffer_size =
+                    Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX));
+            } else if s.udp_buffer_size == Some(0) {
+                bail!("service {}: udp_buffer_size must be greater than 0", name);
+            }
+            if s.udp_idle_timeout.is_none() {
+                s.udp_idle_timeout = Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS);
+            } else if s.udp_idle_timeout == Some(0) {
+                bail!("service {}: udp_idle_timeout must be greater than 0", name);
+            }
+            if s.udp_sendq_size.is_none() {
+                s.udp_sendq_size = Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap_or(u16::MAX));
+            } else if s.udp_sendq_size == Some(0) {
+                bail!("service {}: udp_sendq_size must be greater than 0", name);
             }
         }
 
@@ -504,105 +686,167 @@ mod tests {
 
     #[test]
     fn test_validate_server_config() -> Result<()> {
-        let mut cfg = ServerConfig::default();
-
-        cfg.services.insert(
-            "foo1".into(),
-            ServerServiceConfig {
-                service_type: ServiceType::Tcp,
-                name: "foo1".into(),
-                bind_addr: "127.0.0.1:80".into(),
-                token: None,
-                ..Default::default()
-            },
-        );
-
         // Missing the token
+        let mut cfg = ServerConfig {
+            bind_addr: "0.0.0.0:2333".into(),
+            default_token: "".into(),
+            ..Default::default()
+        };
         assert!(Config::validate_server_config(&mut cfg).is_err());
 
-        // Use the default token
-        cfg.default_token = Some("123".into());
+        // Empty token is rejected too
+        let mut cfg = ServerConfig {
+            bind_addr: "0.0.0.0:2333".into(),
+            default_token: "123".into(),
+            ..Default::default()
+        };
         assert!(Config::validate_server_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "123"
-        );
 
-        // The default token won't override the service token
-        cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_server_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "4"
-        );
         Ok(())
+    }
+
+    #[test]
+    fn test_port_range() {
+        assert!(PortRange::parse("8080").is_ok_and(|r| r.contains(8080) && !r.contains(8081)));
+        let r = PortRange::parse("6000 - 6999").unwrap();
+        assert!(r.contains(6000) && r.contains(6999) && !r.contains(5999) && !r.contains(7000));
+        assert!(PortRange::parse("").is_err());
+        assert!(PortRange::parse("6999-6000").is_err());
+        assert!(PortRange::parse("a-b").is_err());
+        assert_eq!(PortRange { start: 80, end: 80 }.to_string(), "80");
+        assert_eq!(
+            PortRange {
+                start: 6000,
+                end: 6999
+            }
+            .to_string(),
+            "6000-6999"
+        );
     }
 
     #[test]
     fn test_validate_client_config() -> Result<()> {
         let mut cfg = ClientConfig {
             remote_addr: "example.com:2333".into(),
+            default_token: "123".into(),
             ..Default::default()
         };
 
-        cfg.services.insert(
-            "foo1".into(),
-            ClientServiceConfig {
-                service_type: ServiceType::Tcp,
-                name: "foo1".into(),
-                local_addr: "127.0.0.1:80".into(),
-                token: None,
-                ..Default::default()
-            },
-        );
+        let svc = |remote_bind_addr: &str| ClientServiceConfig {
+            service_type: ServiceType::Udp,
+            name: "foo1".into(),
+            local_addr: "127.0.0.1:80".into(),
+            remote_bind_addr: remote_bind_addr.to_string(),
+            ..Default::default()
+        };
 
-        // Missing the token
+        // Missing remote_bind_addr (empty string does not parse)
+        cfg.services.insert("foo1".into(), svc(""));
         assert!(Config::validate_client_config(&mut cfg).is_err());
 
-        // Use the default token
-        cfg.default_token = Some("123".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
+        // Invalid remote_bind_addr (missing port)
+        cfg.services.insert("foo1".into(), svc("0.0.0.0"));
+        assert!(Config::validate_client_config(&mut cfg).is_err());
+
+        // Port 0 is rejected
+        cfg.services.insert("foo1".into(), svc("0.0.0.0:0"));
+        assert!(Config::validate_client_config(&mut cfg).is_err());
+
+        // A valid config passes and gets its runtime defaults filled in
+        cfg.services.insert("foo1".into(), svc("0.0.0.0:6081"));
+        Config::validate_client_config(&mut cfg)?;
+        let s = cfg.services.get("foo1").unwrap();
+        assert_eq!(s.pool_size, Some(DEFAULT_UDP_POOL_SIZE));
         assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "123"
+            s.udp_buffer_size,
+            Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap())
+        );
+        assert_eq!(s.udp_idle_timeout, Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS));
+        assert_eq!(
+            s.udp_sendq_size,
+            Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap())
         );
 
-        // The default token won't override the service token
-        cfg.services.get_mut("foo1").unwrap().token = Some("4".into());
-        assert!(Config::validate_client_config(&mut cfg).is_ok());
-        assert_eq!(
-            cfg.services
-                .get("foo1")
-                .as_ref()
-                .unwrap()
-                .token
-                .as_ref()
-                .unwrap()
-                .0,
-            "4"
-        );
         Ok(())
+    }
+
+    #[test]
+    fn test_client_service_explicit_pool_and_udp_options() {
+        let config = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+
+[client.services.test]
+type = "udp"
+local_addr = "127.0.0.1:53"
+remote_bind_addr = "0.0.0.0:6053"
+pool_size = 4
+udp_buffer_size = 65535
+udp_idle_timeout = 30
+udp_sendq_size = 128
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let s = &cfg.client.unwrap().services["test"];
+        assert_eq!(s.pool_size, Some(4));
+        assert_eq!(s.udp_buffer_size, Some(65535));
+        assert_eq!(s.udp_idle_timeout, Some(30));
+        assert_eq!(s.udp_sendq_size, Some(128));
+
+        // Zero values are rejected
+        let bad = config.replace("udp_buffer_size = 65535", "udp_buffer_size = 0");
+        assert!(Config::from_str(&bad).is_err());
+    }
+
+    #[test]
+    fn test_server_allow_ports_parsing() {
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+allow_ports = ["6000-6999", "8080"]
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        let server = cfg.server.unwrap();
+        assert_eq!(
+            server.allow_ports,
+            vec![
+                PortRange {
+                    start: 6000,
+                    end: 6999
+                },
+                PortRange {
+                    start: 8080,
+                    end: 8080
+                },
+            ]
+        );
+
+        // allow_ports defaults to empty (= dynamic registration disabled)
+        let config = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        assert!(cfg.server.unwrap().allow_ports.is_empty());
+
+        // Malformed ranges fail validation
+        let bad = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+allow_ports = ["9999-1000"]
+"#;
+        assert!(Config::from_str(bad).is_err());
+
+        // An empty default_token is rejected
+        let bad = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = ""
+"#;
+        assert!(Config::from_str(bad).is_err());
     }
 
     #[test]
@@ -617,10 +861,11 @@ mod tests {
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 
 [client.transport]
 type = "noise"
@@ -638,10 +883,11 @@ psk_location = 0
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 
 [client.transport]
 type = "noise"
@@ -658,10 +904,11 @@ psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }
 "#;
         let cfg = Config::from_str(config).unwrap();
@@ -687,10 +934,11 @@ health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 health_check = {}
 "#;
         let cfg = Config::from_str(config).unwrap();
@@ -716,11 +964,12 @@ health_check = {}
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
 type = "udp"
-token = "t"
 local_addr = "127.0.0.1:53"
+remote_bind_addr = "0.0.0.0:6053"
 health_check = { interval = 5 }
 "#;
         assert!(Config::from_str(config).is_err());
@@ -731,10 +980,11 @@ health_check = { interval = 5 }
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 health_check = { interval = 0 }
 "#;
         assert!(Config::from_str(config).is_err());
@@ -745,11 +995,12 @@ health_check = { interval = 0 }
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 prefer_ipv6 = true
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 prefer_ipv6 = true
 "#;
         let cfg = Config::from_str(config).unwrap();
@@ -763,10 +1014,11 @@ prefer_ipv6 = true
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 "#;
         let cfg = Config::from_str(config).unwrap();
         let client = cfg.client.unwrap();
@@ -779,6 +1031,7 @@ local_addr = "127.0.0.1:80"
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.transport]
 type = "tcp"
@@ -787,8 +1040,8 @@ type = "tcp"
 proxy = "socks5://127.0.0.1:1080"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 "#;
         Config::from_str(config).unwrap();
     }
@@ -798,6 +1051,7 @@ local_addr = "127.0.0.1:80"
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.transport]
 type = "tcp"
@@ -806,8 +1060,8 @@ type = "tcp"
 proxy = "http://user:pass@proxy.example.com:8080"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 "#;
         Config::from_str(config).unwrap();
     }
@@ -817,6 +1071,7 @@ local_addr = "127.0.0.1:80"
         let config = r#"
 [client]
 remote_addr = "example.com:2333"
+default_token = "t"
 
 [client.transport]
 type = "tcp"
@@ -825,8 +1080,8 @@ type = "tcp"
 proxy = "https://127.0.0.1:443"
 
 [client.services.test]
-token = "t"
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 "#;
         assert!(Config::from_str(config).is_err());
     }

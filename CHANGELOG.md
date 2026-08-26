@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-26
+
+Major release: the server no longer needs per-service configuration — clients
+declare what to expose and the server enforces policy. **Protocol bumped to
+v2: upgrade both ends together** (mismatched peers fail loudly with a
+"please update" message; no compatibility with 0.6.x, by design).
+
+### ⚠ Breaking changes & migration
+
+1. **`[server.services.*]` removed.** The client is now authoritative.
+   - Move each service's server-side `bind_addr` into the client's
+     `remote_bind_addr`.
+   - Delete all per-service `token = ...` lines; both sides now use one
+     required `default_token`.
+   - The server now requires `allow_ports` (see below).
+2. **Protocol v2**: hello/auth/registration framing changed; the fixed-size
+   ack gained framed variants (`RegisterRejected(reason)` replaces
+   `ServiceNotExist`).
+3. Auth is anchored to `default_token` on each side instead of per-service
+   token tables.
+
+### Added
+
+- **Dynamic service registration**: clients send a framed `RegisterService`
+  (name, type, `remote_bind_addr`, pool size) right after authentication;
+  the server validates against its policy, binds the endpoint eagerly, and
+  acknowledges — port conflicts surface as precise rejections delivered to
+  the client.
+- **Server-side policy knobs**: mandatory-for-registration `allow_ports`
+  whitelist (empty/missing rejects *all* registrations), explicit listing
+  required for privileged ports (<1024), optional `max_pool_size` clamp.
+  Rejections are terminal for that service run: the client logs the server's
+  reason once and stops retrying until config/restart.
+- **Per-service tuning**: `pool_size` (default 8 TCP / 2 UDP),
+  `udp_buffer_size` (default 2048, up to 65535 — wire-compatible),
+  `udp_idle_timeout` (default 60s), `udp_sendq_size` (default 1024).
+- **Multiplexing**: one tunnel connection per service carries every data
+  channel as a yamux stream. The `multiplex` feature is part of the default
+  feature set and `mux = true` is the default. rust-yamux auto-tunes stream
+  receive windows towards the bandwidth-delay product; tunable via
+  `mux_receive_window` / `mux_max_streams`. The initial end-to-end stall was
+  traced to yamux's lazy outbound-stream SYN (a read-only pooled stream never
+  emitted its first frame); the client driver now sends a zero-length SYN
+  kick, with a read-first regression test and a full
+  `{tcp,tls,noise,websocket} × {mux±}` integration matrix. `mux = false`
+  keeps the one-connection-per-channel path available.
+- **Container image parity**: the release musl builds and the scratch image
+  now include multiplexing, and the publish workflow smoke-tests the pushed
+  image (`--help` plus manifest inspection).
+- **Colored, span-aware logging**: level-coded colors (ERROR red, WARN
+  yellow, INFO green, DEBUG cyan, TRACE purple), visible span context
+  (`handle{service=ssh}:`) on every line, ANSI only on TTYs (`NO_COLOR`
+  respected), source target appended at debug/trace.
+
+### Performance
+
+- Loopback benchmark vs v0.6.4 and frp 0.71.0 (plain TCP, same machine):
+  throughput is loopback-saturated and statistically identical across all
+  tools (~64 Gbit/s aggregate); the differentiator is connection-path
+  latency — echo RTT p50 **0.249 ms** with mux enabled vs **0.380 ms** for
+  frp (~35% lower), p99 **0.319 ms** vs **0.594 ms** (~46% lower). Chart in
+  the README; raw data and reproducible scripts in `benches/scripts/bench/`.
+- With `multiplex` enabled (default), concurrent visitors no longer pay a
+  TCP(+TLS/Noise) handshake per data channel, and steady-state file
+  descriptors drop from one-connection-per-channel to a single tunnel.
+- Memory comparison added: average RSS (server + client) sampled under
+  loopback iperf3 load — molehill 0.7.0 mux **16.9 MiB** (35.8% of frp),
+  mux=off 16.8 MiB (35.7%), v0.6.4 16.5 MiB (35.0%), frp 47.1 MiB.
+  `run_bench.sh` now records RSS and the chart includes the memory panel.
+
+### Changed
+
+- Service endpoints bind eagerly at registration time so conflicts surface
+  immediately as rejections instead of pool retry loops.
+- Hot reload of client services registers/unregisters over existing control
+  channels instead of tearing down physical connections.
+- UDP oversized-datagram drop threshold follows the receiver's configured
+  `udp_buffer_size` instead of a compile-time constant.
+- CI now also checks the no-hot-reload `server,client`-only feature
+  combination (clippy + lib tests) and runs integration tests serially to
+  avoid timing flake between the TCP and UDP suites.
+- CI minimal-size job now looks for `target/minimal/molehill` (the custom
+  Cargo profile's actual output path), fixing the size step failure.
+
 ## [0.6.4] - 2026-08-25
 
 ### Added
