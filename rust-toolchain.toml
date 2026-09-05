@@ -1,2 +1,6 @@
+# Always use the latest stable toolchain.
+# rustup resolves this per machine, so cloners automatically get the
+# newest stable release. clippy + rustfmt are required by githooks/pre-commit.
 [toolchain]
 channel = "stable"
+components = ["clippy", "rustfmt"]

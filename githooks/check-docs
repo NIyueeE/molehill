@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Docs-alignment check: verify the modular docs (docs/ + README landing pages)
+# still describe the actual code (hook commands, lints, toolchain, edition,
+# justfile, CI).
+# Covers greppable invariants only; semantic alignment stays with the agent/human.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+errors=0
+
+expect() {
+  # expect <description> <file> <fixed-string-pattern>
+  local desc="$1" file="$2" pattern="$3"
+  if grep -qF -- "$pattern" "$file"; then
+    echo "  ok    $desc"
+  else
+    echo "  FAIL  $desc -> missing '$pattern' in $file" >&2
+    errors=$((errors + 1))
+  fi
+}
+
+# 1) every cargo command in every hook must be documented in the checks docs
+for hook in githooks/pre-commit githooks/pre-push; do
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
+    expect "[$hook] command documented: $cmd" docs/checks.zh.md "$cmd"
+  done < <(grep -E '^cargo ' "$hook")
+done
+
+# 2) every lint declared in Cargo.toml [lints] must be documented in the lint-policy docs
+while IFS= read -r lint; do
+  [ -n "$lint" ] || continue
+  expect "lint documented: $lint" docs/lint-policy.md '`'"$lint"'`'
+  expect "lint documented: $lint" docs/lint-policy.zh.md '`'"$lint"'`'
+done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0} f && /=/{split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k}' Cargo.toml)
+
+# 3) rustc edition
+edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)
+if [ -n "$edition" ]; then
+  expect "edition documented: $edition" README.md "${edition} edition"
+  expect "edition documented: $edition" README.zh.md "${edition} edition"
+fi
+
+# 4) toolchain channel
+channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+if [ -n "$channel" ]; then
+  expect "toolchain channel documented: $channel" README.md "channel = \"$channel\""
+  expect "toolchain channel documented: $channel" README.zh.md "channel = \"$channel\""
+fi
+
+# 5) justfile recipes documented on the landing pages
+expect "just setup documented" README.md 'just setup'
+expect "just setup documented" README.zh.md 'just setup'
+expect "just check documented" README.md 'just check'
+expect "just check documented" README.zh.md 'just check'
+
+# 6) hooks activation instruction
+expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'
+expect "hooksPath instruction documented" README.zh.md 'core.hooksPath githooks'
+
+# 7) docs gate itself must stay documented in the checks docs
+expect "docs gate documented" docs/checks.md 'githooks/check-docs'
+expect "docs gate documented" docs/checks.zh.md 'githooks/check-docs'
+
+# 8) READMEs must link the modular governance docs (index integrity, per language)
+for doc in checks lint-policy release structure; do
+  expect "README links docs/$doc.md" README.md "docs/$doc.md"
+  expect "README links docs/$doc.zh.md" README.zh.md "docs/$doc.zh.md"
+done
+
+# 9) CI must run the same chain
+if [ -f .github/workflows/ci.yml ]; then
+  expect "CI runs the full chain" .github/workflows/ci.yml 'just check'
+else
+  echo "  FAIL  .github/workflows/ci.yml missing (README badge references it)" >&2
+  errors=$((errors + 1))
+fi
+
+# 10) release notes must be extracted from CHANGELOG.md
+if [ -f .github/workflows/release.yml ]; then
+  expect "release notes extracted from CHANGELOG" .github/workflows/release.yml 'CHANGELOG.md'
+  expect "release docs mention CHANGELOG" docs/release.md 'CHANGELOG'
+  expect "release docs mention CHANGELOG" docs/release.zh.md 'CHANGELOG'
+else
+  echo "  FAIL  .github/workflows/release.yml missing (see docs/release.md)" >&2
+  errors=$((errors + 1))
+fi
+
+# 11) CD test builds: manual dispatch only, never a release, documented
+if [ -f .github/workflows/test-build.yml ]; then
+  expect "test builds are manual (workflow_dispatch)" .github/workflows/test-build.yml 'workflow_dispatch'
+  expect "test builds documented" docs/release.md 'test-build.yml'
+  expect "test builds documented" docs/release.zh.md 'test-build.yml'
+else
+  echo "  FAIL  .github/workflows/test-build.yml missing (see AGENTS.md §6)" >&2
+  errors=$((errors + 1))
+fi
+
+# 12) HANDOFF.md: agent-facing state notes exist and are referenced
+if [ -f HANDOFF.md ]; then
+  expect "README links HANDOFF.md" README.md 'HANDOFF.md'
+  expect "README links HANDOFF.md" README.zh.md 'HANDOFF.md'
+  expect "AGENTS.md references HANDOFF.md" AGENTS.md 'HANDOFF.md'
+else
+  echo "  FAIL  HANDOFF.md missing (AGENTS.md points to it for working state)" >&2
+  errors=$((errors + 1))
+fi
+
+# 13) secret scan gate wired into the chain and documented
+if [ -f githooks/check-secrets ]; then
+  expect "secret scan gate wired" githooks/pre-commit 'githooks/check-secrets'
+  expect "secret scan documented" docs/checks.md 'githooks/check-secrets'
+  expect "secret scan documented" docs/checks.zh.md 'githooks/check-secrets'
+else
+  echo "  FAIL  githooks/check-secrets missing (AGENTS.md §9 secrets discipline)" >&2
+  errors=$((errors + 1))
+fi
+
+# soft notice: stale upstream references are expected only in provenance docs
+if grep -qiF 'rathole-org' README.md README.zh.md 2>/dev/null; then
+  echo "  note: upstream 'rathole-org' references present (expected: provenance links only)"
+fi
+
+if [ "$errors" -eq 0 ]; then
+  echo "  docs alignment ok"
+else
+  echo "  $errors docs alignment issue(s) found" >&2
+  exit 1
+fi

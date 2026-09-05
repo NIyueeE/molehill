@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/NIyueeE/molehill.svg"></a>
   <img src="https://img.shields.io/github/v/release/NIyueeE/molehill.svg">
-  <img src="https://img.shields.io/badge/rust-1.95.0+-93450a.svg">
+  <img src="https://img.shields.io/badge/rust-stable-93450a.svg">
   <img src="https://github.com/NIyueeE/molehill/actions/workflows/ci.yml/badge.svg">
 </p>
 <p align="center">
@@ -33,6 +33,7 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
     - [Container](#container)
   - [Configuration](#configuration)
   - [Documentation](#documentation)
+  - [Development](#development)
 
 <!-- /TOC -->
 
@@ -183,10 +184,37 @@ deployments.
 
 ## Documentation
 
+Using molehill:
+
 - [Configuration](./docs/configuration.md) — full configuration specification, logging, tuning
 - [Transport](./docs/transport.md) — TLS and Noise Protocol setup
 - [Build guide](./docs/build-guide.md) — build customization, rustls support, minimal binary
 - [Internals](./docs/internals.md) — how control/data channels work
 - [Examples](./examples) — configs for common scenarios
 
-Planned work and future design documents are tracked in [`HANDOFF.md`](./HANDOFF.md).
+Contributing & engineering:
+
+- [Checks](./docs/checks.md) — what every gate runs, how to handle a block
+- [Lint policy](./docs/lint-policy.md) — lint levels and waiver rules
+- [Release](./docs/release.md) — release mechanics, versioning, test builds
+- [Structure](./docs/structure.md) — what every file in this repo is for
+- [Contributing](./CONTRIBUTING.md) — setup and workflow
+- [Security](./SECURITY.md) — reporting vulnerabilities
+- [`HANDOFF.md`](./HANDOFF.md) — current working state; planned work and future design documents
+
+## Development
+
+molehill is written in Rust (2024 edition); `rust-toolchain.toml` declares
+`channel = "stable"` with clippy and rustfmt components — never hardcode a
+version. Layered git hooks guard every commit and push, and CI runs the
+identical chain:
+
+```bash
+just setup   # activate git hooks (core.hooksPath githooks) + install check tools
+just check   # fmt / secrets / machete / docs / clippy + audit / deny / outdated / test
+```
+
+molehill is a community fork of [rathole](https://github.com/rapiz1/rathole);
+version numbers continue the upstream line (upstream's last release was
+v0.5.0). See [docs/release.md](./docs/release.md) for release mechanics and
+[AGENTS.md](./AGENTS.md) for the repository rules.

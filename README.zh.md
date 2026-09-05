@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/NIyueeE/molehill.svg"></a>
   <img src="https://img.shields.io/github/v/release/NIyueeE/molehill.svg">
-  <img src="https://img.shields.io/badge/rust-1.95.0+-93450a.svg">
+  <img src="https://img.shields.io/badge/rust-stable-93450a.svg">
   <img src="https://github.com/NIyueeE/molehill/actions/workflows/ci.yml/badge.svg">
 </p>
 <p align="center">
@@ -33,6 +33,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
     - [容器](#容器)
   - [配置](#配置)
   - [文档](#文档)
+  - [开发](#开发)
 
 <!-- /TOC -->
 
@@ -161,10 +162,36 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
 ## 文档
 
+使用 molehill：
+
 - [配置文档](./docs/configuration.md) — 完整的配置规范、日志和调优
 - [传输层](./docs/transport.md) — TLS 和 Noise Protocol 配置
 - [构建指南](./docs/build-guide.md) — 构建定制、rustls 支持、最小化二进制
 - [内部原理](./docs/internals.md) — 控制通道和数据通道的工作原理
 - [示例](./examples) — 常见场景的配置
 
-计划中的工作和将来的设计文档统一收录在 [`HANDOFF.md`](./HANDOFF.md)。
+贡献与工程：
+
+- [检查门](./docs/checks.zh.md) — 每个门运行什么、被拦住时怎么办
+- [Lint 策略](./docs/lint-policy.zh.md) — lint 级别与豁免规则
+- [发布流程](./docs/release.zh.md) — 发布机制、版本编号、测试构建
+- [仓库结构](./docs/structure.zh.md) — 仓库里每个文件的用途
+- [贡献指南](./CONTRIBUTING.md) — 环境搭建与工作流
+- [安全策略](./SECURITY.md) — 漏洞报告
+- [`HANDOFF.md`](./HANDOFF.md) — 当前工作状态；计划中的工作和将来的设计文档
+
+## 开发
+
+molehill 使用 Rust 编写（2024 edition）；`rust-toolchain.toml` 声明
+`channel = "stable"` 并附带 clippy 与 rustfmt 组件 —— 不要硬编码版本号。分层
+git hooks 守护每次 commit 与 push，CI 运行同一条链：
+
+```bash
+just setup   # 激活 git hooks（core.hooksPath githooks）并安装检查工具
+just check   # fmt / secrets / machete / docs / clippy + audit / deny / outdated / test
+```
+
+molehill 是 [rathole](https://github.com/rapiz1/rathole) 的社区 fork；版本号
+沿上游序列续计（上游最后一个版本是 v0.5.0）。发布机制见
+[docs/release.zh.md](./docs/release.zh.md)，仓库规则见
+[AGENTS.md](./AGENTS.md)。

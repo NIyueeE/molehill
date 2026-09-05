@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-05
+
+Project base rebuilt on [rust-agents-template](https://github.com/NIyueeE/rust-agents-template).
+No forwarding-behavior changes; the git history was also rebuilt in this
+release (upstream rathole history intact; the fork's development commits
+squashed into one release commit per version).
+
+### Added
+
+- Layered git hooks under `githooks/`: pre-commit fast gates (fmt, staged-
+  changes secret scan, unused-dependency check, docs↔code alignment, strict
+  clippy) and pre-push heavy gates (audit, deny, outdated, tests); activate
+  with `just setup`
+- `githooks/check-docs`: verifies the governance docs still describe the code
+  (hook commands, lint tables, edition, toolchain channel, README doc index,
+  CI/release wiring)
+- `githooks/check-secrets`: blocks commits that stage credential-shaped
+  lines (`security-scan:allow` marker to waive a documented line)
+- Modular bilingual governance docs: `docs/checks.md`, `docs/lint-policy.md`,
+  `docs/release.md`, `docs/structure.md` with `*.zh.md` counterparts
+- Dependency policy via `cargo-deny` (`deny.toml`: licenses, bans,
+  advisories, yanked crates) wired into pre-push and CI
+- `just` recipes: `setup`, `fmt`, `test`, `check`, `powerset` (cargo-hack
+  feature powerset), `container` (scratch image)
+- `.github/workflows/test-build.yml`: manual per-commit, per-platform CD
+  test builds that never publish
+- `CONTRIBUTING.md`, `SECURITY.md` (private vulnerability reporting with
+  molehill-specific scope notes), `.editorconfig`, Dependabot config for
+  cargo and GitHub Actions, PR template, issue-template config
+- `rust-toolchain.toml` now declares `clippy` and `rustfmt` components
+- All GitHub Actions pinned to commit SHAs (Dependabot tracks the `# vX`
+  comments)
+
+### Changed
+
+- CI restructured: the full check chain runs via `just check`; the
+  feature-powerset, per-feature test matrix, minimal-size check, and
+  cross-platform builds remain dedicated jobs
+- Release workflow enforces the changelog-driven policy: a missing
+  `## [x.y.z]` section in `CHANGELOG.md` fails the release before anything
+  builds; notes are only ever extracted from the changelog; releases are
+  created as drafts
+- `AGENTS.md` rewritten as repository rules (self-check, waiver discipline,
+  docs↔code alignment, commit convention, tag-push policy, provenance from
+  rathole and the upstream-anchored versioning); architecture details moved
+  to `docs/structure.md` and `docs/internals.md`
+- READMEs gained a Development section (hooks activation, `just setup` /
+  `just check`) and a split documentation index; the stale `rust-1.95.0+`
+  badge now reflects the `stable` channel
+
+### Removed
+
+- Legacy `.githooks/pre-commit` (superseded by the layered `githooks/` chain)
+
 ## [0.7.0] - 2026-08-26
 
 Major release: the server no longer needs per-service configuration — clients

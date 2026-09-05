@@ -1,4 +1,21 @@
-# HANDOFF: Release State & Future Work
+# HANDOFF: Working State & Future Work
+
+> **2026-09-05 — v0.7.1: project base rebuilt on
+> [rust-agents-template](https://github.com/NIyueeE/rust-agents-template).**
+> Layered githooks (fast pre-commit / heavy pre-push, `check-docs`,
+> `check-secrets`), `just setup` / `just check`, changelog-gated tag-driven
+> releases, pinned CI actions, CD test-build workflow, bilingual governance
+> docs (checks / lint-policy / release / structure), `deny.toml`,
+> dependabot, CONTRIBUTING / SECURITY. Git history was rebuilt in the same
+> change: upstream rathole history intact, the 35 fork commits squashed into
+> six release commits (v0.6.0…v0.7.0, trees byte-identical to the old tags),
+> tags re-cut as annotated ones. Deferred from the template's lint set:
+> `clippy::pedantic` deny and `missing_docs` warn — a dedicated migration for
+> molehill's public API, tracked in the backlog below.
+
+---
+
+## Shipped in 0.7.0
 
 Status as of the mux-stabilization commit. Completed 0.7.0 items are recorded
 below as context; only genuinely future work stays in the backlog.

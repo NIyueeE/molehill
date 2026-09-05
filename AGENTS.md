@@ -1,252 +1,274 @@
-# CLAUDE.md
-
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-## Project Overview
-
-molehill is a secure, stable, and high-performance reverse proxy for NAT traversal, written in Rust. It allows services behind a NAT/firewall to be exposed to the internet via a publicly accessible server. Think of it as a Rust alternative to frp or ngrok.
-
-- **Language**: Rust (Edition 2024)
-- **Toolchain**: Uses the `stable` channel (see `rust-toolchain.toml`)
-- **License**: Apache-2.0
-
-## Common Commands
-
-### Build
-
-```bash
-# Standard release build
-cargo build --release
-
-# Minimal binary size build (~500KiB)
-cargo build --profile minimal --no-default-features --features client
-
-# Build with rustls instead of native-tls
-cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
-
-# Container image (packages a pre-built static musl binary into a scratch image)
-cargo build --release --target x86_64-unknown-linux-musl \
-  --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
-mkdir -p img/bin/amd64
-cp target/x86_64-unknown-linux-musl/release/molehill img/bin/amd64/
-cp /etc/ssl/certs/ca-certificates.crt img/bin/amd64/
-docker build -f Containerfile -t molehill img/
-```
-
-### Test
-
-```bash
-# Run tests with default features (native-tls)
-cargo test --verbose
-
-# Run tests with rustls
-cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-
-# Run a specific integration test by function name
-cargo test --test integration_test tcp
-cargo test --test integration_test udp
-
-# Run a specific unit test
-cargo test <test_name>
-```
-
-Integration tests spawn their own echo/pingpong servers internally (see `tests/common/mod.rs`). Test fixture configs live in `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/`. They do not require external services to be running.
-
-### Lint
-
-```bash
-# Run all checks at once (requires just, cargo-audit, cargo-machete)
-just check
-
-# Individual checks
-cargo clippy -- -D warnings
-cargo fmt --check
-cargo audit
-cargo machete
-
-# Check all feature combinations
-cargo install cargo-hack
-cargo hack check --feature-powerset --no-dev-deps --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
-```
-
-### Run
-
-```bash
-# Run from source (development)
-cargo run -- server.toml
-cargo run -- client.toml
-
-# Generate a Noise keypair (requires `noise` feature; default x25519; optionally pass x448)
-cargo run -- --genkey
-cargo run --features noise -- --genkey x448
-
-# Run compiled binary as server
-./molehill server.toml
-
-# Run compiled binary as client
-./molehill client.toml
-
-# Run with explicit mode (when config has both client and server)
-./molehill --server unified.toml
-./molehill --client unified.toml
-
-# Control logging
-RUST_LOG=debug ./molehill config.toml
-```
-
-### Benchmark
-
-```bash
-# Benchmarks live in benches/scripts (HTTP latency via vegeta, memory usage sampling)
-# See examples/iperf3/ for benchmark config templates
-```
-
-### Configuration Examples
-
-Example configs for various scenarios live in `examples/`:
-
-| Directory | Description |
-|-----------|-------------|
-| `tls/` | TLS transport with self-signed certificates |
-| `noise_nk/` | Noise NK pattern |
-| `udp/` | UDP service forwarding |
-| `use_proxy/` | Outbound connections via SOCKS5/HTTP CONNECT proxy |
-| `minimal/` | Minimal config for embedded devices |
-| `iperf3/` | Performance benchmark setup |
-| `unified/` | Combined server+client config in one file |
-| `systemd/` | Systemd service unit files |
-| `full/` | Complete configuration example with all options |
-
-## Architecture
-
-### Core Concepts
-
-- **Service**: The entity whose traffic needs forwarding (e.g., an SSH server)
-- **Server**: Publicly accessible host running molehill in server mode
-- **Client**: Host behind NAT running molehill in client mode
-- **Control Channel**: A TCP connection carrying control commands for one service
-- **Data Channel**: A TCP connection carrying forwarded data for one service
-
-### Source Structure
-
-Uses the Rust 2018 module layout (`src/foo.rs` + `src/foo/`) rather than the older `mod.rs` convention.
-
-- `build.rs`: Build metadata injection via `vergen` (git SHA, build timestamp, cargo features, target triple)
-- `src/main.rs`: Binary entry point — CLI parsing (clap), signal handling, logging setup
-- `src/lib.rs`: Library root — re-exports public API, run mode detection (`determine_run_mode`), main event loop. `lib.rs` also owns the config watcher lifecycle: on `ConfigChange::General` it restarts the instance, on service-level changes it forwards via mpsc.
-- `src/cli.rs`: CLI argument definitions (clap derive)
-- `src/protocol.rs`: Wire protocol definitions (Hello, Auth, Ack, ControlChannelCmd, DataChannelCmd, UdpTraffic). Serialized with postcard (compact binary). Protocol versioning via `CURRENT_PROTO_VERSION`.
-- `src/common.rs` + `src/common/`: Shared utilities
-  - `constants.rs`: Timeouts, buffer sizes (UDP_BUFFER_SIZE), backoff strategies
-  - `helper.rs`: DNS resolution, keepalive, UDP connect, retry helpers
-  - `multi_map.rs`: Multi-value hash map (used in server for connection pools)
-- `src/config.rs` + `src/config/`: Configuration
-  - `parsing.rs`: TOML parsing/validation with serde. Key types: `Config`, `ClientConfig`, `ServerConfig`, `ClientServiceConfig`, `PortRange`. The server owns no per-service config; clients register services at runtime against the server's `allow_ports` policy. Uses `MaskedString` to avoid leaking tokens in debug logs.
-  - `watcher.rs`: Hot-reload file watcher (behind `hot-reload` feature). Sends `ConfigChange` variants over an mpsc channel.
-- `src/core.rs` + `src/core/`: Client and server implementations
-  - `client.rs`: Client mode (feature-gated on `client`). `Client<T: Transport>` generic struct. Handles control channel setup, authentication, data channel requests from server.
-  - `server.rs`: Server mode (feature-gated on `server`). `Server<T: Transport>` generic struct. Validates client registrations, binds service endpoints eagerly, manages connection pools. Pool sizes are per-service registration values clamped by `[server].max_pool_size`; `CHAN_SIZE=2048`.
-- `src/transport.rs` + `src/transport/`: Transport layer
-  - `tcp.rs`: Plain TCP transport
-  - `native_tls.rs` / `rustls.rs`: TLS transports (mutually exclusive features via compile_error! macro)
-  - `noise.rs`: Noise Protocol transport (KK pattern by default, supports x25519 and x448)
-  - `websocket.rs`: WebSocket transport (feature-gated)
-
-### Key Design Patterns
-
-1. **Transport Trait**: All transports implement the `Transport` trait (`bind`, `accept`, `handshake`, `connect`). The client and server are generic over `Transport`. Transport selection happens at the config level — `Client<TcpTransport>`, `Client<TlsTransport>`, etc.
-
-2. **Generic Client/Server**: `Client<T: Transport>` and `Server<T: Transport>` are generic structs. The concrete transport is instantiated via match on `TransportType` in `run_client`/`run_server`.
-
-3. **Feature-Gated Compilation**: Major functionality is behind Cargo features:
-   - `server` / `client`: Enable respective modes
-   - `native-tls` / `rustls`: TLS backends (mutually exclusive, enforced by `compile_error!`)
-   - `noise`: Noise Protocol encryption
-   - `websocket-native-tls` / `websocket-rustls`: WebSocket support
-   - `hot-reload`: Config file watching
-   - `embedded`: Minimal feature set for embedded devices
-
-4. **Protocol Flow** (v2):
-   - Client establishes a control channel per service; server sends a nonce challenge; client answers with `sha256(default_token || nonce)`
-   - After auth the client sends a framed `RegisterService` message; the server validates against `allow_ports`, binds eagerly, and replies with a framed ack (`RegisterRejected(reason)` on failure)
-   - When a visitor connects, the server sends `CreateDataChannel` via the control channel; the client opens a data channel back (a plain transport connection or a tunnel stream)
-   - The server pre-creates data channels (pool) to reduce visitor latency
-   - For UDP services, traffic is framed with a `UdpHeader` (source address + length); oversized datagrams are dropped in-stream
-
-5. **Config Watcher**: `lib.rs` spawns a `ConfigWatcherHandle` that monitors the config file. General config changes trigger a full restart; service-level changes are sent via an mpsc channel to the running instance for hot updates.
-
-6. **MaskedString**: Sensitive values (tokens, private keys) use `MaskedString` which implements `Debug` as `"MASKED"` to prevent accidental leakage in logs.
-
-7. **Proxy Support**: Outbound connections can go through SOCKS5 or HTTP CONNECT proxies, configured via the `proxy` field on `TcpConfig`. Handled transparently during transport connection.
-
-8. **Connection Pooling**: Each registered service keeps a pool of pre-established data channels (per-service `pool_size`, default 8 for TCP / 2 for UDP, clamped by `[server].max_pool_size`) to reduce connection latency for new visitors.
-
-9. **Dynamic Service Registration** (v0.7+): clients declare services — name, type, `remote_bind_addr`, pool size — in a framed `RegisterService` message sent right after authentication. The server validates against `allow_ports`/privileged ports/conflicts, binds the endpoint, and replies with a framed ack; rejections carry a human-readable reason and are permanent for that run. Protocol version is v2 with hard mismatch rejection.
-
-10. **Multiplexing** (`multiplex` feature, in the default feature set): after registering, a client with `mux = true` (the default) dials an extra tunnel connection announced via `Hello::DataChannelTunnelHello`; both ends upgrade it to a yamux session and every subsequent data channel is a stream (`src/transport/multiplex.rs`). The server adapts per connection, so no cross-end mux configuration is required. Window/stream-count setters must respect upstream's invariant (see `mux_config`). yamux opens outbound streams lazily (SYN rides on the first outbound frame), so the client driver sends a zero-length kick before handing out each stream — pooled streams read first (`StartForward*`) and would otherwise never be announced. `mux = false` keeps the one-connection-per-channel path, and the integration matrix runs every transport through both.
-
-## Feature Flags
-
-| Feature | Description |
-|---------|-------------|
-| `server` | Enable server mode |
-| `client` | Enable client mode |
-| `native-tls` | TLS via native-tls (OpenSSL/Secure Transport/Schannel) |
-| `rustls` | TLS via rustls (pure Rust) |
-| `noise` | Noise Protocol encryption via snowstorm |
-| `websocket-native-tls` | WebSocket transport with native-tls |
-| `websocket-rustls` | WebSocket transport with rustls |
-| `hot-reload` | Configuration file hot-reloading |
-| `multiplex` | yamux data-channel multiplexing over one tunnel connection (in `default`; excluded from `minimal`/`embedded`) |
-| `embedded` | Minimal feature set for embedded devices |
-| `console` | Tokio console debugging support |
-
-**Note**: `native-tls` and `rustls` are mutually exclusive. Same for their websocket variants.
-
-## Proxy Support
-
-molehill supports outbound connections through proxies for environments where direct TCP connections to the server are blocked:
-
-- **SOCKS5** via `async-socks5`
-- **HTTP CONNECT** via `async-http-proxy` (supports basic auth)
-
-Configured per-service in the `[client.services.<name>.transport.tcp]` section with a `proxy` URL field (e.g., `proxy = "socks5://127.0.0.1:1080"` or `proxy = "http://user:pass@proxy:8080"`).
-
-## Test Infrastructure
-
-- **Integration tests** (`tests/integration_test.rs`): Spawn a real molehill server + client pair and hit them with echo/pingpong hitters. Test both TCP and UDP forwarding across all transport types (tcp, tls, noise, websocket).
-- **Shared test helpers** (`tests/common/mod.rs`): Echo servers, ping-pong servers, and molehill runner functions. Tests are self-contained — no external services needed.
-- **Test fixtures**: Transport-specific configs in `tests/for_tcp/` and `tests/for_udp/`.
-- **Config validation tests** (`tests/config_test/`): Valid and invalid config files for parsing tests.
-
-## Build Profiles
-
-- `dev`: Default cargo dev profile (empty `[profile.dev]` in Cargo.toml)
-- `release`: `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`
-- `minimal`: Inherits release, `opt-level = "z"` for smallest binary size (~500KiB)
-- `bench`: `debug = 1`
-
-## CI/CD
-
-GitHub Actions in `.github/workflows/`:
-- `ci.yml`: Lints (clippy, fmt, cargo-hack, cargo-machete, cargo-audit), builds for Linux/Windows/macOS (x86_64 + aarch64), runs tests
-- `release.yml`: Cross-compiles for 14+ targets, publishes Docker images and crates.io
-
-## Additional Documentation
-
-- `docs/configuration.md`: Full configuration specification, usage notes, and troubleshooting.
-- `docs/transport.md`: Detailed TLS and Noise Protocol setup, including certificate generation and keypair configuration.
-- `docs/build-guide.md`: Build customization, rustls support, and binary size minimization.
-- `docs/internals.md`: Conceptual overview of control/data channels and forwarding process.
-
-## Done in 0.7.0 / Remaining TODOs
-
-Shipped in 0.7.0: dynamic client-side service registration with `allow_ports`
-policy, configurable pool sizes, `udp_buffer_size`/`udp_idle_timeout`/
-`udp_sendq_size`, colored span-aware logging, and yamux multiplexing
-(`multiplex` feature in the default set, `mux = true` by default; `mux =
-false` retains the one-connection-per-channel path).
-
-Still deferred (see `HANDOFF.md`): HTTP API for configuration, visitor IP
-allowlist, per-service bandwidth limiting, QUIC transport, single-control-
-channel consolidation.
+# AGENTS.md — Repository Rules
+
+This file governs AI coding agents (and, equally, human contributors) working
+in this repository. Read it fully before making any change; when resuming an
+interrupted session, treat it as a fresh entry and redo the §1 self-check.
+HANDOFF.md records the current working state (decisions, open threads) — read
+it right after this file. If this file contradicts the actual code, the code
+wins — and §3 requires fixing the docs in the same change.
+
+## 1. Entering the repository: routine self-check (every time)
+
+Before touching anything, verify three things:
+
+1. **pre-commit is enabled** — `git config core.hooksPath` must print
+   `githooks`. If empty, run (prefer `just setup`, which also installs missing
+   tools):
+
+   ```bash
+   git config core.hooksPath githooks
+   ```
+
+2. **hook dependencies are installed** — four external tools must be on PATH:
+
+   ```bash
+   command -v cargo-machete cargo-audit cargo-outdated cargo-deny
+   ```
+
+   Install whatever is missing (with `--locked`):
+
+   ```bash
+   cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
+   ```
+
+   Note: `cargo fmt` and `cargo clippy` are guaranteed by the components
+   declared in `rust-toolchain.toml`; rustup installs them with the toolchain.
+
+3. **toolchain** — `rust-toolchain.toml` declares `channel = "stable"`; rustup
+   resolves the latest stable automatically. Never hardcode a version number
+   and never bypass this file.
+
+When in doubt about environment health, run `githooks/pre-commit` end to end
+as a smoke test (the first run of `cargo audit` fetches the RustSec database;
+slowness is normal).
+
+## 2. Lint errors: waiver discipline
+
+Principle: **fix the code first; a waiver is the last resort, and only
+code-level.**
+
+- Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
+  `githooks/pre-commit`, or any check command.
+- When a waiver is truly needed, relax **in code only**:
+  - prefer `#[expect(clippy::lint_name)]` (it starts producing a compile
+    warning once the lint stops firing, preventing stale allows), fall back to
+    `#[allow(clippy::lint_name)]`;
+  - minimal scope: a single statement or one function; never function groups,
+    module-level `#![allow(...)]`, or crate-level relaxation;
+  - a one-line reason comment at the waiver point is mandatory (plus a linked
+    issue, if any).
+- Only two legitimate scenarios:
+  1. **genuinely unavoidable** — the business need demands it and no equally
+     reasonable alternative exists;
+  2. **upstream problems** — false positives, macro/derive-generated code, or
+     audit noise from dependencies themselves (e.g. RustSec unmaintained
+     notices).
+- All other audits and extra checks (machete, audit, deny, outdated,
+  docs-sync, secret scan, and anything added later) follow the **same
+  discipline**: fix if fixable; waive only as above when truly unfixable.
+  Never delete, comment out, or bypass a check.
+- The chain has two layers: **fast gates** (`githooks/pre-commit`: fmt /
+  secrets / machete / docs / clippy) run on commit, **heavy gates**
+  (`githooks/pre-push`: audit / deny / outdated / test) run on push; CI runs
+  the whole chain via `just check`. All three are "the checks" and bound by
+  this discipline. Levels and the declared lint set:
+  [docs/lint-policy.md](docs/lint-policy.md).
+
+## 3. Before every commit: docs ↔ code alignment (every commit)
+
+- Verify the docs still tell the truth about the code:
+  - lint tables in docs/lint-policy.md / docs/lint-policy.zh.md ↔
+    `[lints]` in `Cargo.toml`;
+  - gate tables in docs/checks.md / docs/checks.zh.md ↔ the actual commands in
+    both hooks (`githooks/pre-commit` and `githooks/pre-push`);
+  - README.md / README.zh.md as landing pages: quick-start commands, docs
+    index links, and feature claims still hold;
+  - toolchain description ↔ `rust-toolchain.toml`; layout ↔
+    docs/structure(.zh).md; command examples; version numbers;
+  - source doc comments (`//!` / `///`) ↔ actual behavior.
+- Governance docs are bilingual pairs (`*.md` + `*.zh.md`) and must change
+  together; never update one language only. The user-facing pages
+  (configuration / transport / build-guide / internals) currently exist in
+  English only — when touching them, at minimum keep them truthful.
+- Changing lint config or the check chain requires syncing the affected docs
+  pages, both READMEs, and this file **in the same commit**.
+- The mechanical part is automated in `githooks/check-docs`, wired into the
+  pre-commit chain. It only covers greppable invariants (hook commands ↔
+  docs/checks, lint names ↔ docs/lint-policy, edition, channel, just recipes,
+  README docs index, CI entry, CHANGELOG extraction, test-build entry,
+  secret-scan gate).
+  **Semantic alignment** (outdated prose, runnable examples, consistent tone)
+  cannot be mechanized — it stays with the agent or a human reviewer.
+
+## 4. Commit message convention
+
+- **English only**, regardless of the author's language.
+- Conventional Commits prefixes: `feat:`, `fix:`, `docs:`, `chore:`,
+  `refactor:`, `test:`, `ci:`, `perf:`.
+- Subject line: imperative mood ("add", not "added"), ≤ 72 characters, no
+  trailing period.
+- Body (optional): explain **why**, wrap long lines; breaking changes append
+  `!` to the type and carry a `BREAKING CHANGE:` footer.
+- Every commit must pass the pre-commit gate — it runs automatically; do not
+  use `--no-verify`.
+
+## 5. Releases: tag-driven, automated
+
+- **Releases are tag-driven.** The only trigger of a release is pushing a
+  `v*` tag; `.github/workflows/release.yml` owns the whole flow and no other
+  path publishes a release.
+- **Versioning counts from the upstream line**: molehill is a fork of
+  [rathole](https://github.com/rapiz1/rathole) (upstream's last release:
+  v0.5.0) and continues its numbering from v0.6.0. Never renumber.
+- `CHANGELOG.md` is the **single source of release notes**, maintained in
+  [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
+  following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+- During development, record notable changes under `## [Unreleased]`.
+- Before tagging, move that content into a dated section:
+  `## [x.y.z] - YYYY-MM-DD` (the git tag is the same version with a `v`
+  prefix, e.g. `v0.7.1`).
+- Pushing a `v*` tag triggers `.github/workflows/release.yml`, which verifies
+  the version ↔ tag match and the changelog section, builds the 9-target
+  matrix, creates a **draft** GitHub Release with notes extracted from
+  `CHANGELOG.md`, publishes the GHCR image, and pushes the crate to
+  crates.io. A missing or empty changelog section **fails the release**.
+  Never hand-edit release notes on GitHub; the changelog is the source.
+- **Tag-push policy: no casual release pushes.** Commits are always allowed —
+  the fast gates guard them and they trigger nothing public. Pushing a `v*`
+  tag is a deliberate release act; **all** of the following must hold before
+  pushing one:
+  1. an explicit human request (agents must never create release tags on
+     their own initiative);
+  2. `version` in `Cargo.toml` equals the tag version;
+  3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`;
+  4. `just check` is green on the tagged commit.
+  Re-tagging is allowed only to fix a failed release (delete the tag, fix,
+  re-push). For verifying a commit without releasing, use CD test builds (§6).
+
+## 6. CD test builds: per-commit, per-platform artifacts
+
+- `.github/workflows/test-build.yml` builds **test artifacts** from any
+  commit without creating a release: dispatch it manually from the Actions
+  tab, choose a `ref` (commit SHA, branch, or tag) and `targets`
+  (`linux`, `macos`, `windows`).
+- Artifacts are ephemeral (7-day retention) and are never a Release — do not
+  hand out release links for them, and do not reference them in the
+  changelog.
+- Typical uses: verifying that a specific commit compiles on all platforms
+  before tagging (§5), and reproducing platform-specific issues on an exact
+  commit.
+
+## 7. Provenance: relationship to upstream
+
+- molehill is a community fork of [rathole](https://github.com/rapiz1/rathole)
+  (Apache-2.0). Upstream history is preserved intact below the v0.6.0
+  release commit; fork development starts at v0.6.0 and version numbers
+  continue the upstream line.
+- When porting an upstream fix, credit it in the commit body
+  (`Ported from rathole <sha>.`) and add a CHANGELOG entry in the same
+  commit.
+- Do not re-sync wholesale with upstream: v0.7.0 replaced the configuration
+  model and the wire protocol (v2). Cherry-pick consciously; note any
+  conflict with the dynamic-registration design in HANDOFF.md.
+
+## 8. Day-to-day operations
+
+- commit → fast gates; push to a branch → heavy gates; **push of a `v*` tag →
+  release (§5, deliberate)**; PR or push to `main` → CI runs the identical
+  chain; branch protection on `main` requires the `full check chain` check
+  and forbids force-pushes (the one sanctioned exception: a coordinated
+  history rebuild, explicitly requested and backed up first).
+- Formatting: `just fmt` auto-fixes; `just check` rehearses the whole chain
+  before committing.
+- Dependencies: add or remove them only through cargo — `cargo add` (add
+  `--dev` for dev-dependencies) and `cargo remove`. Never hand-edit the
+  `[dependencies]` / `[dev-dependencies]` tables in `Cargo.toml`: `cargo add`
+  resolves a compatible version requirement and updates `Cargo.lock` in the
+  same step, avoiding hand-written specs that drift from the lock or trip the
+  dependency gates.
+- Maintenance: Dependabot opens weekly updates for GitHub Actions and cargo
+  dependencies; they merge only with CI green.
+- Security reports go through GitHub's private vulnerability reporting
+  (SECURITY.md), never public issues.
+
+## 9. Working discipline (daily rules)
+
+- **Stage with eyes open.** Review `git status` and stage selectively
+  (`git add -p`); never blanket `git add -A` while the worktree holds
+  unrelated changes. One commit = one logical change: features, refactors,
+  and fixes do not share a commit.
+- **main stays releasable.** Direct pushes to main are allowed, so CI red on
+  main is the top priority — fix it before starting new work; experiments go
+  to a branch.
+- **No drive-by dependency upgrades.** Upgrades are Dependabot's job (or a
+  dedicated commit); never bundle them into feature work — keep bisect clean.
+- **CHANGELOG as you go.** A user-visible change and its `## [Unreleased]`
+  entry land in the same commit; never backfill at release time (§5).
+- **Prove it, don't assume it.** Every "it works" claim must be backed by
+  real command output from this session; no output, no claim.
+- **No corpses.** Commented-out code and `todo!()` stubs get removed, not
+  accumulated (the `todo` lint already watches).
+- **End-of-session ritual.** A session ends with `just fmt` + `just check`,
+  everything committed and pushed — never a dirty tree, never unpushed
+  commits.
+- **Timebox rabbit holes.** Three failed attempts on the same problem: stop,
+  write the findings into HANDOFF.md, and ask the human.
+- **Clear → act; ambiguous or irreversible → ask.** Renames, deletions,
+  settings changes, and anything touching releases need the human's go.
+- **Secrets never enter the repository.** Tokens, keys, and credentials live
+  in repo settings / environment only — never in code, docs, or commits.
+  Enforced mechanically by `githooks/check-secrets` in the pre-commit chain;
+  a line that must carry a secret-shaped string takes a
+  `security-scan:allow` marker with a reason.
+
+## 10. Documentation map
+
+| Question | Where |
+|----------|-------|
+| How to build, run, and configure molehill | README.md / docs/configuration.md |
+| What each gate runs, how to handle a block | docs/checks.md |
+| Lint levels and waiver rules | docs/lint-policy.md |
+| Release mechanics, test builds, versioning | docs/release.md |
+| What every file in this repo is for | docs/structure.md |
+| TLS and Noise transport setup | docs/transport.md |
+| Control/data channel design | docs/internals.md |
+| Current working state, decisions, open threads | HANDOFF.md |
+
+Governance pages (checks, lint-policy, release, structure) have `*.zh.md`
+counterparts; §3 governs their sync.
+
+## 11. Project facts (appendix)
+
+Details that agents need constantly:
+
+- **What it is**: a secure, stable, high-performance reverse proxy for NAT
+  traversal (a Rust alternative to frp / ngrok). Server runs on a public
+  host, client behind NAT; a control channel carries commands, data channels
+  carry forwarded traffic.
+- **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
+  Apache-2.0. Feature-gated: `server` / `client` modes; mutually exclusive
+  `native-tls` / `rustls` (and websocket variants, enforced by
+  `compile_error!`); `noise`; `hot-reload`; `multiplex` (yamux, in the
+  default set); `embedded` (minimal). The mutual exclusivity is why clippy
+  runs twice in the pre-commit gate instead of `--all-features` once.
+- **Protocol**: v2 — client registers services dynamically after auth
+  (`RegisterService`), server enforces `allow_ports`; protocol mismatch is a
+  hard error. See docs/internals.md.
+- **Build profiles**: `release` (lto, strip, panic=abort), `minimal`
+  (opt-level "z", ~500KiB), `bench`. Container image: static musl binary on
+  scratch.
+- **Tests are serial** (`--test-threads=1`): integration tests spawn real
+  server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
+  `cargo run -- --genkey` (noise keypair).
+- **Full architecture guidance** (module layout, design patterns, protocol
+  flow) lives in [docs/structure.md](docs/structure.md) and
+  [docs/internals.md](docs/internals.md).
+
+## 12. One-line summary
+
+> Self-check the environment on entry; when a check blocks you, fix the code —
+> waive only as a last resort, locally, with a named reason; keep docs and
+> code in the same commit; write commit messages in english; commits are free,
+> release tags are deliberate; let releases speak through CHANGELOG.md; count
+> versions from the upstream line; prove every claim with real output; end
+> sessions clean; secrets never enter the repo.

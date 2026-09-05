@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + strict clippy.
+# Heavyweight gates (audit / deny / outdated / test) live in githooks/pre-push.
+# Activate via: git config core.hooksPath githooks   (or: just setup)
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "==> secret scan (githooks/check-secrets)"
+githooks/check-secrets
+
+echo "==> cargo machete (unused dependencies)"
+cargo machete
+
+echo "==> docs alignment (githooks/check-docs)"
+githooks/check-docs
+
+echo "==> cargo clippy (strict lints from Cargo.toml, default features)"
+cargo clippy --all-targets -- -D warnings
+
+echo "==> cargo clippy (server+client only — no TLS/websocket/mux feature gates)"
+cargo clippy --all-targets --no-default-features --features server,client -- -D warnings
+
+echo "pre-commit checks passed"

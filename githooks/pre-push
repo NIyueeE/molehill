@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Pre-push hook (heavyweight gates): audit + dependency policy + freshness + tests.
+# Fast gates live in githooks/pre-commit; CI runs the full chain via `just check`.
+# Activate via: git config core.hooksPath githooks   (or: just setup)
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> cargo audit (security advisories)"
+cargo audit
+
+echo "==> cargo deny (licenses / bans / advisories policy)"
+cargo deny check
+
+echo "==> cargo outdated (root dependencies)"
+cargo outdated --root-deps-only
+
+echo "==> cargo test (serial by design — the integration suite binds fixed ports)"
+cargo test --quiet -- --test-threads=1
+
+echo "pre-push checks passed"

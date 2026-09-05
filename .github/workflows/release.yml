@@ -1,16 +1,14 @@
 name: Release
 
+# Tag-driven releases only (AGENTS.md §5): pushing a `v*` tag is the single
+# release trigger. The tag version must equal Cargo.toml's version and a
+# dated `## [x.y.z]` section must exist in CHANGELOG.md — the changelog is
+# the single source of release notes. A missing section fails the release.
+# For verifying a commit without releasing, use test-build.yml instead.
+
 on:
   push:
-    tags:
-      - "v*"
-
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v0.5.0)"
-        required: true
-        type: string
+    tags: ["v*"]
 
 permissions:
   contents: write
@@ -20,35 +18,45 @@ env:
 
 jobs:
   check:
-    name: Pre-release checks
+    name: pre-release checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "stable"
-      - name: Resolve tag
-        id: meta
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+
       - name: Verify version matches Cargo.toml
         run: |
           CARGO_VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          TAG="${{ steps.meta.outputs.tag }}"
-          TAG_VERSION="${TAG#v}"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
           if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
-            echo "Mismatch: Cargo.toml version=$CARGO_VERSION, tag=$TAG_VERSION"
+            echo "::error::Mismatch: Cargo.toml version=$CARGO_VERSION, tag=$TAG_VERSION"
             exit 1
           fi
+
+      - name: Verify CHANGELOG section exists (single source of release notes)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {insec=1; next}
+            insec && /^## / {exit}
+            insec {print}
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section. Add it (Keep a Changelog format) before tagging."
+            exit 1
+          fi
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cargo-audit
+
       - name: cargo audit
-        uses: actions-rust-lang/audit@v1
+        run: cargo audit
 
   build:
-    name: Build for ${{ matrix.target }}
+    name: build ${{ matrix.target }}
     needs: check
     runs-on: ${{ matrix.os }}
     strategy:
@@ -102,21 +110,13 @@ jobs:
             target: x86_64-pc-windows-msvc
             exe: molehill.exe
             cross: false
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "stable"
 
-      - name: Resolve tag
-        id: meta
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          fi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install OpenSSL
         if: matrix.os == 'ubuntu-latest'
@@ -142,7 +142,7 @@ jobs:
       # Cross build
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
           tool: cross
       - name: Run tests
@@ -155,7 +155,7 @@ jobs:
       - name: Run UPX
         continue-on-error: true
         if: matrix.os == 'ubuntu-latest'
-        uses: crazy-max/ghaction-upx@v4
+        uses: crazy-max/ghaction-upx@c83f378efc804f828e988debb88ed6116feb2368 # v4
         with:
           version: v4.0.2
           files: target/${{ matrix.target }}/release/${{ matrix.exe }}
@@ -164,7 +164,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          tag="${{ steps.meta.outputs.tag }}"
+          tag="${GITHUB_REF_NAME}"
           name="molehill-${tag}-${{ matrix.target }}"
           mkdir -p "$name"
           cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" "$name/"
@@ -176,7 +176,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.target }}
           path: |
@@ -189,21 +189,23 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Resolve tag
-        id: meta
+      - name: Extract release notes from CHANGELOG.md
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {insec=1; next}
+            insec && /^## / {exit}
+            insec {print}
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section."
+            exit 1
           fi
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -213,40 +215,31 @@ jobs:
           cd dist
           sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true
 
-      - name: Extract changelog
-        id: changelog
+      # Releases are created as drafts; publish after a quick look.
+      # Never hand-edit the notes — CHANGELOG.md is the source (AGENTS.md §5).
+      - name: Create release with notes extracted from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ steps.meta.outputs.tag }}"
-          VERSION="${TAG#v}"
-          awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" CHANGELOG.md > release_notes.md
-          if [ -s release_notes.md ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
+          TAG="$GITHUB_REF_NAME"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md --draft
+            gh release upload "$TAG" dist/* --clobber
           else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            rm -f release_notes.md
+            gh release create "$TAG" --draft --title "$TAG" --notes-file release-notes.md dist/*
           fi
-
-      - name: Create release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          files: dist/*
-          generate_release_notes: ${{ steps.changelog.outputs.found != 'true' }}
-          body_path: ${{ steps.changelog.outputs.found == 'true' && 'release_notes.md' || '' }}
-          draft: true
 
   docker:
     name: Publish to GHCR (scratch image from build artifacts)
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       packages: write
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -263,16 +256,16 @@ jobs:
           cp Containerfile img/Dockerfile
           file img/bin/amd64/molehill img/bin/arm64/molehill
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Login to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push
         id: docker_build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: img
           push: true
@@ -287,14 +280,11 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "stable"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
