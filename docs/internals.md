@@ -12,13 +12,7 @@
 
 ## Startup and registration
 
-In client mode, molehill creates one control channel per configured service, all connecting to `server.bind_addr`. The server owns no service configuration: after authentication the *client registers* each service by sending its name, type, public endpoint (`remote_bind_addr`) and desired pool size.
-
-The server validates every registration against its policy before exposing anything:
-
-1. the requested port must be covered by `[server].allow_ports` — an empty whitelist disables dynamic registration entirely;
-2. privileged ports (<1024) must be listed explicitly;
-3. the port must not already be in use (the bind happens before the registration is acknowledged, so conflicts surface as precise rejections).
+In client mode, molehill creates one control channel per configured service, all connecting to `server.bind_addr`. The server owns no service configuration: after authentication the *client registers* each service by sending its name, type, public endpoint (`remote_bind_addr`) and desired pool size, and the server validates the registration against its policy before exposing anything — `allow_ports` whitelist, explicit privileged ports, and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
 
 On success the server binds the endpoint and starts serving visitors; on failure it replies with the exact reason and the client gives up for that service instead of hammering the server with doomed retries.
 

@@ -26,13 +26,9 @@ molehill 是 [rathole](https://github.com/rapiz1/rathole) 的 fork,版本号
 ## Tag 推送策略:不随手发版
 
 commit 随时可以推 —— 快速门守护它们,且不会触发任何公开动作。推送 `v*`
-tag 是一次郑重的发布行为;推送前以下条件**必须全部**满足:
-
-1. 明确的人类请求(代理程序绝不能擅自创建发布 tag);
-2. `Cargo.toml` 中的 `version` 等于 tag 版本(发布工作流强制校验);
-3. `CHANGELOG.md` 存在带日期的 `## [x.y.z] - YYYY-MM-DD` 小节(发布工作流
-   强制校验);
-4. 该 commit 上 `just check` 全绿。
+tag 是一次郑重的发布行为;四项前提条件(明确的人类请求、`Cargo.toml` 版本
+一致、带日期的 CHANGELOG 小节、`just check` 全绿)是 [AGENTS.md §5](../AGENTS.md)
+中的仓库规则 —— 发布工作流对其中版本与 CHANGELOG 两项做机械强制校验。
 
 重新打 tag 仅用于修复失败的发布(删除 tag、修复、重新推送)。不发布地验证
 某个 commit,请使用 CD 测试构建。

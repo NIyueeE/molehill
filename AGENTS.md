@@ -128,11 +128,11 @@ code-level.**
   `## [x.y.z] - YYYY-MM-DD` (the git tag is the same version with a `v`
   prefix, e.g. `v0.7.1`).
 - Pushing a `v*` tag triggers `.github/workflows/release.yml`, which verifies
-  the version ↔ tag match and the changelog section, builds the 9-target
-  matrix, creates a **draft** GitHub Release with notes extracted from
-  `CHANGELOG.md`, publishes the GHCR image, and pushes the crate to
-  crates.io. A missing or empty changelog section **fails the release**.
-  Never hand-edit release notes on GitHub; the changelog is the source.
+  the version ↔ tag match and the changelog section, then builds and
+  publishes (draft GitHub Release, GHCR image, crates.io). A missing or empty
+  changelog section **fails the release**; never hand-edit release notes on
+  GitHub — the changelog is the source. Step-by-step mechanics:
+  [docs/release.md](docs/release.md).
 - **Tag-push policy: no casual release pushes.** Commits are always allowed —
   the fast gates guard them and they trigger nothing public. Pushing a `v*`
   tag is a deliberate release act; **all** of the following must hold before
@@ -147,16 +147,14 @@ code-level.**
 
 ## 6. CD test builds: per-commit, per-platform artifacts
 
-- `.github/workflows/test-build.yml` builds **test artifacts** from any
-  commit without creating a release: dispatch it manually from the Actions
-  tab, choose a `ref` (commit SHA, branch, or tag) and `targets`
-  (`linux`, `macos`, `windows`).
-- Artifacts are ephemeral (7-day retention) and are never a Release — do not
-  hand out release links for them, and do not reference them in the
-  changelog.
-- Typical uses: verifying that a specific commit compiles on all platforms
-  before tagging (§5), and reproducing platform-specific issues on an exact
-  commit.
+`.github/workflows/test-build.yml` builds **test artifacts** from any commit
+without ever creating a release — dispatch it manually from the Actions tab
+with a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
+`windows`). Artifacts are ephemeral (7-day retention): never hand out
+release links for them, and never reference them in the changelog. Typical
+uses: verifying that a specific commit compiles on all platforms before
+tagging (§5), and reproducing platform-specific issues on an exact commit.
+Details: [docs/release.md](docs/release.md).
 
 ## 7. Provenance: relationship to upstream
 

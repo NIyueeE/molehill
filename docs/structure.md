@@ -64,4 +64,20 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | transport fixtures and valid/invalid configs |
 | `benches/` | HTTP latency (vegeta) and memory-sampling scripts |
 | `examples/` | runnable configs: tls, noise_nk, udp, use_proxy, minimal, iperf3, unified, systemd, container, full |
-| `docs/` | user docs (configuration, transport, build-guide, internals) + governance docs (checks, lint-policy, release, structure), each bilingual (`*.md` + `*.zh.md`) |
+| `docs/` | documentation set — one owner per topic, everything else links (see below) |
+
+### Documentation responsibilities
+
+One topic, one home; the other pages link instead of repeating.
+
+| Doc | Owns |
+|-----|------|
+| `configuration.md` | full config reference, logging, tuning, troubleshooting |
+| `transport.md` | TLS / Noise / WebSocket setup: keys, certificates, patterns |
+| `build-guide.md` | building from source, feature flags, minimal binaries |
+| `internals.md` | wire protocol and forwarding design (registration, muxing, UDP affinity) |
+| `checks.md` | gate tables: every command and how to handle a block |
+| `lint-policy.md` | declared lints and waiver discipline |
+| `release.md` | release mechanics, versioning, CD test builds |
+| `structure.md` | this map |
+| `*.zh.md` | mirrors of the English governance docs — always edited in the same commit |

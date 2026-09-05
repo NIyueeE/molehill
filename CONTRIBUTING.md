@@ -12,15 +12,13 @@ just check        # run the full chain (same as CI)
 
 ## Check gates
 
-Details and the full gate tables: [docs/checks.md](docs/checks.md) (简体中文:
-[docs/checks.zh.md](docs/checks.zh.md)).
-
-- **pre-commit (fast)**: `cargo fmt --check`, secret scan (`githooks/check-secrets`),
-  `cargo machete`, docs↔code alignment (`githooks/check-docs`), strict clippy
-- **pre-push (heavy)**: `cargo audit`, `cargo deny check`, `cargo outdated`,
-  `cargo test` (serial)
-- **CI**: the whole chain via `just check`, plus feature powerset, per-feature
-  test matrix, minimal-size check, and 4-platform builds
+The authoritative gate tables — every command, what it does, and what to do
+when a gate blocks you — live in [docs/checks.md](docs/checks.md) (简体中文:
+[docs/checks.zh.md](docs/checks.zh.md)). In short: fast gates (fmt, secret
+scan, machete, docs↔code alignment, strict clippy) on every commit, heavy
+gates (audit, deny, outdated, serial tests) on every push, and CI runs the
+whole chain via `just check` plus feature powerset, per-feature test matrix,
+minimal-size check, and 4-platform builds.
 
 The full discipline — including when a lint waiver is acceptable — lives in
 [AGENTS.md](AGENTS.md). In short: fix code first; waivers are code-level,

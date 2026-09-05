@@ -146,14 +146,14 @@ and cuts FD usage under many concurrent visitors.
 
 - The decision belongs to the client alone (`mux = true/false`); the server
   adapts per connection automatically.
-- `mux = false` restores the one-connection-per-channel path (used by the
-  integration matrix to keep both data paths continuously verified).
-- Stream receive windows auto-tune towards the bandwidth-delay product
-  (rust-yamux), so high-BDP links are not throttled like with stock yamux.
+- `mux = false` restores the one-connection-per-channel path.
 - `mux_receive_window` / `mux_max_streams` bound the buffering and stream
   count per tunnel; sensible defaults apply when unset.
 - Building without the feature removes the option entirely and always uses
   the one-connection-per-channel path.
+
+The wire-level design — tunnel upgrade, per-stream framing and windows, and
+why pooled streams need a SYN kick — is in [Internals](./internals.md).
 
 ## Logging
 
@@ -211,11 +211,16 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 - `health_check` does not apply to UDP services.
 
-### Transport specifics
+### Transports
 
-- **TLS**: with rustls builds, the server's PKCS#12 archive must use legacy PBE algorithms (with openssl 3, add `-legacy` when creating it). The client either pins `trusted_root` or falls back to the system certificate store.
-- **Noise**: generate keypairs with `molehill --genkey`. The server holds `local_private_key`; the client holds the server's `remote_public_key`. A `psk` must be 32 bytes, base64-encoded, identical on both sides, and the pattern must include a PSK modifier.
-- **Proxy**: `proxy` only applies to the client's outbound connections to the server (control channel, tunnel, and non-multiplexed data channels). Both `socks5` and `http` (CONNECT), with optional basic auth, are supported.
+Transport setup — TLS certificates (including the rustls legacy-PBE caveat),
+Noise keypairs, patterns and PSKs, and the WebSocket transport — is
+documented step by step in [Transport](./transport.md): pick the `type` in
+the specification above and follow that guide.
+
+- **Proxy**: `proxy` only applies to the client's outbound connections to the
+  server (control channel, tunnel, and non-multiplexed data channels). Both
+  `socks5` and `http` (CONNECT), with optional basic auth, are supported.
 
 ### Hot reload
 

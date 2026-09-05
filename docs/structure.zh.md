@@ -65,4 +65,20 @@
 | `tests/for_tcp/`、`tests/for_udp/`、`tests/config_test/` | 传输夹具与有效/无效配置 |
 | `benches/` | HTTP 延迟(vegeta)与内存采样脚本 |
 | `examples/` | 可运行的配置:tls、noise_nk、udp、use_proxy、minimal、iperf3、unified、systemd、container、full |
-| `docs/` | 用户文档(configuration、transport、build-guide、internals)+ 治理文档(checks、lint-policy、release、structure),全部双语(`*.md` + `*.zh.md`) |
+| `docs/` | 文档集 —— 每个主题只有一个归属地,其余页面以链接代替重复(见下) |
+
+### 文档职责
+
+一个主题,一个归属地;其他页面用链接而不是重复。
+
+| 文档 | 负责 |
+|-----|------|
+| `configuration.md` | 完整配置规范、日志、调优、故障排查 |
+| `transport.md` | TLS / Noise / WebSocket 配置:密钥、证书、握手模式 |
+| `build-guide.md` | 从源码构建、特性开关、最小化二进制 |
+| `internals.md` | 线路协议与转发设计(注册、多路复用、UDP 会话亲和) |
+| `checks.md` | 门表:每条命令与被拦住时的处理 |
+| `lint-policy.md` | 已声明的 lint 与豁免纪律 |
+| `release.md` | 发布机制、版本编号、CD 测试构建 |
+| `structure.md` | 本地图 |
+| `*.zh.md` | 英文治理文档的镜像 —— 必须在同一次提交中同步修改 |

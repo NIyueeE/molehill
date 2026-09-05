@@ -29,16 +29,11 @@ applies within that line.
 ## Tag-push policy: no casual release pushes
 
 Commits are always allowed — the fast gates guard them and they trigger
-nothing public. Pushing a `v*` tag is a deliberate release act; **all** of the
-following must hold before pushing one:
-
-1. an explicit human request (agents must never create release tags on their
-   own initiative);
-2. `version` in `Cargo.toml` equals the tag version (enforced by the release
-   workflow);
-3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`
-   (enforced by the release workflow);
-4. `just check` is green on the tagged commit.
+nothing public. Pushing a `v*` tag is a deliberate release act; the four
+preconditions (explicit human request, `Cargo.toml` version match, dated
+changelog section, green `just check`) are the repository rule stated in
+[AGENTS.md §5](../AGENTS.md) — the release workflow enforces the version and
+changelog ones mechanically.
 
 Re-tagging is allowed only to fix a failed release (delete the tag, fix,
 re-push). For verifying a commit without releasing, use CD test builds.
