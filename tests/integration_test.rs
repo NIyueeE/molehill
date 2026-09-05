@@ -1,7 +1,14 @@
+//! End-to-end integration tests: real server/client pairs over every
+//! transport, plus the UDP session-affinity regression scenario.
+//!
+//! Run serially (`--test-threads=1`): the scenarios bind fixed ports.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use anyhow::{Ok, Result};
 use common::{PING, PONG, run_molehill_client};
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -28,6 +35,11 @@ mod common;
 const ECHO_SERVER_ADDR: &str = "127.0.0.1:8080";
 const PINGPONG_SERVER_ADDR: &str = "127.0.0.1:8081";
 const HITTER_NUM: usize = 4;
+
+// Ports for the UDP session-affinity regression test (`udp_session_affinity`).
+const AFFINITY_LOCAL_SERVICE: &str = "127.0.0.1:8082";
+const AFFINITY_EXPOSED_ADDR: &str = "127.0.0.1:2340";
+const AFFINITY_PACKETS: usize = 64;
 
 #[cfg(feature = "multiplex")]
 static MUX_CONFIG_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -104,14 +116,14 @@ async fn tcp() -> Result<()> {
     // Spawn a echo server
     tokio::spawn(async move {
         if let Err(e) = common::tcp::echo_server(ECHO_SERVER_ADDR).await {
-            panic!("Failed to run the echo server for testing: {:?}", e);
+            panic!("Failed to run the echo server for testing: {e:?}");
         }
     });
 
     // Spawn a pingpong server
     tokio::spawn(async move {
         if let Err(e) = common::tcp::pingpong_server(PINGPONG_SERVER_ADDR).await {
-            panic!("Failed to run the pingpong server for testing: {:?}", e);
+            panic!("Failed to run the pingpong server for testing: {e:?}");
         }
     });
 
@@ -147,14 +159,14 @@ async fn udp() -> Result<()> {
     // Spawn a echo server
     tokio::spawn(async move {
         if let Err(e) = common::udp::echo_server(ECHO_SERVER_ADDR).await {
-            panic!("Failed to run the echo server for testing: {:?}", e);
+            panic!("Failed to run the echo server for testing: {e:?}");
         }
     });
 
     // Spawn a pingpong server
     tokio::spawn(async move {
         if let Err(e) = common::udp::pingpong_server(PINGPONG_SERVER_ADDR).await {
-            panic!("Failed to run the pingpong server for testing: {:?}", e);
+            panic!("Failed to run the pingpong server for testing: {e:?}");
         }
     });
 
@@ -181,6 +193,98 @@ async fn udp() -> Result<()> {
     test_transport("tests/for_udp/websocket_tls_transport.toml", Type::Udp).await?;
 
     Ok(())
+}
+
+#[tokio::test]
+async fn udp_session_affinity() -> Result<()> {
+    init();
+
+    // A stateful-UDP "game server": it records the source address of every
+    // datagram (a stateful protocol pins the session to `(ip, port)`) and
+    // echoes payloads back to it. One peer must arrive from exactly one
+    // source port, or its session is torn in half.
+    let seen_srcs = Arc::new(Mutex::new(HashSet::new()));
+    let server_seen = seen_srcs.clone();
+    tokio::spawn(async move {
+        if let Err(e) = sticky_echo_server(server_seen).await {
+            panic!("Failed to run the sticky echo server for testing: {e:?}");
+        }
+    });
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_udp/affinity_transport.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    // Sleep for 1 second. Expect the client keep retrying to reach the server
+    time::sleep(Duration::from_secs(1)).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_udp/affinity_transport.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    time::sleep(Duration::from_millis(2500)).await;
+
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(AFFINITY_EXPOSED_ADDR).await?;
+
+    // Fire a burst without waiting for replies: exactly the pattern that
+    // used to race one peer's packets onto different data channels (and out
+    // of the client through different local sockets).
+    let mut sent = HashSet::new();
+    for i in 0..AFFINITY_PACKETS {
+        let payload = format!("session-affinity-{i}");
+        conn.send(payload.as_bytes()).await?;
+        sent.insert(payload);
+    }
+
+    // Every datagram must come back.
+    let mut received = HashSet::new();
+    let mut buf = [0u8; 2048];
+    time::timeout(Duration::from_secs(10), async {
+        while received.len() < AFFINITY_PACKETS {
+            let n = conn.recv(&mut buf).await?;
+            received.insert(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for the echo replies"))?;
+
+    assert_eq!(received, sent, "datagrams were lost or corrupted");
+
+    // And all of them must have arrived at the local service from ONE source
+    // address: the peer's session stayed on a single outbound socket.
+    // Snapshot before asserting — the panic message must not re-lock a Mutex
+    // whose guard is still alive in this very expression.
+    let (src_count, srcs) = {
+        let seen = seen_srcs.lock().unwrap();
+        (seen.len(), seen.clone())
+    };
+    assert_eq!(
+        src_count, 1,
+        "stateful UDP session was split across multiple source ports: {srcs:?}"
+    );
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+
+    Ok(())
+}
+
+/// Echo server that asserts session affinity: records the source address of
+/// every datagram it receives.
+async fn sticky_echo_server(seen_srcs: Arc<Mutex<HashSet<SocketAddr>>>) -> Result<()> {
+    let l = UdpSocket::bind(AFFINITY_LOCAL_SERVICE).await?;
+    let mut buf = [0u8; 2048];
+    loop {
+        let (n, from) = l.recv_from(&mut buf).await?;
+        seen_srcs.lock().unwrap().insert(from);
+        l.send_to(&buf[..n], from).await?;
+    }
 }
 
 #[instrument]

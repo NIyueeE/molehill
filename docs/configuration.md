@@ -72,7 +72,7 @@ remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service i
 nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 prefer_ipv6 = false # Optional. Override the `client.prefer_ipv6` per service
-pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`
+pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`. For UDP this shards distinct visitors across channels; each visitor is pinned to one channel (session affinity)
 health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Probes the local service and removes it from the server while it is down (see "Health check" below)
 
 [client.services.service2] # Multiple services can be defined
@@ -80,7 +80,7 @@ type = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
-udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client. Default: 60
+udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
 udp_sendq_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
@@ -207,7 +207,8 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 ### UDP services
 
 - The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535); larger datagrams are dropped while the channel stays usable. Configure it identically on the service and remember that the server enforces its own copy received at registration time.
-- UDP forwarding is connectionless: the client maps visitor addresses to local sockets and cleans up idle mappings after `udp_idle_timeout` seconds (default 60).
+- **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `pool_size` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels.
+- A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 - `health_check` does not apply to UDP services.
 
 ### Transport specifics
@@ -240,4 +241,5 @@ If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay =
 | Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
 | `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |
 | UDP traffic not flowing | Check `type = "udp"`; datagrams larger than `udp_buffer_size` are dropped; idle mappings time out after `udp_idle_timeout` seconds. |
+| Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |

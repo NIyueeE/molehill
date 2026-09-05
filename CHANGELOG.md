@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- UDP forwarding keeps **session affinity** for every remote peer: the
+  server routes all datagrams of one peer address through a single data
+  channel (previously the per-datagram pool load balancing split a burst
+  across channels), and the proxy client keeps one local outbound socket per
+  peer for its whole session, surviving channel re-sharding and channel
+  loss. Stateful UDP sessions — e.g. Minecraft Bedrock (RakNet), QUIC,
+  WireGuard — no longer tear in half with `pool_size > 1`; the pool now
+  shards distinct peers, not packets. The server also replaces dead UDP
+  data channels to keep the pool at its configured size.
+
 ## [0.7.1] - 2026-09-05
 
 Project base rebuilt on [rust-agents-template](https://github.com/NIyueeE/rust-agents-template).

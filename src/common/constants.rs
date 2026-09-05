@@ -23,11 +23,21 @@ pub const DEFAULT_TCP_POOL_SIZE: u16 = 8;
 /// Default number of pre-established data channels per UDP service.
 pub const DEFAULT_UDP_POOL_SIZE: u16 = 2;
 
-/// Default queue size for outbound UDP datagrams per data channel.
+/// Queue size for visitor-bound UDP datagrams per data channel, on both the
+/// server (affinity routing queue) and the client (channel writer queue).
 pub const DEFAULT_UDP_SENDQ_SIZE: usize = 1024;
 /// Default idle timeout (seconds) after which an inactive UDP peer mapping is
 /// cleaned up on the client side.
 pub const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Time-to-live (seconds) for the server-side UDP session-affinity table.
+///
+/// An expired entry only re-shards an idle peer onto another data channel;
+/// the proxy client keeps the peer's outbound socket, so the source port the
+/// local service sees is unaffected. The TTL bounds memory under address
+/// churn (e.g. scans), not session lifetime.
+#[cfg(feature = "server")]
+pub const UDP_ROUTE_TTL_SECS: u64 = 300;
 
 #[cfg(feature = "client")]
 pub fn run_control_chan_backoff(interval: u64) -> ExponentialBuilder {

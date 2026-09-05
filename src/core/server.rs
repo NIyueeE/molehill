@@ -1,4 +1,4 @@
-use crate::common::constants::TCP_COPY_BUFFER_SIZE;
+use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP_ROUTE_TTL_SECS};
 use crate::common::helper::write_and_flush;
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
@@ -12,14 +12,19 @@ use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
 use backon::ExponentialBuilder;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use rand::TryRng;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
 use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
@@ -57,24 +62,21 @@ pub async fn run_server(
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
-    let config = match config.server {
-        Some(config) => config,
-        None => {
-            return Err(anyhow!(
-                "Try to run as a server, but the configuration is missing. Please add the `[server]` block"
-            ));
-        }
+    let Some(config) = config.server else {
+        return Err(anyhow!(
+            "Try to run as a server, but the configuration is missing. Please add the `[server]` block"
+        ));
     };
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config).await?;
+            let mut server = Server::<TcpTransport>::from(config)?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config).await?;
+                let mut server = Server::<TlsTransport>::from(config)?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -83,7 +85,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config).await?;
+                let mut server = Server::<NoiseTransport>::from(config)?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -92,7 +94,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config).await?;
+                let mut server = Server::<WebsocketTransport>::from(config)?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -123,7 +125,7 @@ struct Server<T: Transport> {
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub fn from(config: ServerConfig) -> Result<Server<T>> {
         let config = Arc::new(config);
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
         let transport = Arc::new(T::new(&config.transport)?);
@@ -209,7 +211,10 @@ impl<T: 'static + Transport> Server<T> {
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                        // The server owns no service configuration, so there
+                        // is nothing to hot-reload here: services come and go
+                        // with their control channels.
+                        warn!("Ignored {e:?} since running as a server");
                     }
                 }
             }
@@ -218,12 +223,6 @@ impl<T: 'static + Transport> Server<T> {
         info!("Shutdown");
 
         Ok(())
-    }
-
-    async fn handle_hot_reload(&mut self, e: ConfigChange) {
-        // The server owns no service configuration, so there is nothing to
-        // hot-reload here: services come and go with their control channels.
-        warn!("Ignored {:?} since running as a server", e);
     }
 }
 
@@ -342,7 +341,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     let bound = match bind_with_retry(&service).await {
         Ok(b) => b,
         Err(e) => {
-            let reason = format!("{:#}", e);
+            let reason = format!("{e:#}");
             warn!(service = %reg.name, "Registration failed: {reason}");
             write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
             bail!("Service {}: {reason}", reg.name);
@@ -353,7 +352,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     let handle = ControlChannelHandle::new(
         conn,
-        service,
+        &service,
         bound,
         server_config.heartbeat_interval,
         pool_size,
@@ -451,12 +450,9 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
 
     // Validate
     let control_channels_guard = control_channels.read().await;
-    let handle = match control_channels_guard.get2(&nonce) {
-        Some(handle) => handle.clone(),
-        None => {
-            warn!("Data channel has incorrect nonce");
-            return Ok(());
-        }
+    let Some(handle) = control_channels_guard.get2(&nonce).cloned() else {
+        warn!("Data channel has incorrect nonce");
+        return Ok(());
     };
     drop(control_channels_guard);
 
@@ -505,21 +501,26 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     Ok(())
 }
 
+#[expect(
+    clippy::struct_field_names,
+    reason = "the handle deliberately holds the three channel senders whose \
+              lifetime keeps the control channel and its pools alive"
+)]
 pub struct ControlChannelHandle<T: Transport> {
     // Shutdown the control channel by dropping it
-    _shutdown_tx: broadcast::Sender<bool>,
+    shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<DataChannel<T>>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
 }
 
 impl<T: Transport> Clone for ControlChannelHandle<T> {
     fn clone(&self) -> Self {
         ControlChannelHandle {
-            _shutdown_tx: self._shutdown_tx.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
             data_ch_tx: self.data_ch_tx.clone(),
-            _data_ch_req_tx: self._data_ch_req_tx.clone(),
+            data_ch_req_tx: self.data_ch_req_tx.clone(),
         }
     }
 }
@@ -587,7 +588,7 @@ where
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
         conn: T::Stream,
-        service: RegisteredService,
+        service: &RegisteredService,
         bound: BoundEndpoint,
         heartbeat_interval: u64,
         pool_size: usize,
@@ -605,7 +606,7 @@ where
         for _i in 0..pool_size {
             if let Err(e) = data_ch_req_tx.send(true) {
                 error!("Failed to request data channel {}", e);
-            };
+            }
         }
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
@@ -637,12 +638,14 @@ where
             BoundEndpoint::Udp(socket) => {
                 info!(service = %service.name, "Listening at {}", service.bind_addr);
                 let buffer_size = service.udp_buffer_size;
+                let data_ch_req_tx = data_ch_req_tx.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_udp_connection_pool::<T, _>(
                             Arc::new(socket),
                             buffer_size,
                             data_ch_rx,
+                            data_ch_req_tx,
                             shutdown_rx_clone,
                         )
                         .await
@@ -675,9 +678,9 @@ where
         );
 
         ControlChannelHandle {
-            _shutdown_tx: shutdown_tx,
+            shutdown_tx,
             data_ch_tx,
-            _data_ch_req_tx: data_ch_req_tx,
+            data_ch_req_tx,
         }
     }
 }
@@ -719,7 +722,7 @@ impl<T: Transport> ControlChannel<T> {
                         }
                     }
                 },
-                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                () = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
                             if let Err(e) = self.write_and_flush(&heartbeat).await {
                                 error!("{:#}", e);
                                 break;
@@ -808,11 +811,10 @@ where
                                 .await;
                             });
                             break;
-                        } else {
-                            // Current data channel is broken. Request for a new one
-                            if data_ch_req_tx.send(true).is_err() {
-                                break 'pool;
-                            }
+                        }
+                        // Current data channel is broken. Request for a new one
+                        if data_ch_req_tx.send(true).is_err() {
+                            break 'pool;
                         }
                     }
                 }
@@ -824,11 +826,67 @@ where
     Ok(())
 }
 
+/// Visitor-bound datagram queue into one data-channel worker.
+type UdpWorkerQueue = mpsc::Sender<(SocketAddr, Bytes)>;
+/// Live data-channel workers, keyed by a monotonically increasing id.
+type UdpWorkerMap = Mutex<HashMap<usize, UdpWorkerQueue>>;
+/// Session-affinity table: remote peer -> assigned data channel.
+type UdpRouteMap = Mutex<HashMap<SocketAddr, UdpRoute>>;
+
+/// Session-affinity entry: the data channel (`worker`) a remote peer's
+/// datagrams are routed to, and when the peer was last seen (for TTL
+/// eviction).
+struct UdpRoute {
+    worker: usize,
+    last_seen: Instant,
+}
+
+/// Cleans up after a UDP worker task exits: removes its queue from the
+/// routing table and asks the control channel for a replacement data channel
+/// so the pool keeps its size. Runs on normal exits and on panics (the guard
+/// drops on unwind).
+struct UdpWorkerGuard {
+    id: usize,
+    workers: Arc<UdpWorkerMap>,
+    req_tx: mpsc::UnboundedSender<bool>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl Drop for UdpWorkerGuard {
+    fn drop(&mut self) {
+        let removed = self
+            .workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id)
+            .is_some();
+        if removed && !self.shutting_down.load(Ordering::Relaxed) {
+            debug!(
+                "UDP data channel {} exited, requesting a replacement",
+                self.id
+            );
+            // Fails only when the control channel is gone; the pool loop
+            // breaks on its own in that case.
+            let _ = self.req_tx.send(true);
+        }
+    }
+}
+
+/// Accept visitors on the pre-bound UDP socket and route every peer's
+/// datagrams to the data channel assigned to it.
+///
+/// Session affinity is the point: with a plain "every worker reads the
+/// socket" pool, the kernel hands each datagram to an arbitrary worker, so
+/// one peer's packets traverse different channels and leave the proxy client
+/// through different local sockets. Stateful UDP (`RakNet`, QUIC,
+/// `WireGuard`, ...) pins sessions to the `(ip, port)` tuple and breaks apart
+/// when the proxy splits a peer across source ports.
 #[instrument(skip_all)]
 async fn run_udp_connection_pool<T, C>(
     l: Arc<UdpSocket>,
     buffer_size: usize,
     mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()>
 where
@@ -839,79 +897,220 @@ where
 
     let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp)?;
 
-    let mut set = tokio::task::JoinSet::new();
+    // Live data channels, keyed by a monotonically increasing worker id.
+    // Workers remove their own entry on exit (via the guard) and request a
+    // replacement, so the pool keeps its size for the session's lifetime.
+    let workers: Arc<UdpWorkerMap> = Arc::new(Mutex::new(HashMap::new()));
+    // The affinity table: peer address -> assigned data channel.
+    let routes: Arc<UdpRouteMap> = Arc::new(Mutex::new(HashMap::new()));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let mut next_worker = 0usize;
+    // One socket reader: `recv_from` is the single entry point for all
+    // visitors, and the affinity table below decides the channel. A single
+    // reader also means one slow worker can never stall other peers.
+    let mut buf = vec![0u8; buffer_size];
 
-    // Spawn one worker per data channel. Multiple workers concurrently
-    // read from the same UDP socket, distributing traffic across channels.
+    let mut sweep = time::interval(Duration::from_secs(UDP_ROUTE_TTL_SECS));
+    // The first tick of an interval completes immediately; consume it.
+    sweep.tick().await;
+
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
+                shutting_down.store(true, Ordering::Relaxed);
                 break;
             }
             maybe_chan = data_ch_rx.recv() => {
-                match maybe_chan {
-                    Some(mut conn) => {
-                        if let Err(e) = write_and_flush(&mut conn, &cmd).await {
-                            error!("Failed to init UDP channel: {:#}", e);
-                            continue;
-                        }
-                        let l = Arc::clone(&l);
-                        let shutdown = shutdown_rx.resubscribe();
-                        set.spawn(async move {
-                            if let Err(e) =
-                                udp_forward_worker(l, conn, shutdown, buffer_size).await
-                            {
-                                error!("UDP worker exited: {:#}", e);
-                            }
-                        });
-                    }
-                    None => break,
+                let Some(mut conn) = maybe_chan else {
+                    shutting_down.store(true, Ordering::Relaxed);
+                    break;
+                };
+                if let Err(e) = write_and_flush(&mut conn, &cmd).await {
+                    error!("Failed to init UDP channel: {:#}", e);
+                    continue;
                 }
+                let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+                let id = next_worker;
+                next_worker += 1;
+                workers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(id, tx);
+                let guard = UdpWorkerGuard {
+                    id,
+                    workers: Arc::clone(&workers),
+                    req_tx: data_ch_req_tx.clone(),
+                    shutting_down: Arc::clone(&shutting_down),
+                };
+                tokio::spawn(udp_forward_worker(
+                    Arc::clone(&l),
+                    conn,
+                    rx,
+                    shutdown_rx.resubscribe(),
+                    buffer_size,
+                    guard,
+                ));
             }
-            Some(result) = set.join_next() => {
-                if let Err(e) = result {
-                    error!("UDP worker panicked: {:?}", e);
+            recv = l.recv_from(&mut buf) => match recv {
+                Ok((n, from)) => {
+                    route_udp_datagram(
+                        &workers,
+                        &routes,
+                        &mut next_worker,
+                        from,
+                        Bytes::copy_from_slice(&buf[..n]),
+                    );
                 }
+                // Linux surfaces a stale ICMP error (the recipient of an
+                // earlier datagram has gone) as ECONNREFUSED on the next
+                // recv; it is transient and must not tear down the pool.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                    debug!("Transient UDP recv error: {e}");
+                }
+                Err(e) => {
+                    shutting_down.store(true, Ordering::Relaxed);
+                    return Err(e).with_context(|| "UDP service socket failed");
+                }
+            },
+            _ = sweep.tick() => {
+                // Evict idle affinity entries so address churn (e.g. scans)
+                // cannot grow the table unboundedly. Expiry only re-shards a
+                // peer onto another channel; the client-side hub keeps the
+                // peer's local outbound socket, so its source port is
+                // unaffected.
+                routes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|_, route| {
+                        route.last_seen.elapsed() < Duration::from_secs(UDP_ROUTE_TTL_SECS)
+                    });
             }
         }
     }
 
-    // Drop the socket and task set immediately so the port is released
-    // before a replacement pool tries to bind.
+    // Drop the socket immediately so the port is released before a
+    // replacement pool tries to bind. Worker tasks exit on the shutdown
+    // signal (or when their channel dies) and release their own clones.
     drop(l);
-    drop(set);
-
     debug!("UDP pool dropped");
     Ok(())
 }
 
+/// Send one visitor datagram to the data channel assigned to its source
+/// address, assigning (or re-assigning after a worker died) on the fly.
+///
+/// The single socket reader never blocks: a full worker queue drops the
+/// datagram — exactly what UDP peers already tolerate — instead of
+/// head-of-line blocking every other visitor.
+fn route_udp_datagram(
+    workers: &UdpWorkerMap,
+    routes: &UdpRouteMap,
+    next_worker: &mut usize,
+    from: SocketAddr,
+    mut data: Bytes,
+) {
+    let now = Instant::now();
+    let mut routes = routes.lock().unwrap_or_else(PoisonError::into_inner);
+    let workers = workers.lock().unwrap_or_else(PoisonError::into_inner);
+
+    // Sticky path: this peer already has a live data channel assigned.
+    if let Some(route) = routes.get_mut(&from)
+        && let Some(tx) = workers.get(&route.worker)
+    {
+        match tx.try_send((from, data)) {
+            Ok(()) => {
+                route.last_seen = now;
+                return;
+            }
+            Err(TrySendError::Full(_)) => {
+                debug!("UDP worker queue full, dropping a datagram from {from}");
+                return;
+            }
+            Err(TrySendError::Closed((_, back))) => {
+                // The assigned worker died; re-assign below.
+                data = back;
+            }
+        }
+    }
+
+    // (Re-)assign the peer to a worker, round-robin over the live ones.
+    if workers.is_empty() {
+        debug!("No UDP data channel is ready, dropping a datagram from {from}");
+        return;
+    }
+    let idx = *next_worker % workers.len();
+    *next_worker = next_worker.wrapping_add(1);
+    let Some((id, tx)) = workers.iter().nth(idx).map(|(id, tx)| (*id, tx.clone())) else {
+        return; // Unreachable: the map is non-empty.
+    };
+    debug!("UDP peer {from} assigned to data channel {id}");
+    routes.insert(
+        from,
+        UdpRoute {
+            worker: id,
+            last_seen: now,
+        },
+    );
+    if let Err(e) = tx.try_send((from, data)) {
+        debug!("Dropped a datagram from {from}: {e}");
+    }
+}
+
+/// One data channel serving the peers assigned to it: visitor-bound
+/// datagrams arrive through the routed queue, replies are read from the
+/// channel and sent from the shared service socket.
 async fn udp_forward_worker<C>(
     l: Arc<UdpSocket>,
     mut conn: C,
+    mut rx: mpsc::Receiver<(SocketAddr, Bytes)>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     buffer_size: usize,
-) -> Result<()>
-where
+    _guard: UdpWorkerGuard,
+) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; buffer_size];
-    // Scratch buffers reused across datagrams so the hot path allocates nothing.
+    // Scratch buffers reused across datagrams so the hot path allocates
+    // nothing.
     let mut tx_scratch = BytesMut::with_capacity(MAX_UDP_HEADER_LEN + buffer_size);
     let mut rx_scratch = BytesMut::with_capacity(MAX_UDP_HEADER_LEN + buffer_size);
     loop {
         tokio::select! {
-            // Forward inbound traffic to the client
-            val = l.recv_from(&mut buf) => {
-                let (n, from) = val?;
-                UdpTraffic::write_frame(&mut conn, &mut tx_scratch, from, &buf[..n]).await?;
-            }
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                // `Ok(None)` means an oversized packet was dropped; keep going.
-                if let Some((from, len)) =
-                    UdpTraffic::read_slice(&mut conn, hdr_len?, &mut rx_scratch, buffer_size).await?
+            // Visitor-bound datagrams routed to this channel
+            item = rx.recv() => {
+                let Some((from, data)) = item else { break };
+                if let Err(e) =
+                    UdpTraffic::write_frame(&mut conn, &mut tx_scratch, from, &data).await
                 {
-                    l.send_to(&rx_scratch[..len], from).await?;
+                    debug!("Failed to forward UDP traffic to the client: {e:#}");
+                    break;
+                }
+            }
+            // Replies from the local service, back to the visitor
+            hdr_len = conn.read_u8() => {
+                let hdr_len = match hdr_len {
+                    Ok(len) => len,
+                    Err(e) => {
+                        debug!("UDP data channel closed: {e:#}");
+                        break;
+                    }
+                };
+                // `Ok(None)` means an oversized packet was dropped; the
+                // stream stays in sync, so just keep going.
+                match UdpTraffic::read_slice(&mut conn, hdr_len, &mut rx_scratch, buffer_size)
+                    .await
+                {
+                    Ok(Some((from, len))) => {
+                        if let Err(e) = l.send_to(&rx_scratch[..len], from).await {
+                            // Transient send failures must not kill the
+                            // worker (and churn a replacement channel).
+                            debug!("Failed to send a UDP datagram to {from}: {e:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!("UDP data channel closed: {e:#}");
+                        break;
+                    }
                 }
             }
             _ = shutdown_rx.recv() => {
@@ -919,7 +1118,6 @@ where
             }
         }
     }
-    Ok(())
 }
 
 /// Returns `true` if the error is a transient resource exhaustion error (EMFILE, ENFILE, ENOMEM, ENOBUFS)
@@ -931,10 +1129,130 @@ fn should_retry_accept(err: &anyhow::Error) -> bool {
     if cfg!(unix) {
         matches!(
             io_err.raw_os_error(),
-            Some(24) | Some(23) | Some(12) | Some(105) // EMFILE, ENFILE, ENOMEM, ENOBUFS
+            Some(24 | 23 | 12 | 105) // EMFILE, ENFILE, ENOMEM, ENOBUFS
         )
     } else {
         // On non-Unix, treat all IO errors as potentially transient
         io_err.kind() == io::ErrorKind::OutOfMemory || io_err.kind() == io::ErrorKind::StorageFull
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    type UdpWorkerRxs = Vec<mpsc::Receiver<(SocketAddr, Bytes)>>;
+
+    /// A routing table with `n` live workers; returns the maps and the
+    /// receiving ends of every worker queue.
+    fn setup(n: usize) -> (Arc<UdpWorkerMap>, Arc<UdpRouteMap>, UdpWorkerRxs, usize) {
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let mut rxs = Vec::new();
+        for id in 0..n {
+            let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+            workers.lock().unwrap().insert(id, tx);
+            rxs.push(rx);
+        }
+        (workers, routes, rxs, 0)
+    }
+
+    fn route(
+        workers: &Arc<UdpWorkerMap>,
+        routes: &Arc<UdpRouteMap>,
+        next_worker: &mut usize,
+        from: SocketAddr,
+    ) {
+        route_udp_datagram(workers, routes, next_worker, from, Bytes::from_static(b"x"));
+    }
+
+    #[test]
+    fn same_peer_always_routed_to_one_worker() {
+        let (workers, routes, mut rxs, mut next) = setup(2);
+
+        for _ in 0..16 {
+            route(&workers, &routes, &mut next, peer(1000));
+        }
+
+        // All datagrams landed on exactly one worker...
+        let total: usize = rxs
+            .iter_mut()
+            .map(|rx| {
+                let mut n = 0;
+                while rx.try_recv().is_ok() {
+                    n += 1;
+                }
+                n
+            })
+            .sum();
+        assert_eq!(total, 16);
+        // ...and the affinity entry points at a single, stable channel.
+        let table = routes.lock().unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&peer(1000)));
+    }
+
+    #[test]
+    fn distinct_peers_spread_across_workers() {
+        let (workers, routes, mut rxs, mut next) = setup(2);
+
+        for port in 2000..2010 {
+            route(&workers, &routes, &mut next, peer(port));
+        }
+
+        // Round-robin at assignment time: both channels carry traffic.
+        assert!(rxs[0].try_recv().is_ok(), "worker 0 got no peers");
+        assert!(rxs[1].try_recv().is_ok(), "worker 1 got no peers");
+        assert_eq!(routes.lock().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn dead_worker_is_bypassed() {
+        let (workers, routes, mut rxs, mut next) = setup(2);
+
+        route(&workers, &routes, &mut next, peer(3000));
+        let first = routes.lock().unwrap()[&peer(3000)].worker;
+        rxs[first].try_recv().unwrap();
+
+        // Simulate the worker exiting (what `UdpWorkerGuard` does): its
+        // queue disappears from the table.
+        workers.lock().unwrap().remove(&first);
+
+        // The peer's next datagram must be re-assigned to a live channel.
+        route(&workers, &routes, &mut next, peer(3000));
+        let reassigned = routes.lock().unwrap()[&peer(3000)].worker;
+        assert_ne!(reassigned, first, "peer stayed on the dead worker");
+        rxs[reassigned].try_recv().unwrap();
+    }
+
+    #[test]
+    fn full_queue_drops_without_blocking() {
+        // Capacity 1, filled before the call: the router must drop instead
+        // of stalling the single socket reader.
+        let workers = Arc::new(Mutex::new(HashMap::new()));
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        workers.lock().unwrap().insert(0, tx.clone());
+        tx.try_send((peer(4000), Bytes::from_static(b"fill")))
+            .unwrap();
+        let mut next = 0;
+
+        route(&workers, &routes, &mut next, peer(4000));
+
+        // Only the pre-filled datagram is in the queue.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_workers_drops_quietly() {
+        let (workers, routes, _rxs, mut next) = setup(0);
+        route(&workers, &routes, &mut next, peer(5000));
+        assert!(routes.lock().unwrap().is_empty());
     }
 }

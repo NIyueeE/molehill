@@ -30,7 +30,9 @@ When a control channel is established, the server challenges the client with a r
 
 When a visitor connects to a registered service's endpoint, the server sends a `CreateDataChannel` command over the corresponding control channel. The client opens a data channel back, the server marks it with a `StartForwardTcp`/`StartForwardUdp` command, and the pair copies the visitor's bytes bidirectionally.
 
-To reduce first-visitor latency, data channels are pre-created as a pool (per-service `pool_size`, default 8 for TCP / 2 for UDP, clamped by the server's `max_pool_size`). New channels are requested on demand when the pool runs empty.
+To reduce first-visitor latency, data channels are pre-created as a pool (per-service `pool_size`, default 8 for TCP / 2 for UDP, clamped by the server's `max_pool_size`). New channels are requested on demand: per visitor for TCP, and whenever a UDP channel dies so the pool keeps its size.
+
+For UDP, the server maintains a per-service **session-affinity table**: a single reader task accepts datagrams from the service socket and routes every peer address to one data channel for the entry's lifetime (TTL-evicted after 300 s of inactivity). Routing every peer to a fixed channel — instead of letting all workers race on the socket — is what keeps one peer's packets on one path; the pool shards *distinct peers*, not packets.
 
 ### Multiplexing
 
@@ -46,7 +48,7 @@ With the `multiplex` feature (part of the default feature set) and `mux = true` 
 
 ## UDP
 
-UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the client side, each visitor address is mapped to a local UDP forwarder socket; idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60). Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable.
+UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. Idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
 
 ## Heartbeat
 

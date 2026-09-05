@@ -20,10 +20,6 @@
 Status as of the mux-stabilization commit. Completed 0.7.0 items are recorded
 below as context; only genuinely future work stays in the backlog.
 
----
-
-## Shipped in 0.7.0
-
 - **Dynamic service registration** (protocol v2): the server has no
   per-service config. Clients send `RegisterService` after auth; the server
   enforces `allow_ports` (+ explicit privileged-port listing), binds eagerly,
@@ -48,6 +44,42 @@ client and server waited on each other silently. The fix is a zero-length
 write kick in `ClientTunnel::start` before handing out a stream; yamux sends
 the SYN on that empty data frame. `read_first_stream_is_announced_to_the_server`
 regresses this exact sequence.
+
+## UDP session affinity (kept as design note)
+
+Root cause of stateful-UDP breakage (Minecraft Bedrock/RakNet sessions torn
+in half, one peer seen on two local source ports): the v0.6.2 UDP pool
+load-balancing let every pooled worker `recv_from` the service socket, so
+the kernel handed each datagram of one peer to an arbitrary channel; the
+client kept a private peer→socket map per channel, so the peer's packets
+left through different local sockets. `DEFAULT_UDP_POOL_SIZE` is 2, so the
+default UDP config triggered it.
+
+Fix (two halves, one contract — *one peer, one path, one source port*):
+
+- **Server**: a single reader task owns the service socket and routes each
+  peer address to one data channel via an affinity table (`UdpRoute`,
+  TTL-evicted after 300 s). A full worker queue drops the datagram
+  (`try_send`) instead of head-of-line blocking other peers; a dead worker
+  self-removes (`UdpWorkerGuard`, unwind-safe) and the pool requests a
+  replacement channel so it keeps its size.
+- **Client**: a per-service `UdpHub` replaces the per-channel peer maps.
+  Each peer gets exactly one local forwarder socket for its whole session
+  (created on first datagram, outside the lock to avoid blocking other
+  channels on DNS), and its outbound datagrams are pinned to the channel
+  its inbound traffic arrives on, falling back to any live channel when
+  that one dies. The peer's source port therefore survives server-side
+  re-sharding and channel churn.
+
+Inherent limit, documented in docs/configuration.md: after
+`udp_idle_timeout` (default 60 s) without traffic the forwarder socket is
+recycled, so the next datagram re-binds a fresh source port. Stateful UDP
+needs traffic within the window (RakNet keepalives qualify).
+
+Regression tests: `core::server::tests::*` (routing semantics, sync) and
+`udp_session_affinity` (end-to-end: a 64-datagram burst from one peer must
+arrive at the local service from exactly one source address and all be
+echoed back).
 
 ## Verification at commit time
 
