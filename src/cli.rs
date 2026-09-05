@@ -1,5 +1,5 @@
 use clap::{ArgGroup, Parser};
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 #[derive(clap::ValueEnum, Clone, Debug, Copy)]
 pub enum KeypairType {
@@ -7,10 +7,10 @@ pub enum KeypairType {
     X448,
 }
 
-lazy_static! {
-    static ref VERSION: &'static str =
-        option_env!("VERGEN_GIT_DESCRIBE").unwrap_or(env!("CARGO_PKG_VERSION"));
-    static ref LONG_VERSION: String = format!(
+static VERSION: LazyLock<&'static str> =
+    LazyLock::new(|| option_env!("VERGEN_GIT_DESCRIBE").unwrap_or(env!("CARGO_PKG_VERSION")));
+static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
         "
 Build Timestamp:     {}
 Build Version:       {}
@@ -25,9 +25,10 @@ cargo Features:      {}
         option_env!("VERGEN_GIT_COMMIT_DATE"),
         option_env!("VERGEN_CARGO_TARGET_TRIPLE").unwrap_or("unknown"),
         option_env!("VERGEN_CARGO_FEATURES").unwrap_or("unknown")
-    );
-}
+    )
+});
 
+/// Command-line arguments of the molehill binary.
 #[derive(Parser, Debug, Default, Clone)]
 #[command(
     about,

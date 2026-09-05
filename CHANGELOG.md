@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Adopted the rust-agents-template lint set in full: `pedantic` (deny) and
+  `missing_docs` (warn) are declared in `Cargo.toml` and the whole codebase
+  passes them; the public API and config structs are now documented. The
+  unused `lazy_static` dependency was replaced by `std::sync::LazyLock` and
+  dropped.
+
 ### Fixed
 
 - UDP forwarding keeps **session affinity** for every remote peer: the

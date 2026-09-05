@@ -10,6 +10,7 @@ of truth. Changing a lint level requires updating this page (both languages)
 
 | Lint | Level | Why |
 |------|-------|-----|
+| `missing_docs` | warn | the public API (lib surface, config structs, CLI) carries doc comments |
 | `unsafe_code` | warn | unsafe is confined to audited modules that opt in explicitly; every `unsafe` block must carry a `SAFETY` comment |
 | `linker_messages` | allow | cross's musl linker wrapper prints trace output to stderr; real linker errors still fail the build |
 | `dbg_macro` | deny | no debug leftovers in production code |
@@ -18,6 +19,7 @@ of truth. Changing a lint level requires updating this page (both languages)
 | `undocumented_unsafe_blocks` | deny | every `unsafe` block carries a `SAFETY` comment |
 | `unwrap_used` | deny | no hidden panics; handle errors explicitly |
 | `todo` | warn | stubs get removed, not accumulated (AGENTS.md §9) |
+| `pedantic` | deny | the whole pedantic clippy group (rust-agents-template parity); members that genuinely do not fit are relaxed per-item in code with a reason, never here |
 
 ## Waiver discipline
 
@@ -44,7 +46,8 @@ deny, outdated, docs-sync, secret scan) follow the same discipline.
 
 ## Deviations from the rust-agents-template lint set
 
-The template denies `clippy::pedantic` and warns on `missing_docs`. molehill
-is a fork of a mature codebase (rathole) with a large public API; adopting
-both is a dedicated migration, tracked in [HANDOFF.md](../HANDOFF.md). The
-deny set above already covers the safety-critical lints the template targets.
+None. The template's `clippy::pedantic` (deny) and `missing_docs` (warn) are
+declared above since the lint migration. Individual pedantic members that do
+not fit this codebase are relaxed per-item in code — prefer
+`#[expect(..., reason = "...")]` — under the same waiver discipline as
+every other lint.

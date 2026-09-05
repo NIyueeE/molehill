@@ -1,5 +1,14 @@
 # HANDOFF: Working State & Future Work
 
+> **2026-09-05 — post-v0.7.1: UDP session affinity + lint migration.**
+> Fixed stateful-UDP session splitting (server-side affinity routing +
+> client-side per-service `UdpHub`, design note below). Adopted the
+> template's full lint set: `clippy::pedantic` deny + `missing_docs` warn,
+> with the entire codebase brought up to it (governance docs synced, no
+> crate-level relaxations). Regression tests: `udp_session_affinity`
+> (fails on pre-fix code with the exact two-source-port split) and the
+> `core::server::tests` routing suite.
+
 > **2026-09-05 — v0.7.1: project base rebuilt on
 > [rust-agents-template](https://github.com/NIyueeE/rust-agents-template).**
 > Layered githooks (fast pre-commit / heavy pre-push, `check-docs`,
@@ -10,8 +19,8 @@
 > change: upstream rathole history intact, the 35 fork commits squashed into
 > six release commits (v0.6.0…v0.7.0, trees byte-identical to the old tags),
 > tags re-cut as annotated ones. Deferred from the template's lint set:
-> `clippy::pedantic` deny and `missing_docs` warn — a dedicated migration for
-> molehill's public API, tracked in the backlog below.
+> `clippy::pedantic` deny and `missing_docs` warn — **done in the
+> post-v0.7.1 lint migration above**, no longer deferred.
 
 ---
 

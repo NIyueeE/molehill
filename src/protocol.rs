@@ -2,9 +2,9 @@ pub const HASH_WIDTH_IN_BYTES: usize = 32;
 
 use anyhow::{Context, Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
-use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{trace, warn};
 
@@ -121,10 +121,13 @@ pub struct UdpTraffic {
 /// single TLS/Noise record), with no per-packet heap allocation when callers
 /// reuse the same scratch buffer.
 fn encode_udp_frame(scratch: &mut BytesMut, from: SocketAddr, data: &[u8]) -> Result<()> {
-    let hdr = UdpHeader {
-        from,
-        len: data.len() as UdpPacketLen,
-    };
+    let len = u16::try_from(data.len()).with_context(|| {
+        format!(
+            "Datagram of {} bytes exceeds the wire format limit",
+            data.len()
+        )
+    })?;
+    let hdr = UdpHeader { from, len };
 
     scratch.clear();
     scratch.reserve(1 + MAX_UDP_HEADER_LEN + data.len());
@@ -137,10 +140,13 @@ fn encode_udp_frame(scratch: &mut BytesMut, from: SocketAddr, data: &[u8]) -> Re
     let mut hdr_buf = [0u8; MAX_UDP_HEADER_LEN];
     let encoded =
         postcard::to_slice(&hdr, &mut hdr_buf).with_context(|| "Failed to serialize UdpHeader")?;
-    debug_assert!(encoded.len() <= MAX_UDP_HEADER_LEN && encoded.len() <= u8::MAX as usize);
+    // `to_slice` cannot emit more than `MAX_UDP_HEADER_LEN` (32) bytes, which
+    // also fits the `u8` length prefix.
+    debug_assert!(encoded.len() <= MAX_UDP_HEADER_LEN);
     scratch.extend_from_slice(encoded);
-    let hdr_len = scratch.len() - prefix_pos - 1;
-    scratch[prefix_pos] = hdr_len as u8;
+    let hdr_len = u8::try_from(scratch.len() - prefix_pos - 1)
+        .with_context(|| "UDP header length exceeds the u8 prefix")?;
+    scratch[prefix_pos] = hdr_len;
 
     trace!("Write {:?} of length {}", hdr, hdr_len);
     scratch.extend_from_slice(data);
@@ -150,9 +156,7 @@ fn encode_udp_frame(scratch: &mut BytesMut, from: SocketAddr, data: &[u8]) -> Re
 async fn read_udp_header<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpHeader> {
     if hdr_len as usize > MAX_UDP_HEADER_LEN {
         bail!(
-            "UDP header length {} exceeds the maximum of {}, the stream is corrupt",
-            hdr_len,
-            MAX_UDP_HEADER_LEN
+            "UDP header length {hdr_len} exceeds the maximum of {MAX_UDP_HEADER_LEN}, the stream is corrupt"
         );
     }
     let mut buf = [0u8; MAX_UDP_HEADER_LEN];
@@ -216,7 +220,7 @@ impl UdpTraffic {
 
         // A UDP payload larger than the receive buffer cannot originate from
         // this implementation; drop it while keeping the stream usable.
-        if hdr.len > max_len as UdpPacketLen {
+        if hdr.len > u16::try_from(max_len).unwrap_or(UdpPacketLen::MAX) {
             skip_oversized_payload(reader, hdr.len, hdr.from).await?;
             return Ok(None);
         }
@@ -242,7 +246,7 @@ impl UdpTraffic {
     ) -> Result<Option<(SocketAddr, usize)>> {
         let hdr = read_udp_header(reader, hdr_len).await?;
 
-        if hdr.len > max_len as UdpPacketLen {
+        if hdr.len > u16::try_from(max_len).unwrap_or(UdpPacketLen::MAX) {
             skip_oversized_payload(reader, hdr.len, hdr.from).await?;
             return Ok(None);
         }
@@ -307,9 +311,7 @@ impl PacketLength {
     }
 }
 
-lazy_static! {
-    static ref PACKET_LEN: PacketLength = PacketLength::new();
-}
+static PACKET_LEN: LazyLock<PacketLength> = LazyLock::new(PacketLength::new);
 
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
     let mut buf = vec![0u8; PACKET_LEN.hello];
@@ -324,9 +326,7 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Resu
         | Hello::DataChannelTunnelHello(v, _) => {
             if v != CURRENT_PROTO_VERSION {
                 bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `molehill`.",
-                    CURRENT_PROTO_VERSION,
-                    v
+                    "Protocol version mismatched. Expected {CURRENT_PROTO_VERSION}, got {v}. Please update `molehill`."
                 );
             }
         }
@@ -368,7 +368,9 @@ pub async fn write_registration<T: AsyncWrite + Unpin>(
         "Registration message too large: {} bytes",
         payload.len()
     );
-    conn.write_u16(payload.len() as u16)
+    let len = u16::try_from(payload.len())
+        .with_context(|| "Registration length exceeds the u16 frame prefix")?;
+    conn.write_u16(len)
         .await
         .with_context(|| "Failed to write registration length")?;
     conn.write_all(&payload)
@@ -388,11 +390,10 @@ pub async fn read_registration<T: AsyncRead + AsyncWrite + Unpin>(
         .await
         .with_context(|| "Failed to read registration length")?;
     anyhow::ensure!(
-        len <= MAX_REGISTRATION_LEN as UdpPacketLen,
-        "Registration message too large: {} bytes",
-        len
+        usize::from(len) <= MAX_REGISTRATION_LEN,
+        "Registration message too large: {len} bytes"
     );
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; usize::from(len)];
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read registration")?;
@@ -414,11 +415,10 @@ pub async fn read_register_result<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut 
         .await
         .with_context(|| "Failed to read register result length")?;
     anyhow::ensure!(
-        len <= MAX_REGISTRATION_LEN as UdpPacketLen,
-        "Register result too large: {} bytes",
-        len
+        usize::from(len) <= MAX_REGISTRATION_LEN,
+        "Register result too large: {len} bytes"
     );
-    let mut buf = vec![0u8; len as usize];
+    let mut buf = vec![0u8; usize::from(len)];
     conn.read_exact(&mut buf)
         .await
         .with_context(|| "Failed to read register result")?;
@@ -434,7 +434,9 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
         "Register result too large: {} bytes",
         payload.len()
     );
-    conn.write_u16(payload.len() as u16)
+    let len = u16::try_from(payload.len())
+        .with_context(|| "Register result length exceeds the u16 frame prefix")?;
+    conn.write_u16(len)
         .await
         .with_context(|| "Failed to write register result length")?;
     conn.write_all(&payload)
@@ -479,7 +481,7 @@ mod tests {
     }
 
     fn sample_addr() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
     }
 
     #[test]
@@ -531,8 +533,7 @@ mod tests {
             let bytes = postcard::to_stdvec(&ack).unwrap();
             let back: Ack = postcard::from_bytes(&bytes).unwrap();
             match (&ack, &back) {
-                (Ack::Ok, Ack::Ok) => {}
-                (Ack::AuthFailed, Ack::AuthFailed) => {}
+                (Ack::Ok, Ack::Ok) | (Ack::AuthFailed, Ack::AuthFailed) => {}
                 (Ack::RegisterRejected(a), Ack::RegisterRejected(b)) => assert_eq!(a, b),
                 _ => panic!("Ack round-trip mismatch"),
             }
@@ -653,13 +654,16 @@ mod tests {
             .await
             .unwrap();
 
-        let oversized_len = crate::common::constants::DEFAULT_UDP_BUFFER_SIZE as u16 + 1;
+        let oversized_len =
+            u16::try_from(crate::common::constants::DEFAULT_UDP_BUFFER_SIZE).unwrap() + 1;
         let hdr = UdpHeader {
             from: sample_addr(),
             len: oversized_len,
         };
         let encoded = postcard::to_stdvec(&hdr).unwrap();
-        tx.write_u8(encoded.len() as u8).await.unwrap();
+        tx.write_u8(u8::try_from(encoded.len()).unwrap())
+            .await
+            .unwrap();
         tx.write_all(&encoded).await.unwrap();
         tx.write_all(&vec![0u8; oversized_len as usize])
             .await

@@ -24,7 +24,7 @@ unsafe impl<K1, K2, V> Send for RawItem<K1, K2, V> {}
 // SAFETY: See above — all access to the inner tuple goes through `MultiMap`.
 unsafe impl<K1, K2, V> Sync for RawItem<K1, K2, V> {}
 
-/// MultiMap is a hash map that can index an item by two keys
+/// `MultiMap` is a hash map that can index an item by two keys
 /// For example, after an item with key (a, b) is insert, `map.get1(a)` and
 /// `map.get2(b)` both returns the item. Likewise the `remove1` and `remove2`.
 pub struct MultiMap<K1, K2, V> {
@@ -60,7 +60,7 @@ impl<T> Borrow<T> for Key<T> {
 
 impl<T: Hash> Hash for Key<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.borrow() as &T).hash(state)
+        (self.borrow() as &T).hash(state);
     }
 }
 
@@ -93,8 +93,10 @@ where
             return Err((k1, k2, v));
         }
         let item = Box::new((k1, k2, v));
-        let k1 = Key(&item.0);
-        let k2 = Key(&item.1);
+        // Explicit raw pointers: the keys point into the heap tuple that
+        // `Box::into_raw` hands to the maps right below.
+        let k1 = Key(std::ptr::from_ref(&item.0));
+        let k2 = Key(std::ptr::from_ref(&item.1));
         let item = Box::into_raw(item);
         self.map1.insert(k1, RawItem(item));
         self.map2.insert(k2, RawItem(item));

@@ -1,3 +1,4 @@
+//! Build script: emits build metadata (version, features, git info) via vergen.
 use anyhow::Result;
 use vergen::{Build, Cargo};
 use vergen_gitcl::{Emitter, Gitcl};

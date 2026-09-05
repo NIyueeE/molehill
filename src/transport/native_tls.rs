@@ -31,22 +31,19 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = match config.trusted_root.as_ref() {
-            Some(path) => {
-                let s = fs::read_to_string(path)
-                    .with_context(|| "Failed to read the `tls.trusted_root`")?;
-                let cert = Certificate::from_pem(s.as_bytes())
-                    .with_context(|| "Failed to read certificate from `tls.trusted_root`")?;
-                let connector = native_tls::TlsConnector::builder()
-                    .add_root_certificate(cert)
-                    .build()?;
-                Some(TlsConnector::from(connector))
-            }
-            None => {
-                // if no trusted_root is specified, allow TlsConnector to use system default
-                let connector = native_tls::TlsConnector::builder().build()?;
-                Some(TlsConnector::from(connector))
-            }
+        let connector = if let Some(path) = config.trusted_root.as_ref() {
+            let s = fs::read_to_string(path)
+                .with_context(|| "Failed to read the `tls.trusted_root`")?;
+            let cert = Certificate::from_pem(s.as_bytes())
+                .with_context(|| "Failed to read certificate from `tls.trusted_root`")?;
+            let connector = native_tls::TlsConnector::builder()
+                .add_root_certificate(cert)
+                .build()?;
+            Some(TlsConnector::from(connector))
+        } else {
+            // if no trusted_root is specified, allow TlsConnector to use system default
+            let connector = native_tls::TlsConnector::builder().build()?;
+            Some(TlsConnector::from(connector))
         };
 
         let tls_acceptor = match config.pkcs12.as_ref() {

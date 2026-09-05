@@ -39,18 +39,14 @@ pub fn try_set_tcp_keepalive(
 
 #[allow(dead_code)]
 pub fn feature_not_compile(feature: &str) -> ! {
-    eprintln!(
-        "The feature '{}' is not compiled in this binary. Please re-compile molehill",
-        feature
-    );
+    eprintln!("The feature '{feature}' is not compiled in this binary. Please re-compile molehill");
     std::process::exit(1);
 }
 
 #[allow(dead_code)]
 pub fn feature_neither_compile(feature1: &str, feature2: &str) -> ! {
     eprintln!(
-        "Neither of the feature '{}' or '{}' is compiled in this binary. Please re-compile molehill",
-        feature1, feature2
+        "Neither of the feature '{feature1}' or '{feature2}' is compiled in this binary. Please re-compile molehill"
     );
     std::process::exit(1);
 }
@@ -66,7 +62,7 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
     let semi = s
         .rfind(':')
-        .ok_or_else(|| anyhow!("Address is missing the port: {}", s))?;
+        .ok_or_else(|| anyhow!("Address is missing the port: {s}"))?;
     Ok((&s[..semi], s[semi + 1..].parse()?))
 }
 
@@ -75,45 +71,35 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
 pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result<UdpSocket> {
     let (socket_addr, bind_addr);
 
-    match prefer_ipv6 {
-        false => {
-            socket_addr = to_socket_addr(addr).await?;
+    if prefer_ipv6 {
+        let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
 
-            bind_addr = match socket_addr {
-                SocketAddr::V4(_) => "0.0.0.0:0",
-                SocketAddr::V6(_) => ":::0",
-            };
-        }
-        true => {
-            let all_host_addresses: Vec<SocketAddr> = lookup_host(addr).await?.collect();
-
-            // Try to find an IPv6 address
-            match all_host_addresses.clone().iter().find(|x| x.is_ipv6()) {
-                Some(socket_addr_ipv6) => {
-                    socket_addr = *socket_addr_ipv6;
-                    bind_addr = ":::0";
-                }
-                None => {
-                    let socket_addr_ipv4 = all_host_addresses.iter().find(|x| x.is_ipv4());
-                    match socket_addr_ipv4 {
-                        None => return Err(anyhow!("Failed to lookup the host")),
-                        // fallback to IPv4
-                        Some(socket_addr_ipv4) => {
-                            socket_addr = *socket_addr_ipv4;
-                            bind_addr = "0.0.0.0:0";
-                        }
-                    }
-                }
+        // Try to find an IPv6 address, falling back to IPv4 when the host
+        // only exposes A records.
+        let found = all_host_addresses.iter().find(|x| x.is_ipv6());
+        let fallback = all_host_addresses.iter().find(|x| x.is_ipv4());
+        match found.or(fallback) {
+            Some(addr) => {
+                bind_addr = if addr.is_ipv6() { ":::0" } else { "0.0.0.0:0" };
+                socket_addr = *addr;
             }
+            None => return Err(anyhow!("Failed to lookup the host")),
         }
-    };
+    } else {
+        socket_addr = to_socket_addr(addr).await?;
+
+        bind_addr = match socket_addr {
+            SocketAddr::V4(_) => "0.0.0.0:0",
+            SocketAddr::V6(_) => ":::0",
+        };
+    }
     let s = UdpSocket::bind(bind_addr).await?;
     s.connect(socket_addr).await?;
     Ok(s)
 }
 
-/// Create a TcpStream using a proxy
-/// e.g. socks5://user:pass@127.0.0.1:1080 http://127.0.0.1:8080
+/// Create a `TcpStream` using a proxy
+/// e.g. `<socks5://user:pass@127.0.0.1:1080>` `<http://127.0.0.1:8080>`
 pub async fn tcp_connect_with_proxy(
     addr: &AddrMaybeCached,
     proxy: Option<&Url>,
@@ -122,10 +108,10 @@ pub async fn tcp_connect_with_proxy(
         let addr = &addr.addr;
         let host = url
             .host_str()
-            .ok_or_else(|| anyhow!("Proxy URL is missing the host: {}", url))?;
+            .ok_or_else(|| anyhow!("Proxy URL is missing the host: {url}"))?;
         let port = url
             .port()
-            .ok_or_else(|| anyhow!("Proxy URL is missing the port: {}", url))?;
+            .ok_or_else(|| anyhow!("Proxy URL is missing the port: {url}"))?;
         let mut s = TcpStream::connect((host, port)).await?;
 
         let auth = if !url.username().is_empty() || url.password().is_some() {
@@ -151,12 +137,12 @@ pub async fn tcp_connect_with_proxy(
                             &auth.username,
                             &auth.password,
                         )
-                        .await?
+                        .await?;
                     }
                     None => http_connect_tokio(&mut s, host, port).await?,
                 }
             }
-            scheme => return Err(anyhow!("Unknown proxy scheme: {}", scheme)),
+            scheme => return Err(anyhow!("Unknown proxy scheme: {scheme}")),
         }
         Ok(s)
     } else {

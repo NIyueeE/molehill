@@ -414,14 +414,15 @@ mod tests {
 
     #[tokio::test]
     async fn open_after_idle_period() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::{TcpListener, TcpStream};
+
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::level_filters::LevelFilter::TRACE)
             .with_ansi(false)
             .try_init();
         // Production failure signature: initial pooled opens succeed, then
         // after an idle period a NEW open never completes.
-        use tokio::net::{TcpListener, TcpStream};
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
@@ -433,7 +434,6 @@ mod tests {
         };
         // Mimic production: hello + ack bytes flow on the socket BEFORE the
         // yamux sessions are constructed.
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         client_sock.write_all(&[0u8; 34]).await.unwrap();
         let mut hello = [0u8; 34];
         server_sock.read_exact(&mut hello).await.unwrap();

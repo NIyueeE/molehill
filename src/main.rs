@@ -1,3 +1,5 @@
+//! The molehill binary: parses the CLI, installs logging, and runs the
+//! configured instance (server, client, or `--genkey`) until shutdown.
 use anyhow::Result;
 use clap::Parser;
 use molehill_rathole::{Cli, logging, run};
@@ -12,14 +14,14 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
             // Something really weird happened. So just panic
-            eprintln!("Failed to listen for the ctrl-c signal: {:?}", e);
+            eprintln!("Failed to listen for the ctrl-c signal: {e:?}");
             std::process::exit(1);
         }
 
         if let Err(e) = shutdown_tx.send(true) {
             // shutdown signal must be catched and handle properly
             // `rx` must not be dropped
-            eprintln!("Failed to send shutdown signal: {:?}", e);
+            eprintln!("Failed to send shutdown signal: {e:?}");
             std::process::exit(1);
         }
     });

@@ -1483,7 +1483,6 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "hex",
- "lazy_static",
  "notify",
  "nu-ansi-term",
  "openssl",

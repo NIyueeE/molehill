@@ -1,3 +1,12 @@
+//! molehill: a secure, stable, high-performance reverse proxy for NAT
+//! traversal — a Rust alternative to frp / ngrok, forked from
+//! [rathole](https://github.com/rapiz1/rathole).
+//!
+//! The client runs next to the service behind NAT and keeps a control
+//! channel to the server on a public host; visitors hit the server's public
+//! endpoint and their traffic is relayed over data channels. See the README
+//! and `docs/` for configuration, transports, and the protocol design.
+
 #![cfg_attr(
     not(any(feature = "client", feature = "server")),
     allow(dead_code, unused_imports, unused_variables, unused_mut)
@@ -41,6 +50,7 @@ fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
 
 #[cfg(feature = "noise")]
 fn genkey(curve: Option<KeypairType>) -> Result<()> {
+    use base64::Engine;
     let curve = curve.unwrap_or(DEFAULT_CURVE);
     let builder = snowstorm::Builder::new(
         format!(
@@ -51,7 +61,6 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
     );
     let keypair = builder.generate_keypair()?;
 
-    use base64::Engine;
     println!(
         "Private Key:\n{}\n",
         base64::engine::general_purpose::STANDARD.encode(&keypair.private)
@@ -68,6 +77,17 @@ fn genkey(_curve: Option<KeypairType>) -> Result<()> {
     crate::common::helper::feature_not_compile("nosie")
 }
 
+/// Run molehill until shutdown.
+///
+/// Loads the configuration through the config watcher (hot-reload aware),
+/// spawns the instance as a server or a client, and restarts the instance
+/// on general configuration changes.
+///
+/// # Errors
+///
+/// Fails when no config path is given, when the config watcher cannot be
+/// started, or when the previous instance errored while a general config
+/// change triggers a restart.
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     if let Some(curve) = args.genkey {
         return genkey(curve);
@@ -161,19 +181,18 @@ enum RunMode {
 }
 
 fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
-    use RunMode::*;
     if args.client && args.server {
-        Undetermine
+        RunMode::Undetermine
     } else if args.client {
-        Client
+        RunMode::Client
     } else if args.server {
-        Server
+        RunMode::Server
     } else if config.client.is_some() && config.server.is_none() {
-        Client
+        RunMode::Client
     } else if config.server.is_some() && config.client.is_none() {
-        Server
+        RunMode::Server
     } else {
-        Undetermine
+        RunMode::Undetermine
     }
 }
 
@@ -181,92 +200,43 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use crate::config::{ClientConfig, ServerConfig};
 
     #[test]
     fn test_determine_run_mode() {
-        use RunMode::*;
-        use config::*;
-
-        struct T {
-            cfg_s: bool,
-            cfg_c: bool,
-            arg_s: bool,
-            arg_c: bool,
-            run_mode: RunMode,
-        }
-
-        let tests = [
-            T {
-                cfg_s: false,
-                cfg_c: false,
-                arg_s: false,
-                arg_c: false,
-                run_mode: Undetermine,
-            },
-            T {
-                cfg_s: true,
-                cfg_c: false,
-                arg_s: false,
-                arg_c: false,
-                run_mode: Server,
-            },
-            T {
-                cfg_s: false,
-                cfg_c: true,
-                arg_s: false,
-                arg_c: false,
-                run_mode: Client,
-            },
-            T {
-                cfg_s: true,
-                cfg_c: true,
-                arg_s: false,
-                arg_c: false,
-                run_mode: Undetermine,
-            },
-            T {
-                cfg_s: true,
-                cfg_c: true,
-                arg_s: true,
-                arg_c: false,
-                run_mode: Server,
-            },
-            T {
-                cfg_s: true,
-                cfg_c: true,
-                arg_s: false,
-                arg_c: true,
-                run_mode: Client,
-            },
-            T {
-                cfg_s: true,
-                cfg_c: true,
-                arg_s: true,
-                arg_c: true,
-                run_mode: Undetermine,
-            },
+        // (config has `[server]`, config has `[client]`, `--server`, `--client`)
+        let tests: [(bool, bool, bool, bool, RunMode); 7] = [
+            (false, false, false, false, RunMode::Undetermine),
+            (true, false, false, false, RunMode::Server),
+            (false, true, false, false, RunMode::Client),
+            (true, true, false, false, RunMode::Undetermine),
+            (true, true, true, false, RunMode::Server),
+            (true, true, false, true, RunMode::Client),
+            (true, true, true, true, RunMode::Undetermine),
         ];
 
-        for t in tests {
+        for (cfg_s, cfg_c, arg_s, arg_c, run_mode) in tests {
             let config = Config {
-                server: match t.cfg_s {
-                    true => Some(ServerConfig::default()),
-                    false => None,
+                server: if cfg_s {
+                    Some(ServerConfig::default())
+                } else {
+                    None
                 },
-                client: match t.cfg_c {
-                    true => Some(ClientConfig::default()),
-                    false => None,
+                client: if cfg_c {
+                    Some(ClientConfig::default())
+                } else {
+                    None
                 },
             };
 
             let args = Cli {
                 config_path: Some(std::path::PathBuf::new()),
-                server: t.arg_s,
-                client: t.arg_c,
+                server: arg_s,
+                client: arg_c,
                 ..Default::default()
             };
 
-            assert_eq!(determine_run_mode(&config, &args), t.run_mode);
+            assert_eq!(determine_run_mode(&config, &args), run_mode);
         }
     }
 }

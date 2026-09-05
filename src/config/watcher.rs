@@ -44,12 +44,12 @@ impl InstanceConfig for ClientConfig {
     type ServiceConfig = ClientServiceConfig;
     fn equal_without_service(&self, rhs: &Self) -> bool {
         let left = ClientConfig {
-            services: Default::default(),
+            services: HashMap::default(),
             ..self.clone()
         };
 
         let right = ClientConfig {
-            services: Default::default(),
+            services: HashMap::default(),
             ..rhs.clone()
         };
 
@@ -78,7 +78,7 @@ impl ConfigWatcherHandle {
         // Initial start
         event_tx
             .send(ConfigChange::General(Box::new(origin_cfg.clone())))
-            .map_err(|e| anyhow!("Failed to send the initial config event: {}", e))?;
+            .map_err(|e| anyhow!("Failed to send the initial config event: {e}"))?;
 
         tokio::spawn(config_watcher(
             path.to_owned(),
@@ -231,6 +231,7 @@ fn calculate_instance_config_events<T: InstanceConfig>(
 mod test {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use crate::config::ServerConfig;
 
     #[test]
     fn test_calculate_events() {
@@ -238,12 +239,12 @@ mod test {
         // has no per-service config anymore); client service changes are
         // forwarded as incremental events.
         let old = Config {
-            server: Some(Default::default()),
+            server: Some(ServerConfig::default()),
             client: None,
         };
         let new = Config {
-            server: Some(Default::default()),
-            client: Some(Default::default()),
+            server: Some(ServerConfig::default()),
+            client: Some(ClientConfig::default()),
         };
         assert_eq!(
             calculate_events(&old, &new),
@@ -251,7 +252,7 @@ mod test {
         );
 
         let server_a = Config {
-            server: Some(Default::default()),
+            server: Some(ServerConfig::default()),
             client: None,
         };
         assert_eq!(calculate_events(&server_a, &server_a), None);

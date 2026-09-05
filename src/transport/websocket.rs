@@ -134,7 +134,7 @@ impl AsyncBufRead for WebsocketTunnel {
     }
 
     fn consume(self: Pin<&mut Self>, amt: usize) {
-        Pin::new(&mut self.get_mut().inner).consume(amt)
+        Pin::new(&mut self.get_mut().inner).consume(amt);
     }
 }
 
@@ -191,15 +191,16 @@ impl Transport for WebsocketTransport {
             .ok_or_else(|| anyhow!("Missing websocket config"))?;
 
         let conf = WebSocketConfig::default().write_buffer_size(0);
-        let sub = match wsconfig.tls {
-            true => SubTransport::Secure(TlsTransport::new(config)?),
-            false => SubTransport::Insecure(TcpTransport::new(config)?),
+        let sub = if wsconfig.tls {
+            SubTransport::Secure(TlsTransport::new(config)?)
+        } else {
+            SubTransport::Insecure(TcpTransport::new(config)?)
         };
         Ok(WebsocketTransport { sub, conf })
     }
 
     fn hint(conn: &Self::Stream, opt: SocketOpts) {
-        opt.apply(conn.inner.get_ref().inner.get_ref().get_tcpstream())
+        opt.apply(conn.inner.get_ref().inner.get_ref().get_tcpstream());
     }
 
     async fn bind<A: ToSocketAddrs + Send + Sync>(
@@ -237,7 +238,7 @@ impl Transport for WebsocketTransport {
         };
         let (wsstream, _) = client_async_with_config(&u, tstream, Some(self.conf))
             .await
-            .map_err(|e| anyhow!("Failed to connect to {}: {}", u, e))?;
+            .map_err(|e| anyhow!("Failed to connect to {u}: {e}"))?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };

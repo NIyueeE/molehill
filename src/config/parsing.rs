@@ -113,7 +113,7 @@ pub enum ServiceType {
 }
 
 fn default_service_type() -> ServiceType {
-    Default::default()
+    ServiceType::default()
 }
 
 /// How the client probes the local service of a TCP service
@@ -134,7 +134,7 @@ const DEFAULT_HEALTH_CHECK_MAX_FAILED: u32 = 1;
 const DEFAULT_HEALTH_CHECK_HTTP_PATH: &str = "/";
 
 fn default_health_check_type() -> HealthCheckType {
-    Default::default()
+    HealthCheckType::default()
 }
 
 fn default_health_check_interval() -> u64 {
@@ -212,14 +212,14 @@ impl PortRange {
                     .parse::<u16>()
                     .with_context(|| format!("Invalid port: {b}"))?;
                 if start > end {
-                    bail!("Port range start {} is greater than end {}", start, end);
+                    bail!("Port range start {start} is greater than end {end}");
                 }
                 Ok(PortRange { start, end })
             }
         }
     }
 
-    pub fn contains(&self, port: u16) -> bool {
+    pub fn contains(self, port: u16) -> bool {
         self.start <= port && port <= self.end
     }
 }
@@ -385,6 +385,7 @@ impl ClientConfig {
         #[cfg(feature = "multiplex")]
         return self.mux_receive_window;
         #[cfg(not(feature = "multiplex"))]
+        let _ = self;
         None
     }
 
@@ -394,6 +395,7 @@ impl ClientConfig {
         #[cfg(feature = "multiplex")]
         return self.mux_max_streams;
         #[cfg(not(feature = "multiplex"))]
+        let _ = self;
         None
     }
 }
@@ -405,6 +407,7 @@ impl ServerConfig {
         #[cfg(feature = "multiplex")]
         return self.mux_receive_window;
         #[cfg(not(feature = "multiplex"))]
+        let _ = self;
         None
     }
 
@@ -414,6 +417,7 @@ impl ServerConfig {
         #[cfg(feature = "multiplex")]
         return self.mux_max_streams;
         #[cfg(not(feature = "multiplex"))]
+        let _ = self;
         None
     }
 }
@@ -452,10 +456,14 @@ pub struct ServerConfig {
     pub heartbeat_interval: u64,
 }
 
+/// The full molehill configuration file: at least one of `[server]` /
+/// `[client]` must be present.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// `[server]` block; `None` when absent.
     pub server: Option<ServerConfig>,
+    /// `[client]` block; `None` when absent.
     pub client: Option<ClientConfig>,
 }
 
@@ -503,7 +511,7 @@ impl Config {
 
         // Validate services
         for (name, s) in &mut client.services {
-            s.name = name.clone();
+            s.name.clone_from(name);
 
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
@@ -511,28 +519,18 @@ impl Config {
             if let Some(hc) = &s.health_check {
                 if s.service_type != ServiceType::Tcp {
                     bail!(
-                        "health_check is only supported for TCP services, but service {} is {:?}",
-                        name,
+                        "health_check is only supported for TCP services, but service {name} is {:?}",
                         s.service_type
                     );
                 }
                 if hc.interval == 0 {
-                    bail!(
-                        "health_check.interval must be greater than 0 for service {}",
-                        name
-                    );
+                    bail!("health_check.interval must be greater than 0 for service {name}");
                 }
                 if hc.timeout == 0 {
-                    bail!(
-                        "health_check.timeout must be greater than 0 for service {}",
-                        name
-                    );
+                    bail!("health_check.timeout must be greater than 0 for service {name}");
                 }
                 if hc.max_failed == 0 {
-                    bail!(
-                        "health_check.max_failed must be greater than 0 for service {}",
-                        name
-                    );
+                    bail!("health_check.max_failed must be greater than 0 for service {name}");
                 }
             }
 
@@ -544,7 +542,7 @@ impl Config {
                 )
             })?;
             if bind.port() == 0 {
-                bail!("service {}: `remote_bind_addr` port must not be 0", name);
+                bail!("service {name}: `remote_bind_addr` port must not be 0");
             }
 
             // Fill in runtime defaults.
@@ -558,17 +556,17 @@ impl Config {
                 s.udp_buffer_size =
                     Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX));
             } else if s.udp_buffer_size == Some(0) {
-                bail!("service {}: udp_buffer_size must be greater than 0", name);
+                bail!("service {name}: udp_buffer_size must be greater than 0");
             }
             if s.udp_idle_timeout.is_none() {
                 s.udp_idle_timeout = Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS);
             } else if s.udp_idle_timeout == Some(0) {
-                bail!("service {}: udp_idle_timeout must be greater than 0", name);
+                bail!("service {name}: udp_idle_timeout must be greater than 0");
             }
             if s.udp_sendq_size.is_none() {
                 s.udp_sendq_size = Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap_or(u16::MAX));
             } else if s.udp_sendq_size == Some(0) {
-                bail!("service {}: udp_sendq_size must be greater than 0", name);
+                bail!("service {name}: udp_sendq_size must be greater than 0");
             }
         }
 
@@ -581,18 +579,17 @@ impl Config {
         config.tcp.proxy.as_ref().map_or(Ok(()), |u| {
             match u.scheme() {
                 "socks5" | "http" => {}
-                scheme => bail!("Unknown proxy scheme: {}", scheme),
+                scheme => bail!("Unknown proxy scheme: {scheme}"),
             }
             if u.host_str().is_none() {
-                bail!("Proxy URL is missing the host: {}", u);
+                bail!("Proxy URL is missing the host: {u}");
             }
             if u.port().is_none() {
-                bail!("Proxy URL is missing the port: {}", u);
+                bail!("Proxy URL is missing the port: {u}");
             }
             Ok(())
         })?;
         match config.transport_type {
-            TransportType::Tcp => Ok(()),
             TransportType::Tls => {
                 let tls_config = config
                     .tls
@@ -607,18 +604,23 @@ impl Config {
                 }
                 Ok(())
             }
-            TransportType::Noise => {
-                // The check is done in transport
-                Ok(())
-            }
-            TransportType::Websocket => Ok(()),
+            // These need no extra validation here; their own transport
+            // constructors validate the configuration.
+            TransportType::Tcp | TransportType::Noise | TransportType::Websocket => Ok(()),
         }
     }
 
+    /// Load and validate the configuration from `path`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be read, or when the parsed TOML violates
+    /// validation rules (missing tokens, invalid addresses, ...). The error
+    /// message names the offending part of the file.
     pub async fn from_file(path: &Path) -> Result<Config> {
         let s: String = fs::read_to_string(path)
             .await
-            .with_context(|| format!("Failed to read the config {:?}", path))?;
+            .with_context(|| format!("Failed to read the config {}", path.display()))?;
         Config::from_str(&s).with_context(
             || "Configuration is invalid. Please refer to the configuration specification.",
         )
@@ -685,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_server_config() -> Result<()> {
+    fn test_validate_server_config() {
         // Missing the token
         let mut cfg = ServerConfig {
             bind_addr: "0.0.0.0:2333".into(),
@@ -701,8 +703,6 @@ mod tests {
             ..Default::default()
         };
         assert!(Config::validate_server_config(&mut cfg).is_ok());
-
-        Ok(())
     }
 
     #[test]
@@ -852,7 +852,7 @@ default_token = ""
     #[test]
     fn test_masked_string_debug() {
         let s = MaskedString::from("secret-token");
-        assert_eq!(format!("{:?}", s), "MASKED");
+        assert_eq!(format!("{s:?}"), "MASKED");
         assert_eq!(&*s, "secret-token");
     }
 

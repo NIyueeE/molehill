@@ -44,8 +44,8 @@ fn colors_enabled() -> bool {
 }
 
 /// Color for a given level, matching the conventional palette.
-fn level_style(level: &Level) -> ansi::Style {
-    match *level {
+fn level_style(level: Level) -> ansi::Style {
+    match level {
         Level::ERROR => ansi::Color::Red.bold(),
         Level::WARN => ansi::Color::Yellow.normal(),
         Level::INFO => ansi::Color::Green.normal(),
@@ -99,7 +99,7 @@ where
         SystemTime.format_time(&mut writer)?;
 
         // Level, fixed width so columns line up
-        let style = level_style(meta.level());
+        let style = level_style(*meta.level());
         if color {
             write!(
                 writer,
@@ -120,7 +120,7 @@ where
             }
             write!(writer, "{}", span.metadata().name())?;
             if let Some(fields) = span.extensions().get::<ts_fmt::FormattedFields<N>>() {
-                write!(writer, "{{{}}}", fields)?;
+                write!(writer, "{{{fields}}}")?;
             }
             if color {
                 write!(writer, "{}", ansi::Color::Cyan.suffix())?;
@@ -228,11 +228,11 @@ mod tests {
     #[test]
     fn colored_levels_use_distinct_colors() {
         let styles = [
-            level_style(&Level::ERROR),
-            level_style(&Level::WARN),
-            level_style(&Level::INFO),
-            level_style(&Level::DEBUG),
-            level_style(&Level::TRACE),
+            level_style(Level::ERROR),
+            level_style(Level::WARN),
+            level_style(Level::INFO),
+            level_style(Level::DEBUG),
+            level_style(Level::TRACE),
         ];
         for (i, a) in styles.iter().enumerate() {
             for b in styles.iter().skip(i + 1) {
@@ -244,7 +244,7 @@ mod tests {
             }
         }
         assert_ne!(
-            level_style(&Level::ERROR).prefix().to_string(),
+            level_style(Level::ERROR).prefix().to_string(),
             ansi::Style::new().prefix().to_string()
         );
     }
