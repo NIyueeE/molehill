@@ -17,6 +17,11 @@ REG_RTT_P50_PCT=${REG_RTT_P50_PCT:-15}
 REG_RTT_P99_PCT=${REG_RTT_P99_PCT:-20}
 REG_THR_PCT=${REG_THR_PCT:-5}
 REG_RSS_PCT=${REG_RSS_PCT:-20}
+# v3 metrics (skipped when the baseline predates them)
+REG_STEADY_RTT_PCT=${REG_STEADY_RTT_PCT:-25}
+REG_UDP_RTT_PCT=${REG_UDP_RTT_PCT:-25}
+REG_HOL_GAP_PCT=${REG_HOL_GAP_PCT:-30}
+REG_UDP_LOSS_PP=${REG_UDP_LOSS_PP:-1.0}   # absolute percentage points
 
 cur=${1:-}
 base=${2:-}
@@ -41,6 +46,9 @@ base = json.load(open(base_path))
 def molehill_key(results):
     cands = [t for t in results if t.startswith("molehill")
              and "mux=off" not in t]
+    # the gated row is the default mux arm — deterministic even though the
+    # bash associative-array dump order is randomized
+    cands.sort(key=lambda t: (0 if "(mux)" in t else 1, t))
     return cands[0] if cands else None
 
 def env_pct(name, default):
@@ -53,6 +61,10 @@ thr_pct = env_pct("REG_THR_PCT", 5)
 p50_pct = env_pct("REG_RTT_P50_PCT", 15)
 p99_pct = env_pct("REG_RTT_P99_PCT", 20)
 rss_pct = env_pct("REG_RSS_PCT", 20)
+steady_pct = env_pct("REG_STEADY_RTT_PCT", 25)
+udp_pct = env_pct("REG_UDP_RTT_PCT", 25)
+hol_pct = env_pct("REG_HOL_GAP_PCT", 30)
+loss_pp = env_pct("REG_UDP_LOSS_PP", 1.0)
 
 ck, bk = molehill_key(cur["results"]), molehill_key(base["results"])
 if not ck or not bk:
@@ -87,6 +99,15 @@ METRICS = [
     ("rtt p50", lambda c: c.get("echo_rtt_ms", {}).get("p50"), p50_pct, +1),
     ("rtt p99", lambda c: c.get("echo_rtt_ms", {}).get("p99"), p99_pct, +1),
     ("rss avg", lambda c: c.get("memory_rss_kb", {}).get("total_avg_kb"), rss_pct, +1),
+    # v3 metrics: skipped silently when the baseline predates them (None)
+    ("steady rtt p99", lambda c: c.get("tcp_steady_rtt_ms", {}).get("p99"), steady_pct, +1),
+    ("udp rtt p99", lambda c: c.get("udp_rtt_ms", {}).get("p99"), udp_pct, +1),
+    ("hol max gap", lambda c: c.get("hol", {}).get("ping_max_gap_ms"), hol_pct, +1),
+]
+
+# absolute-threshold metrics (delta in percentage points, not % of baseline)
+ABS_METRICS = [
+    ("udp loss pp", lambda c: c.get("udp_loss_pct"), loss_pp),
 ]
 
 violations = 0
@@ -105,6 +126,20 @@ for cell in common:
             violations += 1
         print(f"{cell:<14}{label:<14}{b:>12.3f}{c:>12.3f}"
               f"{delta:>+8.1f}%{pct:>7.0f}%  {verdict}")
+
+for cell in common:
+    bcell, ccell = cbase[cell], ccur[cell]
+    for label, get, limit in ABS_METRICS:
+        b, c = get(bcell), get(ccell)
+        if b is None or c is None:
+            continue
+        delta_pp = c - b
+        bad = delta_pp > limit
+        verdict = "REGRESSION" if bad else "ok"
+        if bad:
+            violations += 1
+        print(f"{cell:<14}{label:<14}{b:>12.2f}{c:>12.2f}"
+              f"{delta_pp:>+8.2f}{limit:>7.1f}pp  {verdict}")
 
 print()
 if violations:

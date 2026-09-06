@@ -42,7 +42,13 @@ re-push). For verifying a commit without releasing, use CD test builds.
 
 Every tag refreshes the peer-comparison benchmark (matrix design and tool
 pins live in `benches/scripts/bench/`; peers: frp, rathole (upstream), bore,
-chisel):
+chisel). The matrix (schema v3) measures, per tool and network cell: TCP
+throughput (1/8 streams), connection-path RTT, data-path RTT (steady ping over
+one established connection), UDP session quality over one established session
+(RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
+bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
+as mux and noise variants (mux-off additionally on the loopback cell); peers:
+frp / rathole / chisel also run UDP arms, bore is TCP-only:
 
 1. `just bench` — runs the full matrix (loopback + weak-network cells) and
    writes `benches/scripts/bench/results-vX.Y.Z.json`.

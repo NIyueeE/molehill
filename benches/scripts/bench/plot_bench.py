@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the README benchmark chart from run_bench.sh results (schema v2).
+"""Render the README benchmark chart from run_bench.sh results (schema v3).
 
 Usage: plot_bench.py [results.json] [out.png]
 Defaults: newest results-v*.json in this directory -> assets/benchmark-v<ver>.png
@@ -8,6 +8,8 @@ Panels (top row: loopback cell; bottom row: all cells incl. weak-network):
   1 throughput (loopback, 1/8 streams)   4 throughput per cell (log scale)
   2 connection-path RTT (loopback)       5 echo RTT per cell (log scale)
   3 memory (avg RSS)
+v3 metrics (steady data-path RTT, UDP session quality, HoL probe) are emitted
+in the markdown tables; the chart panels stay focused on the release table.
 """
 import json
 import sys
@@ -167,22 +169,27 @@ print(f"wrote {out_path}")
 def fmt(v, nd=1):
     return f"{v:.{nd}f}" if isinstance(v, (int, float)) else "-"
 
-print("\n| Tool | thr 1-str | thr 8-str | RTT p50 | RTT p99 | RSS |",
-      "|---|---|---|---|---|---|", sep="\n")
+print("\n| Tool | thr 1-str | thr 8-str | RTT p50 | RTT p99 | steady p99 | UDP loss | RSS |",
+      "|---|---|---|---|---|---|---|---|", sep="\n")
 for t in tools:
     lb = results[t].get(loopback, {})
     print(f"| {t} | {fmt(lb.get('throughput_1stream_gbps'))} | "
           f"{fmt(lb.get('throughput_8streams_gbps'))} | "
           f"{fmt(lb.get('echo_rtt_ms', {}).get('p50'), 3)} | "
           f"{fmt(lb.get('echo_rtt_ms', {}).get('p99'), 3)} | "
+          f"{fmt(lb.get('tcp_steady_rtt_ms', {}).get('p99'), 3)} | "
+          f"{fmt(lb.get('udp_loss_pct'), 2)}% | "
           f"{fmt(lb.get('memory_rss_kb', {}).get('total_avg_kb', 0) / 1024)} MiB |")
 for cell in cells:
     if cell == loopback:
         continue
-    print(f"\nCell `{cell}`:", "| Tool | thr 1-str | RTT p50 | retransmits |",
-          "|---|---|---|---|", sep="\n")
+    print(f"\nCell `{cell}`:",
+          "| Tool | thr 1-str | RTT p50 | retransmits | UDP loss | UDP max gap |",
+          "|---|---|---|---|---|---|", sep="\n")
     for t in tools:
         d = results[t].get(cell, {})
         print(f"| {t} | {fmt(d.get('throughput_1stream_gbps'), 3)} | "
               f"{fmt(d.get('echo_rtt_ms', {}).get('p50'), 3)} | "
-              f"{d.get('retransmits_1stream', '-')} |")
+              f"{d.get('retransmits_1stream', '-')} | "
+              f"{fmt(d.get('udp_loss_pct'), 2)}% | "
+              f"{fmt(d.get('udp_max_gap_ms'), 1)} |")

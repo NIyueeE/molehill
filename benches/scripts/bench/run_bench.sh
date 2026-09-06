@@ -1,31 +1,49 @@
 #!/usr/bin/env bash
-# Benchmark matrix: peer comparison × network cells, all on loopback.
+# Benchmark matrix: peer comparison × network cells × service types, loopback.
 #
 # Topology (every run, 127.0.0.1):
-#   visitor -> proxy-server -> proxy-client -> backend (iperf3 / echo)
+#   visitor -> proxy-server -> proxy-client -> backend (iperf3 / echo / udp-echo)
 #
-# Network cells (CELLS="loss%/rtt_ms"; "0/0" -> "loopback"):
-#   - preferred: tc netem on `lo` (needs CAP_NET_ADMIN; shapes the whole
-#     loopback path, visitor leg included), otherwise
-#   - userspace weakproxy.py adds rtt/2 per direction on the client<->server
-#     leg only (no root needed); LOSS cells are skipped without netem, since a
-#     userspace proxy cannot drop packets before the kernel ACKs them.
+# Network cells (CELLS):
+#   "0/0"       loopback
+#   "0/10"      rtt only                 (netem, else userspace weakproxy)
+#   "1%/10"     loss% / rtt_ms           (netem; skipped without CAP_NET_ADMIN)
+#   "2:25/10"   loss% : burst% / rtt_ms  (netem correlated loss)
+#   "r10/50"    rate 10 mbit + rtt_ms    (netem; congestion-policy cells)
+#   netem runs on `lo` (needs CAP_NET_ADMIN; shapes the whole loopback path,
+#   backend leg included — known limitation, netns isolation is future work),
+#   otherwise the userspace weakproxy adds rtt/2 per direction on the
+#   client<->server leg only; loss cells are skipped without netem, since a
+#   userspace proxy cannot drop packets before the kernel ACKs them (UDP
+#   excepted: weakproxy --udp can drop datagrams, for visitor-side scenarios).
 #
 # Per tool per cell:
 #   - iperf3 TCP throughput, 1 and 8 streams (median of REPS; retransmits kept)
 #   - echo connection-path RTT, 300 sequential connections (ms percentiles)
+#   - TCP data-path RTT: steady ping over ONE established connection
+#   - UDP session quality: steady ping over ONE established UDP session —
+#       RTT percentiles, end-to-end loss %, jitter, max inter-packet gap
+#   - HoL probe: saturating bulk flow + game-like pinger concurrently over the
+#     same service (head-of-line visibility; per-stream isolation check)
 #   - resident memory (RSS) of the tool's server+client, sampled during the run
 #
-# Tools (pin versions in fetch_peers.sh): molehill (current tree, mux on;
-# extra mux=off variant on the loopback cell), frp, rathole (upstream),
-# bore, chisel. Override with TOOLS="...".
+# Tools (pin versions in fetch_peers.sh): molehill (current tree; variants via
+# MOLEHILL_VARIANTS="mux,noise" — mux-off runs on the loopback cell), frp,
+# rathole (upstream), bore, chisel. UDP arms: molehill / frp / rathole /
+# chisel forward UDP; bore is TCP-only (its UDP metrics are omitted and the
+# regression gate skips them). Full matrix runtime is roughly an hour — trim
+# with TOOLS / CELLS / MOLEHILL_VARIANTS.
 #
-# Output: results-vX.Y.Z.json (version read from Cargo.toml), schema v2:
+# Output: results-vX.Y.Z.json (version read from Cargo.toml), schema v3:
 #   meta{date, hostname, kernel, cpu, reps, secs, cells[], tool_versions{}}
 #   results[tool][cell]{throughput_1stream_gbps, throughput_8streams_gbps,
 #                       retransmits_1stream, retransmits_8streams,
-#                       echo_rtt_ms{p50,p95,p99,mean}, memory_rss_kb{...}}
-# Regression gate: check_regression.sh compares against the previous tag's file.
+#                       echo_rtt_ms{p50,p95,p99,mean}, tcp_steady_rtt_ms{...},
+#                       udp_rtt_ms{...}, udp_loss_pct, udp_jitter_ms,
+#                       udp_max_gap_ms, hol{bulk_gbps, ping_rtt_ms{...},
+#                       ping_max_gap_ms}, hol_udp{...}, memory_rss_kb{...}}
+# Regression gate: check_regression.sh compares against the previous tag's file
+# (metrics absent from an older baseline are skipped).
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -36,7 +54,15 @@ PEER_DIR=${PEER_DIR:-/tmp/bench-peers}
 REPS=${REPS:-3}
 SECS=${SECS:-8}
 SECS_WEAK=${SECS_WEAK:-15}
-CELLS=${CELLS:-"0/0 0/10 0/100 1%/10 5%/100"}
+HOL_SECS=${HOL_SECS:-8}
+# HoL bulk pacing: a paced bulk keeps the pinger alive so the metric stays
+# comparable across arms; 0 = saturate (stress mode). Loopback has huge spare
+# capacity — the paced numbers differentiate arms primarily in weak cells.
+HOL_BULK_RATE_TCP=${HOL_BULK_RATE_TCP:-200}
+HOL_BULK_RATE_UDP=${HOL_BULK_RATE_UDP:-50}
+CELLS=${CELLS:-"0/0 0/10 0/100 1%/10 5%/100 2:25/10"}
+MOLEHILL_VARIANTS=${MOLEHILL_VARIANTS:-"mux noise"}
+POOL_SIZE=${POOL_SIZE:-8}
 TOOLS=${TOOLS:-"molehill frp rathole bore chisel"}
 OUT=${OUT:-}
 [ -n "$OUT" ] || OUT="$SCRIPT_DIR/results-v$(grep -m1 '^version' "$REPO_ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/').json"
@@ -166,8 +192,15 @@ if command -v tc >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
 fi
 [ "$NETEM_OK" = 1 ] || echo "NOTE: netem unavailable (no CAP_NET_ADMIN) -> rtt cells run via userspace weakproxy; loss cells are skipped" >&2
 
-netem_on() { # loss_pct rtt_ms
-    sudo tc qdisc replace dev lo root netem loss "$1%" delay "$2ms" >/dev/null
+netem_on() { # loss_pct burst_pct rate_mbit rtt_ms
+    local args=()
+    if [ "$1" != 0 ]; then
+        args+=(loss "$1%")
+        [ "$2" != 0 ] && args+=("$2%")
+    fi
+    [ "$4" != 0 ] && args+=(delay "$4ms")
+    [ "$3" != 0 ] && args+=(rate "$3mbit")
+    sudo tc qdisc replace dev lo root netem "${args[@]}" >/dev/null
 }
 netem_off() {
     sudo tc qdisc del dev lo root >/dev/null 2>&1 || true
@@ -180,35 +213,64 @@ netem_off() {
 # dials CLIENT_PORT — the weakproxy when one is active), IPERF_EXPOSED,
 # ECHO_EXPOSED, BACKEND_IPERF, BACKEND_ECHO.
 
-setup_molehill() { # $1: "off" -> mux = false variant
+# Molehill variant spec: "mux" | "mux-off" | "noise". The UDP echo service is
+# part of every variant — the UDP scenario runs for every arm that forwards
+# UDP. Noise keys are generated once per run via `molehill --genkey`.
+ensure_noise_keys() {
+    [ -s "$WORK/noise.pub" ] && return 0
+    "$MOLEHILL_BIN" --genkey > "$WORK/noise.gen" 2>&1
+    awk '/^Private Key:/{getline; print; exit}' "$WORK/noise.gen" > "$WORK/noise.priv"
+    awk '/^Public Key:/{getline; print; exit}' "$WORK/noise.gen" > "$WORK/noise.pub"
+    [ -s "$WORK/noise.priv" ] && [ -s "$WORK/noise.pub" ]
+}
+
+setup_molehill() { # $1: variant ("mux" | "mux-off" | "noise")
     local d="$WORK/molehill"; mkdir -p "$d"
+    local mux=true transport="tcp" noise_server="" noise_client=""
+    case "${1:-mux}" in
+        mux-off) mux=false ;;
+        noise)   transport="noise"
+                 ensure_noise_keys || { echo "noise keygen failed" >&2; return 1; }
+                 noise_server=$(printf '[server.transport.noise]\nlocal_private_key = "%s"\n' "$(cat "$WORK/noise.priv")")
+                 noise_client=$(printf '[client.transport.noise]\nremote_public_key = "%s"\n' "$(cat "$WORK/noise.pub")") ;;
+    esac
     cat > "$d/server.toml" <<TOML
 [server]
 bind_addr = "127.0.0.1:$SERVER_PORT"
 default_token = "bench"
-allow_ports = ["25100-25500"]
+allow_ports = ["25100-25999"]
 [server.transport]
-type = "tcp"
+type = "$transport"
+${noise_server}
 TOML
     cat > "$d/client.toml" <<TOML
 [client]
 remote_addr = "127.0.0.1:$CLIENT_PORT"
 default_token = "bench"
-mux = true
+mux = $mux
 [client.transport]
-type = "tcp"
+type = "$transport"
+${noise_client}
 
 [client.services.iperf]
 local_addr = "127.0.0.1:$BACKEND_IPERF"
 remote_bind_addr = "127.0.0.1:$IPERF_EXPOSED"
-pool_size = 8
+pool_size = $POOL_SIZE
 
 [client.services.echo]
 local_addr = "127.0.0.1:$BACKEND_ECHO"
 remote_bind_addr = "127.0.0.1:$ECHO_EXPOSED"
-pool_size = 8
+pool_size = $POOL_SIZE
+
+[client.services.udpecho]
+type = "udp"
+local_addr = "127.0.0.1:$BACKEND_UDP"
+remote_bind_addr = "127.0.0.1:$UDP_EXPOSED"
+pool_size = 2
+udp_buffer_size = 2048
+udp_idle_timeout = 60
+udp_sendq_size = 1024
 TOML
-    [ "${1:-}" != "off" ] || sed -i 's/^mux = true/mux = false/' "$d/client.toml"
     "$MOLEHILL_BIN" --server "$d/server.toml" >"$d/s.log" 2>&1 &
     SRV_PID=$!
     "$MOLEHILL_BIN" --client "$d/client.toml" >"$d/c.log" 2>&1 &
@@ -241,6 +303,13 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = $BACKEND_ECHO
 remotePort = $ECHO_EXPOSED
+
+[[proxies]]
+name = "udpecho"
+type = "udp"
+localIP = "127.0.0.1"
+localPort = $BACKEND_UDP
+remotePort = $UDP_EXPOSED
 TOML
     "$PEER_DIR/frp/frps" -c "$d/frps.toml" >"$d/s.log" 2>&1 &
     SRV_PID=$!
@@ -263,6 +332,10 @@ token = "bench"
 [server.services.echo]
 bind_addr = "127.0.0.1:$ECHO_EXPOSED"
 token = "bench"
+
+[server.services.udpecho]
+bind_addr = "127.0.0.1:$UDP_EXPOSED"
+token = "bench"
 TOML
     cat > "$d/client.toml" <<TOML
 [client]
@@ -276,6 +349,11 @@ token = "bench"
 
 [client.services.echo]
 local_addr = "127.0.0.1:$BACKEND_ECHO"
+token = "bench"
+
+[client.services.udpecho]
+type = "udp"
+local_addr = "127.0.0.1:$BACKEND_UDP"
 token = "bench"
 TOML
     "$PEER_DIR/rathole" --server "$d/server.toml" >"$d/s.log" 2>&1 &
@@ -304,6 +382,8 @@ start_bore_local() { # exposed_port local_port log -> echoes client pid; retries
 }
 
 setup_bore() { # control port is fixed at 7835; one `bore local` per exposed port
+    # bore is TCP-only: no UDP service arm (its UDP metrics stay absent and
+    # the regression gate skips them)
     local d="$WORK/bore"; mkdir -p "$d"
     if [ "$MECH" = "weakproxy" ]; then
         # control on a second loopback IP so the weakproxy can hold
@@ -332,15 +412,18 @@ setup_chisel() {
     SRV_PID=$!
     "$PEER_DIR/chisel" client "http://127.0.0.1:$CLIENT_PORT" \
         "R:$IPERF_EXPOSED:127.0.0.1:$BACKEND_IPERF" \
-        "R:$ECHO_EXPOSED:127.0.0.1:$BACKEND_ECHO" >"$d/c.log" 2>&1 &
+        "R:$ECHO_EXPOSED:127.0.0.1:$BACKEND_ECHO" \
+        "R:$UDP_EXPOSED:127.0.0.1:$BACKEND_UDP/udp" >"$d/c.log" 2>&1 &
     CLI_PID=$!
 }
 
 kill_tool() {
-    for pid in "$SRV_PID" "$CLI_PID" "${EXTRA_PID:-}" "${PROXY_PID:-}"; do
+    # NOTE: the weakproxy is cell-scoped (started once per tool, shared by the
+    # molehill variants) — it is killed at the end of the cell, not here.
+    for pid in "$SRV_PID" "$CLI_PID" "${EXTRA_PID:-}"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null
     done
-    EXTRA_PID=""; PROXY_PID=""
+    EXTRA_PID=""
     sleep 0.4
     pkill -x molehill 2>/dev/null; pkill -x frps 2>/dev/null; pkill -x frpc 2>/dev/null
     pkill -x rathole 2>/dev/null; pkill -x bore 2>/dev/null; pkill -x chisel 2>/dev/null
@@ -400,22 +483,39 @@ while True:
     threading.Thread(target=serve, args=(c,), daemon=True).start()
 PYECHO
 
+cat > "$WORK/udp_echo_srv.py" <<'PYUDPECHO'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+while True:
+    data, addr = s.recvfrom(65535)
+    s.sendto(data, addr)
+PYUDPECHO
+
 declare -A R      # "cell|tool" -> per-run json fragment
 CELLS_META=""
 IDX=0
 
 for cell in $CELLS; do
-    loss=${cell%%/*}; loss=${loss%\%}   # tolerate "1%/10" style input
-    rtt=${cell##*/}
-    if [ "$loss" = 0 ] && [ "$rtt" = 0 ]; then cname="loopback"
-    elif [ "$loss" = 0 ]; then cname="rtt${rtt}"
-    else cname="loss${loss}_rtt${rtt}"; fi
+    # formats: "loss%/rtt", "loss%:burst%/rtt" (correlated loss), "r<mbit>/rtt"
+    loss=0; burst=0; rate=0; rtt=0
+    case "$cell" in
+        r[0-9]*)  rate=${cell%%/*}; rate=${rate#r}; rtt=${cell##*/}
+                  cname="rate${rate}_rtt${rtt}" ;;
+        *:*)      lb=${cell%%/*}; loss=${lb%%:*}; burst=${lb#*:}; rtt=${cell##*/}
+                  cname="loss${loss}b${burst}_rtt${rtt}" ;;
+        *)        loss=${cell%%/*}; loss=${loss%\%}   # tolerate "1%/10" style
+                  rtt=${cell##*/}
+                  if [ "$loss" = 0 ] && [ "$rtt" = 0 ]; then cname="loopback"
+                  elif [ "$loss" = 0 ]; then cname="rtt${rtt}"
+                  else cname="loss${loss}_rtt${rtt}"; fi ;;
+    esac
     secs=$SECS
     MECH="direct"
-    if [ "$loss" != 0 ] || [ "$rtt" != 0 ]; then
+    if [ "$loss" != 0 ] || [ "$rtt" != 0 ] || [ "$rate" != 0 ] || [ "$burst" != 0 ]; then
         secs=$SECS_WEAK
         if [ "$NETEM_OK" = 1 ]; then
-            netem_on "$loss" "$rtt"
+            netem_on "$loss" "$burst" "$rate" "$rtt"
             MECH="netem"
         elif [ "$loss" != 0 ]; then
             echo "skip cell $cname: loss simulation needs netem (CAP_NET_ADMIN)" >&2
@@ -426,15 +526,17 @@ for cell in $CELLS; do
     fi
 
     BASE=$((25100 + IDX * 100))
-    BACKEND_IPERF=$((BASE + 90)); BACKEND_ECHO=$((BASE + 91))
+    BACKEND_IPERF=$((BASE + 90)); BACKEND_ECHO=$((BASE + 91)); BACKEND_UDP=$((BASE + 92))
     iperf3 -s -B 127.0.0.1 -p "$BACKEND_IPERF" >/dev/null 2>&1 &
     IPERF_SRV_PID=$!
     python3 "$WORK/echo_srv.py" "$BACKEND_ECHO" >/dev/null 2>&1 &
     ECHO_SRV_PID=$!
+    python3 "$WORK/udp_echo_srv.py" "$BACKEND_UDP" >/dev/null 2>&1 &
+    UDP_SRV_PID=$!
     sleep 0.4
 
-    run_one() { # label setup_fn setup_arg
-        local label=$1 setup=$2 sarg=$3
+    run_one() { # label setup_fn setup_arg has_udp
+        local label=$1 setup=$2 sarg=$3 has_udp=${4:-1}
         echo "=== $label [$cname] ===" >&2
         "$setup" "$sarg" || { echo "$label: setup failed, skipped" >&2; kill_tool; return; }
         wait_port "$IPERF_EXPOSED" 25 || { echo "$label: exposed port not ready, skipped" >&2; kill_tool; return; }
@@ -444,16 +546,28 @@ for cell in $CELLS; do
         read -r t1 r1 <<< "$(throughput 1 "$secs")"
         read -r t8 r8 <<< "$(throughput 8 "$secs")"
         lat=$(latency "$ECHO_EXPOSED")
+        steady=$(python3 "$SCRIPT_DIR/tcp_steady_ping.py" 127.0.0.1 "$ECHO_EXPOSED" 200 20 \
+            || echo '{"p50":0,"p95":0,"p99":0,"mean":0}')
+        udp_json="null"; hol_udp_json="null"
+        if [ "$has_udp" = 1 ]; then
+            udp_json=$(python3 "$SCRIPT_DIR/udp_ping.py" 127.0.0.1 "$UDP_EXPOSED" 200 20 $((secs + 3)) \
+                || echo '{"sent":0,"received":0,"loss_pct":100,"rtt_ms":{"p50":0,"p95":0,"p99":0,"mean":0},"jitter_ms":0,"max_gap_ms":0}')
+            hol_udp_json=$(python3 "$SCRIPT_DIR/hol_probe.py" --mode udp --host 127.0.0.1 --port "$UDP_EXPOSED" \
+                --duration "$HOL_SECS" --bulk-rate-mbps "$HOL_BULK_RATE_UDP" || echo "null")
+        fi
+        hol_json=$(python3 "$SCRIPT_DIR/hol_probe.py" --mode tcp --host 127.0.0.1 --port "$ECHO_EXPOSED" \
+            --duration "$HOL_SECS" --bulk-rate-mbps "$HOL_BULK_RATE_TCP" || echo "null")
         stop_mem
         read -r ms mc mt mp mn <<< "$(mem_stats "$WORK/$cname.$label.mem")"
         kill_tool
-        R["$cname|$label"]="{\"thr1\": $t1, \"retr1\": $r1, \"thr8\": $t8, \"retr8\": $r8, \"lat\": $lat, \"mem\": {\"server_avg_kb\": $ms, \"client_avg_kb\": $mc, \"total_avg_kb\": $mt, \"total_peak_kb\": $mp, \"samples\": $mn}}"
+        R["$cname|$label"]="{\"thr1\": $t1, \"retr1\": $r1, \"thr8\": $t8, \"retr8\": $r8, \"lat\": $lat, \"steady\": ${steady:-null}, \"udp\": ${udp_json}, \"hol\": ${hol_json}, \"hol_udp\": ${hol_udp_json}, \"mem\": {\"server_avg_kb\": $ms, \"client_avg_kb\": $mc, \"total_avg_kb\": $mt, \"total_peak_kb\": $mp, \"samples\": $mn}}"
     }
 
     for tool in $TOOLS; do
         if ! tool_bin_ok "$tool"; then echo "skip $tool: binary missing (run fetch_peers.sh)" >&2; continue; fi
         off=${TOFF[$tool]}
         CONTROL=$((BASE + off + 1)); IPERF_EXPOSED=$((BASE + off + 2)); ECHO_EXPOSED=$((BASE + off + 3))
+        UDP_EXPOSED=$((BASE + off + 4))
         SERVER_PORT=$CONTROL
         if [ "$MECH" = "weakproxy" ]; then
             # one userspace proxy per tool: client dials the proxy, which adds
@@ -476,23 +590,27 @@ for cell in $CELLS; do
             PROXY_PID=""
         fi
         case "$tool" in
-            molehill) run_one "molehill $MOLEHILL_V (mux)" setup_molehill "" ;;
-            frp)      run_one "frp $FRP_V" setup_frp "" ;;
-            rathole)  run_one "rathole $RATHOLE_V" setup_rathole "" ;;
-            bore)     run_one "bore $BORE_V" setup_bore "" ;;
-            chisel)   run_one "chisel $CHISEL_V" setup_chisel "" ;;
+            molehill)
+                for variant in $MOLEHILL_VARIANTS; do
+                    run_one "molehill $MOLEHILL_V ($variant)" setup_molehill "$variant" 1
+                done
+                if [ "$cname" = loopback ] && [[ " $MOLEHILL_VARIANTS " != *"mux-off"* ]]; then
+                    run_one "molehill $MOLEHILL_V (mux=off)" setup_molehill "mux-off" 1
+                fi ;;
+            frp)      run_one "frp $FRP_V" setup_frp "" 1 ;;
+            rathole)  run_one "rathole $RATHOLE_V" setup_rathole "" 1 ;;
+            bore)     run_one "bore $BORE_V" setup_bore "" 0 ;;
+            chisel)   run_one "chisel $CHISEL_V" setup_chisel "" 1 ;;
         esac
     done
 
-    # loopback extra: molehill with mux disabled (fast links favor it slightly)
-    if [ "$cname" = "loopback" ] && [[ " $TOOLS " == *" molehill "* ]] && tool_bin_ok molehill; then
-        CONTROL=$((BASE + 11)); IPERF_EXPOSED=$((BASE + 12)); ECHO_EXPOSED=$((BASE + 13))
-        SERVER_PORT=$CONTROL; CLIENT_PORT=$CONTROL; PROXY_PID=""
-        run_one "molehill $MOLEHILL_V (mux=off)" setup_molehill off
-    fi
+    # loopback extra: molehill with mux disabled is handled inside the
+    # molehill case (runs after the mux/noise variants on the loopback cell)
 
-    kill "$IPERF_SRV_PID" "$ECHO_SRV_PID" 2>/dev/null
+    kill "$IPERF_SRV_PID" "$ECHO_SRV_PID" "$UDP_SRV_PID" 2>/dev/null
     pkill -x iperf3 2>/dev/null
+    pkill -f "weakproxy.py" 2>/dev/null
+    PROXY_PID=""
     [ "$MECH" = "netem" ] && netem_off
     CELLS_META="$CELLS_META{\"name\": \"$cname\", \"loss_pct\": $loss, \"rtt_ms\": $rtt, \"mech\": \"$MECH\"},"
     IDX=$((IDX + 1))
@@ -506,7 +624,7 @@ BENCH_RAW=""
 for k in "${!R[@]}"; do BENCH_RAW+="$k=${R[$k]};"; done
 BENCH_RAW=${BENCH_RAW%;} BENCH_CELLS="$CELLS_META" \
 BENCH_TOOLV="molehill=$MOLEHILL_V;frp=$FRP_V;rathole=$RATHOLE_V;bore=$BORE_V;chisel=$CHISEL_V" \
-REPS="$REPS" SECS="$SECS" SECS_WEAK="$SECS_WEAK" \
+REPS="$REPS" SECS="$SECS" SECS_WEAK="$SECS_WEAK" HOL_SECS="$HOL_SECS" \
 python3 - "$OUT" <<'PYDUMP'
 import datetime, json, os, platform, socket, sys
 
@@ -516,13 +634,21 @@ for item in filter(None, raw.split(";")):
     cell, rest = item.split("|", 1)
     tool, blob = rest.rsplit("=", 1)  # labels may contain "=" (e.g. mux=off)
     frag = json.loads(blob)
-    # normalize to the v2 schema consumed by plot_bench.py / check_regression.sh
+    # normalize to the v3 schema consumed by plot_bench.py / check_regression.sh
+    udp = frag.get("udp") or {}
     results.setdefault(tool, {})[cell] = {
         "throughput_1stream_gbps": frag["thr1"],
         "throughput_8streams_gbps": frag["thr8"],
         "retransmits_1stream": frag.get("retr1"),
         "retransmits_8streams": frag.get("retr8"),
         "echo_rtt_ms": frag["lat"],
+        "tcp_steady_rtt_ms": frag.get("steady"),
+        "udp_rtt_ms": udp.get("rtt_ms"),
+        "udp_loss_pct": udp.get("loss_pct"),
+        "udp_jitter_ms": udp.get("jitter_ms"),
+        "udp_max_gap_ms": udp.get("max_gap_ms"),
+        "hol": frag.get("hol"),
+        "hol_udp": frag.get("hol_udp"),
         "memory_rss_kb": frag["mem"],
     }
 
@@ -549,13 +675,15 @@ meta = {
     "hostname": socket.gethostname(),
     "kernel": platform.release(),
     "cpu": cpu,
+    "schema": 3,
     "reps": int(os.environ.get("REPS", "3")),
     "secs_per_rep_loopback": int(os.environ.get("SECS", "8")),
     "secs_per_rep_weak": int(os.environ.get("SECS_WEAK", "15")),
+    "hol_probe_seconds": int(os.environ.get("HOL_SECS", "8")),
     "latency_samples": 300,
     "memory_samples_interval_s": 0.5,
     "topology": "loopback visitor->server->client->backend",
-    "transport": "plain tcp",
+    "transport": "plain tcp + noise (molehill variants)",
     "cells": cells,
     "tool_versions": toolv,
 }
