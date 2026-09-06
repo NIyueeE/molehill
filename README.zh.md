@@ -48,25 +48,47 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 ## 基准测试
 
-与上一版本及 frp 的回环对比（明文 TCP，单机拓扑
-`访客 -> 服务端 -> 客户端 -> 后端`）。各工具吞吐均打满回环带宽——
-真正的差异在每条连接的路径开销：
+单机同类对比（明文 TCP，单机拓扑 `访客 -> 服务端 -> 客户端 -> 后端`；
+弱网档在软件层面为 `服务端↔客户端` 链路增加往返时延）。对比对象：
+frp 0.71.0、rathole 0.5.0（上游）、bore 0.6.0、chisel 1.10.1。
 
-![Benchmark: molehill v0.7.0 vs v0.6.4 vs frp 0.71.0](assets/benchmark-v0.7.0.png)
+![Benchmark: molehill 0.7.2 vs peers](assets/benchmark-v0.7.2.png)
 
-| 工具 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存（平均 RSS） | 占 frp 比例 |
-|---|---|---|---|---|---|---|
-| **molehill 0.7.0**（mux，默认） | 49.8 | 63.8 | **0.249 ms** | 0.319 ms | **16.9 MiB** | **35.8%** |
-| molehill 0.7.0（`mux = false`） | 50.1 | 63.7 | 0.218 ms | 0.259 ms | 16.8 MiB | 35.7% |
-| molehill 0.6.4 | 51.3 | 64.0 | 0.239 ms | 0.325 ms | 16.5 MiB | 35.0% |
-| frp 0.71.0 | 49.3 | 64.0 | 0.380 ms | 0.594 ms | 47.1 MiB | 100% |
+### 回环
 
-- 多路复用开启（默认）时，连接路径延迟比 frp **p50 低约 35%，p99 低约 46%**。
-- 内存为服务端 + 客户端在回环 iperf3 流量下采样的常驻内存（RSS）；
-  molehill 的内存占用约为 frp 的 **35%**（越低越好）。
-- 吞吐已打满回环、各工具统计上无差异，仅作为上限参考。
-- 复现方式：`benches/scripts/bench/run_bench.sh`
-  （原始数据 `benches/scripts/bench/results-v0.7.0.json`，绘图 `plot_bench.py`）。
+吞吐对每个工具都打满回环带宽——真正的差异在每条连接的路径开销与内存：
+
+| 工具 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存（平均 RSS） |
+|---|---|---|---|---|---|
+| **molehill 0.7.2**（mux，默认） | 44.8 | 62.1 | 0.261 ms | 0.303 ms | 17.1 MiB |
+| molehill 0.7.2（`mux = false`） | 45.8 | 62.7 | 0.220 ms | 0.281 ms | 17.1 MiB |
+| rathole 0.5.0（上游） | 45.4 | 62.0 | 0.235 ms | 0.312 ms | 19.7 MiB |
+| bore 0.6.0 | 45.7 | 62.7 | 0.517 ms | 0.633 ms | **8.1 MiB** |
+| chisel 1.10.1 | 45.4 | 62.3 | 0.373 ms | 0.556 ms | 24.5 MiB |
+| frp 0.71.0 | 46.2 | 61.9 | 0.379 ms | 0.690 ms | 47.2 MiB |
+
+### 弱网：隧道链路附加 RTT
+
+连接路径正是预建通道池的收益所在。给隧道链路增加 `rtt` 毫秒往返时延后，
+没有连接池的工具每条访客连接都要多付整整一个往返：
+
+| 工具 | rtt10: RTT p50 | rtt100: RTT p50 | rtt100: 单流 (Gbit/s) |
+|---|---|---|---|
+| **molehill 0.7.2**（mux，默认） | **11.2 ms** | **101.7 ms** | 44.8 |
+| frp 0.71.0 | 11.4 ms | 102.0 ms | 45.9 |
+| rathole 0.5.0（上游） | 11.5 ms | 102.0 ms | 46.1 |
+| chisel 1.10.1 | 22.1 ms | 202.6 ms | 47.2 |
+| bore 0.6.0 | 22.5 ms | 203.2 ms | 44.0 |
+
+- molehill/frp/rathole 在附加 RTT 之上只保留约 1.2 ms 的每连接开销
+  （预建数据通道）；bore/chisel 每条连接约为附加 RTT 的 2 倍——访客每次
+  连接都要经隧道现拨一个完整往返。
+- 回环绝对吞吐与主机相关（会打满整机），仅作上限参考，不是差异项。
+- 丢包档（netem）需要 `CAP_NET_ADMIN`，环境不具备时自动跳过
+  （见 docs/release.md）。
+- 复现方式：`just bench` → `just bench-plot` → `just bench-check`
+  （原始数据 `benches/scripts/bench/results-v0.7.2.json`；仪式与回归门禁
+  见 docs/release.md）。
 
 ## 快速开始
 

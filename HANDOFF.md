@@ -28,6 +28,24 @@ for many-service clients.
 - [ ] Buffer pooling under high churn (measure first)
 - [ ] Zero-copy splice/sendfile: deliberately not recommended (keep as-is)
 
+### Benchmark ritual (per tag, see docs/release.md)
+
+`just bench` → `just bench-plot` → `just bench-check` must be green before
+tagging: results JSON + chart + README table land in the release commit, and
+performance may not regress vs the previous tag (thresholds env-tunable, see
+`benches/scripts/bench/check_regression.sh`). Machine notes: loss cells need
+`CAP_NET_ADMIN` (unavailable in this container — rtt cells run via the
+userspace `weakproxy.py` fallback, loss cells auto-skip); bore's `--to` only
+accepts a bare host (port 7835 implied), so proxied cells shift its control
+port to 127.0.0.2.
+
+Known waiver (v0.7.2): the gate against `results-v0.7.0.json` fails on
+loopback 1-stream throughput (-10.1%) because that baseline was recorded on a
+different host — every tool shifted down together (frp -6.3%; 8-stream only
+-2.7%) and a same-host re-run reproduces ~45.5 Gbit/s stably. Waived for this
+tag only; from the next tag the gate compares same-host results and must be
+genuinely green.
+
 ## References
 
 - rust-yamux: <https://github.com/paritytech/yamux>

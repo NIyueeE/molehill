@@ -141,7 +141,11 @@ code-level.**
      their own initiative);
   2. `version` in `Cargo.toml` equals the tag version;
   3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`;
-  4. `just check` is green on the tagged commit.
+  4. `just check` is green on the tagged commit;
+  5. the benchmark ritual is done (docs/release.md): `results-vX.Y.Z.json`,
+     the new chart, and the README benchmark table are refreshed in the
+     release commit, and `just bench-check` is green against the previous
+     tag — performance must not regress.
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 

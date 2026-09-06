@@ -26,12 +26,31 @@ molehill 是 [rathole](https://github.com/rapiz1/rathole) 的 fork,版本号
 ## Tag 推送策略:不随手发版
 
 commit 随时可以推 —— 快速门守护它们,且不会触发任何公开动作。推送 `v*`
-tag 是一次郑重的发布行为;四项前提条件(明确的人类请求、`Cargo.toml` 版本
-一致、带日期的 CHANGELOG 小节、`just check` 全绿)是 [AGENTS.md §5](../AGENTS.md)
-中的仓库规则 —— 发布工作流对其中版本与 CHANGELOG 两项做机械强制校验。
+tag 是一次郑重的发布行为;五项前提条件(明确的人类请求、`Cargo.toml` 版本
+一致、带日期的 CHANGELOG 小节、`just check` 全绿、基准门禁全绿 —— 见下)
+是 [AGENTS.md §5](../AGENTS.md) 中的仓库规则 —— 发布工作流对其中版本与
+CHANGELOG 两项做机械强制校验。
 
 重新打 tag 仅用于修复失败的发布(删除 tag、修复、重新推送)。不发布地验证
 某个 commit,请使用 CD 测试构建。
+
+## 基准:每次 tag 的固定仪式
+
+每个 tag 都要刷新同类对比基准(矩阵设计与工具版本 pin 在
+`benches/scripts/bench/`;对比对象:frp、上游 rathole、bore、chisel):
+
+1. `just bench` —— 跑全矩阵(loopback + 弱网档),生成
+   `benches/scripts/bench/results-vX.Y.Z.json`。
+2. `just bench-plot` —— 渲染 `assets/benchmark-vX.Y.Z.png` 并输出 markdown
+   表格;据此更新 README 的 Benchmarks 小节,然后删除上一 tag 的旧图。
+3. `just bench-check` —— 对照上一个 tag 的结果文件跑回归门禁。
+   **性能不得比上一个 tag 下降**;违规即阻止打 tag,除非修复或明确豁免
+   (豁免记录在 `HANDOFF.md`)。
+4. 结果 JSON + 新图 + README 表格**随发布 commit 一起提交**。
+
+门禁只在打 tag 前本地执行,绝不进 CI:共享 runner 的性能数字噪声太大。
+弱网丢包档需要 `CAP_NET_ADMIN`(netem);没有时脚本自动退化为用户态延迟
+代理跑 rtt 档、跳过丢包档 —— 机制不同时请在 README 表格中注明。
 
 ## 发布工作流做什么
 

@@ -29,14 +29,37 @@ applies within that line.
 ## Tag-push policy: no casual release pushes
 
 Commits are always allowed — the fast gates guard them and they trigger
-nothing public. Pushing a `v*` tag is a deliberate release act; the four
+nothing public. Pushing a `v*` tag is a deliberate release act; the five
 preconditions (explicit human request, `Cargo.toml` version match, dated
-changelog section, green `just check`) are the repository rule stated in
-[AGENTS.md §5](../AGENTS.md) — the release workflow enforces the version and
-changelog ones mechanically.
+changelog section, green `just check`, green benchmark gate — see below) are
+the repository rule stated in [AGENTS.md §5](../AGENTS.md) — the release
+workflow enforces the version and changelog ones mechanically.
 
 Re-tagging is allowed only to fix a failed release (delete the tag, fix,
 re-push). For verifying a commit without releasing, use CD test builds.
+
+## Benchmarks: per-tag ritual
+
+Every tag refreshes the peer-comparison benchmark (matrix design and tool
+pins live in `benches/scripts/bench/`; peers: frp, rathole (upstream), bore,
+chisel):
+
+1. `just bench` — runs the full matrix (loopback + weak-network cells) and
+   writes `benches/scripts/bench/results-vX.Y.Z.json`.
+2. `just bench-plot` — renders `assets/benchmark-vX.Y.Z.png` and prints the
+   markdown tables; update the README Benchmarks section with them, then
+   delete the previous tag's chart from `assets/`.
+3. `just bench-check` — regression gate against the previous tag's results
+   file. **Performance must not regress vs the previous tag**; a violation
+   blocks the tag until fixed or explicitly waived (record the waiver in
+   `HANDOFF.md`).
+4. Commit results JSON + new chart + README table **in the release commit**.
+
+The gate runs locally before tagging, never in CI: shared runners are too
+noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
+(netem); without it the script falls back to a userspace delay proxy for
+rtt cells and skips loss cells — note the mechanism in the README table when
+it differs.
 
 ## What the release workflow does
 

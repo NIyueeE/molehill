@@ -63,7 +63,7 @@
 | `tests/integration_test.rs` | 启动真实 server+client 对;跨传输类型的 TCP/UDP 转发 |
 | `tests/common/mod.rs` | echo/pingpong 打流器与运行助手 |
 | `tests/for_tcp/`、`tests/for_udp/`、`tests/config_test/` | 传输夹具与有效/无效配置 |
-| `benches/` | HTTP 延迟(vegeta)与内存采样脚本 |
+| `benches/` | 同类对比基准矩阵(`bench/`:运行器、对比工具抓取、图表、回归门禁),另有 HTTP 延迟(vegeta)与内存采样脚本 |
 | `examples/` | 可运行的配置:tls、noise_nk、udp、use_proxy、minimal、iperf3、unified、systemd、container、full |
 | `docs/` | 文档集 —— 每个主题只有一个归属地,其余页面以链接代替重复(见下) |
 

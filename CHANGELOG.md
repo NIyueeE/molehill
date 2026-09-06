@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Release-grade benchmark matrix (`just bench`): peer comparison against frp,
+  rathole (upstream), bore and chisel across loopback and weak-network cells
+  (rtt/loss via netem, with a userspace delay-proxy fallback when
+  `CAP_NET_ADMIN` is unavailable), chart + table rendering (`just bench-plot`)
+  and a per-tag regression gate (`just bench-check`) required before tagging.
+
 ## [0.7.2] - 2026-09-05
 
 ### Changed

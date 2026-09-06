@@ -41,6 +41,26 @@ check:
 powerset:
     cargo hack check --feature-powerset --no-dev-deps --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
+# Install benchmark prerequisites (iperf3, tc/netem, matplotlib).
+bench-deps:
+    sudo apt-get install -y iperf3 iproute2 python3-matplotlib
+
+# Fetch/build pinned peer tools (frp, rathole, bore, chisel) into /tmp/bench-peers.
+bench-peers:
+    bash benches/scripts/bench/fetch_peers.sh
+
+# Run the full benchmark matrix (loss cells need netem; rtt cells use weakproxy).
+bench:
+    bash benches/scripts/bench/run_bench.sh
+
+# Render the README chart + markdown tables from the latest results file.
+bench-plot:
+    python3 benches/scripts/bench/plot_bench.py
+
+# Regression gate: latest results vs the previous tag's file (pre-tag ritual).
+bench-check:
+    bash benches/scripts/bench/check_regression.sh
+
 # Build the scratch container image from a release musl binary (see Containerfile).
 container:
     #!/usr/bin/env bash

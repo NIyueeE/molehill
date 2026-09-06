@@ -48,29 +48,52 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 
 ## Benchmarks
 
-Loopback comparison against the previous release and frp (plain TCP,
-`visitor -> server -> client -> backend` on one machine). Throughput
-saturates loopback for every tool — the differentiator is per-connection
-path overhead:
+Peer comparison on one machine (plain TCP, `visitor -> server -> client ->
+backend` on loopback; weak-network cells add round-trip time to the
+server↔client leg in software). Peers: frp 0.71.0, rathole 0.5.0 (upstream),
+bore 0.6.0, chisel 1.10.1.
 
-![Benchmark: molehill v0.7.0 vs v0.6.4 vs frp 0.71.0](assets/benchmark-v0.7.0.png)
+![Benchmark: molehill 0.7.2 vs peers](assets/benchmark-v0.7.2.png)
 
-| Tool | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) | % of frp |
-|---|---|---|---|---|---|---|
-| **molehill 0.7.0** (mux, default) | 49.8 | 63.8 | **0.249 ms** | 0.319 ms | **16.9 MiB** | **35.8%** |
-| molehill 0.7.0 (`mux = false`) | 50.1 | 63.7 | 0.218 ms | 0.259 ms | 16.8 MiB | 35.7% |
-| molehill 0.6.4 | 51.3 | 64.0 | 0.239 ms | 0.325 ms | 16.5 MiB | 35.0% |
-| frp 0.71.0 | 49.3 | 64.0 | 0.380 ms | 0.594 ms | 47.1 MiB | 100% |
+### Loopback
 
-- With multiplexing on (default): **~35% lower p50** and **~46% lower p99**
-  connection-path latency than frp.
-- Memory is the resident set size (RSS) of server + client sampled while
-  serving loopback iperf3 traffic; molehill uses roughly **35% of frp's
-  memory** (lower is better).
-- Throughput is loopback-saturated and statistically identical across tools —
+Throughput saturates loopback for every tool — the differentiator is
+per-connection path overhead and memory:
+
+| Tool | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
+|---|---|---|---|---|---|
+| **molehill 0.7.2** (mux, default) | 44.8 | 62.1 | 0.261 ms | 0.303 ms | 17.1 MiB |
+| molehill 0.7.2 (`mux = false`) | 45.8 | 62.7 | 0.220 ms | 0.281 ms | 17.1 MiB |
+| rathole 0.5.0 (upstream) | 45.4 | 62.0 | 0.235 ms | 0.312 ms | 19.7 MiB |
+| bore 0.6.0 | 45.7 | 62.7 | 0.517 ms | 0.633 ms | **8.1 MiB** |
+| chisel 1.10.1 | 45.4 | 62.3 | 0.373 ms | 0.556 ms | 24.5 MiB |
+| frp 0.71.0 | 46.2 | 61.9 | 0.379 ms | 0.690 ms | 47.2 MiB |
+
+### Weak network: added RTT on the tunnel leg
+
+The connection path is where pre-established pooled channels pay off. With
+`rtt` milliseconds of added round-trip time on the tunnel leg, every visitor
+connection costs the pool-free tools one full extra round trip:
+
+| Tool | rtt10: RTT p50 | rtt100: RTT p50 | rtt100: 1-stream (Gbit/s) |
+|---|---|---|---|
+| **molehill 0.7.2** (mux, default) | **11.2 ms** | **101.7 ms** | 44.8 |
+| frp 0.71.0 | 11.4 ms | 102.0 ms | 45.9 |
+| rathole 0.5.0 (upstream) | 11.5 ms | 102.0 ms | 46.1 |
+| chisel 1.10.1 | 22.1 ms | 202.6 ms | 47.2 |
+| bore 0.6.0 | 22.5 ms | 203.2 ms | 44.0 |
+
+- molehill/frp/rathole keep ~1.2 ms of per-connection overhead on top of the
+  added RTT (pre-established data channels); bore/chisel pay ~2× the added
+  RTT per connection — one full round trip dialed through the tunnel each
+  time a visitor connects.
+- Absolute loopback throughput is host-dependent (it saturates the machine);
   treat it as a ceiling sanity check, not a differentiator.
-- Reproduce: `benches/scripts/bench/run_bench.sh` (raw data in
-  `benches/scripts/bench/results-v0.7.0.json`, chart via `plot_bench.py`).
+- Loss cells (netem) require `CAP_NET_ADMIN` and are skipped when unavailable
+  (see docs/release.md).
+- Reproduce: `just bench` → `just bench-plot` → `just bench-check`
+  (raw data in `benches/scripts/bench/results-v0.7.2.json`; ritual and
+  regression gate in docs/release.md).
 
 ## Quickstart
 

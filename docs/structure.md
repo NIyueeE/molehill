@@ -62,7 +62,7 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | transport fixtures and valid/invalid configs |
-| `benches/` | HTTP latency (vegeta) and memory-sampling scripts |
+| `benches/` | Peer-comparison benchmark matrix (`bench/`: runner, peer fetch, chart, regression gate) plus HTTP latency (vegeta) and memory-sampling scripts |
 | `examples/` | runnable configs: tls, noise_nk, udp, use_proxy, minimal, iperf3, unified, systemd, container, full |
 | `docs/` | documentation set — one owner per topic, everything else links (see below) |
 
