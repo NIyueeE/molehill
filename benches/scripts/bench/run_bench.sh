@@ -16,6 +16,12 @@
 #   client<->server leg only; loss cells are skipped without netem, since a
 #   userspace proxy cannot drop packets before the kernel ACKs them (UDP
 #   excepted: weakproxy --udp can drop datagrams, for visitor-side scenarios).
+#   NOTE on shared-qdisc dilution: netem drops land uniformly on ALL loopback
+#   traffic — the saturating iperf flow absorbs the vast majority of them
+#   (TCP retransmits silently), so a light UDP pinger sees much less loss
+#   than the cell percentage (verified: `loss 2% 25%` measured 0% UDP loss
+#   while the qdisc counter reported 16 drops). For UDP-loss-specific
+#   measurements use `weakproxy.py --udp` on the visitor leg instead.
 #
 # Per tool per cell:
 #   - iperf3 TCP throughput, 1 and 8 streams (median of REPS; retransmits kept)
@@ -82,7 +88,7 @@ cleanup() {
     pkill -x rathole 2>/dev/null; pkill -x bore 2>/dev/null; pkill -x chisel 2>/dev/null
     pkill -x iperf3 2>/dev/null
     pkill -f "weakproxy.py" 2>/dev/null
-    sudo tc qdisc del dev lo root 2>/dev/null || true
+    sudo "$TC_BIN" qdisc del dev lo root 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -184,10 +190,13 @@ stop_mem() {
 
 # --- weak-network simulation -------------------------------------------------
 NETEM_OK=0
-if command -v tc >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    if sudo tc qdisc replace dev lo root netem loss 0% delay 0ms 2>/dev/null; then
+TC_BIN=$(command -v tc || true)
+if [ -n "$TC_BIN" ] && sudo -n true 2>/dev/null; then
+    # sudo's secure_path may not include /usr/sbin — always use the absolute
+    # path captured above
+    if sudo "$TC_BIN" qdisc replace dev lo root netem loss 0% delay 0ms 2>/dev/null; then
         NETEM_OK=1
-        sudo tc qdisc del dev lo root 2>/dev/null || true
+        sudo "$TC_BIN" qdisc del dev lo root 2>/dev/null || true
     fi
 fi
 [ "$NETEM_OK" = 1 ] || echo "NOTE: netem unavailable (no CAP_NET_ADMIN) -> rtt cells run via userspace weakproxy; loss cells are skipped" >&2
@@ -200,10 +209,10 @@ netem_on() { # loss_pct burst_pct rate_mbit rtt_ms
     fi
     [ "$4" != 0 ] && args+=(delay "$4ms")
     [ "$3" != 0 ] && args+=(rate "$3mbit")
-    sudo tc qdisc replace dev lo root netem "${args[@]}" >/dev/null
+    sudo "$TC_BIN" qdisc replace dev lo root netem "${args[@]}" >/dev/null
 }
 netem_off() {
-    sudo tc qdisc del dev lo root >/dev/null 2>&1 || true
+    sudo "$TC_BIN" qdisc del dev lo root >/dev/null 2>&1 || true
 }
 
 # --- tool setups -------------------------------------------------------------
@@ -617,7 +626,7 @@ for cell in $CELLS; do
 done
 
 netem_off
-tc qdisc show dev lo | grep -q netem && echo "WARNING: netem still active on lo!" >&2
+"$TC_BIN" qdisc show dev lo | grep -q netem && echo "WARNING: netem still active on lo!" >&2
 
 # --- dump --------------------------------------------------------------------
 BENCH_RAW=""
