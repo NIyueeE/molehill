@@ -15,6 +15,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CAP_NET_ADMIN` is unavailable), chart + table rendering (`just bench-plot`)
   and a per-tag regression gate (`just bench-check`) required before tagging.
 
+### Changed
+
+- Benchmark entries are PEP 723 python scripts run via `uv run` (no shell test
+  entries); peer tools (frp, rathole, bore, chisel) are fetched as the latest
+  GitHub release binaries — never built from source. The matrix measures per
+  tool and cell: through-tunnel TCP
+  throughput (1/8 streams), connection-path RTT, data-path RTT, UDP session
+  quality (RTT/loss/jitter/max gap), a head-of-line probe and RSS (schema v3).
+  Runs are resumable and continue on error: each completed arm is printed and
+  checkpointed to the results file immediately, `--tools/--cells/--variants`
+  select subsets, and results merge unless `--fresh` is given.
+
+### Fixed
+
+- Benchmark throughput now measures **through the tunnel** (iperf3 dials the
+  tool's exposed port); previously it dialed the backend directly, so every
+  tool reported the loopback iperf3 ceiling (~46 Gbit/s) regardless of tool or
+  network cell. Historical results files and charts are not comparable to the
+  new schema.
+- Benchmark runner hardening: a global lock refuses concurrent runs (they
+  used to reap each other's live processes through the stale-pid sweep, which
+  now also never touches processes owned by a running runner); SIGTERM takes
+  the Ctrl-C cleanup path (arms killed, netem qdisc removed, full meta
+  checkpointed); a killed `--fresh` run can no longer destroy the previous
+  results file (it is backed up first); mid-run checkpoints carry the full
+  meta instead of only the schema; per-metric failures record `null` plus a
+  `partial_metrics` list instead of faking `0.0` or discarding the arm; a
+  backend bind failure records that cell's arms as errors instead of aborting
+  the whole matrix; retransmit counts belong to the median throughput rep;
+  leaked iperf3 backends are now reaped by the sweep (workdir in cmdline).
+
 ## [0.7.2] - 2026-09-05
 
 ### Changed

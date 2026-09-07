@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Head-of-line (HoL) probe: saturating bulk flow + game-like pinger running
 CONCURRENTLY through the SAME forwarded service (and therefore the same
 tunnel). This is the metric that separates single-tunnel TCP (one loss domain,
@@ -18,7 +22,6 @@ Output: one JSON object.
 """
 import json
 import socket
-import sys
 import threading
 import time
 import argparse
@@ -150,7 +153,12 @@ def ping_udp(stop, host, port, hz, stats):
         wait = max(0.0, min(next_t - now, 0.001))
         r, _, _ = select.select([s], [], [], wait)
         if r:
-            data = s.recv(65535)
+            try:
+                data = s.recv(65535)
+            except OSError:
+                # connected UDP sockets surface ICMP errors (e.g. a flow that
+                # expired behind a lossy path) — count as lost and go on
+                continue
             if len(data) >= PKT.size:
                 seq, t0 = PKT.unpack_from(data)
                 received += 1
@@ -178,6 +186,44 @@ def ping_udp(stop, host, port, hz, stats):
     stats["ping_loss_pct"] = round((sent - received) / sent * 100.0, 2) if sent else 0.0
 
 
+def run_hol_probe(mode: str, host: str, port: int, duration: float = 8.0,
+                  ping_hz: float = 30.0, bulk_conns: int = 2,
+                  bulk_rate_mbps: float = 0.0) -> dict:
+    """Bulk flow + game-like pinger through the same service; returns the
+    HoL dict (bulk_gbps, ping_rtt_ms, ping_max_gap_ms, [ping_loss_pct])."""
+    stop = threading.Event()
+    stats = {"bytes": 0}
+    bulk = bulk_udp if mode == "udp" else bulk_tcp
+    ping = ping_udp if mode == "udp" else ping_tcp
+
+    threads = [threading.Thread(target=ping,
+                                args=(stop, host, port, ping_hz, stats),
+                                daemon=True)]
+    for i in range(max(1, bulk_conns)):
+        threads.append(threading.Thread(target=bulk,
+                                        args=(stop, host, port, stats, i,
+                                              bulk_rate_mbps),
+                                        daemon=True))
+    for t in threads:
+        t.start()
+    time.sleep(duration)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5)
+
+    out = {
+        "mode": mode,
+        "bulk_gbps": round(stats["bytes"] * 8 / duration / 1e9, 3),
+        "ping_rtt_ms": stats.get("ping_rtt_ms"),
+        "ping_max_gap_ms": stats.get("ping_max_gap_ms", 0.0),
+    }
+    if mode == "udp":
+        out["ping_sent"] = stats.get("ping_sent", 0)
+        out["ping_received"] = stats.get("ping_received", 0)
+        out["ping_loss_pct"] = stats.get("ping_loss_pct", 0.0)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["tcp", "udp"], required=True)
@@ -190,41 +236,8 @@ def main():
     # metric stays comparable across arms
     ap.add_argument("--bulk-rate-mbps", type=float, default=0.0)
     a = ap.parse_args()
-
-    stop = threading.Event()
-    stats = {"bytes": 0}
-    bulk = bulk_udp if a.mode == "udp" else bulk_tcp
-    ping = ping_udp if a.mode == "udp" else ping_tcp
-
-    threads = [threading.Thread(target=ping, args=(stop, a.host, a.port, a.ping_hz, stats),
-                                daemon=True)]
-    for i in range(max(1, a.bulk_conns)):
-        threads.append(threading.Thread(target=bulk,
-                                        args=(stop, a.host, a.port, stats, i, a.bulk_rate_mbps),
-                                        daemon=True))
-    for t in threads:
-        t.start()
-    time.sleep(a.duration)
-    stop.set()
-    for t in threads:
-        t.join(timeout=5)
-
-    dur = a.duration
-    out = {
-        "mode": a.mode,
-        "bulk_gbps": round(stats["bytes"] * 8 / dur / 1e9, 3),
-        "ping_rtt_ms": stats.get("ping_rtt_ms"),
-        "ping_max_gap_ms": stats.get("ping_max_gap_ms", 0.0),
-    }
-    if a.mode == "udp":
-        out["ping_sent"] = stats.get("ping_sent", 0)
-        out["ping_received"] = stats.get("ping_received", 0)
-        out["ping_loss_pct"] = stats.get("ping_loss_pct", 0.0)
-    if stats.get("ping_rtt_ms"):
-        # overwrite with values computed from the actual run window
-        out["ping_rtt_ms"] = stats["ping_rtt_ms"]
-        out["ping_max_gap_ms"] = stats.get("ping_max_gap_ms", 0.0)
-    print(json.dumps(out))
+    print(json.dumps(run_hol_probe(a.mode, a.host, a.port, a.duration,
+                                   a.ping_hz, a.bulk_conns, a.bulk_rate_mbps)))
 
 
 if __name__ == "__main__":

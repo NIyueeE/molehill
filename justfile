@@ -41,25 +41,28 @@ check:
 powerset:
     cargo hack check --feature-powerset --no-dev-deps --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
-# Install benchmark prerequisites (iperf3, tc/netem, matplotlib).
+# Install benchmark system prerequisites (iperf3, tc/netem; python deps come
+# from the PEP 723 headers via uv — install uv itself with: curl -LsSf
+# https://astral.sh/uv/install.sh | sh)
 bench-deps:
-    sudo apt-get install -y iperf3 iproute2 python3-matplotlib
+    sudo apt-get install -y iperf3 iproute2
 
-# Fetch/build pinned peer tools (frp, rathole, bore, chisel) into /tmp/bench-peers.
+# Fetch the latest GitHub release binaries of the peer tools (frp, rathole,
+# bore, chisel) into /tmp/bench-peers — nothing is built from source.
 bench-peers:
-    bash benches/scripts/bench/fetch_peers.sh
+    uv run benches/scripts/bench/fetch_peers.py
 
-# Run the full benchmark matrix (loss cells need netem; rtt cells use weakproxy).
+# Run the full benchmark matrix (molehill arms at full rigor; loss cells need netem).
 bench:
-    bash benches/scripts/bench/run_bench.sh
+    uv run benches/scripts/bench/bench.py
 
 # Render the README chart + markdown tables from the latest results file.
 bench-plot:
-    python3 benches/scripts/bench/plot_bench.py
+    uv run benches/scripts/bench/plot_bench.py
 
 # Regression gate: latest results vs the previous tag's file (pre-tag ritual).
 bench-check:
-    bash benches/scripts/bench/check_regression.sh
+    uv run benches/scripts/bench/check_regression.py
 
 # Build the scratch container image from a release musl binary (see Containerfile).
 container:

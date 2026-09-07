@@ -40,15 +40,28 @@ re-push). For verifying a commit without releasing, use CD test builds.
 
 ## Benchmarks: per-tag ritual
 
-Every tag refreshes the peer-comparison benchmark (matrix design and tool
-pins live in `benches/scripts/bench/`; peers: frp, rathole (upstream), bore,
-chisel). The matrix (schema v3) measures, per tool and network cell: TCP
-throughput (1/8 streams), connection-path RTT, data-path RTT (steady ping over
+Every tag refreshes the peer-comparison benchmark (matrix design and peer
+fetching live in `benches/scripts/bench/`; peers: frp, rathole (upstream),
+bore, chisel — each fetched as the **latest GitHub release** binary, never
+built from source, with the resolved versions recorded in the results meta
+and the chart footer). The matrix (schema v3) measures, per tool and network
+cell: TCP
+throughput (1/8 streams) **through the tunnel** (iperf3 dials the tool's
+exposed port), connection-path RTT, data-path RTT (steady ping over
 one established connection), UDP session quality over one established session
 (RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
 bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
 as mux and noise variants (mux-off additionally on the loopback cell); peers:
-frp / rathole / chisel also run UDP arms, bore is TCP-only:
+frp / rathole / chisel also run UDP arms, bore is TCP-only. All bench entries
+are PEP 723 python scripts run via `uv run`: runs are resumable (each
+completed arm is checkpointed together with the full meta), continue on
+error (a per-metric failure records `null` plus a `partial_metrics` list
+instead of a fake 0), refuse to run concurrently (a global lock — concurrent
+runs used to reap each other's live processes), and a killed run (Ctrl-C or
+SIGTERM) cleans up arms, removes the netem qdisc and writes the full meta;
+`--fresh` backs up the previous results file to `.bak` first.
+`--tools/--cells/--variants` select subsets — the full matrix is roughly
+three hours at full rigor:
 
 1. `just bench` — runs the full matrix (loopback + weak-network cells) and
    writes `benches/scripts/bench/results-vX.Y.Z.json`.
@@ -65,7 +78,9 @@ The gate runs locally before tagging, never in CI: shared runners are too
 noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
 (netem); without it the script falls back to a userspace delay proxy for
 rtt cells and skips loss cells — note the mechanism in the README table when
-it differs.
+it differs. The gate is only meaningful between same-schema results: schema
+v3 fixed the throughput measurement point (pre-v3 files dialed the backend
+directly and are not comparable).
 
 ## What the release workflow does
 

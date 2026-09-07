@@ -36,8 +36,22 @@ CHANGELOG 两项做机械强制校验。
 
 ## 基准:每次 tag 的固定仪式
 
-每个 tag 都要刷新同类对比基准(矩阵设计与工具版本 pin 在
-`benches/scripts/bench/`;对比对象:frp、上游 rathole、bore、chisel):
+每个 tag 都要刷新同类对比基准(矩阵设计与对比工具抓取在
+`benches/scripts/bench/`;对比对象:frp、上游 rathole、bore、chisel——一律
+抓取 **GitHub 最新 release** 的预编译二进制,绝不源码编译,解析出的版本
+记录在结果元数据与图表页脚)。矩阵
+(schema v3)对每个工具、每个网络档测量:**穿透隧道**的 TCP 吞吐(1/8 流,
+iperf3 拨号到工具暴露端口)、连接路径 RTT、数据路径 RTT(已建连上的稳定
+ping)、单条 UDP 会话质量(RTT / 丢包 / 抖动 / 最大包间隔)、队头阻塞探针
+(饱和 bulk 流 + 游戏式 pinger 走同一条隧道)以及 RSS。molehill 以 mux 和
+noise 两个变体运行(mux-off 额外跑 loopback 档);frp / rathole / chisel
+也跑 UDP 档,bore 仅 TCP。所有基准入口都是 PEP 723 python 脚本、经
+`uv run` 执行:可断点续跑(每个完成的 arm 连同完整 meta 立即落盘)、单
+指标失败记录 `null` 加 `partial_metrics` 列表而不是伪造 0、拒绝并发运行
+(全局锁——并发运行曾互相收割对方的活进程)、被终止的运行(Ctrl-C 或
+SIGTERM)会清理 arm、移除 netem qdisc 并写全 meta;`--fresh` 会先把旧
+结果文件备份为 `.bak`。`--tools/--cells/--variants` 选择子集 —— 全矩阵
+全 rigor 约需 3 小时:
 
 1. `just bench` —— 跑全矩阵(loopback + 弱网档),生成
    `benches/scripts/bench/results-vX.Y.Z.json`。
@@ -50,7 +64,9 @@ CHANGELOG 两项做机械强制校验。
 
 门禁只在打 tag 前本地执行,绝不进 CI:共享 runner 的性能数字噪声太大。
 弱网丢包档需要 `CAP_NET_ADMIN`(netem);没有时脚本自动退化为用户态延迟
-代理跑 rtt 档、跳过丢包档 —— 机制不同时请在 README 表格中注明。
+代理跑 rtt 档、跳过丢包档 —— 机制不同时请在 README 表格中注明。门禁只在
+同 schema 的结果之间有意义:schema v3 修正了吞吐的测量点(v3 之前的文件
+直连后端测量,不可比)。
 
 ## 发布工作流做什么
 

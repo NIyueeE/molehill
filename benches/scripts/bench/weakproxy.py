@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Userspace weak-network proxy: adds fixed one-way delay to a TCP stream, or
 delay + optional loss to a UDP datagram flow.
 
