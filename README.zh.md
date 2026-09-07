@@ -101,23 +101,34 @@ GitHub 最新 release 二进制:frp 0.71.0、rathole 0.5.0(上游)、bore 0.6.0�
 - 所有支持 UDP 转发的工具,会话质量都退化平缓:残余丢包 ≤6%(共享
   qdisc 使配置的 1% 落点不均),最大包间隔 ≤61 ms——游戏类会话可以存活。
 
-### molehill 配置对比:多路复用与加密
+### molehill:多路复用代价(mux vs mux-off)
 
-配置图展示的是**同一个二进制的四种配置**——不是四个工具:`mux = false`
-隔离多路复用的代价;`noise` 与 `tls` 行把传输层切换为加密的
-Noise / TLS(复用保持不变),隔离加密的代价。
+同一个二进制,**只变一个变量**——多路复用开关;`mux` 是对照组。仅在
+loopback 档测量(该扰动不跑弱网档)。
 
-![Benchmark: molehill configurations](assets/benchmark-molehill-v0.7.2.png)
+![Multiplexing cost](assets/benchmark-mux-v0.7.2.png)
 
 | 配置 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存(平均 RSS) |
 |---|---|---|---|---|---|
 | **mux(默认)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
 | `mux = false` | 20.1 | 28.2 | 0.217 ms | 0.268 ms | 18.7 MiB |
-| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
-| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
 
 - 多路复用用单流吞吐换取连接效率:同一个二进制 `mux = false` 时为
   20.1 / 28.2 Gbit/s。
+
+### molehill:传输代价(mux vs noise vs tls)
+
+同一个二进制,**只变一个变量**——加密传输层(Noise / TLS vs 明文 TCP),
+三者均开启多路复用;`mux` 是共同对照组。
+
+![Transport cost](assets/benchmark-transport-v0.7.2.png)
+
+| 配置 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存(平均 RSS) |
+|---|---|---|---|---|---|
+| **mux(明文 TCP)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
+| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
+| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
+
 - 加密让吞吐减半:noise(3.8)与 tls(4.1)都约为明文 mux 行的一半,而
   连接路径开销仍在亚毫秒级;TLS 额外多占内存(33.8 MiB)。
 - 弱网档下加密行跟随明文行:1% 丢包时三个变体都保持 3.6–3.8 Gbit/s

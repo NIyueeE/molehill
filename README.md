@@ -110,24 +110,34 @@ pays the baseline only:
   ≤6% residual loss (the shared qdisc spreads the configured 1% unevenly)
   and ≤61 ms worst inter-packet gap — a game-like session survives.
 
-### molehill configurations: multiplexing and encryption
+### molehill: multiplexing cost (mux vs mux-off)
 
-The family chart shows **one binary in four configurations** — not four
-tools: `mux = false` isolates the cost of multiplexing, the `noise` and
-`tls` rows switch the transport to encrypted Noise / TLS (multiplexing
-unchanged) and isolate the cost of encryption.
+One binary, **one variable** — multiplexing on/off; `mux` is the control.
+Measured on the loopback cell (the perturbation is not run in weak cells).
 
-![Benchmark: molehill configurations](assets/benchmark-molehill-v0.7.2.png)
+![Multiplexing cost](assets/benchmark-mux-v0.7.2.png)
 
 | Configuration | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
 |---|---|---|---|---|---|
 | **mux (default)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
 | `mux = false` | 20.1 | 28.2 | 0.217 ms | 0.268 ms | 18.7 MiB |
-| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
-| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
 
 - Multiplexing trades single-stream throughput for connection efficiency:
   with `mux = false` the same binary does 20.1 / 28.2 Gbit/s.
+
+### molehill: transport cost (mux vs noise vs tls)
+
+One binary, **one variable** — the encrypted transport (Noise / TLS vs
+plain TCP), multiplexing on for all three; `mux` is the shared control.
+
+![Transport cost](assets/benchmark-transport-v0.7.2.png)
+
+| Configuration | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
+|---|---|---|---|---|---|
+| **mux (plain TCP)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
+| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
+| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
+
 - Encryption halves throughput: noise (3.8) and tls (4.1) both sit at
   roughly half of the plain mux row, while the connection-path overhead
   stays sub-millisecond. TLS carries the extra memory (33.8 MiB).

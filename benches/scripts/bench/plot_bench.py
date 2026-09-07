@@ -5,14 +5,18 @@
 # ///
 """Render the README benchmark charts from the results file (schema v3).
 
-Two figures plus markdown tables:
+Three figures plus markdown tables — every comparison is a SINGLE
+variable (no confounding):
 - main chart (`assets/benchmark-vX.Y.Z.png`): molehill's default (mux, plain
   TCP) row vs the plain-TCP peers (frp, rathole, bore) — same-transport
   competition. Encrypted tools (e.g. chisel's SSH tunnel) are deliberately
   absent: their numbers are not comparable on the plain-TCP axis.
-- family chart (`assets/benchmark-molehill-vX.Y.Z.png`): molehill's own
-  configurations — mux vs mux-off (cost of multiplexing), and mux vs noise
-  vs tls (cost of encryption).
+- mux chart (`assets/benchmark-mux-vX.Y.Z.png`): mux vs mux-off — the one
+  variable is multiplexing on/off (loopback cell; the perturbation is not
+  run in weak cells).
+- transport chart (`assets/benchmark-transport-vX.Y.Z.png`): mux vs noise vs
+  tls — the one variable is the encrypted transport, multiplexing on for
+  all three, with mux as the shared control.
 
 Usage: plot_bench.py [results.json]
 Default: newest results-v*.json in this directory.
@@ -229,17 +233,9 @@ def render_main(results, meta, out_path):
     print(f"wrote {out_path}")
 
 
-def render_family(results, meta, out_path):
-    """molehill's own configurations: multiplexing and encryption costs."""
-    tools = molehill_family(results)
-    cells = [c["name"] for c in meta.get("cells", [])] or ["loopback"]
-    loopback = "loopback" if "loopback" in cells else cells[0]
-    colors = tool_colors(tools)
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
-    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.15, top=0.90,
-                        wspace=0.3, hspace=0.45)
-    (ax_thr, ax_rtt, ax_mem), (ax_cthr, ax_crtt, ax_udp) = axes
+def loopback_panels(axes, tools, colors, results, loopback):
+    """Three loopback panels: throughput (1/8 streams), RTT, memory."""
+    ax_thr, ax_rtt, ax_mem = axes
     xs = range(len(tools))
     width = 0.34
 
@@ -296,6 +292,50 @@ def render_family(results, meta, out_path):
     ax_mem.set_title("Memory (avg RSS)", fontsize=10)
     ax_mem.grid(axis="y", alpha=0.3)
 
+
+def render_mux(results, meta, out_path):
+    """Multiplexing cost: mux vs mux-off. ONE variable (multiplexing on/off);
+    measured on the loopback cell only — the perturbation is not run in the
+    weak cells, and mixing it with the transport dimension would confound
+    both comparisons."""
+    mux = mux_row(results)
+    off = [t for t in molehill_family(results) if "(mux-off)" in t]
+    tools = [mux, *off]
+    cells = [c["name"] for c in meta.get("cells", [])] or ["loopback"]
+    loopback = "loopback" if "loopback" in cells else cells[0]
+    colors = tool_colors(tools)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.22, top=0.80,
+                        wspace=0.3)
+    loopback_panels(axes, tools, colors, results, loopback)
+
+    footer(meta, "reproduce: just bench && just bench-plot")
+    fig.suptitle("Multiplexing cost — mux vs mux-off, one variable "
+                 f"({meta.get('date', '')})", fontsize=12)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"wrote {out_path}")
+
+
+def render_transport(results, meta, out_path):
+    """Transport cost: mux vs noise vs tls. ONE variable (the encrypted
+    transport), multiplexing on for all three; mux is the shared control.
+    Loopback panels plus the weak-cell behavior."""
+    mux = mux_row(results)
+    tools = [mux] + [t for t in molehill_family(results)
+                     if "(noise)" in t or "(tls)" in t]
+    cells = [c["name"] for c in meta.get("cells", [])] or ["loopback"]
+    loopback = "loopback" if "loopback" in cells else cells[0]
+    colors = tool_colors(tools)
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8.5))
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.15, top=0.90,
+                        wspace=0.3, hspace=0.45)
+    loopback_panels(axes[0], tools, colors, results, loopback)
+
+    (ax_cthr, ax_crtt, ax_udp) = axes[1]
     def thr1(t, cell):
         return read(results, t, cell, "throughput_1stream_gbps")
     bar_group(ax_cthr, tools, colors, cells, thr1, log=True,
@@ -316,8 +356,8 @@ def render_family(results, meta, out_path):
     ax_udp.set_title("UDP session RTT p99 per cell", fontsize=10)
 
     footer(meta, "reproduce: just bench && just bench-plot")
-    fig.suptitle("molehill configurations: multiplexing and encryption "
-                 f"({meta.get('date', '')})", fontsize=12)
+    fig.suptitle("Transport cost — mux vs noise vs tls, one variable, "
+                 f"mux on ({meta.get('date', '')})", fontsize=12)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
@@ -359,21 +399,34 @@ def print_tables(results, meta):
               f"{fmt_table(lb.get('udp_loss_pct'), 2)}% | "
               f"{fmt_table(mem_kb / 1024 if mem_kb else None)} MiB |")
 
-    print("\n### molehill configurations (multiplexing / encryption)")
-    print("| Tool | thr 1-str | thr 8-str | RTT p50 | RTT p99 | "
-          "steady p99 | RSS |",
-          "|---|---|---|---|---|---|---|", sep="\n")
-    for t in molehill_family(results):
+    def family_row(t):
         lb = results[t].get(loopback, {})
         echo = lb.get("echo_rtt_ms") or {}
         steady = lb.get("tcp_steady_rtt_ms") or {}
         mem_kb = (lb.get("memory_rss_kb") or {}).get("total_avg_kb")
-        print(f"| {t} | {fmt_table(lb.get('throughput_1stream_gbps'))} | "
-              f"{fmt_table(lb.get('throughput_8streams_gbps'))} | "
-              f"{fmt_table(echo.get('p50'), 3)} | "
-              f"{fmt_table(echo.get('p99'), 3)} | "
-              f"{fmt_table(steady.get('p99'), 3)} | "
-              f"{fmt_table(mem_kb / 1024 if mem_kb else None)} MiB |")
+        return (f"| {t} | {fmt_table(lb.get('throughput_1stream_gbps'))} | "
+                f"{fmt_table(lb.get('throughput_8streams_gbps'))} | "
+                f"{fmt_table(echo.get('p50'), 3)} | "
+                f"{fmt_table(echo.get('p99'), 3)} | "
+                f"{fmt_table(steady.get('p99'), 3)} | "
+                f"{fmt_table(mem_kb / 1024 if mem_kb else None)} MiB |")
+
+    print("\n### Multiplexing cost (mux vs mux-off)")
+    print("| Tool | thr 1-str | thr 8-str | RTT p50 | RTT p99 | "
+          "steady p99 | RSS |",
+          "|---|---|---|---|---|---|---|", sep="\n")
+    for t in [mux_row(results)] + \
+            [t for t in molehill_family(results) if "(mux-off)" in t]:
+        print(family_row(t))
+
+    print("\n### Transport cost (mux vs noise vs tls)")
+    print("| Tool | thr 1-str | thr 8-str | RTT p50 | RTT p99 | "
+          "steady p99 | RSS |",
+          "|---|---|---|---|---|---|---|", sep="\n")
+    for t in [mux_row(results)] + \
+            [t for t in molehill_family(results)
+             if "(noise)" in t or "(tls)" in t]:
+        print(family_row(t))
 
     for cell in cells:
         if cell == loopback:
@@ -402,7 +455,9 @@ def main():
     ver = path.stem.removeprefix("results-")
     assets = script_dir.parents[2] / "assets"
     render_main(results, meta, assets / f"benchmark-{ver}.png")
-    render_family(results, meta, assets / f"benchmark-molehill-{ver}.png")
+    render_mux(results, meta, assets / f"benchmark-mux-{ver}.png")
+    render_transport(results, meta,
+                     assets / f"benchmark-transport-{ver}.png")
     print_tables(results, meta)
 
 
