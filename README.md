@@ -51,56 +51,48 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 Peer comparison on one machine (plain TCP, `visitor -> server -> client ->
 backend` on loopback; everything is measured **through the tunnel** — iperf3
 dials each tool's exposed port). Peers are the latest GitHub release builds:
-frp 0.71.0, rathole 0.5.0 (upstream), bore 0.6.0, chisel 1.12.0.
+frp 0.71.0, rathole 0.5.0 (upstream), bore 0.6.0.
 Weak-network cells apply netem to the loopback interface, so every leg of
 the path is delayed or lossy — identical for all tools (a "10 ms" cell
 therefore shows ~100 ms echo RTT through the multi-leg path; the
 amplification is per-leg and tool-independent).
 
-![Benchmark: molehill 0.7.2 vs peers](assets/benchmark-v0.7.2.png)
+### molehill vs plain-TCP peers
 
-The three molehill rows are one binary in three configurations — the default,
-plus two single-variable perturbations of it: `mux = false` isolates the cost
-of multiplexing, the `noise` row switches the transport to the encrypted
-Noise Protocol (multiplexing unchanged) and isolates the cost of encryption
-— not a third forwarding mode.
+The comparison chart is deliberately restricted to the **plain-TCP axis**:
+molehill's default configuration (mux on, no encryption) against the peers
+with the same transport properties. Encrypted competitors (e.g. chisel's
+built-in SSH tunnel) are excluded — their numbers are not comparable here,
+and molehill's own encrypted variants are isolated in the chart below.
 
-### Loopback
+![Benchmark: molehill 0.7.2 vs plain-TCP peers](assets/benchmark-v0.7.2.png)
 
 Through-tunnel throughput separates the tools: the `mux` arm rides one yamux
-channel (per-stream ceiling), `mux = false` and the per-connection peers
-open a channel per stream:
+channel (per-stream ceiling), the peers open a channel per connection:
 
 | Tool | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
 |---|---|---|---|---|---|
 | **molehill 0.7.2** (mux, default) | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
-| molehill 0.7.2 (`mux = false`) | 19.7 | 27.0 | 0.216 ms | 0.286 ms | 18.9 MiB |
-| molehill 0.7.2 (noise) | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
 | rathole 0.5.0 (upstream) | 12.4 | 26.8 | 0.234 ms | 0.312 ms | 20.0 MiB |
 | bore 0.6.0 | 14.2 | 27.0 | 0.495 ms | 0.629 ms | **8.4 MiB** |
-| chisel 1.12.0 | 4.1 | 3.9 | 0.336 ms | 0.581 ms | 44.2 MiB |
 | frp 0.71.0 | 4.8 | 6.3 | 0.375 ms | 0.673 ms | 72.1 MiB |
 
-- Multiplexing trades single-stream throughput for connection efficiency:
-  with `mux = false` the same binary does 19.7 / 27.0 Gbit/s.
-- Noise encryption halves throughput (~3.8 Gbit/s); the connection-path
-  overhead stays sub-millisecond.
+- The multiplexed single-tunnel path (mux) tops out around 10 Gbit/s per
+  stream; the per-connection architectures (rathole, bore) reach 12–14.
 - bore is the lightest (8.4 MiB) and a strong plain TCP relay — but no UDP
   forwarding at all.
+- frp pays the highest memory (72 MiB) for the lowest throughput here.
 
-### Weak network (netem on every loopback leg)
-
-Connection-path RTT under added delay; chisel pays one extra round trip per
-visitor connection, bore two or more (its local forward dials through the
-control port each time) — the pre-established channel pool pays the baseline
-only:
+Weak-network cells (netem on every loopback leg): connection-path RTT under
+added delay; bore pays two or more extra round trips (its local forward
+dials through the control port each time), the pre-established channel pool
+pays the baseline only:
 
 | Tool | rtt10: echo RTT p50 | rtt100: echo RTT p50 | rtt10: 1-stream (Gbit/s) |
 |---|---|---|---|
 | **molehill 0.7.2** (mux, default) | **101.3 ms** | **1001.4 ms** | 6.3 |
 | rathole 0.5.0 (upstream) | 101.1 ms | 1001.3 ms | 6.3 |
 | bore 0.6.0 | 141.8 ms | 1402.0 ms | 10.2 |
-| chisel 1.12.0 | 121.5 ms | 1201.6 ms | 0.8 |
 | frp 0.71.0 | 101.5 ms | 1001.6 ms | 1.8 |
 
 | Tool | loss 1%: 1-stream (Gbit/s) | UDP session loss | UDP max gap |
@@ -108,16 +100,41 @@ only:
 | **molehill 0.7.2** (mux, default) | **4.4** | 5.0% | 61 ms |
 | rathole 0.5.0 (upstream) | 4.3 | 6.0% | 60 ms |
 | bore 0.6.0 | 4.6 | - (no UDP) | - |
-| chisel 1.12.0 | 0.4 | 5.5% | 60 ms |
 | frp 0.71.0 | 0.8 | 3.5% | 60 ms |
 
 - Under 1% loss the multiplexed/pooled data paths (molehill, rathole) and
-  the plain relay (bore) hold 4.3–4.6 Gbit/s while frp (0.8) and chisel
-  (0.4) collapse — loss tolerance separates forwarding architectures more
-  sharply than raw loopback speed.
+  the plain relay (bore) hold 4.3–4.6 Gbit/s while frp (0.8) collapses —
+  loss tolerance separates forwarding architectures more sharply than raw
+  loopback speed.
 - UDP session quality degrades gracefully for every tool that forwards UDP:
   ≤6% residual loss (the shared qdisc spreads the configured 1% unevenly)
   and ≤61 ms worst inter-packet gap — a game-like session survives.
+
+### molehill configurations: multiplexing and encryption
+
+The family chart shows **one binary in four configurations** — not four
+tools: `mux = false` isolates the cost of multiplexing, the `noise` and
+`tls` rows switch the transport to encrypted Noise / TLS (multiplexing
+unchanged) and isolate the cost of encryption.
+
+![Benchmark: molehill configurations](assets/benchmark-molehill-v0.7.2.png)
+
+| Configuration | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
+|---|---|---|---|---|---|
+| **mux (default)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
+| `mux = false` | 20.1 | 28.2 | 0.217 ms | 0.268 ms | 18.7 MiB |
+| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
+| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
+
+- Multiplexing trades single-stream throughput for connection efficiency:
+  with `mux = false` the same binary does 20.1 / 28.2 Gbit/s.
+- Encryption halves throughput: noise (3.8) and tls (4.1) both sit at
+  roughly half of the plain mux row, while the connection-path overhead
+  stays sub-millisecond. TLS carries the extra memory (33.8 MiB).
+- In the weak cells the encrypted rows track the plain row: loss 1% keeps
+  3.6–3.8 Gbit/s for all three variants; the transport choice does not
+  change loss behavior.
+
 - Absolute numbers are host-dependent; the comparison is same-host and
   same-methodology. Reproduce: `just bench-peers` → `just bench` →
   `just bench-plot` → `just bench-check` (raw data in

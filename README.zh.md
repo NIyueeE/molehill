@@ -50,48 +50,42 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 单机同类对比(明文 TCP,单机拓扑 `访客 -> 服务端 -> 客户端 -> 后端`;所有
 指标都**穿透隧道**测量——iperf3 拨号到各工具的暴露端口)。对比对象均为
-GitHub 最新 release 二进制:frp 0.71.0、rathole 0.5.0(上游)、bore 0.6.0、
-chisel 1.12.0。弱网档把 netem 施加在回环接口上,路径的每一段都被延迟/丢包
+GitHub 最新 release 二进制:frp 0.71.0、rathole 0.5.0(上游)、bore 0.6.0。
+弱网档把 netem 施加在回环接口上,路径的每一段都被延迟/丢包
 ——对所有工具一视同仁("10 ms"档穿透多段路径后 echo RTT 约为 100 ms;
 放大系数与段数相关、与工具无关)。
 
-![Benchmark: molehill 0.7.2 vs peers](assets/benchmark-v0.7.2.png)
+### molehill vs 明文 TCP 同类工具
 
-molehill 的三行是同一二进制的三种配置——默认值,外加两次单变量扰动:
-`mux = false` 隔离多路复用的代价;`noise` 行把传输层切换为加密的
-Noise Protocol(复用保持不变),隔离加密的代价——并不是第三种转发模式。
+对比图**刻意限定在明文 TCP 轴线上**:molehill 默认配置(mux 开、不加密)
+对同样传输特性的同类工具。加密竞品(如 chisel 内置的 SSH 隧道)被排除
+——它们的数字在这里不可比;molehill 自己的加密变体在下图单独隔离。
 
-### 回环
+![Benchmark: molehill 0.7.2 vs plain-TCP peers](assets/benchmark-v0.7.2.png)
 
 穿透隧道的吞吐把工具真正区分开:`mux` 档共享一条 yamux 通道(单流上限),
-`mux = false` 与按连接建通道的对比工具则为每条流单独开通道:
+对比工具则按连接建通道:
 
 | 工具 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存(平均 RSS) |
 |---|---|---|---|---|---|
 | **molehill 0.7.2**(mux,默认) | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
-| molehill 0.7.2(`mux = false`) | 19.7 | 27.0 | 0.216 ms | 0.286 ms | 18.9 MiB |
-| molehill 0.7.2(noise) | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
 | rathole 0.5.0(上游) | 12.4 | 26.8 | 0.234 ms | 0.312 ms | 20.0 MiB |
 | bore 0.6.0 | 14.2 | 27.0 | 0.495 ms | 0.629 ms | **8.4 MiB** |
-| chisel 1.12.0 | 4.1 | 3.9 | 0.336 ms | 0.581 ms | 44.2 MiB |
 | frp 0.71.0 | 4.8 | 6.3 | 0.375 ms | 0.673 ms | 72.1 MiB |
 
-- 多路复用用单流吞吐换取连接效率:同一个二进制 `mux = false` 时为
-  19.7 / 27.0 Gbit/s。
-- Noise 加密让吞吐减半(约 3.8 Gbit/s),但连接路径开销仍在亚毫秒级。
+- 多路复用单隧道路径(mux)的单流上限约 10 Gbit/s;按连接建通道的架构
+  (rathole、bore)可达 12–14。
 - bore 最轻(8.4 MiB)且是很强的纯 TCP 中继——但完全不支持 UDP 转发。
+- frp 内存最高(72 MiB),此处吞吐也最低。
 
-### 弱网(netem 施加于回环每一跳)
-
-附加时延下的连接路径 RTT:chisel 每条访客连接多付一个往返,bore 付两个
-以上(其 local 转发每次都经控制端口现拨)——预建通道池只需付基线值:
+弱网档(netem 施加于回环每一跳):附加时延下的连接路径 RTT;bore 付两个
+以上往返(其 local 转发每次都经控制端口现拨),预建通道池只需付基线值:
 
 | 工具 | rtt10: echo RTT p50 | rtt100: echo RTT p50 | rtt10: 单流 (Gbit/s) |
 |---|---|---|---|
 | **molehill 0.7.2**(mux,默认) | **101.3 ms** | **1001.4 ms** | 6.3 |
 | rathole 0.5.0(上游) | 101.1 ms | 1001.3 ms | 6.3 |
 | bore 0.6.0 | 141.8 ms | 1402.0 ms | 10.2 |
-| chisel 1.12.0 | 121.5 ms | 1201.6 ms | 0.8 |
 | frp 0.71.0 | 101.5 ms | 1001.6 ms | 1.8 |
 
 | 工具 | 丢包 1%: 单流 (Gbit/s) | UDP 会话丢包 | UDP 最大间隔 |
@@ -99,14 +93,36 @@ Noise Protocol(复用保持不变),隔离加密的代价——并不是第三种
 | **molehill 0.7.2**(mux,默认) | **4.4** | 5.0% | 61 ms |
 | rathole 0.5.0(上游) | 4.3 | 6.0% | 60 ms |
 | bore 0.6.0 | 4.6 | -(无 UDP) | - |
-| chisel 1.12.0 | 0.4 | 5.5% | 60 ms |
 | frp 0.71.0 | 0.8 | 3.5% | 60 ms |
 
 - 1% 丢包下,多路复用/通道池化的数据路径(molehill、rathole)与纯中继
-  (bore)保持 4.3–4.6 Gbit/s,而 frp(0.8)与 chisel(0.4)崩塌——丢包
+  (bore)保持 4.3–4.6 Gbit/s,而 frp(0.8)崩塌——丢包
   容忍度比回环裸速更能区分转发架构。
 - 所有支持 UDP 转发的工具,会话质量都退化平缓:残余丢包 ≤6%(共享
   qdisc 使配置的 1% 落点不均),最大包间隔 ≤61 ms——游戏类会话可以存活。
+
+### molehill 配置对比:多路复用与加密
+
+配置图展示的是**同一个二进制的四种配置**——不是四个工具:`mux = false`
+隔离多路复用的代价;`noise` 与 `tls` 行把传输层切换为加密的
+Noise / TLS(复用保持不变),隔离加密的代价。
+
+![Benchmark: molehill configurations](assets/benchmark-molehill-v0.7.2.png)
+
+| 配置 | 单流 (Gbit/s) | 8 流 (Gbit/s) | echo RTT p50 | echo RTT p99 | 内存(平均 RSS) |
+|---|---|---|---|---|---|
+| **mux(默认)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
+| `mux = false` | 20.1 | 28.2 | 0.217 ms | 0.268 ms | 18.7 MiB |
+| noise | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
+| tls | 4.1 | 4.5 | 0.327 ms | 0.419 ms | 33.8 MiB |
+
+- 多路复用用单流吞吐换取连接效率:同一个二进制 `mux = false` 时为
+  20.1 / 28.2 Gbit/s。
+- 加密让吞吐减半:noise(3.8)与 tls(4.1)都约为明文 mux 行的一半,而
+  连接路径开销仍在亚毫秒级;TLS 额外多占内存(33.8 MiB)。
+- 弱网档下加密行跟随明文行:1% 丢包时三个变体都保持 3.6–3.8 Gbit/s
+  ——传输层选择不改变丢包行为。
+
 - 绝对数值与主机相关;对比为同机同方法学。复现方式:`just bench-peers` →
   `just bench` → `just bench-plot` → `just bench-check`
   (原始数据 `benches/scripts/bench/results-v0.7.2.json`;仪式与回归门禁
