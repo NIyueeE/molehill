@@ -28,6 +28,7 @@ Usage:
   weakproxy.py --udp <listen_port> <target_host:port> <rtt_ms> [loss_pct]
 """
 import asyncio
+import contextlib
 import random
 import sys
 
@@ -40,6 +41,8 @@ TARGET_HOST, TARGET_PORT = args[1].rsplit(":", 1)
 TARGET_PORT = int(TARGET_PORT)
 ONE_WAY = float(args[2]) / 2000.0  # rtt_ms -> one-way seconds
 LOSS_PCT = float(args[3]) if UDP and len(args) > 3 else 0.0
+
+_TASKS: list = []  # keep references so pending relays are not GC-collected
 
 
 def drop():
@@ -110,20 +113,18 @@ async def udp_main():
                 ca = Proto.client_addr
                 if ca is None:
                     return
-                loop.create_task(relay(data, ca))
+                _TASKS.append(loop.create_task(relay(data, ca)))
             else:
                 Proto.client_addr = addr
-                loop.create_task(relay(data, target))
+                _TASKS.append(loop.create_task(relay(data, target)))
 
     async def relay(data: bytes, dest):
         if ONE_WAY > 0:
             await asyncio.sleep(ONE_WAY)
         if drop():
             return
-        try:
+        with contextlib.suppress(OSError):
             Proto.transport.sendto(data, dest)
-        except OSError:
-            pass
 
     transport, _ = await loop.create_datagram_endpoint(
         Proto, local_addr=("127.0.0.1", LISTEN))
@@ -132,7 +133,5 @@ async def udp_main():
 
 
 if __name__ == "__main__":
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(udp_main() if UDP else tcp_main())
-    except KeyboardInterrupt:
-        pass

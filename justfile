@@ -48,7 +48,7 @@ bench-deps:
     sudo apt-get install -y iperf3 iproute2
 
 # Fetch the latest GitHub release binaries of the peer tools (frp, rathole,
-# bore, chisel) into /tmp/bench-peers — nothing is built from source.
+# bore) into /tmp/bench-peers — nothing is built from source.
 bench-peers:
     uv run benches/scripts/bench/fetch_peers.py
 
@@ -63,6 +63,10 @@ bench-plot:
 # Regression gate: latest results vs the previous tag's file (pre-tag ritual).
 bench-check:
     uv run benches/scripts/bench/check_regression.py
+
+# Lint the python bench/test entries (ruff via uvx; also in the pre-commit gate).
+py-lint:
+    uvx ruff check benches/scripts/
 
 # Build the scratch container image from a release musl binary (see Containerfile).
 container:

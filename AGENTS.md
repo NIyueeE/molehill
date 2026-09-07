@@ -31,6 +31,9 @@ Before touching anything, verify three things:
    cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
    ```
 
+   `uv`/`uvx` must also be on PATH (the python bench gates and ruff lint in
+   the pre-commit chain; install: `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+
    Note: `cargo fmt` and `cargo clippy` are guaranteed by the components
    declared in `rust-toolchain.toml`; rustup installs them with the toolchain.
 
@@ -262,6 +265,9 @@ Details that agents need constantly:
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
+- **Bench/test entries are PEP 723 python scripts run via `uv run`** (no
+  shell test entries; see docs/release.md). They are linted by ruff
+  (`ruff.toml`) in the pre-commit gate — fix the code, never disable a check.
 - **Full architecture guidance** (module layout, design patterns, protocol
   flow) lives in [docs/structure.md](docs/structure.md) and
   [docs/internals.md](docs/internals.md).

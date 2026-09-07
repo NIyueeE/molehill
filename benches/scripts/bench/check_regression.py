@@ -68,8 +68,10 @@ def main():
     cur_path, base_path = pick_files()
     print(f"current : {Path(cur_path).name}")
     print(f"baseline: {Path(base_path).name}")
-    cur = json.load(open(cur_path))
-    base = json.load(open(base_path))
+    with open(cur_path) as fh:
+        cur = json.load(fh)
+    with open(base_path) as fh:
+        base = json.load(fh)
 
     ck, bk = molehill_key(cur["results"]), molehill_key(base["results"])
     if not ck or not bk:

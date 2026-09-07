@@ -15,7 +15,6 @@ re-downloads automatically when a newer release appears.
 
 Usage: uv run fetch_peers.py [peer_dir]   (default /tmp/bench-peers)
 """
-import gzip
 import json
 import platform
 import re
@@ -32,8 +31,7 @@ UA = {"User-Agent": "molehill-bench-peer-fetch",
       "Accept": "application/vnd.github+json"}
 
 # tool -> binary path relative to PEER_DIR once installed
-BIN = {"frp": "frp/frps", "bore": "bore", "chisel": "chisel",
-       "rathole": "rathole"}
+BIN = {"frp": "frp/frps", "bore": "bore", "rathole": "rathole"}
 
 
 def http_get(url: str) -> bytes:
@@ -124,20 +122,6 @@ def main() -> None:
                    f"bore-v{v}-{rust_arch}-unknown-linux-gnu.tar.gz"],
         install_bore)
 
-    # ---- chisel: chisel_<ver>_linux_amd64.gz (single gzipped binary) ------
-    def install_chisel(ver: str, blob: bytes) -> None:
-        gz = PEER_DIR / "chisel.gz"
-        gz.write_bytes(blob)
-        with gzip.open(gz) as r, open(PEER_DIR / "chisel", "wb") as w:
-            w.write(r.read())
-        gz.unlink()
-        (PEER_DIR / "chisel").chmod(0o755)
-
-    fetch_release(
-        "chisel", "jpillora/chisel",
-        lambda v: [f"chisel_{v}_linux_{arch}.gz",
-                   f"chisel_{v}_linux_amd64.gz"], install_chisel)
-
     # ---- rathole (upstream): rathole-x86_64-unknown-linux-{gnu,musl}.zip --
     def install_rathole(ver: str, blob: bytes) -> None:
         zp = PEER_DIR / "rathole.zip"
@@ -162,7 +146,7 @@ def main() -> None:
     print("== peer versions ==")
     for tool, rel in BIN.items():
         r = subprocess.run([str(PEER_DIR / rel), "--version"],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, check=False)
         out = r.stdout + r.stderr
         m = re.search(r"\d+\.\d+\.\d+", out)
         print(f"  {tool}: {m.group(0) if m else '?'}")

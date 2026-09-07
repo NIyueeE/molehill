@@ -20,12 +20,14 @@ Usage:
   hol_probe.py --mode udp --host H --port P --duration S [...]
 Output: one JSON object.
 """
+import argparse
+import contextlib
 import json
+import select
 import socket
+import struct
 import threading
 import time
-import argparse
-import select
 
 CHUNK = 256 * 1024
 
@@ -60,10 +62,8 @@ def bulk_tcp(stop, host, port, stats, idx, rate):
     except OSError:
         pass
     finally:
-        try:
+        with contextlib.suppress(Exception):
             s.close()
-        except Exception:
-            pass
 
 
 def bulk_udp(stop, host, port, stats, idx, rate):
@@ -136,7 +136,6 @@ def ping_tcp(stop, host, port, hz, stats):
 
 
 def ping_udp(stop, host, port, hz, stats):
-    import struct
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect((host, port))
@@ -160,7 +159,7 @@ def ping_udp(stop, host, port, hz, stats):
                 # expired behind a lossy path) — count as lost and go on
                 continue
             if len(data) >= PKT.size:
-                seq, t0 = PKT.unpack_from(data)
+                _, t0 = PKT.unpack_from(data)
                 received += 1
                 rtts.append((time.perf_counter() - t0) * 1000.0)
                 if last is not None:

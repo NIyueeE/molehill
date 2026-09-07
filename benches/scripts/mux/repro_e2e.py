@@ -14,6 +14,7 @@ asserts the fixed behavior.
 Usage: uv run repro_e2e.py
 """
 import atexit
+import contextlib
 import os
 import signal
 import socket
@@ -61,7 +62,7 @@ def main() -> None:
     # only reap molehill leftovers of THIS scenario (configs under a
     # molehill-mux.* workdir) — never a running benchmark matrix
     subprocess.run(["pkill", "-9", "-f", r"molehill.*molehill-mux\."],
-                   capture_output=True)
+                   capture_output=True, check=False)
     time.sleep(0.3)
 
     (WORK / "server.toml").write_text("""[server]
@@ -93,7 +94,7 @@ pool_size = 8
         while True:
             try:
                 conn, _ = srv.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -125,10 +126,8 @@ pool_size = 8
 
     def cleanup():
         for p in procs:
-            try:
+            with contextlib.suppress(OSError):
                 p.send_signal(signal.SIGKILL)
-            except OSError:
-                pass
 
     atexit.register(cleanup)
 

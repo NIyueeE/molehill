@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + strict clippy.
+# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + python lint (ruff) + strict clippy.
 # Heavyweight gates (audit / deny / outdated / test) live in githooks/pre-push.
 # Activate via: git config core.hooksPath githooks   (or: just setup)
 set -euo pipefail
@@ -17,6 +17,9 @@ cargo machete
 
 echo "==> docs alignment (githooks/check-docs)"
 githooks/check-docs
+
+echo "==> ruff (python bench/test entries, see ruff.toml)"
+uvx ruff check benches/scripts/
 
 echo "==> cargo clippy (strict lints from Cargo.toml, default features)"
 cargo clippy --all-targets -- -D warnings

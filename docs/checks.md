@@ -7,8 +7,8 @@ runs the whole chain on every push / pull request via `just check`.
 
 ## Tools
 
-The gates use four external tools; `just setup` installs any that are missing
-(and activates the git hooks):
+The cargo gates use four external tools; `just setup` installs any that are
+missing (and activates the git hooks):
 
 ```bash
 cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
@@ -16,6 +16,9 @@ cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
 
 `cargo fmt` and `cargo clippy` come with the toolchain declared in
 `rust-toolchain.toml` (`channel = "stable"` + clippy/rustfmt components).
+The python bench/test entries and the ruff gate run through `uv` / `uvx`
+(PEP 723 scripts, see docs/release.md); install uv with
+`curl -LsSf https://astral.sh/uv/install.sh | sh`.
 
 ## On every commit — `githooks/pre-commit`
 
@@ -25,8 +28,9 @@ cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
 | 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
 | 3 | machete | `cargo machete` | unused dependencies |
 | 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
-| 5 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
-| 6 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
+| 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
+| 6 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
+| 7 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
 
 Note the template difference: molehill's TLS backends (`native-tls` vs
 `rustls`) and their websocket variants are **mutually exclusive**, so clippy
@@ -40,10 +44,10 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 
 | # | Gate | Command | Purpose |
 |---|------|---------|---------|
-| 7 | audit | `cargo audit` | RustSec security advisories |
-| 8 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
-| 9 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
-| 10 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
+| 8 | audit | `cargo audit` | RustSec security advisories |
+| 9 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
+| 10 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
+| 11 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
 
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.

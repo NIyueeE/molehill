@@ -38,10 +38,13 @@ jobs:
         with:
           tool: cargo-machete,cargo-audit,cargo-outdated,cargo-deny
 
+      - name: Install uv (python bench gates + ruff lint)
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
-      - name: Full check chain (fmt/secrets/machete/docs/clippy + audit/deny/outdated/test)
+      - name: Full check chain (fmt/secrets/machete/docs/ruff/clippy + audit/deny/outdated/test)
         run: just check
 
   features:

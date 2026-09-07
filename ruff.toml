@@ -1,0 +1,42 @@
+# Ruff configuration for the python bench/test entries (uv/PEP 723 scripts
+# under benches/scripts/). Linted by `uvx ruff check` in the pre-commit gate
+# (githooks/pre-commit) — see docs/checks.md.
+target-version = "py311"
+line-length = 88
+
+[lint]
+extend-select = [
+    "E402",   # sys.path.insert before imports is the bench-lib pattern
+    "I",      # import sorting
+    "UP",     # pyupgrade
+    "SIM",    # simplify
+    "EXE",    # shebang + exec bit must agree
+    "BLE",    # blind-except audit (BLE001 waived below, by design)
+    "PL",     # pylint rules
+    "RUF",    # ruff-specific
+    "ISC",    # implicit string concat
+    "FURB",   # refurb
+    "S",      # bandit
+]
+
+# Waivers — all deliberate, code-level only (AGENTS.md §2):
+# - BLE001: the bench matrix is continue-on-error by design; every arm and
+#   metric is guarded by a blind except that records the failure and moves on
+# - S110/S112: silent fallbacks in probes and reaping loops are intentional
+#   (a dead process or a refused probe must not spam the run)
+# - S101: `assert` is used for scenario assertions in repro_e2e.py
+# - S602/S603/S607: the scripts deliberately shell out to PATH tools
+#   (iperf3, tc, vegeta, peers); latency.py's `sh -c` pipelines are the
+#   scenario's core usage, not untrusted input
+# - S108: /tmp defaults for the peer dir and lock are intentional
+# - S310: urllib fetches of GitHub release assets (fetch_peers.py)
+# - S311: `random` drives the loss simulation, not security
+# - S202: zipfile extractall of trusted release assets (rathole)
+# - PLW0603: the noise-keypair cache global is a per-run memo
+# - PLR091x/PLR2004: config-like scripts legitimately carry many ports,
+#   knobs and long arm sequences; not library code
+ignore = [
+    "BLE001", "S101", "S110", "S112", "S602", "S603", "S607",
+    "S108", "S310", "S311", "S202", "PLW0603",
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004",
+]

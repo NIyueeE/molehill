@@ -17,18 +17,20 @@ DURATION = "60s"
 TARGETS = {"frp": "http://127.0.0.1:5203", "molehill": "http://127.0.0.1:5202"}
 
 if not (vegeta := subprocess.run(["sh", "-c", "command -v vegeta"],
-                                 capture_output=True, text=True).stdout.strip()):
+                                 capture_output=True, text=True,
+                                 check=False).stdout.strip()):
     sys.exit("vegeta required on PATH")
 
 
 def attack(url: str, rate: str) -> str:
-    name = f"{url.split(':')[-1]}-{rate}qps-{DURATION}.bin"
+    name = f"{url.rsplit(':', maxsplit=1)[-1]}-{rate}qps-{DURATION}.bin"
     with open(name, "wb") as out:
         subprocess.run(f"echo GET {url} | vegeta attack -rate {rate} "
                        f"-duration {DURATION}", shell=True, stdout=out,
                        check=True)
     report = subprocess.run(["vegeta", "report", name],
-                            capture_output=True, text=True).stdout
+                            capture_output=True, text=True,
+                            check=False).stdout
     print(report)
     return name
 

@@ -14,7 +14,9 @@ cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
 ```
 
 `cargo fmt` 和 `cargo clippy` 由 `rust-toolchain.toml` 声明的工具链
-(`channel = "stable"` + clippy/rustfmt 组件)自带。
+(`channel = "stable"` + clippy/rustfmt 组件)自带。python 基准/测试脚本与
+ruff 门禁经 `uv` / `uvx` 运行(PEP 723 脚本,见 docs/release.md);安装 uv:
+`curl -LsSf https://astral.sh/uv/install.sh | sh`。
 
 ## 每次 commit — `githooks/pre-commit`
 
@@ -24,8 +26,9 @@ cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
 | 2 | secrets | `githooks/check-secrets` | 对暂存区做密钥扫描 |
 | 3 | machete | `cargo machete` | 未使用的依赖 |
 | 4 | docs | `githooks/check-docs` | 文档 ↔ 代码对齐 |
-| 5 | clippy | `cargo clippy --all-targets -- -D warnings` | 严格 lint,默认特性 |
-| 6 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | 特性门控的代码路径 |
+| 5 | python lint | `uvx ruff check benches/scripts/` | python 基准/测试脚本(ruff.toml) |
+| 6 | clippy | `cargo clippy --all-targets -- -D warnings` | 严格 lint,默认特性 |
+| 7 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | 特性门控的代码路径 |
 
 与模板的差异:molehill 的两种 TLS 后端(`native-tls` 与 `rustls`)及其
 websocket 变体**互斥**,因此 clippy 运行两遍(默认特性,再仅
@@ -39,10 +42,10 @@ websocket 变体**互斥**,因此 clippy 运行两遍(默认特性,再仅
 
 | # | 门 | 命令 | 目的 |
 |---|------|---------|---------|
-| 7 | audit | `cargo audit` | RustSec 安全通告 |
-| 8 | deny | `cargo deny check` | 许可证 / 禁用 / 通告策略(deny.toml) |
-| 9 | outdated | `cargo outdated --root-deps-only` | 过期的直接依赖 |
-| 10 | test | `cargo test --quiet -- --test-threads=1` | 测试套件(按设计串行) |
+| 8 | audit | `cargo audit` | RustSec 安全通告 |
+| 9 | deny | `cargo deny check` | 许可证 / 禁用 / 通告策略(deny.toml) |
+| 10 | outdated | `cargo outdated --root-deps-only` | 过期的直接依赖 |
+| 11 | test | `cargo test --quiet -- --test-threads=1` | 测试套件(按设计串行) |
 
 测试**串行**运行(`--test-threads=1`):集成测试会在固定端口上启动真实的
 server/client 对,并行执行会在端口上竞争。

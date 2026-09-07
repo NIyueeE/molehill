@@ -36,6 +36,7 @@ Machine notes (moved from the retired run_bench.sh):
   molehill's default (mux) row
 """
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -51,13 +52,28 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from bench_lib import (Backends, Knobs, Netem, SCHEMA, acquire_lock,  # noqa: E402
-                       dump_results, latency, load_results, merge_arm,
-                       mem_stats, parse_cell, record_pid, release_lock,
-                       run_rss_sampler, sweep_stale, throughput, wait_port)
-from hol_probe import run_hol_probe  # noqa: E402
-from tcp_steady_ping import run_tcp_steady_ping  # noqa: E402
-from udp_ping import run_udp_ping  # noqa: E402
+from bench_lib import (
+    SCHEMA,
+    Backends,
+    Knobs,
+    Netem,
+    acquire_lock,
+    dump_results,
+    latency,
+    load_results,
+    mem_stats,
+    merge_arm,
+    parse_cell,
+    record_pid,
+    release_lock,
+    run_rss_sampler,
+    sweep_stale,
+    throughput,
+    wait_port,
+)
+from hol_probe import run_hol_probe
+from tcp_steady_ping import run_tcp_steady_ping
+from udp_ping import run_udp_ping
 
 
 def _handle_sigterm(signum, frame):
@@ -67,8 +83,7 @@ def _handle_sigterm(signum, frame):
 
 
 TCP_ONLY = {"bore"}  # peers without UDP forwarding (UDP metrics omitted)
-PEER_BINS = {"frp": "frps", "bore": "bore", "chisel": "chisel",
-             "rathole": "rathole"}
+PEER_BINS = {"frp": "frps", "bore": "bore", "rathole": "rathole"}
 
 
 class ArmProcs:
@@ -91,10 +106,8 @@ class ArmProcs:
 
     def kill(self) -> None:
         for pid in self.pids:
-            try:
+            with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
         self.pids.clear()
         time.sleep(0.3)
 
@@ -107,7 +120,7 @@ def noise_keys() -> tuple:
     global _NOISE_KEYS
     if _NOISE_KEYS is None:
         out = subprocess.run([knobs_bin(), "--genkey"], capture_output=True,
-                             text=True, timeout=30).stdout
+                             text=True, timeout=30, check=False).stdout
         priv = pub = ""
         lines = out.splitlines()
         for i, line in enumerate(lines):
@@ -125,26 +138,40 @@ def molehill_config(work: Path, variant: str, knobs: Knobs, p: dict) -> Path:
     """Write server/client tomls for one molehill variant; returns config dir."""
     d = work / "molehill"; d.mkdir(exist_ok=True)
     mux = "true" if variant != "mux-off" else "false"
-    transport = "noise" if variant == "noise" else "tcp"
+    if variant == "noise":
+        transport = "noise"
+    elif variant == "tls":
+        transport = "tls"
+    else:
+        transport = "tcp"
     noise_s = noise_c = ""
     if transport == "noise":
         priv, pub = noise_keys()
         noise_s = f'[server.transport.noise]\nlocal_private_key = "{priv}"\n'
         noise_c = f'[client.transport.noise]\nremote_public_key = "{pub}"\n'
+    tls_s = tls_c = ""
+    if transport == "tls":
+        # repo-owned self-signed PKI (examples/tls); hostname check uses the
+        # configured name, so dialing 127.0.0.1 is fine
+        tls_dir = Path(__file__).parents[3] / "examples" / "tls"
+        tls_s = (f'[server.transport.tls]\npkcs12 = "{tls_dir / "identity.pfx"}"'
+                 f'\npkcs12_password = "1234"\n')
+        tls_c = (f'[client.transport.tls]\ntrusted_root = "{tls_dir / "rootCA.crt"}"'
+                 f'\nhostname = "localhost"\n')
     (d / "server.toml").write_text(f"""[server]
 bind_addr = "127.0.0.1:{p['control']}"
 default_token = "bench"
 allow_ports = ["25100-{knobs.allow_port_hi}"]
 [server.transport]
 type = "{transport}"
-{noise_s}""")
+{noise_s}{tls_s}""")
     (d / "client.toml").write_text(f"""[client]
 remote_addr = "127.0.0.1:{p['client_dial']}"
 default_token = "bench"
 mux = {mux}
 [client.transport]
 type = "{transport}"
-{noise_c}
+{noise_c}{tls_c}
 [client.services.iperf]
 local_addr = "127.0.0.1:{p['iperf_backend']}"
 remote_bind_addr = "127.0.0.1:{p['iperf_exposed']}"
@@ -287,16 +314,6 @@ def setup_bore(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
             raise TimeoutError(f"bore tunnel {exposed} not ready")
 
 
-def setup_chisel(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
-    peer = Path(knobs.peer_dir) / "chisel"
-    procs.spawn([str(peer), "server", "--host", "0.0.0.0",
-                 "--port", str(p["control"]), "--reverse"])
-    procs.spawn([str(peer), "client", f"http://127.0.0.1:{p['client_dial']}",
-                 f"R:{p['iperf_exposed']}:127.0.0.1:{p['iperf_backend']}",
-                 f"R:{p['echo_exposed']}:127.0.0.1:{p['echo_backend']}",
-                 f"R:{p['udp_exposed']}:127.0.0.1:{p['udp_backend']}/udp"])
-
-
 def _start_weakproxy(procs: ArmProcs, p: dict) -> None:
     """Spawn the per-arm userspace delay proxy (fallback cells only)."""
     cmd = p.get("weakproxy_cmd")
@@ -344,7 +361,7 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                          start, True, True))
     else:
         setup = {"frp": setup_frp, "rathole": setup_rathole,
-                 "bore": setup_bore, "chisel": setup_chisel}[tool]
+                 "bore": setup_bore}[tool]
         has_udp = tool not in TCP_ONLY
 
         def start():
@@ -364,7 +381,8 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
 def tool_version(knobs: Knobs) -> str:
     try:
         out = subprocess.run([knobs_bin(), "--version"],
-                             capture_output=True, text=True).stdout
+                             capture_output=True, text=True,
+                             check=False).stdout
         return next((l.split()[2] for l in out.splitlines()
                      if l.startswith("Build Version:")), "dev")
     except OSError:
@@ -373,8 +391,9 @@ def tool_version(knobs: Knobs) -> str:
 
 def peer_version(tool: str, knobs: Knobs) -> str:
     """Best-effort version string: peers print it in different places
-    (frp on stderr, rathole as a 'Build Version:' line, bore/chisel on
-    stdout); fall back to the upstream release version constant."""
+    (frp on stderr, rathole as a 'Build Version:' line, bore on stdout);
+    fall back to the release-version marker written by fetch_peers.py,
+    then to the upstream release version constant."""
     binname = PEER_BINS[tool]
     for cand in (Path(knobs.peer_dir) / tool / binname,   # frp's subdir layout
                  Path(knobs.peer_dir) / binname):         # flat layouts
@@ -384,7 +403,8 @@ def peer_version(tool: str, knobs: Knobs) -> str:
         return "0.5.0"
     try:
         r = subprocess.run([str(cand), "--version"],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=15,
+                           check=False)
         out = r.stdout + r.stderr
         for line in out.splitlines():
             if line.startswith("Build Version:"):
@@ -392,8 +412,14 @@ def peer_version(tool: str, knobs: Knobs) -> str:
                 if re.search(r"\d+\.\d+\.\d+", tok):
                     return tok
         m = re.search(r"\d+\.\d+\.\d+", out)
-        return m.group(0) if m else "0.5.0"
+        if m:
+            return m.group(0)
     except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:  # marker written by fetch_peers.py (tools without --version)
+        marker = Path(knobs.peer_dir) / f".{tool}-release-version"
+        return marker.read_text().strip() or "0.5.0"
+    except OSError:
         return "0.5.0"
 
 
@@ -501,13 +527,14 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--tools", default="molehill,frp,rathole,bore,chisel",
-                    help="comma list: molehill,frp,rathole,bore,chisel")
+    ap.add_argument("--tools", default="molehill,frp,rathole,bore",
+                    help="comma list: molehill,frp,rathole,bore")
     ap.add_argument("--cells",
                     default="0/0,0/10,0/100,1%/10,5%/100,2:25/10",
                     help="comma list: loss[/burst]/rtt or r<mbit>/rtt")
-    ap.add_argument("--variants", default="mux,noise",
-                    help="molehill arms: mux,noise,mux-off (mux-off: loopback only)")
+    ap.add_argument("--variants", default="mux,noise,tls",
+                    help="molehill arms: mux,noise,tls,mux-off "
+                         "(mux-off: loopback only)")
     ap.add_argument("--out",
                     default=str(Path(__file__).parent / "results-v0.7.2.json"))
     ap.add_argument("--fresh", action="store_true",
@@ -608,7 +635,7 @@ def main():
                       "recording arms as errors", file=sys.stderr)
                 for tool in tools:
                     off = {"molehill": 0, "frp": 20, "rathole": 40,
-                           "bore": 60, "chisel": 80}[tool]
+                           "bore": 60}[tool]
                     p = cell_port_map(base, off, mech)
                     for label, _, _, _ in build_arms(tool, spec, variants,
                                                      knobs, p, work):
@@ -620,7 +647,7 @@ def main():
             try:
                 for tool in tools:
                     off = {"molehill": 0, "frp": 20, "rathole": 40,
-                           "bore": 60, "chisel": 80}[tool]
+                           "bore": 60}[tool]
                     p = cell_port_map(base, off, mech)
                     if tool == "bore" and mech == "weakproxy":
                         # bore's control port is fixed at 7835; the weakproxy

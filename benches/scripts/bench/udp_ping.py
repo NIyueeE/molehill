@@ -20,6 +20,8 @@ Metrics:
 Usage: udp_ping.py <host> <port> <count> <interval_ms> <timeout_s>
 Output: one JSON object.
 """
+import contextlib
+import itertools
 import json
 import select
 import socket
@@ -39,10 +41,8 @@ def pct(xs, p):
 
 def _reset_udp_socket(s, host: str, port: int) -> None:
     """Clear a poisoned connected-UDP error state (ECONNREFUSED lingers)."""
-    try:
+    with contextlib.suppress(OSError):
         s.connect((host, port))
-    except OSError:
-        pass
 
 
 def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
@@ -102,7 +102,7 @@ def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
             "p99": pct(rtts, 0.99),
             "mean": round(sum(rtts) / len(rtts), 3) if rtts else 0.0,
         },
-        "jitter_ms": round(sum(abs(b - a) for a, b in zip(rtts, rtts[1:]))
+        "jitter_ms": round(sum(abs(b - a) for a, b in itertools.pairwise(rtts))
                            / max(len(rtts) - 1, 1), 3) if len(rtts) > 1 else 0.0,
         "max_gap_ms": round(max(gaps), 3) if gaps else 0.0,
     }

@@ -20,7 +20,8 @@ def sample(pid: int, log: Path, stop: threading.Event) -> None:
     with open(log, "w") as f:
         while not stop.is_set():
             try:
-                rss_kb = open(f"/proc/{pid}/statm").read().split()[1]
+                with open(f"/proc/{pid}/statm") as fh:
+                    rss_kb = fh.read().split()[1]
                 f.write(f"{int(rss_kb) * 4}\n")  # pages -> KB
                 f.flush()
             except (OSError, ValueError, IndexError):
@@ -30,7 +31,8 @@ def sample(pid: int, log: Path, stop: threading.Event) -> None:
 
 def pidof(pattern: str) -> int:
     out = subprocess.run(["pgrep", "-f", pattern],
-                         capture_output=True, text=True).stdout.split()
+                         capture_output=True, text=True,
+                         check=False).stdout.split()
     return int(out[0]) if out else 0
 
 

@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Release-grade benchmark matrix (`just bench`): peer comparison against frp,
-  rathole (upstream), bore and chisel across loopback and weak-network cells
+  rathole (upstream) and bore across loopback and weak-network cells
   (rtt/loss via netem, with a userspace delay-proxy fallback when
   `CAP_NET_ADMIN` is unavailable), chart + table rendering (`just bench-plot`)
   and a per-tag regression gate (`just bench-check`) required before tagging.
@@ -18,14 +18,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Benchmark entries are PEP 723 python scripts run via `uv run` (no shell test
-  entries); peer tools (frp, rathole, bore, chisel) are fetched as the latest
+  entries); peer tools (frp, rathole, bore) are fetched as the latest
   GitHub release binaries — never built from source. The matrix measures per
   tool and cell: through-tunnel TCP
   throughput (1/8 streams), connection-path RTT, data-path RTT, UDP session
   quality (RTT/loss/jitter/max gap), a head-of-line probe and RSS (schema v3).
   Runs are resumable and continue on error: each completed arm is printed and
   checkpointed to the results file immediately, `--tools/--cells/--variants`
-  select subsets, and results merge unless `--fresh` is given.
+  select subsets, and results merge unless `--fresh` is given. Molehill runs
+  mux / mux-off / noise / tls variants (mux-off on the loopback cell only).
+- Benchmark charts split into a plain-TCP peers chart (molehill default mux
+  vs frp / rathole / bore) and a molehill-family chart isolating the costs of
+  multiplexing (mux vs mux-off) and encryption (mux vs noise vs tls); the
+  encrypted chisel peer was removed — its SSH tunnel is not comparable on the
+  plain-TCP axis.
+- The python bench/test entries are now linted by ruff in the pre-commit gate
+  (`ruff.toml`, waivers documented there), and the uv/PEP 723 convention is
+  part of AGENTS.md.
 
 ### Fixed
 

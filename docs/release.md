@@ -42,7 +42,7 @@ re-push). For verifying a commit without releasing, use CD test builds.
 
 Every tag refreshes the peer-comparison benchmark (matrix design and peer
 fetching live in `benches/scripts/bench/`; peers: frp, rathole (upstream),
-bore, chisel — each fetched as the **latest GitHub release** binary, never
+bore — each fetched as the **latest GitHub release** binary, never
 built from source, with the resolved versions recorded in the results meta
 and the chart footer). The matrix (schema v3) measures, per tool and network
 cell: TCP
@@ -52,7 +52,7 @@ one established connection), UDP session quality over one established session
 (RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
 bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
 as mux and noise variants (mux-off additionally on the loopback cell); peers:
-frp / rathole / chisel also run UDP arms, bore is TCP-only. All bench entries
+frp / rathole also run UDP arms, bore is TCP-only. All bench entries
 are PEP 723 python scripts run via `uv run`: runs are resumable (each
 completed arm is checkpointed together with the full meta), continue on
 error (a per-metric failure records `null` plus a `partial_metrics` list

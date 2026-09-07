@@ -14,6 +14,7 @@ Design principles (mapped to the test-engineering concepts):
 - isolation: every arm gets fresh processes, its own port band, and per-cell
   backend instances
 """
+import contextlib
 import json
 import os
 import shutil
@@ -61,7 +62,8 @@ def reap_pids(pids: list) -> int:
         if probe.encode() not in cmd:
             continue
         try:
-            stat = open(f"/proc/{pid}/stat").read().split(") ", 1)[1]
+            with open(f"/proc/{pid}/stat") as fh:
+                stat = fh.read().split(") ", 1)[1]
             ppid = int(stat.split()[1])
             with open(f"/proc/{ppid}/cmdline", "rb") as fh:
                 parent_cmd = fh.read()
@@ -110,10 +112,8 @@ def acquire_lock() -> None:
             return
         except FileExistsError:
             pid = 0
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 pid = int(LOCK_PATH.read_text().strip())
-            except (OSError, ValueError):
-                pass
             if pid and Path(f"/proc/{pid}").exists():
                 sys.exit(f"another bench run (pid {pid}) is active — "
                          "concurrent runs interfere with each other; "
@@ -190,7 +190,7 @@ def parse_cell(cell: str) -> CellSpec:
     length is 100/burst packets (see Netem.on)."""
     loss = burst = rate = rtt = 0.0
     if cell.startswith("r") and cell[1:2].isdigit():
-        rate = float(cell[1:].split("/")[0])
+        rate = float(cell[1:].split("/", maxsplit=1)[0])
         rtt = float(cell.split("/")[1])
         name = f"rate{rate:g}_rtt{rtt:g}"
     elif ":" in cell:
@@ -199,7 +199,7 @@ def parse_cell(cell: str) -> CellSpec:
         rtt = float(rtt_s)
         name = f"loss{loss:g}b{burst:g}_rtt{rtt:g}"
     else:
-        loss = float(cell.split("/")[0].rstrip("%"))
+        loss = float(cell.split("/", maxsplit=1)[0].rstrip("%"))
         rtt = float(cell.split("/")[1])
         if loss == 0 and rtt == 0:
             name = "loopback"
@@ -216,11 +216,12 @@ class Netem:
         self.tc = shutil.which("tc") or ""
         self.ok = False
         self.active = False
-        if self.tc and subprocess.run(["sudo", "-n", "true"]).returncode == 0:
+        if self.tc and subprocess.run(["sudo", "-n", "true"],
+                                         check=False).returncode == 0:
             probe = subprocess.run(
                 ["sudo", self.tc, "qdisc", "replace", "dev", "lo", "root",
                  "netem", "loss", "0%", "delay", "0ms"],
-                capture_output=True)
+                capture_output=True, check=False)
             self.ok = probe.returncode == 0
             if self.ok:
                 # the probe left a no-op netem on lo — remove it
@@ -255,14 +256,15 @@ class Netem:
             args += ["delay", f"{spec.rtt:g}ms"]
         if spec.rate:
             args += ["rate", f"{spec.rate:g}mbit"]
-        applied = subprocess.run(args, capture_output=True).returncode == 0
+        applied = subprocess.run(args, capture_output=True,
+                                 check=False).returncode == 0
         self.active = applied
         return applied
 
     def off(self) -> None:
         if self.tc and self.active:
             subprocess.run(["sudo", self.tc, "qdisc", "del", "dev", "lo",
-                            "root"], capture_output=True)
+                            "root"], capture_output=True, check=False)
             self.active = False
 
 
@@ -312,10 +314,8 @@ class Backends:
             time.sleep(0.4)
         except Exception as e:
             for p in self._procs:
-                try:
+                with contextlib.suppress(OSError):
                     p.terminate()
-                except OSError:
-                    pass
             self._procs.clear()
             raise RuntimeError(f"backends failed on ports "
                                f"{iperf_port}/{tcp_port}/{udp_port}: {e}") \
@@ -347,7 +347,7 @@ class Backends:
                     conn, _ = srv.accept()
                     threading.Thread(target=serve, args=(conn,),
                                      daemon=True).start()
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError:
                     break  # socket closed by stop()
@@ -367,7 +367,7 @@ class Backends:
                 try:
                     data, addr = srv.recvfrom(65535)
                     srv.sendto(data, addr)
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError:
                     break  # socket closed by stop()
@@ -379,15 +379,11 @@ class Backends:
     def stop(self) -> None:
         self._stop.set()
         for s in self._socks:
-            try:
+            with contextlib.suppress(OSError):
                 s.close()
-            except OSError:
-                pass
         for p in self._procs:
-            try:
+            with contextlib.suppress(OSError):
                 p.terminate()
-            except OSError:
-                pass
         self._procs.clear()
         self._socks.clear()
         self._threads.clear()
@@ -417,7 +413,8 @@ def throughput(reps: int, streams: int, secs: int, iperf_port: int) -> tuple | N
             j = subprocess.run(
                 ["iperf3", "-J", "-c", "127.0.0.1", "-p", str(iperf_port),
                  "-t", str(secs), "-O", "2", "-P", str(streams)],
-                capture_output=True, text=True, timeout=secs + 20).stdout
+                capture_output=True, text=True, timeout=secs + 20,
+                check=False).stdout
             d = json.loads(j)
             pairs.append((d["end"]["sum_received"]["bits_per_second"] / 1e9,
                           d["end"]["sum_sent"].get("retransmits", 0)))
@@ -475,8 +472,10 @@ def run_rss_sampler(server_pid: int, client_pid: int, stop: threading.Event,
                     out: list, interval: float = 0.5) -> None:
     while not stop.is_set():
         try:
-            s = int(open(f"/proc/{server_pid}/statm").read().split()[1]) * 4
-            c = int(open(f"/proc/{client_pid}/statm").read().split()[1]) * 4
+            with open(f"/proc/{server_pid}/statm") as fh:
+                s = int(fh.read().split()[1]) * 4
+            with open(f"/proc/{client_pid}/statm") as fh:
+                c = int(fh.read().split()[1]) * 4
             out.append((s, c))
         except (OSError, ValueError, IndexError):
             pass
