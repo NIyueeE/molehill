@@ -68,6 +68,10 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 两种加密都会让吞吐减半(3.8–4.1 vs 明文 10.2 Gbit/s),RTT 代价可忽略;
 传输层选择不改变丢包行为。
 
+具体写法:`mux` 选项与 `transport` 块见[配置文档](./docs/configuration.zh.md);
+noise 密钥对与 TLS 证书见[传输层文档](./docs/transport.md);可直接运行的
+配置见[快速开始](#快速开始)与[示例](./examples)。
+
 ### molehill vs 明文 TCP 同类工具
 
 只对比明文 TCP 轴线(mux 开、不加密):加密竞品(如 chisel 的 SSH 隧道)
@@ -205,7 +209,7 @@ remote_bind_addr = "0.0.0.0:5202" # 在服务端暴露的公网地址
 ## 配置
 
 `molehill` 会根据配置文件自动判断运行模式（server/client），也可以通过 `--server` / `--client` 强制指定。完整的配置规范、日志和调优选项见
-[配置文档](./docs/configuration.md)。[示例配置](./examples) 覆盖了各种常见场景。
+[配置文档](./docs/configuration.zh.md)。[示例配置](./examples) 覆盖了各种常见场景。
 
 ## 部署
 
@@ -241,7 +245,7 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
 使用 molehill：
 
-- [配置文档](./docs/configuration.md) — 完整的配置规范、日志和调优
+- [配置文档](./docs/configuration.zh.md) — 完整的配置规范、日志和调优
 - [传输层](./docs/transport.md) — TLS 和 Noise Protocol 配置
 - [构建指南](./docs/build-guide.md) — 构建定制、rustls 支持、最小化二进制
 - [内部原理](./docs/internals.md) — 控制通道和数据通道的工作原理

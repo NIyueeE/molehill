@@ -69,6 +69,11 @@ The measurements below justify the defaults and tell you when to deviate:
 Both encryptions halve throughput (3.8–4.1 vs 10.2 Gbit/s plain) with
 negligible RTT cost; the transport choice does not change loss behavior.
 
+How to apply each choice: the `mux` option and the `transport` block are in
+[Configuration](docs/configuration.md); Noise keypairs and TLS certificates
+in [Transport](docs/transport.md); ready-to-run configs in
+[Quickstart](#quickstart) and [examples](../examples).
+
 ### molehill vs plain-TCP peers
 
 Plain-TCP axis only (mux on, no encryption): encrypted competitors such as
