@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The python bench/test entries are now linted by ruff in the pre-commit gate
   (`ruff.toml`, waivers documented there), and the uv/PEP 723 convention is
   part of AGENTS.md.
+- The multiplexing-cost comparison now covers the weak cells: under loss the
+  single tunnel shares one retransmit domain while `mux = false` retransmits
+  per stream (at 1% loss, 8-stream throughput 18.5 vs 4.7 Gbit/s). The README
+  benchmark section is reorganized around a configuration-selection guide
+  (when to keep or turn off mux, noise vs tls) and a methodology section
+  documenting the test discipline and known limits.
 
 ### Fixed
 
