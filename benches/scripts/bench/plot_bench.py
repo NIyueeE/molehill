@@ -209,16 +209,21 @@ def render_main(results, meta, out_path):
     ax_crtt.set_ylabel("echo RTT p50 (ms, log)")
     ax_crtt.set_title("Connection-path latency per cell", fontsize=10)
 
+    # bore is TCP-only and carries no UDP metrics: drop it from the UDP
+    # panels so it does not occupy an empty slot
+    udp_tools = [t for t in tools
+                 if read(results, t, loopback, "udp_rtt_ms") is not None]
+
     def udp_rtt99(t, cell):
         return (read(results, t, cell, "udp_rtt_ms") or {}).get("p99")
-    bar_group(ax_udprtt, tools, colors, cells, udp_rtt99, log=True,
+    bar_group(ax_udprtt, udp_tools, colors, cells, udp_rtt99, log=True,
               floor=1e-1)
     ax_udprtt.set_ylabel("UDP RTT p99 (ms, log)")
     ax_udprtt.set_title("UDP session RTT p99 per cell", fontsize=10)
 
     def udp_loss(t, cell):
         return read(results, t, cell, "udp_loss_pct")
-    bar_group(ax_udploss, tools, colors, cells, udp_loss)
+    bar_group(ax_udploss, udp_tools, colors, cells, udp_loss)
     ax_udploss.set_ylabel("UDP loss (%)")
     ax_udploss.set_title("UDP session loss per cell", fontsize=10)
 
