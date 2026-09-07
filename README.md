@@ -49,51 +49,80 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 ## Benchmarks
 
 Peer comparison on one machine (plain TCP, `visitor -> server -> client ->
-backend` on loopback; weak-network cells add round-trip time to the
-server↔client leg in software). Peers: frp 0.71.0, rathole 0.5.0 (upstream),
-bore 0.6.0, chisel 1.10.1.
+backend` on loopback; everything is measured **through the tunnel** — iperf3
+dials each tool's exposed port). Peers are the latest GitHub release builds:
+frp 0.71.0, rathole 0.5.0 (upstream), bore 0.6.0, chisel 1.12.0.
+Weak-network cells apply netem to the loopback interface, so every leg of
+the path is delayed or lossy — identical for all tools (a "10 ms" cell
+therefore shows ~100 ms echo RTT through the multi-leg path; the
+amplification is per-leg and tool-independent).
 
 ![Benchmark: molehill 0.7.2 vs peers](assets/benchmark-v0.7.2.png)
 
+The three molehill rows are one binary in three configurations — the default,
+plus two single-variable perturbations of it: `mux = false` isolates the cost
+of multiplexing, the `noise` row switches the transport to the encrypted
+Noise Protocol (multiplexing unchanged) and isolates the cost of encryption
+— not a third forwarding mode.
+
 ### Loopback
 
-Throughput saturates loopback for every tool — the differentiator is
-per-connection path overhead and memory:
+Through-tunnel throughput separates the tools: the `mux` arm rides one yamux
+channel (per-stream ceiling), `mux = false` and the per-connection peers
+open a channel per stream:
 
 | Tool | 1-stream (Gbit/s) | 8-stream (Gbit/s) | echo RTT p50 | echo RTT p99 | Memory (avg RSS) |
 |---|---|---|---|---|---|
-| **molehill 0.7.2** (mux, default) | 44.8 | 62.1 | 0.261 ms | 0.303 ms | 17.1 MiB |
-| molehill 0.7.2 (`mux = false`) | 45.8 | 62.7 | 0.220 ms | 0.281 ms | 17.1 MiB |
-| rathole 0.5.0 (upstream) | 45.4 | 62.0 | 0.235 ms | 0.312 ms | 19.7 MiB |
-| bore 0.6.0 | 45.7 | 62.7 | 0.517 ms | 0.633 ms | **8.1 MiB** |
-| chisel 1.10.1 | 45.4 | 62.3 | 0.373 ms | 0.556 ms | 24.5 MiB |
-| frp 0.71.0 | 46.2 | 61.9 | 0.379 ms | 0.690 ms | 47.2 MiB |
+| **molehill 0.7.2** (mux, default) | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
+| molehill 0.7.2 (`mux = false`) | 19.7 | 27.0 | 0.216 ms | 0.286 ms | 18.9 MiB |
+| molehill 0.7.2 (noise) | 3.8 | 4.3 | 0.318 ms | 0.383 ms | 22.3 MiB |
+| rathole 0.5.0 (upstream) | 12.4 | 26.8 | 0.234 ms | 0.312 ms | 20.0 MiB |
+| bore 0.6.0 | 14.2 | 27.0 | 0.495 ms | 0.629 ms | **8.4 MiB** |
+| chisel 1.12.0 | 4.1 | 3.9 | 0.336 ms | 0.581 ms | 44.2 MiB |
+| frp 0.71.0 | 4.8 | 6.3 | 0.375 ms | 0.673 ms | 72.1 MiB |
 
-### Weak network: added RTT on the tunnel leg
+- Multiplexing trades single-stream throughput for connection efficiency:
+  with `mux = false` the same binary does 19.7 / 27.0 Gbit/s.
+- Noise encryption halves throughput (~3.8 Gbit/s); the connection-path
+  overhead stays sub-millisecond.
+- bore is the lightest (8.4 MiB) and a strong plain TCP relay — but no UDP
+  forwarding at all.
 
-The connection path is where pre-established pooled channels pay off. With
-`rtt` milliseconds of added round-trip time on the tunnel leg, every visitor
-connection costs the pool-free tools one full extra round trip:
+### Weak network (netem on every loopback leg)
 
-| Tool | rtt10: RTT p50 | rtt100: RTT p50 | rtt100: 1-stream (Gbit/s) |
+Connection-path RTT under added delay; chisel pays one extra round trip per
+visitor connection, bore two or more (its local forward dials through the
+control port each time) — the pre-established channel pool pays the baseline
+only:
+
+| Tool | rtt10: echo RTT p50 | rtt100: echo RTT p50 | rtt10: 1-stream (Gbit/s) |
 |---|---|---|---|
-| **molehill 0.7.2** (mux, default) | **11.2 ms** | **101.7 ms** | 44.8 |
-| frp 0.71.0 | 11.4 ms | 102.0 ms | 45.9 |
-| rathole 0.5.0 (upstream) | 11.5 ms | 102.0 ms | 46.1 |
-| chisel 1.10.1 | 22.1 ms | 202.6 ms | 47.2 |
-| bore 0.6.0 | 22.5 ms | 203.2 ms | 44.0 |
+| **molehill 0.7.2** (mux, default) | **101.3 ms** | **1001.4 ms** | 6.3 |
+| rathole 0.5.0 (upstream) | 101.1 ms | 1001.3 ms | 6.3 |
+| bore 0.6.0 | 141.8 ms | 1402.0 ms | 10.2 |
+| chisel 1.12.0 | 121.5 ms | 1201.6 ms | 0.8 |
+| frp 0.71.0 | 101.5 ms | 1001.6 ms | 1.8 |
 
-- molehill/frp/rathole keep ~1.2 ms of per-connection overhead on top of the
-  added RTT (pre-established data channels); bore/chisel pay ~2× the added
-  RTT per connection — one full round trip dialed through the tunnel each
-  time a visitor connects.
-- Absolute loopback throughput is host-dependent (it saturates the machine);
-  treat it as a ceiling sanity check, not a differentiator.
-- Loss cells (netem) require `CAP_NET_ADMIN` and are skipped when unavailable
-  (see docs/release.md).
-- Reproduce: `just bench` → `just bench-plot` → `just bench-check`
-  (raw data in `benches/scripts/bench/results-v0.7.2.json`; ritual and
-  regression gate in docs/release.md).
+| Tool | loss 1%: 1-stream (Gbit/s) | UDP session loss | UDP max gap |
+|---|---|---|---|
+| **molehill 0.7.2** (mux, default) | **4.4** | 5.0% | 61 ms |
+| rathole 0.5.0 (upstream) | 4.3 | 6.0% | 60 ms |
+| bore 0.6.0 | 4.6 | - (no UDP) | - |
+| chisel 1.12.0 | 0.4 | 5.5% | 60 ms |
+| frp 0.71.0 | 0.8 | 3.5% | 60 ms |
+
+- Under 1% loss the multiplexed/pooled data paths (molehill, rathole) and
+  the plain relay (bore) hold 4.3–4.6 Gbit/s while frp (0.8) and chisel
+  (0.4) collapse — loss tolerance separates forwarding architectures more
+  sharply than raw loopback speed.
+- UDP session quality degrades gracefully for every tool that forwards UDP:
+  ≤6% residual loss (the shared qdisc spreads the configured 1% unevenly)
+  and ≤61 ms worst inter-packet gap — a game-like session survives.
+- Absolute numbers are host-dependent; the comparison is same-host and
+  same-methodology. Reproduce: `just bench-peers` → `just bench` →
+  `just bench-plot` → `just bench-check` (raw data in
+  `benches/scripts/bench/results-v0.7.2.json`; ritual and regression gate in
+  docs/release.md).
 
 ## Quickstart
 
