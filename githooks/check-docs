@@ -25,7 +25,6 @@ for hook in githooks/pre-commit githooks/pre-push; do
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
-    expect "[$hook] command documented: $cmd" docs/checks.zh.md "$cmd"
   done < <(grep -E '^cargo ' "$hook")
 done
 
@@ -33,7 +32,6 @@ done
 while IFS= read -r lint; do
   [ -n "$lint" ] || continue
   expect "lint documented: $lint" docs/lint-policy.md '`'"$lint"'`'
-  expect "lint documented: $lint" docs/lint-policy.zh.md '`'"$lint"'`'
 done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0} f && /=/{split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k}' Cargo.toml)
 
 # 3) rustc edition
@@ -62,12 +60,10 @@ expect "hooksPath instruction documented" README.zh.md 'core.hooksPath githooks'
 
 # 7) docs gate itself must stay documented in the checks docs
 expect "docs gate documented" docs/checks.md 'githooks/check-docs'
-expect "docs gate documented" docs/checks.zh.md 'githooks/check-docs'
 
 # 8) READMEs must link the modular governance docs (index integrity, per language)
 for doc in checks lint-policy release structure; do
   expect "README links docs/$doc.md" README.md "docs/$doc.md"
-  expect "README links docs/$doc.zh.md" README.zh.md "docs/$doc.zh.md"
 done
 
 # 9) CI must run the same chain
@@ -82,7 +78,6 @@ fi
 if [ -f .github/workflows/release.yml ]; then
   expect "release notes extracted from CHANGELOG" .github/workflows/release.yml 'CHANGELOG.md'
   expect "release docs mention CHANGELOG" docs/release.md 'CHANGELOG'
-  expect "release docs mention CHANGELOG" docs/release.zh.md 'CHANGELOG'
 else
   echo "  FAIL  .github/workflows/release.yml missing (see docs/release.md)" >&2
   errors=$((errors + 1))
@@ -92,7 +87,6 @@ fi
 if [ -f .github/workflows/test-build.yml ]; then
   expect "test builds are manual (workflow_dispatch)" .github/workflows/test-build.yml 'workflow_dispatch'
   expect "test builds documented" docs/release.md 'test-build.yml'
-  expect "test builds documented" docs/release.zh.md 'test-build.yml'
 else
   echo "  FAIL  .github/workflows/test-build.yml missing (see AGENTS.md §6)" >&2
   errors=$((errors + 1))
@@ -112,7 +106,6 @@ fi
 if [ -f githooks/check-secrets ]; then
   expect "secret scan gate wired" githooks/pre-commit 'githooks/check-secrets'
   expect "secret scan documented" docs/checks.md 'githooks/check-secrets'
-  expect "secret scan documented" docs/checks.zh.md 'githooks/check-secrets'
 else
   echo "  FAIL  githooks/check-secrets missing (AGENTS.md §9 secrets discipline)" >&2
   errors=$((errors + 1))

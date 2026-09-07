@@ -1,6 +1,5 @@
 # Checks
 
-> English | [简体中文](checks.zh.md)
 
 Fast gates run before every commit, heavyweight gates before every push, and CI
 runs the whole chain on every push / pull request via `just check`.

@@ -1,6 +1,5 @@
 # Lint policy
 
-> English | [简体中文](lint-policy.zh.md)
 
 All lints live in `Cargo.toml` `[lints]`; the table below is the single source
 of truth. Changing a lint level requires updating this page (both languages)

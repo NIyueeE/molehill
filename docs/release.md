@@ -1,6 +1,5 @@
 # Releases
 
-> English | [简体中文](release.zh.md)
 
 Releases are **tag-driven**. The only trigger of a release is pushing a `v*`
 tag; `.github/workflows/release.yml` owns the whole flow and no other path

@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   benchmark section is reorganized around a configuration-selection guide
   (when to keep or turn off mux, noise vs tls) and a methodology section
   documenting the test discipline and known limits.
+- Documentation policy: governance and contributor docs are English-only —
+  the four `*.zh.md` governance mirrors were dropped; user-facing docs
+  (README, configuration, transport) keep Chinese mirrors, and the Chinese
+  configuration (`docs/configuration.zh.md`) and transport
+  (`docs/transport.zh.md`) pages were added. AGENTS.md §2/§3 and the
+  docs-alignment check were updated to match.
 
 ### Fixed
 

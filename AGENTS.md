@@ -71,28 +71,29 @@ code-level.**
   discipline**: fix if fixable; waive only as above when truly unfixable.
   Never delete, comment out, or bypass a check.
 - The chain has two layers: **fast gates** (`githooks/pre-commit`: fmt /
-  secrets / machete / docs / clippy) run on commit, **heavy gates**
-  (`githooks/pre-push`: audit / deny / outdated / test) run on push; CI runs
-  the whole chain via `just check`. All three are "the checks" and bound by
-  this discipline. Levels and the declared lint set:
+  secrets / machete / docs / python lint (ruff) / clippy) run on commit,
+  **heavy gates** (`githooks/pre-push`: audit / deny / outdated / test) run
+  on push; CI runs the whole chain via `just check`. All three are "the
+  checks" and bound by this discipline. Levels and the declared lint set:
   [docs/lint-policy.md](docs/lint-policy.md).
 
 ## 3. Before every commit: docs ↔ code alignment (every commit)
 
 - Verify the docs still tell the truth about the code:
-  - lint tables in docs/lint-policy.md / docs/lint-policy.zh.md ↔
-    `[lints]` in `Cargo.toml`;
-  - gate tables in docs/checks.md / docs/checks.zh.md ↔ the actual commands in
-    both hooks (`githooks/pre-commit` and `githooks/pre-push`);
+  - lint tables in docs/lint-policy.md ↔ `[lints]` in `Cargo.toml`;
+  - gate tables in docs/checks.md ↔ the actual commands in both hooks
+    (`githooks/pre-commit` and `githooks/pre-push`);
   - README.md / README.zh.md as landing pages: quick-start commands, docs
     index links, and feature claims still hold;
   - toolchain description ↔ `rust-toolchain.toml`; layout ↔
-    docs/structure(.zh).md; command examples; version numbers;
+    docs/structure.md; command examples; version numbers;
   - source doc comments (`//!` / `///`) ↔ actual behavior.
-- Governance docs are bilingual pairs (`*.md` + `*.zh.md`) and must change
-  together; never update one language only. The user-facing pages
-  (configuration / transport / build-guide / internals) currently exist in
-  English only — when touching them, at minimum keep them truthful.
+- User-facing docs (README, configuration, transport) keep Chinese mirrors
+  (`*.zh.md`) and must change together; never update one language only.
+  Governance and contributor docs (checks, lint-policy, release, structure,
+  internals, build-guide, AGENTS.md, HANDOFF.md) are English-only by
+  decision — do not create `*.zh.md` for them. When touching any page, at
+  minimum keep it truthful.
 - Changing lint config or the check chain requires syncing the affected docs
   pages, both READMEs, and this file **in the same commit**.
 - The mechanical part is automated in `githooks/check-docs`, wired into the
@@ -239,8 +240,6 @@ Details: [docs/release.md](docs/release.md).
 | Control/data channel design | docs/internals.md |
 | Current working state, decisions, open threads | HANDOFF.md |
 
-Governance pages (checks, lint-policy, release, structure) have `*.zh.md`
-counterparts; §3 governs their sync.
 
 ## 11. Project facts (appendix)
 

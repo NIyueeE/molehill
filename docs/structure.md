@@ -1,6 +1,5 @@
 # Repository structure
 
-> English | [简体中文](structure.zh.md)
 
 What every file and directory in this repository is for. Deeper behavioral
 docs: [configuration](configuration.md), [transport](transport.md),
@@ -80,4 +79,4 @@ One topic, one home; the other pages link instead of repeating.
 | `lint-policy.md` | declared lints and waiver discipline |
 | `release.md` | release mechanics, versioning, CD test builds |
 | `structure.md` | this map |
-| `*.zh.md` | mirrors of the English governance docs — always edited in the same commit |
+| `*.zh.md` | Chinese mirrors of the user-facing docs (README, configuration, transport) — governance and contributor docs are English-only |

@@ -35,13 +35,10 @@ for many-service clients.
       the uv/python runtime dependency; until then `uv run` stays the entry
 - [ ] Zero-copy splice/sendfile: deliberately not recommended (keep as-is)
 
-### Benchmark ritual (per tag, see docs/release.md)
+### Benchmark ritual (per tag — see docs/release.md)
 
-`just bench` → `just bench-plot` → `just bench-check` must be green before
-tagging: results JSON + chart + README table land in the release commit, and
-performance may not regress vs the previous tag (thresholds env-tunable, see
-`benches/scripts/bench/check_regression.py`; all bench entries are PEP 723
-python scripts run via `uv run` — no shell test entries). Machine notes: loss
+The ritual steps, gate thresholds and the uv/PEP 723 runner are documented
+in [docs/release.md](docs/release.md). Environment-specific notes: loss
 cells need `CAP_NET_ADMIN` (granted in the current container — netem cells
 run; without it loss cells auto-skip and rtt cells run via the userspace
 `weakproxy.py` fallback); bore's `--to` only accepts a bare host (port 7835

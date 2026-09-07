@@ -253,10 +253,10 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
 贡献与工程：
 
-- [检查门](./docs/checks.zh.md) — 每个门运行什么、被拦住时怎么办
-- [Lint 策略](./docs/lint-policy.zh.md) — lint 级别与豁免规则
-- [发布流程](./docs/release.zh.md) — 发布机制、版本编号、测试构建
-- [仓库结构](./docs/structure.zh.md) — 仓库里每个文件的用途
+- [检查门](./docs/checks.md) — 每个门运行什么、被拦住时怎么办
+- [Lint 策略](./docs/lint-policy.md) — lint 级别与豁免规则
+- [发布流程](./docs/release.md) — 发布机制、版本编号、测试构建
+- [仓库结构](./docs/structure.md) — 仓库里每个文件的用途
 - [贡献指南](./CONTRIBUTING.md) — 环境搭建与工作流
 - [安全策略](./SECURITY.md) — 漏洞报告
 - [`HANDOFF.md`](./HANDOFF.md) — 当前工作状态；计划中的工作和将来的设计文档
@@ -274,5 +274,5 @@ just check   # fmt / secrets / machete / docs / clippy + audit / deny / outdated
 
 molehill 是 [rathole](https://github.com/rapiz1/rathole) 的社区 fork；版本号
 沿上游序列续计（上游最后一个版本是 v0.5.0）。发布机制见
-[docs/release.zh.md](./docs/release.zh.md)，仓库规则见
+[docs/release.md](./docs/release.md)，仓库规则见
 [AGENTS.md](./AGENTS.md)。
