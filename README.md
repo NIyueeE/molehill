@@ -113,7 +113,7 @@ pays the baseline only:
 ### molehill: multiplexing cost (mux vs mux-off)
 
 One binary, **one variable** — multiplexing on/off; `mux` is the control.
-Measured on the loopback cell (the perturbation is not run in weak cells).
+Loopback plus every weak cell.
 
 ![Multiplexing cost](assets/benchmark-mux-v0.7.2.png)
 
@@ -122,8 +122,25 @@ Measured on the loopback cell (the perturbation is not run in weak cells).
 | **mux (default)** | 10.2 | 9.5 | 0.262 ms | 0.333 ms | 22.6 MiB |
 | `mux = false` | 20.1 | 28.2 | 0.217 ms | 0.268 ms | 18.7 MiB |
 
+| Cell | mux 1-str | mux-off 1-str | mux 8-str | mux-off 8-str |
+|---|---|---|---|---|
+| loopback | 10.2 | 20.1 | 9.5 | 28.2 |
+| rtt10 | 6.3 | 8.3 | 5.9 | 10.1 |
+| rtt100 | 0.75 | 0.74 | 1.0 | 1.3 |
+| loss 1% | 4.4 | 4.3 | 4.7 | 18.5 |
+| loss 5% | 0.19 | 0.32 | 0.31 | 1.49 |
+| loss 2% burst | 4.0 | 4.3 | 4.3 | 18.7 |
+
 - Multiplexing trades single-stream throughput for connection efficiency:
-  with `mux = false` the same binary does 20.1 / 28.2 Gbit/s.
+  with `mux = false` the same binary does 20.1 / 28.2 Gbit/s on loopback.
+- Under pure delay the gap narrows (rtt100 single-stream is a tie) — the
+  per-connection cost is amortized once RTT dominates.
+- **Under loss the gap inverts for concurrent streams**: the single tunnel
+  shares one loss/retransmit domain (all streams stall together), while
+  `mux = false` retransmits per stream — at 1% loss, 8-stream throughput is
+  18.5 Gbit/s for mux-off vs 4.7 for mux. Single-stream loss behavior is
+  nearly identical; the multiplexing penalty shows up exactly where the
+  tunnel shares one fate domain.
 
 ### molehill: transport cost (mux vs noise vs tls)
 

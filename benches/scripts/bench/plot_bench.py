@@ -12,8 +12,8 @@ variable (no confounding):
   competition. Encrypted tools (e.g. chisel's SSH tunnel) are deliberately
   absent: their numbers are not comparable on the plain-TCP axis.
 - mux chart (`assets/benchmark-mux-vX.Y.Z.png`): mux vs mux-off — the one
-  variable is multiplexing on/off (loopback cell; the perturbation is not
-  run in weak cells).
+  variable is multiplexing on/off; loopback plus weak cells (under loss the
+  single tunnel shares one loss/retransmit domain, mux-off does not).
 - transport chart (`assets/benchmark-transport-vX.Y.Z.png`): mux vs noise vs
   tls — the one variable is the encrypted transport, multiplexing on for
   all three, with mux as the shared control.
@@ -293,39 +293,9 @@ def loopback_panels(axes, tools, colors, results, loopback):
     ax_mem.grid(axis="y", alpha=0.3)
 
 
-def render_mux(results, meta, out_path):
-    """Multiplexing cost: mux vs mux-off. ONE variable (multiplexing on/off);
-    measured on the loopback cell only — the perturbation is not run in the
-    weak cells, and mixing it with the transport dimension would confound
-    both comparisons."""
-    mux = mux_row(results)
-    off = [t for t in molehill_family(results) if "(mux-off)" in t]
-    tools = [mux, *off]
-    cells = [c["name"] for c in meta.get("cells", [])] or ["loopback"]
-    loopback = "loopback" if "loopback" in cells else cells[0]
-    colors = tool_colors(tools)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
-    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.22, top=0.80,
-                        wspace=0.3)
-    loopback_panels(axes, tools, colors, results, loopback)
-
-    footer(meta, "reproduce: just bench && just bench-plot")
-    fig.suptitle("Multiplexing cost — mux vs mux-off, one variable "
-                 f"({meta.get('date', '')})", fontsize=12)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"wrote {out_path}")
-
-
-def render_transport(results, meta, out_path):
-    """Transport cost: mux vs noise vs tls. ONE variable (the encrypted
-    transport), multiplexing on for all three; mux is the shared control.
-    Loopback panels plus the weak-cell behavior."""
-    mux = mux_row(results)
-    tools = [mux] + [t for t in molehill_family(results)
-                     if "(noise)" in t or "(tls)" in t]
+def render_dimension(results, meta, out_path, tools, suptitle):
+    """Single-variable comparison chart: loopback panels on top, weak-cell
+    panels below. `tools` share the mux control (one variable only)."""
     cells = [c["name"] for c in meta.get("cells", [])] or ["loopback"]
     loopback = "loopback" if "loopback" in cells else cells[0]
     colors = tool_colors(tools)
@@ -356,12 +326,35 @@ def render_transport(results, meta, out_path):
     ax_udp.set_title("UDP session RTT p99 per cell", fontsize=10)
 
     footer(meta, "reproduce: just bench && just bench-plot")
-    fig.suptitle("Transport cost — mux vs noise vs tls, one variable, "
-                 f"mux on ({meta.get('date', '')})", fontsize=12)
+    fig.suptitle(suptitle, fontsize=12)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"wrote {out_path}")
+
+
+def render_mux(results, meta, out_path):
+    """Multiplexing cost: mux vs mux-off. ONE variable (multiplexing on/off),
+    loopback plus the weak cells — under loss the single-tunnel (mux) shares
+    one loss/retransmit domain while mux-off does not, which is exactly the
+    behavior worth measuring."""
+    mux = mux_row(results)
+    off = [t for t in molehill_family(results) if "(mux-off)" in t]
+    render_dimension(results, meta, out_path, [mux, *off],
+                     "Multiplexing cost — mux vs mux-off, one variable "
+                     f"({meta.get('date', '')})")
+
+
+def render_transport(results, meta, out_path):
+    """Transport cost: mux vs noise vs tls. ONE variable (the encrypted
+    transport), multiplexing on for all three; mux is the shared control.
+    Loopback panels plus the weak-cell behavior."""
+    mux = mux_row(results)
+    tools = [mux] + [t for t in molehill_family(results)
+                     if "(noise)" in t or "(tls)" in t]
+    render_dimension(results, meta, out_path, tools,
+                     "Transport cost — mux vs noise vs tls, one variable, "
+                     f"mux on ({meta.get('date', '')})")
 
 
 def footer(meta, reproduce):
