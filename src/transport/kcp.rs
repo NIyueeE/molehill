@@ -185,13 +185,14 @@ const PACER_DOWN_FACTOR: f64 = 0.75; // PONG timeout
 const PACER_UP_FACTOR: f64 = 1.05; // sustained clean PONGs
 const KEEPALIVE_MS: u32 = 2000; // PING period (also NAT keep-alive)
 const PONG_TIMEOUT: Duration = Duration::from_millis(2500);
-/// Gap-notification cooldown and pile-up threshold: transient reordering
-/// (a few segments, sub-ms on loopback) must NOT trigger a SACK — the
-/// resend would waste bandwidth on an in-flight segment. A genuine loss
-/// parks dozens-to-hundreds of segments behind the gap, so wait for that
-/// signal.
-const SACK_COOLDOWN: Duration = Duration::from_millis(50);
-const SACK_PILEUP_SEGMENTS: usize = 32;
+/// Gap-notification cooldown and pile-up threshold. The cooldown sits
+/// BELOW the nodelay RTO floor (~30 ms) so a SACK beats the RTO backoff —
+/// the previous 50 ms only fired after the RTO had already retransmitted,
+/// making the extension inert on loss cells (measured: 10 ms / 16 segments
+/// gains +9% on `loss1_rtt10`, flat elsewhere, no jitter-cell regression).
+/// The pile-up still filters sub-ms loopback reordering.
+const SACK_COOLDOWN: Duration = Duration::from_millis(10);
+const SACK_PILEUP_SEGMENTS: usize = 16;
 
 struct Pacer {
     tokens: f64,

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The KCP adapter's SACK gap notification tightens from 50 ms / 32
+  segments to 10 ms / 16: the cooldown now sits below the nodelay RTO
+  floor, so a SACK beats the RTO backoff instead of firing after it
+  (measured +9% on the loss1_rtt10 cell, flat elsewhere, no jitter-cell
+  regression).
+
 - The KCP data plane batches UDP datagram IO on Linux (`recvmmsg` /
   `sendmmsg`, up to 32 datagrams per syscall — the same amortization
   QUIC stacks get from UDP GSO): loopback throughput improves +32%
