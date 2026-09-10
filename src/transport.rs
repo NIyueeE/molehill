@@ -96,6 +96,14 @@ pub(crate) use noise::NoiseKeys;
 #[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
 pub(crate) mod kcp;
 
+// Batch UDP datagram IO (recvmmsg/sendmmsg) for the KCP carrier on Linux.
+#[cfg(all(
+    target_os = "linux",
+    feature = "kcp",
+    any(feature = "client", feature = "server")
+))]
+pub(crate) mod udp_batch;
+
 #[cfg(feature = "multiplex")]
 pub(crate) mod multiplex;
 #[cfg(feature = "multiplex")]

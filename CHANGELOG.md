@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The KCP data plane batches UDP datagram IO on Linux (`recvmmsg` /
+  `sendmmsg`, up to 32 datagrams per syscall — the same amortization
+  QUIC stacks get from UDP GSO): loopback throughput improves +32%
+  (1-stream) and +8% (8-stream) on the kcp4 arm, with the weak cells
+  flat; the wire format is untouched (datagrams are byte-identical).
+
 - `just test-fast` and `just bench-fast`: a quick verification loop (lib +
   core integration subset) and a ~2-minute molehill-only smoke matrix into
   `results-dev.json`; the bench runner's default `--out` derives from

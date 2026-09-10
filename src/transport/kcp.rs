@@ -647,23 +647,92 @@ async fn maybe_ping(
 }
 
 /// Drain KCP's outbound datagrams onto the wire, through the pacer. A
-/// denied token leaves the datagram queued (the ARQ still holds it); the
-/// next pump iteration retries, so the drain never blocks the pump.
+/// denied token or a full kernel send buffer drops the datagram — KCP's
+/// ARQ still holds the segment and re-emits it on the next flush, so the
+/// drain never blocks the pump.
 async fn drain_dgrams(
     dgram_rx: &mut mpsc::UnboundedReceiver<Bytes>,
     net: &SessionNet,
     pace: &mut PaceState,
     sent_any: &mut bool,
 ) {
-    while let Ok(d) = dgram_rx.try_recv() {
-        match pace.pacer.allow(Instant::now(), d.len(), pace.rate_bps) {
-            Ok(()) => match net.send_datagram(&d).await {
-                Ok(()) => *sent_any = true,
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use tokio::io::Interest;
+
+        let mut batch: Vec<Bytes> = Vec::with_capacity(crate::transport::udp_batch::BATCH);
+        let mut send_batch = crate::transport::udp_batch::SendBatch::new();
+        loop {
+            batch.clear();
+            while batch.len() < crate::transport::udp_batch::BATCH {
+                match dgram_rx.try_recv() {
+                    Ok(d) => {
+                        if pace
+                            .pacer
+                            .allow(Instant::now(), d.len(), pace.rate_bps)
+                            .is_ok()
+                        {
+                            batch.push(d);
+                        } else {
+                            break; // denied: drop the copy, ARQ holds the segment
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if batch.is_empty() {
+                return;
+            }
+            // Park on writability first: this arms tokio's writable
+            // interest — a bare `try_io` would only run the closure on
+            // *cached* readiness and drop the very first batch. After an
+            // EAGAIN, `try_io` clears the cached flag, so this await parks
+            // until the kernel send buffer drains — no spinning.
+            if net.socket.writable().await.is_err() {
+                return;
+            }
+            match net.socket.try_io(Interest::WRITABLE, || {
+                send_batch.send(net.socket.as_raw_fd(), net.peer, &batch)
+            }) {
+                Ok(k) => {
+                    *sent_any = true;
+                    if k < batch.len() {
+                        // Partial send: drop the rest — KCP's ARQ re-emits
+                        // them on the next flush.
+                        return;
+                    }
+                }
+                // WouldBlock: kernel send buffer full; the datagrams are
+                // dropped and KCP's ARQ re-emits them on the next flush.
                 Err(e) => {
                     debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                    return;
                 }
-            },
-            Err(_) => break,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        while let Ok(d) = dgram_rx.try_recv() {
+            match pace.pacer.allow(Instant::now(), d.len(), pace.rate_bps) {
+                Ok(()) => {
+                    // Same park-then-try pattern as the Linux path.
+                    if net.socket.writable().await.is_err() {
+                        return;
+                    }
+                    match net.socket.try_send_to(&d, net.peer) {
+                        Ok(_) => *sent_any = true,
+                        // WouldBlock: drop and let the ARQ re-emit on the
+                        // next flush; tokio's try_send_to clears the
+                        // cached writability so the next park waits.
+                        Err(e) => {
+                            debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 }
@@ -765,7 +834,6 @@ async fn run_session(
     let mut pace = PaceState::new(start);
     // Last SACK gap notification (throttled by SACK_COOLDOWN).
     let mut last_sack_sent = Instant::now();
-
     while let Some(delay) = pump_head(&mut kcp, &net, &mut pace, start).await {
         let mut sent_any = false;
         tokio::select! {
@@ -1167,25 +1235,69 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
 
     // Ingress task: socket → session pump, filtered to the fixed peer.
     tokio::spawn(async move {
+        #[cfg(target_os = "linux")]
+        let mut batch = crate::transport::udp_batch::RecvBatch::new(
+            crate::transport::udp_batch::BATCH,
+            DGRAM_BUF,
+        );
+        #[cfg(not(target_os = "linux"))]
         let mut buf = [0u8; DGRAM_BUF];
         loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((n, from)) => {
-                    if from != remote {
-                        trace!("Dropping a KCP datagram from an unexpected peer {from}");
-                        continue;
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                use tokio::io::Interest;
+                if socket.readable().await.is_err() {
+                    break;
+                }
+                // `try_io` clears the cached readiness on EAGAIN (see
+                // `dispatch_recv`).
+                match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
+                    Ok(_) => {
+                        let mut pump_gone = false;
+                        for (from, data) in batch.iter() {
+                            if from != remote {
+                                trace!("Dropping a KCP datagram from an unexpected peer {from}");
+                                continue;
+                            }
+                            if pkt_tx.send(Bytes::copy_from_slice(data)).await.is_err() {
+                                pump_gone = true;
+                                break; // session pump gone
+                            }
+                        }
+                        if pump_gone {
+                            break;
+                        }
                     }
-                    if pkt_tx
-                        .send(Bytes::copy_from_slice(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break; // session pump gone
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Drained (stale readiness flag); park again.
+                    }
+                    Err(e) => {
+                        debug!("KCP client socket recv failed: {e}");
+                        break;
                     }
                 }
-                Err(e) => {
-                    debug!("KCP client socket recv failed: {e}");
-                    break;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if from != remote {
+                            trace!("Dropping a KCP datagram from an unexpected peer {from}");
+                            continue;
+                        }
+                        if pkt_tx
+                            .send(Bytes::copy_from_slice(&buf[..n]))
+                            .await
+                            .is_err()
+                        {
+                            break; // session pump gone
+                        }
+                    }
+                    Err(e) => {
+                        debug!("KCP client socket recv failed: {e}");
+                        break;
+                    }
                 }
             }
         }
@@ -1272,6 +1384,147 @@ impl Drop for KcpAcceptor {
     }
 }
 
+/// Route one inbound listener datagram: adapter control frames to the
+/// owning session, data to the session by `(peer, conv)`, adopting unknown
+/// conversations (subject to the session cap). Returns false when the
+/// acceptor is gone (the dispatcher should exit).
+#[cfg(any(feature = "server", test))]
+async fn route_datagram(
+    socket: &Arc<UdpSocket>,
+    sessions: &mut HashMap<SessionKey, mpsc::Sender<Bytes>>,
+    accepted_tx: &mpsc::Sender<AcceptedSession>,
+    gone_tx: &mpsc::Sender<SessionKey>,
+    from: SocketAddr,
+    data: &[u8],
+) -> bool {
+    // Adapter control frames (PING/PONG/SACK) are shorter than
+    // a KCP header: recognize them by the magic byte instead
+    // of dropping them as runts — the pacing/keepalive state
+    // machine depends on these crossing the listener.
+    let (conv, is_ctrl) = if is_ctrl_frame(data) {
+        let mut c = [0u8; 4];
+        c.copy_from_slice(&data[..4]);
+        (u32::from_le_bytes(c), true)
+    } else if data.len() >= KCP_OVERHEAD {
+        (get_conv(data), false)
+    } else {
+        trace!("Dropping a runt KCP datagram ({}) from {from}", data.len());
+        return true;
+    };
+    let key = (from, conv);
+    let pkt = Bytes::copy_from_slice(data);
+
+    // Control frames must reach the session pump even if no
+    // data session exists yet? No — they carry the session
+    // conv, so route like any other datagram; a PING for an
+    // unknown conv is silently dropped (never adopted).
+    if is_ctrl && !sessions.contains_key(&key) {
+        return true;
+    }
+
+    if let Some(tx) = sessions.get(&key) {
+        // Pure blocking hand-off: backpressure travels
+        // dispatcher → kernel socket buffer (sized for a full
+        // ARQ burst) → the peer's window, instead of dropping
+        // datagrams in userspace. A bounded wait was tried and
+        // rejected: with a burst (full window) larger than the
+        // session channel, the 2 ms cap dropped datagrams
+        // every burst and collapsed throughput. The per-session
+        // head-of-line cost (one lagging session parking the
+        // dispatcher) is bounded by the kernel socket buffers
+        // and the peer's window backpressure.
+        match tx.send(pkt).await {
+            Ok(()) => {}
+            Err(_) => {
+                sessions.remove(&key);
+            }
+        }
+        return true;
+    }
+
+    if sessions.len() >= MAX_LISTENER_SESSIONS {
+        warn!(
+            "KCP listener at the session cap ({}), dropping new conv {} from {from}",
+            MAX_LISTENER_SESSIONS, conv
+        );
+        return true;
+    }
+
+    // Adopt the conversation into a fresh session.
+    let net = SessionNet {
+        socket: Arc::clone(socket),
+        peer: from,
+        gone_tx: Some(gone_tx.clone()),
+        key,
+    };
+    let (stream, pkt_tx) = spawn_session(conv, net);
+    if pkt_tx.try_send(pkt).is_err() {
+        warn!("Fresh KCP session {key:?} rejected its first datagram");
+        return true;
+    }
+    sessions.insert(key, pkt_tx);
+    debug!(peer = %from, conv, "KCP session adopted");
+    accepted_tx
+        .send(AcceptedSession { stream, peer: from })
+        .await
+        .is_ok()
+}
+
+/// One dispatcher recv round: on Linux, wait for readability and drain one
+/// `recvmmsg` batch (bounded, so the shutdown/gone arms stay fair under
+/// load); elsewhere, receive one datagram. Routing happens inside.
+#[cfg(any(feature = "server", test))]
+async fn dispatch_recv(
+    socket: &Arc<UdpSocket>,
+    sessions: &mut HashMap<SessionKey, mpsc::Sender<Bytes>>,
+    accepted_tx: &mpsc::Sender<AcceptedSession>,
+    gone_tx: &mpsc::Sender<SessionKey>,
+    #[cfg(target_os = "linux")] batch: &mut crate::transport::udp_batch::RecvBatch,
+    #[cfg(not(target_os = "linux"))] buf: &mut [u8],
+) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        use tokio::io::Interest;
+        if socket.readable().await.is_err() {
+            return;
+        }
+        // `try_io` clears tokio's cached readiness when the drain hits
+        // EAGAIN, so the next `readable()` parks instead of spinning.
+        match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
+            Ok(_) => {
+                for (from, data) in batch.iter() {
+                    if !route_datagram(socket, sessions, accepted_tx, gone_tx, from, data).await {
+                        return; // acceptor dropped
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Drained: the stale-readiness flag was cleared by
+                // `try_io`, so the next `readable()` parks again.
+            }
+            Err(e) => {
+                warn!("KCP listener recv failed: {e}");
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match socket.recv_from(buf).await {
+            Ok((n, from)) => {
+                route_datagram(socket, sessions, accepted_tx, gone_tx, from, &buf[..n]).await;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Drained: the stale-readiness flag was cleared by
+                // `try_io`, so the next `readable()` parks again.
+            }
+            Err(e) => {
+                warn!("KCP listener recv failed: {e}");
+            }
+        }
+    }
+}
+
 /// The listener dispatcher: owns the session map, routes datagrams by
 /// `(peer, conv)` and adopts new conversations. Routing never blocks on a
 /// session's queue — overflow datagrams are dropped and recovered by KCP's
@@ -1284,98 +1537,30 @@ async fn dispatch(
 ) {
     let mut sessions: HashMap<SessionKey, mpsc::Sender<Bytes>> = HashMap::new();
     let (gone_tx, mut gone_rx) = mpsc::channel::<SessionKey>(64);
+    #[cfg(target_os = "linux")]
+    let mut batch =
+        crate::transport::udp_batch::RecvBatch::new(crate::transport::udp_batch::BATCH, DGRAM_BUF);
+    #[cfg(not(target_os = "linux"))]
     let mut buf = [0u8; DGRAM_BUF];
 
     loop {
+        let recv_fut = dispatch_recv(
+            &socket,
+            &mut sessions,
+            &accepted_tx,
+            &gone_tx,
+            #[cfg(target_os = "linux")]
+            &mut batch,
+            #[cfg(not(target_os = "linux"))]
+            &mut buf,
+        );
         tokio::select! {
             _ = shutdown_rx.changed() => break,
             // Forget exited sessions so their key can be reused cleanly.
             Some(key) = gone_rx.recv() => {
                 sessions.remove(&key);
             }
-            r = socket.recv_from(&mut buf) => {
-                let (n, from) = match r {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("KCP listener recv failed: {e}");
-                        continue;
-                    }
-                };
-                // Adapter control frames (PING/PONG/SACK) are shorter than
-                // a KCP header: recognize them by the magic byte instead
-                // of dropping them as runts — the pacing/keepalive state
-                // machine depends on these crossing the listener.
-                let (conv, is_ctrl) = if is_ctrl_frame(&buf[..n]) {
-                    let mut c = [0u8; 4];
-                    c.copy_from_slice(&buf[..4]);
-                    (u32::from_le_bytes(c), true)
-                } else if n >= KCP_OVERHEAD {
-                    (get_conv(&buf[..n]), false)
-                } else {
-                    trace!("Dropping a runt KCP datagram ({n} bytes) from {from}");
-                    continue;
-                };
-                let key = (from, conv);
-                let pkt = Bytes::copy_from_slice(&buf[..n]);
-
-                // Control frames must reach the session pump even if no
-                // data session exists yet? No — they carry the session
-                // conv, so route like any other datagram; a PING for an
-                // unknown conv is silently dropped (never adopted).
-                if is_ctrl && !sessions.contains_key(&key) {
-                    continue;
-                }
-
-                if let Some(tx) = sessions.get(&key) {
-                    // Pure blocking hand-off: backpressure travels
-                    // dispatcher → kernel socket buffer (sized for a full
-                    // ARQ burst) → the peer's window, instead of dropping
-                    // datagrams in userspace. A bounded wait was tried and
-                    // rejected: with a burst (full window) larger than the
-                    // session channel, the 2 ms cap dropped datagrams
-                    // every burst and collapsed throughput. The per-session
-                    // head-of-line cost (one lagging session parking the
-                    // dispatcher) is bounded by the kernel socket buffers
-                    // and the peer's window backpressure.
-                    match tx.send(pkt).await {
-                        Ok(()) => {}
-                        Err(_) => {
-                            sessions.remove(&key);
-                        }
-                    }
-                    continue;
-                }
-
-                if sessions.len() >= MAX_LISTENER_SESSIONS {
-                    warn!(
-                        "KCP listener at the session cap ({}), dropping new conv {} from {from}",
-                        MAX_LISTENER_SESSIONS, conv
-                    );
-                    continue;
-                }
-
-                // Adopt the conversation into a fresh session.
-                let net = SessionNet {
-                    socket: Arc::clone(&socket),
-                    peer: from,
-                    gone_tx: Some(gone_tx.clone()),
-                    key,
-                };
-                let (stream, pkt_tx) = spawn_session(conv, net);
-                if pkt_tx.try_send(pkt).is_err() {
-                    warn!("Fresh KCP session {key:?} rejected its first datagram");
-                    continue;
-                }
-                sessions.insert(key, pkt_tx);
-                debug!(peer = %from, conv, "KCP session adopted");
-                if accepted_tx
-                    .send(AcceptedSession { stream, peer: from })
-                    .await
-                    .is_err()
-                {
-                    break; // acceptor dropped
-                }
-            }
+            () = recv_fut => {}
         }
     }
 
