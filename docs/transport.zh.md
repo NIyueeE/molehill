@@ -1,75 +1,27 @@
 # 传输层
 
-默认情况下,`molehill` 按原样转发流量(明文 TCP)。可以通过不同的
-`transport` 配置来加密流量。`[client.transport]` 与 `[server.transport]`
-的 `type` 在两端必须一致。
-
-## TLS
-
-当你已经有证书(例如来自公共 CA 或 Let's Encrypt)时,TLS 是即插即用的
-选择。参见[示例](../examples/tls)。
-
-### 客户端
-
-通常使用自签名证书,此时客户端需要信任 CA。`trusted_root` 是根 CA 证书
-PEM 文件的路径。`hostname` 是客户端校验服务端证书时使用的主机名;它不必
-与 `client.remote_addr` 相同。
-
-```toml
-[client.transport]
-type = "tls"
-
-[client.transport.tls]
-trusted_root = "examples/tls/rootCA.crt"
-hostname = "localhost"
-```
-
-省略 `trusted_root` 时使用系统证书库,适用于公共信任的证书。
-
-### 服务端
-
-服务端需要 PKCS#12 归档文件,可以用 openssl 生成:
-
-```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt
-```
-
-参数:
-
-- `-inkey`:服务端私钥
-- `-in`:服务端证书
-- `-certfile`:CA 证书
-
-用自己的 CA 创建自签名证书不是一件小事;[tls 示例目录](../examples/tls)
-里提供了参考脚本。
-
-```toml
-[server.transport]
-type = "tls"
-
-[server.transport.tls]
-pkcs12 = "identity.pfx"
-pkcs12_password = "password"
-```
-
-### Rustls 支持
-
-`molehill` 提供可选的 `rustls` 支持;见[构建指南](build-guide.md)。一个
-差异是:加载 PKCS#12 归档所用的 crate 只处理有限类型的 PBE 算法,因此
-归档必须用 legacy(openssl 1.x)格式创建。使用 openssl 3 时加 `-legacy`:
-
-```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
-```
+默认情况下,`molehill` 按原样转发流量(明文 TCP)。客户端的
+`[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
+决定**:每条连接以 v3 传输选择器字节开头,服务端接受客户端说的任何一种
+语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
+`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见 README 的
+配置指南。本文只讲 `noise`;`plain` 除默认值外无需任何配置。
 
 ## Noise 协议
 
-[Noise 协议](http://noiseprotocol.org/noise.html)是 TLS 的轻量、易配置
-替代品:不需要自签名证书即可保护连接。
+[Noise 协议](http://noiseprotocol.org/noise.html)是轻量、易配置的传输加密
+方式:一对 X25519 密钥对,不需要 PKI。
 
-`molehill` 自带合理的默认配置;见最小[示例](../examples/noise_nk)。默认
-pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证(相当于
-配置正确的 TLS),因此不再有中间人(MITM)问题。
+`molehill` 自带合理的默认配置;见[noise 示例](./configuration.zh.md#noise加密传输)。默认
+pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不再有
+中间人(MITM)问题。
+
+> **ring-accelerated 改变了什么?** 默认构建链接了 `snow` 的
+> **ring-accelerated** resolver,于是 ChaCha20-Poly1305 数据路径——每个
+> 加密字节的热路径——走 ring 的硬件分派实现:x86-64 上传输层实测约为
+> 纯 Rust resolver 的 1.5 倍,端到端约 1.3 倍。pattern 的哈希(默认
+> BLAKE2s,其他 pattern 用 SHA-256/SHA-512)只在一次性握手中运行,不影响
+> 吞吐:所有 pattern 都走加速后的密码算法。线缆格式不变。
 
 使用它需要一个 X25519 密钥对。
 
@@ -98,12 +50,39 @@ type = "noise"
 [client.transport.noise]
 remote_public_key = "GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE="
 
-# 服务端
-[server.transport]
-type = "noise"
+# 服务端(只有密钥,没有 `type`;是否加密由客户端选择决定)
 [server.transport.noise]
 local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 ```
+
+### 按服务加密
+
+客户端全局的 `[client.transport].type` 是每个服务的默认值,每个服务都可以
+单独覆盖——包括自己的密钥,这正是多服务端场景需要的(每个服务端持有自己的
+密钥对):
+
+```toml
+[client.transport]
+type = "noise"            # 默认:所有服务加密
+[client.transport.noise]
+remote_public_key = "server-a-pub-key"
+
+[client.services.ssh]     # 继承:用全局密钥加密
+
+[client.services.bulk]
+transport = { type = "plain" }   # 退出:明文
+
+[client.services.region-b]       # 全局明文 + 本服务加密
+remote_addr = "region-b.example.com:2333"
+transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" } }
+```
+
+规则:`transport.type` 不设则跟随全局 `type`;`"noise"` 强制加密,`"plain"`
+强制明文。有效传输为 Noise 的服务必须要有密钥——优先用自己
+`transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
+Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
+(`carrier = "kcp"` 时的)Noise-over-KCP 包裹都用该服务的有效密钥。服务端
+只需要放置自己的密钥(v3 选择器:它接受每条连接所说的语言)。
 
 ### 指定 pattern
 
@@ -162,13 +141,3 @@ psk_location = 0
 
 - [7.5. 交互式握手 pattern(基础)](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
 - [8. 协议名与修饰符](https://noiseprotocol.org/noise.html#protocol-names-and-modifiers)
-
-## WebSocket
-
-`websocket` 传输把 molehill 协议封装在 WebSocket 之上,适合只允许
-HTTP(S) 流量的环境。两端都设置 `type = "websocket"` 并配置对应块:
-
-```toml
-[client.transport.websocket] # 或 [server.transport.websocket]
-tls = true # 必填。WebSocket 连接上的 TLS(使用上面的 TLS 设置);设为 false 使用明文 WebSocket
-```

@@ -1,29 +1,31 @@
 [client]
-remote_addr = "127.0.0.1:2332"
 default_token = "default_token_if_not_specify"
+
+[client.control]
+default_remote_addr = "127.0.0.1:2332"
 
 [client.transport]
 type = "noise" 
+
 [client.transport.noise]
 remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
 [client.services.echo]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:8080"
 remote_bind_addr = "0.0.0.0:2336"
 
 [client.services.pingpong]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:8081"
 remote_bind_addr = "0.0.0.0:2337"
 
 [server]
-bind_addr = "0.0.0.0:2332"
 default_token = "default_token_if_not_specify"
 allow_ports = ["2334-2337"]
 
-[server.transport]
-type = "noise" 
+[server.control]
+bind_addr = "0.0.0.0:2332"
+
 [server.transport.noise]
 local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
-

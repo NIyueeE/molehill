@@ -1,64 +1,29 @@
 # Transport
 
-By default, `molehill` forwards traffic as it is (plain TCP). Different `transport` configurations can be enabled to secure the traffic. The `type` of `[client.transport]` and `[server.transport]` must match on both sides.
-
-## TLS
-
-TLS is the drop-in choice when you already have certificates, e.g. from a public CA or Let's Encrypt. See the [example](../examples/tls).
-
-### Client
-
-Normally a self-signed certificate is used, in which case the client needs to trust the CA. `trusted_root` is the path to the root CA's certificate PEM file. `hostname` is the hostname that the client uses to validate against the certificate that the server presents; it does not have to be the same as `client.remote_addr`.
-
-```toml
-[client.transport]
-type = "tls"
-
-[client.transport.tls]
-trusted_root = "examples/tls/rootCA.crt"
-hostname = "localhost"
-```
-
-If `trusted_root` is omitted, the system certificate store is used, which works for publicly trusted certificates.
-
-### Server
-
-A PKCS#12 archive is needed on the server side. It can be created with openssl:
-
-```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt
-```
-
-Arguments:
-
-- `-inkey`: Server private key
-- `-in`: Server certificate
-- `-certfile`: CA certificate
-
-Creating a self-signed certificate with one's own CA is a non-trivial task; a script is provided in the [tls example folder](../examples/tls) for reference.
-
-```toml
-[server.transport]
-type = "tls"
-
-[server.transport.tls]
-pkcs12 = "identity.pfx"
-pkcs12_password = "password"
-```
-
-### Rustls support
-
-`molehill` provides optional `rustls` support; see the [build guide](build-guide.md). One difference is that the crate used for loading PKCS#12 archives only handles limited types of PBE algorithms, so the archive must be created in the legacy (openssl 1.x) format. With openssl 3, add `-legacy`:
-
-```sh
-openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
-```
+By default, `molehill` forwards traffic as it is (plain TCP). The client's
+`[client.transport]` block supports two types — `plain` and `noise` — and
+**the client decides**: every connection starts with a v3 transport selector
+byte, and the server accepts whatever the client speaks (its
+`[server.transport]` block only places the Noise keys — there is no
+server-side `type`). The noise-vs-plain benchmark is the price list for
+this choice: see README's configuration guide. This page covers `noise`;
+`plain` needs no configuration beyond the default.
 
 ## Noise Protocol
 
-The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight, easy-to-configure drop-in replacement of TLS: no self-signed certificates are needed to secure the connection.
+The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight,
+easy-to-configure way to encrypt the connection: one X25519 keypair, no PKI.
 
-`molehill` comes with a reasonable default configuration; see the minimal [example](../examples/noise_nk). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server (like TLS with properly configured certificates), so MITM is no longer a problem.
+`molehill` comes with a reasonable default configuration; see the minimal [noise example](./configuration.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so MITM is no longer a problem.
+
+> **What does ring-accelerated change?** The default build links `snow`'s
+> **ring-accelerated** resolver, so the ChaCha20-Poly1305 data path — the
+> hot path for every encrypted byte — runs ring's hardware-dispatched
+> implementation: measured ~1.5x the pure-Rust resolver at the transport
+> level and ~1.3x end-to-end on x86-64. The pattern's hash (BLAKE2s by
+> default, or SHA-256/SHA-512 for other patterns) only runs during the
+> one-time handshake, so it does not affect throughput: every pattern gets
+> the accelerated cipher. The wire format is unchanged.
 
 To use it, an X25519 keypair is needed.
 
@@ -86,12 +51,41 @@ type = "noise"
 [client.transport.noise]
 remote_public_key = "GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE="
 
-# Server side
-[server.transport]
-type = "noise"
+# Server side (keys only — no `type`; the client's choice decides)
 [server.transport.noise]
 local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 ```
+
+### Per-service encryption
+
+The client-wide `[client.transport].type` is the default for every service,
+and each service can override it individually — including its own keys, which
+is what a multi-server setup needs (each server holds its own keypair):
+
+```toml
+[client.transport]
+type = "noise"            # default: every service is encrypted
+[client.transport.noise]
+remote_public_key = "server-a-pub-key"
+
+[client.services.ssh]     # inherits: encrypted with the global key
+
+[client.services.bulk]
+transport = { type = "plain" }   # opt out: plain
+
+[client.services.region-b]       # global plain + this service encrypted
+remote_addr = "region-b.example.com:2333"
+transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" } }
+```
+
+Rules: `transport.type` unset follows the client-wide `type`; `"noise"`
+forces encryption, `"plain"` forces plaintext. A service whose effective transport is
+Noise needs keys — its own `transport.noise` if set, else the global
+`[client.transport].noise`; configuring effective Noise with no keys
+anywhere is a startup error. The data plane follows the service: TCP
+tunnels and (with `carrier = "kcp"`) the Noise-over-KCP wrapping both use
+the service's effective keys. The server needs nothing beyond placing its
+keys (v3 selector: it accepts whatever each connection speaks).
 
 ### Specifying the pattern
 
@@ -147,12 +141,3 @@ To find out which pattern to use, refer to:
 
 - [7.5. Interactive handshake patterns (fundamental)](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
 - [8. Protocol names and modifiers](https://noiseprotocol.org/noise.html#protocol-names-and-modifiers)
-
-## WebSocket
-
-The `websocket` transport tunnels the molehill protocol over WebSocket, which can help when only HTTP(S) traffic is allowed. Set `type = "websocket"` on both sides and configure the block:
-
-```toml
-[client.transport.websocket] # or [server.transport.websocket]
-tls = true # Necessary. TLS on the WebSocket connection (uses the TLS settings above); set to false for plain WebSocket
-```
