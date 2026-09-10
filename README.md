@@ -68,7 +68,7 @@ The measurements below justify the defaults and tell you when to deviate.
 | **`mode = "direct"`** | one service or a few long-lived streams (SSH); **raw throughput first** (bulk transfers): 19.3/28.0 Gbit/s on loopback | one physical tunnel per stream: FDs/ports/NAT mappings scale with stream count; per-connection setup is real (churn p99 ~3.5 ms at 16-way concurrency) but invisible at `pool_size = 8` |
 | **`count = 4` (default)** | many concurrent streams, or a lossy path: independent tunnels isolate head-of-line blocking and aggregate beyond a single flow | 4 physical connections per service (FDs/ports/NAT mappings); at 1% loss 8-stream 15.4 vs 4.6 Gbit/s at `count = 1`; under heavy loss the shared retransmit domain shows (loss5 HoL max 1673 vs 1157 ms at `count = 1`) |
 | **`count = 1`** | one long-lived stream, or a tight connection budget | one TCP-flow ceiling; every stream shares one retransmit domain |
-| **`carrier = "kcp"`** (experimental) | only when TCP data tunnels are blocked or throttled; KCP trades CPU and memory for aggressive loss recovery over UDP | much lower throughput than `carrier = "tcp"` in every cell (loopback 1-str 2.5 vs 4.8 Gbit/s against the noise control; jitter cell 0.127 vs 2.1) and ~4x the RSS (102 vs 24 MiB); its one win: at rtt100 its UDP session quality holds (loss 0%, max gap 20 ms vs the TCP arms' 100+ ms) |
+| **`carrier = "kcp"`** (experimental) | only when TCP data tunnels are blocked or throttled; KCP trades CPU and memory for aggressive loss recovery over UDP | much lower throughput than `carrier = "tcp"` in every cell (loopback 1-str 3.2 vs 4.8 Gbit/s against the noise control; jitter cell 0.151 vs 2.1) and ~4x the RSS (91 vs 24 MiB); its one win: at rtt100 its UDP session quality holds (loss 0%, max gap 20 ms vs the TCP arms' 100+ ms) |
 | **noise** | encrypted transport wanted with **memory and simplicity first**: a pre-shared public key and no PKI, at 23.8 MiB | throughput 4.8/14.8 vs 10.9/27.7 Gbit/s plain (1/8 streams) on loopback; RTT cost sub-millisecond; CPU is a wash with plain (both ~550% of one core under full load — the ring-accelerated cipher's cost is hidden by the forwarding path) |
 
 How to apply each choice: the `[client.data]` block holds the per-client
@@ -205,21 +205,28 @@ One variable (what carries the data channels), noise control channel,
 
 | Cell | tcp 1-str | kcp 1-str | tcp 8-str | kcp 8-str | tcp HoL max | kcp HoL max | tcp RSS | kcp RSS |
 |---|---|---|---|---|---|---|---|---|
-| loopback | 4.8 | 2.5 | 14.8 | 5.9 | 33.4 | 33.4 | 23.8 | 102.3 |
-| rtt10 | 4.2 | 0.391 | 5.5 | 0.39 | 81.1 | 81.1 | 20.6 | 121.1 |
-| rtt100 | 0.652 | 0.04 | 0.992 | 0.051 | 801.6 | 801.3 | 19.3 | 84.4 |
-| loss1_rtt10 | 3.7 | 0.356 | 8.6 | 0.413 | 360.0 | 327.5 | 28.5 | 111.4 |
-| loss5_rtt100 | 0.242 | 0.025 | 0.62 | 0.045 | 2963.2 | 1444.0 | 21.6 | 80.8 |
-| loss2b25_rtt10 | 3.3 | 0.353 | 9.5 | 0.382 | 1179.7 | 523.2 | 34.3 | 108.6 |
-| rate100_rtt20 | 0.03 | 0.023 | 0.03 | 0 | 514.2 | 377.8 | 18.1 | 49.4 |
-| rate20_rtt40 | 0.007 | 0.005 | - | - | 2039.8 | 2252.5 | 19.9 | 27.7 |
-| jitter20_10 | 2.1 | 0.127 | 3.1 | 0.114 | 159.3 | 377.3 | 21.6 | 106.1 |
+| loopback | 4.8 | 3.2 | 14.8 | 1.5 | 33.4 | 33.4 | 23.8 | 91.0 |
+| rtt10 | 4.2 | 0.415 | 5.5 | 0.653 | 81.1 | 80.9 | 20.6 | 57.4 |
+| rtt100 | 0.652 | 0.038 | 0.992 | 0.064 | 801.6 | 801.0 | 19.3 | 33.8 |
+| loss1_rtt10 | 3.7 | 0.418 | 8.6 | 0.686 | 360.0 | 288.7 | 28.5 | 67.9 |
+| loss5_rtt100 | 0.242 | 0.029 | 0.62 | 0.038 | 2963.2 | 801.0 | 21.6 | 41.4 |
+| loss2b25_rtt10 | 3.3 | 0.393 | 9.5 | 0.691 | 1179.7 | 315.4 | 34.3 | 64.1 |
+| rate100_rtt20 | 0.03 | 0.028 | 0.03 | - | 514.2 | 246.4 | 18.1 | 42.9 |
+| rate20_rtt40 | 0.007 | 0.004 | - | - | 2039.8 | 958.9 | 19.9 | 25.6 |
+| jitter20_10 | 2.1 | 0.151 | 3.1 | 0.176 | 159.3 | 349.9 | 21.6 | 68.5 |
 
 KCP-over-UDP stays far slower than TCP tunnels in every cell and costs
 ~4x the memory (the 2048/4096 ARQ windows); its one measured win is UDP
 session quality at high delay: at rtt100 its probe shows 0% loss and a
 20 ms max inter-packet gap where the TCP arms' games stall 100+ ms. It is
 worth considering only when TCP data tunnels are blocked or throttled.
+
+The kcp4 numbers above are the 2026-09-10 refresh (batched datagram IO
+and tightened SACK thresholds — see HANDOFF.md). Note the loopback
+8-stream cell: the re-measured 1.5 Gbit/s reflects today's host state
+(the previous 5.9 was not reproducible on this host for either code
+version, A/B-checked), while the loss cells improved +11-81% across the
+board.
 
 ### Configuration tradeoffs (loopback)
 
@@ -231,7 +238,7 @@ worth considering only when TCP data tunnels are blocked or throttled.
 | mux-off | 596.6 | 4969.3 | 3.55 | 19997.8 | 24.65 | 17.56 |
 | noise | 535.3 | 4960.0 | 3.56 | 19997.8 | 15.93 | 4.84 |
 | mux1 | 262.6 | 5005.7 | 3.53 | 19999.6 | - | 9.00 |
-| kcp4 | 344.2 | 4698.7 | 4.46 | 19999.7 | 0.56 | 0.03 |
+| kcp4 | 366.0 | 4778.3 | 3.71 | 19999.0 | 6.59 | 0.38 |
 
 Every mode sustains ~20k UDP datagrams/s with 0% loss and ~5k
 connections/s under churn (setup-to-first-byte p99 ~3.5-4.7 ms — the pool

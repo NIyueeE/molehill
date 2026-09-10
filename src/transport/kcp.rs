@@ -45,6 +45,13 @@
 //! trigger 2, congestion control disabled (`nc=1`); send window 2048
 //! segments (~2.8 MiB in flight), receive window 4096; MTU 1400 (protocol
 //! default); dead-link default (20 retransmits); 32 MiB socket buffers.
+//! SACK gap notification: 10 ms cooldown, 16-segment pile-up (below the
+//! nodelay RTO floor, so the SACK beats the RTO backoff).
+//!
+//! **IO batching**: on Linux the datagram path batches with
+//! `recvmmsg`/`sendmmsg` (up to 32 datagrams per syscall, the
+//! amortization QUIC stacks get from UDP GSO — see `udp_batch.rs`); the
+//! wire format is untouched. Other platforms keep single-datagram calls.
 //!
 //! Security note: KCP provides reliability, not confidentiality. In the
 //! arm-2 stack Noise rides **on top** of `KcpStream`

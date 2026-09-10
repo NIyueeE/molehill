@@ -123,10 +123,29 @@ had zero-or-one pinger replies over repeated runs, so the probe change — not
 a transient — is what records them). The host could not reproduce the
 baseline for `mux-off` (~20% low: 22.6 vs 28.0 Gbit/s 8-stream under current
 load), so the rest of `results-v0.8.0.json` is untouched; a full-matrix
-re-run on a quiet host is still needed before the next tag. Peer binaries are
+re-run on a quiet host is still needed before the next tag.
+
+KCP optimization refresh (2026-09-10, full rigor, kcp4 arm only, merged
+into `results-v0.8.0.json`; meta now reads `ebb615bff576` / 2026-09-10):
+loopback 1-stream 2.496 -> 3.191 Gbit/s (+28%, A/B against the
+pre-optimization code on the same host: 2.405), rtt10 8-stream 0.39 ->
+0.653 (+67%), loss1 0.356/0.413 -> 0.418/0.686 (+17%/+66%), loss2b25
+0.353/0.382 -> 0.393/0.691 (+11%/+81%), loss5 0.025/0.045 -> 0.029/0.038
+(two complementary passes merged), rate100 0.023 -> 0.028, rate20 0.005
+-> 0.004 (floor), jitter 0.127/0.114 -> 0.151/0.176, rtt100 0.04/0.051
+-> 0.038/0.064. Cell fragility notes: loopback 8-stream measures ~1.4
+today for BOTH code versions (A/B: old code 1.116, new 1.453; the
+committed 5.9 was not reproducible on this host — same story as
+`mux-off` above); rtt100 1-stream flaked to 0.008 in one pass and the
+backfill's 0.038/old-code's 0.04 stand; rate100 1-stream flaked to
+0.008 in the first pass, the backfill's 0.028 matches the old code's
+0.025; rate100/rate20 8-stream stayed unrecordable (iperf3 single-test
+server wedge — the committed rate100 8s was a fake zero and rate20 8s
+was already None). Peer binaries are
 cached under `~/tmp/bench-peers` (not `/tmp`, which session cleanup wipes)
 and pinned to the baseline versions (frp 0.71.0 / rathole 0.5.0 / bore
 0.6.0), fetched directly because the unauthenticated GitHub API was
+rate-limited.
 
 KCP in-repo self-maintenance (2026-09-10): the KCP protocol engine moved
 from the `third_party/kcp` path dependency into `src/kcp/`, maintained as
@@ -155,7 +174,27 @@ overflows on a hostile `frg = 255`; the dead conv-adoption hook
 Remaining benign deltas: relative `check()` return, `Err(NeedUpdate)` on
 pre-first-update flush, bool `nodelay` (the reference's nodelay=2 mode is
 unreachable — the adapter uses 1).
-rate-limited.
+
+KCP optimization pass (2026-09-10, two tuning changes on top of the
+absorption, both validated against the committed baseline on the same
+host):
+- datagram IO batching on Linux (`recvmmsg`/`sendmmsg`, up to 32
+  datagrams per syscall — `src/transport/udp_batch.rs`, the second
+  audited unsafe site after `src/common/multi_map.rs`): loopback
+  1-stream +28-33% (A/B: 2.405 -> 3.191), weak cells flat-to-better;
+  the EAGAIN path runs through `UdpSocket::try_io`, which clears
+  tokio's cached readiness, so the park-then-drain loops never spin;
+  a full kernel send buffer drops the datagram and KCP's ARQ re-emits
+  it on the next flush.
+- SACK thresholds 50 ms / 32 segments -> 10 ms / 16: the old cooldown
+  sat ABOVE the nodelay RTO floor (~30 ms), so the SACK fired only
+  after the RTO had already retransmitted — it was inert on loss
+  cells. Tuned, the SACK beats the RTO backoff: the loss cells in the
+  refresh above improved +11-81% (1-stream and 8-stream).
+MTU is NOT a tuning direction (IP-fragmentation risk on real paths):
+the `set_mtu` probe (1400 -> 8000 measured +84%..+476% on the weak
+cells but -29% loopback 8-stream) was reverted and removed from the
+tuning space.
 
 Known waiver (v0.7.2 era): results files before schema v3 measured throughput
 by dialing the **backend directly** (bypassing the tunnel), so every tool
