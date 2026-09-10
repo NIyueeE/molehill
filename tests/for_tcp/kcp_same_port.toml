@@ -1,0 +1,35 @@
+# Same-port fixture: neither side sets a data-plane address, so the KCP
+# tunnel endpoint defaults to the control endpoint — TCP control and UDP KCP
+# data share port 2341 (different protocols, no conflict). Two KCP sessions
+# also share the one UDP listener (demuxed by peer address + conv id).
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+
+[client.control]
+default_remote_addr = "127.0.0.1:2341"
+
+[client.data]
+default_carrier = "kcp"
+default_count = 2
+
+[client.transport]
+type = "plain"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[client.services.pingpong]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2335"
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "0.0.0.0:2341"
+
+[server.data]
+
