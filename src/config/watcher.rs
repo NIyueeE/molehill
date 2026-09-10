@@ -20,13 +20,13 @@ use notify::{EventKind, RecursiveMode, Watcher};
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
     #[cfg(feature = "notify")]
-    ClientChange(ClientServiceChange),
+    ClientChange(Box<ClientServiceChange>),
 }
 
 #[cfg(feature = "notify")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientServiceChange {
-    Add(ClientServiceConfig),
+    Add(Box<ClientServiceConfig>),
     Delete(String),
 }
 
@@ -56,10 +56,10 @@ impl InstanceConfig for ClientConfig {
         left == right
     }
     fn service_delete_change(s: String) -> ConfigChange {
-        ConfigChange::ClientChange(ClientServiceChange::Delete(s))
+        ConfigChange::ClientChange(Box::new(ClientServiceChange::Delete(s)))
     }
     fn service_add_change(cfg: Self::ServiceConfig) -> ConfigChange {
-        ConfigChange::ClientChange(ClientServiceChange::Add(cfg))
+        ConfigChange::ClientChange(Box::new(ClientServiceChange::Add(Box::new(cfg))))
     }
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig> {
         &self.services
@@ -229,7 +229,6 @@ fn calculate_instance_config_events<T: InstanceConfig>(
 
 #[cfg(all(test, feature = "notify"))]
 mod test {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::config::ServerConfig;
 

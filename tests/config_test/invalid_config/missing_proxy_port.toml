@@ -1,10 +1,11 @@
 [client]
-remote_addr = "example.com:2333"
 default_token = "123"
 
+[client.control]
+default_remote_addr = "example.com:2333"
+
 [client.transport]
-type = "tcp"
-[client.transport.tcp]
+type = "plain"
 proxy = "socks5://127.0.0.1"
 
 [client.services.foo]

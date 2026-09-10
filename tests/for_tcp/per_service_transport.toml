@@ -1,0 +1,36 @@
+# Per-service transport fixture: the client-wide transport is plain, and
+# one service opts into Noise with its own keys (`transport.type = "noise"`
+# plus `transport.noise`) — the multi-server scenario where a service dials
+# a different server with its own public key. The other service inherits
+# plain. One client, two transports, one keyed server.
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+
+[client.control]
+default_remote_addr = "127.0.0.1:2349"
+
+[client.transport]
+type = "plain"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[client.services.pingpong]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2335"
+[client.services.pingpong.transport]
+type = "noise"
+[client.services.pingpong.transport.noise]
+remote_public_key = "sukCwgWeNuVWd0gSm+dgQT636fWfzfV7U16b8xwxDxc=" # security-scan:allow dummy fixture keypair, generated for this fixture
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "127.0.0.1:2349"
+
+[server.transport.noise]
+local_private_key = "fhfbkUGkVR1f5buTxhLiVQPKP93tQD0lrVEIT2QelqE=" # security-scan:allow dummy fixture keypair, generated for this fixture

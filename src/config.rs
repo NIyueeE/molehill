@@ -3,15 +3,14 @@ pub mod watcher;
 
 #[cfg(any(feature = "client", feature = "notify"))]
 pub use parsing::{ClientConfig, ClientServiceConfig, HealthCheckConfig, HealthCheckType};
-// Public API re-exports: some names are only consumed by feature-gated
-// modules, so client-only builds would otherwise warn about `ServerConfig`.
-#[allow(unused_imports)]
-pub use parsing::{
-    Config, MaskedString, ServerConfig, ServiceType, TcpConfig, TransportConfig, TransportType,
-};
-// Only used by the TLS transports, which are not compiled in embedded builds
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-pub use parsing::TlsConfig;
+// Server-side names are only consumed by the server run mode
+// (ServerControlConfig/ServerTransportConfig stay internal to parsing).
+#[cfg(feature = "server")]
+pub use parsing::ServerConfig;
+pub use parsing::{Config, MaskedString, ServiceType, TransportConfig, TransportType};
+// Only meaningful together with the data-plane fields they select between
+#[cfg(feature = "multiplex")]
+pub use parsing::{DataCarrier, DataMode};
 // Only used by the noise transport
 #[cfg(feature = "noise")]
 pub use parsing::NoiseConfig;

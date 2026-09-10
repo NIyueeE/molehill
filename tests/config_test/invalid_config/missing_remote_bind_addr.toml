@@ -1,12 +1,16 @@
 [client]
-remote_addr = "example.com:2333"
 default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
 
 [client.services.test]
 local_addr = "127.0.0.1:80"
 # `remote_bind_addr` is required
 
 [server]
-bind_addr = "0.0.0.0:2333"
 default_token = "t"
 allow_ports = ["6000-6999"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"

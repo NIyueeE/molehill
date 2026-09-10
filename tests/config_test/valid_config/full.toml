@@ -1,22 +1,14 @@
 [client]
-remote_addr = "example.com:2333" # Necessary. The address of the server
 default_token = "default_token_if_not_specify" # Necessary. Must match `[server].default_token`
-heartbeat_timeout = 40 # Optional. Must be greater than `server.heartbeat_interval`. Default: 40 seconds
-retry_interval = 1 # Optional. Default: 1 second
-prefer_ipv6 = false # Optional. Default: false
+
+[client.control]
+default_remote_addr = "example.com:2333" # Necessary. The address of the server
+default_heartbeat_timeout = 40 # Optional. Must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
+default_retry_interval = 1 # Optional. Default: 1 second
 
 [client.transport]
-type = "tcp" # Optional. Possible values: ["tcp", "tls", "noise", "websocket"]. Default: "tcp"
-
-[client.transport.tcp] # Optional. TCP socket options (also apply to `tls` and `noise`)
+type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect through a proxy
-nodelay = true # Optional. Default: true
-keepalive_secs = 20 # Optional. Default: 20 seconds
-keepalive_interval = 8 # Optional. Default: 8 seconds
-
-[client.transport.tls] # Necessary if `type` is "tls"
-trusted_root = "ca.pem" # Necessary. The certificate of CA that signed the server's certificate
-hostname = "example.com" # Optional. The hostname that the client uses to validate the certificate. If not set, fallback to `client.remote_addr`
 
 [client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
@@ -25,12 +17,9 @@ remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
-[client.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # Necessary. TLS on the WebSocket connection
-
 [client.services.service1]
-type = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
-prefer_ipv6 = false # Optional. If the client prefers to use IPv6 when connecting to the server (e.g.: When the client is behind an ISP's NAT). Default: false
+protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
+udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only). Default: false
 local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
 remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server
 nodelay = true # Optional. Override the default nodelay behavior per service
@@ -38,31 +27,21 @@ retry_interval = 1 # Optional. Override the global `retry_interval` per service
 pool_size = 8 # Optional. Requested number of pre-established data channels. Default: 8 for TCP, 2 for UDP
 
 [client.services.service2]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
 udp_buffer_size = 2048 # Optional. Receive buffer size for datagrams in bytes. Default: 2048, max 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped. Default: 60
-udp_sendq_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
+udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients.
 default_token = "default_token_if_not_specify" # Necessary. Must match `[client].default_token`
 allow_ports = ["6000-6999", "8080-8090"] # Necessary to enable dynamic registration. Empty or missing = all registrations rejected. Privileged ports (<1024) must be listed explicitly
 max_pool_size = 16 # Optional. Upper bound applied to every service's requested pool_size. Default: no limit
+
+[server.control]
+bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients.
 heartbeat_interval = 30 # Optional. Default: 30 seconds
-
-[server.transport]
-type = "tcp" # Same as `[client.transport]`
-
-[server.transport.tcp] # Same as the client
-nodelay = true
-keepalive_secs = 20
-keepalive_interval = 8
-
-[server.transport.tls] # Necessary if `type` is "tls"
-pkcs12 = "identify.pfx" # Necessary. pkcs12 file of server's certificate and private key
-pkcs12_password = "password" # Necessary. Password of the pkcs12 file
 
 [server.transport.noise] # Same as `[client.transport.noise]`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
@@ -71,5 +50,3 @@ remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
-[server.transport.websocket] # Necessary if `type` is "websocket"
-tls = true # Necessary. TLS on the WebSocket connection
