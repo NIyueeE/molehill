@@ -50,6 +50,7 @@ def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
     """Steady same-socket UDP ping; returns the session-quality dict."""
     interval = interval_ms / 1000.0
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
     s.connect((host, port))
 
     sent = received = 0

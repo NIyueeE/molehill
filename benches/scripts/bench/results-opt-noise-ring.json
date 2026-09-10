@@ -1,0 +1,360 @@
+{
+  "meta": {
+    "schema": 3,
+    "date": "2026-09-08",
+    "topology": "loopback visitor->server->client->backend",
+    "transport": "plain tcp + noise (molehill variants)",
+    "reps": 3,
+    "peer_reps": 1,
+    "secs_per_rep_loopback": 8,
+    "secs_per_rep_weak": 15,
+    "peer_secs_per_rep_loopback": 5,
+    "peer_secs_per_rep_weak": 8,
+    "hol_probe_seconds": 8.0,
+    "latency_samples": 300,
+    "memory_samples_interval_s": 0.5,
+    "hostname": "13614b7217ad",
+    "kernel": "6.12.0-160000.37-default",
+    "cpu": "Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz",
+    "cells": [
+      {
+        "name": "loopback",
+        "loss_pct": 0.0,
+        "burst_pct": 0.0,
+        "rate_mbit": 0.0,
+        "rtt_ms": 0.0,
+        "mech": "direct",
+        "loss_model": ""
+      },
+      {
+        "name": "loss1_rtt10",
+        "loss_pct": 1.0,
+        "burst_pct": 0.0,
+        "rate_mbit": 0.0,
+        "rtt_ms": 10.0,
+        "mech": "netem",
+        "loss_model": "random 1%"
+      },
+      {
+        "name": "loss5_rtt100",
+        "loss_pct": 5.0,
+        "burst_pct": 0.0,
+        "rate_mbit": 0.0,
+        "rtt_ms": 100.0,
+        "mech": "netem",
+        "loss_model": "random 5%"
+      }
+    ],
+    "tool_versions": {
+      "molehill": "0.7.2"
+    }
+  },
+  "results": {
+    "molehill 0.7.2 (mux)": {
+      "loopback": {
+        "status": "ok",
+        "throughput_1stream_gbps": 9.283,
+        "retransmits_1stream": 0,
+        "throughput_8streams_gbps": 25.87,
+        "retransmits_8streams": 260,
+        "echo_rtt_ms": {
+          "p50": 0.261,
+          "p95": 0.309,
+          "p99": 0.339,
+          "mean": 0.264
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.438,
+          "p95": 0.57,
+          "p99": 0.627,
+          "mean": 0.427
+        },
+        "udp_rtt_ms": {
+          "p50": 0.445,
+          "p95": 0.628,
+          "p99": 0.654,
+          "mean": 0.454
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.103,
+        "udp_max_gap_ms": 20.401,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.296,
+          "ping_rtt_ms": {
+            "p50": 0.38,
+            "p95": 0.58,
+            "p99": 0.943,
+            "mean": 0.393
+          },
+          "ping_max_gap_ms": 33.433
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.116,
+            "p95": 0.165,
+            "p99": 0.221,
+            "mean": 0.123
+          },
+          "ping_max_gap_ms": 33.519,
+          "ping_sent": 240,
+          "ping_received": 240,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 9621,
+          "client_avg_kb": 10092,
+          "total_avg_kb": 19713,
+          "total_peak_kb": 25564,
+          "samples": 169
+        }
+      },
+      "loss1_rtt10": {
+        "status": "ok",
+        "throughput_1stream_gbps": 4.239,
+        "retransmits_1stream": 1257,
+        "throughput_8streams_gbps": 15.625,
+        "retransmits_8streams": 5545,
+        "echo_rtt_ms": {
+          "p50": 101.284,
+          "p95": 349.436,
+          "p99": 1137.967,
+          "mean": 151.693
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.751,
+          "p95": 285.568,
+          "p99": 327.625,
+          "mean": 77.601
+        },
+        "udp_rtt_ms": {
+          "p50": 60.57,
+          "p95": 80.688,
+          "p99": 100.66,
+          "mean": 62.729
+        },
+        "udp_loss_pct": 4.5,
+        "udp_jitter_ms": 2.656,
+        "udp_max_gap_ms": 67.394,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.033,
+          "ping_rtt_ms": {
+            "p50": 60.613,
+            "p95": 283.682,
+            "p99": 288.832,
+            "mean": 76.899
+          },
+          "ping_max_gap_ms": 291.265
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 162.111,
+            "p95": 188.919,
+            "p99": 188.919,
+            "mean": 137.141
+          },
+          "ping_max_gap_ms": 161.908,
+          "ping_sent": 240,
+          "ping_received": 3,
+          "ping_loss_pct": 98.75
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 10744,
+          "client_avg_kb": 30599,
+          "total_avg_kb": 41343,
+          "total_peak_kb": 92304,
+          "samples": 420
+        }
+      }
+    },
+    "molehill 0.7.2 (noise)": {
+      "loopback": {
+        "status": "ok",
+        "throughput_1stream_gbps": 4.921,
+        "retransmits_1stream": 0,
+        "throughput_8streams_gbps": 14.751,
+        "retransmits_8streams": 4,
+        "echo_rtt_ms": {
+          "p50": 0.256,
+          "p95": 0.322,
+          "p99": 0.432,
+          "mean": 0.266
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.409,
+          "p95": 0.559,
+          "p99": 0.591,
+          "mean": 0.411
+        },
+        "udp_rtt_ms": {
+          "p50": 0.484,
+          "p95": 0.62,
+          "p99": 0.662,
+          "mean": 0.485
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.096,
+        "udp_max_gap_ms": 20.362,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.258,
+          "ping_rtt_ms": {
+            "p50": 0.446,
+            "p95": 0.831,
+            "p99": 1.2,
+            "mean": 0.468
+          },
+          "ping_max_gap_ms": 33.447
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.134,
+            "p95": 0.194,
+            "p99": 0.388,
+            "mean": 0.144
+          },
+          "ping_max_gap_ms": 33.703,
+          "ping_sent": 240,
+          "ping_received": 240,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 11529,
+          "client_avg_kb": 10829,
+          "total_avg_kb": 22358,
+          "total_peak_kb": 25876,
+          "samples": 169
+        }
+      },
+      "loss1_rtt10": {
+        "status": "ok",
+        "throughput_1stream_gbps": 3.682,
+        "retransmits_1stream": 1032,
+        "throughput_8streams_gbps": 8.478,
+        "retransmits_8streams": 3576,
+        "echo_rtt_ms": {
+          "p50": 101.292,
+          "p95": 327.601,
+          "p99": 1134.893,
+          "mean": 135.568
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.769,
+          "p95": 285.272,
+          "p99": 307.978,
+          "mean": 75.247
+        },
+        "udp_rtt_ms": {
+          "p50": 60.582,
+          "p95": 80.684,
+          "p99": 100.717,
+          "mean": 62.794
+        },
+        "udp_loss_pct": 4.5,
+        "udp_jitter_ms": 2.49,
+        "udp_max_gap_ms": 69.014,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.04,
+          "ping_rtt_ms": {
+            "p50": 60.676,
+            "p95": 111.319,
+            "p99": 285.126,
+            "mean": 72.003
+          },
+          "ping_max_gap_ms": 290.366
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 175.872,
+            "p95": 189.865,
+            "p99": 189.865,
+            "mean": 148.245
+          },
+          "ping_max_gap_ms": 110.98,
+          "ping_sent": 240,
+          "ping_received": 5,
+          "ping_loss_pct": 97.92
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 12310,
+          "client_avg_kb": 14956,
+          "total_avg_kb": 27266,
+          "total_peak_kb": 80112,
+          "samples": 409
+        }
+      }
+    },
+    "molehill 0.7.2 (mux-off)": {
+      "loopback": {
+        "status": "ok",
+        "throughput_1stream_gbps": 19.368,
+        "retransmits_1stream": 26,
+        "throughput_8streams_gbps": 28.298,
+        "retransmits_8streams": 135,
+        "echo_rtt_ms": {
+          "p50": 0.226,
+          "p95": 0.264,
+          "p99": 0.277,
+          "mean": 0.228
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.334,
+          "p95": 0.489,
+          "p99": 0.564,
+          "mean": 0.342
+        },
+        "udp_rtt_ms": {
+          "p50": 0.408,
+          "p95": 0.562,
+          "p99": 0.606,
+          "mean": 0.425
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.093,
+        "udp_max_gap_ms": 20.374,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.354,
+          "ping_rtt_ms": {
+            "p50": 0.363,
+            "p95": 0.547,
+            "p99": 0.679,
+            "mean": 0.365
+          },
+          "ping_max_gap_ms": 33.459
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.089,
+            "p95": 0.124,
+            "p99": 0.146,
+            "mean": 0.094
+          },
+          "ping_max_gap_ms": 33.489,
+          "ping_sent": 240,
+          "ping_received": 240,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 6857,
+          "client_avg_kb": 6987,
+          "total_avg_kb": 13844,
+          "total_peak_kb": 15044,
+          "samples": 169
+        }
+      }
+    }
+  }
+}

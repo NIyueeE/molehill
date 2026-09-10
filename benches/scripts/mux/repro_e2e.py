@@ -6,7 +6,7 @@
 
 Requires target/release/molehill built with the default features (which
 include `multiplex`). Starts a local echo backend plus a molehill
-server+client pair using the default `mux = true`, registers the service,
+server+client pair using the default `mode = "multiplex"`, registers the service,
 then requires three visitor echo round-trips through the yamux tunnel. This
 used to be the reproduction script for the 0.7.0 stall; the same flow now
 asserts the fixed behavior.
@@ -66,18 +66,18 @@ def main() -> None:
     time.sleep(0.3)
 
     (WORK / "server.toml").write_text("""[server]
-bind_addr = "0.0.0.0:23332"
 default_token = "bench"
 allow_ports = ["52021"]
-[server.transport]
-type = "tcp"
+[server.control]
+bind_addr = "0.0.0.0:23332"
 """)
-    # `mux` is omitted on purpose: true is the 0.7.0 default.
+    # `[client.data]` is omitted on purpose: the multiplex default applies.
     (WORK / "client.toml").write_text("""[client]
-remote_addr = "127.0.0.1:23332"
 default_token = "bench"
+[client.control]
+default_remote_addr = "127.0.0.1:23332"
 [client.transport]
-type = "tcp"
+type = "plain"
 [client.services.echo]
 local_addr = "127.0.0.1:60002"
 remote_bind_addr = "0.0.0.0:52021"

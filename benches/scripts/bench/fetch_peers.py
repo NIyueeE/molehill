@@ -13,7 +13,7 @@ Downloads hit api.github.com (unauthenticated: 60 req/h is plenty for four
 lookups); binaries come from the release assets. A per-tool version marker
 re-downloads automatically when a newer release appears.
 
-Usage: uv run fetch_peers.py [peer_dir]   (default /tmp/bench-peers)
+Usage: uv run fetch_peers.py [peer_dir]   (default ~/tmp/bench-peers)
 """
 import json
 import platform
@@ -26,7 +26,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-PEER_DIR = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/bench-peers")
+PEER_DIR = Path(sys.argv[1] if len(sys.argv) > 1
+                else Path.home() / "tmp" / "bench-peers")
 UA = {"User-Agent": "molehill-bench-peer-fetch",
       "Accept": "application/vnd.github+json"}
 
@@ -146,7 +147,8 @@ def main() -> None:
     print("== peer versions ==")
     for tool, rel in BIN.items():
         r = subprocess.run([str(PEER_DIR / rel), "--version"],
-                           capture_output=True, text=True, check=False)
+                           capture_output=True, text=True, check=False,
+                           timeout=15)
         out = r.stdout + r.stderr
         m = re.search(r"\d+\.\d+\.\d+", out)
         print(f"  {tool}: {m.group(0) if m else '?'}")

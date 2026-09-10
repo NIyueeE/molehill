@@ -27,21 +27,49 @@ def pct(xs, p):
 
 
 def run_tcp_steady_ping(host: str, port: int, count: int,
-                        interval_ms: int) -> dict:
-    """Ping-pong over one established TCP connection; returns RTT percentiles."""
-    interval = interval_ms / 1000.0
-    s = socket.socket()
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    s.connect((host, port))
+                        interval_ms: int, max_wall_s: float = 20.0) -> dict:
+    """Ping-pong over one established TCP connection; returns RTT percentiles.
+    Wall-bounded like the latency probe: on a 100 ms cell each ping costs
+    ~1 s, and ~20 samples on a fixed-delay path carry the same p50/p99.
 
+    A stalled connection (recv timeout) or a closed one (EOF) counts as a
+    stall and the probe reconnects — under burst loss a wedged session must
+    not nuke the whole metric, and reconnecting is what a real long-lived
+    client does anyway."""
+    interval = interval_ms / 1000.0
     rtts = []
-    for _ in range(count):
-        t0 = time.perf_counter()
-        s.sendall(b"p")
-        while s.recv(1) != b"p":
-            pass
-        rtts.append((time.perf_counter() - t0) * 1000.0)
-        time.sleep(interval)
+    deadline = time.time() + max_wall_s
+
+    def new_conn():
+        s = socket.socket()
+        s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.connect((host, port))
+        return s
+
+    s = new_conn()
+    try:
+        for _ in range(count):
+            if time.time() > deadline:
+                break
+            t0 = time.perf_counter()
+            try:
+                s.sendall(b"p")
+                # exactly one reply byte per ping on this connection; EOF
+                # means the peer closed it — reconnect instead of spinning
+                if s.recv(1) != b"p":
+                    s.close()
+                    s = new_conn()
+                    continue
+                rtts.append((time.perf_counter() - t0) * 1000.0)
+            except (TimeoutError, OSError):
+                s.close()
+                s = new_conn()
+            time.sleep(interval)
+    finally:
+        s.close()
+    if len(rtts) < 10:
+        raise RuntimeError("steady ping: too few samples")
 
     return {
         "p50": pct(rtts, 0.50),

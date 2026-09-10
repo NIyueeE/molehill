@@ -42,6 +42,7 @@ def pct(xs, p):
 def bulk_tcp(stop, host, port, stats, idx, rate):
     try:
         s = socket.socket()
+        s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.connect((host, port))
         chunk = b"x" * CHUNK
@@ -69,6 +70,7 @@ def bulk_tcp(stop, host, port, stats, idx, rate):
 def bulk_udp(stop, host, port, stats, idx, rate):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
         s.connect((host, port))
         s.setblocking(False)
         pkt = b"b" * 1200
@@ -101,14 +103,19 @@ def bulk_udp(stop, host, port, stats, idx, rate):
 def ping_tcp(stop, host, port, hz, stats):
     try:
         s = socket.socket()
+        s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.connect((host, port))
     except OSError:
+        stats["ping_rtt_ms"] = None  # no samples: a missing probe, not a 0 ms one
+        stats["ping_max_gap_ms"] = None
         return
     interval = 1.0 / hz
     rtts, gaps = [], []
     last = None
-    next_t = time.perf_counter()
+    timed_out = False
+    t_start = time.perf_counter()
+    next_t = t_start
     while not stop.is_set():
         now = time.perf_counter()
         if now < next_t:
@@ -117,8 +124,13 @@ def ping_tcp(stop, host, port, hz, stats):
         t0 = time.perf_counter()
         try:
             s.sendall(b"p")
-            while s.recv(1) != b"p":
-                pass
+            # exactly one reply byte per ping; EOF means the peer closed it —
+            # stop instead of spinning on recv()==b""
+            if s.recv(1) != b"p":
+                break
+        except TimeoutError:  # no reply within the socket timeout
+            timed_out = True
+            break
         except OSError:
             break
         rtt = (time.perf_counter() - t0) * 1000.0
@@ -127,20 +139,36 @@ def ping_tcp(stop, host, port, hz, stats):
             gaps.append((t0 - last) * 1000.0)
         last = t0
         next_t += interval
+    if not rtts:
+        # No round trip at all. If the reply simply did not arrive in time
+        # (the bulk flow held the tunnel), that is a MAXIMAL stall: record
+        # how long the pinger waited (a lower bound) instead of nulling the
+        # metric, which vanished from the chart and read as "not measured"
+        # (frp/rathole at rate20_rtt40). A connection closed under us is a
+        # broken probe, not a measured stall, and stays null.
+        stats["ping_rtt_ms"] = None
+        stats["ping_max_gap_ms"] = (
+            round((time.perf_counter() - t_start) * 1000.0, 3)
+            if timed_out else None)
+        return
     stats["ping_rtt_ms"] = {
         "p50": pct(rtts, 0.50), "p95": pct(rtts, 0.95),
         "p99": pct(rtts, 0.99),
-        "mean": round(sum(rtts) / len(rtts), 3) if rtts else 0.0,
+        "mean": round(sum(rtts) / len(rtts), 3),
     }
-    stats["ping_max_gap_ms"] = round(max(gaps), 3) if gaps else 0.0
+    stats["ping_max_gap_ms"] = round(max(gaps), 3) if gaps \
+        else round(rtts[0], 3)  # a single reply: the wait for it is the stall
 
 
 def ping_udp(stop, host, port, hz, stats):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
         s.connect((host, port))
         s.setblocking(False)
     except OSError:
+        stats["ping_rtt_ms"] = None  # no samples: a missing probe, not a 0 ms one
+        stats["ping_max_gap_ms"] = None
         return
     PKT = struct.Struct("<Id")
     interval = 1.0 / hz
@@ -176,13 +204,20 @@ def ping_udp(stop, host, port, hz, stats):
             next_t = now + interval
     stats["ping_sent"] = sent
     stats["ping_received"] = received
+    stats["ping_loss_pct"] = round((sent - received) / sent * 100.0, 2) if sent else 0.0
+    if not rtts:
+        # no successful round trips: the probe failed, it did not measure 0
+        # (the UDP arm already records sent/received/loss explicitly)
+        stats["ping_rtt_ms"] = None
+        stats["ping_max_gap_ms"] = None
+        return
     stats["ping_rtt_ms"] = {
         "p50": pct(rtts, 0.50), "p95": pct(rtts, 0.95),
         "p99": pct(rtts, 0.99),
-        "mean": round(sum(rtts) / len(rtts), 3) if rtts else 0.0,
+        "mean": round(sum(rtts) / len(rtts), 3),
     }
-    stats["ping_max_gap_ms"] = round(max(gaps), 3) if gaps else 0.0
-    stats["ping_loss_pct"] = round((sent - received) / sent * 100.0, 2) if sent else 0.0
+    stats["ping_max_gap_ms"] = round(max(gaps), 3) if gaps \
+        else round(rtts[0], 3)  # a single reply: the wait for it is the stall
 
 
 def run_hol_probe(mode: str, host: str, port: int, duration: float = 8.0,

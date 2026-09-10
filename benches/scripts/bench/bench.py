@@ -34,6 +34,11 @@ Machine notes (moved from the retired run_bench.sh):
 - knobs are env-tunable (see bench_lib.Knobs): molehill runs at full rigor
   (3 reps), peers at reduced rigor (1 rep) — the regression gate only gates
   molehill's default (mux) row
+- peers are reference points: they run the loopback / rtt10 / loss1 cells
+  plus the rate-limited cells (the pure-delay, high-loss and jitter
+  stories are told by the molehill rows), which keeps the peer axis lean
+- rate cells (r<mbit>/<rtt>) need netem with `rate` support (modern
+  iproute2); without it the cell degrades to the weakproxy fallback
 """
 import argparse
 import contextlib
@@ -49,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -58,6 +64,9 @@ from bench_lib import (
     Knobs,
     Netem,
     acquire_lock,
+    cell_sort_key,
+    churn,
+    cpu_stats,
     dump_results,
     latency,
     load_results,
@@ -66,9 +75,12 @@ from bench_lib import (
     parse_cell,
     record_pid,
     release_lock,
+    run_cpu_sampler,
     run_rss_sampler,
     sweep_stale,
     throughput,
+    udp_capacity,
+    wait_load_quiet,
     wait_port,
 )
 from hol_probe import run_hol_probe
@@ -84,6 +96,20 @@ def _handle_sigterm(signum, frame):
 
 TCP_ONLY = {"bore"}  # peers without UDP forwarding (UDP metrics omitted)
 PEER_BINS = {"frp": "frps", "bore": "bore", "rathole": "rathole"}
+
+# yamux's default max concurrent streams per tunnel
+# (DEFAULT_MUX_MAX_STREAMS in src/common/constants.rs): an arm's practical
+# stream ceiling is its tunnel count x this, so a scale test above the
+# ceiling is skipped deliberately instead of failing an over-limit dial.
+MUX_MAX_STREAMS = 32
+
+
+def variant_stream_ceiling(variant: str) -> int | None:
+    """Concurrent data-stream ceiling of a molehill arm, or None when the
+    arm has no mux layer (direct mode). `mux1` runs one tunnel -> 32; the
+    count = 4 arms -> 128."""
+    count = {"mux1": 1, "mux-off": None}.get(variant, 4)
+    return None if count is None else count * MUX_MAX_STREAMS
 
 
 class ArmProcs:
@@ -137,41 +163,53 @@ def noise_keys() -> tuple:
 def molehill_config(work: Path, variant: str, knobs: Knobs, p: dict) -> Path:
     """Write server/client tomls for one molehill variant; returns config dir."""
     d = work / "molehill"; d.mkdir(exist_ok=True)
-    mux = "true" if variant != "mux-off" else "false"
+    mode = "direct" if variant == "mux-off" else "multiplex"
+    # Single-variable arms. `mux` is the default control (plain transport,
+    # multiplex, count = 4): `noise` changes only the transport, `mux1` only
+    # the tunnel count, `kcp4` only the data-plane carrier (on top of the
+    # noise arm).
+    data_c = data_s = ""
     if variant == "noise":
         transport = "noise"
-    elif variant == "tls":
-        transport = "tls"
+    elif variant == "mux1":            # count axis: plain, one tunnel
+        transport = "plain"
+        data_c = "default_count = 1\n"
+    elif variant == "kcp4":            # carrier axis: noise + KCP-over-UDP
+        transport = "noise"
+        data_c = (f'default_carrier = "kcp"\n'
+                  f'default_data_addr = "127.0.0.1:{p["kcp_bind"]}"\n'
+                  f"default_count = 4\n")
+        data_s = (f'bind_addr = "127.0.0.1:{p["kcp_bind"]}"\n')
     else:
-        transport = "tcp"
+        transport = "plain"
     noise_s = noise_c = ""
     if transport == "noise":
         priv, pub = noise_keys()
         noise_s = f'[server.transport.noise]\nlocal_private_key = "{priv}"\n'
         noise_c = f'[client.transport.noise]\nremote_public_key = "{pub}"\n'
-    tls_s = tls_c = ""
-    if transport == "tls":
-        # repo-owned self-signed PKI (examples/tls); hostname check uses the
-        # configured name, so dialing 127.0.0.1 is fine
-        tls_dir = Path(__file__).parents[3] / "examples" / "tls"
-        tls_s = (f'[server.transport.tls]\npkcs12 = "{tls_dir / "identity.pfx"}"'
-                 f'\npkcs12_password = "1234"\n')
-        tls_c = (f'[client.transport.tls]\ntrusted_root = "{tls_dir / "rootCA.crt"}"'
-                 f'\nhostname = "localhost"\n')
+    data_s_block = f"[server.data]\n{data_s}" if data_s else ""
+    # Client-first server transport: keys only, no `type` — whether a
+    # connection is encrypted is the client's call (v3 selector byte).
+    server_transport = noise_s or ""
     (d / "server.toml").write_text(f"""[server]
-bind_addr = "127.0.0.1:{p['control']}"
 default_token = "bench"
 allow_ports = ["25100-{knobs.allow_port_hi}"]
-[server.transport]
-type = "{transport}"
-{noise_s}{tls_s}""")
+
+[server.control]
+bind_addr = "127.0.0.1:{p['control']}"
+
+{data_s_block}{server_transport}""")
     (d / "client.toml").write_text(f"""[client]
-remote_addr = "127.0.0.1:{p['client_dial']}"
 default_token = "bench"
-mux = {mux}
-[client.transport]
+
+[client.control]
+default_remote_addr = "127.0.0.1:{p['client_dial']}"
+
+[client.data]
+default_mode = "{mode}"
+{data_c}[client.transport]
 type = "{transport}"
-{noise_c}{tls_c}
+{noise_c}
 [client.services.iperf]
 local_addr = "127.0.0.1:{p['iperf_backend']}"
 remote_bind_addr = "127.0.0.1:{p['iperf_exposed']}"
@@ -183,13 +221,13 @@ remote_bind_addr = "127.0.0.1:{p['echo_exposed']}"
 pool_size = {knobs.pool_size}
 
 [client.services.udpecho]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:{p['udp_backend']}"
 remote_bind_addr = "127.0.0.1:{p['udp_exposed']}"
 pool_size = 2
 udp_buffer_size = 2048
 udp_idle_timeout = 60
-udp_sendq_size = 1024
+udp_send_queue_size = 1024
 """)
     return d
 
@@ -331,6 +369,9 @@ def cell_port_map(base: int, off: int, mech: str) -> dict:
         "iperf_exposed": base + off + 2,
         "echo_exposed": base + off + 3,
         "udp_exposed": base + off + 4,
+        # KCP tunnel listener (UDP): distinct within the tool band and below
+        # the backend block at base+90
+        "kcp_bind": base + off + 6,
         "iperf_backend": base + 90,
         "echo_backend": base + 91,
         "udp_backend": base + 92,
@@ -340,7 +381,8 @@ def cell_port_map(base: int, off: int, mech: str) -> dict:
 
 def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                work: Path) -> list:
-    """Return [(label, start_fn, has_udp, full_rigor)] for one tool in a cell."""
+    """Return [(label, start_fn, has_udp, full_rigor, stream_ceiling)] for
+    one tool in a cell."""
     arms = []
     if tool == "molehill":
         loop = list(variants)
@@ -358,7 +400,7 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                     raise
                 return procs
             arms.append((f"molehill {tool_version(knobs)} ({variant})",
-                         start, True, True))
+                         start, True, True, variant_stream_ceiling(variant)))
     else:
         setup = {"frp": setup_frp, "rathole": setup_rathole,
                  "bore": setup_bore}[tool]
@@ -374,15 +416,83 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                 raise
             return procs
         arms.append((f"{tool} {peer_version(tool, knobs)}", start, has_udp,
-                     False))
+                     False, None))
     return arms
+
+
+def peer_cell(spec) -> bool:
+    """Peers are reference points: the low-loss / low-delay cells plus the
+    rate-limited ones (overhead at a bottleneck is a peer-comparison
+    question); the rtt100 / loss5 / burst / jitter stories are told by the
+    molehill rows."""
+    return (spec.loss <= 1.0 and spec.rtt <= 10.0 and spec.jitter == 0.0) \
+        or spec.rate > 0
+
+
+def default_out() -> Path:
+    """Results file for the current Cargo.toml version (the next tag), so a
+    plain `just bench` never merges into the previous release's baseline."""
+    try:
+        with open(Path(__file__).parents[3] / "Cargo.toml", "rb") as fh:
+            ver = tomllib.load(fh)["package"]["version"]
+    except (OSError, KeyError):
+        ver = "dev"
+    return Path(__file__).parent / f"results-v{ver}.json"
+
+
+def mixed_bulk_latency(iperf_port: int, echo_port: int, secs: int) -> dict:
+    """Bulk transfer (iperf, 1 stream) and interactive latency (fresh
+    connections to the echo service) CONCURRENTLY through the same client —
+    the per-service mix story: does a bulk service starve an interactive
+    one? (loopback cell only)."""
+    res: dict = {}
+
+    def bulk():
+        try:
+            thr = throughput(1, 1, secs, iperf_port)
+            res["bulk_gbps"] = thr[0] if thr else None
+        except Exception as e:
+            # keep the echo half of the metric; record why the bulk failed
+            res["bulk_gbps"] = None
+            res["bulk_reason"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=bulk, daemon=True)
+    t.start()
+    xs = []
+    failed = 0
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket()
+            s.settimeout(3.0)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.connect(("127.0.0.1", echo_port))
+            s.sendall(b"p")
+            s.recv(1)
+            s.close()
+            xs.append((time.perf_counter() - t0) * 1000.0)
+            failed = 0
+        except (OSError, TimeoutError):
+            failed += 1
+            if failed >= 5:
+                break  # path wedged; keep the bulk half of the metric
+    t.join()
+    if xs:
+        xs.sort()
+        res.update({
+            "echo_p50_ms": round(xs[len(xs) // 2], 3),
+            "echo_p99_ms": round(xs[int(len(xs) * 0.99) - 1], 3),
+            "echo_mean_ms": round(sum(xs) / len(xs), 3),
+        })
+    return res
 
 
 def tool_version(knobs: Knobs) -> str:
     try:
         out = subprocess.run([knobs_bin(), "--version"],
                              capture_output=True, text=True,
-                             check=False).stdout
+                             check=False, timeout=15).stdout
         return next((l.split()[2] for l in out.splitlines()
                      if l.startswith("Build Version:")), "dev")
     except OSError:
@@ -426,10 +536,26 @@ def peer_version(tool: str, knobs: Knobs) -> str:
 # === arm execution ===
 
 def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
-            knobs: Knobs, p: dict, mech: str, data: dict,
-            out_path: Path) -> None:
+            stream_ceiling: int | None, knobs: Knobs, p: dict, mech: str,
+            data: dict, out_path: Path, base: int, work: Path) -> None:
     """One arm, fully guarded: a failure records an error entry and the
     matrix moves on. Completed metrics are checkpointed immediately."""
+    # Load-aware cooldown: start every arm from a quiet machine.
+    wait_load_quiet(knobs.cooldown_load_factor, knobs.cooldown_max_wait_s)
+    # Backends (iperf3 server + echo/udp servers) are per-ARM, not per-cell:
+    # the iperf3 server is single-test and can wedge on a stalled test (rate-
+    # limited cells with parallel streams — GSO-sized segments times netem's
+    # packet limit buffer seconds of data) and then die with EBADF. A shared
+    # server would poison every later arm of the cell with refused dials.
+    backends = Backends()
+    try:
+        backends.start(base + 90, base + 91, base + 92, work)
+    except Exception as e:  # backends failed (ports held, leaked process, ...)
+        entry = {"status": "error", "error": f"Backends: {e}"}
+        merge_arm(data, label, spec.name, entry, out_path)
+        print(f"RESULT [{spec.name}] {label}: error: {entry['error']}",
+              flush=True)
+        return
     try:
         procs = start_fn()
     except Exception as e:  # setup failed (ports held, tool crashed, ...)
@@ -453,13 +579,20 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
             secs = knobs.peer_secs if mech == "direct" else knobs.peer_secs_weak
 
         samples: list = []
+        cpu_samples: list = []
         stop = threading.Event()
         sampler = threading.Thread(
             target=run_rss_sampler,
             args=(procs.tool_pids[0] if procs.tool_pids else 0,
                   procs.tool_pids[1] if len(procs.tool_pids) > 1 else 0,
                   stop, samples), daemon=True)
+        cpu_sampler = threading.Thread(
+            target=run_cpu_sampler,
+            args=(procs.tool_pids[0] if procs.tool_pids else 0,
+                  procs.tool_pids[1] if len(procs.tool_pids) > 1 else 0,
+                  stop, cpu_samples), daemon=True)
         sampler.start()
+        cpu_sampler.start()
 
         # Each metric is guarded independently: a failure records None and a
         # note in `partial_metrics` instead of faking a 0 or discarding the
@@ -478,12 +611,15 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
 
         thr1 = metric("throughput_1stream", lambda: throughput(
             reps, 1, secs, p["iperf_exposed"]))
-        thr8 = metric("throughput_8streams", lambda: throughput(
-            reps, 8, secs, p["iperf_exposed"]))
+        # The cheap probes run BEFORE the 8-stream test: on rate-limited
+        # cells (netem rate + GSO-sized segments + the packet limit) eight
+        # parallel iperf streams wedge iperf3's single-test server and can
+        # leave the tunnel saturated — echo/steady/udp/hol/churn must not
+        # inherit that state.
         lat = metric("echo_rtt",
                      lambda: latency(p["echo_exposed"]))
         steady = metric("tcp_steady_rtt", lambda: run_tcp_steady_ping(
-            "127.0.0.1", p["echo_exposed"], 200, 20))
+            "127.0.0.1", p["echo_exposed"], knobs.steady_ping_count, 20))
         udp = hol_udp = None
         if has_udp:
             udp = metric("udp_ping", lambda: run_udp_ping(
@@ -495,23 +631,71 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         hol = metric("hol_tcp", lambda: run_hol_probe(
             "tcp", "127.0.0.1", p["echo_exposed"], knobs.hol_secs,
             bulk_rate_mbps=knobs.hol_bulk_rate_tcp))
+        # Scale + per-service mix stories only make sense unthrottled, and
+        # they run BEFORE the UDP capacity blast: a saturated UDP path can
+        # wedge the shared mux tunnel, and the TCP metrics must not inherit
+        # that state. The scale stream count stays below the yamux ceiling
+        # (count x MUX_MAX_STREAMS): an arm whose ceiling is lower than the
+        # scale point (count = 1 -> 32) is skipped deliberately — attempting
+        # it wedges the per-arm iperf3 server and poisons the mixed-workload
+        # probe that follows.
+        if spec.name == "loopback" and (stream_ceiling is None
+                                        or knobs.scale_streams
+                                        <= stream_ceiling):
+            thr128 = metric("throughput_64streams", lambda: throughput(
+                1, knobs.scale_streams, secs, p["iperf_exposed"]))
+        else:
+            thr128 = None
+            if spec.name == "loopback":
+                partial.append(
+                    f"throughput_64streams: skipped ({knobs.scale_streams} "
+                    f"streams exceed this arm's {stream_ceiling}-stream "
+                    "yamux ceiling)")
+        if spec.name == "loopback":
+            mixed = metric("mixed_bulk_latency", lambda: mixed_bulk_latency(
+                p["iperf_exposed"], p["echo_exposed"], secs))
+        else:
+            mixed = None
+        churn_ = metric("churn", lambda: churn(
+            p["echo_exposed"], knobs.churn_secs, knobs.churn_concurrency))
+        # 8-stream throughput is attempted on every cell, rate-limited ones
+        # included: rate100_rtt20 measures fine (0.025-0.035 Gbit/s in the
+        # v0.8.0 baseline); only the low-rate rate20_rtt40 wedges the
+        # single-test iperf3 server (netem's packet limit buffers seconds of
+        # GSO-sized segments) and records the timeout in `partial_metrics`.
+        thr8 = metric("throughput_8streams", lambda: throughput(
+            reps, 8, secs, p["iperf_exposed"]))
+        udpcap = metric("udp_capacity", lambda: udp_capacity(
+            p["udp_exposed"], knobs.udp_capacity_count,
+            knobs.udp_capacity_pps)) if has_udp else None
         stop.set()
         sampler.join(timeout=2)
+        cpu_sampler.join(timeout=2)
 
         entry = {
             "status": "ok",
             "throughput_1stream_gbps": thr1[0] if thr1 else None,
             "retransmits_1stream": thr1[1] if thr1 else None,
+            "throughput_1stream_min_gbps": thr1[2] if thr1 else None,
+            "throughput_1stream_max_gbps": thr1[3] if thr1 else None,
             "throughput_8streams_gbps": thr8[0] if thr8 else None,
             "retransmits_8streams": thr8[1] if thr8 else None,
+            "throughput_8streams_min_gbps": thr8[2] if thr8 else None,
+            "throughput_8streams_max_gbps": thr8[3] if thr8 else None,
+            "throughput_64streams_gbps": thr128[0] if thr128 else None,
+            "retransmits_64streams": thr128[1] if thr128 else None,
             "echo_rtt_ms": lat,
             "tcp_steady_rtt_ms": steady,
             "udp_rtt_ms": (udp or {}).get("rtt_ms"),
             "udp_loss_pct": (udp or {}).get("loss_pct"),
             "udp_jitter_ms": (udp or {}).get("jitter_ms"),
             "udp_max_gap_ms": (udp or {}).get("max_gap_ms"),
+            "churn": churn_,
+            "udp_capacity": udpcap,
+            "mixed_bulk_latency": mixed,
             "hol": hol, "hol_udp": hol_udp,
             "memory_rss_kb": mem_stats(samples),
+            "cpu": cpu_stats(cpu_samples),
         }
         if partial:
             entry["partial_metrics"] = partial
@@ -519,6 +703,7 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         entry = {"status": "error", "error": f"{type(e).__name__}: {e}"}
     finally:
         procs.kill()
+        backends.stop()
     merge_arm(data, label, spec.name, entry, out_path)
     summary = json.dumps(entry)
     print(f"RESULT [{spec.name}] {label}: "
@@ -530,17 +715,25 @@ def main():
     ap.add_argument("--tools", default="molehill,frp,rathole,bore",
                     help="comma list: molehill,frp,rathole,bore")
     ap.add_argument("--cells",
-                    default="0/0,0/10,0/100,1%/10,5%/100,2:25/10",
-                    help="comma list: loss[/burst]/rtt or r<mbit>/rtt")
-    ap.add_argument("--variants", default="mux,noise,tls",
-                    help="molehill arms: mux,noise,tls,mux-off "
-                         "(mux-off: loopback only)")
-    ap.add_argument("--out",
-                    default=str(Path(__file__).parent / "results-v0.7.2.json"))
+                    default="0/0,0/10,0/100,1%/10,5%/100,2:25/10,"
+                            "r100/20,r20/40,j20/10",
+                    help="comma list: loss[/burst]/rtt, r<mbit>/rtt, "
+                         "j<rtt>/<jitter>")
+    ap.add_argument("--variants", default="mux,noise,mux1,kcp4",
+                    help="molehill arms: mux (plain control), noise "
+                         "(encryption), mux1 (count=1), kcp4 (carrier), "
+                         "mux-off (loopback only); each varies one knob")
+    ap.add_argument("--out", default=str(default_out()))
     ap.add_argument("--fresh", action="store_true",
                     help="discard existing results instead of merging")
     ap.add_argument("--pool-size", type=int, default=8)
     args = ap.parse_args()
+
+    # Yield to interactive/system tasks: the matrix saturates every core it
+    # can reach, and a raised nice value keeps the host responsive without
+    # touching the measurements.
+    with contextlib.suppress(OSError):
+        os.nice(10)
 
     knobs = Knobs.from_env()
     knobs.pool_size = args.pool_size
@@ -590,6 +783,9 @@ def main():
         "peer_secs_per_rep_loopback": knobs.peer_secs,
         "peer_secs_per_rep_weak": knobs.peer_secs_weak,
         "hol_probe_seconds": knobs.hol_secs,
+        "churn_seconds": knobs.churn_secs,
+        "churn_concurrency": knobs.churn_concurrency,
+        "udp_capacity_datagrams": knobs.udp_capacity_count,
         "latency_samples": 300,
         "memory_samples_interval_s": 0.5,
         "hostname": socket.gethostname(),
@@ -616,36 +812,21 @@ def main():
                     mech = "weakproxy"
             meta_cells.append({"name": spec.name, "loss_pct": spec.loss,
                                "burst_pct": spec.burst, "rate_mbit": spec.rate,
-                               "rtt_ms": spec.rtt, "mech": mech,
-                               "loss_model": spec.loss_model})
+                               "rtt_ms": spec.rtt, "jitter_ms": spec.jitter,
+                               "mech": mech, "loss_model": spec.loss_model})
             # keep mid-run checkpoints informative: the cells seen so far and
             # the static meta are part of every merge_arm dump
             cur_names = {c["name"] for c in meta_cells}
             data.setdefault("meta", {}).update(statics)
-            data["meta"]["cells"] = (
+            # canonical cell order (loopback first, then by shaping params):
+            # targeted re-runs must not shuffle the order the charts plot
+            data["meta"]["cells"] = sorted(
                 [c for n, c in prior_cells.items() if n not in cur_names]
-                + meta_cells)
-            try:
-                backends = Backends()
-                backends.start(base + 90, base + 91, base + 92, work)
-            except Exception as e:
-                # a broken backend cell must not abort the whole matrix:
-                # record every arm of the cell as an error and move on
-                print(f"cell {spec.name}: backends unavailable ({e}); "
-                      "recording arms as errors", file=sys.stderr)
-                for tool in tools:
-                    off = {"molehill": 0, "frp": 20, "rathole": 40,
-                           "bore": 60}[tool]
-                    p = cell_port_map(base, off, mech)
-                    for label, _, _, _ in build_arms(tool, spec, variants,
-                                                     knobs, p, work):
-                        merge_arm(data, label, spec.name,
-                                  {"status": "error",
-                                   "error": f"Backends: {e}"}, out_path)
-                netem.off()
-                continue
+                + meta_cells, key=cell_sort_key)
             try:
                 for tool in tools:
+                    if tool != "molehill" and not peer_cell(spec):
+                        continue
                     off = {"molehill": 0, "frp": 20, "rathole": 40,
                            "bore": 60}[tool]
                     p = cell_port_map(base, off, mech)
@@ -663,12 +844,13 @@ def main():
                             str(Path(__file__).parent / "weakproxy.py"),
                             str(p["client_dial"]),
                             f"127.0.0.1:{p['control']}", f"{spec.rtt:g}"]
-                    for label, start_fn, has_udp, full_rigor in build_arms(
+                    for (label, start_fn, has_udp, full_rigor,
+                         stream_ceiling) in build_arms(
                             tool, spec, variants, knobs, p, work):
                         run_arm(label, spec, start_fn, has_udp, full_rigor,
-                                knobs, p, mech, data, out_path)
+                                stream_ceiling, knobs, p, mech, data,
+                                out_path, base, work)
             finally:
-                backends.stop()
                 netem.off()
     except KeyboardInterrupt:
         print("interrupted — completed arms are saved", flush=True)
@@ -676,8 +858,9 @@ def main():
     finally:
         release_lock()
         cur_cells = {c["name"] for c in meta_cells}
-        merged_cells = ([c for n, c in prior_cells.items() if n not in cur_cells]
-                        + meta_cells)
+        merged_cells = sorted(
+            [c for n, c in prior_cells.items() if n not in cur_cells]
+            + meta_cells, key=cell_sort_key)
         # same merge rule for tool_versions: keep tools from earlier runs
         tv = dict(data["meta"].get("tool_versions") or {})
         tv.update({t: tool_version(knobs) if t == "molehill"
