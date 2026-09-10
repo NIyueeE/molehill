@@ -2,10 +2,14 @@ use crate::common::helper::{host_port_pair, udp_connect};
 #[cfg(feature = "notify")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
+#[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+use crate::config::NoiseConfig;
 use crate::config::{
     ClientConfig, ClientServiceConfig, Config, HealthCheckConfig, HealthCheckType, MaskedString,
     ServiceType, TransportType,
 };
+#[cfg(feature = "multiplex")]
+use crate::config::{DataCarrier, DataMode};
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, MAX_UDP_HEADER_LEN,
@@ -29,15 +33,11 @@ use tokio::sync::{RwLock, broadcast, mpsc, oneshot, watch};
 use tokio::time::{self, Duration, Instant};
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
 #[cfg(feature = "multiplex")]
-use crate::transport::multiplex::ClientTunnel;
+use crate::transport::multiplex::{ClientTunnel, TunnelPool};
 
+#[cfg(feature = "multiplex")]
+use crate::common::constants::MAX_MUX_TUNNELS;
 use crate::common::constants::{
     DEFAULT_TCP_POOL_SIZE, DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS,
     DEFAULT_UDP_POOL_SIZE, DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
@@ -69,92 +69,232 @@ pub async fn run_client(
     )
     })?;
 
-    match config.transport.transport_type {
-        TransportType::Tcp => {
-            let mut client = Client::<TcpTransport>::from(config)?;
-            client.run(shutdown_rx, update_rx).await
-        }
-        TransportType::Tls => {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                let mut client = Client::<TlsTransport>::from(config)?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::common::helper::feature_neither_compile("native-tls", "rustls")
-        }
-        TransportType::Noise => {
-            #[cfg(feature = "noise")]
-            {
-                let mut client = Client::<NoiseTransport>::from(config)?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(feature = "noise"))]
-            crate::common::helper::feature_not_compile("noise")
-        }
-        TransportType::Websocket => {
-            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-            {
-                let mut client = Client::<WebsocketTransport>::from(config)?;
-                client.run(shutdown_rx, update_rx).await
-            }
-            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::common::helper::feature_neither_compile(
-                "websocket-native-tls",
-                "websocket-rustls",
-            )
-        }
-    }
+    let mut client = Client::from(config);
+    client.run(shutdown_rx, update_rx).await
 }
 
 type ServiceDigest = protocol::Digest;
 type Nonce = protocol::Digest;
 
-/// Multiplexing knobs resolved from `[client]`.
-#[derive(Clone, Copy, Debug, Default)]
-struct MuxOpts {
+/// Data-plane knobs for one service, resolved from `[client.data]` with the
+/// service's own `mode`/`count`/`carrier` overrides.
+#[derive(Clone, Debug, Default)]
+struct DataOpts {
     enabled: bool,
+    /// Endpoint the data plane dials: the service's own `remote_addr` when
+    /// set, else `[client.data].default_data_addr`, else the control
+    /// channel's
+    /// `remote_addr`.
+    addr: String,
     #[cfg(feature = "multiplex")]
-    receive_window: Option<usize>,
+    tunnels: usize,
+    /// Which carrier carries the data plane.
     #[cfg(feature = "multiplex")]
-    max_streams: Option<usize>,
+    carrier: DataCarrier,
+    /// Noise key config, `Some` iff the control transport is `noise`; KCP
+    /// tunnels wrap it on top (the crypto stack is kept).
+    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    noise: Option<NoiseConfig>,
 }
 
 /// Placeholder so control-channel code compiles unchanged without the
-/// `multiplex` feature (`MuxOpts::enabled` is always `false` there).
+/// `multiplex` feature (`DataOpts::enabled` is always `false` there).
 #[cfg(not(feature = "multiplex"))]
-#[derive(Clone)]
-struct ClientTunnel;
+struct Tunnels;
 
-impl From<&ClientConfig> for MuxOpts {
-    fn from(c: &ClientConfig) -> Self {
-        MuxOpts {
-            enabled: c.mux_enabled(),
+/// One connection dialed by the client, after its v3 transport selector
+/// byte: plain TCP, or TCP wrapped in the Noise record stream. The
+/// transport is a per-service decision (see `ClientTransport`).
+enum ClientStream {
+    Plain(TcpStream),
+    #[cfg(feature = "noise")]
+    Noise(Box<crate::transport::NoiseStream<TcpStream>>),
+}
+
+impl std::fmt::Debug for ClientStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(_) => f.debug_tuple("Noise").finish(),
+        }
+    }
+}
+
+impl ClientStream {
+    /// Apply socket options to the underlying TCP socket.
+    fn hint(&self, opts: SocketOpts) {
+        match self {
+            ClientStream::Plain(s) => opts.apply(s),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(s) => opts.apply(s.get_inner()),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ClientStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ClientStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "noise")]
+            ClientStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// The client's wire stack, resolved **per service**: the service's
+/// `transport.type` override wins over `[client.transport].type`, and the
+/// service's `transport.noise` keys win over the global ones.
+enum ClientTransport {
+    Plain(TcpTransport),
+    #[cfg(feature = "noise")]
+    // Boxed: the NoiseTransport state dwarfs the plain variant; the enum
+    // lives in per-service Arcs and on the stack of dial paths.
+    Noise(Box<crate::transport::NoiseTransport>),
+}
+
+impl ClientTransport {
+    /// Build the per-service transport from the client-wide transport
+    /// config plus the service's override.
+    fn from_configs(
+        client: &ClientConfig,
+        service: &ClientServiceConfig,
+    ) -> Result<ClientTransport> {
+        let mut cfg = client.transport.clone();
+        if let Some(st) = &service.transport {
+            if let Some(t) = st.transport_type {
+                cfg.transport_type = t;
+            }
+            if let Some(noise) = &st.noise {
+                cfg.noise = Some(noise.clone());
+            }
+        }
+        match cfg.transport_type {
+            TransportType::Plain => Ok(ClientTransport::Plain(TcpTransport::new(&cfg)?)),
+            TransportType::Noise => {
+                #[cfg(feature = "noise")]
+                {
+                    Ok(ClientTransport::Noise(Box::new(
+                        crate::transport::NoiseTransport::new(&cfg)?,
+                    )))
+                }
+                #[cfg(not(feature = "noise"))]
+                {
+                    let _ = cfg;
+                    Err(anyhow!("This binary was built without the `noise` feature"))
+                }
+            }
+        }
+    }
+
+    /// Dial a connection with this transport's selector byte and optional
+    /// Noise handshake.
+    async fn connect(&self, addr: &AddrMaybeCached) -> Result<ClientStream> {
+        match self {
+            ClientTransport::Plain(t) => t.connect(addr).await.map(ClientStream::Plain),
+            #[cfg(feature = "noise")]
+            ClientTransport::Noise(n) => n
+                .connect(addr)
+                .await
+                .map(|s| ClientStream::Noise(Box::new(s))),
+        }
+    }
+}
+
+impl DataOpts {
+    /// Resolve the data-plane knobs for one service: `[client.data]` as
+    /// defaults, overridden by the service's own `mode`/`count`/`carrier`.
+    /// The data endpoint follows the service's own server: its `remote_addr`
+    /// override when set, else `[client.data].default_data_addr` (or the
+    /// client-wide
+    /// control endpoint when that is unset either).
+    fn for_service(c: &ClientConfig, s: &ClientServiceConfig) -> DataOpts {
+        DataOpts {
+            enabled: {
+                #[cfg(feature = "multiplex")]
+                {
+                    s.mode
+                        .map_or_else(|| c.multiplex_enabled(), |m| m == DataMode::Multiplex)
+                }
+                #[cfg(not(feature = "multiplex"))]
+                {
+                    // The data plane is always direct without the feature.
+                    let _ = s;
+                    false
+                }
+            },
+            addr: s
+                .remote_addr
+                .clone()
+                .unwrap_or_else(|| c.data_addr().to_owned()),
             #[cfg(feature = "multiplex")]
-            receive_window: c.mux_receive_window(),
+            tunnels: s
+                .count
+                .map_or_else(|| c.tunnel_count(), |n| n.clamp(1, MAX_MUX_TUNNELS)),
             #[cfg(feature = "multiplex")]
-            max_streams: c.mux_max_streams(),
+            carrier: s.carrier.unwrap_or(c.data.default_carrier),
+            #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+            noise: match s.transport_type_with(c.transport.transport_type) {
+                TransportType::Noise => s.noise_config_with(c.transport.noise.as_ref()).cloned(),
+                TransportType::Plain => None,
+            },
         }
     }
 }
 
 // Holds the state of a client
-struct Client<T: Transport> {
+struct Client {
     config: ClientConfig,
     service_handles: HashMap<String, ControlChannelHandle>,
-    transport: Arc<T>,
 }
 
-impl<T: 'static + Transport> Client<T> {
-    // Create a Client from `[client]` config block
-    fn from(config: ClientConfig) -> Result<Client<T>> {
-        let transport =
-            Arc::new(T::new(&config.transport).with_context(|| "Failed to create the transport")?);
-        Ok(Client {
+impl Client {
+    // Create a Client from `[client]` config block. The transport is
+    // resolved per service (see `ClientTransport`), so there is nothing
+    // to build here.
+    fn from(config: ClientConfig) -> Client {
+        Client {
             config,
             service_handles: HashMap::new(),
-            transport,
-        })
+        }
     }
 
     // The entrypoint of Client
@@ -164,14 +304,28 @@ impl<T: 'static + Transport> Client<T> {
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
         for (name, config) in &self.config.services {
-            // Create a control channel for each service defined
+            // Create a control channel for each service defined. A service
+            // can override the server, the token and the heartbeat timeout
+            // on its own block.
+            let remote_addr = config
+                .remote_addr
+                .clone()
+                .unwrap_or_else(|| self.config.control.default_remote_addr.clone());
+            let token = config
+                .token
+                .clone()
+                .unwrap_or_else(|| self.config.default_token.clone());
+            let heartbeat_timeout = config
+                .heartbeat_timeout
+                .unwrap_or(self.config.control.default_heartbeat_timeout);
+            let transport = Arc::new(ClientTransport::from_configs(&self.config, config)?);
             let handle = ControlChannelHandle::new(
                 (*config).clone(),
-                self.config.remote_addr.clone(),
-                self.config.default_token.clone(),
-                self.transport.clone(),
-                self.config.heartbeat_timeout,
-                MuxOpts::from(&self.config),
+                remote_addr,
+                token,
+                transport,
+                heartbeat_timeout,
+                DataOpts::for_service(&self.config, config),
             );
             self.service_handles.insert(name.clone(), handle);
         }
@@ -213,16 +367,35 @@ impl<T: 'static + Transport> Client<T> {
     #[cfg(feature = "notify")]
     fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
-            ConfigChange::ClientChange(client_change) => match client_change {
+            ConfigChange::ClientChange(client_change) => match *client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    let data = DataOpts::for_service(&self.config, &cfg);
+                    let remote_addr = cfg
+                        .remote_addr
+                        .clone()
+                        .unwrap_or_else(|| self.config.control.default_remote_addr.clone());
+                    let token = cfg
+                        .token
+                        .clone()
+                        .unwrap_or_else(|| self.config.default_token.clone());
+                    let heartbeat_timeout = cfg
+                        .heartbeat_timeout
+                        .unwrap_or(self.config.control.default_heartbeat_timeout);
+                    let transport = match ClientTransport::from_configs(&self.config, &cfg) {
+                        Ok(t) => Arc::new(t),
+                        Err(e) => {
+                            warn!("Failed to create the transport for service {name}: {e:#}");
+                            return;
+                        }
+                    };
                     let handle = ControlChannelHandle::new(
-                        cfg,
-                        self.config.remote_addr.clone(),
-                        self.config.default_token.clone(),
-                        self.transport.clone(),
-                        self.config.heartbeat_timeout,
-                        MuxOpts::from(&self.config),
+                        *cfg,
+                        remote_addr,
+                        token,
+                        transport,
+                        heartbeat_timeout,
+                        data,
                     );
                     let _ = self.service_handles.insert(name, handle);
                 }
@@ -237,26 +410,24 @@ impl<T: 'static + Transport> Client<T> {
     }
 }
 
-struct RunDataChannelArgs<T: Transport> {
+struct RunDataChannelArgs {
     session_key: Nonce,
     remote_addr: AddrMaybeCached,
-    connector: Arc<T>,
+    connector: Arc<ClientTransport>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
     /// Shared UDP hub for the service; `Some` iff this is a UDP service.
     udp: Option<Arc<UdpHub>>,
 }
 
-async fn do_data_channel_handshake<T: Transport>(
-    args: Arc<RunDataChannelArgs<T>>,
-) -> Result<T::Stream> {
+async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<ClientStream> {
     // Retry at least every 100ms, at most for 10 seconds
     let backoff = ExponentialBuilder::default()
         .with_max_delay(Duration::from_millis(100))
         .with_total_delay(Some(Duration::from_secs(10)));
 
     // Connect to remote_addr
-    let mut conn: T::Stream = (|| async {
+    let mut conn: ClientStream = (|| async {
         args.connector
             .connect(&args.remote_addr)
             .await
@@ -268,7 +439,7 @@ async fn do_data_channel_handshake<T: Transport>(
     })
     .await?;
 
-    T::hint(&conn, args.socket_opts);
+    conn.hint(args.socket_opts);
 
     // Send nonce
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, args.session_key);
@@ -278,7 +449,7 @@ async fn do_data_channel_handshake<T: Transport>(
     Ok(conn)
 }
 
-async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Result<()> {
+async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Do the handshake
     let conn = do_data_channel_handshake(args.clone()).await?;
 
@@ -286,16 +457,83 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
     forward_data_channel(conn, &args.service, args.udp.clone()).await
 }
 
-/// Run a data channel as one stream of the multiplexed tunnel.
+/// The established tunnel(s) of one control session, per `[client].tunnel`:
+/// a yamux tunnel pool over TCP (arms 0/1) or KCP (arm 2).
 #[cfg(feature = "multiplex")]
-async fn run_mux_data_channel<T: Transport>(
-    args: &Arc<RunDataChannelArgs<T>>,
-    tunnel: &ClientTunnel,
-) -> Result<()> {
-    let stream = tunnel
-        .open_stream()
-        .await
-        .map_err(|e| anyhow!("Failed to open a multiplexed data channel: {e}"))?;
+#[derive(Clone)]
+enum Tunnels {
+    Yamux(crate::transport::multiplex::TunnelPool),
+}
+
+#[cfg(feature = "multiplex")]
+impl Tunnels {
+    /// Open the next data channel: a yamux stream from the pool, round-robin
+    /// over the physical tunnels.
+    async fn open_stream(&self) -> Result<TunnelStream> {
+        match self {
+            Tunnels::Yamux(pool) => pool
+                .open_stream()
+                .await
+                .map(TunnelStream::Yamux)
+                .map_err(|e| anyhow!("Failed to open a multiplexed data channel: {e}")),
+        }
+    }
+}
+
+/// One opened data channel over the arm's tunnel transport.
+#[cfg(feature = "multiplex")]
+enum TunnelStream {
+    Yamux(crate::transport::MuxStream),
+}
+
+#[cfg(feature = "multiplex")]
+impl tokio::io::AsyncRead for TunnelStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Yamux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl tokio::io::AsyncWrite for TunnelStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TunnelStream::Yamux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Yamux(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelStream::Yamux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Run a data channel as one stream of the multiplexed tunnels.
+#[cfg(feature = "multiplex")]
+async fn run_mux_data_channel(args: &Arc<RunDataChannelArgs>, tunnel: &Tunnels) -> Result<()> {
+    let stream = tunnel.open_stream().await?;
     trace!("Multiplexed data channel opened");
     forward_data_channel(stream, &args.service, args.udp.clone()).await
 }
@@ -333,19 +571,17 @@ where
 ///
 /// The returned sender shuts the driver down when dropped.
 #[cfg(feature = "multiplex")]
-#[allow(clippy::too_many_arguments)]
-async fn establish_tunnel<T: Transport>(
-    transport: &Arc<T>,
+async fn establish_tunnel(
+    transport: &Arc<ClientTransport>,
     remote_addr: &AddrMaybeCached,
     session_key: Nonce,
-    opts: MuxOpts,
     service_name: &str,
 ) -> Result<(ClientTunnel, watch::Sender<bool>)> {
     let mut conn = transport
         .connect(remote_addr)
         .await
         .with_context(|| format!("Failed to connect the data tunnel to {remote_addr}"))?;
-    T::hint(&conn, SocketOpts::for_control_channel());
+    conn.hint(SocketOpts::for_control_channel());
 
     let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_key);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
@@ -356,11 +592,157 @@ async fn establish_tunnel<T: Transport>(
         v => bail!("Service {service_name}: the server refused the multiplexed data tunnel: {v}"),
     }
 
-    let config = crate::transport::multiplex::mux_config(opts.receive_window, opts.max_streams);
+    let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tunnel = ClientTunnel::start(conn, config, shutdown_rx);
-    debug!(service = %service_name, "Multiplexed data tunnel established");
     Ok((tunnel, shutdown_tx))
+}
+
+/// Establish `opts.tunnels` parallel data tunnels (arm 1 of the transport
+/// comparison: N physical connections instead of one; opened streams are
+/// spread across them round-robin).
+///
+/// The carrier follows `[client.data].default_carrier`: `tcp` dials the data
+/// endpoint with the control-channel wire stack, `kcp` opens KCP-over-UDP
+/// sessions (optionally Noise-wrapped).
+///
+/// The returned senders shut the tunnel drivers down when dropped.
+#[cfg(feature = "multiplex")]
+async fn establish_tunnels(
+    transport: &Arc<ClientTransport>,
+    data_addr: &AddrMaybeCached,
+    session_key: Nonce,
+    opts: &DataOpts,
+    service_name: &str,
+) -> Result<(Tunnels, Vec<watch::Sender<bool>>)> {
+    match opts.carrier {
+        DataCarrier::Tcp => {
+            let mut tunnels = Vec::with_capacity(opts.tunnels);
+            let mut guards = Vec::with_capacity(opts.tunnels);
+            for i in 0..opts.tunnels {
+                let (tunnel, guard) =
+                    establish_tunnel(transport, data_addr, session_key, service_name)
+                        .await
+                        .with_context(|| {
+                            format!("Failed to establish multiplexed data tunnel {i}")
+                        })?;
+                tunnels.push(tunnel);
+                guards.push(guard);
+            }
+            debug!(
+                service = %service_name,
+                tunnels = opts.tunnels,
+                "Multiplexed data tunnel pool established"
+            );
+            Ok((Tunnels::Yamux(TunnelPool::new(tunnels)), guards))
+        }
+        #[cfg(feature = "kcp")]
+        DataCarrier::Kcp => establish_kcp_tunnels(opts, session_key, service_name).await,
+        // Config validation rejects `carrier = "kcp"` without the feature,
+        // so this arm is unreachable in a correctly loaded configuration.
+        #[cfg(not(feature = "kcp"))]
+        DataCarrier::Kcp => bail!("This binary was built without the `kcp` feature"),
+    }
+}
+
+/// Timeout for one KCP tunnel establishment (session dial + optional Noise
+/// handshake + hello/ack). UDP gives no connect error, so a blackholed
+/// endpoint must not hang the control channel forever; on timeout the usual
+/// control-channel retry loop rebuilds the pool.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+const KCP_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Establish N KCP data tunnels (arm 2): each is an independent KCP session
+/// over its own ephemeral UDP socket, Noise-wrapped with the control
+/// transport's keys when that transport is `noise`, carrying the usual
+/// tunnel hello/ack and yamux session on top.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+async fn establish_kcp_tunnels(
+    opts: &DataOpts,
+    session_key: Nonce,
+    service_name: &str,
+) -> Result<(Tunnels, Vec<watch::Sender<bool>>)> {
+    let mut remote = AddrMaybeCached::new(&opts.addr);
+    remote
+        .resolve()
+        .await
+        .with_context(|| format!("Failed to resolve the data endpoint {}", opts.addr))?;
+    let remote_addr = remote
+        .socket_addr
+        .ok_or_else(|| anyhow!("the data endpoint did not resolve: {remote}"))?;
+
+    let mut tunnels = Vec::with_capacity(opts.tunnels);
+    let mut guards = Vec::with_capacity(opts.tunnels);
+    for i in 0..opts.tunnels {
+        let (tunnel, guard) = tokio::time::timeout(
+            KCP_ESTABLISH_TIMEOUT,
+            establish_one_kcp_tunnel(remote_addr, session_key, opts, service_name),
+        )
+        .await
+        .with_context(|| format!("KCP data tunnel {i} establishment timed out"))?
+        .with_context(|| format!("Failed to establish KCP data tunnel {i}"))?;
+        tunnels.push(tunnel);
+        guards.push(guard);
+    }
+    debug!(
+        service = %service_name,
+        tunnels = opts.tunnels,
+        %remote_addr,
+        "KCP data tunnel pool established"
+    );
+    Ok((Tunnels::Yamux(TunnelPool::new(tunnels)), guards))
+}
+
+/// Open one KCP session, optionally wrap it in Noise, exchange the tunnel
+/// hello/ack and start the yamux driver.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+async fn establish_one_kcp_tunnel(
+    remote_addr: SocketAddr,
+    session_key: Nonce,
+    opts: &DataOpts,
+    service_name: &str,
+) -> Result<(ClientTunnel, watch::Sender<bool>)> {
+    use crate::transport::kcp::{self, KcpTunnelStream};
+    use rand::TryRng;
+
+    // Random per-session conversation id; together with the ephemeral client
+    // port it keeps the server's session map collision-free across restarts.
+    let mut rng = rand::rngs::SysRng;
+    let mut conv_bytes = [0u8; 4];
+    rng.try_fill_bytes(&mut conv_bytes)
+        .with_context(|| "Failed to generate a KCP conversation id")?;
+    let conv = u32::from_le_bytes(conv_bytes);
+
+    let stream = kcp::connect(remote_addr, conv).await?;
+    let mut io = {
+        #[cfg(feature = "noise")]
+        if let Some(cfg) = &opts.noise {
+            let keys = crate::transport::NoiseKeys::from_config(cfg)?;
+            // v3 transport selector: announce this session speaks Noise
+            // (over the KCP byte stream, same rule as TCP).
+            let mut s = stream;
+            s.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
+            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator(s).await?))
+        } else {
+            let mut s = stream;
+            s.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
+            KcpTunnelStream::Plain(s)
+        }
+        #[cfg(not(feature = "noise"))]
+        KcpTunnelStream::Plain(stream)
+    };
+
+    let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_key);
+    io.write_all(&postcard::to_stdvec(&hello)?).await?;
+    io.flush().await?;
+    match read_ack(&mut io).await? {
+        Ack::Ok => {}
+        v => bail!("Service {service_name}: the server refused the KCP data tunnel: {v}"),
+    }
+
+    let config = crate::transport::multiplex::mux_config();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    Ok((ClientTunnel::start(io, config, shutdown_rx), shutdown_tx))
 }
 
 // Runtime-resolved per-service UDP options. Validation fills the defaults;
@@ -374,8 +756,8 @@ fn udp_idle_timeout_secs(s: &ClientServiceConfig) -> u64 {
     s.udp_idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT_SECS)
 }
 
-fn udp_sendq_size(s: &ClientServiceConfig) -> usize {
-    s.udp_sendq_size
+fn udp_send_queue_size(s: &ClientServiceConfig) -> usize {
+    s.udp_send_queue_size
         .map_or(DEFAULT_UDP_SENDQ_SIZE, |v| v as usize)
 }
 
@@ -411,7 +793,7 @@ where
 /// the service configuration per control-channel session.
 struct UdpForwardParams {
     local_addr: String,
-    prefer_ipv6: bool,
+    udp_forwarder_ipv6: bool,
     buffer_size: usize,
     idle_timeout_secs: u64,
     sendq_size: usize,
@@ -484,7 +866,7 @@ impl UdpHub {
         // First datagram from this peer: bind its dedicated local socket
         // outside the lock, then insert the route. Another channel may have
         // created the peer in the meantime; reuse that forwarder.
-        let socket = match udp_connect(&me.params.local_addr, me.params.prefer_ipv6).await {
+        let socket = match udp_connect(&me.params.local_addr, me.params.udp_forwarder_ipv6).await {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to connect to the local UDP service: {e:#}");
@@ -585,7 +967,7 @@ where
 
     // Keep sending datagrams the hub routes to this channel to the server.
     // The scratch buffer is reused across packets: each datagram is framed
-    // into it once and emitted with a single write (single TLS/Noise record).
+    // into it once and emitted with a single write (single Noise record).
     let writer_hub = Arc::clone(&hub);
     tokio::spawn(async move {
         let mut scratch =
@@ -700,15 +1082,15 @@ async fn run_udp_forwarder(
 }
 
 // Control channel, using T as the transport layer
-struct ControlChannel<T: Transport> {
+struct ControlChannel {
     digest: ServiceDigest,              // SHA256 of the service name
     service: ClientServiceConfig,       // `[client.services.foo]` config block
-    token: MaskedString,                // `client.default_token`
+    token: MaskedString,                // `[client].default_token`, or the service's own
     shutdown_rx: oneshot::Receiver<u8>, // Receives the shutdown signal
-    remote_addr: String,                // `client.remote_addr`
-    transport: Arc<T>,                  // Wrapper around the transport layer
-    heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
-    mux: MuxOpts,                       // Multiplexing knobs
+    remote_addr: String, // `[client.control].default_remote_addr`, or the service's own
+    transport: Arc<ClientTransport>, // This service's wire stack
+    heartbeat_timeout: u64, // Application layer heartbeat timeout in secs
+    data: DataOpts,      // `[client.data]` knobs
 }
 
 /// Build the per-service UDP hub for a UDP service session: every data
@@ -719,10 +1101,10 @@ fn build_udp_hub(service: &ClientServiceConfig) -> Option<Arc<UdpHub>> {
     match service.service_type {
         ServiceType::Udp => Some(Arc::new(UdpHub::new(UdpForwardParams {
             local_addr: service.local_addr.clone(),
-            prefer_ipv6: service.prefer_ipv6,
+            udp_forwarder_ipv6: service.udp_forwarder_ipv6,
             buffer_size: udp_buffer_size(service),
             idle_timeout_secs: udp_idle_timeout_secs(service),
-            sendq_size: udp_sendq_size(service),
+            sendq_size: udp_send_queue_size(service),
         }))),
         ServiceType::Tcp => None,
     }
@@ -736,18 +1118,23 @@ struct ControlChannelHandle {
     health_stop_tx: oneshot::Sender<u8>,
 }
 
-impl<T: 'static + Transport> ControlChannel<T> {
+impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(&mut self, mut health_rx: Option<&mut watch::Receiver<bool>>) -> Result<()> {
-        let mut remote_addr = AddrMaybeCached::new(&self.remote_addr);
-        remote_addr.resolve().await?;
+        let mut control_addr = AddrMaybeCached::new(&self.remote_addr);
+        control_addr.resolve().await?;
+
+        // Data-plane endpoint; equals the control endpoint unless
+        // `[client.data].default_addr` is set.
+        let mut data_addr = AddrMaybeCached::new(&self.data.addr);
+        data_addr.resolve().await?;
 
         let mut conn = self
             .transport
-            .connect(&remote_addr)
+            .connect(&control_addr)
             .await
             .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
-        T::hint(&conn, SocketOpts::for_control_channel());
+        conn.hint(SocketOpts::for_control_channel());
 
         // Authenticate the session, then register the service: the server
         // owns no per-service configuration, so the client declares its
@@ -759,16 +1146,20 @@ impl<T: 'static + Transport> ControlChannel<T> {
             "Registered, exposed at {}", reg.bind_addr
         );
 
-        // Establish the multiplexed tunnel if enabled: one extra connection
-        // carrying every future data channel as a yamux stream.
-        #[cfg_attr(not(feature = "multiplex"), allow(unused_variables))]
-        let (tunnel, _tunnel_shutdown_tx) = if self.mux.enabled {
+        // Establish the multiplexed tunnel pool if enabled: `count` extra
+        // connections, each carrying future data channels as yamux streams,
+        // spread round-robin.
+        #[cfg_attr(
+            not(feature = "multiplex"),
+            allow(unused_variables, reason = "only bound in the multiplex arm")
+        )]
+        let (tunnel, _tunnel_shutdown_tx) = if self.data.enabled {
             #[cfg(feature = "multiplex")]
-            match establish_tunnel(
+            match establish_tunnels(
                 &self.transport,
-                &remote_addr,
+                &data_addr,
                 session_key,
-                self.mux,
+                &self.data,
                 &self.service.name,
             )
             .await
@@ -777,7 +1168,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
                 Err(e) => return Err(e),
             }
             #[cfg(not(feature = "multiplex"))]
-            (None::<ClientTunnel>, None::<watch::Sender<bool>>)
+            (None::<Tunnels>, None::<Vec<watch::Sender<bool>>>)
         } else {
             (None, None)
         };
@@ -789,7 +1180,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
         let socket_opts = SocketOpts::from_client_cfg(&self.service);
         let data_ch_args = Arc::new(RunDataChannelArgs {
             session_key,
-            remote_addr,
+            remote_addr: data_addr,
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
@@ -855,7 +1246,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
     ///
     /// Returns the session key derived from the server's nonce; it also
     /// authenticates the multiplexed tunnel.
-    async fn authenticate(&self, conn: &mut T::Stream) -> Result<Nonce> {
+    async fn authenticate(&self, conn: &mut ClientStream) -> Result<Nonce> {
         // Send hello
         debug!("Sending hello");
         let hello_send = Hello::ControlChannelHello(CURRENT_PROTO_VERSION, self.digest);
@@ -894,7 +1285,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
     /// for the server's verdict.
     ///
     /// Returns the accepted registration.
-    async fn register(&self, conn: &mut T::Stream) -> Result<ServiceRegistration> {
+    async fn register(&self, conn: &mut ClientStream) -> Result<ServiceRegistration> {
         let bind_addr: SocketAddr = self.service.remote_bind_addr.parse().map_err(|_| {
             anyhow!(
                 "service {}: invalid `remote_bind_addr`: {:?}",
@@ -906,6 +1297,18 @@ impl<T: 'static + Transport> ControlChannel<T> {
             name: self.service.name.clone(),
             service_type: self.service.service_type,
             bind_addr,
+            // Client-declared data-plane carrier; the server validates it
+            // against its own capabilities and lazily opens listeners.
+            carrier: {
+                #[cfg(feature = "multiplex")]
+                {
+                    protocol::Carrier::from_data_carrier(self.data.carrier)
+                }
+                #[cfg(not(feature = "multiplex"))]
+                {
+                    protocol::Carrier::Tcp
+                }
+            },
             pool_size: self
                 .service
                 .pool_size
@@ -936,13 +1339,13 @@ impl<T: 'static + Transport> ControlChannel<T> {
 
 impl ControlChannelHandle {
     #[instrument(name="handle", skip_all, fields(service = %service.name))]
-    fn new<T: 'static + Transport>(
+    fn new(
         service: ClientServiceConfig,
         remote_addr: String,
         token: MaskedString,
-        transport: Arc<T>,
+        transport: Arc<ClientTransport>,
         heartbeat_timeout: u64,
-        mux: MuxOpts,
+        data: DataOpts,
     ) -> ControlChannelHandle {
         let digest = protocol::digest(service.name.as_bytes());
 
@@ -982,7 +1385,7 @@ impl ControlChannelHandle {
             remote_addr,
             transport,
             heartbeat_timeout,
-            mux,
+            data,
         };
 
         tokio::spawn(
@@ -1178,7 +1581,11 @@ async fn health_probe(cfg: &HealthCheckConfig, local_addr: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap values they just constructed"
+    )]
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

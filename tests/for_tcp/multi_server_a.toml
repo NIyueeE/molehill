@@ -1,0 +1,28 @@
+# Multi-server fixture, server A side: the client registers the echo service
+# on this server (the client-wide control endpoint) and the pingpong service
+# on server B via its per-service `remote_addr`. Server B lives in
+# multi_server_b.toml; the client's data planes follow each service's own
+# server by default.
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+
+[client.control]
+default_remote_addr = "127.0.0.1:2346"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[client.services.pingpong]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2335"
+remote_addr = "127.0.0.1:2347"
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "0.0.0.0:2346"
+

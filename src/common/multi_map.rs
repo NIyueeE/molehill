@@ -1,7 +1,7 @@
 // This module is the only place in the codebase that uses unsafe code:
 // raw pointers provide shared ownership of heap-allocated items between two
-// hash maps. Every unsafe block below carries a SAFETY comment.
-#![allow(unsafe_code)]
+// hash maps. Every unsafe item below carries a SAFETY comment directly above
+// it and an expect with the same reason.
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
@@ -11,22 +11,33 @@ use std::hash::{Hash, Hasher};
 ///
 /// # Safety
 /// Each `RawItem` owns a `Box<(K1, K2, V)>` via a raw pointer.
-/// The value is allocated once in `insert` and freed exactly once in `remove1`,
-/// `remove2`, or `Drop::drop`. The two maps hold separate `RawItem` handles
-/// pointing to the same heap allocation, so removal from one map must not
-/// double-free — this is guaranteed by having `remove1` / `remove2` also remove
-/// the entry from the other map before freeing.
+/// The value is allocated once in `insert` and freed exactly once in `remove1`
+/// or `Drop::drop`. The two maps hold separate `RawItem` handles pointing to
+/// the same heap allocation, so removal from one map must not double-free —
+/// this is guaranteed by having `remove1` also remove the entry from the other
+/// map before freeing.
 struct RawItem<K1, K2, V>(*mut (K1, K2, V));
 
+#[expect(
+    unsafe_code,
+    reason = "raw-pointer shared ownership between the two maps; access is \
+              serialized through &self/&mut self (module docs)"
+)]
 // SAFETY: `RawItem` only gives out shared/mutable references to the inner
 // tuple, and access is serialized through `&self` / `&mut self` on `MultiMap`.
 unsafe impl<K1, K2, V> Send for RawItem<K1, K2, V> {}
+
+#[expect(
+    unsafe_code,
+    reason = "raw-pointer shared ownership between the two maps; access is \
+              serialized through &self/&mut self (module docs)"
+)]
 // SAFETY: See above — all access to the inner tuple goes through `MultiMap`.
 unsafe impl<K1, K2, V> Sync for RawItem<K1, K2, V> {}
 
-/// `MultiMap` is a hash map that can index an item by two keys
-/// For example, after an item with key (a, b) is insert, `map.get1(a)` and
-/// `map.get2(b)` both returns the item. Likewise the `remove1` and `remove2`.
+/// `MultiMap` is a hash map that can index an item by two keys.
+/// For example, after an item with key (a, b) is inserted, `map.get2(b)`
+/// returns the item and `remove1(a)` removes it from both indexes.
 pub struct MultiMap<K1, K2, V> {
     map1: HashMap<Key<K1>, RawItem<K1, K2, V>>,
     map2: HashMap<Key<K2>, RawItem<K1, K2, V>>,
@@ -41,20 +52,38 @@ pub struct MultiMap<K1, K2, V> {
 /// ensures the tuple outlives the keys stored in its hash maps.
 struct Key<T>(*const T);
 
+#[expect(
+    unsafe_code,
+    reason = "raw-pointer shared ownership between the two maps; access is \
+              serialized through &self/&mut self (module docs)"
+)]
 // SAFETY: `Key` is only used as a hash map key inside `MultiMap`, where the
 // pointee is the heap-allocated item owned by the map itself. Access to the
 // map is serialized through `&self` / `&mut self`.
 unsafe impl<T> Send for Key<T> {}
+
+#[expect(
+    unsafe_code,
+    reason = "raw-pointer shared ownership between the two maps; access is \
+              serialized through &self/&mut self (module docs)"
+)]
 // SAFETY: See above — `Key` is never shared outside `MultiMap`.
 unsafe impl<T> Sync for Key<T> {}
 
 impl<T> Borrow<T> for Key<T> {
     fn borrow(&self) -> &T {
+        #[expect(
+            unsafe_code,
+            reason = "raw-pointer shared ownership between the two maps; access \
+                      is serialized through &self/&mut self (module docs)"
+        )]
         // SAFETY: The pointee is guaranteed to outlive the `Key` because both
         // are owned by the `MultiMap` — the `Key` is stored in the map's
         // `HashMap` and the pointee is the heap-allocated tuple, which is
         // only freed when the item is removed or the map is dropped.
-        unsafe { &*self.0 }
+        unsafe {
+            &*self.0
+        }
     }
 }
 
@@ -81,7 +110,6 @@ impl<K1, K2, V> MultiMap<K1, K2, V> {
     }
 }
 
-#[allow(dead_code)]
 impl<K1, K2, V> MultiMap<K1, K2, V>
 where
     K1: Hash + Eq + Send,
@@ -103,56 +131,32 @@ where
         Ok(())
     }
 
-    pub fn get1(&self, k1: &K1) -> Option<&V> {
-        let item = self.map1.get(k1)?;
-        // SAFETY: The `RawItem` pointer is valid because it was created from
-        // a `Box::into_raw` in `insert` and hasn't been freed yet — the item
-        // is still stored in at least one of the maps.
-        let item = unsafe { &*item.0 };
-        Some(&item.2)
-    }
-
-    pub fn get1_mut(&mut self, k1: &K1) -> Option<&mut V> {
-        let item = self.map1.get(k1)?;
-        // SAFETY: `&mut self` ensures exclusive access, and the pointer is
-        // valid as above. The aliasing `map2` entry points to the same
-        // allocation but is not accessed during the mutable borrow.
-        let item = unsafe { &mut *item.0 };
-        Some(&mut item.2)
-    }
-
     pub fn get2(&self, k2: &K2) -> Option<&V> {
         let item = self.map2.get(k2)?;
+        #[expect(
+            unsafe_code,
+            reason = "raw-pointer shared ownership between the two maps; access \
+                      is serialized through &self/&mut self (module docs)"
+        )]
         // SAFETY: Same as `get1` — the pointer is valid and the item is
         // still live.
         let item = unsafe { &*item.0 };
         Some(&item.2)
     }
 
-    pub fn get_mut2(&mut self, k2: &K2) -> Option<&mut V> {
-        let item = self.map2.get(k2)?;
-        // SAFETY: Same as `get1_mut` — `&mut self` gives exclusive access.
-        let item = unsafe { &mut *item.0 };
-        Some(&mut item.2)
-    }
-
     pub fn remove1(&mut self, k1: &K1) -> Option<V> {
         let item = self.map1.remove(k1)?;
+        #[expect(
+            unsafe_code,
+            reason = "raw-pointer shared ownership between the two maps; access \
+                      is serialized through &self/&mut self (module docs)"
+        )]
         // SAFETY: We just removed the entry from `map1`, so the raw pointer
         // is the last reference (aside from the still-live entry in `map2`).
         // Reconstructing the `Box` lets it drop, which also frees the
         // allocation. The matching `map2` entry is cleaned up below.
         let item = unsafe { Box::from_raw(item.0) };
         self.map2.remove(&item.1);
-        Some(item.2)
-    }
-
-    pub fn remove2(&mut self, k2: &K2) -> Option<V> {
-        let item = self.map2.remove(k2)?;
-        // SAFETY: Same as `remove1` — the last reference was removed from
-        // `map2`, and we reconstruct the `Box` to free it.
-        let item = unsafe { Box::from_raw(item.0) };
-        self.map1.remove(&item.0);
         Some(item.2)
     }
 }
@@ -164,8 +168,15 @@ impl<K1, K2, V> Drop for MultiMap<K1, K2, V> {
         // handles. Each handle points to a heap-allocated tuple, which we
         // reconstruct as a `Box` so it is properly freed. We drain `map2` to
         // avoid iterating freed pointers.
-        self.map2
-            .drain()
-            .for_each(|(_, item)| drop(unsafe { Box::from_raw(item.0) }));
+        self.map2.drain().for_each(|(_, item)| {
+            #[expect(
+                unsafe_code,
+                reason = "raw-pointer shared ownership between the two maps; access \
+                          is serialized through &self/&mut self (module docs)"
+            )]
+            // SAFETY: `map2` owns the same heap item as `map1`; draining
+            // `map2` first means each pointer is freed exactly once.
+            drop(unsafe { Box::from_raw(item.0) });
+        });
     }
 }

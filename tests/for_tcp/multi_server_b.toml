@@ -1,0 +1,11 @@
+# Multi-server fixture, server B side: binds its own control listener. The
+# client's pingpong service points here with its per-service `remote_addr`;
+# server A and the client block live in multi_server_a.toml.
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "0.0.0.0:2347"
+

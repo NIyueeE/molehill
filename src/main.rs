@@ -2,7 +2,9 @@
 //! configured instance (server, client, or `--genkey`) until shutdown.
 use anyhow::Result;
 use clap::Parser;
-use molehill_rathole::{Cli, logging, run};
+#[cfg(not(feature = "console"))]
+use molehill_rathole::logging;
+use molehill_rathole::{Cli, run};
 use tokio::{signal, sync::broadcast};
 use tracing::{debug, info};
 

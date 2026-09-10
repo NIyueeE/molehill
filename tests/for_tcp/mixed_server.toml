@@ -1,0 +1,28 @@
+# Mixed-transport fixture, server A side: the server places its Noise keys
+# only (no transport `type` — v3 client-first: the client decides whether a
+# connection is encrypted via the selector byte). The plain client lives in
+# this file's [client] block; the Noise client in mixed_client_noise.toml;
+# both register against the same server.
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+
+[client.control]
+default_remote_addr = "127.0.0.1:2348"
+
+[client.transport]
+type = "plain"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "127.0.0.1:2348"
+
+[server.transport.noise]
+local_private_key = "fhfbkUGkVR1f5buTxhLiVQPKP93tQD0lrVEIT2QelqE=" # security-scan:allow dummy fixture keypair, generated for this fixture

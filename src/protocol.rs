@@ -13,11 +13,46 @@ use crate::config::ServiceType;
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
-const PROTO_V2: u8 = 2u8;
+const _PROTO_V2: u8 = 2u8;
+const PROTO_V3: u8 = 3u8;
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V2;
+/// v3: every connection starts with a one-byte transport selector (`0x00`
+/// plain / `0x01` noise) so the server can accept both transports on one
+/// listener without a config-side `type` agreement, and the registration
+/// carries the service's data-plane carrier (client-declared, server
+/// validates). Both ends must upgrade together.
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
+
+/// First byte of every byte stream between client and server (TCP
+/// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
+/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake.
+pub const PLAIN_SELECTOR: u8 = 0x00;
+pub const NOISE_SELECTOR: u8 = 0x01;
 
 pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
+
+/// The data-plane carrier a service's tunnels will use, as declared by the
+/// client in its registration. Wire contract: stays stable across versions.
+#[derive(Deserialize, Serialize, Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Carrier {
+    #[serde(rename = "tcp")]
+    Tcp,
+    #[serde(rename = "kcp")]
+    Kcp,
+}
+
+impl Carrier {
+    /// Map the client's config-side carrier to the wire value. Only
+    /// exists with the `multiplex` feature (the `DataCarrier` type is
+    /// feature-gated); without it the data plane is always TCP.
+    #[cfg(feature = "multiplex")]
+    pub fn from_data_carrier(c: crate::config::DataCarrier) -> Carrier {
+        match c {
+            crate::config::DataCarrier::Tcp => Carrier::Tcp,
+            crate::config::DataCarrier::Kcp => Carrier::Kcp,
+        }
+    }
+}
 
 /// The client-driven service registration sent right after the control
 /// channel authentication succeeds.
@@ -32,6 +67,10 @@ pub struct ServiceRegistration {
     pub service_type: ServiceType,
     /// Public address the service is exposed at, chosen by the client.
     pub bind_addr: SocketAddr,
+    /// The data-plane carrier this service's tunnels will use
+    /// (`tcp`/`kcp`, client-declared). The server validates it against its
+    /// own capabilities and lazily opens its listeners on first use.
+    pub carrier: Carrier,
     /// Requested number of pre-established data channels. The server clamps
     /// this to `[server].max_pool_size`.
     pub pool_size: u16,
@@ -44,7 +83,7 @@ pub struct ServiceRegistration {
 pub const MAX_REGISTRATION_LEN: usize = 1024;
 
 /// Variant names mirror the wire contract and stay stable across versions.
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names, reason = "wire-contract variant names")]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum Hello {
     ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
@@ -107,7 +146,10 @@ pub const MAX_UDP_HEADER_LEN: usize = 32;
 
 // The owned-payload variant is only used on the client side; the server reads
 // through the zero-allocation `read_slice` path instead.
-#[cfg_attr(not(feature = "client"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "client"),
+    allow(dead_code, reason = "client-only owned UDP payload")
+)]
 #[derive(Debug)]
 pub struct UdpTraffic {
     pub from: SocketAddr,
@@ -118,7 +160,7 @@ pub struct UdpTraffic {
 ///
 /// The wire format is unchanged; the point is that the whole datagram is
 /// emitted with a single buffer and therefore a single `write_all` (and a
-/// single TLS/Noise record), with no per-packet heap allocation when callers
+/// single Noise record), with no per-packet heap allocation when callers
 /// reuse the same scratch buffer.
 fn encode_udp_frame(scratch: &mut BytesMut, from: SocketAddr, data: &[u8]) -> Result<()> {
     let len = u16::try_from(data.len()).with_context(|| {
@@ -192,7 +234,10 @@ impl UdpTraffic {
     ///
     /// Callers should reuse the same `scratch` buffer across packets to avoid
     /// per-packet allocations.
-    #[cfg_attr(not(any(feature = "client", feature = "server")), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "client", feature = "server")),
+        allow(dead_code, reason = "used by both run modes")
+    )]
     pub async fn write_frame<T: AsyncWrite + Unpin>(
         writer: &mut T,
         scratch: &mut BytesMut,
@@ -210,7 +255,10 @@ impl UdpTraffic {
     /// larger than it cannot be handled and are dropped in-stream (payload is
     /// drained so the framing stays in sync) instead of tearing down the data
     /// channel.
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "client"),
+        allow(dead_code, reason = "client-only UDP read path")
+    )]
     pub async fn read<T: AsyncRead + Unpin>(
         reader: &mut T,
         hdr_len: u8,
@@ -237,7 +285,10 @@ impl UdpTraffic {
     /// Zero-allocation variant of [`UdpTraffic::read`] for consumers that use
     /// the payload immediately: on success the payload occupies
     /// `scratch[..len]`. The oversized-packet policy is identical.
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "server"),
+        allow(dead_code, reason = "server-only zero-allocation read path")
+    )]
     pub async fn read_slice<T: AsyncRead + Unpin>(
         reader: &mut T,
         hdr_len: u8,
@@ -275,9 +326,12 @@ struct PacketLength {
     d_cmd: usize,
 }
 
-// Infallible: serializing compile-time-known fixed-size values
-#[allow(clippy::unwrap_used)]
 impl PacketLength {
+    // Infallible: serializing compile-time-known fixed-size values.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "serializing compile-time-known fixed-size values cannot fail"
+    )]
     pub fn new() -> PacketLength {
         let username = "default";
         let d = digest(username.as_bytes());
@@ -470,7 +524,11 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![expect(
+        clippy::unwrap_used,
+        clippy::panic,
+        reason = "tests unwrap values they just constructed"
+    )]
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -556,6 +614,7 @@ mod tests {
             name: "ssh".to_string(),
             service_type: crate::config::ServiceType::Tcp,
             bind_addr: sample_addr(),
+            carrier: Carrier::Tcp,
             pool_size: 8,
             udp_buffer_size: 2048,
         };

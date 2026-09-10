@@ -1,21 +1,19 @@
 //! molehill: a secure, stable, high-performance reverse proxy for NAT
-//! traversal — a Rust alternative to frp / ngrok, forked from
-//! [rathole](https://github.com/rapiz1/rathole).
+//! traversal — a Rust alternative to frp / ngrok. It began as a fork of
+//! [rathole](https://github.com/rapiz1/rathole) and is developed
+//! independently since.
 //!
 //! The client runs next to the service behind NAT and keeps a control
 //! channel to the server on a public host; visitors hit the server's public
 //! endpoint and their traffic is relayed over data channels. See the README
 //! and `docs/` for configuration, transports, and the protocol design.
 
-#![cfg_attr(
-    not(any(feature = "client", feature = "server")),
-    allow(dead_code, unused_imports, unused_variables, unused_mut)
-)]
-
 mod cli;
 mod common;
 mod config;
 mod core;
+#[cfg(feature = "kcp")]
+mod kcp;
 pub mod logging;
 mod protocol;
 mod transport;
@@ -52,7 +50,7 @@ fn get_str_from_keypair_type(curve: KeypairType) -> &'static str {
 fn genkey(curve: Option<KeypairType>) -> Result<()> {
     use base64::Engine;
     let curve = curve.unwrap_or(DEFAULT_CURVE);
-    let builder = snowstorm::Builder::new(
+    let builder = snow::Builder::new(
         format!(
             "Noise_KK_{}_ChaChaPoly_BLAKE2s",
             get_str_from_keypair_type(curve)
@@ -198,7 +196,6 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::config::{ClientConfig, ServerConfig};
 

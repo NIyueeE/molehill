@@ -151,7 +151,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests unwrap values they just constructed"
+    )]
     use super::*;
     use std::fmt::Debug;
     use std::sync::{Arc, Mutex};

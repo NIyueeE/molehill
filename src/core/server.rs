@@ -2,12 +2,15 @@ use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP
 use crate::common::helper::write_and_flush;
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
-use crate::config::{Config, ServerConfig, ServiceType, TransportType};
+use crate::config::{Config, ServerConfig, ServiceType};
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, Ack, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN,
-    UdpTraffic, read_auth, read_hello, read_registration, write_register_result,
+    self, Ack, Carrier, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello,
+    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, UdpTraffic, read_auth, read_hello,
+    read_registration, write_register_result,
 };
+#[cfg(feature = "noise")]
+use crate::transport::{NoiseKeys, NoiseStream};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
@@ -22,19 +25,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::io::{
+    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
+    copy_bidirectional_with_sizes,
+};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::time;
 use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
 
-#[cfg(feature = "noise")]
-use crate::transport::NoiseTransport;
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-use crate::transport::TlsTransport;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-use crate::transport::WebsocketTransport;
+#[cfg(feature = "kcp")]
+use crate::transport::kcp::KcpAcceptor;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
@@ -68,71 +70,238 @@ pub async fn run_server(
         ));
     };
 
-    match config.transport.transport_type {
-        TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config)?;
-            server.run(shutdown_rx, update_rx).await?;
-        }
-        TransportType::Tls => {
-            #[cfg(any(feature = "native-tls", feature = "rustls"))]
-            {
-                let mut server = Server::<TlsTransport>::from(config)?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
-            crate::common::helper::feature_neither_compile("native-tls", "rustls")
-        }
-        TransportType::Noise => {
-            #[cfg(feature = "noise")]
-            {
-                let mut server = Server::<NoiseTransport>::from(config)?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(feature = "noise"))]
-            crate::common::helper::feature_not_compile("noise")
-        }
-        TransportType::Websocket => {
-            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-            {
-                let mut server = Server::<WebsocketTransport>::from(config)?;
-                server.run(shutdown_rx, update_rx).await?;
-            }
-            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
-            crate::common::helper::feature_neither_compile(
-                "websocket-native-tls",
-                "websocket-rustls",
-            )
-        }
-    }
+    let mut server = Server::from(config)?;
+    server.run(shutdown_rx, update_rx).await?;
 
     Ok(())
 }
 
 // A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
 // See also MultiMap
-type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
+type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
+
+/// A connection accepted by the server, after the transport selector byte:
+/// plain TCP, or TCP wrapped in the Noise record stream when the client
+/// chose encryption. The client decides the transport; the server accepts
+/// both on every listener (v3 selector, see protocol.rs).
+enum ServerStream {
+    Plain(TcpStream),
+    #[cfg(feature = "noise")]
+    Noise(Box<NoiseStream<TcpStream>>),
+}
+
+impl std::fmt::Debug for ServerStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(_) => f.debug_tuple("Noise").finish(),
+        }
+    }
+}
+
+impl ServerStream {
+    /// Apply socket options to the underlying TCP socket (the Noise wrapper
+    /// exposes its inner stream).
+    fn hint(&self, opts: SocketOpts) {
+        match self {
+            ServerStream::Plain(s) => opts.apply(s),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(s) => opts.apply(s.get_inner()),
+        }
+    }
+}
+
+impl AsyncRead for ServerStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ServerStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "noise")]
+            ServerStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Upgrade a freshly accepted TCP connection by its v3 transport selector:
+/// `PLAIN_SELECTOR` keeps the raw stream, `NOISE_SELECTOR` runs the Noise
+/// responder handshake (requires the server's keys), anything else is
+/// rejected.
+async fn upgrade_conn(
+    mut conn: TcpStream,
+    #[cfg(feature = "noise")] noise_keys: Option<&NoiseKeys>,
+) -> Result<ServerStream> {
+    let selector = conn.read_u8().await?;
+    match selector {
+        PLAIN_SELECTOR => Ok(ServerStream::Plain(conn)),
+        NOISE_SELECTOR => {
+            #[cfg(feature = "noise")]
+            {
+                let keys = noise_keys.ok_or_else(|| {
+                    anyhow!("Client requested Noise, but the server has no Noise keys")
+                })?;
+                Ok(ServerStream::Noise(Box::new(
+                    keys.wrap_responder(conn).await?,
+                )))
+            }
+            #[cfg(not(feature = "noise"))]
+            {
+                let _ = conn;
+                bail!(
+                    "Client requested Noise, but this binary was built without the `noise` feature"
+                )
+            }
+        }
+        other => bail!("Unknown transport selector {other:#04x}"),
+    }
+}
+
+/// Everything the accept paths need, shared across the server's listener
+/// tasks: the TCP transport (bind/accept/hints), the optional Noise keys,
+/// the lazily-bound KCP listener state and the shutdown broadcast for
+/// tasks spawned after startup.
+struct ServerShared {
+    tcp: Arc<TcpTransport>,
+    #[cfg(feature = "noise")]
+    noise_keys: Option<NoiseKeys>,
+    #[cfg(feature = "kcp")]
+    kcp: Arc<KcpListenerState>,
+    #[cfg(feature = "kcp")]
+    shutdown_tx: broadcast::Sender<bool>,
+}
+
+/// Shared state for the lazily-bound KCP listener: bound on the first
+/// registration that declares the `kcp` carrier (client-first), once per
+/// server process.
+#[cfg(feature = "kcp")]
+struct KcpListenerState {
+    acceptor: tokio::sync::Mutex<Option<Arc<KcpAcceptor>>>,
+}
+
+#[cfg(feature = "kcp")]
+impl Default for KcpListenerState {
+    fn default() -> Self {
+        Self {
+            acceptor: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// Ensure the KCP UDP listener is bound — once, on the first registration
+/// that declares the `kcp` carrier. A bind failure is a precise
+/// registration rejection, not a startup failure: servers that never see a
+/// KCP client never open the UDP socket (client-first, no config-side
+/// carrier opt-in).
+#[cfg(feature = "kcp")]
+async fn ensure_kcp_listener(
+    shared: Arc<ServerShared>,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    server_config: Arc<ServerConfig>,
+) -> Result<()> {
+    let mut guard = shared.kcp.acceptor.lock().await;
+    if guard.is_some() {
+        return Ok(());
+    }
+    let acceptor = KcpAcceptor::bind(server_config.data_bind_addr())
+        .await
+        .with_context(|| "Failed to bind the KCP data listener")?;
+    let bound = acceptor.local_addr().with_context(|| {
+        format!(
+            "Failed to read the KCP tunnel socket address at {}",
+            server_config.data_bind_addr()
+        )
+    })?;
+    info!("Listening for KCP tunnels at {bound}");
+    let acceptor = Arc::new(acceptor);
+    tokio::spawn(run_kcp_tunnel_listener(
+        Arc::clone(&acceptor),
+        Arc::clone(&control_channels),
+        Arc::clone(&shared),
+        shared.shutdown_tx.subscribe(),
+    ));
+    *guard = Some(acceptor);
+    Ok(())
+}
 
 // Server holds all states of running a server
-struct Server<T: Transport> {
+struct Server {
     // `[server]` config
     config: Arc<ServerConfig>,
 
     // Collection of contorl channels, each carrying one registered service
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
-    // Wrapper around the transport layer
-    transport: Arc<T>,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    // TCP transport + Noise keys + lazy KCP listener + shutdown broadcast
+    // (see `ServerShared`).
+    shared: Arc<ServerShared>,
 }
 
-impl<T: 'static + Transport> Server<T> {
+impl Server {
     // Create a server from `[server]`
-    pub fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub fn from(config: ServerConfig) -> Result<Server> {
         let config = Arc::new(config);
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
-        let transport = Arc::new(T::new(&config.transport)?);
+        let tcp = Arc::new(TcpTransport::new(
+            &crate::config::TransportConfig::default(),
+        )?);
+        #[cfg(feature = "kcp")]
+        let kcp = Arc::new(KcpListenerState::default());
+        #[cfg(feature = "noise")]
+        let noise_keys = match &config.transport.noise {
+            Some(cfg) => Some(NoiseKeys::from_config(cfg)?),
+            None => None,
+        };
+        let shared = Arc::new(ServerShared {
+            tcp,
+            #[cfg(feature = "noise")]
+            noise_keys,
+            #[cfg(feature = "kcp")]
+            kcp,
+            #[cfg(feature = "kcp")]
+            shutdown_tx: broadcast::channel(1).0,
+        });
         Ok(Server {
             config,
             control_channels,
-            transport,
+            shared,
         })
     }
 
@@ -142,78 +311,58 @@ impl<T: 'static + Transport> Server<T> {
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
-        // Listen at `server.bind_addr`
-        let l = self
-            .transport
-            .bind(&self.config.bind_addr)
+        // Control listener: authenticates and registers services, and also
+        // accepts data channels when the data plane shares this address.
+        let control_bind = self.config.control.bind_addr.clone();
+        let control_l = self
+            .shared
+            .tcp
+            .bind(&control_bind)
             .await
-            .with_context(|| "Failed to listen at `server.bind_addr`")?;
-        info!("Listening at {}", self.config.bind_addr);
+            .with_context(|| "Failed to listen at `server.control.bind_addr`")?;
+        info!("Listening at {control_bind}");
+        tokio::spawn(run_accept_loop(
+            Arc::clone(&self.shared),
+            control_l,
+            self.control_channels.clone(),
+            self.config.clone(),
+            shutdown_rx.resubscribe(),
+        ));
 
-        // Retry at least every 100ms
-        let backoff_builder =
-            ExponentialBuilder::default().with_max_delay(Duration::from_millis(100));
-        let mut backoff = backoff_builder.build();
+        // Data-plane listener. When `[server.data].bind_addr` equals the
+        // control address (the default) the control listener above already
+        // accepts data connections; otherwise a second listener is bound.
+        #[cfg(feature = "multiplex")]
+        {
+            let data_bind = self.config.data_bind_addr().to_owned();
+            if data_bind != control_bind {
+                let data_l = self.shared.tcp.bind(&data_bind).await.with_context(|| {
+                    format!("Failed to listen at `server.data.bind_addr` ({data_bind})")
+                })?;
+                info!("Listening for data channels at {data_bind}");
+                tokio::spawn(run_accept_loop(
+                    Arc::clone(&self.shared),
+                    data_l,
+                    self.control_channels.clone(),
+                    self.config.clone(),
+                    shutdown_rx.resubscribe(),
+                ));
+            }
+            // The KCP UDP listener is bound lazily: the first registration
+            // that declares the `kcp` carrier triggers it (client-first —
+            // the server does not pre-declare carriers in its config).
+        }
 
-        // Wait for connections and shutdown signals
+        // Wait for the shutdown signal; the server owns no service
+        // configuration, so there is nothing to hot-reload here.
         loop {
             tokio::select! {
-                // Wait for incoming control and data channels
-                ret = self.transport.accept(&l) => {
-                    match ret {
-                        Err(err) => {
-                            if should_retry_accept(&err) {
-                                if let Some(d) = backoff.next() {
-                                    error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
-                                    time::sleep(d).await;
-                                } else {
-                                    error!("Too many retries. Aborting...");
-                                    break;
-                                }
-                            } else if let Some(e) = err.downcast_ref::<io::Error>() {
-                                // Transient connection-level errors (ECONNABORTED, ECONNRESET, etc.)
-                                // don't affect the listener, just ignore
-                                debug!("Accept interrupted: {e}");
-                            }
-                            // Non-IO errors from the transport layer are silently ignored
-                        }
-                        Ok((conn, addr)) => {
-                            backoff = backoff_builder.build();
-
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
-                                }
-                            }
-                        }
-                    }
-                },
-                // Wait for the shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Shutting down gracefully...");
                     break;
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        // The server owns no service configuration, so there
-                        // is nothing to hot-reload here: services come and go
-                        // with their control channels.
                         warn!("Ignored {e:?} since running as a server");
                     }
                 }
@@ -226,25 +375,113 @@ impl<T: 'static + Transport> Server<T> {
     }
 }
 
-// Handle connections to `server.bind_addr`
-async fn handle_connection<T: 'static + Transport>(
-    mut conn: T::Stream,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+/// Accept loop for one listener: read the v3 transport selector and run
+/// the (optional) Noise handshake with a timeout, then dispatch each
+/// connection to `handle_connection`.
+async fn run_accept_loop(
+    shared: Arc<ServerShared>,
+    listener: TcpListener,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     server_config: Arc<ServerConfig>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    // Retry at least every 100ms
+    let backoff_builder = ExponentialBuilder::default().with_max_delay(Duration::from_millis(100));
+    let mut backoff = backoff_builder.build();
+
+    loop {
+        tokio::select! {
+            ret = shared.tcp.accept(&listener) => {
+                match ret {
+                    Err(err) => {
+                        if should_retry_accept(&err) {
+                            if let Some(d) = backoff.next() {
+                                error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
+                                time::sleep(d).await;
+                            } else {
+                                error!("Too many retries. Aborting...");
+                                break;
+                            }
+                        } else if let Some(e) = err.downcast_ref::<io::Error>() {
+                            // Transient connection-level errors (ECONNABORTED,
+                            // ECONNRESET, ...) don't affect the listener.
+                            debug!("Accept interrupted: {e}");
+                        }
+                        // Non-IO errors from the transport layer are ignored.
+                    }
+                    Ok((conn, addr)) => {
+                        backoff = backoff_builder.build();
+
+                        // Transport selector + optional Noise handshake,
+                        // under the handshake timeout.
+                        #[cfg(feature = "noise")]
+                        let upgrade = upgrade_conn(conn, shared.noise_keys.as_ref());
+                        #[cfg(not(feature = "noise"))]
+                        let upgrade = upgrade_conn(conn);
+                        match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), upgrade).await
+                        {
+                            Ok(conn) => {
+                                match conn.with_context(|| "Failed to do transport handshake") {
+                                    Ok(conn) => {
+                                        let control_channels = control_channels.clone();
+                                        let server_config = server_config.clone();
+                                        let shared = Arc::clone(&shared);
+                                        tokio::spawn(async move {
+                                            if let Err(err) = handle_connection(
+                                                conn,
+                                                control_channels,
+                                                server_config,
+                                                shared,
+                                            )
+                                            .await
+                                            {
+                                                error!("{:#}", err);
+                                            }
+                                        }.instrument(info_span!("connection", %addr)));
+                                    }
+                                    Err(e) => {
+                                        error!("{:#}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Transport handshake timeout: {}", e);
+                            }
+                        }
+                    }
+                }
+            },
+            _ = shutdown_rx.recv() => break,
+        }
+    }
+}
+
+// Handle connections accepted on the control or data listener.
+async fn handle_connection(
+    mut conn: ServerStream,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    server_config: Arc<ServerConfig>,
+    shared: Arc<ServerShared>,
 ) -> Result<()> {
     // Read hello
     let hello = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(conn, control_channels, service_digest, server_config)
-                .await?;
+            do_control_channel_handshake(
+                conn,
+                control_channels,
+                service_digest,
+                server_config,
+                shared,
+            )
+            .await?;
         }
         DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce, false, server_config).await?;
+            do_data_channel_handshake(conn, control_channels, nonce, false).await?;
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce, true, server_config).await?;
+            do_data_channel_handshake(conn, control_channels, nonce, true).await?;
         }
         #[cfg(not(feature = "multiplex"))]
         Hello::DataChannelTunnelHello(..) => {
@@ -256,15 +493,20 @@ async fn handle_connection<T: 'static + Transport>(
     Ok(())
 }
 
-async fn do_control_channel_handshake<T: 'static + Transport>(
-    mut conn: T::Stream,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+async fn do_control_channel_handshake(
+    mut conn: ServerStream,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    #[cfg_attr(
+        not(feature = "kcp"),
+        allow(unused_variables, reason = "only read by the kcp carrier-check arm")
+    )]
+    shared: Arc<ServerShared>,
 ) -> Result<()> {
     debug!("Handshaking a control channel");
 
-    T::hint(&conn, SocketOpts::for_control_channel());
+    conn.hint(SocketOpts::for_control_channel());
 
     // Generate a nonce
     let mut nonce = [0u8; HASH_WIDTH_IN_BYTES];
@@ -313,6 +555,27 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         bail!("Service {}: {reason}", reg.name);
     }
 
+    // Client-declared carrier: the server opens the corresponding
+    // listener on first use (client-first — no config-side opt-in), and a
+    // failure is a precise rejection, like `allow_ports`.
+    if reg.carrier == Carrier::Kcp {
+        #[cfg(feature = "kcp")]
+        let result = ensure_kcp_listener(
+            Arc::clone(&shared),
+            Arc::clone(&control_channels),
+            Arc::clone(&server_config),
+        )
+        .await;
+        #[cfg(not(feature = "kcp"))]
+        let result: Result<()> = Err(anyhow!("This server was built without the `kcp` feature"));
+        if let Err(e) = result {
+            let reason = format!("{e:#}");
+            warn!(service = %reg.name, "Registration failed: {reason}");
+            write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
+            bail!("Service {}: {reason}", reg.name);
+        }
+    }
+
     // Clamp the requested pool size to the server-wide maximum
     let pool_size = match server_config.max_pool_size {
         Some(max) => reg.pool_size.min(max),
@@ -354,7 +617,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn,
         &service,
         bound,
-        server_config.heartbeat_interval,
+        server_config.control.heartbeat_interval,
         pool_size,
     );
 
@@ -372,27 +635,27 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 /// With the `multiplex` feature a data channel is either a plain transport
 /// stream (no-mux mode) or one yamux stream of the client's tunnel.
 #[cfg(not(feature = "multiplex"))]
-type DataChannel<T> = <T as Transport>::Stream;
+type DataChannel = ServerStream;
 
 #[cfg(feature = "multiplex")]
-enum DataChannel<T: Transport> {
-    Raw(<T as Transport>::Stream),
+enum DataChannel {
+    Raw(ServerStream),
     Mux(crate::transport::MuxStream),
 }
 
 /// Wrap a freshly handshaked transport stream as a pool-ready data channel.
 #[cfg(not(feature = "multiplex"))]
-fn new_data_channel<T: Transport>(stream: <T as Transport>::Stream) -> <T as Transport>::Stream {
+fn new_data_channel(stream: ServerStream) -> ServerStream {
     stream
 }
 
 #[cfg(feature = "multiplex")]
-fn new_data_channel<T: Transport>(stream: <T as Transport>::Stream) -> DataChannel<T> {
+fn new_data_channel(stream: ServerStream) -> DataChannel {
     DataChannel::Raw(stream)
 }
 
 #[cfg(feature = "multiplex")]
-impl<T: Transport> tokio::io::AsyncRead for DataChannel<T> {
+impl tokio::io::AsyncRead for DataChannel {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -406,7 +669,7 @@ impl<T: Transport> tokio::io::AsyncRead for DataChannel<T> {
 }
 
 #[cfg(feature = "multiplex")]
-impl<T: Transport> tokio::io::AsyncWrite for DataChannel<T> {
+impl tokio::io::AsyncWrite for DataChannel {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -437,14 +700,15 @@ impl<T: Transport> tokio::io::AsyncWrite for DataChannel<T> {
     }
 }
 
-async fn do_data_channel_handshake<T: 'static + Transport>(
-    #[cfg_attr(not(feature = "multiplex"), allow(unused_mut))] mut conn: T::Stream,
-    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+async fn do_data_channel_handshake(
+    conn: ServerStream,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
     nonce: Nonce,
-    #[cfg_attr(not(feature = "multiplex"), allow(unused_variables))] is_tunnel: bool,
-    #[cfg_attr(not(feature = "multiplex"), allow(unused_variables))] server_config: Arc<
-        ServerConfig,
-    >,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        allow(unused_variables, reason = "only read by the multiplex arm")
+    )]
+    is_tunnel: bool,
 ) -> Result<()> {
     debug!("Handshaking a data channel");
 
@@ -456,49 +720,175 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     };
     drop(control_channels_guard);
 
-    T::hint(&conn, SocketOpts::for_service(None));
+    conn.hint(SocketOpts::for_service(None));
 
     #[cfg(feature = "multiplex")]
     {
         // The hello variant told us whether this connection is a plain data
         // channel or the opening of a multiplexed tunnel.
         if is_tunnel {
-            // Confirm the upgrade before speaking yamux: the client waits for
-            // this ack, so a stale nonce surfaces as a clean error there.
-            write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
-            let config = crate::transport::multiplex::mux_config(
-                server_config.mux_receive_window,
-                server_config.mux_max_streams,
-            );
-            // Bridge: the tunnel driver produces raw mux streams, which are
-            // wrapped and fed into the same pool channel as plain streams.
-            let (bridge_tx, mut bridge_rx) = mpsc::channel::<crate::transport::MuxStream>(64);
-            tokio::spawn(async move {
-                crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx).await;
-                debug!("Multiplexed data tunnel closed");
-            });
-            tokio::spawn(async move {
-                while let Some(stream) = bridge_rx.recv().await {
-                    if handle
-                        .data_ch_tx
-                        .send(DataChannel::Mux(stream))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            return Ok(());
+            return upgrade_to_tunnel(conn, handle).await;
         }
     }
 
     handle
         .data_ch_tx
-        .send(new_data_channel::<T>(conn))
+        .send(new_data_channel(conn))
         .await
         .with_context(|| "Data channel for a stale control channel")?;
     Ok(())
+}
+
+/// Finalize a tunnel upgrade on a validated tunnel stream: confirm with the
+/// ack (the client waits for it, so a stale nonce surfaces as a clean error
+/// there), then run the yamux session and bridge every inbound stream — each
+/// one a requested data channel — into the control channel's pool.
+///
+/// Generic over the stream type so TCP tunnels and KCP tunnels (arm 2) share
+/// one implementation.
+#[cfg(feature = "multiplex")]
+async fn upgrade_to_tunnel<S>(mut conn: S, handle: ControlChannelHandle) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
+    let config = crate::transport::multiplex::mux_config();
+    let (bridge_tx, mut bridge_rx) = mpsc::channel::<crate::transport::MuxStream>(64);
+    tokio::spawn(async move {
+        crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx).await;
+        debug!("Multiplexed data tunnel closed");
+    });
+    tokio::spawn(async move {
+        while let Some(stream) = bridge_rx.recv().await {
+            if handle
+                .data_ch_tx
+                .send(DataChannel::Mux(stream))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Accept KCP tunnel sessions (arm 2 of the transport comparison) and
+/// upgrade each into a yamux data tunnel. Sessions authenticate exactly like
+/// TCP tunnels: the hello carries the control session's nonce.
+#[cfg(all(feature = "kcp", feature = "multiplex"))]
+async fn run_kcp_tunnel_listener(
+    acceptor: Arc<KcpAcceptor>,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    shared: Arc<ServerShared>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => break,
+            session = acceptor.accept() => {
+                let Some(session) = session else { break };
+                let peer = session.peer;
+                let control_channels = control_channels.clone();
+                let shared = Arc::clone(&shared);
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = handle_kcp_tunnel_session(
+                            session,
+                            control_channels,
+                            shared,
+                        )
+                        .await
+                        {
+                            debug!("KCP tunnel session ended: {e:#}");
+                        }
+                    }
+                    .instrument(info_span!("kcp_tunnel", %peer)),
+                );
+            }
+        }
+    }
+    debug!("KCP tunnel listener stopped");
+}
+
+/// Validate one accepted KCP session (optional Noise handshake + tunnel
+/// hello) and hand it to the shared tunnel upgrade path.
+#[cfg(all(feature = "kcp", feature = "multiplex"))]
+async fn handle_kcp_tunnel_session(
+    mut session: crate::transport::kcp::AcceptedSession,
+    control_channels: Arc<RwLock<ControlChannelMap>>,
+    shared: Arc<ServerShared>,
+) -> Result<()> {
+    use crate::transport::kcp::KcpTunnelStream;
+
+    // Bound the crypto + hello phase: an unresponsive or bogus peer must not
+    // park a session task forever (the same role HANDSHAKE_TIMEOUT plays on
+    // the TCP accept path).
+    let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
+
+    // v3 transport selector on the KCP byte stream, same rule as TCP: the
+    // client announces plain or Noise, and the server honors it (the crypto
+    // stack follows the connection, not a config-side type agreement).
+    let selector = tokio::time::timeout(deadline, session.stream.read_u8())
+        .await
+        .with_context(|| "KCP transport selector timed out")??;
+    let mut io = match selector {
+        PLAIN_SELECTOR => KcpTunnelStream::Plain(session.stream),
+        NOISE_SELECTOR => {
+            #[cfg(feature = "noise")]
+            {
+                let keys = shared.noise_keys.as_ref().ok_or_else(|| {
+                    anyhow!("Client requested Noise, but the server has no Noise keys")
+                })?;
+                KcpTunnelStream::Noise(Box::new(
+                    tokio::time::timeout(deadline, keys.wrap_responder(session.stream))
+                        .await
+                        .with_context(|| "KCP tunnel noise handshake timed out")??,
+                ))
+            }
+            #[cfg(not(feature = "noise"))]
+            {
+                let _ = (session, shared);
+                bail!(
+                    "Client requested Noise, but this binary was built without the `noise` feature"
+                )
+            }
+        }
+        other => bail!("Unknown transport selector {other:#04x}"),
+    };
+
+    // Read and validate the tunnel hello, then run the shared upgrade.
+    let (handle, _nonce) = tokio::time::timeout(
+        deadline,
+        validate_tunnel_hello(&mut io, &control_channels, "KCP"),
+    )
+    .await
+    .with_context(|| "KCP tunnel hello timed out")??;
+
+    upgrade_to_tunnel(io, handle).await
+}
+
+/// Read the tunnel hello on a freshly established tunnel stream (any arm)
+/// and resolve the control channel it belongs to via the session nonce.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+async fn validate_tunnel_hello<S>(
+    conn: &mut S,
+    control_channels: &RwLock<ControlChannelMap>,
+    arm: &str,
+) -> Result<(ControlChannelHandle, Nonce)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    match read_hello(conn).await? {
+        Hello::DataChannelTunnelHello(_, nonce) => {
+            let guard = control_channels.read().await;
+            let Some(handle) = guard.get2(&nonce).cloned() else {
+                bail!("{arm} tunnel hello carried an incorrect nonce");
+            };
+            Ok((handle, nonce))
+        }
+        other => bail!("Expected a tunnel hello on the {arm} tunnel, got {other:?}"),
+    }
 }
 
 #[expect(
@@ -506,16 +896,16 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     reason = "the handle deliberately holds the three channel senders whose \
               lifetime keeps the control channel and its pools alive"
 )]
-pub struct ControlChannelHandle<T: Transport> {
+pub struct ControlChannelHandle {
     // Shutdown the control channel by dropping it
     shutdown_tx: broadcast::Sender<bool>,
-    data_ch_tx: mpsc::Sender<DataChannel<T>>,
+    data_ch_tx: mpsc::Sender<DataChannel>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
 }
 
-impl<T: Transport> Clone for ControlChannelHandle<T> {
+impl Clone for ControlChannelHandle {
     fn clone(&self) -> Self {
         ControlChannelHandle {
             shutdown_tx: self.shutdown_tx.clone(),
@@ -579,20 +969,17 @@ async fn bind_with_retry(service: &RegisteredService) -> Result<BoundEndpoint> {
     }
 }
 
-impl<T> ControlChannelHandle<T>
-where
-    T: 'static + Transport,
-{
+impl ControlChannelHandle {
     // Create a control channel handle for an already-bound service: spawn
     // the connection pool task and the control channel handling task.
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
-        conn: T::Stream,
+        conn: ServerStream,
         service: &RegisteredService,
         bound: BoundEndpoint,
         heartbeat_interval: u64,
         pool_size: usize,
-    ) -> ControlChannelHandle<T> {
+    ) -> ControlChannelHandle {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
 
@@ -619,7 +1006,7 @@ where
                 let data_ch_req_tx = data_ch_req_tx.clone();
                 tokio::spawn(
                     async move {
-                        if let Err(e) = run_tcp_connection_pool::<T, _>(
+                        if let Err(e) = run_tcp_connection_pool::<DataChannel>(
                             listener,
                             sock_opts,
                             data_ch_rx,
@@ -641,7 +1028,7 @@ where
                 let data_ch_req_tx = data_ch_req_tx.clone();
                 tokio::spawn(
                     async move {
-                        if let Err(e) = run_udp_connection_pool::<T, _>(
+                        if let Err(e) = run_udp_connection_pool::<DataChannel>(
                             Arc::new(socket),
                             buffer_size,
                             data_ch_rx,
@@ -660,7 +1047,7 @@ where
         }
 
         // Create the control channel
-        let ch = ControlChannel::<T> {
+        let ch = ControlChannel {
             conn,
             shutdown_rx,
             data_ch_req_rx,
@@ -686,14 +1073,14 @@ where
 }
 
 // Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
-struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
+struct ControlChannel {
+    conn: ServerStream,                            // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
 }
 
-impl<T: Transport> ControlChannel<T> {
+impl ControlChannel {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
         write_and_flush(&mut self.conn, data)
             .await
@@ -744,7 +1131,7 @@ impl<T: Transport> ControlChannel<T> {
 // Accept visitors on the pre-bound listener and pair each of them with a
 // data channel from the pool.
 #[instrument(skip_all)]
-async fn run_tcp_connection_pool<T, C>(
+async fn run_tcp_connection_pool<C>(
     l: TcpListener,
     sock_opts: SocketOpts,
     mut data_ch_rx: mpsc::Receiver<C>,
@@ -752,7 +1139,6 @@ async fn run_tcp_connection_pool<T, C>(
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()>
 where
-    T: Transport,
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     info!("Listening at {}", l.local_addr()?);
@@ -882,7 +1268,7 @@ impl Drop for UdpWorkerGuard {
 /// `WireGuard`, ...) pins sessions to the `(ip, port)` tuple and breaks apart
 /// when the proxy splits a peer across source ports.
 #[instrument(skip_all)]
-async fn run_udp_connection_pool<T, C>(
+async fn run_udp_connection_pool<C>(
     l: Arc<UdpSocket>,
     buffer_size: usize,
     mut data_ch_rx: mpsc::Receiver<C>,
@@ -890,7 +1276,6 @@ async fn run_udp_connection_pool<T, C>(
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()>
 where
-    T: Transport,
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     info!("Listening at {}", l.local_addr()?);
@@ -1139,7 +1524,10 @@ fn should_retry_accept(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests unwrap values they just constructed"
+    )]
     use super::*;
 
     fn peer(port: u16) -> SocketAddr {
