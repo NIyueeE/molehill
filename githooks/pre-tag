@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Pre-tag hook — light release review for a `v*` tag (AGENTS.md §5).
+#
+# git has no native tag hook, so this review fires at the two tag moments:
+#   1. `just tag` — locally, before the tag is created (default: HEAD)
+#   2. githooks/pre-push — automatically, when a `v*` tag is pushed
+#      (pre-push passes --tag and --commit of the tagged state)
+#
+# Scope is deliberately light: greppable release-state invariants plus an
+# advisory review checklist. Heavy gates (audit, deny, outdated, tests) stay
+# in pre-push and CI; release.yml re-enforces the version and changelog
+# invariants remotely. Nothing here replaces a human/agent review of the
+# CHANGELOG and the docs — see the checklist at the bottom.
+#
+# Usage:
+#   githooks/pre-tag [--tag vX.Y.Z] [--commit <sha>]
+#     --tag     tag name under review (default: v + Cargo.toml version)
+#     --commit  state under review (default: HEAD; pre-push passes the tag's
+#               commit, so re-pushing an old tag reviews that tag's state,
+#               not the working tree)
+# Exit code: 0 review passed; 1 mechanical violation; 2 usage error.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+tag=""
+commit=""
+passed_commit=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tag)
+      [ $# -ge 2 ] || { echo "pre-tag: --tag needs a value" >&2; exit 2; }
+      tag="$2"; shift 2 ;;
+    --commit)
+      [ $# -ge 2 ] || { echo "pre-tag: --commit needs a value" >&2; exit 2; }
+      commit="$2"; passed_commit=1; shift 2 ;;
+    *)
+      echo "pre-tag: unknown argument: $1" >&2
+      exit 2 ;;
+  esac
+done
+[ -n "$commit" ] || commit=HEAD
+
+# content of a path at the reviewed state ("" when absent)
+at() { git show "$commit:$1" 2>/dev/null || true; }
+exists_at() { git cat-file -e "$commit:$1" 2>/dev/null; }
+
+errors=0
+fail() { echo "  FAIL  $*" >&2; errors=$((errors + 1)); }
+
+version="$(at Cargo.toml | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)"
+if [ -z "$version" ]; then
+  echo "pre-tag: no version in Cargo.toml at $commit" >&2
+  exit 1
+fi
+[ -n "$tag" ] || tag="v${version}"
+short="$(git rev-parse --short "$commit" 2>/dev/null || echo "$commit")"
+echo "==> release review: $tag ($short)"
+
+# --- version consistency ---------------------------------------------------
+echo "[version]"
+if [ "$tag" = "v${version}" ]; then
+  echo "  ok    tag name matches Cargo.toml version $version"
+else
+  fail "tag $tag does not match Cargo.toml version $version at $short"
+fi
+lock_version="$(at Cargo.lock | awk '
+  /^name = "molehill-rathole"/ {f=1; next}
+  f && /^version = / {split($3, a, "\""); print a[2]; exit}')"
+if [ -n "$lock_version" ] && [ "$lock_version" = "$version" ]; then
+  echo "  ok    Cargo.lock in sync (molehill-rathole $lock_version)"
+else
+  fail "Cargo.lock version '$lock_version' != Cargo.toml $version"
+fi
+
+# --- changelog: single source of release notes ------------------------------
+echo "[changelog]"
+n="$(at CHANGELOG.md | awk -v ver="$version" '
+  $0 ~ "^## \\[" ver "\\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" {insec=1; next}
+  insec && /^## / {exit}
+  insec {n++}
+  END {print n+0}')"
+if [ "${n:-0}" -gt 0 ]; then
+  echo "  ok    dated, non-empty '## [$version] - YYYY-MM-DD' section in CHANGELOG.md"
+else
+  fail "no dated, non-empty '## [$version] - YYYY-MM-DD' section in CHANGELOG.md at $short — move the [Unreleased] content and commit it before tagging"
+fi
+
+# --- release assets (benchmark ritual deliverables) -------------------------
+echo "[release assets]"
+# In push mode (--commit) missing assets are a note, not a failure: a
+# historical tag legitimately predates the ritual, and re-pushing one to fix
+# a failed release must stay possible. At tag creation they are required.
+if exists_at "benches/scripts/bench/results-v${version}.json"; then
+  echo "  ok    results-v${version}.json committed"
+elif [ "$passed_commit" -eq 1 ]; then
+  echo "  note  results-v${version}.json absent at this commit (historical tag?)"
+else
+  fail "benches/scripts/bench/results-v${version}.json missing — run the benchmark ritual (docs/release.md) and commit it"
+fi
+if exists_at "assets/benchmark-v${version}.png"; then
+  echo "  ok    assets/benchmark-v${version}.png committed"
+elif [ "$passed_commit" -eq 1 ]; then
+  echo "  note  assets/benchmark-v${version}.png absent at this commit (historical tag?)"
+else
+  fail "assets/benchmark-v${version}.png missing — run 'just bench-plot' and commit the chart"
+fi
+
+# --- container image build review (mechanical part) -------------------------
+echo "[container image]"
+if exists_at Containerfile; then
+  echo "  ok    Containerfile present"
+else
+  fail "Containerfile missing"
+fi
+wf="$(at .github/workflows/release.yml)"
+if printf '%s\n' "$wf" | grep -q 'Publish to GHCR'; then
+  echo "  ok    release.yml has the GHCR publish job"
+else
+  fail "release.yml has no 'Publish to GHCR' job"
+fi
+if printf '%s\n' "$wf" | grep -q 'ghcr.io/niyueee/molehill'; then
+  echo "  ok    image tags target ghcr.io/niyueee/molehill"
+else
+  fail "no ghcr.io/niyueee/molehill tags in release.yml"
+fi
+if printf '%s\n' "$wf" | grep -q -- '--help'; then
+  echo "  ok    release.yml smoke-tests the image (--help)"
+else
+  fail "no container smoke test ('--help') in release.yml"
+fi
+
+# --- local-only: the tag is about to be created here ------------------------
+if [ "$passed_commit" -eq 0 ]; then
+  echo "[local tag]"
+  if [ -z "$(git status --porcelain)" ]; then
+    echo "  ok    working tree clean (HEAD is the release state)"
+  else
+    fail "working tree dirty — commit the release state first (the tag would miss it)"
+  fi
+  if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+    fail "refs/tags/$tag already exists — delete it first (only to fix a failed release)"
+  else
+    echo "  ok    refs/tags/$tag does not exist yet"
+  fi
+fi
+
+# --- advisory checklist (human/agent audit; no mechanical gate can do this) -
+echo "[review checklist — verify each item, then push the tag]"
+cat <<'EOF'
+  [ ] CHANGELOG audit: the section for this version is accurate, complete and
+      user-visible (no internal-only noise); zh user docs mirrored for every
+      entry that touches them
+  [ ] Docs audit: version numbers, config examples and claims in README.md /
+      README.zh.md / docs/ still hold at this commit
+  [ ] Container image review: scratch + static musl; img/bin amd64+arm64
+      layout; feature set server,client,noise,hot-reload,multiplex; the
+      --help smoke test passed in the workflow run
+  [ ] Benchmark ritual done (docs/release.md): matrix run, 'just bench-check'
+      green vs the previous tag (waivers recorded in HANDOFF.md), README
+      benchmark section refreshed
+  [ ] Heavy gates green on this commit: 'just check' (pre-commit + pre-push);
+      CI runs the identical chain
+  [ ] Release is deliberate (AGENTS.md §5): explicit human request — pushing
+      the tag publishes the release directly (no draft stage)
+EOF
+
+echo
+if [ "$errors" -eq 0 ]; then
+  echo "pre-tag review passed for $tag"
+else
+  echo "pre-tag review FAILED for $tag ($errors issue(s))" >&2
+  exit 1
+fi

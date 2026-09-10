@@ -70,10 +70,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install OpenSSL (macOS)
-        if: matrix.os == 'macos-latest'
-        run: brew install openssl@3
-
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 

@@ -65,7 +65,6 @@ jobs:
       - name: Check all feature combinations
         run: >
           cargo hack check --feature-powerset --no-dev-deps
-          --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
   test:
     name: test ${{ matrix.name }}
@@ -76,12 +75,13 @@ jobs:
         include:
           # default-feature tests already run inside the `check` job's chain;
           # the matrix covers the alternative feature combinations.
-          - name: rustls
-            args: --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-          - name: rustls + multiplex
-            args: --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
-          - name: embedded (noise-only)
-            args: --no-default-features --features embedded
+          # `embedded` resolves to exactly the `noise` set
+          # (server,client,hot-reload,noise), so only the explicit legs run
+          # tests; the powerset check compiles every other combination.
+          - name: noise
+            args: --no-default-features --features server,client,noise,hot-reload
+          - name: noise + multiplex
+            args: --no-default-features --features server,client,noise,hot-reload,multiplex
           - name: server+client lib only
             args: --lib --no-default-features --features server,client
     steps:

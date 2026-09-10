@@ -24,7 +24,7 @@ uvx ruff check benches/scripts/
 echo "==> cargo clippy (strict lints from Cargo.toml, default features)"
 cargo clippy --all-targets -- -D warnings
 
-echo "==> cargo clippy (server+client only — no TLS/websocket/mux feature gates)"
+echo "==> cargo clippy (server+client only — minimal no-default-features build)"
 cargo clippy --all-targets --no-default-features --features server,client -- -D warnings
 
 echo "pre-commit checks passed"

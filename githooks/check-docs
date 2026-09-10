@@ -21,7 +21,12 @@ expect() {
 }
 
 # 1) every cargo command in every hook must be documented in the checks docs
-for hook in githooks/pre-commit githooks/pre-push; do
+for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
+  if [ ! -f "$hook" ]; then
+    echo "  FAIL  $hook missing (see docs/checks.md)" >&2
+    errors=$((errors + 1))
+    continue
+  fi
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
@@ -108,6 +113,16 @@ if [ -f githooks/check-secrets ]; then
   expect "secret scan documented" docs/checks.md 'githooks/check-secrets'
 else
   echo "  FAIL  githooks/check-secrets missing (AGENTS.md §9 secrets discipline)" >&2
+  errors=$((errors + 1))
+fi
+
+# 14) pre-tag release review: wired into pre-push and documented
+if [ -f githooks/pre-tag ]; then
+  expect "pre-tag review wired" githooks/pre-push 'githooks/pre-tag'
+  expect "pre-tag review documented" docs/checks.md 'githooks/pre-tag'
+  expect "pre-tag review in AGENTS.md" AGENTS.md 'githooks/pre-tag'
+else
+  echo "  FAIL  githooks/pre-tag missing (light release review, see AGENTS.md §5)" >&2
   errors=$((errors + 1))
 fi
 

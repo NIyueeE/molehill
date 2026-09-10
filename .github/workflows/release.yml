@@ -70,16 +70,16 @@ jobs:
             target: x86_64-unknown-linux-musl
             exe: molehill
             cross: false
-            # Full rustls feature set: static musl binary, no OpenSSL.
+            # Full default feature set: static musl binary.
             # Used as the linux/amd64 container image artifact.
-            features: server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
+            features: server,client,noise,hot-reload,multiplex,kcp
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             exe: molehill
             cross: true
             # Same feature set as x86_64 musl so the linux/arm64 container
             # image artifact is feature-consistent with linux/amd64.
-            features: server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
+            features: server,client,noise,hot-reload,multiplex,kcp
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             exe: molehill
@@ -118,15 +118,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Install OpenSSL
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install pkg-config libssl-dev
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get install musl-tools
-      - name: Install OpenSSL
-        if: matrix.os == 'macos-latest'
-        run: brew install openssl@3
 
       # Native build
       - name: Install target
@@ -215,18 +209,20 @@ jobs:
           cd dist
           sha256sum *.tar.gz *.zip > SHA256SUMS 2>/dev/null || true
 
-      # Releases are created as drafts; publish after a quick look.
-      # Never hand-edit the notes — CHANGELOG.md is the source (AGENTS.md §5).
+      # Published directly — there is no draft stage. The human checkpoint is
+      # the tag push itself (AGENTS.md §5): the local pre-tag review
+      # (githooks/pre-tag) ran before the tag was created and again inside
+      # pre-push. Never hand-edit the notes — CHANGELOG.md is the source.
       - name: Create release with notes extracted from CHANGELOG.md
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="$GITHUB_REF_NAME"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md --draft
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" --draft --title "$TAG" --notes-file release-notes.md dist/*
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md dist/*
           fi
 
   docker:
@@ -251,8 +247,6 @@ jobs:
           mkdir -p img/bin/amd64 img/bin/arm64
           tar xzf "dist/molehill-${tag}-x86_64-unknown-linux-musl.tar.gz" -C img/bin/amd64 --strip-components=1
           tar xzf "dist/molehill-${tag}-aarch64-unknown-linux-musl.tar.gz" -C img/bin/arm64 --strip-components=1
-          cp /etc/ssl/certs/ca-certificates.crt img/bin/amd64/
-          cp /etc/ssl/certs/ca-certificates.crt img/bin/arm64/
           cp Containerfile img/Dockerfile
           file img/bin/amd64/molehill img/bin/arm64/molehill
       - name: Set up Docker Buildx

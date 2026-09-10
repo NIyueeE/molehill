@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
-# Pre-push hook (heavyweight gates): audit + dependency policy + freshness + tests.
-# Fast gates live in githooks/pre-commit; CI runs the full chain via `just check`.
+# Pre-push hook (heavyweight gates + tag review dispatch): audit + dependency
+# policy + freshness + tests guard every push. A push carrying a `v*` tag is a
+# release act (AGENTS.md §5): the light release review (githooks/pre-tag) runs
+# first so a violation fails fast — git has no native tag hook, so pre-push is
+# where the review fires automatically on a tag push. Fast gates live in
+# githooks/pre-commit.
 # Activate via: git config core.hooksPath githooks   (or: just setup)
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
+
+# Consume the pushed refs from stdin before running anything; `v*` tag pushes
+# get the release review ahead of the heavy gates. Deletions are skipped.
+# (A manual run from a terminal reads nothing, like the hook always did.)
+if [ ! -t 0 ]; then
+  zeros="0000000000000000000000000000000000000000"
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_ref" in
+      refs/tags/v*)
+        if [ "$local_sha" != "$zeros" ]; then
+          echo "==> release tag pushed: $local_ref"
+          githooks/pre-tag --tag "${local_ref#refs/tags/}" --commit "$(git rev-parse --verify "$local_sha^{commit}")"
+        fi
+        ;;
+    esac
+  done
+fi
 
 echo "==> cargo audit (security advisories)"
 cargo audit
