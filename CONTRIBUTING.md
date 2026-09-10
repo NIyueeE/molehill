@@ -39,7 +39,7 @@ The integration suite spawns real server/client pairs on fixed ports and runs
 cargo test -- --test-threads=1
 ```
 
-Feature-combination coverage (TLS backends are mutually exclusive):
+Feature-combination coverage:
 
 ```bash
 just powerset     # cargo hack feature powerset (what CI's features job runs)

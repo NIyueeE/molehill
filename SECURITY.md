@@ -19,7 +19,7 @@ fixes are developed privately and released as soon as possible.
 - The shared `default_token` authenticates control channels; the server's
   `allow_ports` whitelist bounds what any client can register. Reports about
   bypassing either are in scope.
-- Transport-layer concerns (TLS validation, Noise handshake, PSK handling)
+- Transport-layer concerns (Noise handshake, key and PSK handling)
   are in scope. Transport docs: [docs/transport.md](docs/transport.md).
 - Supply-chain reports (a compromised dependency or CI action) also go here;
   actions are pinned to commit SHAs and audited by `cargo audit` /

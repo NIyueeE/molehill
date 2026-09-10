@@ -12,7 +12,7 @@
 
 ## Startup and registration
 
-In client mode, molehill creates one control channel per configured service, all connecting to `server.bind_addr`. The server owns no service configuration: after authentication the *client registers* each service by sending its name, type, public endpoint (`remote_bind_addr`) and desired pool size, and the server validates the registration against its policy before exposing anything — `allow_ports` whitelist, explicit privileged ports, and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
+In client mode, molehill creates one control channel per configured service — by default all connecting to `server.control.bind_addr`, or to each service's own `remote_addr` (`[client.services.<name>]`) when that overrides the client-wide control endpoint. The server owns no service configuration: after authentication the *client registers* each service by sending its name, type, public endpoint (`remote_bind_addr`) and desired pool size, and the server validates the registration against its policy before exposing anything — `allow_ports` whitelist, explicit privileged ports, and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
 
 On success the server binds the endpoint and starts serving visitors; on failure it replies with the exact reason and the client gives up for that service instead of hammering the server with doomed retries.
 
@@ -30,15 +30,15 @@ For UDP, the server maintains a per-service **session-affinity table**: a single
 
 ### Multiplexing
 
-With the `multiplex` feature (part of the default feature set) and `mux = true` (the default), the client dials one extra connection per control session right after registering — the *tunnel* — announced with a distinct hello so the server upgrades it to a yamux session too. From then on:
+With the `multiplex` feature (part of the default feature set) and `mode = "multiplex"` (the default), the client dials N connections per control session right after registering (`[client.data].default_count`, default 4, overridable per service) — the *tunnels* — each announced with a distinct hello so the server upgrades them to yamux sessions too. Data-channel opens spread across the tunnels round-robin (a dead tunnel is skipped transparently until the heartbeat-driven reconnect replaces the pool). The tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr` when set, else `[client.data].default_data_addr`, else the control endpoint) and are accepted by the server's data listener — the control listener itself when the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
-- `CreateDataChannel` no longer dials a fresh TCP(+TLS/Noise) connection; the client simply opens a new stream on the tunnel.
+- `CreateDataChannel` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
 - Per-stream framing is identical to the plain path (`StartForward*` command first), which keeps both modes testable against each other.
 - rust-yamux auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 
-`mux = false` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.
+`mode = "direct"` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.
 
 ## UDP
 
@@ -46,8 +46,8 @@ UDP services are forwarded over the same data channels, framed with a small head
 
 ## Heartbeat
 
-The server sends application-layer heartbeats on each control channel every `heartbeat_interval` seconds (`0` disables sending). The client expects some control command within `heartbeat_timeout` seconds; otherwise it treats the channel as dead and reconnects. `heartbeat_timeout` must be greater than `heartbeat_interval`.
+The server sends application-layer heartbeats on each control channel every `[server.control].heartbeat_interval` seconds (`0` disables sending). The client expects some control command within `[client.control].default_heartbeat_timeout` seconds (overridable per service); otherwise it treats the channel as dead and reconnects. The timeout must be greater than the server's `heartbeat_interval`.
 
 ## Hot reload
 
-When the config file changes, the watcher compares the old and new configs: general changes (transport, addresses, tokens, mux settings) trigger a full restart of the instance; client service-level changes (add, remove, or modify a service) are applied without restarting — the affected control channels are torn down or created, which unregisters/re-registers exactly those services on the server.
+When the config file changes, the watcher compares the old and new configs: general changes (transport, addresses, tokens, data-plane settings) trigger a full restart of the instance; client service-level changes (add, remove, or modify a service) are applied without restarting — the affected control channels are torn down or created, which unregisters/re-registers exactly those services on the server.

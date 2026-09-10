@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `just test-fast` and `just bench-fast`: a quick verification loop (lib +
+  core integration subset) and a ~2-minute molehill-only smoke matrix into
+  `results-dev.json`; the bench runner's default `--out` derives from
+  `Cargo.toml`'s version, so dev runs never merge into a release baseline.
+
+- v0.8.0 benchmark re-baseline: `results-v0.8.0.json` and the README
+  chapter/charts now describe the merged defaults (count=4, ring-
+  accelerated noise) with three new cells (rate-limited r100/20 and
+  r20/40, jittery j20/10) and six new metrics (CPU%, connection churn,
+  sustained UDP capacity, a 64-stream scale point, a mixed bulk +
+  interactive workload, per-rep min/max). The matrix self-throttles
+  (nice 10, load-aware cooldown) and every probe socket is bounded.
+  The v0.7.2 baseline ran a different container and single-tunnel
+  default, so the old regression gate does not carry over;
+  `results-v0.8.0.json` is the new baseline.
+
+- Parallel multiplex tunnels by default (`[client.data].default_count = N`,
+  default 4): data channels are spread round-robin over N tunnel connections
+  per service, isolating head-of-line blocking (rtt10 HoL max 101 -> 81 ms)
+  and aggregating beyond a single TCP flow (loopback 8-stream 4.3 -> 12 Gbps,
+  1% loss 3.7 -> 7.1 Gbps in the bench matrix); a dead tunnel is skipped
+  transparently. `1` reproduces the single-tunnel behavior.
+- Per-service servers and auth: `[client.services.<name>].remote_addr`
+  overrides `[client.control].default_remote_addr` for that service — its
+  control channel and, by default, its data plane dial the given server —
+  and `token` overrides `[client].default_token`, so one client can spread
+  services across several molehill servers (region replicas, per-tenant
+  servers, rolling migrations) even when the servers do not share a token;
+  each server covers the registered ports in its own `allow_ports`.
+- Per-service data-plane and control overrides: `[client.services.<name>]`
+  accepts `mode`/`count`/`carrier` (defaults in `[client.data]`),
+  `remote_addr`/`heartbeat_timeout`/`retry_interval`/`token` (defaults in
+  `[client.control]` / `[client]`), so one client can mix data paths per
+  service (e.g. a multiplexed interactive service next to a `direct` bulk
+  service) and per-service heartbeat timeouts against servers with
+  different heartbeat intervals. The pools were already per service; the
+  server needs no changes — it adapts per connection and lazily opens its
+  KCP listener on the first `kcp` registration.
+- Optional KCP data tunnels (`[client.data].default_carrier = "kcp"`,
+  feature `kcp`):
+  multiplexed tunnels ride KCP-over-UDP sessions (fixed, recorded protocol
+  parameters) behind a thin in-repo tokio adapter, with Noise kept on top
+  when the control transport is `noise`; the server lazily binds its UDP
+  listener on the first registration that declares the `kcp` carrier (see
+  HANDOFF.md); idle-tunnel keepalive is a known limitation.
+- Explicit data-plane endpoints: `[client.data].default_data_addr` (defaults to
+  the service's control endpoint) and `[server.data].bind_addr` (defaults
+  to the control listener) let operators move data channels onto a separate
+  port or interface. The server binds a dedicated listener only when the
+  two addresses differ; otherwise the control listener keeps accepting data
+  connections exactly as before.
 - Release-grade benchmark matrix (`just bench`): peer comparison against frp,
   rathole (upstream) and bore across loopback and weak-network cells
   (rtt/loss via netem, with a userspace delay-proxy fallback when
@@ -17,6 +68,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The logo was replaced with the mole + volcano + data-stream design
+  (`assets/molehill.svg`), and per-run bench artifacts
+  (`results-arms-*.json`) are no longer tracked — only the release
+  snapshots (`results-vX.Y.Z.json`) and charts stay committed.
+
+- Docs now present molehill as an independent project: the rathole fork is
+  kept as provenance (README / README.zh provenance note, AGENTS.md §7,
+  `docs/release.md` versioning, the crate doc comment and the Cargo
+  description) instead of as the project's identity. The fork point and the
+  continued version line stay documented and unchanged.
+
+- Benchmark peer binaries are cached under `~/tmp/bench-peers` instead of
+  `/tmp/bench-peers`, which session cleanup wipes (forcing a re-download
+  through the rate-limited GitHub API); `PEER_DIR` still overrides it.
+
+- **BREAKING (protocol v3)**: every connection between client and server
+  starts with a one-byte transport selector (`0x00` plain / `0x01` noise,
+  on TCP connections and KCP sessions alike), and the service registration
+  carries the data-plane carrier the client will use (`tcp`/`kcp`). The
+  server accepts whatever the client speaks on one listener — its
+  `[server.transport]` block is keys-only — and opens its KCP UDP listener
+  lazily on the first `kcp` registration, rejecting with a precise reason
+  when the bind fails or the binary lacks the `kcp` feature. Per-service
+  encryption: `[client.services.<name>].transport` accepts `type`
+  (`"noise"` / `"plain"`, unset = follow `[client.transport].type`)
+  plus per-service `noise` keys — one client can run plain and encrypted
+  services side by side (e.g. a service dialing a different server with its
+  own public key), and the client is no longer generic over one transport
+  (`ClientStream`/`ClientTransport` enums). Both ends
+  must upgrade together (protocol version mismatch is a hard error).
+- `snow` is upgraded to 0.10 (MSRV 1.85, edition 2024): the u16-framed
+  record stream wrapper is vendored in-repo (`src/transport/noise_stream.rs`,
+  ported from snowstorm 0.4.0 — unmaintained and pinned to snow 0.9, so a
+  real upgrade requires owning the wrapper; Apache-2.0 attribution in the
+  file header) and `pin-project` joins the `noise` feature. No behavior or
+  wire change (measured throughput identical to the snow 0.9.6 build); the
+  wrapper is now ours, which unblocks the leaner-record-stream work
+  (HANDOFF). `Builder::local_private_key`/`remote_public_key`/`psk` now
+  return `Result` and validate key/PSK lengths at build time — a wrong-size
+  key surfaces at handshake setup instead of mid-handshake.
+- KCP data tunnels: the ARQ send/receive windows are doubled (2048/4096
+  segments, ~2.8/5.7 MiB in flight at MTU 1400 — the old 1024/2048 capped
+  throughput at BDP/RTT, e.g. ~0.28 Gbps at 40 ms tunnel RTT). Measured
+  with the bench matrix: +29% single-stream on the 1%-loss/10 ms cell
+  (0.29 -> 0.38 Gbps) and +20% on the 5%-loss/100 ms cell, loopback
+  unchanged. A 5 ms flush interval was tried and rejected: it regressed
+  loopback 8-stream ~3x (busier update timer under saturation). The
+  adapter-level PING/PONG keepalive (2 s, NAT warm + RTT probe) is now
+  documented as present; dead peers are still only confirmed on the next
+  write (~20 RTOs). KCP's measured role: UDP-only paths (TCP blocked by
+  firewall/NAT) and latency-first interactive traffic on high-loss,
+  high-RTT links (5%-loss/100 ms cell: udp p50 601 vs 813 ms and hol max
+  gap 1444 vs 2963 ms, kcp4 vs the noise-TCP arm).
+- The Noise data path now runs ring's hardware-dispatched
+  ChaCha20-Poly1305 (`snow`'s ring-accelerated resolver, part of the
+  default feature set; `snow` is now a direct dependency, `snowstorm`
+  keeps the stream wrapper): measured +29% loopback single-stream
+  (3.81 -> 4.92 Gbps) and +25% 8-stream (11.80 -> 14.75 Gbps) end-to-end
+  on x86-64, and +7%/+16% on the 1%-loss/10 ms cell. No wire change —
+  every pattern gets the accelerated cipher; the pattern hash (BLAKE2s
+  default) only runs once per connection in the handshake.
+- **BREAKING (transport)**: the `tls` and `websocket` transports are removed.
+  `[client.transport]` / `[server.transport]` accept only `"plain"` (default)
+  and `"noise"`, and the `[client.transport.tls]`,
+  `[client.transport.websocket]`, `[server.transport.tls]` and
+  `[server.transport.websocket]` blocks, the `TlsConfig`/`WebsocketConfig`
+  types, and the `native-tls` / `rustls` / `websocket-*` cargo features with
+  their dependencies are gone. Migrate to `noise` (docs/transport.md); if TLS
+  termination is still required, run nginx or a CDN in front of molehill.
+  Old configs naming the removed values or blocks fail loudly at startup.
+- **BREAKING (configuration)**: the client/server layout is now three blocks
+  per side. `[client]` keeps `default_token`; the client-level `prefer_ipv6`
+  was removed (it had no effect in the running code — only the per-service
+  `prefer_ipv6`, which steers the UDP forwarder's bind choice, is live); the
+  control channel moved to `[client.control]` and the data plane to
+  `[client.data]`. The client-wide defaults are `default_`-prefixed so they
+  read distinctly from the per-service overlay keys:
+  `[client.control]` (`default_remote_addr`, `default_heartbeat_timeout`,
+  `default_retry_interval`) and `[client.data]` (`default_mode`,
+  `default_count`, `default_carrier`, `default_data_addr` — replacing `mux`,
+  `mux_tunnels`, `tunnel`, `tunnel_addr`), while `[client.services.<name>]`
+  carries the overlays (`remote_addr`, `heartbeat_timeout`,
+  `retry_interval`, `token`, `mode`, `count`, `carrier`, `protocol`,
+  `transport`, `udp_forwarder_ipv6`, `udp_send_queue_size`). The service
+  key `type` was renamed to `protocol` (it selects tcp/udp and collided
+  with the transport `type`), `prefer_ipv6` to `udp_forwarder_ipv6` (it
+  only steers the UDP forwarder's bind choice), `udp_sendq_size` to
+  `udp_send_queue_size`, and the per-service transport toggle is
+  `transport.type` (`"noise"`/`"plain"`). On the server,
+  `bind_addr`/`heartbeat_interval` moved to `[server.control]`,
+  `kcp_bind_addr` became `[server.data].bind_addr`, and
+  `[server.data].carriers` is **gone** — the registration carries the
+  client-declared carrier (v3) and the server opens the listener on first
+  use. `[server.transport]` lost its `type` key: it holds only the Noise
+  keys, and the server accepts both plain and Noise connections (v3
+  transport selector byte); a client that decides to encrypt (noise-vs-
+  plain benchmark in the README is the price list) needs no server-side
+  `type` agreement. The transport value `"tcp"` is now `"plain"`,
+  `[client.transport.tcp].proxy` moved to `[client.transport].proxy`, and the
+  dead transport-level `nodelay`/`keepalive_secs`/`keepalive_interval` keys
+  were removed (fixed internal defaults; the per-service `nodelay` remains).
+  Old keys are rejected by `deny_unknown_fields`, never silently ignored;
+  the full migration table is in docs/configuration.md.
+- Bounded per-tunnel yamux buffering: the receive window is fixed at 64 MiB
+  per tunnel with 32 streams (was: yamux's own 1 GiB / 512, and configurable).
+  With the old defaults a lossy link accumulated unbounded backlog — measured
+  211 MiB avg / 620 MiB peak RSS in the client process at 1% loss (10 ms
+  RTT); the new defaults keep every cell of the bench matrix at its previous
+  throughput (the auto-tuner needs allocatable credit headroom,
+  ~window/2RTT per stream; 16 MiB / 32 streams measured 30-65% slower on
+  delayed links) while bounding the loss backlog at ~35 MiB avg / ~69 MiB
+  peak. The values are internal constants, no longer config keys — yamux
+  couples them (`window >= 256 KiB * streams`), so exposing both invited
+  misconfiguration. Applies to TCP and KCP tunnels alike.
+- The client tunnel driver is now event-driven: announcing a freshly opened
+  stream is a polled future instead of an awaited socket flush inside the
+  driver loop, so a backpressured tunnel can no longer stall inbound frame
+  processing (window updates, data) while an open is in flight.
+- The transport-arm feature `kcp` is part of the default feature set, so the
+  standard `cargo build --release` binary covers the tcp/kcp arms. Slim
+  builds (`embedded`, the `minimal` profile, the container recipe) keep
+  their explicit feature lists and are unaffected.
 - Benchmark entries are PEP 723 python scripts run via `uv run` (no shell test
   entries); peer tools (frp, rathole, bore) are fetched as the latest
   GitHub release binaries — never built from source. The matrix measures per
@@ -26,29 +199,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Runs are resumable and continue on error: each completed arm is printed and
   checkpointed to the results file immediately, `--tools/--cells/--variants`
   select subsets, and results merge unless `--fresh` is given. Molehill runs
-  mux / mux-off / noise / tls variants (mux-off on the loopback cell only).
+  mux / mux-off / mux1 / noise / kcp4 variants (mux-off on the loopback cell
+  only).
 - Benchmark charts split into a plain-TCP peers chart (molehill default mux
   vs frp / rathole / bore) and a molehill-family chart isolating the costs of
-  multiplexing (mux vs mux-off) and encryption (mux vs noise vs tls); the
+  multiplexing (mux vs mux-off) and encryption (mux vs noise); the
   encrypted chisel peer was removed — its SSH tunnel is not comparable on the
   plain-TCP axis.
 - The python bench/test entries are now linted by ruff in the pre-commit gate
   (`ruff.toml`, waivers documented there), and the uv/PEP 723 convention is
   part of AGENTS.md.
-- The multiplexing-cost comparison now covers the weak cells: under loss the
-  single tunnel shares one retransmit domain while `mux = false` retransmits
-  per stream (at 1% loss, 8-stream throughput 18.5 vs 4.7 Gbit/s). The README
-  benchmark section is reorganized around a configuration-selection guide
-  (when to keep or turn off mux, noise vs tls) and a methodology section
-  documenting the test discipline and known limits.
+- The multiplexing-cost comparison covers the loopback cell only (mux-off
+  runs loopback by design; the weak-cell multiplexing behavior is told by
+  the tunnel-count axis — count = 4 vs count = 1 — in the count chart). The
+  README benchmark section is reorganized around a configuration-selection
+  guide (when to keep or turn off mux, plain vs noise) and a methodology
+  section documenting the test discipline and known limits.
 - Documentation policy: governance and contributor docs are English-only —
   the four `*.zh.md` governance mirrors were dropped; user-facing docs
   (README, configuration, transport) keep Chinese mirrors, and the Chinese
   configuration (`docs/configuration.zh.md`) and transport
   (`docs/transport.zh.md`) pages were added. AGENTS.md §2/§3 and the
   docs-alignment check were updated to match.
+- Releases are published **directly** — the GitHub Release is created public
+  from `CHANGELOG.md` notes as soon as the build matrix finishes; the draft
+  stage is gone and the human checkpoint is the tag push itself.
+- New `githooks/pre-tag` release review (light, seconds): tag↔version match
+  (incl. `Cargo.lock`), dated non-empty changelog section, committed bench
+  results/chart, container-job greps, plus an advisory audit checklist
+  (CHANGELOG & docs, container build, benchmark gate, deliberate-release
+  confirm). git has no native tag hook, so it fires via `just tag` and again
+  inside pre-push on every `v*` tag push (before the heavy gates); the
+  pre-commit / pre-push / pre-tag responsibilities are now separated in
+  docs/checks.md.
+- Benchmark data hygiene: the missing/failed cells of the v0.8.0 baseline
+  are filled from targeted same-host re-runs — the peer tunnels at the
+  rate-limited cells (frp/rathole/bore 1-stream now measured, previously
+  null; the 8-stream slots stay `null` by design — see the known
+  limitation below), the loss2b25 steady-RTT probes, churn at rate20,
+  and every HoL probe that previously recorded fake zero RTTs now records
+  `null` with its reason. The benchmark backends now run **per arm** (a
+  wedged iperf3 server can no longer poison every later arm of a cell;
+  EADDRINUSE retries + SIGKILL cleanup), the 8-stream test runs after the
+  cheap probes so a wedge cannot contaminate them, and every throughput
+  failure carries the iperf3 stderr in `partial_metrics` instead of a bare
+  null. The charts mark missing data with an 'x' and the README tables are
+  emitted mechanically from the raw results (full per-cell count/carrier
+  tables, adaptive decimals). Known limitation, recorded in the
+  methodology: on the low-rate rate20 cell, eight parallel iperf3 streams
+  wedge iperf3's single-test server on the shaped loopback path
+  (GSO-sized segments × the netem packet limit buffer seconds of data), so
+  its 8-stream slot is `null` with the timeout reason in `partial_metrics`
+  — consistently across all tools (rate100 measures both).
+- Configuration docs restructured around the measured data: a decision
+  tree (mermaid) with the v0.8.0 benchmark costs now guides the
+  `mode`/`count`/`carrier`/transport choices before the specification, in
+  both languages. The `examples/` directory is gone — every example config
+  (minimal, full, noise, udp, unified, proxy, iperf3) and the
+  systemd/container deployment files now live as code blocks in
+  docs/configuration.md, and the config test suite parses those blocks
+  directly (it previously read the `examples/` files), so the shipped
+  examples keep being validated.
 
 ### Fixed
+
+- The container image (and the musl release binaries it is built from) now
+  include the `kcp` feature: the explicit feature lists in `release.yml`
+  and `just container` omitted it while the default set — and the docs —
+  include KCP, so `default_carrier = "kcp"` failed with a config error on
+  the GHCR image. Verified with a `x86_64-unknown-linux-musl` check of the
+  exact feature set.
+
+- The KCP protocol engine is now maintained in-repo as molehill's own
+  module (`src/kcp/`), re-implemented from the reference C implementation
+  by skywind3000 instead of the `third_party/kcp` path dependency: cargo
+  strips path dependencies when publishing, so `cargo publish` used to
+  compile against the unpatched registry version and fail verification.
+  `cargo package` now verifies cleanly. Aligned with the reference: fast
+  retransmit is ack-timestamp-gated (`IKCP_FASTACK_CONSERVE` semantics —
+  the old dep feature of the same name was inverted and shipped the
+  aggressive variant), the timeout ssthresh halves the flush-entry cwnd,
+  window probing starts after 5 s, and stream-mode `send` reports partial
+  progress; the unused accessors, the `tokio`-feature code and the
+  conv-adoption hook are trimmed.
+
+- The committed charts are regenerated with the canonical cell order and
+  the canonical footer (targeted re-runs no longer shuffle the axes or the
+  footer cell list).
+
+- Benchmark chart values: a measured zero is labelled `0` (a zero-height
+  bar was indistinguishable from an absent slot, e.g. the UDP-loss panel
+  showed empty-looking cells), and sub-1 cost metrics keep three significant
+  digits (`kcp4`'s mixed-bulk 0.029 Gbit/s used to print as `0.0`).
+
+- Benchmark charts only draw rows and cells that actually take part in a
+  comparison: the molehill-vs-peers per-cell panels skip the cells the
+  plain-TCP peers do not run (those molehill-only stories live in the
+  count/carrier charts), the mux chart is a single loopback row (mux-off is
+  loopback-only by design), and the cost chart's 64-stream panel omits
+  `mux1` instead of drawing an empty slot. The HoL probe now records a
+  connected pinger that completes zero or one round trip as a stall (the
+  elapsed wait) instead of `null`, which used to vanish from the chart
+  (frp/rathole at rate20_rtt40).
+
+- Benchmark charts and runner: an absent measurement now renders as a grey
+  `x` instead of a fake `0.0` bar (the cost chart drew `mux1`'s unmeasured
+  64-stream and mixed-bulk slots as zero), the runner skips by design the
+  probe it would otherwise wedge — the 64-stream scale point above an
+  arm's `count × 32` yamux ceiling —
+  recording the reason in `partial_metrics`, and a failed iperf3 run
+  reports iperf3's own error/exit status instead of a bare
+  `KeyError: 'sum_received'`. `mux1`'s mixed-bulk probe is re-measured at
+  9.0 Gbit/s now that the over-ceiling scale test no longer leaves the
+  shared iperf3 server wedged.
+
+- Benchmark probes: the steady-ping probe reconnects on stall or EOF (no
+  more probe-wide `TimeoutError` on burst loss; the EOF recv-spin is gone),
+  the churn probe no longer `IndexError`s when every connection fails
+  (reports zeros with `success_pct`), the HoL pinger records `null` instead
+  of fake 0 ms when it gets no samples (single-sample gaps are `null` too),
+  and a failed mixed-bulk transfer records its reason alongside the echo
+  half of the metric.
 
 - Benchmark throughput now measures **through the tunnel** (iperf3 dials the
   tool's exposed port); previously it dialed the backend directly, so every

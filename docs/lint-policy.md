@@ -2,8 +2,8 @@
 
 
 All lints live in `Cargo.toml` `[lints]`; the table below is the single source
-of truth. Changing a lint level requires updating this page (both languages)
-**in the same commit** — `githooks/check-docs` enforces the mechanical part.
+of truth. Changing a lint level requires updating this page **in the same
+commit** — `githooks/check-docs` enforces the mechanical part.
 
 ## Declared lints
 

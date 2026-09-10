@@ -10,8 +10,6 @@ To use default build settings, run:
 cargo build --release
 ```
 
-You may need to pre-install [openssl](https://docs.rs/openssl/latest/openssl/index.html) dependencies in Unix-like systems.
-
 ## Customize the Build
 
 `molehill` comes with lots of *crate features* that determine whether a certain feature will be compiled or not. Supported features can be checked out in `[features]` of [Cargo.toml](../Cargo.toml).
@@ -22,21 +20,7 @@ For example, to build `molehill` with the `client` and `noise` feature:
 cargo build --release --no-default-features --features client,noise
 ```
 
-## Rustls Support
-
-`molehill` provides optional `rustls` support. It's an almost drop-in replacement of `native-tls` support. (See [Transport](transport.md) for more information.)
-
-To enable this, disable the default features and enable `rustls` feature. And for websocket feature, enable `websocket-rustls` feature as well.
-
-You can also use command line option for this. For example, to replace all default features with `rustls`:
-
-```sh
-cargo build --release --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload,multiplex
-```
-
-Feature `rustls` and `websocket-rustls` cannot be enabled with `native-tls` and `websocket-native-tls` at the same time, as they are mutually exclusive. Enabling both will result in a compile error.
-
-(Note that the default feature set also contains `multiplex`.)
+(Note that the default feature set also contains `multiplex` and `kcp`.)
 
 ## Minimalize the binary
 

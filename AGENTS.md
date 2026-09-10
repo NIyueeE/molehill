@@ -58,6 +58,16 @@ code-level.**
     `#[allow(clippy::lint_name)]`;
   - minimal scope: a single statement or one function; never function groups,
     module-level `#![allow(...)]`, or crate-level relaxation;
+  - feature-gated dead code: prefer real `#[cfg(feature = "...")]` gating
+    over `allow(dead_code)` when the item's only consumer is feature-gated —
+    gate the whole item (struct, function, parameter, trait method) when the
+    non-gated build would leave it empty; the `allow` stays only for the
+    narrow case where gating would cascade;
+  - `unsafe` items with an expect: put the `// SAFETY:` comment directly
+    above the unsafe item and the `#[expect(...)]` attribute above the
+    comment — `undocumented_unsafe_blocks` requires the comment to be
+    adjacent to the unsafe item, and an attribute in between silently breaks
+    it;
   - a one-line reason comment at the waiver point is mandatory (plus a linked
     issue, if any).
 - Only two legitimate scenarios:
@@ -70,19 +80,20 @@ code-level.**
   docs-sync, secret scan, and anything added later) follow the **same
   discipline**: fix if fixable; waive only as above when truly unfixable.
   Never delete, comment out, or bypass a check.
-- The chain has two layers: **fast gates** (`githooks/pre-commit`: fmt /
+- The chain has two layers — **fast gates** (`githooks/pre-commit`: fmt /
   secrets / machete / docs / python lint (ruff) / clippy) run on commit,
   **heavy gates** (`githooks/pre-push`: audit / deny / outdated / test) run
-  on push; CI runs the whole chain via `just check`. All three are "the
-  checks" and bound by this discipline. Levels and the declared lint set:
-  [docs/lint-policy.md](docs/lint-policy.md).
+  on push; CI runs the whole chain via `just check`. Tag pushes additionally
+  run the light release review `githooks/pre-tag` (§5) before the heavy
+  gates. All of these are "the checks" and bound by this discipline. Levels
+  and the declared lint set: [docs/lint-policy.md](docs/lint-policy.md).
 
 ## 3. Before every commit: docs ↔ code alignment (every commit)
 
 - Verify the docs still tell the truth about the code:
   - lint tables in docs/lint-policy.md ↔ `[lints]` in `Cargo.toml`;
-  - gate tables in docs/checks.md ↔ the actual commands in both hooks
-    (`githooks/pre-commit` and `githooks/pre-push`);
+  - gate tables in docs/checks.md ↔ the actual commands in the hooks
+    (`githooks/pre-commit`, `githooks/pre-push`, `githooks/pre-tag`);
   - README.md / README.zh.md as landing pages: quick-start commands, docs
     index links, and feature claims still hold;
   - toolchain description ↔ `rust-toolchain.toml`; layout ↔
@@ -121,9 +132,10 @@ code-level.**
 - **Releases are tag-driven.** The only trigger of a release is pushing a
   `v*` tag; `.github/workflows/release.yml` owns the whole flow and no other
   path publishes a release.
-- **Versioning counts from the upstream line**: molehill is a fork of
-  [rathole](https://github.com/rapiz1/rathole) (upstream's last release:
-  v0.5.0) and continues its numbering from v0.6.0. Never renumber.
+- **Versioning continues from the fork point**: the version line started at
+  v0.6.0, where molehill forked from
+  [rathole](https://github.com/rapiz1/rathole) (upstream's last release was
+  v0.5.0), and has been numbered independently since. Never renumber.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -133,10 +145,14 @@ code-level.**
   prefix, e.g. `v0.7.1`).
 - Pushing a `v*` tag triggers `.github/workflows/release.yml`, which verifies
   the version ↔ tag match and the changelog section, then builds and
-  publishes (draft GitHub Release, GHCR image, crates.io). A missing or empty
-  changelog section **fails the release**; never hand-edit release notes on
-  GitHub — the changelog is the source. Step-by-step mechanics:
-  [docs/release.md](docs/release.md).
+  publishes directly (GitHub Release — no draft stage —, GHCR image,
+  crates.io). A missing or empty changelog section **fails the release**;
+  never hand-edit release notes on GitHub — the changelog is the source.
+  Before the tag exists, `just tag` runs the light release review
+  (`githooks/pre-tag`: tag↔version match, dated changelog section,
+  committed bench results/chart, container-job greps, advisory review
+  checklist); pre-push repeats it on every `v*` tag push (git has no native
+  tag hook). Step-by-step mechanics: [docs/release.md](docs/release.md).
 - **Tag-push policy: no casual release pushes.** Commits are always allowed —
   the fast gates guard them and they trigger nothing public. Pushing a `v*`
   tag is a deliberate release act; **all** of the following must hold before
@@ -164,12 +180,14 @@ uses: verifying that a specific commit compiles on all platforms before
 tagging (§5), and reproducing platform-specific issues on an exact commit.
 Details: [docs/release.md](docs/release.md).
 
-## 7. Provenance: relationship to upstream
+## 7. Provenance: independent project, rathole lineage
 
-- molehill is a community fork of [rathole](https://github.com/rapiz1/rathole)
-  (Apache-2.0). Upstream history is preserved intact below the v0.6.0
-  release commit; fork development starts at v0.6.0 and version numbers
-  continue the upstream line.
+- molehill is an independent project that began as a fork of
+  [rathole](https://github.com/rapiz1/rathole) (Apache-2.0). Upstream history
+  is preserved intact below the v0.6.0 fork commit and the version line
+  continues from there. Development has long since diverged — a different
+  configuration model, protocol and feature set — so upstream is history,
+  not the reference point for the design.
 - When porting an upstream fix, credit it in the commit body
   (`Ported from rathole <sha>.`) and add a CHANGELOG entry in the same
   commit.
@@ -180,10 +198,13 @@ Details: [docs/release.md](docs/release.md).
 ## 8. Day-to-day operations
 
 - commit → fast gates; push to a branch → heavy gates; **push of a `v*` tag →
-  release (§5, deliberate)**; PR or push to `main` → CI runs the identical
-  chain; branch protection on `main` requires the `full check chain` check
-  and forbids force-pushes (the one sanctioned exception: a coordinated
-  history rebuild, explicitly requested and backed up first).
+  release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
+  runs the identical chain. `main` is not branch-protected today — the
+  `full check chain` check and the no-force-push rule are enforced by
+  convention (CI red on main is the top priority; the one sanctioned
+  exception to history rules: a coordinated history rebuild, explicitly
+  requested and backed up first). Enabling branch protection is a repo
+  settings change for a human to make.
 - Formatting: `just fmt` auto-fixes; `just check` rehearses the whole chain
   before committing.
 - Dependencies: add or remove them only through cargo — `cargo add` (add
@@ -212,6 +233,19 @@ Details: [docs/release.md](docs/release.md).
   entry land in the same commit; never backfill at release time (§5).
 - **Prove it, don't assume it.** Every "it works" claim must be backed by
   real command output from this session; no output, no claim.
+- **Shell hygiene for commits and bulk edits.**
+  - Commit messages containing backticks, quotes or parentheses (TOML keys,
+    markdown) go through a quoted heredoc or a file (`git commit -F - <<'EOF'`)
+    — never inline them in `-m "..."`: backticks trigger shell command
+    substitution and parentheses break the parser mid-message.
+  - Bulk-edit scripts: `assert old in s` before every `s.replace(old, new)` —
+    a silently non-matching anchor leaves a half-edited file; after the
+    sweep, grep for the old names to prove the rename is complete. Keep
+    triple quotes out of heredoc-python that already uses triple quotes —
+    use single-quoted strings or `<<'PYEOF'`.
+  - `pkill` self-match: use bracket patterns (`[s]erver`) and never combine
+    a pkill and a process launch in one bash call — the outer shell matches
+    its own command line.
 - **No corpses.** Commented-out code and `todo!()` stubs get removed, not
   accumulated (the `todo` lint already watches).
 - **End-of-session ritual.** A session ends with `just fmt` + `just check`,
@@ -236,7 +270,7 @@ Details: [docs/release.md](docs/release.md).
 | Lint levels and waiver rules | docs/lint-policy.md |
 | Release mechanics, test builds, versioning | docs/release.md |
 | What every file in this repo is for | docs/structure.md |
-| TLS and Noise transport setup | docs/transport.md |
+| Noise transport setup | docs/transport.md |
 | Control/data channel design | docs/internals.md |
 | Current working state, decisions, open threads | HANDOFF.md |
 
@@ -250,14 +284,17 @@ Details that agents need constantly:
   host, client behind NAT; a control channel carries commands, data channels
   carry forwarded traffic.
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
-  Apache-2.0. Feature-gated: `server` / `client` modes; mutually exclusive
-  `native-tls` / `rustls` (and websocket variants, enforced by
-  `compile_error!`); `noise`; `hot-reload`; `multiplex` (yamux, in the
-  default set); `embedded` (minimal). The mutual exclusivity is why clippy
-  runs twice in the pre-commit gate instead of `--all-features` once.
-- **Protocol**: v2 — client registers services dynamically after auth
-  (`RegisterService`), server enforces `allow_ports`; protocol mismatch is a
-  hard error. See docs/internals.md.
+  Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
+  `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
+  KCP-over-UDP data tunnels — arm 2 of the transport comparison, in the
+  default set, see HANDOFF.md); `embedded` (minimal). Clippy runs twice in
+  the pre-commit gate: the second pass covers the minimal no-default-features
+  `server,client` build that the default-feature pass never compiles.
+- **Protocol**: v3 — client registers services dynamically after auth
+  (`RegisterService`, carrying the data-plane carrier), server enforces
+  `allow_ports`; every connection starts with a one-byte transport selector
+  (0x00 plain / 0x01 noise); protocol mismatch is a hard error. See
+  docs/internals.md.
 - **Build profiles**: `release` (lto, strip, panic=abort), `minimal`
   (opt-level "z", ~500KiB), `bench`. Container image: static musl binary on
   scratch.
@@ -277,5 +314,5 @@ Details that agents need constantly:
 > waive only as a last resort, locally, with a named reason; keep docs and
 > code in the same commit; write commit messages in english; commits are free,
 > release tags are deliberate; let releases speak through CHANGELOG.md; count
-> versions from the upstream line; prove every claim with real output; end
+> versions from the fork point; prove every claim with real output; end
 > sessions clean; secrets never enter the repo.

@@ -7,10 +7,11 @@ publishes a release.
 
 ## Versioning
 
-molehill is a fork of [rathole](https://github.com/rapiz1/rathole) and counts
-its version numbers **from the upstream line**: upstream's last release was
-v0.5.0 and the fork continued at v0.6.0. [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-applies within that line.
+molehill's version line began at v0.6.0 — the point where it forked from
+[rathole](https://github.com/rapiz1/rathole); upstream's last release was
+v0.5.0 — and has been numbered independently since.
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html) applies within
+that line.
 
 ## Release notes: CHANGELOG.md is the single source
 
@@ -32,10 +33,38 @@ nothing public. Pushing a `v*` tag is a deliberate release act; the five
 preconditions (explicit human request, `Cargo.toml` version match, dated
 changelog section, green `just check`, green benchmark gate — see below) are
 the repository rule stated in [AGENTS.md §5](../AGENTS.md) — the release
-workflow enforces the version and changelog ones mechanically.
+workflow enforces the version and changelog ones mechanically, and the local
+tag review (`githooks/pre-tag`, next section) checks most of them before the
+tag exists.
 
 Re-tagging is allowed only to fix a failed release (delete the tag, fix,
 re-push). For verifying a commit without releasing, use CD test builds.
+
+## Tag review: `githooks/pre-tag`
+
+Releases are published **directly** — there is no draft stage — so the
+human checkpoint is the tag push itself, and a light release review runs at
+the two tag moments (responsibilities of the three hooks are split in
+[checks.md](checks.md)):
+
+- **Locally**: `just tag` runs the review against HEAD, then creates the
+  annotated tag for `Cargo.toml`'s version. `just tag-check` runs only the
+  review.
+- **On tag push**: git has no native tag hook, so `githooks/pre-push` re-runs
+  the review (against the tag's commit) for every `v*` tag in the push,
+  before the heavy gates — a violation fails the push.
+
+The review mechanically verifies tag↔version match (including `Cargo.lock`),
+a dated non-empty changelog section, the committed bench results/chart, and
+the container job structure (GHCR job, image tags, `--help` smoke test),
+then prints an advisory checklist — CHANGELOG and docs audit, container
+build review, benchmark gate, deliberate-release confirmation — that only a
+human/agent review can clear. Bench assets are required at tag creation; on
+a re-push of a historical tag they degrade to a note (the ritual postdates
+older tags, and re-pushing one to fix a failed release must stay possible).
+It is deliberately light: heavy gates
+(audit/deny/outdated/test) belong to pre-push and CI, and release.yml
+re-enforces the version and changelog invariants remotely.
 
 ## Benchmarks: per-tag ritual
 
@@ -50,12 +79,18 @@ exposed port), connection-path RTT, data-path RTT (steady ping over
 one established connection), UDP session quality over one established session
 (RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
 bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
-as mux and noise variants (mux-off additionally on the loopback cell); peers:
-frp / rathole also run UDP arms, bore is TCP-only. All bench entries
-are PEP 723 python scripts run via `uv run`: runs are resumable (each
+as mux, noise, mux1 and kcp4 variants (mux-off additionally on the loopback
+cell); peers: frp / rathole also run UDP arms, bore is TCP-only, and all
+three run a lean cell subset (loopback, rtt10, 1% loss, the two rate cells)
+— the peers chart plots only those cells. All bench
+entries are PEP 723 python scripts run via `uv run`: runs are resumable (each
 completed arm is checkpointed together with the full meta), continue on
 error (a per-metric failure records `null` plus a `partial_metrics` list
-instead of a fake 0), refuse to run concurrently (a global lock — concurrent
+instead of a fake 0; a probe that is structurally out of range — the
+64-stream scale point above an arm's `count × 32` yamux ceiling — is
+skipped by design with its reason recorded the same way; the rate20
+8-stream test wedges the single-test iperf3 server and records the timeout
+instead), refuse to run concurrently (a global lock — concurrent
 runs used to reap each other's live processes), and a killed run (Ctrl-C or
 SIGTERM) cleans up arms, removes the netem qdisc and writes the full meta;
 `--fresh` backs up the previous results file to `.bak` first.
@@ -63,15 +98,31 @@ SIGTERM) cleans up arms, removes the netem qdisc and writes the full meta;
 three hours at full rigor:
 
 1. `just bench` — runs the full matrix (loopback + weak-network cells) and
-   writes `benches/scripts/bench/results-vX.Y.Z.json`.
-2. `just bench-plot` — renders `assets/benchmark-vX.Y.Z.png` and prints the
-   markdown tables; update the README Benchmarks section with them, then
-   delete the previous tag's chart from `assets/`.
+   writes `benches/scripts/bench/results-vX.Y.Z.json` (the default `--out`
+   derives from `Cargo.toml`'s version, so a plain run targets the next
+   tag's file, never the previous release's baseline). During development,
+   `just bench-fast` runs a ~2-minute molehill-only smoke matrix into
+   `results-dev.json`, which plot/regression never pick up.
+   **The full matrix is a heavy, machine-exclusive ritual (~1.5-2 h)**:
+   it saturates every reachable core by design. It self-throttles (nice
+   10, load-aware cooldown between arms) so the host stays responsive,
+   but do not run other work on the same machine while it runs.
+2. `just bench-plot` — renders the per-axis chart set
+   (`assets/benchmark-vX.Y.Z.png` for the peers baseline,
+   `benchmark-mux-*`, `benchmark-transport-*` for encryption,
+   `benchmark-count-*` and `benchmark-carrier-*` — one single-variable
+   comparison each) and prints the markdown tables; update the README
+   Benchmarks section with them, then delete the previous tag's charts from
+   `assets/`.
 3. `just bench-check` — regression gate against the previous tag's results
    file. **Performance must not regress vs the previous tag**; a violation
    blocks the tag until fixed or explicitly waived (record the waiver in
    `HANDOFF.md`).
 4. Commit results JSON + new chart + README table **in the release commit**.
+5. `just tag` — the release review (`githooks/pre-tag`) must pass, then the
+   annotated tag for `Cargo.toml`'s version is created locally. Pushing it
+   (`git push origin vX.Y.Z`) is the release act: pre-push re-runs the review
+   and the heavy gates, then release.yml publishes directly.
 
 The gate runs locally before tagging, never in CI: shared runners are too
 noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
@@ -87,12 +138,13 @@ directly and are not comparable).
    section present, `cargo audit`.
 2. **build matrix** (9 targets): linux gnu + musl, aarch64 musl (via cross),
    arm/armv7 musl (`embedded` feature), macOS x86_64 + aarch64, Windows
-   msvc. musl artifacts build with the full rustls feature set; linux
-   artifacts are UPX-compressed. Tests run inside the matrix for native and
-   cross targets.
-3. **GitHub Release**: created as a **draft**, with notes extracted from
-   `CHANGELOG.md`, all archives, and a `SHA256SUMS`. Publish after a quick
-   look — never edit the notes by hand.
+   msvc. musl artifacts build with the full feature set
+   (`server,client,noise,hot-reload,multiplex`); linux artifacts are
+   UPX-compressed. Tests run inside the matrix for native and cross targets.
+3. **GitHub Release**: published **directly** (no draft stage — the human
+   checkpoint is the tag push itself, guarded locally by the pre-tag
+   review), with notes extracted from `CHANGELOG.md`, all archives, and a
+   `SHA256SUMS`. Never edit the notes by hand.
 4. **GHCR**: publishes the multi-arch scratch image
    (`ghcr.io/niyueee/molehill:<tag>` and `:latest`) from the musl artifacts,
    then smoke-tests it.
