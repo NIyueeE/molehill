@@ -1,25 +1,26 @@
 [client]
-remote_addr = "127.0.0.1:2332"
 default_token = "default_token_if_not_specify"
 
+[client.control]
+default_remote_addr = "127.0.0.1:2332"
+
 [client.transport]
-type = "tcp" 
+type = "plain" 
 
 [client.services.echo]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:8080"
 remote_bind_addr = "0.0.0.0:2336"
 
 [client.services.pingpong]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:8081"
 remote_bind_addr = "0.0.0.0:2337"
 
 [server]
-bind_addr = "0.0.0.0:2332"
 default_token = "default_token_if_not_specify"
 allow_ports = ["2334-2337"]
 
-[server.transport]
-type = "tcp" 
+[server.control]
+bind_addr = "0.0.0.0:2332"
 

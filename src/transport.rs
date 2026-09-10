@@ -3,7 +3,7 @@ use crate::common::helper::to_socket_addr;
 use crate::common::helper::try_set_tcp_keepalive;
 #[cfg(feature = "client")]
 use crate::config::ClientServiceConfig;
-use crate::config::{TcpConfig, TransportConfig};
+use crate::config::TransportConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::fmt::{Debug, Display};
@@ -54,7 +54,7 @@ impl Display for AddrMaybeCached {
     }
 }
 
-/// Specify a transport layer, like TCP, TLS
+/// Specify a transport layer: plain TCP or Noise.
 #[async_trait]
 pub trait Transport: Debug + Send + Sync {
     type Acceptor: Send + Sync;
@@ -64,46 +64,37 @@ pub trait Transport: Debug + Send + Sync {
     fn new(config: &TransportConfig) -> Result<Self>
     where
         Self: Sized;
-    /// Provide the transport with socket options, which can be handled at the need of the transport
-    fn hint(conn: &Self::Stream, opts: SocketOpts);
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    /// Bind a listener (server side only).
+    #[cfg(feature = "server")]
     async fn bind<T: ToSocketAddrs + Send + Sync>(&self, addr: T) -> Result<Self::Acceptor>;
-    /// accept must be cancel safe
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    /// Accept a connection; must be cancel safe (server side only).
+    #[cfg(feature = "server")]
     async fn accept(&self, a: &Self::Acceptor) -> Result<(Self::RawStream, SocketAddr)>;
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
-    async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream>;
-    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    /// Dial a connection (client side only).
+    #[cfg(feature = "client")]
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream>;
 }
 
 mod tcp;
 pub use tcp::TcpTransport;
 
-#[cfg(all(feature = "native-tls", feature = "rustls"))]
-compile_error!("Only one of `native-tls` and `rustls` can be enabled");
-
-#[cfg(feature = "native-tls")]
-mod native_tls;
-#[cfg(feature = "native-tls")]
-use native_tls as tls;
-#[cfg(feature = "rustls")]
-mod rustls;
-#[cfg(feature = "rustls")]
-use rustls as tls;
-
-#[cfg(any(feature = "native-tls", feature = "rustls"))]
-pub(crate) use tls::TlsTransport;
-
 #[cfg(feature = "noise")]
 mod noise;
 #[cfg(feature = "noise")]
 pub use noise::NoiseTransport;
+// The u16-framed Noise record stream over tokio IO (vendored from
+// snowstorm 0.4.0, adapted to snow 0.10 — see noise_stream.rs).
+#[cfg(feature = "noise")]
+pub(crate) mod noise_stream;
+#[cfg(feature = "noise")]
+pub(crate) use noise_stream::NoiseStream;
+// Key material: the Noise transport, the server's dual-transport accept,
+// and the KCP tunnel path (Noise-over-KCP) all build sessions from it.
+#[cfg(feature = "noise")]
+pub(crate) use noise::NoiseKeys;
 
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-mod websocket;
-#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
-pub use websocket::WebsocketTransport;
+#[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
+pub(crate) mod kcp;
 
 #[cfg(feature = "multiplex")]
 pub(crate) mod multiplex;
@@ -144,16 +135,6 @@ impl SocketOpts {
 }
 
 impl SocketOpts {
-    pub fn from_cfg(cfg: &TcpConfig) -> SocketOpts {
-        SocketOpts {
-            nodelay: Some(cfg.nodelay),
-            keepalive: Some(Keepalive {
-                keepalive_secs: cfg.keepalive_secs,
-                keepalive_interval: cfg.keepalive_interval,
-            }),
-        }
-    }
-
     /// Socket options for the legs of a forwarded service: the data channels
     /// on both ends and, on the server, the visitor-facing sockets.
     ///

@@ -29,61 +29,80 @@ use yamux::{Config, Connection, Mode};
 /// A multiplexed stream adapted to tokio's IO traits.
 pub type MuxStream = Compat<yamux::Stream>;
 
-/// Make a freshly opened outbound stream emit its SYN frame immediately.
+/// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
 /// rust-yamux opens outbound streams lazily: the SYN flag is piggybacked on
 /// the first outbound frame, and a read-only consumer never produces one.
 /// Our data-channel protocol is server-speaks-first (`StartForward*`), so a
-/// freshly pooled stream starts by reading. Without this zero-length write
-/// the stream would never be announced to the server and both ends would
-/// wait for each other forever.
-async fn send_stream_syn(stream: &mut MuxStream) -> std::io::Result<()> {
-    poll_fn(
-        |cx| match tokio::io::AsyncWrite::poll_write(Pin::new(stream), cx, &[]) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        },
-    )
-    .await
+/// freshly pooled stream starts by reading — without this zero-length write
+/// it would never be announced to the server and both ends would wait for
+/// each other forever.
+///
+/// This is a *future* rather than an await inside the driver loop: the
+/// driver polls it alongside the connection state machine, so a
+/// backpressured socket completes the announcement whenever it becomes
+/// writable without ever stalling the tunnel's inbound processing.
+struct SynAnnounce {
+    stream: Option<MuxStream>,
+    reply: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
 }
 
-/// Build the session configuration, clamping values so that the upstream
-/// crate's range assertions cannot panic on a bad config.
-///
-/// Note: rust-yamux auto-tunes each stream's receive window towards the
-/// bandwidth-delay product (starting from 256 KiB), so unlike frp's yamux
-/// fork there is no fixed per-stream window to raise; the knob here bounds
-/// the *total* advertised buffering per tunnel.
-pub(crate) fn mux_config(receive_window: Option<usize>, max_streams: Option<usize>) -> Config {
-    // Upstream asserts `window >= DEFAULT_CREDIT * max_streams` on EVERY
-    // setter (against the *other* field's current value), so the setters
-    // must be driven in an order that keeps the invariant intact. The
-    // default window is 1 GiB, i.e. up to 4096 streams are always safe.
-    const CREDIT: usize = 256 * 1024; // rust-yamux DEFAULT_CREDIT
-    const DEFAULT_WINDOW: usize = 1024 * 1024 * 1024;
-    const MAX_SAFE_STREAMS_WITH_DEFAULT_WINDOW: usize = DEFAULT_WINDOW / CREDIT;
+impl std::future::Future for SynAnnounce {
+    type Output = ();
 
-    let max_streams = max_streams.unwrap_or(512).clamp(1, 8192);
-    let mut config = Config::default();
-
-    match receive_window {
-        None => {
-            // Window stays unlimited-ish (default 1 GiB total).
-            config.set_max_num_streams(max_streams.min(MAX_SAFE_STREAMS_WITH_DEFAULT_WINDOW));
-        }
-        Some(window) => {
-            // 1. Lower the stream count to a value that is safe under the
-            //    current default window.
-            let intermediate = max_streams.min(MAX_SAFE_STREAMS_WITH_DEFAULT_WINDOW);
-            config.set_max_num_streams(intermediate);
-            // 2. Raise the window to cover the final stream count.
-            let needed = CREDIT.saturating_mul(max_streams).max(window);
-            config.set_max_connection_receive_window(Some(needed));
-            // 3. Apply the requested stream count.
-            config.set_max_num_streams(max_streams);
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        // Take the stream out; when it is already gone the announcement was
+        // delivered, so stay total for a misused second poll.
+        let Some(mut stream) = this.stream.take() else {
+            return Poll::Ready(());
+        };
+        match tokio::io::AsyncWrite::poll_write(Pin::new(&mut stream), cx, &[]) {
+            Poll::Ready(Ok(_)) => {
+                if let Some(reply) = this.reply.take() {
+                    let _ = reply.send(Ok(stream));
+                }
+                Poll::Ready(())
+            }
+            Poll::Ready(Err(e)) => {
+                debug!(error = %e, "Failed to announce outbound multiplexed stream");
+                if let Some(reply) = this.reply.take() {
+                    let _ = reply.send(Err(yamux::ConnectionError::Closed));
+                }
+                Poll::Ready(())
+            }
+            Poll::Pending => {
+                // Park the stream again for the next poll.
+                this.stream = Some(stream);
+                Poll::Pending
+            }
         }
     }
+}
+
+/// Build the session configuration for every tunnel: a 64 MiB total
+/// receive window (bounded loss backlog — yamux's own 1 GiB default
+/// accumulates without bound under loss) with 32 streams, each guaranteed
+/// the 256 KiB default credit, leaving 56 MiB for the auto-tuner.
+///
+/// The two values are coupled by an upstream invariant (`window >=
+/// streams * 256 KiB` asserted on every setter), so they are fixed internal
+/// constants rather than config knobs: tuning them independently measured
+/// 30x regressions (streams that swallow the window pin every stream at
+/// 256 KiB) and 30-65% throughput drops on delayed links (windows too
+/// small for the auto-tuner). The frame split size stays at yamux's
+/// 16 KiB default: larger frames (64 KiB) measured faster on loopback but
+/// 30-60% slower under round-trip delay.
+pub(crate) fn mux_config() -> Config {
+    use crate::common::constants::{DEFAULT_MUX_MAX_STREAMS, DEFAULT_MUX_RECEIVE_WINDOW};
+
+    let mut config = Config::default();
+    // Setter order keeps the upstream assertion (`window >= 256 KiB *
+    // streams`) satisfied at every step: lower the stream count under the
+    // default 1 GiB window first, then bound the window under the final
+    // stream count.
+    config.set_max_num_streams(DEFAULT_MUX_MAX_STREAMS);
+    config.set_max_connection_receive_window(Some(DEFAULT_MUX_RECEIVE_WINDOW));
     config
 }
 
@@ -115,55 +134,93 @@ impl ClientTunnel {
             let mut conn = Connection::new(io.compat(), config, Mode::Client);
             let mut waiting: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>> =
                 None;
+            // A freshly opened stream whose SYN announcement is in flight.
+            // The announcement is driven inside the poll closure (via the
+            // shared mutex, so the closure never captures it mutably),
+            // keeping the driver event-driven: a backpressured socket must
+            // not stall inbound frame processing for the whole tunnel. The
+            // lock is only ever held by this one driver task, so it never
+            // contends.
+            let announce: std::sync::Mutex<Option<SynAnnounce>> = std::sync::Mutex::new(None);
 
             loop {
-                // One unified poll: an outbound open (when a request is
-                // pending) takes precedence over inbound work. Both arms of
-                // the connection state machine register their wakers here.
                 enum Step {
+                    /// The pending announcement settled; its reply was
+                    /// already delivered to the waiting caller.
+                    Announced,
                     Opened(Result<yamux::Stream, yamux::ConnectionError>),
                     Inbound(Option<Result<yamux::Stream, yamux::ConnectionError>>),
                 }
 
                 let step = poll_fn(|cx| {
-                    if waiting.is_some()
-                        && let std::task::Poll::Ready(r) = conn.poll_new_outbound(cx)
+                    // 1. Drive the pending SYN announcement first; while it
+                    //    stays pending the inbound poll below keeps
+                    //    registering wakers, so data keeps flowing under
+                    //    socket backpressure.
                     {
-                        return std::task::Poll::Ready(Step::Opened(r));
+                        let mut slot = announce
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(f) = slot.as_mut()
+                            && let Poll::Ready(()) = std::pin::Pin::new(&mut *f).poll(cx)
+                        {
+                            *slot = None;
+                            return Poll::Ready(Step::Announced);
+                        }
                     }
+                    // 2. Serve the next outbound open — one at a time, like
+                    //    before: only when a request is pending and no
+                    //    announcement is in flight.
+                    if waiting.is_some()
+                        && announce
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_none()
+                        && let Poll::Ready(r) = conn.poll_new_outbound(cx)
+                    {
+                        return Poll::Ready(Step::Opened(r));
+                    }
+                    // 3. Inbound flows in every state: the server never
+                    //    opens streams toward us, so drop any that appear;
+                    //    errors and end of stream close the tunnel.
                     match conn.poll_next_inbound(cx) {
-                        std::task::Poll::Ready(v) => std::task::Poll::Ready(Step::Inbound(v)),
-                        std::task::Poll::Pending => std::task::Poll::Pending,
+                        Poll::Ready(v) => Poll::Ready(Step::Inbound(v)),
+                        Poll::Pending => Poll::Pending,
                     }
                 });
 
                 tokio::select! {
                     _ = shutdown.changed() => break,
                     step = step => match step {
+                        Step::Announced => {}
                         Step::Opened(result) => {
                             if let Some(reply) = waiting.take() {
-                                let response = match result {
+                                match result {
                                     Ok(stream) => {
-                                        let mut stream = stream.compat();
-                                        match send_stream_syn(&mut stream).await {
-                                            Ok(()) => Ok(stream),
-                                            Err(e) => {
-                                                debug!(error = %e, "Failed to announce outbound multiplexed stream");
-                                                Err(yamux::ConnectionError::Closed)
-                                            }
-                                        }
+                                        *announce
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            Some(SynAnnounce {
+                                                stream: Some(stream.compat()),
+                                                reply: Some(reply),
+                                            });
                                     }
-                                    Err(e) => Err(e),
-                                };
-                                let _ = reply.send(response);
+                                    Err(e) => {
+                                        let _ = reply.send(Err(e));
+                                    }
+                                }
                             }
                         }
-                        // The server never opens streams toward us; drop any
-                        // that appear. Errors/end of stream close the tunnel.
                         Step::Inbound(Some(Ok(_stream))) => {}
                         Step::Inbound(_) => break,
                     },
-                    req = open_rx.recv(), if waiting.is_none() => {
+                    req = open_rx.recv(),
+                    if waiting.is_none()
+                        && announce
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_none() =>
+                    {
                         match req {
                             Some(reply) => waiting = Some(reply),
                             None => break, // all handles dropped
@@ -184,6 +241,60 @@ impl ClientTunnel {
             .await
             .map_err(|_| yamux::ConnectionError::Closed)?;
         rx.await.map_err(|_| yamux::ConnectionError::Closed)?
+    }
+}
+
+/// A pool of parallel client tunnels (arm 1 of the transport comparison:
+/// N physical connections instead of one).
+///
+/// `open_stream` spreads streams round-robin over the tunnels. A tunnel whose
+/// driver died returns `Closed` immediately, so the pool transparently tries
+/// the next tunnel; only when every tunnel is dead does the open fail (the
+/// control channel's heartbeat then triggers the usual full reconnect, which
+/// re-establishes the whole pool).
+///
+/// Clones share one round-robin counter, so placement stays balanced across
+/// concurrently opened data channels.
+#[derive(Clone)]
+pub struct TunnelPool {
+    inner: std::sync::Arc<TunnelPoolInner>,
+}
+
+struct TunnelPoolInner {
+    tunnels: Vec<ClientTunnel>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl TunnelPool {
+    /// Wrap the established tunnels. `tunnels` must not be empty.
+    pub fn new(tunnels: Vec<ClientTunnel>) -> TunnelPool {
+        TunnelPool {
+            inner: std::sync::Arc::new(TunnelPoolInner {
+                tunnels,
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Open a data-channel stream on the next tunnel, falling through to the
+    /// remaining ones if a tunnel is already closed.
+    pub async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
+        use std::sync::atomic::Ordering;
+
+        let n = self.inner.tunnels.len();
+        // Wrapping is fine: the index is only used modulo `n`.
+        let start = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let mut last_err = yamux::ConnectionError::Closed;
+        for i in 0..n {
+            match self.inner.tunnels[(start + i) % n].open_stream().await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    debug!("Tunnel {} of {n} refused a stream: {e}", (start + i) % n);
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
     }
 }
 
@@ -210,7 +321,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap values they just constructed"
+    )]
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -219,14 +334,10 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let server_task = tokio::spawn(run_server_tunnel(
-            server_io,
-            mux_config(None, None),
-            inbound_tx,
-        ));
+        let server_task = tokio::spawn(run_server_tunnel(server_io, mux_config(), inbound_tx));
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let tunnel = ClientTunnel::start(client_io, mux_config(None, None), shutdown_rx);
+        let tunnel = ClientTunnel::start(client_io, mux_config(), shutdown_rx);
 
         // Open a stream and push some bytes through
         let mut stream = tunnel.open_stream().await.unwrap();
@@ -258,14 +369,10 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
         let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
-        let server_task = tokio::spawn(run_server_tunnel(
-            server_io,
-            mux_config(None, None),
-            inbound_tx,
-        ));
+        let server_task = tokio::spawn(run_server_tunnel(server_io, mux_config(), inbound_tx));
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let tunnel = ClientTunnel::start(client_io, mux_config(None, None), shutdown_rx);
+        let tunnel = ClientTunnel::start(client_io, mux_config(), shutdown_rx);
 
         let mut stream = tunnel.open_stream().await.unwrap();
 
@@ -310,12 +417,12 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            run_server_tunnel(sock, mux_config(None, None), inbound_tx).await;
+            run_server_tunnel(sock, mux_config(), inbound_tx).await;
         });
 
         let client_sock = TcpStream::connect(addr).await.unwrap();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let tunnel = ClientTunnel::start(client_sock, mux_config(None, None), shutdown_rx);
+        let tunnel = ClientTunnel::start(client_sock, mux_config(), shutdown_rx);
 
         // Open several streams back-to-back before reading anything
         let mut streams = Vec::new();
@@ -372,12 +479,12 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            run_server_tunnel(sock, mux_config(None, None), inbound_tx).await;
+            run_server_tunnel(sock, mux_config(), inbound_tx).await;
         });
 
         let client_sock = TcpStream::connect(addr).await.unwrap();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let tunnel = ClientTunnel::start(client_sock, mux_config(None, None), shutdown_rx);
+        let tunnel = ClientTunnel::start(client_sock, mux_config(), shutdown_rx);
 
         // Fire 12 opens concurrently without awaiting them in order.
         let mut handles = Vec::new();
@@ -443,10 +550,10 @@ mod tests {
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let server = tokio::spawn(async move {
-            run_server_tunnel(server_sock, mux_config(None, None), inbound_tx).await;
+            run_server_tunnel(server_sock, mux_config(), inbound_tx).await;
         });
 
-        let tunnel = ClientTunnel::start(client_sock, mux_config(None, None), shutdown_rx);
+        let tunnel = ClientTunnel::start(client_sock, mux_config(), shutdown_rx);
 
         // Phase 1: burst of 8 opens like the pool pre-creation
         let mut first = Vec::new();
@@ -500,10 +607,164 @@ mod tests {
     }
 
     #[test]
-    fn mux_config_clamps_bad_values() {
-        // Must not panic even with absurd inputs
-        let _ = mux_config(Some(1), Some(0));
-        let _ = mux_config(Some(usize::MAX), Some(usize::MAX));
-        let _ = mux_config(None, None);
+    fn mux_config_is_total() {
+        // The config is built from fixed internal constants; keep a guard
+        // so a change to those constants cannot make the builder panic.
+        let _ = mux_config();
+    }
+
+    #[test]
+    fn default_window_keeps_auto_tunable_credit() {
+        // Regression guard: yamux reserves `max_streams * 256 KiB` of the
+        // connection window as guaranteed per-stream credit; the auto-tuner
+        // may only allocate the remainder. A stream count that swallows the
+        // whole window pins every stream at 256 KiB (measured: 0.1 Gbps at
+        // 10 ms RTT, a ~30x drop from the tuned window).
+        use crate::common::constants::{DEFAULT_MUX_MAX_STREAMS, DEFAULT_MUX_RECEIVE_WINDOW};
+
+        const CREDIT: usize = 256 * 1024; // yamux DEFAULT_CREDIT
+        let reserved = DEFAULT_MUX_MAX_STREAMS * CREDIT;
+        assert!(
+            DEFAULT_MUX_RECEIVE_WINDOW > reserved,
+            "the credit reservation must not swallow the whole window"
+        );
+        assert!(
+            DEFAULT_MUX_RECEIVE_WINDOW - reserved >= DEFAULT_MUX_RECEIVE_WINDOW / 2,
+            "at least half the window must stay auto-tunable"
+        );
+        let _ = mux_config();
+    }
+
+    #[tokio::test]
+    async fn pool_spreads_streams_over_tunnels() {
+        // Two tunnels, four opens: round-robin must place two streams on
+        // each tunnel, and every stream must survive a full round trip.
+        const TUNNELS: usize = 2;
+        const OPENS: usize = 4;
+
+        let mut tunnels = Vec::new();
+        let mut per_tunnel_counts = Vec::new();
+        // One shutdown sender per tunnel keeps every driver alive; dropping
+        // them at the end of the test stops all drivers.
+        let shutdown_senders: Vec<_> = (0..TUNNELS)
+            .map(|_| tokio::sync::watch::channel(false).0)
+            .collect();
+
+        for sender in &shutdown_senders {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (inbound_tx, mut inbound_rx) = mpsc::channel::<MuxStream>(8);
+            let counter = tokio::spawn(async move {
+                let mut count = 0usize;
+                while let Some(mut stream) = inbound_rx.recv().await {
+                    count += 1;
+                    let mut buf = [0u8; 4];
+                    stream.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(&buf, format!("msg{count}").as_bytes());
+                    // Round trip: prove the stream is usable both ways before
+                    // the client drops it.
+                    stream.write_all(b"ok").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                count
+            });
+            let server = tokio::spawn(run_server_tunnel(server_io, mux_config(), inbound_tx));
+            tunnels.push(ClientTunnel::start(
+                client_io,
+                mux_config(),
+                sender.subscribe(),
+            ));
+            per_tunnel_counts.push((counter, server));
+        }
+
+        let pool = TunnelPool::new(tunnels);
+
+        for i in 0..OPENS {
+            let mut s = pool.open_stream().await.unwrap();
+            // Round-robin sends open `i` to tunnel `i % TUNNELS`, where it is
+            // the `(i / TUNNELS + 1)`-th stream to arrive.
+            s.write_all(format!("msg{}", i / TUNNELS + 1).as_bytes())
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            let mut ok = [0u8; 2];
+            s.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, b"ok");
+        }
+        drop(pool);
+        drop(shutdown_senders);
+
+        for (counter, server) in per_tunnel_counts {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+            let count = tokio::time::timeout(std::time::Duration::from_secs(3), counter)
+                .await
+                .expect("tunnel counter did not finish")
+                .unwrap();
+            assert_eq!(count, OPENS / TUNNELS, "streams were not spread evenly");
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_skips_dead_tunnel() {
+        // Kill one tunnel's driver (drop its shutdown sender): opens must
+        // fall through to the surviving tunnel instead of failing.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_io2, server_io2) = tokio::io::duplex(64 * 1024);
+
+        let (tx1, mut rx1) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
+        let s1 = tokio::spawn(run_server_tunnel(server_io, mux_config(), tx1));
+        let s2 = tokio::spawn(run_server_tunnel(server_io2, mux_config(), tx2));
+
+        let (shutdown1, shutdown1_rx) = tokio::sync::watch::channel(false);
+        let (_shutdown2, shutdown2_rx) = tokio::sync::watch::channel(false);
+        let t1 = ClientTunnel::start(client_io, mux_config(), shutdown1_rx);
+        let t2 = ClientTunnel::start(client_io2, mux_config(), shutdown2_rx);
+        let pool = TunnelPool::new(vec![t1, t2]);
+
+        // Sanity: both tunnels work.
+        let mut a = pool.open_stream().await.unwrap();
+        a.write_all(b"aaaa").await.unwrap();
+        let mut b = pool.open_stream().await.unwrap();
+        b.write_all(b"bbbb").await.unwrap();
+        let mut got = Vec::new();
+        for rx in [&mut rx1, &mut rx2] {
+            let mut s = rx.recv().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            got.push(buf);
+        }
+        assert_eq!(got.len(), 2);
+
+        // Shut tunnel 1 down; every subsequent open must still succeed on
+        // tunnel 2 regardless of where the round-robin pointer stands.
+        send_shutdown(&shutdown1);
+        // Let the driver actually exit: an open that lands on the dying
+        // driver while it is still draining its select loop would win the
+        // race and return a stream that dies a moment later (WriteZero).
+        // Once the driver is gone the pool's fall-through is deterministic.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for _ in 0..4 {
+            let mut s = pool.open_stream().await.unwrap();
+            s.write_all(b"cccc").await.unwrap();
+        }
+        for _ in 0..4 {
+            let mut s = tokio::time::timeout(std::time::Duration::from_secs(3), rx2.recv())
+                .await
+                .expect("surviving tunnel stopped accepting streams")
+                .unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"cccc");
+        }
+
+        drop(a);
+        drop(b);
+        drop(pool);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), s2).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), s1).await;
+    }
+
+    fn send_shutdown(tx: &tokio::sync::watch::Sender<bool>) {
+        tx.send(true).unwrap();
     }
 }
