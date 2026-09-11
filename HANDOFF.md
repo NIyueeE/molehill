@@ -1,17 +1,18 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-10, on the v0.8.0 development line (branch
-> `merge-tcp4`, preparing the merge to `main`). The UDP session-affinity fix,
-> the template lint migration and the benchmark-matrix rework (uv/PEP 723,
-> schema v3 through-tunnel measurements) have landed, and the benchmark
-> measurement method was revised on 2026-09-10/11 (rate-cell shaping, per-rep
-> throughput isolation, a UDP capacity ladder — see the "Method revision"
-> paragraph below) and the v0.8.0 baseline was then re-measured in full from
-> it on host `0b073ddbf222` (52 arms, zero holes, charts and README
-> regenerated). Shipped work is
-> recorded in [CHANGELOG.md](CHANGELOG.md), and design details (protocol,
-> muxing, UDP session affinity) live in [docs/internals.md](docs/internals.md).
-> This file only tracks what is still open.
+> State as of 2026-09-11, on the v0.8.0 release line: everything below is
+> **merged into `main`** (the `merge-tcp4` branch was fast-forwarded into it
+> and deleted) and the `v0.8.0` tag is prepared from that commit. The UDP
+> session-affinity fix, the template lint migration and the benchmark-matrix
+> rework (uv/PEP 723, schema v3 through-tunnel measurements) have landed, the
+> benchmark measurement method was revised on 2026-09-10/11 (rate-cell
+> shaping, per-rep throughput isolation, a UDP capacity ladder — see the
+> "Method revision" paragraph below), and the v0.8.0 baseline was then
+> re-measured in full from it on host `0b073ddbf222` (52 arms, zero holes,
+> charts and README regenerated). Shipped work is recorded in
+> [CHANGELOG.md](CHANGELOG.md), and design details (protocol, muxing, UDP
+> session affinity) live in [docs/internals.md](docs/internals.md). This file
+> only tracks what is still open.
 
 ## Backlog
 
@@ -65,17 +66,28 @@ waiting for the consolidation.)
       (done in the v0.8.0 matrix): results-v0.8.0.json, six charts (incl.
       the new cost chart) and the tables now describe the count=4 default,
       the ring-accelerated noise rows, and the new cells/metrics.
-      **Regression-gate verdict (v0.8.0 vs v0.7.2): void as a gate.** The
-      v0.7.2 baseline ran on a DIFFERENT container (host 621a9d1d3f40 vs
-      2f9bbec0ea67) with the single-tunnel default and unbounded probe
-      durations (200-sample steady pings, e.g.), so the % thresholds are
-      not comparable; the 6 flagged rows split into probe-methodology
-      artifacts (steady RTT sampling, udp-loss dilution) and two signals
-      that spot-verification confirmed stable on the new host: rtt100
-      1-stream ~0.63-0.67 Gbps vs the old host's 0.752, and loss2b25 UDP
-      loss ~5-7.5% vs 2.5% — both plausibly container-variance, recorded
-      here as low-priority follow-ups (a same-host A/B would settle them).
-      results-v0.8.0.json is the new regression baseline.
+      **Regression-gate verdict (v0.8.0 vs v0.7.2): void as a gate — 8
+      flagged rows, waivered and recorded here (last read on the release
+      commit, 2026-09-11: `just bench-check` exits 1).** The gate itself
+      prints `different hosts (current=0b073ddbf222, baseline=621a9d1d3f40)`,
+      and the v0.7.2 file predates the method revision (single-tunnel
+      default, 200-sample steady pings, the old UDP probe), so its thresholds
+      cannot be read as regressions:
+      - 3 x `steady rtt p99` (+104% loss2b25, +33% rtt10, +33% rtt100) and
+        3 x UDP (loss2b25 `udp loss pp` +13pp, loss5 +4pp, loss2b25
+        `udp rtt p99` +33%) — probe-methodology rows: the p99 of a steady
+        ping moves with the sample count (200 before, 100 now), and the old
+        UDP probe diluted loss over unbounded pings, so these compare
+        instruments rather than paths.
+      - 2 x `thr 1-stream`: loss1_rtt10 -5.2% (4.431 -> 4.202 Gbit/s, just
+        over the 5% band) and rtt100 -24.4% (0.752 -> 0.569). Spot
+        verification on this host put rtt100 1-stream at 0.57-0.67, around
+        the committed 0.569, against the old host's 0.752 — container
+        variance, with a same-host A/B as the low-priority follow-up.
+      Every other row is `ok`, and the reference cells improved (loopback
+      8-stream +106%, loss1 8-stream +160%, RSS -29..-70%). Cells absent from
+      the v0.7.2 baseline (not gated): jitter20_10, rate100_rtt20,
+      rate20_rtt40. results-v0.8.0.json is the new regression baseline.
 
 ### Benchmark ritual (per tag — see docs/release.md)
 
@@ -102,8 +114,8 @@ backends per arm (SIGKILL cleanup + EADDRINUSE retry) and runs the 8-stream
 test after the cheap probes; the rate20 8-stream slot is null with the
 timeout reason in `partial_metrics` (rate100 measures both). The 2026-09-09
 targeted re-runs refreshed the rate cells, the loss2b25 steady-RTT probes
-and the fake-zero HoL entries on the same host — `results-v0.8.0.json`
-remains the regression baseline.
+and the fake-zero HoL entries on the same host — all of which the
+2026-09-10/11 revision below then replaced.
 
 **Method revision (2026-09-10, this thread) — the above diagnosis was
 half-wrong and is superseded.** Decisive measurements on this host with a
@@ -157,14 +169,14 @@ plain (tunnel-free) iperf3 pair across the shaped `lo`:
 
 Consequence: **no pre-revision number is comparable to the refreshed
 baseline** (the revision changed the shaping model and the throughput
-window/accounting, and the refresh ran on `ebb615bff576`); the full
+window/accounting, and the refresh ran on `0b073ddbf222`); the full
 re-measure was done on 2026-09-10 (52 arms; `audit_results.py` reports zero
 holes and zero arm errors) and `results-v0.8.0.json` + the charts + the
 README chapter now describe that run. The v0.7.2 regression gate is
 therefore informational only, and a rate-cell-only difference against it is
 never a signal.
 
-### Baseline refresh notes (2026-09-10, host ebb615bff576)
+### Baseline refresh notes (2026-09-10/11, host 0b073ddbf222)
 
 > **The refresh was re-run on 2026-09-10 after an endpoint bug, and the
 > corrected baseline is what is committed now.** An intermediate refresh
@@ -225,16 +237,16 @@ never a signal.
   exposed port, so it is a usable independent check (loopback ~10 Gbit/s,
   matching the matrix).
 - History note (2026-09-11): the 24 fix-on-fix commits on top of `0f44213`
-  were folded into the seven topical commits that follow it and `merge-tcp4`
-  was force-pushed once. The pre-rewrite tip is preserved as
-  `backup/merge-tcp4-20260911` (`4c70eeb`, identical tree); delete it once
-  this branch has merged to `main`.
-- Open before the next release (none block the merge): the UDP fairness
-  question above (instrument ready, no claim), a single-window full-matrix
-  re-run on the target host (this baseline was assembled across one run plus
-  three targeted merges after the recycle), and the `merge-tcp4` -> `main`
-  merge itself. The KCP loss cells were re-measured with the current
-  post-conserve binary in this baseline, so that item is closed.
+  were folded into seven topical commits and `merge-tcp4` was force-pushed
+  once; the branch was then fast-forwarded into `main` (19 thematic commits,
+  no merge commit) and both it and the pre-rewrite backup
+  `backup/merge-tcp4-20260911` (`4c70eeb`, identical tree) were deleted.
+- Open after the v0.8.0 release (none block it): the UDP fairness question
+  above (instrument ready, no claim) and a single-window full-matrix re-run
+  on the target host (this baseline was assembled across one run plus three
+  targeted merges after the container recycle). The KCP loss cells were
+  re-measured with the current post-conserve binary in this baseline, so that
+  item is closed, and the `merge-tcp4` -> `main` merge is done.
 
 Chart/runner follow-up (2026-09-10): absent measurements used to render as a
 fake `0.0` bar in the cost chart (`mux1`'s unmeasured 64-stream and
@@ -251,18 +263,19 @@ bare `KeyError`; `hol_probe.ping_tcp` records a connected pinger that
 completes zero or one round trip as a stall (`ping_max_gap_ms` = the elapsed
 wait) instead of `null`.
 
-Targeted refreshes on the re-created container (`ebb615bff576`; the file-wide
-meta still reads the original baseline host `2f9bbec0ea67` / 2026-09-09):
-`mux1` loopback (mixed bulk 9.0 Gbit/s, previously inherited the wedged
-iperf3 server), and frp/rathole `rate20_rtt40` (HoL now 3003 / 1986 ms; both
-had zero-or-one pinger replies over repeated runs, so the probe change — not
-a transient — is what records them). The host could not reproduce the
-baseline for `mux-off` (~20% low: 22.6 vs 28.0 Gbit/s 8-stream under current
-load), so the rest of `results-v0.8.0.json` is untouched; a full-matrix
-re-run on a quiet host is still needed before the next tag.
+Targeted refreshes on the re-created container (`ebb615bff576`; **superseded** —
+the 2026-09-10/11 revision replaced the whole file with a single run on
+`0b073ddbf222`): `mux1` loopback (mixed bulk 9.0 Gbit/s, previously inherited
+the wedged iperf3 server), and frp/rathole `rate20_rtt40` (HoL now
+3003 / 1986 ms; both had zero-or-one pinger replies over repeated runs, so the
+probe change — not a transient — is what records them). The host could not
+reproduce the baseline for `mux-off` (~20% low: 22.6 vs 28.0 Gbit/s 8-stream
+under current load), which is one reason that file was rebuilt from scratch
+instead of patched further.
 
-KCP optimization refresh (2026-09-10, full rigor, kcp4 arm only, merged
-into `results-v0.8.0.json`; meta now reads `ebb615bff576` / 2026-09-10):
+KCP optimization refresh (2026-09-10, full rigor, kcp4 arm only — also
+superseded by the 2026-09-11 re-measure on `0b073ddbf222`, which is what the
+committed file holds):
 loopback 1-stream 2.496 -> 3.191 Gbit/s (+28%, A/B against the
 pre-optimization code on the same host: 2.405), rtt10 8-stream 0.39 ->
 0.653 (+67%), loss1 0.356/0.413 -> 0.418/0.686 (+17%/+66%), loss2b25
@@ -303,9 +316,9 @@ define (feature ON = the aggressive/unconditional variant), so every
 molehill release so far shipped the aggressive variant while its docs
 claimed "conserve"; the engine now implements the reference's ts-gated
 conserve semantics. Wire-visible only under loss/reordering: the kcp4 loss
-cells in the benchmark were measured with the aggressive variant and
-should be re-verified on the next full-matrix run (already pending, see
-above). Other fixes: the timeout ssthresh now halves the flush-entry cwnd
+cells in the benchmark were measured with the aggressive variant; the
+2026-09-10/11 re-measure on `0b073ddbf222` used the post-conserve binary, so
+that item is closed. Other fixes: the timeout ssthresh now halves the flush-entry cwnd
 (`prior_cwnd`) like the reference; `KCP_PROBE_INIT` 7000→5000; stream-mode
 `send` reports partial progress instead of erroring after appending
 (unreachable in the adapter, which chunks at 64 KiB); `peeksize` no longer
@@ -343,9 +356,9 @@ the rtt cells ran via `weakproxy` (client↔server delay only), which the
 bypassed throughput never traversed. `results-v0.7.2.json` was refreshed in
 place with schema-v3 through-tunnel data; `results-v0.7.0.json` is the
 pre-matrix (v1) baseline and is only kept for history. The live gate verdict
-is v0.8.0 vs v0.7.2 — 6 metric violations, waivered because the v0.7.2
-baseline ran a different container with the single-tunnel default (see the
-baseline paragraph above).
+is v0.8.0 vs v0.7.2 — 8 metric violations, waivered because the v0.7.2
+baseline ran a different container with the single-tunnel default (the
+row-by-row read is in the baseline paragraph above).
 
 ## Transport comparison: 4 arms implemented, 3 merged (decision record)
 
@@ -354,7 +367,7 @@ on the `transport-test` branch (kcp_tunnel and quic_tunnel ran their full
 lifecycle in the serial suite). The branch is **deleted**; the comparison
 history (including the QUIC arm) survives in the local tag
 `archive/transport-test`. **Fork decision:** arms 0-2 (N×TCP default, KCP
-optional) merged into main as `merge-tcp4`; **arm 3 (QUIC) was left out** —
+optional) are merged into `main`; **arm 3 (QUIC) was left out** —
 behind on loss cells (quinn "too many gaps" at rtt10), no peer auth on the
 QUIC leg, and N×TCP measured better in every comparable cell. The bench
 matrix on main covers mux / mux-off / mux1 / noise / kcp4 only.
@@ -469,8 +482,8 @@ Design decisions (merged part):
   `target/release/molehill` the bench tooling builds covers the tcp/kcp
   arms (embedded/minimal/container builds keep their explicit slim feature
   lists and are unaffected).
-- Merge status: the merged part (arms 0-2 + the bench arms below) is
-  delivered on main via the `merge-tcp4` branch (not yet merged into main);
+- Merge status: the merged part (arms 0-2 + the bench arms below) is in
+  `main` (fast-forwarded on 2026-09-11, no merge commit);
   the QUIC arm and the full comparison history live in the local tag
   `archive/transport-test`. Bench variants on main are `mux` (plain,
   `count = 4`, the default baseline), `mux-off` (plain, `mode = "direct"`,

@@ -5,56 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-09-11
 
-### Changed
-
-- Benchmark measurement method revision (2026-09-10). Rate cells shape `lo`
-  with a `limit 2000`-packet queue (recorded as `netem_rate_limit`): the old
-  shallow queue tail-dropped GSO segments and cost ~80% of the shaped rate,
-  so a rate cell measured the shaper rather than the tool. Throughput
-  sampling is isolated per repetition (fresh iperf3 server after a stall or a
-  `server is busy` answer, a client bound never tighter than the historical
-  `secs + 20`), keeps raw per-rep JSON under `iperf-raw/<arm> <cell>/`, uses
-  one stated window convention (bytes over the measured window, with the
-  receiver's own window beside it, and the receiver's count used when the
-  sender's accounting is provably degenerate), and records a typed reason for
-  every `null`. `audit_results.py` gates completeness (holes, nested fields,
-  sampler output) and the endpoint invariant below; `docs/release.md` and
-  AGENTS.md §10 state the comparability rules.
-
-- The UDP capacity probe is now a ladder rather than a fixed two-point
-  sample: 500 pps to the configured burst rate in 2000-datagram bursts with a
-  1.5 s drain, reporting the highest step delivered within
-  `max(2%, cell loss + 2pp)` plus the knee. It finds real knees (10 ms cell
-  12 000 pps / 10.9 Mbit/s, 100 ms cell 1 000-2 000 pps / 0.7-1.4 Mbit/s) and
-  a lower bound on unshaped loopback (27.2 Mbit/s, the ladder top), where the
-  previous design only reported its own pacing back.
-
-- The v0.8.0 benchmark baseline was re-measured on 2026-09-10/11 against the
-  revised method (52 arms on host `0b073ddbf222`; the audit reports zero
-  holes, zero arm errors and no endpoint violation), and the README
-  chapter/charts were regenerated from it. Because the revision changed the
-  shaping model, the throughput window/accounting and the host, **every
-  number in the chapter is a fresh same-host measurement — the previous
-  v0.8.0 rows and the v0.7.2 regression baseline are not comparable.** The
-  re-derived conclusions from this run: Noise retains ~58%/76% of plain
-  throughput, `count = 4` aggregates at 8 streams (19.5 vs 9.2 Gbit/s on
-  loopback, 12.3 vs 4.5 at 1% loss), and the KCP carrier stays far behind TCP
-  wherever the path is not the bottleneck (1.1 vs 14.9 Gbit/s at 8 streams,
-  ~3x RSS) with UDP-only paths and rtt100 session quality as its uses. A
-  UDP-under-load weakness seen in two earlier runs (100% paced-pinger loss in
-  the 10 ms cell) did **not** reproduce in this one (2%), so it is recorded as
-  variance rather than a finding.
-
-- Fixed a measurement regression that invalidated an intermediate baseline:
-  the throughput sampler dialed the iperf3 backend instead of the tool's
-  exposed port, so it reported the loopback ceiling with the tunnel bypassed.
-  Entries now record the endpoint, the sampler raises when the two ports are
-  equal, and the audit fails such a run. With the endpoint fixed, the
-  weak-cell limits are visible again and honest: the 20 Mbit/s cell measures
-  1-stream (0.009 Gbit/s) with its 8-stream slot `null` and a recorded
-  timeout reason, and every `null` in the file carries its reason.
+> **The benchmark figures quoted per entry were measured when that change
+> landed**, on the host then in use. The 2026-09-10/11 method revision
+> (rate-cell shaping, throughput window convention, UDP capacity ladder)
+> then re-measured the whole matrix against the committed defaults, so the
+> figures are not comparable across entries. The authoritative, mutually
+> comparable set is the README Benchmarks chapter, regenerated from
+> `benches/scripts/bench/results-v0.8.0.json`; HANDOFF.md records that
+> baseline's scope and its regression-gate waiver.
 
 ### Added
 
@@ -128,6 +88,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a per-tag regression gate (`just bench-check`) required before tagging.
 
 ### Changed
+
+- Benchmark measurement method revision (2026-09-10). Rate cells shape `lo`
+  with a `limit 2000`-packet queue (recorded as `netem_rate_limit`): the old
+  shallow queue tail-dropped GSO segments and cost ~80% of the shaped rate,
+  so a rate cell measured the shaper rather than the tool. Throughput
+  sampling is isolated per repetition (fresh iperf3 server after a stall or a
+  `server is busy` answer, a client bound never tighter than the historical
+  `secs + 20`), keeps raw per-rep JSON under `iperf-raw/<arm> <cell>/`, uses
+  one stated window convention (bytes over the measured window, with the
+  receiver's own window beside it, and the receiver's count used when the
+  sender's accounting is provably degenerate), and records a typed reason for
+  every `null`. `audit_results.py` gates completeness (holes, nested fields,
+  sampler output) and the endpoint invariant below; `docs/release.md` and
+  AGENTS.md §10 state the comparability rules.
+
+- The UDP capacity probe is now a ladder rather than a fixed two-point
+  sample: 500 pps to the configured burst rate in 2000-datagram bursts with a
+  1.5 s drain, reporting the highest step delivered within
+  `max(2%, cell loss + 2pp)` plus the knee. It finds real knees (10 ms cell
+  12 000 pps / 10.9 Mbit/s, 100 ms cell 1 000-2 000 pps / 0.7-1.4 Mbit/s) and
+  a lower bound on unshaped loopback (27.2 Mbit/s, the ladder top), where the
+  previous design only reported its own pacing back.
+
+- The v0.8.0 benchmark baseline was re-measured on 2026-09-10/11 against the
+  revised method (52 arms on host `0b073ddbf222`; the audit reports zero
+  holes, zero arm errors and no endpoint violation), and the README
+  chapter/charts were regenerated from it. Because the revision changed the
+  shaping model, the throughput window/accounting and the host, **every
+  number in the chapter is a fresh same-host measurement — the previous
+  v0.8.0 rows and the v0.7.2 regression baseline are not comparable.** The
+  re-derived conclusions from this run: Noise retains ~58%/76% of plain
+  throughput, `count = 4` aggregates at 8 streams (19.5 vs 9.2 Gbit/s on
+  loopback, 12.3 vs 4.5 at 1% loss), and the KCP carrier stays far behind TCP
+  wherever the path is not the bottleneck (1.1 vs 14.9 Gbit/s at 8 streams,
+  ~3x RSS) with UDP-only paths and rtt100 session quality as its uses. A
+  UDP-under-load weakness seen in two earlier runs (100% paced-pinger loss in
+  the 10 ms cell) did **not** reproduce in this one (2%), so it is recorded as
+  variance rather than a finding.
+
+- Fixed a measurement regression that invalidated an intermediate baseline:
+  the throughput sampler dialed the iperf3 backend instead of the tool's
+  exposed port, so it reported the loopback ceiling with the tunnel bypassed.
+  Entries now record the endpoint, the sampler raises when the two ports are
+  equal, and the audit fails such a run. With the endpoint fixed, the
+  weak-cell limits are visible again and honest: the 20 Mbit/s cell measures
+  1-stream (0.009 Gbit/s) with its 8-stream slot `null` and a recorded
+  timeout reason, and every `null` in the file carries its reason.
+
 
 - The logo was replaced with the mole + volcano + data-stream design
   (`assets/molehill.svg`), and per-run bench artifacts
