@@ -232,7 +232,7 @@ Details: [docs/release.md](docs/release.md).
 - **CHANGELOG as you go.** A user-visible change and its `## [Unreleased]`
   entry land in the same commit; never backfill at release time (§5).
 - **Prove it, don't assume it.** Every "it works" claim must be backed by
-  real command output from this session; no output, no claim.
+  real command output from this session; no output, no claim. Measurements follow §10.
 - **Shell hygiene for commits and bulk edits.**
   - Commit messages containing backticks, quotes or parentheses (TOML keys,
     markdown) go through a quoted heredoc or a file (`git commit -F - <<'EOF'`)
@@ -261,7 +261,67 @@ Details: [docs/release.md](docs/release.md).
   a line that must carry a secret-shaped string takes a
   `security-scan:allow` marker with a reason.
 
-## 10. Documentation map
+## 10. Measurement discipline (benchmarks, probes, results)
+
+Every performance number in this repository is a claim about the *path under
+test*. These rules come from real incidents (the 2026-09-10 measurement
+revision) and are as binding as the lint discipline in §2.
+
+- **Measure the path you claim.** The benchmark client must dial the
+  endpoint under test (the tool's exposed port), never the backend it
+  forwards to. The pre-schema-v3 results dialed the backend and reported the
+  loopback iperf3 ceiling (~46 Gbit/s) for every tool; the same error
+  reappeared when a sampler was refactored to reuse the backend port. Record
+  the endpoint in the data (`_throughput_exposed_port` /
+  `_bench_backend_port`) and assert the invariant:
+  `bench_lib.run_throughput` raises when they are equal and
+  `audit_results.py` fails the run.
+- **Instrument parameters are part of the method.** Queue depth, pacing
+  rate, client timeout and the window convention change the result, so they
+  are recorded in the results meta (`netem_rate_limit`) and stated in the
+  README. A constant buried in a function is a method nobody can audit: a
+  hardcoded shallow queue shaped rate cells at ~30% of the nominal rate for
+  a whole baseline.
+- **One failure must not poison the next sample.** A wedged iperf3 server
+  (single-test by design) turned every later repetition into a `null` and
+  made the 8-stream slots at the rate cells look unmeasurable. Restart the
+  external tool after a failed sample, scale client timeouts with the test
+  length, and record the restart.
+- **Every failure leaves evidence.** Keep raw per-sample artifacts (exact
+  command, stdout, stderr, exit status) and a typed reason. A bare `null` is
+  a guess; the artifacts under `iperf-raw/<arm> <cell>/` are what let a
+  0-byte cell be diagnosed and the backend-dial bug be caught.
+- **State one convention and apply it everywhere.** Define the denominator
+  once (here: bytes over the measured window, with the receiver's own window
+  beside it), apply it to every tool, and never take `max()` of two sides to
+  look better. When one side's accounting is provably degenerate (a fast
+  sender into a slow shaper), document the fallback and flag it rather than
+  hiding it.
+- **Variance is data; do not conclude across it.** Record min/max, quote the
+  spread, and refuse to build a claim on a difference inside it. State the
+  comparability boundary of every baseline: same schema, same method, same
+  host.
+- **A metric without contrast is not a measurement.** If every arm returns
+  the same value, or the probe only ever reaches its own ceiling, remove the
+  chart panel and the claim — and say why in the README and HANDOFF — rather
+  than drawing a degenerate panel.
+- **Re-check every consumer after reshaping data.** Renaming one field
+  silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
+  the plot still read a removed key and rendered placeholders. Grep for
+  every reader of a key you touch, and keep a completeness gate in the
+  ritual (`audit_results.py`: holes, nested fields, sampler output, endpoint
+  invariant).
+- **Prove provenance.** A run must correspond to a committed revision and a
+  freshly built binary; check the binary's reported version/hash before
+  trusting its numbers (a binary two commits behind HEAD was caught that
+  way, and its numbers would have described code that no longer existed).
+- **Docs move with the data.** A method or number change updates tables,
+  prose *and* the configuration guidance (`README.md` / `README.zh.md`
+  "Choosing a configuration"), and names what is no longer comparable
+  (`docs/release.md`). A re-numbered table with stale conclusions is worse
+  than no table.
+
+## 11. Documentation map
 
 | Question | Where |
 |----------|-------|
@@ -273,9 +333,10 @@ Details: [docs/release.md](docs/release.md).
 | Noise transport setup | docs/transport.md |
 | Control/data channel design | docs/internals.md |
 | Current working state, decisions, open threads | HANDOFF.md |
+| How to measure, and what makes a benchmark number trustworthy | AGENTS.md §10 (this file) |
 
 
-## 11. Project facts (appendix)
+## 12. Project facts (appendix)
 
 Details that agents need constantly:
 
@@ -308,11 +369,12 @@ Details that agents need constantly:
   flow) lives in [docs/structure.md](docs/structure.md) and
   [docs/internals.md](docs/internals.md).
 
-## 12. One-line summary
+## 13. One-line summary
 
 > Self-check the environment on entry; when a check blocks you, fix the code —
 > waive only as a last resort, locally, with a named reason; keep docs and
 > code in the same commit; write commit messages in english; commits are free,
 > release tags are deliberate; let releases speak through CHANGELOG.md; count
-> versions from the fork point; prove every claim with real output; end
+> versions from the fork point; prove every claim with real output and
+> measure the path you claim (§10); end
 > sessions clean; secrets never enter the repo.
