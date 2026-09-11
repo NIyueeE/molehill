@@ -139,9 +139,11 @@ committed 5.9 was not reproducible on this host — same story as
 `mux-off` above); rtt100 1-stream flaked to 0.008 in one pass and the
 backfill's 0.038/old-code's 0.04 stand; rate100 1-stream flaked to
 0.008 in the first pass, the backfill's 0.028 matches the old code's
-0.025; rate100/rate20 8-stream stayed unrecordable (iperf3 single-test
-server wedge — the committed rate100 8s was a fake zero and rate20 8s
-was already None). Peer binaries are
+0.025; rate100/rate20 8-stream stayed unrecordable: the 8-parallel-stream
+iperf3 client timed out on every rep at the shaped bottleneck
+(`iperf3 -P 8` wedges the single-test server; each attempt was killed
+by the 30 s harness timeout — same reason the committed rate100 8s
+was a fake zero and rate20 8s was already None). Peer binaries are
 cached under `~/tmp/bench-peers` (not `/tmp`, which session cleanup wipes)
 and pinned to the baseline versions (frp 0.71.0 / rathole 0.5.0 / bore
 0.6.0), fetched directly because the unauthenticated GitHub API was
