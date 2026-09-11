@@ -411,6 +411,21 @@ def render_transport(results, meta, out_path):
                      f"({meta.get('date', '')})")
 
 
+def tradeoff_row(results, t, loopback="loopback"):
+    """One row of the Configuration-tradeoffs table (shared by both tables)."""
+    lb = results[t].get(loopback, {})
+    cpu = lb.get("cpu") or {}
+    ch = lb.get("churn") or {}
+    mx = lb.get("mixed_bulk_latency") or {}
+    mem_mib = (lb.get("memory_rss_kb") or {}).get("total_avg_kb", 0) / 1024
+    return (f"| {t} | {fmt_table(cpu.get('total_avg_pct'), 1)} | "
+            f"{fmt_table(ch.get('connects_per_s'), 1)} | "
+            f"{fmt_table(ch.get('setup_first_byte_ms_p99'), 2)} | "
+            f"{fmt_table(mem_mib, 1)} MiB | "
+            f"{fmt_table(lb.get('throughput_64streams_gbps'), 2)} | "
+            f"{fmt_table(mx.get('bulk_gbps'), 2)} |")
+
+
 def render_cost(results, meta, out_path):
     """The new tradeoff metrics (0.8): CPU% (noise/KCP cost), connection
     churn (mux-vs-direct and pool guidance), sustained UDP capacity,
@@ -462,27 +477,30 @@ def render_cost(results, meta, out_path):
     bars(axes[0][2], "churn", "setup_first_byte_ms_p99", ylabel="ms",
          title="Churn setup-to-first-byte p99", fmt=lambda v: f"{v:.2f}")
 
-    udp_arms = [t for t in arms
-                if read(results, t, loopback, "udp_capacity") is not None]
-    if udp_arms:
-        uc = [read(results, t, loopback, "udp_capacity", "pps") or 0
-              for t in udp_arms]
-        ax = axes[1][0]
-        ax.bar(list(range(len(udp_arms))), uc, width,
-               color=[colors[t] for t in udp_arms])
-        for x, v in zip(range(len(udp_arms)), uc):
-            ax.annotate(f"{v:.0f}", (x, v), ha="center", va="bottom",
-                        fontsize=6, rotation=90, xytext=(0, 2),
-                        textcoords="offset points")
-        ax.set_xticks(list(range(len(udp_arms))),
-                      [short(t) for t in udp_arms], fontsize=8)
-        ax.set_ylabel("datagrams/s")
-        ax.set_ylim(0, max(uc) * 1.2 if uc else 1)
-        ax.set_title("Sustained UDP capacity (paced, loss in table)",
-                     fontsize=10)
-        ax.grid(axis="y", alpha=0.3)
-    else:
-        axes[1][0].set_visible(False)
+    # The UDP-capacity panel is deliberately NOT drawn. The two-point probe
+    # (paced + saturating) produced numbers this matrix cannot stand behind:
+    # on the unshaped loopback every arm sits at the probe's ceiling (a
+    # constant, so the panel has no contrast), and in the rtt100 cell it
+    # reports 97% loss on a 5.4 Mbit/s paced step while the paced ping in
+    # the same cell reports 0% — i.e. it is measuring its own behaviour, not
+    # the path's. Raw paced/saturated numbers stay in the results file with
+    # the offered rate next to the delivered one; the metric needs a
+    # redesign before anything is claimed from it (HANDOFF.md).
+    mem_kb = [(read(results, t, loopback, "memory_rss_kb") or {})
+              .get("total_avg_kb", 0) for t in arms]
+    mem_mib = [v / 1024 for v in mem_kb]
+    ax = axes[1][0]
+    ax.bar(list(range(len(arms))), mem_mib, width,
+           color=[colors[t] for t in arms])
+    for x, v in zip(range(len(arms)), mem_mib):
+        ax.annotate(f"{v:.1f}", (x, v), ha="center", va="bottom",
+                    fontsize=6, rotation=90, xytext=(0, 2),
+                    textcoords="offset points")
+    ax.set_xticks(list(range(len(arms))), [short(t) for t in arms], fontsize=8)
+    ax.set_ylabel("MiB (server+client)")
+    ax.set_ylim(0, max(mem_mib) * 1.25 if mem_mib else 1)
+    ax.set_title("Memory (avg RSS)", fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
 
     bars(axes[1][1], "throughput_64streams_gbps", ylabel="Gbit/s",
          title="Scale: 64 concurrent streams (loopback)",
@@ -598,23 +616,11 @@ def print_tables(results, meta):
             [t for t in molehill_family(results) if "(noise)" in t]:
         print(family_row(t))
 
-    def tradeoff_row(t):
-        lb = results[t].get(loopback, {})
-        cpu = lb.get("cpu") or {}
-        ch = lb.get("churn") or {}
-        uc = lb.get("udp_capacity") or {}
-        mx = lb.get("mixed_bulk_latency") or {}
-        return (f"| {t} | {fmt_table(cpu.get('total_avg_pct'), 1)} | "
-                f"{fmt_table(ch.get('connects_per_s'), 1)} | "
-                f"{fmt_table(ch.get('setup_first_byte_ms_p99'), 2)} | "
-                f"{fmt_table(uc.get('pps'), 1)} | "
-                f"{fmt_table(lb.get('throughput_64streams_gbps'), 2)} | "
-                f"{fmt_table(mx.get('bulk_gbps'), 2)} |")
 
     if any((results[t].get(loopback) or {}).get("cpu") is not None
            for t in [mux_row(results), *molehill_family(results)]):
         print("\n### Configuration tradeoffs (loopback)")
-        print("| Tool | CPU% | churn/s | churn p99 ms | UDP pps | "
+        print("| Tool | CPU% | churn/s | churn p99 ms | RSS MiB | "
               "thr64 | mixed bulk |",
               "|---|---|---|---|---|---|---|", sep="\n")
         seen = []
@@ -623,7 +629,7 @@ def print_tables(results, meta):
                 continue
             seen.append(t)
             if (results[t].get(loopback) or {}).get("cpu") is not None:
-                print(tradeoff_row(t))
+                print(tradeoff_row(results, t))
 
     for cell in cells:
         if cell == loopback:
@@ -680,23 +686,11 @@ def print_tables_arms(results, meta, arms):
         if row(t, loopback):
             print(row(t, loopback))
 
-    def tradeoff_row(t):
-        lb = results[t].get(loopback, {})
-        cpu = lb.get("cpu") or {}
-        ch = lb.get("churn") or {}
-        uc = lb.get("udp_capacity") or {}
-        mx = lb.get("mixed_bulk_latency") or {}
-        return (f"| {t} | {fmt_table(cpu.get('total_avg_pct'), 1)} | "
-                f"{fmt_table(ch.get('connects_per_s'), 1)} | "
-                f"{fmt_table(ch.get('setup_first_byte_ms_p99'), 2)} | "
-                f"{fmt_table(uc.get('pps'), 1)} | "
-                f"{fmt_table(lb.get('throughput_64streams_gbps'), 2)} | "
-                f"{fmt_table(mx.get('bulk_gbps'), 2)} |")
 
     if any((results[t].get(loopback) or {}).get("cpu") is not None
            for t in [mux_row(results), *molehill_family(results)]):
         print("\n### Configuration tradeoffs (loopback)")
-        print("| Tool | CPU% | churn/s | churn p99 ms | UDP pps | "
+        print("| Tool | CPU% | churn/s | churn p99 ms | RSS MiB | "
               "thr64 | mixed bulk |",
               "|---|---|---|---|---|---|---|", sep="\n")
         seen = []
@@ -705,7 +699,7 @@ def print_tables_arms(results, meta, arms):
                 continue
             seen.append(t)
             if (results[t].get(loopback) or {}).get("cpu") is not None:
-                print(tradeoff_row(t))
+                print(tradeoff_row(results, t))
 
     for cell in cells:
         if cell == loopback:

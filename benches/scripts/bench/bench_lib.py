@@ -254,6 +254,11 @@ def cell_sort_key(c: dict) -> tuple:
 
 
 # --- netem -------------------------------------------------------------------
+# netem rate-limit queue depth in packets (see Netem.on for the measurement
+# behind the value). Recorded in the results meta as `netem_rate_limit`.
+RATE_QUEUE_LIMIT = 2000
+
+
 class Netem:
     def __init__(self):
         self.tc = shutil.which("tc") or ""
@@ -298,7 +303,21 @@ class Netem:
         if spec.rtt or spec.jitter:
             args += ["delay", f"{spec.rtt:g}ms", f"{spec.jitter:g}ms"]
         if spec.rate:
-            args += ["rate", f"{spec.rate:g}mbit", "limit", "1000"]
+            # Queue depth is a MEASUREMENT parameter, not a detail: netem's
+            # token bucket needs a queue deep enough to absorb the sender's
+            # bursts, otherwise the shaper tail-drops whole GSO super-segments
+            # and even a healthy TCP sender collapses. Measured on this host
+            # at `rate 100mbit delay 20ms` with a plain iperf3 pair (-P 8):
+            #   limit 1    -> 18 Mbit/s   (81% of the shaped rate lost)
+            #   limit 1000 -> 99.6 Mbit/s (honest)
+            #   limit 20000-> 100 Mbit/s  (deep buffer, longer drain)
+            # The old hardcoded `limit 1000` was recorded nowhere, so a
+            # reader could not tell whether a weak rate cell was the tool or
+            # the shaper. `limit 2000` keeps the burst tolerance of 1000 with
+            # headroom for 8-stream tests; it is reported in the results meta
+            # (`netem_rate_limit`) so the shaping model is auditable.
+            args += ["rate", f"{spec.rate:g}mbit", "limit",
+                     str(RATE_QUEUE_LIMIT)]
         applied = subprocess.run(args, capture_output=True,
                                  check=False, timeout=10).returncode == 0
         self.active = applied
@@ -326,6 +345,7 @@ class Backends:
         self._threads = []
         self._procs = []
         self._socks = []
+        self._work = None
         self.iperf_port = 0
         self.tcp_port = 0
         self.udp_port = 0
@@ -334,6 +354,7 @@ class Backends:
               work: Path | None = None):
         self.iperf_port, self.tcp_port, self.udp_port = (
             iperf_port, tcp_port, udp_port)
+        self._work = work
         # A previous arm's wedged server can hold the port briefly (or, if
         # it survived a kill, indefinitely): kill whatever listens on our
         # ports and retry a few times instead of failing the whole arm.
@@ -469,6 +490,136 @@ class Backends:
         t.start()
         self._threads.append(t)
 
+    def restart_iperf(self) -> None:
+        """Spawn a FRESH iperf3 server on the same port.
+
+        A stalled throughput test at a shaped (netem rate-limited) cell
+        poisons the single-test iperf3 server's state ("unable to receive
+        cookie" / "Bad file descriptor"): every later test on that server
+        then hangs until the harness timeout, which is why the 8-stream
+        value at the rate cells kept coming back None. A fresh process has
+        clean state; the TCP/UDP echo servers are unaffected. Called by
+        `run_throughput` after every failed rep; the old wedged process is
+        killed and the new one re-recorded for crash reaping.
+        """
+        if not self._procs:
+            raise RuntimeError("restart_iperf: no backend server running")
+        proc = self._procs.pop(0)  # index 0 is always the iperf3 server
+        with contextlib.suppress(OSError):
+            proc.kill()
+        time.sleep(0.3)
+        # a wedged server can survive SIGKILL briefly; make sure the port
+        # is really free before rebinding it
+        self._kill_port_holder(self.iperf_port)
+        cmd = ["iperf3", "-s", "-B", "127.0.0.1", "-p", str(self.iperf_port)]
+        if self._work is not None:
+            cmd += ["--logfile", str(Path(self._work) / "iperf3.log")]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self._procs.insert(0, proc)
+        if self._work is not None:
+            record_pid(self._work, proc.pid)
+        time.sleep(0.4)
+        if proc.poll() is not None:
+            raise RuntimeError(
+                f"iperf3 died on restart (port {self.iperf_port}, exit "
+                f"{proc.returncode})")
+
+    def run_throughput(self, exposed_port: int, reps: int, streams: int,
+                       secs: int, tag: str = "", backend_port: int | None = None) -> dict:
+        """Sample a `-P streams` throughput N times through one arm, isolated.
+
+        Each rep gets a BOUNDED client (the bound scales with the test length,
+        not with a fixed 20 s that a shaped-cell drain legitimately exceeds) and
+        a fresh server when the previous rep wedged it. Returns the full
+        measurement, not only a rate: per-rep records plus the median-rep
+        headline and min/max spread, so `results-*.json` can answer *why* a
+        number is missing or zero after the run (the shape of the failure is
+        data: a 0-byte sum and a timeout are different findings).
+
+        Why per-rep server hygiene matters: iperf3's server is single-test, and
+        a stalled test leaves it in a state ("unable to receive cookie" / EBADF)
+        where every FOLLOWING test hangs until the harness bound. With the
+        harness bound at `secs + 20` and 3 reps, one wedge therefore turned a
+        measurable 8-stream cell into `null` and killed the rest of the
+        repetition budget — the observed rate-cell behaviour in v0.8.0.
+        """
+        # The client MUST dial the tool's EXPOSED port: `self.iperf_port` is
+        # the iperf3 BACKEND (what the tool forwards to), so dialing it
+        # measures the loopback iperf3 ceiling with the tool bypassed — the
+        # pre-schema-v3 error. The assert below makes that impossible to
+        # reintroduce silently; the entry also records both ports.
+        if backend_port is not None and exposed_port == backend_port:
+            raise RuntimeError(
+                f"throughput endpoint {exposed_port} is the iperf3 backend, "
+                "not the tunnel's exposed port — the tool would be bypassed")
+        port = exposed_port
+        # Expected wall time of one rep: `-O 2` warm-up + the measured window,
+        # plus slack for slow-start and the results exchange. The margin is
+        # generous because killing a still-transferring test turns real data
+        # into a `null`; the whole-arm timeout in bench.py stays the hard stop.
+        # Bound the client by the test length, but never tighter than the
+        # historical `secs + 20`: measured through the tunnel (not the
+        # backend), the weakest cells need that slack to finish the results
+        # exchange, and the first version of this bound (secs*2+6 = 26 s for
+        # a 10 s test) turned KCP's rtt100 samples into nulls.
+        timeout = max(secs * 2.0 + 6.0, secs + 20.0)
+        records = []
+        for i in range(reps):
+            art = None
+            if self._work is not None:
+                # per-ARM subdirectory: the work dir is per RUN, so without
+                # the tag every arm overwrote the previous arm's raw
+                # artifacts and only the last arm's evidence survived
+                safe = re.sub(r"[^A-Za-z0-9._-]+", "_", tag) if tag else "arm"
+                art = (Path(self._work) / "iperf-raw" / safe
+                       / f"P{streams}-rep{i}")
+            r = iperf_result(port, streams, secs, timeout, art)
+            r["rep"] = i
+            records.append(r)
+            outcome = "ok" if r["ok"] else "fail"  # NOT `tag`: that is the
+            # artifact-directory name and must survive the loop
+            print(f"    rep{i} P{streams}: {outcome} "
+                  f"{r.get('gbps_headline', '-')} Gbit/s, "
+                  f"{r.get('gbps_received_own_window', '-')} recv-own, "
+                  f"wall {r['wall_s']}s"
+                  f"{'' if r['ok'] else ' — ' + str(r.get('reason'))[:90]}",
+                  flush=True)
+            if not r["ok"]:
+                # the NEXT rep is what a wedged server would poison
+                with contextlib.suppress(Exception):
+                    self.restart_iperf()
+        ok = [r for r in records if r["ok"]]
+        out = {"reps_run": len(records), "reps_ok": len(ok), "records": records,
+               "port": port}
+        if not ok:
+            last = records[-1]
+            out["error"] = last.get("reason", "no result")
+            return out
+        by_rate = sorted(ok, key=lambda r: r["gbps_headline"])
+        med = by_rate[len(by_rate) // 2]
+        out |= {
+            # headline = the delivered/ingress bytes over the measured window
+            # (see iperf_result): the side whose accounting is complete
+            "gbps_sent": round(med["gbps_headline"], 4),
+            "gbps_sent_only": round(med["gbps_sent_only"], 4),
+            "gbps_received": round(med["gbps_received_window"], 4),
+            "gbps_received_own_window": round(med["gbps_received_own_window"], 4),
+            "gbps_min": round(by_rate[0]["gbps_headline"], 4),
+            "gbps_max": round(by_rate[-1]["gbps_headline"], 4),
+            "degenerate_reps": sum(
+                1 for r in ok if r.get("sender_accounting_degenerate")),
+            "retransmits": med["retransmits"],
+            "bytes_sent": med["bytes_sent"],
+            "bytes_received": med["bytes_received"],
+            "active_s": med["active_s"],
+            "receiver_window_s": med["receiver_window_s"],
+            "per_stream_bytes": med["per_stream_bytes"],
+            "mean_rtt_us": med.get("mean_rtt_us"),
+            "median_rep": med["rep"],
+        }
+        return out
+
     def stop(self) -> None:
         self._stop.set()
         for s in self._socks:
@@ -525,56 +676,132 @@ def wait_port(port: int, timeout_s: float = 25.0) -> bool:
 
 
 # --- metrics -----------------------------------------------------------------
-def iperf_error(res) -> str:
-    """Human-readable iperf3 failure: iperf3's own `{"error": ...}` document
-    when it produced one, else the exit code plus an output snippet. Without
-    this a missing `end.sum_received` surfaced as a bare KeyError string
-    ("'sum_received'") that said nothing about the real cause."""
+def iperf_active_seconds(doc: dict, secs: int) -> float:
+    """Length of the MEASURED window = the sender's non-omitted intervals.
+
+    This is the honest denominator for the sender-side rate: total bytes sent
+    include the `-O` warm-up, so `bytes / sum_sent.seconds` (the full test
+    duration) is not the measured-window rate. The receiver keeps a SEPARATE
+    window (`sum_received.seconds`), reported alongside: after the sender
+    stops, the backend can still be draining (6.24 s of receive window for a
+    6.00 s send window on a shaped cell), and collapsing the two into one
+    denominator is what made `sent` and `received` look incomparable.
+    Falls back to the configured duration when the interval list is absent."""
+    intervals = doc.get("intervals") or []
+    acc = 0.0
+    for iv in intervals:
+        s = iv.get("sum") or {}
+        if s.get("omitted"):
+            continue
+        # ALWAYS the interval's own span. iperf3's per-interval `seconds`
+        # field is not that span: on the interval that follows the `-O`
+        # warm-up it reports the warm-up plus the interval (2.005 s for a
+        # 0.005 s tail), which summed to 9.0 s for an 8 s test and silently
+        # deflated the headline by ~12% on the loopback cell.
+        acc += max(0.0, s.get("end", 0.0) - s.get("start", 0.0))
+    return acc if acc > 0 else float(secs)
+
+
+def iperf_result(port: int, streams: int, secs: int, timeout: float,
+                 artifact: Path | None) -> dict:
+    """One `-P streams` iperf3 client run through the tunnel; never raises.
+
+    A raw artifact directory is captured on EVERY outcome (requested and
+    actual timeout, exit status, stdout, stderr) so a later null in the
+    results file can be re-diagnosed instead of guessed at."""
+    if artifact is not None:
+        artifact.mkdir(parents=True, exist_ok=True)
+    cmd = ["iperf3", "-J", "-c", "127.0.0.1", "-p", str(port),
+           "-t", str(secs), "-O", "2", "-P", str(streams)]
+    t0 = time.perf_counter()
+    timed_out = False
     try:
-        err = json.loads(res.stdout).get("error")
-    except (ValueError, AttributeError):
-        err = None
-    if err:
-        return f"iperf3 error: {err}"
-    detail = (res.stderr or res.stdout or "").strip().replace("\n", " ")[:200]
-    return f"iperf3 exit {res.returncode}: {detail or 'no output'}"
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        rc, err = None, (e.stderr or "")
+        out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(
+            "utf-8", "replace")
+    wall = round(time.perf_counter() - t0, 2)
+    if artifact is not None:
+        (artifact / "cmd.txt").write_text(" ".join(cmd) + "\n")
+        (artifact / "stdout.json").write_text(out or "")
+        (artifact / "stderr.txt").write_text(err or "")
+        (artifact / "meta.json").write_text(json.dumps(
+            {"streams": streams, "secs": secs, "timeout_s": timeout,
+             "exit": rc, "timed_out": timed_out, "wall_s": wall}, indent=1))
+    base = {"streams": streams, "secs": secs, "timeout_s": round(timeout, 1),
+            "wall_s": wall, "timed_out": timed_out, "exit": rc,
+            "artifact": str(artifact / "stdout.json") if artifact else None}
+    doc = None
+    with contextlib.suppress(ValueError):
+        doc = json.loads(out) if out else None
+    if doc and doc.get("error"):
+        return base | {"ok": False, "reason": f"iperf3 error: {doc['error']}"}
+    if timed_out:
+        return base | {"ok": False,
+                       "reason": f"client timed out after {timeout:.0f}s "
+                                 "(harness bound, test may still have been "
+                                 "transferring)"}
+    if rc != 0:
+        detail = (err or out or "").strip().replace("\n", " ")[:200]
+        return base | {"ok": False,
+                       "reason": f"iperf3 exit {rc}: {detail or 'no output'}"}
+    if doc is None or "end" not in doc:
+        return base | {"ok": False, "reason": "unparseable iperf3 output"}
+    end = doc["end"]
+    sent = end.get("sum_sent") or {}
+    recv = end.get("sum_received") or {}
+    active_s = iperf_active_seconds(doc, secs)
+    sent_b = sent.get("bytes", 0)
+    recv_b = recv.get("bytes", 0)
+    # iperf3 3.18 nests each connection's own counters under
+    # end.streams[i].sender (a stream entry's top level is empty for a
+    # sender-side run): reading the top level yields all-zero per-stream byte
+    # counts, which is how a perfectly healthy run can still be summarised as
+    # "8 zero streams"
+    streams = [(s.get("sender") or {}) for s in end.get("streams", [])]
+    # `sum_sent` covers only the post-omit window, so its byte count is the
+    # right numerator for the measured window — EXCEPT when the sender's
+    # writes all completed inside the `-O` warm-up and backpressure then
+    # blocked it for the whole measured window. That is exactly what a fast
+    # sender into a slow shaper does: measured at rate20_rtt40, the warm-up
+    # interval carried 153 MB at 1.22 Gbit/s and every measured interval
+    # showed 0 bytes sent, while the receiver still logged 29 MB (the shaped
+    # link rate). The receiver's count is then the only evidence of what the
+    # path carried; both sides are recorded either way.
+    sent_gbps = sent_b * 8 / active_s / 1e9 if active_s else 0.0
+    recv_gbps = recv_b * 8 / active_s / 1e9 if active_s else 0.0
+    degenerate = recv_b > 0 and sent_b * 2 < recv_b
+    # Headline policy: the sender's post-omit bytes over the measured window
+    # is the clean, consistent definition (ingress rate). max(sent, recv)
+    # would inflate: the receiver's total can include warm-up backlog still
+    # draining inside the window (64-stream loopback measured 59.1 Gbit/s
+    # received vs 45.9 sent). Only when the sender's accounting is provably
+    # defeated does the receiver's count become the evidence, and then it is
+    # the ONLY evidence of what the path carried.
+    headline_gbps = recv_gbps if degenerate else sent_gbps
+    return base | {
+        "ok": True,
+        "bytes_sent": sent_b,
+        "bytes_received": recv_b,
+        "active_s": round(active_s, 3),
+        "gbps_sent_only": round(sent_gbps, 4),
+        "gbps_received_window": round(recv_gbps, 4),
+        "gbps_headline": round(headline_gbps, 4),
+        "sender_accounting_degenerate": degenerate,
+        "gbps_received_own_window": round(
+            recv.get("bits_per_second", 0.0) / 1e9, 4),
+        "receiver_window_s": round(recv.get("seconds", 0.0), 3),
+        "retransmits": sent.get("retransmits", 0),
+        "per_stream_bytes": [s.get("bytes", 0) for s in streams],
+        "per_stream_gbps": [round(s.get("bits_per_second", 0.0) / 1e9, 4)
+                            for s in streams],
+        "mean_rtt_us": streams[0].get("mean_rtt") if streams else None,
+    }
 
-
-def throughput(reps: int, streams: int, secs: int, iperf_port: int) -> tuple | None:
-    """iperf3 TCP throughput; returns (gbps, retransmits) of the MEDIAN rep
-    (both values from the same rep, so the retransmit count belongs to the
-    reported throughput) plus the min/max gbps across reps (variance
-    judgment), or None when every rep failed. Raises RuntimeError with the
-    last rep's iperf3 reason when the output is not parseable, so a failure
-    is diagnosable from `partial_metrics` instead of a bare null."""
-    pairs = []
-    last_err = ""
-    for _ in range(reps):
-        try:
-            res = subprocess.run(
-                ["iperf3", "-J", "-c", "127.0.0.1", "-p", str(iperf_port),
-                 "-t", str(secs), "-O", "2", "-P", str(streams)],
-                capture_output=True, text=True, timeout=secs + 20,
-                check=False)
-            if res.returncode != 0:
-                raise RuntimeError(iperf_error(res))
-            d = json.loads(res.stdout)
-            if "end" not in d or "sum_received" not in d.get("end", {}):
-                raise RuntimeError(iperf_error(res))
-            pairs.append((d["end"]["sum_received"]["bits_per_second"] / 1e9,
-                          d["end"]["sum_sent"].get("retransmits", 0)))
-        except Exception as e:  # parse failure or timeout — keep the reason
-            err = getattr(e, "stderr", None) or str(e)
-            last_err = (err or "").strip().replace("\n", " ")[:300]
-    if not pairs:
-        if last_err:
-            raise RuntimeError(f"all {reps} rep(s) failed; last iperf3 "
-                               f"stderr: {last_err}")
-        return None
-    pairs.sort(key=lambda p: p[0])
-    gbps, retr = pairs[len(pairs) // 2]
-    spread = (min(p[0] for p in pairs), max(p[0] for p in pairs))
-    return round(gbps, 3), retr, *(round(v, 3) for v in spread)
 
 
 def latency(exposed_port: int, samples: int = 300,
@@ -692,13 +919,87 @@ def churn(exposed_port: int, secs: float, concurrency: int) -> dict:
     }
 
 
-def udp_capacity(exposed_port: int, count: int, pps: float) -> dict:
+def udp_capacity_probe(exposed_port: int, count: int, pps: float,
+                       rate_mbit: float = 0.0) -> dict:
+    """Two-point UDP characterisation, because ONE burst cannot describe a
+    capacity curve.
+
+    The single 20k-pps burst this replaces read `loss_pct: 100.0` on every
+    shaped cell — the KCP/UDP forwarder's knee sits near 5k pps on this host
+    (measured: 2k/5k -> 0% loss, 10k -> 30% at ~9.5 Mbit/s delivered,
+    20k -> 100%), so offering double the knee saturated it and the loss
+    percentage said nothing about capacity. Reported instead:
+      - `paced`: a fraction of the bursting rate, inside the sustainable
+        regime — "does the path deliver when not overloaded", with loss.
+      - `saturated`: the configured rate — "what the path actually carries
+        under overload", judged by DELIVERED Mbit/s, not by loss.
+    """
+    # The paced point sits under the shaped link budget (60%), not at a fixed
+    # fraction of the burst rate: on a 100 Mbit/s cell that is ~4.4k pps —
+    # inside the sustainable regime measured above — while `pps` stays the
+    # overload point.
+    paced_pps = pps / 5.0
+    if rate_mbit:
+        paced_pps = min(paced_pps,
+                        max(50.0, rate_mbit * 1e6 * 0.6 / ((128 + 28 + 14) * 8)))
+    # The UDP flow is created lazily by the first datagram (the server dials
+    # the backend, the client registers the session): a cold burst loses its
+    # whole establishment window, which is why the identical offered load
+    # reads 0 delivered in the matrix but 0% loss once a paced probe has
+    # warmed the session. Prime with a handful of paced datagrams and keep
+    # every attempt, so a persistent zero stays visible instead of being
+    # hidden behind the retry.
+    attempts = [udp_capacity(exposed_port, count, paced_pps,
+                             rate_mbit=rate_mbit)]
+    if attempts[0].get("datagrams_received", 0) == 0:
+        with contextlib.suppress(Exception):
+            udp_capacity(exposed_port, 32, 200.0, rate_mbit=rate_mbit)
+        primed = udp_capacity(exposed_port, count, paced_pps,
+                              rate_mbit=rate_mbit)
+        primed["after_prime"] = True
+        attempts.append(primed)
+    paced = attempts[-1]
+    sated = udp_capacity(exposed_port, count, pps, rate_mbit=rate_mbit)
+    # Capacity = the delivered rate of the HIGHEST offered step that arrived
+    # intact (<=1% loss), i.e. the last point before the path bends. When the
+    # top (saturating) step is also lossless, the real ceiling is above the
+    # probe's reach and the figure is a LOWER BOUND — that is the loopback
+    # case (every tool delivers the full 27.2 Mbit/s offer), which is why the
+    # old "capacity_mbit = paced delivered" was really the probe's own pace.
+    steps = [paced, sated]
+    lossless = [a for a in steps if (a.get("loss_pct") or 0.0) <= 1.0]
+    cap = max(lossless, key=lambda a: a.get("delivered_mbit", 0.0)) \
+        if lossless else None
+    return {
+        "paced": paced,
+        "saturated": sated,
+        "capacity_mbit": cap.get("delivered_mbit") if cap else None,
+        "capacity_offered_mbit": cap.get("offered_mbit") if cap else None,
+        "capacity_is_lower_bound": bool(cap is not None and cap is sated),
+        "capacity_loss_pct": cap.get("loss_pct") if cap else None,
+        "capacity_mbit_best_attempt": max(a.get("delivered_mbit", 0.0)
+                                          for a in attempts),
+        "attempts": attempts,
+        "paced_loss_pct": paced.get("loss_pct"),
+        "saturated_loss_pct": sated.get("loss_pct"),
+    }
+
+
+def udp_capacity(exposed_port: int, count: int, pps: float,
+                 rate_mbit: float = 0.0) -> dict:
     """Sustained UDP forwarder capacity: send `count` datagrams at a paced
     `pps` rate and count the echoes — the "how much UDP can one client
     carry" number the probes alone never give. Sending and draining share
     ONE socket (replies land on the sender's ephemeral port), and the pace
     keeps the measurement in the sustainable regime instead of flooding
-    the tunnel into drop territory."""
+    the tunnel into drop territory.
+
+    `rate_mbit` is the cell's shaped link rate (0 = unshaped). Without it a
+    fixed 20k pps (~24 Mbit/s incl. headers) is offered even on a 20 Mbit/s
+    cell, where 100% "loss" is just the shaper doing its job — a number
+    that says nothing about the tunnel. On a shaped cell the offered load is
+    therefore kept under the link budget, and both the offered and the
+    delivered rate are recorded so `loss_pct` is interpretable."""
     stop = threading.Event()
     recv = [0]
     lock = threading.Lock()
@@ -715,12 +1016,31 @@ def udp_capacity(exposed_port: int, count: int, pps: float) -> dict:
         except OSError:
             pass
 
+    payload = b"x" * 128
+    on_wire_bits = (len(payload) + 28 + 14) * 8  # payload + UDP/IP + eth
+    offered_bitrate = pps * on_wire_bits
+    if rate_mbit:
+        # 0.4 of the shaped rate: enough to expose where the tunnel bends,
+        # well under the link rate so the shaper is not the only dropper
+        budget = rate_mbit * 1e6 * 0.4
+        if offered_bitrate > budget:
+            pps = max(50.0, budget / on_wire_bits)
+            offered_bitrate = pps * on_wire_bits
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(0.5)
+    # The probe's own receive buffer is a measurement parameter: the kernel
+    # default (~212 KiB) holds only ~1600 of the 128-byte reply datagrams, so
+    # a burst that outruns the single drain thread used to lose datagrams in
+    # THIS process and report them as tunnel loss. Size the buffer from the
+    # offered load (half a second of replies, rounded up) so the reported
+    # loss is the path's, not the probe's.
+    want = int(max(on_wire_bits / 8 * pps * 0.5, 1 << 20))
+    with contextlib.suppress(OSError):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, want)
+    rcvbuf = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
     t = threading.Thread(target=drain, args=(s,), daemon=True)
     t.start()
     try:
-        payload = b"x" * 128
         sent = 0
         interval = 1.0 / pps
         t0 = time.perf_counter()
@@ -749,6 +1069,15 @@ def udp_capacity(exposed_port: int, count: int, pps: float) -> dict:
         "datagrams_received": received,
         "loss_pct": round(loss, 2),
         "pps": round(sent / wall, 1) if wall > 0 else 0.0,
+        "offered_pps": round(pps, 1),
+        "offered_mbit": round(offered_bitrate / 1e6, 2),
+        "delivered_mbit": round(
+            received * on_wire_bits / wall / 1e6, 2) if wall > 0 else 0.0,
+        "shaped_rate_mbit": rate_mbit or None,
+        # SO_RCVBUF doubles the requested value on Linux (bookkeeping);
+        # recorded so a high loss_pct can be checked against the probe's own
+        # buffer before it is blamed on the tunnel
+        "probe_rcvbuf_bytes": rcvbuf,
     }
 
 

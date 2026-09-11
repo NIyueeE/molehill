@@ -59,6 +59,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from bench_lib import (
+    RATE_QUEUE_LIMIT,
     SCHEMA,
     Backends,
     Knobs,
@@ -78,8 +79,7 @@ from bench_lib import (
     run_cpu_sampler,
     run_rss_sampler,
     sweep_stale,
-    throughput,
-    udp_capacity,
+    udp_capacity_probe,
     wait_load_quiet,
     wait_port,
 )
@@ -440,17 +440,24 @@ def default_out() -> Path:
     return Path(__file__).parent / f"results-v{ver}.json"
 
 
-def mixed_bulk_latency(iperf_port: int, echo_port: int, secs: int) -> dict:
+def mixed_bulk_latency(backends, iperf_exposed: int, echo_port: int,
+                       secs: int) -> dict:
     """Bulk transfer (iperf, 1 stream) and interactive latency (fresh
     connections to the echo service) CONCURRENTLY through the same client —
     the per-service mix story: does a bulk service starve an interactive
-    one? (loopback cell only)."""
+    one? (loopback cell only).
+
+    Uses the same isolated sampler as the matrix throughput metrics, so its
+    bulk number has the same window/accounting convention and cannot be
+    silently nulled by a renamed field (the bug that produced a
+    `KeyError: gbps_sent_window` here on every loopback arm)."""
     res: dict = {}
 
     def bulk():
         try:
-            thr = throughput(1, 1, secs, iperf_port)
-            res["bulk_gbps"] = thr[0] if thr else None
+            out = backends.run_throughput(iperf_exposed, 1, 1, secs,
+                                          tag="mixed-bulk")
+            res["bulk_gbps"] = out.get("gbps_sent")
         except Exception as e:
             # keep the echo half of the metric; record why the bulk failed
             res["bulk_gbps"] = None
@@ -535,6 +542,52 @@ def peer_version(tool: str, knobs: Knobs) -> str:
 
 # === arm execution ===
 
+def _thr_fields(prefix: str, thr) -> dict:
+    """Flatten one throughput sample into the results entry.
+
+    `thr` is `Backends.run_throughput`'s dict (the isolated path) or the
+    legacy tuple from `throughput()` (the mixed probe's shared server).
+    The headline rate is the bytes sent over the MEASURED window — that is
+    the number all tools share; the receiver's own window is reported next to
+    it because at a shaped cell the backend keeps draining after the client
+    stops and `sum_received.seconds` runs 50%+ longer, which alone made the
+    received figure look like a different measurement.
+    """
+    if isinstance(thr, tuple):  # legacy (gbps, retr, min, max)
+        return {f"throughput_{prefix}_gbps": thr[0],
+                f"retransmits_{prefix}": thr[1],
+                f"throughput_{prefix}_min_gbps": thr[2],
+                f"throughput_{prefix}_max_gbps": thr[3]}
+    if thr is None:  # probe not applicable to this cell (not a failure)
+        return {f"throughput_{prefix}_gbps": None}
+    out = {
+        f"throughput_{prefix}_gbps": thr.get("gbps_sent"),
+        f"retransmits_{prefix}": thr.get("retransmits"),
+        f"throughput_{prefix}_min_gbps": thr.get("gbps_min"),
+        f"throughput_{prefix}_max_gbps": thr.get("gbps_max"),
+    }
+    if thr.get("gbps_received") is not None:
+        out[f"throughput_{prefix}_received_gbps"] = thr["gbps_received"]
+        out[f"throughput_{prefix}_received_own_window_gbps"] = \
+            thr.get("gbps_received_own_window")
+        out[f"throughput_{prefix}_receiver_window_s"] = \
+            thr.get("receiver_window_s")
+    if thr.get("gbps_sent_only") is not None:
+        out[f"throughput_{prefix}_sent_only_gbps"] = thr["gbps_sent_only"]
+    if thr.get("degenerate_reps"):
+        out[f"throughput_{prefix}_sender_degenerate_reps"] = \
+            thr["degenerate_reps"]
+    if thr.get("median_rep") is not None:
+        out[f"throughput_{prefix}_median_rep"] = thr["median_rep"]
+    if thr.get("per_stream_bytes"):
+        out[f"throughput_{prefix}_per_stream_bytes"] = thr["per_stream_bytes"]
+    if thr.get("per_stream_gbps"):
+        out[f"throughput_{prefix}_per_stream_gbps"] = thr["per_stream_gbps"]
+    if thr.get("reps_ok") is not None:
+        out[f"throughput_{prefix}_reps_ok"] = thr["reps_ok"]
+    return out
+
+
 def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
             stream_ceiling: int | None, knobs: Knobs, p: dict, mech: str,
             data: dict, out_path: Path, base: int, work: Path) -> None:
@@ -609,22 +662,42 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
                 partial.append(f"{name}: no valid result")
             return v
 
-        thr1 = metric("throughput_1stream", lambda: throughput(
-            reps, 1, secs, p["iperf_exposed"]))
+        # Every throughput sample goes through Backends.run_throughput: it
+        # bounds each iperf3 client by the test length (not a fixed 20 s a
+        # shaped-cell drain can legitimately exceed) and replaces the
+        # single-test server whenever a rep wedges it, so one stalled rep no
+        # longer poisons the rest of the repetition budget. Raw per-rep
+        # artifacts land in <work>/iperf-raw/.
+        thr1 = metric("throughput_1stream",
+                      lambda: backends.run_throughput(
+                         p["iperf_exposed"], reps, 1, secs,
+                         tag=f"{label} {spec.name}",
+                         backend_port=p["iperf_backend"]))
         # The cheap probes run BEFORE the 8-stream test: on rate-limited
         # cells (netem rate + GSO-sized segments + the packet limit) eight
-        # parallel iperf streams wedge iperf3's single-test server and can
-        # leave the tunnel saturated — echo/steady/udp/hol/churn must not
-        # inherit that state.
+        # parallel iperf streams can leave the tunnel saturated —
+        # echo/steady/udp/hol/churn must not inherit that state.
         lat = metric("echo_rtt",
                      lambda: latency(p["echo_exposed"]))
         steady = metric("tcp_steady_rtt", lambda: run_tcp_steady_ping(
             "127.0.0.1", p["echo_exposed"], knobs.steady_ping_count, 20))
-        udp = hol_udp = None
+        udp = hol_udp = udpcap = None
         if has_udp:
             udp = metric("udp_ping", lambda: run_udp_ping(
                 "127.0.0.1", p["udp_exposed"], knobs.udp_count,
                 knobs.udp_interval_ms, secs + 3))
+            # Capacity runs BEFORE the bulk-UDP HoL probe, not after it.
+            # Measured 2026-09-10 (kcp4, rate100): a 10k-datagram capacity
+            # sample on a fresh UDP session delivers 100% (0% loss) at the
+            # very same offered pace, while the SAME sample taken after the
+            # 50 Mbit/s hol_udp blast receives 0 datagrams — and the
+            # visitor's UDP path then stays dead for the rest of the arm
+            # (hol_udp's own paced pinger records 100% loss too). That is a
+            # finding about the forwarder's recovery after overload, and it
+            # must not be reported as `udp_capacity: 0` for every arm.
+            udpcap = metric("udp_capacity", lambda: udp_capacity_probe(
+                p["udp_exposed"], knobs.udp_capacity_count,
+                knobs.udp_capacity_pps, rate_mbit=spec.rate))
             hol_udp = metric("hol_udp", lambda: run_hol_probe(
                 "udp", "127.0.0.1", p["udp_exposed"], knobs.hol_secs,
                 bulk_rate_mbps=knobs.hol_bulk_rate_udp))
@@ -642,8 +715,11 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         if spec.name == "loopback" and (stream_ceiling is None
                                         or knobs.scale_streams
                                         <= stream_ceiling):
-            thr128 = metric("throughput_64streams", lambda: throughput(
-                1, knobs.scale_streams, secs, p["iperf_exposed"]))
+            thr128 = metric("throughput_64streams",
+                            lambda: backends.run_throughput(
+                                p["iperf_exposed"], 1, knobs.scale_streams,
+                                secs, tag=f"{label} {spec.name}",
+                                backend_port=p["iperf_backend"]))
         else:
             thr128 = None
             if spec.name == "loopback":
@@ -653,37 +729,47 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
                     "yamux ceiling)")
         if spec.name == "loopback":
             mixed = metric("mixed_bulk_latency", lambda: mixed_bulk_latency(
-                p["iperf_exposed"], p["echo_exposed"], secs))
+                backends, p["iperf_exposed"], p["echo_exposed"], secs))
         else:
             mixed = None
         churn_ = metric("churn", lambda: churn(
             p["echo_exposed"], knobs.churn_secs, knobs.churn_concurrency))
         # 8-stream throughput is attempted on every cell, rate-limited ones
-        # included: rate100_rtt20 measures fine (0.025-0.035 Gbit/s in the
-        # v0.8.0 baseline); only the low-rate rate20_rtt40 wedges the
-        # single-test iperf3 server (netem's packet limit buffers seconds of
-        # GSO-sized segments) and records the timeout in `partial_metrics`.
-        thr8 = metric("throughput_8streams", lambda: throughput(
-            reps, 8, secs, p["iperf_exposed"]))
-        udpcap = metric("udp_capacity", lambda: udp_capacity(
-            p["udp_exposed"], knobs.udp_capacity_count,
-            knobs.udp_capacity_pps)) if has_udp else None
+        # included. With per-rep server hygiene + a test-length-bound client
+        # this is measurable even at the shaped cells (the v0.8.0 nulls came
+        # from a wedged server starving every later rep, not from the path).
+        thr8 = metric("throughput_8streams",
+                      lambda: backends.run_throughput(
+                         p["iperf_exposed"], reps, 8, secs,
+                         tag=f"{label} {spec.name}",
+                         backend_port=p["iperf_backend"]))
         stop.set()
         sampler.join(timeout=2)
         cpu_sampler.join(timeout=2)
 
+        # A sampler that produced no rate must record WHY (per-rep reasons are
+        # in its records); otherwise a null reaches the results file with no
+        # evidence and the audit has to treat it as an unexplained hole.
+        for name, thr in (("throughput_1stream", thr1),
+                          ("throughput_8streams", thr8),
+                          ("throughput_64streams", thr128)):
+            if isinstance(thr, dict) and thr.get("gbps_sent") is None:
+                detail = thr.get("error") or "no valid rep"
+                partial.append(f"{name}: {detail}")
+                reps = thr.get("records") or []
+                last = reps[-1] if reps else {}
+                if last.get("reason"):
+                    partial.append(f"{name}: last rep: {last['reason']}")
         entry = {
             "status": "ok",
-            "throughput_1stream_gbps": thr1[0] if thr1 else None,
-            "retransmits_1stream": thr1[1] if thr1 else None,
-            "throughput_1stream_min_gbps": thr1[2] if thr1 else None,
-            "throughput_1stream_max_gbps": thr1[3] if thr1 else None,
-            "throughput_8streams_gbps": thr8[0] if thr8 else None,
-            "retransmits_8streams": thr8[1] if thr8 else None,
-            "throughput_8streams_min_gbps": thr8[2] if thr8 else None,
-            "throughput_8streams_max_gbps": thr8[3] if thr8 else None,
-            "throughput_64streams_gbps": thr128[0] if thr128 else None,
-            "retransmits_64streams": thr128[1] if thr128 else None,
+            # measurement endpoints, so an audit can prove the throughput
+            # numbers came from the tunnel (exposed) and not the backend
+            "_throughput_endpoint": "exposed",
+            "_throughput_exposed_port": p["iperf_exposed"],
+            "_bench_backend_port": p["iperf_backend"],
+            **_thr_fields("1stream", thr1),
+            **_thr_fields("8streams", thr8),
+            **_thr_fields("64streams", thr128),
             "echo_rtt_ms": lat,
             "tcp_steady_rtt_ms": steady,
             "udp_rtt_ms": (udp or {}).get("rtt_ms"),
@@ -786,6 +872,11 @@ def main():
         "churn_seconds": knobs.churn_secs,
         "churn_concurrency": knobs.churn_concurrency,
         "udp_capacity_datagrams": knobs.udp_capacity_count,
+        "udp_capacity_pps": knobs.udp_capacity_pps,
+        # netem rate-cell queue depth: a measurement parameter that changes
+        # the result (see bench_lib.RATE_QUEUE_LIMIT), recorded so a weak
+        # rate cell can be attributed to the tool rather than the shaper
+        "netem_rate_limit": RATE_QUEUE_LIMIT,
         "latency_samples": 300,
         "memory_samples_interval_s": 0.5,
         "hostname": socket.gethostname(),
