@@ -1,0 +1,33 @@
+# Fixture for `finished_control_channel_releases_its_ports`.
+#
+# Same shape as `tcp_transport.toml`, with one difference: a one-second
+# server heartbeat. The server's control channel has no read loop — it learns
+# that a client is gone from a failed heartbeat write — so the short interval
+# is what keeps that regression test fast and deterministic instead of
+# waiting out the 30-second default.
+[client]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.control]
+default_remote_addr = "127.0.0.1:2333"
+
+[client.transport]
+type = "plain"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[client.services.pingpong]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2335"
+
+[server]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+allow_ports = ["2334-2337"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+heartbeat_interval = 1

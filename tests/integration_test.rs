@@ -947,3 +947,76 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
 
     Ok(())
 }
+
+/// A control channel that ends on its own must release the service's public
+/// ports.
+///
+/// The server's service entry owns the connection pool, and the pool owns the
+/// bound listener. When that entry outlived its control channel, the ports
+/// stayed bound after the client was gone, and the next registration of the
+/// same service was rejected with "Port N is already in use" while nothing
+/// was serving it any more.
+#[tokio::test]
+async fn finished_control_channel_releases_its_ports() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    init();
+
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/teardown_release.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/teardown_release.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    wait_for_echo(exposed_addrs(Type::Tcp).1, Type::Tcp).await?;
+
+    info!("shutdown the client, keep the server running");
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client);
+
+    // Binding the exposed ports here is the OS-level proof that the server
+    // dropped its listeners: while it still holds them the bind is refused
+    // with "address in use", and there is no client left to re-register them.
+    let (echo_addr, pingpong_addr) = exposed_addrs(Type::Tcp);
+    for addr in [echo_addr, pingpong_addr] {
+        wait_for_port_release(addr).await?;
+    }
+
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server);
+
+    Ok(())
+}
+
+/// Wait until `addr` can be bound again, failing the test after a generous
+/// timeout — the teardown is asynchronous by design, so a short grace period
+/// is expected rather than a bug.
+async fn wait_for_port_release(addr: &str) -> Result<()> {
+    let deadline = time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            std::result::Result::Ok(listener) => {
+                drop(listener);
+                return Ok(());
+            }
+            std::result::Result::Err(e) => {
+                if time::Instant::now() >= deadline {
+                    anyhow::bail!("{addr} was still bound 10s after the client left: {e}");
+                }
+                settle(0.05).await;
+            }
+        }
+    }
+}

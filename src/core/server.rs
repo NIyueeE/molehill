@@ -1000,6 +1000,29 @@ impl ControlChannelHandle {
         // Socket options for visitor-facing connections: latency-friendly
         // defaults (nodelay + keepalive)
         let sock_opts = SocketOpts::for_service(None);
+
+        // Create the control channel and run it *before* the pool: the pool
+        // takes the control task's join handle, because a control channel
+        // that ends on its own (client shutdown, a connection reset, a failed
+        // heartbeat write) must stop the pool too. The pool owns the bound
+        // public listener, so without that the port stays occupied with
+        // nothing serving it and the next registration of that service is
+        // rejected with "Port N is already in use".
+        let ch = ControlChannel {
+            conn,
+            shutdown_rx,
+            data_ch_req_rx,
+            heartbeat_interval,
+        };
+        let control_task = tokio::spawn(
+            async move {
+                if let Err(err) = ch.run().await {
+                    error!("{:#}", err);
+                }
+            }
+            .instrument(Span::current()),
+        );
+
         match bound {
             BoundEndpoint::Tcp(listener) => {
                 info!(service = %service.name, "Listening at {}", service.bind_addr);
@@ -1012,6 +1035,7 @@ impl ControlChannelHandle {
                             data_ch_rx,
                             data_ch_req_tx,
                             shutdown_rx_clone,
+                            control_task,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -1034,6 +1058,7 @@ impl ControlChannelHandle {
                             data_ch_rx,
                             data_ch_req_tx,
                             shutdown_rx_clone,
+                            control_task,
                         )
                         .await
                         .with_context(|| "Failed to run UDP connection pool")
@@ -1045,24 +1070,6 @@ impl ControlChannelHandle {
                 );
             }
         }
-
-        // Create the control channel
-        let ch = ControlChannel {
-            conn,
-            shutdown_rx,
-            data_ch_req_rx,
-            heartbeat_interval,
-        };
-
-        // Run the control channel
-        tokio::spawn(
-            async move {
-                if let Err(err) = ch.run().await {
-                    error!("{:#}", err);
-                }
-            }
-            .instrument(Span::current()),
-        );
 
         ControlChannelHandle {
             shutdown_tx,
@@ -1137,6 +1144,7 @@ async fn run_tcp_connection_pool<C>(
     mut data_ch_rx: mpsc::Receiver<C>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    mut control_task: tokio::task::JoinHandle<()>,
 ) -> Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1151,6 +1159,10 @@ where
     'pool: loop {
         tokio::select! {
             _ = shutdown_rx.recv() => break,
+            // The control channel ended without a replacement registration:
+            // release the listener instead of holding the port for a service
+            // nobody drives any more.
+            _ = &mut control_task => break,
             val = l.accept() => match val {
                 Err(e) => {
                     // `l` is a TCP listener so this must be a IO error
@@ -1183,7 +1195,15 @@ where
                     // Pair the visitor with a data channel. A broken channel
                     // (e.g. stale pooled one) is discarded and replaced.
                     loop {
-                        let Some(mut ch) = data_ch_rx.recv().await else {
+                        // A visitor can be waiting for a data channel that
+                        // will never arrive once its control channel is gone,
+                        // so this loop watches both signals too.
+                        let next = tokio::select! {
+                            _ = shutdown_rx.recv() => None,
+                            _ = &mut control_task => None,
+                            ch = data_ch_rx.recv() => ch,
+                        };
+                        let Some(mut ch) = next else {
                             break 'pool;
                         };
                         if write_and_flush(&mut ch, &cmd).await.is_ok() {
@@ -1274,6 +1294,7 @@ async fn run_udp_connection_pool<C>(
     mut data_ch_rx: mpsc::Receiver<C>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    mut control_task: tokio::task::JoinHandle<()>,
 ) -> Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1302,6 +1323,12 @@ where
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
+                shutting_down.store(true, Ordering::Relaxed);
+                break;
+            }
+            // The control channel ended without a replacement registration:
+            // release the visitor-facing socket (see the TCP pool).
+            _ = &mut control_task => {
                 shutting_down.store(true, Ordering::Relaxed);
                 break;
             }
