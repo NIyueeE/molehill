@@ -80,8 +80,8 @@
 
 默认配置——`mode = "multiplex"`、`count = 4`、`carrier = "tcp"`、明文
 传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。下表数字
-来自 v0.8.0 基准测试(同机回环与弱网格子;原始数据在
-`benches/scripts/bench/results-v0.8.0.json`,图表与完整表格见 README
+来自 v0.8.0 基准测试,原样承接进 v0.8.1(同机回环与弱网格子;原始数据在
+`benches/scripts/bench/results-v0.8.1.json`,图表与完整表格见 README
 「基准测试」一章):
 
 ```mermaid
@@ -713,7 +713,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 
 镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
 `multiplex`、`kcp`),所以 `default_carrier = "kcp"` 不需要换镜像。想要可
-复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.8.0`),而不是
+复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.8.1`),而不是
 用 `:latest`。
 
 以 UID 1000 运行带来两个后果:

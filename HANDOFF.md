@@ -1,8 +1,10 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-11, on the v0.8.0 release line: everything below is
+> State as of 2026-09-11, on the v0.8.1 patch line: everything below is
 > **merged into `main`** (the `merge-tcp4` branch was fast-forwarded into it
-> and deleted) and the `v0.8.0` tag is prepared from that commit. The UDP
+> and deleted) and `v0.8.0` is released — `v0.8.1` is the control-channel
+> teardown fix recorded under "Control-channel teardown" below, with the
+> benchmark matrix carried forward unchanged. The UDP
 > session-affinity fix, the template lint migration and the benchmark-matrix
 > rework (uv/PEP 723, schema v3 through-tunnel measurements) have landed, the
 > benchmark measurement method was revised on 2026-09-10/11 (rate-cell
@@ -227,12 +229,52 @@ never a signal.
   once; the branch was then fast-forwarded into `main` (19 thematic commits,
   no merge commit) and both it and the pre-rewrite backup
   `backup/merge-tcp4-20260911` (`4c70eeb`, identical tree) were deleted.
-- Open after the v0.8.0 release (none block it): the UDP fairness question
+- Open after the v0.8.1 release (none block it): the UDP fairness question
   above (instrument ready, no claim) and a single-window full-matrix re-run
   on the target host (this baseline was assembled across one run plus three
-  targeted merges after the container recycle). The KCP loss cells were
+  targeted merges after the container recycle, and v0.8.1 carries it forward
+  unchanged). The KCP loss cells were
   re-measured with the current post-conserve binary in this baseline, so that
   item is closed, and the `merge-tcp4` -> `main` merge is done.
+
+### Control-channel teardown (2026-09-11, the v0.8.1 fix)
+
+Found while smoke-testing a migrated 0.8 config: after a client's health check
+removed a service and its control channel then died (reset), the service could
+not re-register — `Port N is already in use` — until the **server** was
+restarted.
+
+Root cause: the connection pool that owns the bound public listener only ever
+stopped when a *new* registration took the service over (dropping the entry's
+`ControlChannelHandle`, which closes the broadcast both the pool and the
+control task watch). A channel that ended by itself therefore left its pool —
+and its listener — alive forever, and `bind_with_retry`'s 5 s window expired
+against a leak rather than a race. Evidence: the old channel logged
+`Control channel shutdown` with **no** matching `run_tcp_connection_pool:
+Shutdown`, and a live `LISTEN` socket remained on the port.
+
+Fix: the pool also takes the control task's `JoinHandle` and stops with it
+(`select!` arm in both pools, plus the TCP pairing loop, which could otherwise
+wait forever for a data channel that no control channel will ever create).
+Wrong turns worth recording, because both looked right and broke the restart
+path in `tests/integration_test.rs`:
+- removing the service's map entry from a cleanup task that awaited the
+  control task — it interacts with takeover churn (a client restart leaves the
+  old client's service tasks alive briefly, and both clients then re-register
+  in turn), which turned into a registration ping-pong;
+- `impl Drop for ControlChannelHandle` sending the shutdown — the data-plane
+  path *clones* that handle (`get2(&nonce).cloned()`), so any tunnel finishing
+  tore the whole service down.
+
+Deterministic repro: start a client whose service is unhealthy, let the health
+check remove it, then bring the local service back — the re-registration used
+to be rejected and now succeeds (verified against a migrated
+production-shaped config with three `carrier = "kcp"` services).
+`finished_control_channel_releases_its_ports` fails without the fix (the
+exposed port stays bound 10 s after the client left) and passes with it; it
+needs the short-heartbeat fixture `tests/for_tcp/teardown_release.toml`
+because the server's control channel has no read loop and notices a dead
+client only on a failed heartbeat write.
 
 Chart/runner follow-up (2026-09-10): absent measurements used to render as a
 fake `0.0` bar in the cost chart (`mux1`'s unmeasured 64-stream and

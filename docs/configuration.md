@@ -76,8 +76,9 @@ A typical setup:
 The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
 transport — are the right starting point for almost everyone. Deviate only
 when the tree says so. The numbers below are the measured basis of the
-v0.8.0 benchmark (same-host loopback and weak-network cells; raw data in
-`benches/scripts/bench/results-v0.8.0.json`, charts and tables in the
+v0.8.0 benchmark, carried forward unchanged into v0.8.1 (same-host loopback
+and weak-network cells; raw data in
+`benches/scripts/bench/results-v0.8.1.json`, charts and tables in the
 README's Benchmarks chapter):
 
 ```mermaid
@@ -733,7 +734,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 
 The image carries the full default feature set (`server`, `client`, `noise`,
 `hot-reload`, `multiplex`, `kcp`), so `default_carrier = "kcp"` needs no
-different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.8.0`)
+different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.8.1`)
 instead of `:latest` when you want reproducible upgrades.
 
 Two consequences of running as UID 1000:

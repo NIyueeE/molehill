@@ -52,8 +52,9 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 隧道**测量——iperf3 与探针拨的是每个工具的暴露端口,绝不直接连后端。
 对端工具为最新 GitHub release 构建(frp 0.71.0、rathole 0.5.0 上游、
 bore 0.6.0)。网络档(netem 塑造整个 `lo`,每一跳都被延迟/丢包)与指标
-集合见[方法论](#方法论)。以下是 **v0.8.0** 数字(v0.7.2 基线跑的是单隧道
-默认配置且在不同容器上;跨版本数值仅供参考——同矩阵内对比才是精确的)。
+集合见[方法论](#方法论)。以下是 **v0.8.0** 矩阵原样承接进 v0.8.1
+(该补丁不改动转发路径,见 `CHANGELOG.md`);v0.7.2 基线跑的是单隧道默认配置
+且在不同容器上,跨版本数值仅供参考——同矩阵内对比才是精确的。
 
 ### 如何选配置
 
@@ -107,7 +108,7 @@ bore 0.6.0)。网络档(netem 塑造整个 `lo`,每一跳都被延迟/丢包)与
 仅明文轴(mux 开启、不加密):加密类竞品(如 chisel 的 SSH 隧道)在明文
 轴上不可比——molehill 自己的加密行单独隔离在下方。
 
-![Benchmark: molehill 0.8.0 vs plain-TCP peers](assets/benchmark-v0.8.0.png)
+![Benchmark: molehill 0.8.0 vs plain-TCP peers](assets/benchmark-v0.8.1.png)
 
 | 工具 | 1 流 | 8 流 | echo RTT p50 | 内存 |
 |---|---|---|---|---|
@@ -127,7 +128,7 @@ rathole 相差约 10%(19.5 vs 21.4)并高于 frp(6.2);内存第二低(bore
 
 只变一个变量(复用开关),回环:
 
-![Multiplexing cost](assets/benchmark-mux-v0.8.0.png)
+![Multiplexing cost](assets/benchmark-mux-v0.8.1.png)
 
 | 格子 | mux 1 流 | mux-off 1 流 | mux 8 流 | mux-off 8 流 |
 |---|---|---|---|---|
@@ -142,7 +143,7 @@ rathole 相差约 10%(19.5 vs 21.4)并高于 frp(6.2);内存第二低(bore
 
 只变一个变量(加密),两者都开启 mux:
 
-![Transport cost](assets/benchmark-transport-v0.8.0.png)
+![Transport cost](assets/benchmark-transport-v0.8.1.png)
 
 | 配置 | 1 流 | 8 流 | echo RTT p50 | 内存 |
 |---|---|---|---|---|
@@ -157,7 +158,7 @@ ChaChaPoly、KCP 载体的数据报批处理)缩小但没有消除这条代价�
 
 只变一个变量(并行隧道连接数),明文传输,其余保持默认:
 
-![Tunnel count](assets/benchmark-count-v0.8.0.png)
+![Tunnel count](assets/benchmark-count-v0.8.1.png)
 
 | 格子 | c4 1 流 | c1 1 流 | c4 8 流 | c1 8 流 | c4 HoL max | c1 HoL max |
 |---|---|---|---|---|---|---|
@@ -182,7 +183,7 @@ ChaChaPoly、KCP 载体的数据报批处理)缩小但没有消除这条代价�
 
 只变一个变量(数据通道由什么承载),noise 控制通道,两者都 `count = 4`:
 
-![Data-plane carrier](assets/benchmark-carrier-v0.8.0.png)
+![Data-plane carrier](assets/benchmark-carrier-v0.8.1.png)
 
 | 格子 | tcp 1 流 | kcp 1 流 | tcp 8 流 | kcp 8 流 | tcp HoL max | kcp HoL max | tcp RSS | kcp RSS |
 |---|---|---|---|---|---|---|---|---|
@@ -205,7 +206,7 @@ ChaChaPoly、KCP 载体的数据报批处理)缩小但没有消除这条代价�
 
 ### 配置权衡(回环)
 
-![Configuration tradeoffs](assets/benchmark-cost-v0.8.0.png)
+![Configuration tradeoffs](assets/benchmark-cost-v0.8.1.png)
 
 | 工具 | CPU% | churn/秒 | churn p99 ms | RSS MiB | 64 流 | 混合大流 |
 |---|---|---|---|---|---|---|
@@ -295,7 +296,7 @@ mux(22)和 KCP(83)分开。64 流点是工作点参考(默认 14.9 Gbit/s、直�
   逐 rep iperf3 JSON 都保留在运行工作目录的 `iperf-raw/` 下,异常数字
   可以事后复核。
 - **复现**:`just bench-peers` → `just bench` → `just bench-plot` →
-  `just bench-check`(原始数据在 `benches/scripts/bench/results-v0.8.0.json`;
+  `just bench-check`(原始数据在 `benches/scripts/bench/results-v0.8.1.json`;
   仪式与回归门禁见 docs/release.md)。
 
 ## 快速开始

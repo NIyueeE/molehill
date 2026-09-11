@@ -63,7 +63,7 @@ docs: [configuration](configuration.md), [transport](transport.md),
 |------|---------|
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
-| `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | transport fixtures and valid/invalid configs |
+| `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the control-channel teardown case, valid/invalid configs |
 | `benches/` | Peer-comparison benchmark matrix (`bench/`: uv/PEP 723 python — runner, peer fetch, chart, regression gate), mux e2e smoke (`mux/repro_e2e.py`), HTTP latency (vegeta) and memory-sampling scripts |
 | `docs/configuration.md` (Complete examples / Deployment) | ready-to-run configs and systemd/container deployment files, as code blocks (previously the `examples/` directory) |
 | `docs/` | documentation set — one owner per topic, everything else links (see below) |

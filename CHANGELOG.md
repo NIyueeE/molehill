@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-11
+
+### Fixed
+
+- A service whose control channel ended on its own — client shutdown, a
+  connection reset, a heartbeat write failure — kept its public port bound on
+  the server. The connection pool owns the bound listener, and it only ever
+  stopped when a *new* registration took the service over, so a service
+  nobody was driving any more still held its port: visitors reached nothing
+  and the next registration of that service was rejected with `Port N is
+  already in use` until the server was restarted. The pool now also watches
+  its control channel's task and stops with it, releasing the listener (and
+  the UDP socket) on both the TCP and the UDP path. Covered by
+  `finished_control_channel_releases_its_ports`.
+
 ### Changed
+
+- **The benchmark baseline is carried forward from v0.8.0.** This patch
+  changes no forwarding path and no measurement code, so re-running the
+  matrix would only re-measure the same build on a different day:
+  `results-v0.8.1.json` and the charts are the v0.8.0 matrix unchanged, with
+  the provenance recorded in the results meta. `just bench-check` compares
+  them against `results-v0.8.0.json` and reports no regression.
 
 - CI skips the code chain for a change limited to markdown, `docs/` or
   `assets/`: those paths cannot move the Rust gates, so `ci.yml` filters them

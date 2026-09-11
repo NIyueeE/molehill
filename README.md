@@ -54,9 +54,10 @@ probes dial each tool's exposed port, never the backend. Peers are the
 latest GitHub release builds (frp 0.71.0, rathole 0.5.0 upstream, bore
 0.6.0). Network cells (netem on `lo`, every leg affected) and the metric
 set are described in [Methodology](#methodology). These are the v0.8.0
-numbers (the v0.7.2 baseline ran a single-tunnel default and a different
-container; cross-version values are indicative — same-matrix comparisons
-are precise).
+matrix carried forward into v0.8.1 (the patch changes no forwarding path;
+see `CHANGELOG.md`), and the v0.7.2 baseline ran a single-tunnel default on
+a different container — cross-version values are indicative, same-matrix
+comparisons are precise.
 
 ### Choosing a configuration
 
@@ -119,7 +120,7 @@ Plain-TCP axis only (mux on, no encryption): encrypted competitors such as
 chisel's SSH tunnel are not comparable here — molehill's own encrypted rows
 are isolated below.
 
-![Benchmark: molehill 0.8.0 vs plain-TCP peers](assets/benchmark-v0.8.0.png)
+![Benchmark: molehill 0.8.0 vs plain-TCP peers](assets/benchmark-v0.8.1.png)
 
 | Tool | 1-stream | 8-stream | echo RTT p50 | Memory |
 |---|---|---|---|---|
@@ -141,7 +142,7 @@ rate (see Methodology).
 
 One variable (multiplexing on/off), loopback:
 
-![Multiplexing cost](assets/benchmark-mux-v0.8.0.png)
+![Multiplexing cost](assets/benchmark-mux-v0.8.1.png)
 
 | Cell | mux 1-str | mux-off 1-str | mux 8-str | mux-off 8-str |
 |---|---|---|---|---|
@@ -158,7 +159,7 @@ design.
 
 One variable (encryption), mux on for both:
 
-![Transport cost](assets/benchmark-transport-v0.8.0.png)
+![Transport cost](assets/benchmark-transport-v0.8.1.png)
 
 | Configuration | 1-stream | 8-stream | echo RTT p50 | Memory |
 |---|---|---|---|---|
@@ -176,7 +177,7 @@ remove this cost.
 One variable (the number of parallel tunnel connections), plain transport,
 everything else at the default:
 
-![Tunnel count](assets/benchmark-count-v0.8.0.png)
+![Tunnel count](assets/benchmark-count-v0.8.1.png)
 
 | Cell | c4 1-str | c1 1-str | c4 8-str | c1 8-str | c4 HoL max | c1 HoL max |
 |---|---|---|---|---|---|---|
@@ -204,7 +205,7 @@ reason recorded in `partial_metrics` (see Methodology).
 One variable (what carries the data channels), noise control channel,
 `count = 4` for both:
 
-![Data-plane carrier](assets/benchmark-carrier-v0.8.0.png)
+![Data-plane carrier](assets/benchmark-carrier-v0.8.1.png)
 
 | Cell | tcp 1-str | kcp 1-str | tcp 8-str | kcp 8-str | tcp HoL max | kcp HoL max | tcp RSS | kcp RSS |
 |---|---|---|---|---|---|---|---|---|
@@ -228,7 +229,7 @@ session max gap 20 ms against the TCP arms' 100+).
 
 ### Configuration tradeoffs (loopback)
 
-![Configuration tradeoffs](assets/benchmark-cost-v0.8.0.png)
+![Configuration tradeoffs](assets/benchmark-cost-v0.8.1.png)
 
 | Tool | CPU% | churn/s | churn p99 ms | RSS MiB | thr64 | mixed bulk |
 |---|---|---|---|---|---|---|
@@ -348,7 +349,7 @@ interactive service (21.1 direct, 1.3 on KCP).
   JSON for every throughput sample is kept under the run's work directory
   (`iperf-raw/`), so a surprising number can be re-diagnosed.
 - **Reproduce**: `just bench-peers` → `just bench` → `just bench-plot` →
-  `just bench-check` (raw data in `benches/scripts/bench/results-v0.8.0.json`;
+  `just bench-check` (raw data in `benches/scripts/bench/results-v0.8.1.json`;
   ritual and regression gate in docs/release.md).
 
 ## Quickstart
