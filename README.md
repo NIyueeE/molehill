@@ -68,7 +68,7 @@ The measurements below justify the defaults and tell you when to deviate.
 | **`mode = "direct"`** | one service or a few long-lived streams (SSH); **raw throughput first** (bulk transfers): 19.2/23.3 Gbit/s on loopback | one physical tunnel per stream: FDs/ports/NAT mappings scale with stream count; per-connection setup is real (churn p99 ~3.5 ms at 16-way concurrency) but invisible at `pool_size = 8`; smallest footprint (~15.5 MiB) and lower CPU (~515% vs ~494% at four tunnels, but 216% at one) |
 | **`count = 4` (default)** | many concurrent streams, or a lossy path: independent tunnels isolate head-of-line blocking and **aggregate beyond a single flow** | 4 physical connections per service (FDs/ports/NAT mappings) and ~494% CPU against 216% for one tunnel; loopback 8-stream 19.5 vs 9.2 Gbit/s at `count = 1`, 1% loss 12.3 vs 4.5, burst loss 13.3 vs 4.5; the 10 ms HoL max is lower (80.7 vs 100.1 ms) |
 | **`count = 1`** | one long-lived stream, a tight connection budget, or the smallest footprint (~16 MiB with half the CPU) | one TCP-flow ceiling; no aggregation (loopback 8-stream 9.2 Gbit/s); every stream shares one retransmit domain |
-| **`carrier = "kcp"`** (experimental) | when TCP data tunnels are blocked or throttled, or for **latency-first UDP at high delay** | far behind the TCP carrier wherever the path is not the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, rtt10 0.79 vs 5.45, loss1 0.71 vs 7.74) at ~2.5-3x RSS (83 vs 26 MiB) and lower CPU; its clearest win is rtt100 session quality (max gap 20 ms vs the TCP arms' 800+) |
+| **`carrier = "kcp"`** (experimental) | when TCP data tunnels are blocked or throttled, or for **latency-first UDP at high delay** | far behind the TCP carrier wherever the path is not the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, rtt10 0.79 vs 5.45, loss1 0.71 vs 7.74) at ~2.5-3x RSS (83 vs 26 MiB) and lower CPU; its clearest win is rtt100 session quality (max gap 20 ms vs the TCP arms' 100+) |
 | **noise** | encrypted transport wanted with **memory and simplicity first**: a pre-shared public key and no PKI | ~58% of single-stream and ~76% of 8-stream plain throughput (5.8/14.9 vs 10.0/19.5 Gbit/s), sub-millisecond RTT, ~4 MiB more RSS; CPU a wash (470% vs 494% of one core) |
 
 How to apply each choice: the `[client.data]` block holds the per-client
@@ -99,7 +99,7 @@ re-test:
 3. **What does the path look like, and do you forward UDP?** If TCP data
    tunnels are blocked or throttled, or you need latency-first UDP at high
    delay, A/B `carrier = "kcp"` (its rtt100 session max gap is 20 ms against
-   the TCP arms' 800+). Otherwise keep the TCP carrier: the UDP ladder and
+   the TCP arms' 100+). Otherwise keep the TCP carrier: the UDP ladder and
    head-of-line probes show no reproducible UDP-under-load penalty for the
    default in our cells (a 100% paced-pinger loss seen in two runs came back
    as 2% in a third). For lossy/wifi paths keep `count >= 4` — it aggregates
@@ -224,7 +224,7 @@ loss1 0.71 vs 7.74) at ~2.5-3x the RSS (83 vs 26 MiB on loopback) — the
 2048/4096-segment ARQ windows — while at the shaped rate cells both
 carriers sit on the ceiling. Its defensible uses are a **UDP-only path**
 (TCP blocked or throttled) and latency-first UDP at high delay (rtt100
-session max gap 20 ms against the TCP arms' 800+).
+session max gap 20 ms against the TCP arms' 100+).
 
 ### Configuration tradeoffs (loopback)
 
