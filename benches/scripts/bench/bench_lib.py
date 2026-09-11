@@ -575,6 +575,21 @@ class Backends:
                 art = (Path(self._work) / "iperf-raw" / safe
                        / f"P{streams}-rep{i}")
             r = iperf_result(port, streams, secs, timeout, art)
+            if not r["ok"] and "server is busy" in str(r.get("reason", "")):
+                # The iperf3 server is single-test: a previous test that is
+                # still draining (e.g. the 64-stream point before the mixed
+                # workload) answers "server is busy" for the next dial. That
+                # is server state, not path state — restart and retry once,
+                # keeping both attempts' evidence.
+                with contextlib.suppress(Exception):
+                    self.restart_iperf()
+                retry_art = None
+                if art is not None:
+                    retry_art = art.with_name(art.name + "-retry")
+                r2 = iperf_result(port, streams, secs, timeout, retry_art)
+                r2["retried_after_busy"] = True
+                if r2["ok"] or not r2.get("timed_out"):
+                    r = r2
             r["rep"] = i
             records.append(r)
             outcome = "ok" if r["ok"] else "fail"  # NOT `tag`: that is the
@@ -919,74 +934,69 @@ def churn(exposed_port: int, secs: float, concurrency: int) -> dict:
     }
 
 
-def udp_capacity_probe(exposed_port: int, count: int, pps: float,
-                       rate_mbit: float = 0.0) -> dict:
-    """Two-point UDP characterisation, because ONE burst cannot describe a
-    capacity curve.
+# UDP capacity ladder: offered pps steps for the knee search. Short bursts
+# keep the ladder cheap; 12000/16000 exist so a shaped link's knee (around
+# 1.2x the nominal rate) is inside the ladder rather than below it.
+UDP_LADDER_PPS = (500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 16000.0,
+                  20000.0)
+UDP_LADDER_BURST = 2000     # datagrams per step
+UDP_LADDER_DRAIN_S = 1.5    # reply catch-up per step
 
-    The single 20k-pps burst this replaces read `loss_pct: 100.0` on every
-    shaped cell — the KCP/UDP forwarder's knee sits near 5k pps on this host
-    (measured: 2k/5k -> 0% loss, 10k -> 30% at ~9.5 Mbit/s delivered,
-    20k -> 100%), so offering double the knee saturated it and the loss
-    percentage said nothing about capacity. Reported instead:
-      - `paced`: a fraction of the bursting rate, inside the sustainable
-        regime — "does the path deliver when not overloaded", with loss.
-      - `saturated`: the configured rate — "what the path actually carries
-        under overload", judged by DELIVERED Mbit/s, not by loss.
+
+def udp_capacity_probe(exposed_port: int, count: int, pps: float,
+                       rate_mbit: float = 0.0,
+                       configured_loss: float = 0.0) -> dict:
+    """Find the UDP knee with a ladder of paced short bursts.
+
+    A single burst cannot describe a capacity curve: offering 20k pps on a
+    path whose knee is ~5k reads 100% loss and says nothing, and offering a
+    fixed "paced" rate only reports that rate back. This walks a ladder from
+    500 pps to the configured burst rate, stops at the first step outside
+    tolerance, and reports the highest step that arrived. The tolerance is
+    `max(2%, configured cell loss + 2pp)` so a 5%-loss cell is not judged
+    against a lossless baseline. When the TOP step is still within tolerance
+    the true ceiling is above the ladder and the figure is a lower bound.
+
+    The flow is primed first: the UDP session is created lazily by the first
+    datagram, and a cold burst loses its establishment window.
     """
-    # The paced point sits under the shaped link budget (60%), not at a fixed
-    # fraction of the burst rate: on a 100 Mbit/s cell that is ~4.4k pps —
-    # inside the sustainable regime measured above — while `pps` stays the
-    # overload point.
-    paced_pps = pps / 5.0
+    on_wire = (128 + 28 + 14) * 8
+    budget_pps = pps
     if rate_mbit:
-        paced_pps = min(paced_pps,
-                        max(50.0, rate_mbit * 1e6 * 0.6 / ((128 + 28 + 14) * 8)))
-    # The UDP flow is created lazily by the first datagram (the server dials
-    # the backend, the client registers the session): a cold burst loses its
-    # whole establishment window, which is why the identical offered load
-    # reads 0 delivered in the matrix but 0% loss once a paced probe has
-    # warmed the session. Prime with a handful of paced datagrams and keep
-    # every attempt, so a persistent zero stays visible instead of being
-    # hidden behind the retry.
-    attempts = [udp_capacity(exposed_port, count, paced_pps,
-                             rate_mbit=rate_mbit)]
-    if attempts[0].get("datagrams_received", 0) == 0:
-        with contextlib.suppress(Exception):
-            udp_capacity(exposed_port, 32, 200.0, rate_mbit=rate_mbit)
-        primed = udp_capacity(exposed_port, count, paced_pps,
-                              rate_mbit=rate_mbit)
-        primed["after_prime"] = True
-        attempts.append(primed)
-    paced = attempts[-1]
-    sated = udp_capacity(exposed_port, count, pps, rate_mbit=rate_mbit)
-    # Capacity = the delivered rate of the HIGHEST offered step that arrived
-    # intact (<=1% loss), i.e. the last point before the path bends. When the
-    # top (saturating) step is also lossless, the real ceiling is above the
-    # probe's reach and the figure is a LOWER BOUND — that is the loopback
-    # case (every tool delivers the full 27.2 Mbit/s offer), which is why the
-    # old "capacity_mbit = paced delivered" was really the probe's own pace.
-    steps = [paced, sated]
-    lossless = [a for a in steps if (a.get("loss_pct") or 0.0) <= 1.0]
-    cap = max(lossless, key=lambda a: a.get("delivered_mbit", 0.0)) \
-        if lossless else None
+        # reach slightly past the shaped rate so the knee is inside the ladder
+        budget_pps = min(pps, max(50.0, rate_mbit * 1e6 * 1.2 / on_wire))
+    ladder = [p for p in UDP_LADDER_PPS if p <= budget_pps] or [budget_pps]
+    burst = max(200, min(count, UDP_LADDER_BURST))
+    tolerance = max(2.0, configured_loss + 2.0)
+    with contextlib.suppress(Exception):
+        udp_capacity(exposed_port, 32, 200.0)
+    steps = []
+    for pps_step in ladder:
+        r = udp_capacity(exposed_port, burst, pps_step, drain_s=UDP_LADDER_DRAIN_S)
+        r["offered_pps"] = pps_step
+        r["within_tolerance"] = (r.get("loss_pct") or 0.0) <= tolerance
+        steps.append(r)
+        if not r["within_tolerance"]:
+            break  # past the knee; do not keep pushing into overload
+    ok = [s for s in steps if s["within_tolerance"]]
+    cap = max(ok, key=lambda s: s.get("delivered_mbit") or 0.0) if ok else None
+    knee = next((s for s in steps if not s["within_tolerance"]), None)
     return {
-        "paced": paced,
-        "saturated": sated,
-        "capacity_mbit": cap.get("delivered_mbit") if cap else None,
-        "capacity_offered_mbit": cap.get("offered_mbit") if cap else None,
-        "capacity_is_lower_bound": bool(cap is not None and cap is sated),
-        "capacity_loss_pct": cap.get("loss_pct") if cap else None,
-        "capacity_mbit_best_attempt": max(a.get("delivered_mbit", 0.0)
-                                          for a in attempts),
-        "attempts": attempts,
-        "paced_loss_pct": paced.get("loss_pct"),
-        "saturated_loss_pct": sated.get("loss_pct"),
+        "steps": steps,
+        "ladder_pps": ladder,
+        "tolerance_pct": tolerance,
+        "capacity_mbit": (cap or {}).get("delivered_mbit"),
+        "capacity_pps": (cap or {}).get("pps"),
+        "capacity_offered_pps": (cap or {}).get("offered_pps"),
+        "capacity_loss_pct": (cap or {}).get("loss_pct"),
+        "capacity_is_lower_bound": bool(cap is not None and cap is steps[-1]),
+        "knee_offered_pps": (knee or {}).get("offered_pps"),
+        "knee_loss_pct": (knee or {}).get("loss_pct"),
     }
 
 
 def udp_capacity(exposed_port: int, count: int, pps: float,
-                 rate_mbit: float = 0.0) -> dict:
+                 rate_mbit: float = 0.0, drain_s: float = 1.0) -> dict:
     """Sustained UDP forwarder capacity: send `count` datagrams at a paced
     `pps` rate and count the echoes — the "how much UDP can one client
     carry" number the probes alone never give. Sending and draining share
@@ -1056,7 +1066,9 @@ def udp_capacity(exposed_port: int, count: int, pps: float,
             if delay > 0:
                 time.sleep(delay)
         wall = time.perf_counter() - t0
-        time.sleep(1.0)  # catch-up window for in-flight replies
+        # catch-up window for in-flight replies: delay cells need
+        # more than the default second (the ladder passes 1.5 s)
+        time.sleep(drain_s)
     finally:
         s.close()
     stop.set()
@@ -1098,12 +1110,15 @@ def mem_stats(samples: list) -> dict:
 
 def run_rss_sampler(server_pid: int, client_pid: int, stop: threading.Event,
                     out: list, interval: float = 0.5) -> None:
+    # statm counts PAGES; the page size is not always 4 KiB (the old
+    # hardcoded 4 under-reported RSS by 16x on a 64 KiB-page host)
+    page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
     while not stop.is_set():
         try:
             with open(f"/proc/{server_pid}/statm") as fh:
-                s = int(fh.read().split()[1]) * 4
+                s = int(fh.read().split()[1]) * page_kb
             with open(f"/proc/{client_pid}/statm") as fh:
-                c = int(fh.read().split()[1]) * 4
+                c = int(fh.read().split()[1]) * page_kb
             out.append((s, c))
         except (OSError, ValueError, IndexError):
             pass

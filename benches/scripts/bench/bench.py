@@ -458,6 +458,14 @@ def mixed_bulk_latency(backends, iperf_exposed: int, echo_port: int,
             out = backends.run_throughput(iperf_exposed, 1, 1, secs,
                                           tag="mixed-bulk")
             res["bulk_gbps"] = out.get("gbps_sent")
+            if res["bulk_gbps"] is None:
+                # run_throughput reports failure in its return value, not by
+                # raising: keep the reason so a null is never silent (the
+                # audit rejects an unexplained null)
+                res["bulk_reason"] = out.get("error", "no valid rep")
+                last = (out.get("records") or [{}])[-1]
+                if last.get("reason"):
+                    res["bulk_reason"] += f"; last rep: {last['reason']}"
         except Exception as e:
             # keep the echo half of the metric; record why the bulk failed
             res["bulk_gbps"] = None
@@ -697,7 +705,8 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
             # must not be reported as `udp_capacity: 0` for every arm.
             udpcap = metric("udp_capacity", lambda: udp_capacity_probe(
                 p["udp_exposed"], knobs.udp_capacity_count,
-                knobs.udp_capacity_pps, rate_mbit=spec.rate))
+                knobs.udp_capacity_pps, rate_mbit=spec.rate,
+                configured_loss=spec.loss))
             hol_udp = metric("hol_udp", lambda: run_hol_probe(
                 "udp", "127.0.0.1", p["udp_exposed"], knobs.hol_secs,
                 bulk_rate_mbps=knobs.hol_bulk_rate_udp))
