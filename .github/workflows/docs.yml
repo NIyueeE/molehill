@@ -1,0 +1,45 @@
+name: Docs
+
+# The other half of CI. A change limited to markdown, docs/ or assets/ cannot
+# move the Rust gates, so ci.yml skips it (paths-ignore) — but it is exactly
+# what the docs-alignment check validates (hook commands, lint names, toolchain
+# and edition claims, the README doc index, the CI entry). That check is pure
+# git/grep/sed/awk, so this workflow needs no toolchain and finishes in
+# seconds. A commit mixing docs and code paths runs both workflows.
+#
+# The secret scan is deliberately absent: githooks/check-secrets scans the
+# staged diff, so in CI it would be an always-green no-op (it is a
+# pre-commit gate).
+
+on:
+  pull_request:
+    branches: ["*"]
+    paths:
+      - "**.md"
+      - "docs/**"
+      - "assets/**"
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - "**.md"
+      - "docs/**"
+      - "assets/**"
+
+concurrency:
+  # Same reasoning as ci.yml: on main every commit gets its own group so a
+  # faster merge cannot cancel an earlier run's diagnosis.
+  group: ${{ github.ref == 'refs/heads/main' && format('docs-main-{0}', github.sha) || format('docs-{0}', github.ref) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: docs alignment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Docs alignment (hook commands / lints / toolchain / README index / CI entry)
+        run: githooks/check-docs

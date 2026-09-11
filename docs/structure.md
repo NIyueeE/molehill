@@ -34,7 +34,8 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `githooks/pre-tag` | light release review (via `just tag` + on tag pushes): tag↔version, changelog section, bench assets, container-job greps, advisory checklist |
 | `githooks/check-secrets` | staged-changes secret scan (`security-scan:allow` marker to waive a line) |
 | `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, edition, channel, README index, CI entry) |
-| `.github/workflows/ci.yml` | `just check` chain + feature powerset + per-feature test matrix + minimal-size check + 4-platform builds |
+| `.github/workflows/ci.yml` | `just check` chain + feature powerset + per-feature test matrix + minimal-size check + musl check + 4-platform builds (skipped for docs-only changes) |
+| `.github/workflows/docs.yml` | the docs-only half: `githooks/check-docs` for changes limited to markdown, `docs/`, `assets/` |
 | `.github/workflows/release.yml` | tag-driven release: version/changelog gates, 9-target matrix, direct release, GHCR, crates.io |
 | `.github/workflows/test-build.yml` | manual per-commit CD test builds (never publishes) |
 | `.github/dependabot.yml` | weekly cargo + GitHub Actions updates |

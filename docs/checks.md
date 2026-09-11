@@ -16,9 +16,13 @@ review. git has no native tag hook, so pre-tag fires at the two tag moments:
 `v*` tag in a push (before the heavy gates, so a violation fails fast). It is
 not part of `just check` — it needs a release state (dated changelog section,
 committed bench results) and would fail on ordinary development commits.
-release.yml re-enforces the version and changelog invariants remotely; CI runs
+release.yml re-enforces the version and changelog invariants remotely. CI runs
 pre-commit + pre-push via `just check` on every pull request and on pushes to
-`main`/`dev`.
+`main`/`dev` **that touch code**. A change limited to markdown, `docs/` or
+`assets/` cannot move the Rust gates, so `ci.yml` filters those paths out and
+a second workflow, `docs.yml`, runs the doc gates for them instead — the
+docs-alignment check, which is precisely what a docs edit can break. A commit
+mixing docs and code paths runs both workflows.
 
 Beyond that chain, CI's other jobs cover what `just check` cannot: the feature
 powerset (`cargo hack`), the alternative feature-set test matrix, the

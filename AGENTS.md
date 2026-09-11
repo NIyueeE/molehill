@@ -83,7 +83,7 @@ code-level.**
 - The chain has two layers — **fast gates** (`githooks/pre-commit`: fmt /
   secrets / machete / docs / python lint (ruff) / clippy) run on commit,
   **heavy gates** (`githooks/pre-push`: audit / deny / outdated / test) run
-  on push; CI runs the whole chain via `just check`. Tag pushes additionally
+  on push; CI runs the whole chain via `just check` (§8). Tag pushes additionally
   run the light release review `githooks/pre-tag` (§5) before the heavy
   gates. All of these are "the checks" and bound by this discipline. Levels
   and the declared lint set: [docs/lint-policy.md](docs/lint-policy.md).
@@ -199,7 +199,10 @@ Details: [docs/release.md](docs/release.md).
 
 - commit → fast gates; push to a branch → heavy gates; **push of a `v*` tag →
   release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
-  runs the identical chain. `main` is not branch-protected today — the
+  runs the identical chain when the change touches code. A docs-only change
+  (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
+  docs-alignment check instead — the one gate such a change can break. `main`
+  is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by
   convention (CI red on main is the top priority; the one sanctioned
   exception to history rules: a coordinated history rebuild, explicitly

@@ -423,7 +423,8 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
 molehill 使用 Rust 编写（2024 edition）；`rust-toolchain.toml` 声明
 `channel = "stable"` 并附带 clippy 与 rustfmt 组件 —— 不要硬编码版本号。分层
-git hooks 守护每次 commit、push 与发布 tag，CI 运行同一条链：
+git hooks 守护每次 commit、push 与发布 tag，CI 对**涉及代码**的改动运行同一条
+链；只改文档的改动则只跑文档一致性检查（`docs.yml`）：
 
 ```bash
 just setup   # 激活 git hooks（core.hooksPath githooks）并安装检查工具

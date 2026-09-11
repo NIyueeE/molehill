@@ -494,7 +494,8 @@ Contributing & engineering:
 molehill is written in Rust (2024 edition); `rust-toolchain.toml` declares
 `channel = "stable"` with clippy and rustfmt components — never hardcode a
 version. Layered git hooks guard every commit, push, and release tag, and CI
-runs the identical chain:
+runs the identical chain for anything that touches code — a docs-only change
+runs just the docs-alignment check (`docs.yml`) instead:
 
 ```bash
 just setup   # activate git hooks (core.hooksPath githooks) + install check tools
