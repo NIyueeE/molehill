@@ -22,6 +22,39 @@ use bytes::Bytes;
 /// `UIO_MAXIOV`, and a whole burst fits in one call.
 pub const BATCH: usize = 32;
 
+/// An all-zero `msghdr`: null name/control pointers, zero lengths.
+///
+/// Built with `zeroed()` rather than a struct literal because musl's
+/// `msghdr` carries private padding fields (`__pad1`/`__pad2`) that a
+/// literal cannot name, while glibc's has none — the literal compiled only
+/// on glibc. Every field the batching code relies on is assigned explicitly
+/// before the header is used.
+#[expect(
+    unsafe_code,
+    reason = "audited FFI: `msghdr` is a plain C struct for which all-zero is a valid \
+              value (null pointers, zero lengths, no control messages)"
+)]
+fn empty_msghdr() -> libc::msghdr {
+    // SAFETY: all-zero is a valid `msghdr`; the kernel only writes through
+    // it inside `recvmmsg`/`sendmmsg`.
+    unsafe { std::mem::zeroed() }
+}
+
+/// `MSG_DONTWAIT` with the type this target's `recvmmsg`/`sendmmsg` take:
+/// glibc declares the flags argument `c_int`, musl `c_uint` (same constant,
+/// different ABI spelling — a plain `as` cast would trip the pedantic cast
+/// lints, and the value is positive so the conversion cannot fail).
+#[cfg(target_env = "musl")]
+fn msg_dontwait() -> libc::c_uint {
+    u32::try_from(libc::MSG_DONTWAIT).unwrap_or(0)
+}
+
+/// See the musl variant above.
+#[cfg(not(target_env = "musl"))]
+fn msg_dontwait() -> libc::c_int {
+    libc::MSG_DONTWAIT
+}
+
 /// Convert a filled `sockaddr_storage` into a `SocketAddr`.
 ///
 /// # Safety
@@ -141,15 +174,7 @@ impl RecvBatch {
                 iov_len: b.len(),
             });
             msgs.push(libc::mmsghdr {
-                msg_hdr: libc::msghdr {
-                    msg_name: std::ptr::null_mut(),
-                    msg_namelen: 0,
-                    msg_iov: std::ptr::null_mut(),
-                    msg_iovlen: 0,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
-                },
+                msg_hdr: empty_msghdr(),
                 msg_len: 0,
             });
         }
@@ -197,7 +222,7 @@ impl RecvBatch {
                 fd,
                 self.msgs.as_mut_ptr(),
                 u32::try_from(self.msgs.len()).unwrap_or(0),
-                libc::MSG_DONTWAIT,
+                msg_dontwait(),
                 std::ptr::null_mut(),
             )
         };
@@ -309,20 +334,18 @@ impl SendBatch {
             #[expect(unsafe_code, reason = "audited FFI: in-bounds pointer arithmetic")]
             let iov_ptr = unsafe { self.iovs.as_mut_ptr().add(i) };
             self.msgs.push(libc::mmsghdr {
-                msg_hdr: libc::msghdr {
+                msg_hdr: {
+                    let mut hdr = empty_msghdr();
                     // SAFETY of the shared name pointer: `ss` lives for the
                     // whole call below and every message targets the same
                     // peer.
-                    msg_name: std::ptr::addr_of!(ss).cast_mut().cast::<libc::c_void>(),
-                    msg_namelen: libc::socklen_t::try_from(std::mem::size_of::<
-                        libc::sockaddr_storage,
-                    >())
-                    .unwrap_or(0),
-                    msg_iov: iov_ptr,
-                    msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
-                    msg_controllen: 0,
-                    msg_flags: 0,
+                    hdr.msg_name = std::ptr::addr_of!(ss).cast_mut().cast::<libc::c_void>();
+                    hdr.msg_namelen =
+                        libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
+                            .unwrap_or(0);
+                    hdr.msg_iov = iov_ptr;
+                    hdr.msg_iovlen = 1;
+                    hdr
                 },
                 msg_len: 0,
             });
@@ -341,7 +364,7 @@ impl SendBatch {
                 fd,
                 self.msgs.as_mut_ptr(),
                 u32::try_from(n).unwrap_or(0),
-                libc::MSG_DONTWAIT,
+                msg_dontwait(),
             )
         };
         if sent < 0 {
