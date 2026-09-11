@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- CI skips the code chain for a change limited to markdown, `docs/` or
+  `assets/`: those paths cannot move the Rust gates, so `ci.yml` filters them
+  out and a new `docs.yml` runs the docs-alignment check instead — the one
+  gate such a change can break. It needs no toolchain and finishes in
+  seconds. A commit mixing docs and code paths runs both workflows, and the
+  tag-driven release workflow is unaffected.
+
 ## [0.8.0] - 2026-09-11
 
 > **The benchmark figures quoted per entry were measured when that change
