@@ -168,10 +168,11 @@ never a signal.
 
 > **The refresh was re-run on 2026-09-10 after an endpoint bug, and the
 > corrected baseline is what is committed now.** An intermediate refresh
-> (93d50ea/71274b9) was measured with `Backends.run_throughput` dialing the
-> iperf3 BACKEND instead of the tunnel's exposed port, so its TCP figures
-> were the loopback ceiling with every tool bypassed (loopback 1-stream
-> 48-54 Gbit/s instead of the tunnel's ~10). Fixed in b4ac559: the endpoint
+> was measured with `Backends.run_throughput` dialing the iperf3 BACKEND
+> instead of the tunnel's exposed port, so its TCP figures were the
+> loopback ceiling with every tool bypassed (loopback 1-stream 48-54
+> Gbit/s instead of the tunnel's ~10). Fixed by `fix(bench): dial the
+> exposed endpoint and isolate every sample`: the endpoint
 > is explicit (`_throughput_exposed_port` / `_bench_backend_port`), equal
 > ports raise, and `audit_results.py` fails such a run. The final baseline is
 > one same-host run of the corrected method (52 arms, zero holes, zero arm
@@ -223,6 +224,11 @@ never a signal.
 - `focused_run.py` no longer applies a netem to unshaped cells and dials the
   exposed port, so it is a usable independent check (loopback ~10 Gbit/s,
   matching the matrix).
+- History note (2026-09-11): the 24 fix-on-fix commits on top of `0f44213`
+  were folded into the seven topical commits that follow it and `merge-tcp4`
+  was force-pushed once. The pre-rewrite tip is preserved as
+  `backup/merge-tcp4-20260911` (`4c70eeb`, identical tree); delete it once
+  this branch has merged to `main`.
 - Open before the next release (none block the merge): the UDP fairness
   question above (instrument ready, no claim), a single-window full-matrix
   re-run on the target host (this baseline was assembled across one run plus
