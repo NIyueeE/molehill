@@ -20,6 +20,12 @@ release.yml re-enforces the version and changelog invariants remotely; CI runs
 pre-commit + pre-push via `just check` on every pull request and on pushes to
 `main`/`dev`.
 
+Beyond that chain, CI's other jobs cover what `just check` cannot: the feature
+powerset (`cargo hack`), the alternative feature-set test matrix, the
+cross-platform builds, and a musl check of the exact target and feature set
+`release.yml` ships (without it, a glibc-only assumption in Linux-only code
+survives to the tag — `release.yml` itself only runs once a tag is pushed).
+
 ## Tools
 
 The cargo gates use four external tools; `just setup` installs any that are

@@ -128,7 +128,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Run tests
         if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
+        run: cargo test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }} -- --test-threads=1
       - name: Build release
         if: matrix.cross == false
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
