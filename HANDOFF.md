@@ -3,7 +3,12 @@
 > State as of 2026-09-10, on the v0.8.0 development line (branch
 > `merge-tcp4`, preparing the merge to `main`). The UDP session-affinity fix,
 > the template lint migration and the benchmark-matrix rework (uv/PEP 723,
-> schema v3 through-tunnel measurements) have landed; shipped work is
+> schema v3 through-tunnel measurements) have landed, and the benchmark
+> measurement method was revised on 2026-09-10/11 (rate-cell shaping, per-rep
+> throughput isolation, a UDP capacity ladder — see the "Method revision"
+> paragraph below) and the v0.8.0 baseline was then re-measured in full from
+> it on host `0b073ddbf222` (52 arms, zero holes, charts and README
+> regenerated). Shipped work is
 > recorded in [CHANGELOG.md](CHANGELOG.md), and design details (protocol,
 > muxing, UDP session affinity) live in [docs/internals.md](docs/internals.md).
 > This file only tracks what is still open.
@@ -100,6 +105,131 @@ targeted re-runs refreshed the rate cells, the loss2b25 steady-RTT probes
 and the fake-zero HoL entries on the same host — `results-v0.8.0.json`
 remains the regression baseline.
 
+**Method revision (2026-09-10, this thread) — the above diagnosis was
+half-wrong and is superseded.** Decisive measurements on this host with a
+plain (tunnel-free) iperf3 pair across the shaped `lo`:
+- The shaper itself was the bigger problem. `netem rate 100mbit delay
+  20ms limit 1` carries 18 Mbit/s with `-P 8`; the same test at `limit
+  1000` carries 99.6 Mbit/s. The rate cells had been shaped with a queue
+  so shallow that whole GSO segments were tail-dropped, so a "rate cell"
+  number was largely a property of the shaper. `bench_lib.RATE_QUEUE_LIMIT`
+  is now 2000 and is recorded in the results meta (`netem_rate_limit`).
+- The remaining `null`s were harness repetition hygiene, not the path: with
+  per-rep isolation plus a client timeout scaled to the test length, the
+  same kcp4 `rate100_rtt20` cell that used to return `null` measures 3/3
+  reps at both 1 stream (~0.098-0.103 Gbit/s) and 8 streams
+  (~0.091-0.106 Gbit/s) — i.e. at the 100 Mbit/s link ceiling. A stalled
+  rep used to wedge the single-test iperf3 server and starve every later
+  rep (`Backends.run_throughput` now restarts it after a failure).
+- Throughput convention: the headline is bytes over the measured window,
+  with the receiver's own (drain-inclusive) window recorded too, because at
+  a shaped cell `sum_received.seconds` runs well past the sender's and made
+  the two figures look like different tests.
+- UDP capacity: one 20k-pps burst sat ~2x above the forwarder's knee
+  (measured 2k/5k pps -> 0% loss, 10k -> 30% at ~9.5 Mbit/s delivered,
+  20k -> 100%), so `loss_pct` carried no information. It is now two points
+  (paced + saturating, reported by delivered Mbit/s), sampled BEFORE the
+  bulk-UDP HoL blast because the UDP path does not recover within an arm
+  after a 50 Mbit/s burst (the HoL probe's own pinger then records 100%
+  loss) — a forwarder finding worth its own look.
+- Two further measurement bugs were caught while validating that revision,
+  both from reading the per-rep raw JSON the runner now keeps:
+  1. iperf3's per-interval `seconds` is not the interval span (the interval
+     after `-O` reports warm-up + interval), so summing it gave 9.0 s for an
+     8 s test and deflated the loopback headline ~12%. The window is now
+     `sum(end - start)` over non-omitted intervals.
+  2. At `rate20_rtt40` the sender's post-omit count is 0 for the whole
+     measured window — its `-O` warm-up dumped 153 MB at 1.22 Gbit/s into
+     the shaper and backpressure blocked the rest — so every tool (molehill
+     AND the TCP peers) reported a 0.0 Gbit/s 8-stream cell. The headline is
+     now the sender's bytes over the measured window, falling back to the
+     receiver's count only when the sender's accounting is degenerate
+     (receiver > 2x sender); the rate20 8-stream value is then ~0.02 Gbit/s
+     (the shaped link rate) instead of 0.
+- `iperf-raw/` artifacts are written per ARM **and CELL** (the work dir is
+  per run, so arms used to overwrite each other's evidence; a first fix
+  without the cell name still let cells overwrite each other), and
+  `audit_results.py` is the completeness gate: `None` holes, arm errors,
+  per-stream inconsistencies, missing sampler output, and the throughput
+  endpoint invariant (exposed port != backend port) — it exits non-zero on
+  holes/errors. That endpoint check exists because the opposite mistake
+  shipped a whole invalid baseline (see the VOID note above).
+
+Consequence: **no pre-revision number is comparable to the refreshed
+baseline** (the revision changed the shaping model and the throughput
+window/accounting, and the refresh ran on `ebb615bff576`); the full
+re-measure was done on 2026-09-10 (52 arms; `audit_results.py` reports zero
+holes and zero arm errors) and `results-v0.8.0.json` + the charts + the
+README chapter now describe that run. The v0.7.2 regression gate is
+therefore informational only, and a rate-cell-only difference against it is
+never a signal.
+
+### Baseline refresh notes (2026-09-10, host ebb615bff576)
+
+> **The refresh was re-run on 2026-09-10 after an endpoint bug, and the
+> corrected baseline is what is committed now.** An intermediate refresh
+> (93d50ea/71274b9) was measured with `Backends.run_throughput` dialing the
+> iperf3 BACKEND instead of the tunnel's exposed port, so its TCP figures
+> were the loopback ceiling with every tool bypassed (loopback 1-stream
+> 48-54 Gbit/s instead of the tunnel's ~10). Fixed in b4ac559: the endpoint
+> is explicit (`_throughput_exposed_port` / `_bench_backend_port`), equal
+> ports raise, and `audit_results.py` fails such a run. The final baseline is
+> one same-host run of the corrected method (52 arms, zero holes, zero arm
+> errors, guard clean) and the README/strategy numbers are derived from it.
+> Caught by diffing a raw artifact's `connected` port against the cell's port
+> map — the reason raw artifacts are kept, and the first rule of AGENTS.md
+> §10.
+
+- Corrected outcome, tunnel-measured on `0b073ddbf222` (one run of the
+  revised method): Noise retains ~58%/76% of plain throughput, `count = 4`
+  aggregates at 8 streams (loopback 19.5 vs 9.2 Gbit/s, 1% loss 12.3 vs
+  4.5), and the KCP carrier stays far behind TCP wherever the path is not
+  the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, ~3x RSS = 83 vs
+  26 MiB), with UDP-only paths and rtt100 session quality as its uses.
+- **The UDP-under-load lead is retracted.** The head-of-line probe's paced
+  pinger lost 100% of its datagrams on the default arms in two earlier runs
+  and 2% in this one; the ladder probe shows no reproducible penalty either.
+  Treat it as variance, not a path property. The code-level hypothesis
+  (sticky per-peer affinity plus drop-on-full in `route_udp_datagram`, with
+  the server's routed queue hardcoded to `DEFAULT_UDP_SENDQ_SIZE` = 1024 and
+  `udp_send_queue_size` honoured only client-side) is still worth a look as a
+  fairness question. **The instruments were run (2026-09-11) and settle
+  nothing**: the stock pinger lost 8.3% then 10.8% in the same arm, and the
+  rolling-socket control lost 100% — but that control is invalid (a 200 ms
+  socket lifetime is shorter than the lazy UDP session establishment plus
+  the ~100 ms path RTT, so replies to a closed socket are simply lost). No
+  `queue full` drops were captured at that loss level. Net: the lead is
+  variance; the fairness question stays open with no demonstrated defect.
+  Re-running `~/tmp/udp_affinity_probe.py` (or `focused_run.py --hol-udp`)
+  with a socket lifetime of ~1 s and `RUST_LOG=molehill_rathole=debug` is
+  the next step if it is ever picked up.
+- Structural gaps that remain (each with a typed reason in the data): the
+  20 Mbit/s rate cell's 8-stream slot (`null`, client timeout — eight
+  parallel streams cannot finish through that bottleneck) and kcp4's rtt100
+  8-stream slot. Everything else is measured.
+- The UDP ladder replaces the two-point probe: 500 pps to the configured
+  burst rate, 2000-datagram bursts, 1.5 s drain, tolerance `max(2%, cell
+  loss + 2pp)`. Measured: unshaped loopback is a lower bound (27.2 Mbit/s at
+  the top step), the 10 ms cell bends at 12 000 pps (10.9 Mbit/s), the
+  100 ms cell at 1 000-2 000 pps (0.7-1.4 Mbit/s); loss cells have no step
+  inside tolerance, so the knee plus its delivered rate is the informative
+  pair there.
+- Container note: the environment was recycled twice during this work
+  (hostnames `ebb615bff576` -> `fbf069a0506b` -> `0b073ddbf222`; the final
+  baseline is entirely from `0b073ddbf222`, verified via the results meta).
+  A recycle wipes `/tmp` AND the benchmark tooling: `sudo apt-get install -y
+  iperf3 iproute2` (i.e. `just bench-deps`) must run again, and runs should
+  keep their scratch under `~/tmp` (`TMPDIR=$HOME/tmp`), which survives.
+- `focused_run.py` no longer applies a netem to unshaped cells and dials the
+  exposed port, so it is a usable independent check (loopback ~10 Gbit/s,
+  matching the matrix).
+- Open before the next release (none block the merge): the UDP fairness
+  question above (instrument ready, no claim), a single-window full-matrix
+  re-run on the target host (this baseline was assembled across one run plus
+  three targeted merges after the recycle), and the `merge-tcp4` -> `main`
+  merge itself. The KCP loss cells were re-measured with the current
+  post-conserve binary in this baseline, so that item is closed.
+
 Chart/runner follow-up (2026-09-10): absent measurements used to render as a
 fake `0.0` bar in the cost chart (`mux1`'s unmeasured 64-stream and
 mixed-bulk slots), and the two structural nulls looked like opaque runner
@@ -143,7 +273,9 @@ backfill's 0.038/old-code's 0.04 stand; rate100 1-stream flaked to
 iperf3 client timed out on every rep at the shaped bottleneck
 (`iperf3 -P 8` wedges the single-test server; each attempt was killed
 by the 30 s harness timeout — same reason the committed rate100 8s
-was a fake zero and rate20 8s was already None). Peer binaries are
+was a fake zero and rate20 8s was already None). **Superseded by the
+2026-09-10 method revision below: these slots are measurable now.** Peer
+binaries are
 cached under `~/tmp/bench-peers` (not `/tmp`, which session cleanup wipes)
 and pinned to the baseline versions (frp 0.71.0 / rathole 0.5.0 / bore
 0.6.0), fetched directly because the unauthenticated GitHub API was
