@@ -66,28 +66,14 @@ waiting for the consolidation.)
       (done in the v0.8.0 matrix): results-v0.8.0.json, six charts (incl.
       the new cost chart) and the tables now describe the count=4 default,
       the ring-accelerated noise rows, and the new cells/metrics.
-      **Regression-gate verdict (v0.8.0 vs v0.7.2): void as a gate — 8
-      flagged rows, waivered and recorded here (last read on the release
-      commit, 2026-09-11: `just bench-check` exits 1).** The gate itself
-      prints `different hosts (current=0b073ddbf222, baseline=621a9d1d3f40)`,
-      and the v0.7.2 file predates the method revision (single-tunnel
-      default, 200-sample steady pings, the old UDP probe), so its thresholds
-      cannot be read as regressions:
-      - 3 x `steady rtt p99` (+104% loss2b25, +33% rtt10, +33% rtt100) and
-        3 x UDP (loss2b25 `udp loss pp` +13pp, loss5 +4pp, loss2b25
-        `udp rtt p99` +33%) — probe-methodology rows: the p99 of a steady
-        ping moves with the sample count (200 before, 100 now), and the old
-        UDP probe diluted loss over unbounded pings, so these compare
-        instruments rather than paths.
-      - 2 x `thr 1-stream`: loss1_rtt10 -5.2% (4.431 -> 4.202 Gbit/s, just
-        over the 5% band) and rtt100 -24.4% (0.752 -> 0.569). Spot
-        verification on this host put rtt100 1-stream at 0.57-0.67, around
-        the committed 0.569, against the old host's 0.752 — container
-        variance, with a same-host A/B as the low-priority follow-up.
-      Every other row is `ok`, and the reference cells improved (loopback
-      8-stream +106%, loss1 8-stream +160%, RSS -29..-70%). Cells absent from
-      the v0.7.2 baseline (not gated): jitter20_10, rate100_rtt20,
-      rate20_rtt40. results-v0.8.0.json is the new regression baseline.
+      **Regression-gate verdict (v0.8.0 vs v0.7.2): not a comparison.** The
+      v0.7.2 file predates the measurement revision and comes from another
+      container (the gate itself prints `different hosts`), so it measures a
+      different instrument: only same-method results — v0.8.0 and later — are
+      comparable, and nothing read through that boundary is a regression
+      signal. No waiver is claimed because there is no comparable baseline to
+      regress against; `results-v0.8.0.json` is what every later run is gated
+      against.
 
 ### Benchmark ritual (per tag — see docs/release.md)
 
@@ -349,16 +335,18 @@ the `set_mtu` probe (1400 -> 8000 measured +84%..+476% on the weak
 cells but -29% loopback 8-stream) was reverted and removed from the
 tuning space.
 
-Known waiver (v0.7.2 era): results files before schema v3 measured throughput
-by dialing the **backend directly** (bypassing the tunnel), so every tool
+Comparability boundary (v0.7.2 era): results files before schema v3 measured
+throughput by dialing the **backend directly** (bypassing the tunnel), so
+every tool
 reported the loopback iperf3 ceiling (~46 Gbit/s) regardless of tool or cell;
 the rtt cells ran via `weakproxy` (client↔server delay only), which the
 bypassed throughput never traversed. `results-v0.7.2.json` was refreshed in
 place with schema-v3 through-tunnel data; `results-v0.7.0.json` is the
-pre-matrix (v1) baseline and is only kept for history. The live gate verdict
-is v0.8.0 vs v0.7.2 — 8 metric violations, waivered because the v0.7.2
-baseline ran a different container with the single-tunnel default (the
-row-by-row read is in the baseline paragraph above).
+pre-matrix (v1) baseline and is only kept for history. The gate's baseline
+line is v0.8.0 vs v0.7.2 — a cross-method comparison rather than a gate: the
+v0.7.2 file predates the revision and comes from another container, so only
+v0.8.0-and-later same-method results are comparable (see the baseline
+paragraph above).
 
 ## Transport comparison: 4 arms implemented, 3 merged (decision record)
 

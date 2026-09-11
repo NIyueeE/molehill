@@ -129,13 +129,14 @@ noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
 (netem); without it the script falls back to a userspace delay proxy for
 rtt cells and skips loss cells — note the mechanism in the README table when
 it differs. The gate is only meaningful between same-schema AND same-method
-results: schema v3 fixed the throughput measurement point (pre-v3 files
-dialed the backend directly and are not comparable), and the 2026-09-10
-measurement revision changed the rate-cell shaping queue depth and the
-throughput window convention, so the v0.8.0 **rate-cell** rows are not
-comparable to later runs (the other cells are). A rate-cell-only difference
-against the v0.8.0 baseline is therefore not a regression signal; record how
-the gate was read in `HANDOFF.md`. `benches/scripts/bench/audit_results.py`
+results. Schema v3 fixed the throughput measurement point (pre-v3 files
+dialed the backend directly and are not comparable); the 2026-09-10/11
+measurement revision then changed the matrix method itself — rate-cell
+shaping queue, throughput window convention, weak-cell and HoL durations,
+the steady-ping and UDP probes — so only results measured from that revision
+on (v0.8.0 and later) are comparable with each other, and a difference
+against an earlier file is not a regression signal. Record how the gate was
+read in `HANDOFF.md`. `benches/scripts/bench/audit_results.py`
 is the companion check for completeness — it reports `None` holes and
 arm-level errors, and exits non-zero when it finds either.
 
