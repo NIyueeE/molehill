@@ -721,7 +721,7 @@ Multiple instances: add another config (`app2.toml`) and enable
 ### Container
 
 The official image `ghcr.io/niyueee/molehill:latest` is a single static
-musl binary on `scratch` (~8 MiB), runs as non-root UID 1000 and contains
+musl binary on `scratch` (~1.2 MiB), runs as non-root UID 1000 and contains
 **no configuration** — mount your own `server.toml` / `client.toml`
 read-only at `/app/server.toml` (or `/app/client.toml`) and pass its name
 as the command-line argument.
@@ -730,6 +730,23 @@ as the command-line argument.
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
   ghcr.io/niyueee/molehill:latest server.toml
 ```
+
+The image carries the full default feature set (`server`, `client`, `noise`,
+`hot-reload`, `multiplex`, `kcp`), so `default_carrier = "kcp"` needs no
+different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.8.0`)
+instead of `:latest` when you want reproducible upgrades.
+
+Two consequences of running as UID 1000:
+
+- The mounted config must be readable by UID 1000 — `chmod 644` it (or
+  `chown 1000`), otherwise the container exits with a permission error.
+- Under **host** networking the process cannot bind ports below 1024 (the
+  host's `ip_unprivileged_port_start`, normally 1024, applies), so every
+  `remote_bind_addr` and the control/data listeners need ports ≥ 1024. Under
+  bridge networking the container's own namespace usually allows low ports,
+  but the portable recipe is the same: keep the container port high and map
+  the privileged host port onto it (`-p 80:8080` with
+  `remote_bind_addr = "0.0.0.0:8080"`).
 
 Docker / Podman Compose (host networking — simplest on Linux; the server
 must expose arbitrary service ports):
@@ -777,8 +794,9 @@ services:
       - ./server.toml:/app/server.toml:ro
     command: server.toml
     ports:
-      - "2333:2333" # Control channel (clients connect here)
-      - "5202:5202" # Exposed SSH service
+      - "2333:2333"     # Control channel and TCP data plane (clients connect here)
+      - "2333:2333/udp" # KCP data plane, only when a service uses carrier = "kcp"
+      - "5202:5202"     # Exposed SSH service
 
   molehill-client:
     image: ghcr.io/niyueee/molehill:latest
@@ -843,8 +861,9 @@ WantedBy=multi-user.target
 
 ### Network requirements
 
-- The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server).
-- The **client** only needs outbound access to `server.control.bind_addr` (and the data endpoint when it differs); no inbound port is required behind the NAT.
+- The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server). Add the matching **UDP** port whenever a service uses `carrier = "kcp"` — the KCP listener binds `server.data.bind_addr`, i.e. the control port by default, and TCP plus UDP coexist on that port number.
+- The **client** only needs outbound access to `server.control.bind_addr` (and the data endpoint when it differs; TCP, plus UDP for `carrier = "kcp"`); no inbound port is required behind the NAT.
+- Running in a container: the image runs as UID 1000 and cannot bind ports below 1024 — see [Container](#container) for the port and config-permission consequences.
 - `client.control.default_remote_addr` must use the same port as `server.control.bind_addr` unless the server moved its control listener.
 
 ### Security

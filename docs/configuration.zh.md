@@ -702,7 +702,7 @@ systemctl --user enable molehills@app1 --now
 ### 容器
 
 官方镜像 `ghcr.io/niyueee/molehill:latest` 是 `scratch` 上的单个静态
-musl 二进制(~8 MiB),以非 root UID 1000 运行,**不含任何配置**——把
+musl 二进制(约 1.2 MiB),以非 root UID 1000 运行,**不含任何配置**——把
 自己的 `server.toml` / `client.toml` 只读挂载到 `/app/server.toml`
 (或 `/app/client.toml`),把文件名作为命令行参数传入。
 
@@ -710,6 +710,22 @@ musl 二进制(~8 MiB),以非 root UID 1000 运行,**不含任何配置**——�
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
   ghcr.io/niyueee/molehill:latest server.toml
 ```
+
+镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
+`multiplex`、`kcp`),所以 `default_carrier = "kcp"` 不需要换镜像。想要可
+复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.8.0`),而不是
+用 `:latest`。
+
+以 UID 1000 运行带来两个后果:
+
+- 挂载进去的配置文件必须对 UID 1000 可读——`chmod 644`(或 `chown 1000`),
+  否则容器会以权限错误退出。
+- **host** 网络下进程无法绑定 1024 以下的端口(生效的是宿主机的
+  `ip_unprivileged_port_start`,通常是 1024),所以所有 `remote_bind_addr`
+  以及 control/data 监听端口都要 ≥ 1024。bridge 网络下容器自己的 netns
+  通常允许低位端口,但通用的做法一样:容器端口保持高位,把特权宿主端口
+  映射上去(`-p 80:8080`,配置里写
+  `remote_bind_addr = "0.0.0.0:8080"`)。
 
 Docker / Podman Compose(host 网络——Linux 下最简单;服务端需要暴露任意
 服务端口):
@@ -757,8 +773,9 @@ services:
       - ./server.toml:/app/server.toml:ro
     command: server.toml
     ports:
-      - "2333:2333" # Control channel (clients connect here)
-      - "5202:5202" # Exposed SSH service
+      - "2333:2333"     # 控制通道与 TCP 数据面(客户端连接到这里)
+      - "2333:2333/udp" # KCP 数据面,仅当服务使用 carrier = "kcp" 时需要
+      - "5202:5202"     # 暴露的 SSH 服务
 
   molehill-client:
     image: ghcr.io/niyueee/molehill:latest
@@ -824,9 +841,13 @@ WantedBy=multi-user.target
 
 - **服务端**必须能从互联网访问:`server.control.bind_addr`、
   `server.data.bind_addr`(设置时)和每个注册的 `remote_bind_addr` 都需要
-  入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。
+  入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。服务使用
+  `carrier = "kcp"` 时还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
+  `server.data.bind_addr`,默认就是控制端口,同一端口号上 TCP 与 UDP 并存。
 - **客户端**只需要到 `server.control.bind_addr` 的出站访问(数据端点不同时
-  也包括它);NAT 后不需要任何入站端口。
+  也包括它;TCP,`carrier = "kcp"` 时还包括 UDP);NAT 后不需要任何入站端口。
+- 容器部署:镜像以 UID 1000 运行,无法绑定 1024 以下的端口——端口与配置
+  文件权限的后果见[容器](#容器)。
 - `client.control.default_remote_addr` 必须与 `server.control.bind_addr` 使用相同的
   端口,除非服务端改动了控制监听地址。
 

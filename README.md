@@ -451,8 +451,9 @@ systemd service, both as root and rootless, including multiple instances.
 
 Official multi-arch images (linux/amd64, linux/arm64) are published to
 `ghcr.io/niyueee/molehill`. The image is a single static musl binary on
-`scratch` (~8 MiB), runs as non-root UID 1000, and includes the same default
-feature set as the regular release builds (multiplexing enabled).
+`scratch` (~1.2 MiB), runs as non-root UID 1000, and includes the same default
+feature set as the regular release builds (multiplexing and the `kcp` carrier
+included).
 
 ```bash
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
@@ -460,7 +461,10 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 The image contains no configuration — mount your config file and pass its
-name as the argument. See the [container deployments](./docs/configuration.md#container)
+name as the argument. Two container-specific notes: the process runs as UID
+1000 (so mount the config world-readable, and prefer ports ≥ 1024), and under
+bridge networking a `carrier = "kcp"` service needs its data-plane port
+published over **UDP** as well. See the [container deployments](./docs/configuration.md#container)
 for Docker Compose (`compose.yaml` / `compose.bridge.yaml`) and Podman
 Quadlet (`molehill-server.container` / `molehill-client.container`)
 deployments.

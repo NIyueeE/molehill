@@ -388,14 +388,14 @@ remote_bind_addr = "0.0.0.0:5202" # 在服务端暴露的公网地址
 ### 容器
 
 官方多架构镜像（linux/amd64、linux/arm64）发布在
-`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 8 MiB），以非 root UID 1000 运行，并且与常规发布构建使用相同的默认特性集（包含多路复用）。
+`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 1.2 MiB），以非 root UID 1000 运行，并且与常规发布构建使用相同的默认特性集（包含多路复用与 `kcp` 载体）。
 
 ```bash
 docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
   ghcr.io/niyueee/molehill:latest server.toml
 ```
 
-镜像内不包含任何配置——挂载你的配置文件，并把文件名作为参数传入。更多部署方式见
+镜像内不包含任何配置——挂载你的配置文件，并把文件名作为参数传入。两个容器相关的注意点：进程以 UID 1000 运行（因此配置文件要对其他用户可读，端口尽量用 ≥ 1024），以及在 bridge 网络下，使用 `carrier = "kcp"` 的服务还需要把数据面端口按 **UDP** 发布出去。更多部署方式见
 [容器部署](./docs/configuration.zh.md#容器)，包括 Docker Compose（`compose.yaml` / `compose.bridge.yaml`）和 Podman
 Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
