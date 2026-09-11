@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/NIyueeE/molehill/main/assets/molehill.svg" width="81" height="81">
+  <img src="assets/molehill.svg" width="257" height="257">
 </p>
 
 <h1 align="center">molehill</h1>
