@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/common/multi_map.rs` no longer contains `unsafe`, which leaves
   `src/transport/udp_batch.rs` as the single audited unsafe site.
 
+### Fixed
+
+- `molehill --genkey` on a binary built without the `noise` feature names
+  the feature correctly now ("noise", previously "nosie"). The
+  `feature_not_compile` helper is cfg-gated to exist exactly when one of
+  its `#[cfg(not(feature = ...))]` callers does, instead of being
+  `allow(dead_code)`d away in full-feature builds.
+
 ## [0.8.1] - 2026-09-11
 
 ### Fixed

@@ -37,10 +37,16 @@ pub fn try_set_tcp_keepalive(
     Ok(s.set_tcp_keepalive(&keepalive)?)
 }
 
-#[allow(
-    dead_code,
-    reason = "called only from cfg(not(feature = ...)) arms; dead in full-feature builds"
-)]
+/// Exits with a clear message when an entry point is reached in a binary
+/// built without its feature. The callers are the `#[cfg(not(feature =
+/// ...))]` arms in `lib.rs`, so the item is cfg-gated to exist exactly
+/// when one of them does — feature-gated dead code is gated, never
+/// `allow`ed away (AGENTS.md §2).
+#[cfg(any(
+    not(feature = "noise"),
+    not(feature = "client"),
+    not(feature = "server")
+))]
 pub fn feature_not_compile(feature: &str) -> ! {
     eprintln!("The feature '{feature}' is not compiled in this binary. Please re-compile molehill");
     std::process::exit(1);

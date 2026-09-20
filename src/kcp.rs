@@ -129,7 +129,10 @@ impl KcpSegment {
 
     // The payload length is bounded by `mss` (≤ `mtu` − `KCP_OVERHEAD`), so
     // the u32 wire field cannot truncate.
-    #[expect(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "payload length is bounded by `mss`, so the u32 wire field cannot truncate"
+    )]
     fn encode(&self, buf: &mut BytesMut) {
         assert!(
             buf.remaining_mut() >= self.encoded_len(),
@@ -475,7 +478,10 @@ impl<Output> Kcp<Output> {
     }
 
     // `frg` fits u8: `count` is checked against `KCP_WND_RCV` (128) below.
-    #[expect(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`frg` fits u8: `count` is checked against `KCP_WND_RCV` (128) below"
+    )]
     /// Send bytes into buffer
     pub fn send(&mut self, mut buf: &[u8]) -> KcpResult<usize> {
         let mut sent_size = 0;

@@ -72,7 +72,7 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 
 #[cfg(not(feature = "noise"))]
 fn genkey(_curve: Option<KeypairType>) -> Result<()> {
-    crate::common::helper::feature_not_compile("nosie")
+    crate::common::helper::feature_not_compile("noise")
 }
 
 /// Run molehill until shutdown.
