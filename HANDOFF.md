@@ -1,10 +1,17 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-11, on the v0.8.1 patch line: everything below is
-> **merged into `main`** (the `merge-tcp4` branch was fast-forwarded into it
-> and deleted) and `v0.8.0` is released — `v0.8.1` is the control-channel
-> teardown fix recorded under "Control-channel teardown" below, with the
-> benchmark matrix carried forward unchanged. The UDP
+> State as of 2026-09-20 (superseding the 2026-09-11 state below where
+> they overlap), still on the v0.8.1 patch line with three uncommitted-to-a-
+> tag commits on `main`: the leaner Noise record stream (backlog item done,
+> A/B +9.0% / +8.0% on the two non-overlapping cells — see "Leaner noise
+> stream A/B"), the `MultiMap` unsafe elimination, and the
+> `feature_not_compile` cfg-gating plus waiver normalization (see "Unsafe
+> and lint-waiver audit"). `src/transport/udp_batch.rs` is now the only
+> unsafe site in the codebase. Everything below is otherwise as of
+> 2026-09-11: the `merge-tcp4` branch was fast-forwarded into `main` and
+> deleted, `v0.8.0` is released, `v0.8.1` is the control-channel teardown
+> fix recorded under "Control-channel teardown" below, with the benchmark
+> matrix carried forward unchanged. The UDP
 > session-affinity fix, the template lint migration and the benchmark-matrix
 > rework (uv/PEP 723, schema v3 through-tunnel measurements) have landed, the
 > benchmark measurement method was revised on 2026-09-10/11 (rate-cell
@@ -32,18 +39,28 @@ waiting for the consolidation.)
 
 ### Other deferred work
 
-- [ ] Leaner Noise record stream: the wrapper is now in-repo
-      (`src/transport/noise_stream.rs`, vendored from snowstorm 0.4.0 and
-      adapted to snow 0.10 — snowstorm is unmaintained and pinned to
-      snow 0.9, so the upgrade required vendoring it). The ring-accelerated
-      cipher measures ~6.6 Gbps/direction in snow's TransportState but only
-      ~4.9 Gbps end-to-end; the gap is the wrapper's per-record copies +
-      2-byte length read. A leaner AsyncRead/Write (read the length with
-      the payload, decrypt straight into the caller's buffer) could recover
-      part of it — easier now that the code is ours. The default pattern
-      stays BLAKE2s: the cipher is ring-served for every pattern (the hash
-      only runs in the handshake), so a pattern change would add wire churn
-      for zero gain.
+- [x] Leaner Noise record stream (done 2026-09-20, `0870bf1`): the wrapper
+      is in-repo (`src/transport/noise_stream.rs`, vendored from snowstorm
+      0.4.0 and adapted to snow 0.10 — snowstorm is unmaintained and pinned
+      to snow 0.9, so the upgrade required vendoring it). The read path now
+      accumulates the two-byte length header together with the ciphertext
+      in one buffer — one `poll_read` sweep per record instead of a
+      separate header read first — and decrypts in place from that buffer;
+      a record that coalesces with its successor in a single wake is
+      consumed without an extra copy. Writes encrypt straight into the
+      framing buffer behind the header and address it by index; both
+      buffers are allocated once and never resized, which retired the
+      per-record `set_len` dance and with it the module's `unsafe`. The
+      wire format is unchanged (u16 ciphertext length, tag included — the
+      value the writer has always stored). Unit tests cover 1 B–70000 B
+      round trips (max-size and multi-record writes), coalesced small
+      records, and the zero-length record that must not surface as an EOF.
+      **A/B measured** (same host, 3 reps, 8 s tests, noise arm, loopback +
+      loss1_rtt10, before `4903fb4` vs after `0870bf1`): see the
+      "Leaner noise stream A/B" note below. The default pattern stays
+      BLAKE2s: the cipher is ring-served for every pattern (the hash only
+      runs in the handshake), so a pattern change would add wire churn for
+      zero gain.
 - [ ] KCP pacer slow-recovery study: PONG-timeout cuts (x0.75) recover at
       only +5% per 4 clean PONGs (2 s cadence) — on sustained loss the
       pacing rate can pin low for minutes. Not the dominant factor in the
@@ -76,6 +93,83 @@ waiting for the consolidation.)
       signal. No waiver is claimed because there is no comparable baseline to
       regress against; `results-v0.8.0.json` is what every later run is gated
       against.
+
+### Leaner noise stream A/B (2026-09-20)
+
+A/B of the leaner record stream against its parent (`4903fb4`), same host,
+same method, both binaries freshly built (before `d75ac826`, after
+`d7877f80` — the reported commit SHA differs, which is the §10 provenance
+check; an earlier same-tree build shared a build timestamp with the
+pre-change one and was rebuilt from the committed tree for this reason).
+Noise arm (`count=4` + noise), 3 reps, 8 s per test, loopback and
+loss1_rtt10 cells, `bench.py --tools=molehill --cells=0/0,1%/10
+--variants=noise` (the runner force-adds the `mux-off` loopback control to
+every loopback cell — bench.py:389 — so both runs carry the same three
+arms). Results: `results-before.json` / `results-after.json` in the run
+scratch (`~/tmp/ab/`). Headline is the median of 3 reps with the rep range
+beside it:
+
+| arm / cell | before (Gbit/s) | after (Gbit/s) |
+|---|---|---|
+| noise loopback 1-stream | 4.601 [3.987, 4.832] | **5.016 [4.854, 5.276]** |
+| noise loopback 8-stream | 16.884 [15.239, 17.446] | 14.813 [11.739, 16.826] |
+| noise loopback 64-stream (1 rep) | 14.661 | 15.072 |
+| noise loss1_rtt10 1-stream | 3.715 [3.699, 4.225] | 3.759 [3.429, 3.886] |
+| noise loss1_rtt10 8-stream | 8.212 [7.925, 8.555] | **8.869 [8.733, 9.046]** |
+| mux-off loopback 1-stream (control) | 20.815 [18.195, 23.775] | 19.843 [19.122, 19.895] |
+| mux-off loopback 8-stream (control) | 31.193 [26.481, 31.917] | 30.259 [26.387, 31.105] |
+
+**Verdict (§10 — claim only outside the spread):** two cells improve with
+**non-overlapping rep ranges** — loopback 1-stream **+9.0%** median and
+loss1_rtt10 8-stream **+8.0%** median. Both are cells where the per-record
+cost is visible (single stream is record-latency-bound; the loss cell adds
+reordering that makes the merged read pay). Everything else sits inside
+the spread and is **not** a claim: loopback 8-stream's median moved -12%
+but its ranges overlap and the after spread is wider (one slow rep at
+11.7 — watch it if it recurs), loss1 1-stream +1.2%, and the 64-stream
+points are single-rep references. The plain-path control (mux-off, which
+never touches `NoiseStream`) shows no systematic change, so the deltas
+belong to the noise path, not the instrument. Secondary metrics on the
+noise loopback arm: CPU avg 464.5% -> 440.1% (directional, one sample per
+arm), echo p50 0.274 -> 0.283 ms and churn first-byte p50 3.21 -> 3.15 ms
+flat, RSS avg 26.2 -> 29.0 MiB (the buffers are the same size; treat as
+noise until it recurs). This is a focused A/B, **not** a re-baselining:
+the release matrix stays `results-v0.8.0.json` until a full same-method
+run refreshes it.
+
+### Unsafe and lint-waiver audit (2026-09-20)
+
+Enumerated every `unsafe` item and every lint waiver in `src/` (AGENTS.md
+§2) and acted on the findings:
+
+- `src/common/multi_map.rs` — **eliminated**. The dual-key control-channel
+  map shared one heap item between two hash maps through raw pointers
+  (plus matching `unsafe impl Send/Sync` and a manual `Drop`). Storing the
+  second key in both maps — as `map2`'s key and inside `map1`'s value —
+  makes `remove1` total with no shared ownership; API and semantics
+  (including duplicate-key rejection) are unchanged, `get2` pays one extra
+  hash lookup.
+- `src/transport/noise_stream.rs` — **eliminated** by the leaner rewrite
+  above (the `set_len`-over-uninitialized-capacity pattern is gone).
+- `src/transport/udp_batch.rs` — **cannot be eliminated**. `recvmmsg`/
+  `sendmmsg` have no safe Rust surface, the sockaddr casts are inherent to
+  the FFI, and the batching win is measured (+28–33% loopback 1-stream on
+  the KCP arm). It is now the **only** unsafe site in the codebase, every
+  unsafe item carrying a SAFETY comment plus an `#[expect(unsafe_code,
+  reason = ...)]`. The two cross-references between the sites' module docs
+  ("the other one is …") were stale in both directions and are fixed.
+- Waiver sweep: `src/common/helper.rs` held the codebase's only `#[allow]`
+  (`dead_code` on `feature_not_compile`) — replaced by real cfg gating per
+  §2, so the item exists exactly when one of its `cfg(not(feature = ...))`
+  callers does. Two KCP-engine cast waivers carried comment-only reasons
+  and moved to the attribute-reason style; five more keep their
+  multi-line design comments (guarded casts, deliberate single-function
+  flush/input), which is the form §2 asks for. The noise_stream rewrite
+  removed its three `unsafe_code` waivers outright. No `#[allow]` remains
+  in `src/`.
+- Not actionable now: `snow` is the last network-layer protocol engine
+  still owned by an external crate (yamux is the dependency-sinking
+  candidate if that line continues — see the transport-comparison record).
 
 ### Benchmark ritual (per tag — see docs/release.md)
 

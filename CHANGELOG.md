@@ -15,7 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read first — and a record that coalesces with its successor in a single
   wake is decrypted from the same buffer without an extra copy. The
   per-record `set_len` dance is gone, and with it the wrapper's `unsafe`
-  code. Covered by new unit tests in `src/transport/noise_stream.rs`.
+  code. Covered by new unit tests in `src/transport/noise_stream.rs`. An
+  A/B against the parent revision on one host (3 reps, 8 s tests) measures
+  **+9.0%** on the loopback 1-stream cell and **+8.0%** on the
+  loss1_rtt10 8-stream cell — both with non-overlapping rep ranges; the
+  remaining cells sit inside the run spread and claim nothing. Details and
+  the full table: HANDOFF.md, "Leaner noise stream A/B".
 
 ### Changed
 
