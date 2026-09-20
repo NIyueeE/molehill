@@ -1,11 +1,19 @@
 //! u16-framed Noise record stream over any tokio IO type.
 //!
-//! One Noise transport-mode message per record: `u16` payload length +
-//! ciphertext (+16-byte tag). Reads are record-oriented (the length header
-//! is read first, then the full message, then the decrypted payload is
-//! served); writes encrypt the whole buffer into one record and push it
-//! with a single write. This is the exact wrapper that used to be the
-//! `snowstorm` crate's `NoiseStream`.
+//! One Noise transport-mode message per record: a `u16` payload length +
+//! ciphertext (+16-byte tag). Reads are record-oriented; writes encrypt one
+//! record per call. This is the record stream that used to be the
+//! `snowstorm` crate's `NoiseStream`, maintained in-repo since the snow 0.10
+//! upgrade and deliberately leaner than the upstream copy:
+//!
+//! - reads accumulate the length header **and** the ciphertext in one
+//!   buffer — one `poll_read` sweep per record instead of a separate
+//!   two-byte header read first, and a record that coalesces with its
+//!   successor in a single wake is decrypted from the same buffer with no
+//!   extra copy;
+//! - writes encrypt straight into the framing buffer behind the two-byte
+//!   header and address it by index — no per-record `set_len` dance, and no
+//!   `unsafe` anywhere in this module.
 //!
 //! Ported from snowstorm 0.4.0 (<https://github.com/black-binary/snowstorm>),
 //! Apache-2.0. Changes vs upstream: the error type is trimmed to what this
@@ -27,6 +35,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 const TAG_LEN: usize = 16;
 /// Largest Noise message: the wire format carries a `u16` length.
 const MAX_MESSAGE_LEN: usize = u16::MAX as usize;
+const LENGTH_FIELD_LEN: usize = std::mem::size_of::<u16>();
+/// Largest on-wire record: the length header plus a maximal ciphertext.
+const MAX_FRAME_LEN: usize = LENGTH_FIELD_LEN + MAX_MESSAGE_LEN;
+/// Sentinel for "the record's length header has not been decoded yet".
+/// Every real record is at least a tag long, so 0 is never a valid length.
+const UNKNOWN_FRAME_LEN: usize = 0;
 
 /// Errors the wrapper surfaces: the handshake or transport state machine
 /// failed, or the underlying IO failed.
@@ -61,22 +75,30 @@ impl std::error::Error for NoiseStreamError {}
 
 type NoiseStreamResult<T> = Result<T, NoiseStreamError>;
 
-const LENGTH_FIELD_LEN: usize = std::mem::size_of::<u16>();
-
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum ReadState {
+    /// At a record boundary: `read_scratch[read_start..read_filled]` holds
+    /// zero or more bytes of the next record — the head of a record that
+    /// coalesced with its predecessor in a single read wake.
+    ReadingRecord,
+    /// A decrypted record is being served from `read_payload_buffer`;
+    /// `served` of its bytes have already reached the caller.
+    ServingPayload { served: usize },
+    /// EOF or shutdown: further reads return Ok with nothing filled.
     ShuttingDown,
-    Idle,
-    ReadingLen(usize, [u8; 2]),
-    ReadingMessage(usize),
-    ServingPayload(usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum WriteState {
-    ShuttingDown,
     Idle,
-    WritingMessage(usize, usize),
+    /// The record `write_message_buffer[start..end]` is being written to
+    /// the inner stream; it carries `payload_len` plaintext bytes.
+    WritingMessage {
+        start: usize,
+        end: usize,
+        payload_len: usize,
+    },
+    ShuttingDown,
 }
 
 #[pin_project]
@@ -89,9 +111,24 @@ pub struct NoiseStream<T> {
     write_state: WriteState,
     write_clean_waker: Option<Waker>,
 
-    read_message_buffer: Vec<u8>,
-    read_payload_buffer: Vec<u8>,
+    /// Ciphertext accumulation buffer, allocated once at `MAX_FRAME_LEN`:
+    /// `read_scratch[read_start..read_filled]` are the bytes of the record
+    /// in progress, and a successor record may already sit behind it,
+    /// consumed in place without copying. `read_expected` is the record's
+    /// total wire length once its header has been decoded, else
+    /// `UNKNOWN_FRAME_LEN`.
+    read_scratch: Vec<u8>,
+    read_start: usize,
+    read_filled: usize,
+    read_expected: usize,
 
+    /// Decrypt output of the current record: `payload_len` valid bytes.
+    read_payload_buffer: Vec<u8>,
+    payload_len: usize,
+
+    /// Write framing buffer, allocated once at `LENGTH_FIELD_LEN +
+    /// MAX_MESSAGE_LEN`: the length header at `[..LENGTH_FIELD_LEN]`, the
+    /// ciphertext behind it.
     write_message_buffer: Vec<u8>,
 }
 
@@ -130,11 +167,15 @@ where
                 return Ok(Self {
                     inner,
                     transport,
-                    read_state: ReadState::Idle,
+                    read_state: ReadState::ReadingRecord,
                     write_state: WriteState::Idle,
                     write_clean_waker: None,
-                    read_message_buffer: vec![0; MAX_MESSAGE_LEN],
+                    read_scratch: vec![0; MAX_FRAME_LEN],
+                    read_start: 0,
+                    read_filled: 0,
+                    read_expected: UNKNOWN_FRAME_LEN,
                     read_payload_buffer: vec![0; MAX_MESSAGE_LEN],
+                    payload_len: 0,
                     write_message_buffer: vec![0; LENGTH_FIELD_LEN + MAX_MESSAGE_LEN],
                 });
             }
@@ -189,29 +230,17 @@ where
         let write_message_buffer = this.write_message_buffer;
 
         loop {
-            match state {
+            match *state {
                 WriteState::ShuttingDown => {
                     return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
                 }
                 WriteState::Idle => {
                     let payload_len = buf.len().min(MAX_MESSAGE_LEN - TAG_LEN);
-                    let buf = &buf[..payload_len];
-
-                    #[expect(
-                        unsafe_code,
-                        reason = "buffer pre-allocated (and zeroed at construction); set_len avoids a
-                                  per-record memset of the whole 64 KiB record buffer — upstream
-                                  snowstorm pattern"
-                    )]
-                    // SAFETY: the buffer was allocated with exactly this
-                    // capacity; the region is fully overwritten by
-                    // `write_message` before it is exposed.
-                    unsafe {
-                        write_message_buffer.set_len(LENGTH_FIELD_LEN + MAX_MESSAGE_LEN);
-                    }
-
                     let message_len = transport
-                        .write_message(buf, &mut write_message_buffer[LENGTH_FIELD_LEN..])
+                        .write_message(
+                            &buf[..payload_len],
+                            &mut write_message_buffer[LENGTH_FIELD_LEN..],
+                        )
                         .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                     // `message_len` is bounded by MAX_MESSAGE_LEN
                     // (u16::MAX), so the cast cannot truncate.
@@ -221,23 +250,34 @@ where
                     )]
                     write_message_buffer[..LENGTH_FIELD_LEN]
                         .copy_from_slice(&(message_len as u16).to_le_bytes());
-                    write_message_buffer.truncate(LENGTH_FIELD_LEN + message_len);
-                    *state = WriteState::WritingMessage(0, payload_len);
+                    *state = WriteState::WritingMessage {
+                        start: 0,
+                        end: LENGTH_FIELD_LEN + message_len,
+                        payload_len,
+                    };
                 }
-                WriteState::WritingMessage(start, payload_len) => {
+                WriteState::WritingMessage {
+                    start,
+                    end,
+                    payload_len,
+                } => {
                     let n = ready!(
-                        Pin::new(&mut inner).poll_write(cx, &write_message_buffer[*start..])
+                        Pin::new(&mut inner).poll_write(cx, &write_message_buffer[start..end])
                     )?;
-                    *start += n;
+                    let start = start + n;
 
-                    if *start == write_message_buffer.len() {
-                        let n = *payload_len;
+                    if start == end {
                         *state = WriteState::Idle;
                         if let Some(waker) = this.write_clean_waker.take() {
                             waker.wake();
                         }
-                        return Poll::Ready(Ok(n));
+                        return Poll::Ready(Ok(payload_len));
                     }
+                    *state = WriteState::WritingMessage {
+                        start,
+                        end,
+                        payload_len,
+                    };
                 }
             }
         }
@@ -249,7 +289,7 @@ where
             WriteState::ShuttingDown | WriteState::Idle => {
                 return Poll::Ready(Ok(()));
             }
-            WriteState::WritingMessage(..) => {}
+            WriteState::WritingMessage { .. } => {}
         }
 
         *this.write_clean_waker = Some(cx.waker().clone());
@@ -285,101 +325,161 @@ where
         let state = this.read_state;
         let transport = this.transport;
 
-        let read_message_buffer = this.read_message_buffer;
-        let read_payload_buffer = this.read_payload_buffer;
-
         loop {
-            match state {
+            match *state {
                 ReadState::ShuttingDown => {
                     return Poll::Ready(Ok(()));
                 }
-                ReadState::Idle => *state = ReadState::ReadingLen(0, [0; LENGTH_FIELD_LEN]),
-                ReadState::ReadingLen(read_len, buf) => {
-                    // Copy the 2-byte length slot: edition-2024 match
-                    // ergonomics bind it by reference; the state machine
-                    // needs the value (and to store it back).
-                    let mut buf = *buf;
-                    if *read_len == LENGTH_FIELD_LEN {
-                        let message_len = u16::from_le_bytes(buf);
+                ReadState::ServingPayload { served } => {
+                    let take = (*this.payload_len - served).min(read_buf.remaining());
+                    read_buf.put_slice(&this.read_payload_buffer[served..served + take]);
+                    let served = served + take;
 
-                        // Safety: This is safe because message_len <= MAX_MESSAGE_LEN
-                        #[expect(
-                            unsafe_code,
-                            reason = "buffer pre-allocated (and zeroed at construction); set_len avoids a
-                                      per-record memset of the whole 64 KiB record buffer — upstream
-                                      snowstorm pattern"
-                        )]
-                        // SAFETY: `message_len` <= MAX_MESSAGE_LEN, the
-                        // allocation size; the region is fully overwritten
-                        // by the subsequent reads.
-                        unsafe {
-                            read_message_buffer.set_len(message_len as usize);
-                        }
-                        *state = ReadState::ReadingMessage(0);
+                    if served == *this.payload_len {
+                        *state = ReadState::ReadingRecord;
                     } else {
-                        let mut read_buf = ReadBuf::new(&mut buf);
-                        read_buf.advance(*read_len);
-
-                        ready!(Pin::new(&mut inner).poll_read(cx, &mut read_buf))?;
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            // EOF
-                            *state = ReadState::ShuttingDown;
-                        } else {
-                            *state = ReadState::ReadingLen(n, buf);
-                        }
+                        *state = ReadState::ServingPayload { served };
                     }
-                }
-                ReadState::ReadingMessage(start) => {
-                    if *start == read_message_buffer.len() {
-                        // Safety: This is safe because this buffer is initialized with MAX_MESSAGE_LEN
-                        #[expect(
-                            unsafe_code,
-                            reason = "buffer pre-allocated (and zeroed at construction); set_len avoids a
-                                      per-record memset of the whole 64 KiB record buffer — upstream
-                                      snowstorm pattern"
-                        )]
-                        // SAFETY: the buffer was allocated with exactly
-                        // MAX_MESSAGE_LEN; `read_message` overwrites the
-                        // region before it is served, then truncates.
-                        unsafe {
-                            read_payload_buffer.set_len(MAX_MESSAGE_LEN);
-                        }
-
-                        let n = transport
-                            .read_message(read_message_buffer, read_payload_buffer)
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                        read_payload_buffer.truncate(n);
-                        *state = ReadState::ServingPayload(0);
-                    } else {
-                        let mut read_buf = ReadBuf::new(&mut read_message_buffer[*start..]);
-
-                        ready!(Pin::new(&mut inner).poll_read(cx, &mut read_buf))?;
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            // EOF
-                            *state = ReadState::ShuttingDown;
-                        } else {
-                            *start += n;
-                        }
-                    }
-                }
-                ReadState::ServingPayload(start) => {
-                    let read_buf_remaining = read_buf.remaining();
-                    let buf_remaining = read_payload_buffer.len() - *start;
-
-                    if buf_remaining <= read_buf_remaining {
-                        read_buf.put_slice(&read_payload_buffer[*start..]);
-                        *state = ReadState::Idle;
-                    } else {
-                        read_buf
-                            .put_slice(&read_payload_buffer[*start..*start + read_buf_remaining]);
-                        *start += read_buf_remaining;
-                    }
-
                     return Poll::Ready(Ok(()));
+                }
+                ReadState::ReadingRecord => {
+                    // Every buffered record consumed: slide the window back
+                    // to the front so the scratch buffer never drifts.
+                    if *this.read_start == *this.read_filled {
+                        *this.read_start = 0;
+                        *this.read_filled = 0;
+                    }
+
+                    // Decode the length header as soon as two bytes of the
+                    // record are in the buffer. The field is the ciphertext
+                    // length with the tag included — the same value the
+                    // writer stores there — so the record is the header
+                    // plus exactly that many bytes.
+                    if *this.read_expected == UNKNOWN_FRAME_LEN
+                        && *this.read_filled - *this.read_start >= LENGTH_FIELD_LEN
+                    {
+                        let header = [
+                            this.read_scratch[*this.read_start],
+                            this.read_scratch[*this.read_start + 1],
+                        ];
+                        *this.read_expected =
+                            LENGTH_FIELD_LEN + usize::from(u16::from_le_bytes(header));
+                    }
+
+                    // The whole record is buffered: decrypt it straight from
+                    // the accumulation buffer.
+                    if *this.read_expected != UNKNOWN_FRAME_LEN
+                        && *this.read_filled - *this.read_start >= *this.read_expected
+                    {
+                        let start = *this.read_start;
+                        let ciphertext = &this.read_scratch
+                            [start + LENGTH_FIELD_LEN..start + *this.read_expected];
+                        let n = transport
+                            .read_message(ciphertext, &mut this.read_payload_buffer[..])
+                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                        *this.read_start += *this.read_expected;
+                        *this.read_expected = UNKNOWN_FRAME_LEN;
+                        *this.payload_len = n;
+                        if n > 0 {
+                            *state = ReadState::ServingPayload { served: 0 };
+                            continue;
+                        }
+                        // A zero-length record carries no bytes for the
+                        // caller: fall through to the next record instead
+                        // of surfacing an EOF-shaped empty read.
+                        continue;
+                    }
+
+                    // The record is incomplete: read more. A completely
+                    // full buffer is compacted to the front first — the
+                    // record in progress always fits once it starts at
+                    // offset 0.
+                    if *this.read_filled == MAX_FRAME_LEN {
+                        this.read_scratch
+                            .copy_within(*this.read_start..*this.read_filled, 0);
+                        *this.read_filled -= *this.read_start;
+                        *this.read_start = 0;
+                    }
+
+                    let mut scratch_read_buf =
+                        ReadBuf::new(&mut this.read_scratch[*this.read_filled..MAX_FRAME_LEN]);
+                    ready!(inner.as_mut().poll_read(cx, &mut scratch_read_buf))?;
+                    let n = scratch_read_buf.filled().len();
+                    if n == 0 {
+                        // EOF: a partial record at the tail is dropped and
+                        // the caller sees the stream end.
+                        *state = ReadState::ShuttingDown;
+                    } else {
+                        *this.read_filled += n;
+                    }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests unwrap values they just constructed"
+    )]
+    use super::*;
+    use snow::Builder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    async fn pair() -> (
+        NoiseStream<tokio::io::DuplexStream>,
+        NoiseStream<tokio::io::DuplexStream>,
+    ) {
+        let (a, b) = duplex(1024 * 1024);
+        let params: snow::params::NoiseParams =
+            "Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let init = Builder::new(params.clone()).build_initiator().unwrap();
+        let resp = Builder::new(params).build_responder().unwrap();
+        let (c, s) = tokio::join!(
+            NoiseStream::handshake(a, init),
+            NoiseStream::handshake(b, resp)
+        );
+        (c.unwrap(), s.unwrap())
+    }
+
+    #[tokio::test]
+    async fn roundtrip_sizes() {
+        let (mut c, mut s) = pair().await;
+        for size in [1usize, 100, 1000, 16 * 1024, 32 * 1024, 65519, 65535, 70000] {
+            let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            c.write_all(&data).await.unwrap();
+            c.flush().await.unwrap();
+            let mut buf = vec![0; size];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, data, "size {size}");
+        }
+    }
+
+    #[tokio::test]
+    async fn many_small_records_then_read() {
+        let (mut c, mut s) = pair().await;
+        let mut expected = Vec::with_capacity(400);
+        for i in 0..100u32 {
+            c.write_all(&i.to_le_bytes()).await.unwrap();
+            expected.extend_from_slice(&i.to_le_bytes());
+        }
+        c.flush().await.unwrap();
+        let mut buf = vec![0; expected.len()];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, expected);
+    }
+
+    #[tokio::test]
+    async fn zero_length_write_is_not_eof() {
+        let (mut c, mut s) = pair().await;
+        c.write_all(&[1, 2, 3]).await.unwrap();
+        c.write_all(&[]).await.unwrap();
+        c.write_all(&[4, 5, 6]).await.unwrap();
+        c.flush().await.unwrap();
+        let mut buf = [0u8; 6];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, &[1, 2, 3, 4, 5, 6]);
     }
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- The Noise record stream (the `noise` transport) is leaner: reads
+  accumulate the two-byte length header together with the ciphertext in one
+  buffer — one `poll_read` sweep per record instead of a separate header
+  read first — and a record that coalesces with its successor in a single
+  wake is decrypted from the same buffer without an extra copy. The
+  per-record `set_len` dance is gone, and with it the wrapper's `unsafe`
+  code. Covered by new unit tests in `src/transport/noise_stream.rs`.
+
 ## [0.8.1] - 2026-09-11
 
 ### Fixed
