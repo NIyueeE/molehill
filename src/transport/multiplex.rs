@@ -23,10 +23,11 @@ use std::task::Poll;
 
 use crate::mux::{Config, Connection, Mode};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tracing::debug;
 
 /// A multiplexed stream adapted to tokio's IO traits.
-pub type MuxStream = crate::mux::Stream;
+pub type MuxStream = Compat<crate::mux::Stream>;
 
 /// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
@@ -105,33 +106,6 @@ pub(crate) fn mux_config() -> Config {
     config
 }
 
-/// Periodically log the framing counters when `MOLEHILL_MUX_STATS=1`.
-///
-/// A diagnostic facility for attributing cost to the framing path: the
-/// lines carry cumulative frame counts, so a reader that knows the window
-/// (or takes the first and last line of a run) gets frames/s, and beside
-/// the measured CPU that becomes CPU-per-frame. Off by default so normal
-/// operation is silent.
-fn spawn_framing_stats() {
-    if std::env::var_os("MOLEHILL_MUX_STATS").is_none() {
-        return;
-    }
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        // A missed tick is not worth catching up on: the counters are
-        // cumulative, so a late line still reports the true totals.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let (written, read, bytes) = crate::mux::framing_stats();
-            info!(
-                written,
-                read, bytes, "mux-stats: cumulative framing counters"
-            );
-        }
-    });
-}
-
 /// Handle to a client-side tunnel: allows opening data channels as streams.
 #[derive(Clone)]
 pub struct ClientTunnel {
@@ -154,9 +128,10 @@ impl ClientTunnel {
         let (open_tx, mut open_rx) =
             mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
 
-        spawn_framing_stats();
         tokio::spawn(async move {
-            let mut conn = Connection::new(io, config, Mode::Client);
+            // yamux speaks the `futures-io` trait family; adapt the tokio
+            // socket once at the boundary.
+            let mut conn = Connection::new(io.compat(), config, Mode::Client);
             let mut waiting: Option<
                 oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>,
             > = None;
@@ -227,7 +202,7 @@ impl ClientTunnel {
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                             Some(SynAnnounce {
-                                                stream: Some(stream),
+                                                stream: Some(stream.compat()),
                                                 reply: Some(reply),
                                             });
                                     }
@@ -331,13 +306,12 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("server tunnel driver started");
-    spawn_framing_stats();
-    let mut conn = Connection::new(io, config, Mode::Server);
+    let mut conn = Connection::new(io.compat(), config, Mode::Server);
     while let Some(result) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
         match result {
             Ok(stream) => {
                 debug!("server tunnel accepted an inbound stream");
-                if tx.send(stream).await.is_err() {
+                if tx.send(stream.compat()).await.is_err() {
                     break;
                 }
             }
@@ -597,7 +571,10 @@ mod tests {
                     .await
                     .expect("recv timed out")
                     .unwrap();
-            eprintln!("[test] got stream {i} debug={srv_stream:?} reading data");
+            eprintln!(
+                "[test] got stream {i} debug={:?} reading data",
+                srv_stream.get_ref()
+            );
             let mut buf = [0u8; 4];
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),

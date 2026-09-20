@@ -11,21 +11,12 @@
 pub mod header;
 mod io;
 
+use futures::future::Either;
 use header::{Data, GoAway, Header, Ping, StreamId, WindowUpdate};
 use std::{convert::TryInto, num::TryFromIntError};
 
 pub use io::FrameDecodeError;
 pub(crate) use io::Io;
-
-/// Type-level left-or-right marker for frame bodies, replacing
-/// `futures::future::Either` (which the tokio-native engine does not
-/// otherwise need). Never instantiated — it only carries the `Data` /
-/// `WindowUpdate` marker types so the flag traits can be implemented per
-/// side.
-#[derive(Debug)]
-pub(crate) struct Either<L, R> {
-    _marker: std::marker::PhantomData<(L, R)>,
-}
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,13 +113,14 @@ impl Frame<Data> {
     }
 
     pub fn body_len(&self) -> u32 {
-        // A frame body that arrives on the wire is capped at
-        // `MAX_FRAME_BODY_LEN` (1 MiB) by the decoder, and one built for
-        // sending is created through `Frame::data` (which rejects a body
-        // longer than u32::MAX), so the conversion cannot truncate. A
-        // saturated value feeds the receive-window check below, which
-        // rejects the frame as a protocol error.
-        u32::try_from(self.body().len()).unwrap_or(u32::MAX)
+        // Safe cast since we construct `Frame::<Data>`s only with
+        // `Vec<u8>` of length [0, u32::MAX] in `Frame::data` above.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "frame bodies are built with length <= u32::MAX"
+        )]
+        let len = self.body().len() as u32;
+        len
     }
 
     pub fn into_body(self) -> Vec<u8> {

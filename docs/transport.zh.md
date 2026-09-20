@@ -27,8 +27,8 @@ pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不�
 
 ### 生成密钥对
 
-运行 `molehill --genkey`,生成一对 X25519 密钥(这是随包发布的 `snow`
-后端唯一提供的曲线):
+运行 `molehill --genkey`,用默认的 X25519 算法生成密钥对(传 `x448` 可用
+X448):
 
 ```sh
 $ molehill --genkey
@@ -115,11 +115,9 @@ remote_public_key = "server-pub-key-here"
 
 ### 预共享密钥
 
-`psk` 与 `psk_location` 为握手增加预共享密钥。只有配置的 `pattern` 在
-`psk_location` 处带有 PSK 修饰符(如 `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`)
-时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝。密钥 base64
-解码后必须恰好是 32 字节(在建立握手时检查),且两端使用相同的 `psk` 与
-`psk_location`:
+`psk` 与 `psk_location` 为握手增加预共享密钥。pattern 必须包含 PSK
+修饰符(如 `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`),密钥必须是 32 字节
+base64 编码,且两端使用相同的 `psk` 与 `psk_location`:
 
 ```toml
 [server.transport.noise]
@@ -135,36 +133,6 @@ local_private_key = "client-priv-key-here"
 remote_public_key = "server-pub-key-here"
 psk = "the-same-32-byte-key-in-base64"
 psk_location = 0
-```
-
-### Noise 会话恢复
-
-双方都设置 `resume = true`(默认关闭)时,重连不再重跑握手的密钥交换:
-完整握手结束后,服务端签发一张票据(用由其 Noise 静态私钥派生的密钥封存),
-客户端把票据与会话握手摘要一起缓存。下次连接时,客户端带上票据、一个新
-nonce 和证明自己持有该摘要的 MAC;服务端校验通过后,双方用缓存摘要加两个
-全新 nonce(HKDF-SHA256 over ChaCha20-Poly1305)派生新的记录密钥。这条连接
-以传输选择器 `0x02`(而非 `0x01`)开头;不认识该选择器的对端会拒绝它,
-客户端随即回退到完整握手(并重新取得票据)。
-
-在本机测量(release 构建,双工管道上的进程内配对,默认 pattern):完整握手
-加票据交换每对约 451 us,恢复交换约 39 us——握手的密钥交换占建连 CPU 的
-约 97%,而恢复正好去掉它们。剩余开销是对称加密加两个往返。
-
-代价是前向保密:原始会话保留其 DH 派生密钥,但恢复会话的密钥由缓存摘要
-派生,因此日后服务端静态密钥(或客户端缓存)一旦泄露,恢复会话的流量也会
-受影响。这是会话恢复的标准取舍——当每条连接的前向保密比重连时延更重要
-时,保持 `resume = false`(默认)。票据 24 小时后过期,且重复的
-`(票据, nonce)` 会被拒绝,因此捕获到的恢复请求无法重放或跨会话复用。
-
-```toml
-[server.transport.noise]
-local_private_key = "server-priv-key-here"
-resume = true
-
-[client.transport.noise]
-remote_public_key = "server-pub-key-here"
-resume = true
 ```
 
 ### 其他 pattern

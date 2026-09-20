@@ -9,14 +9,10 @@ fn main() -> Result<()> {
         .add_instructions(&Cargo::builder().features(true).target_triple(true).build())?
         .add_instructions(
             &Gitcl::builder()
-                // `--version` prints a `Commit SHA` line, so the SHA has to be
-                // emitted; a dirty tree is marked because a binary built from
-                // uncommitted code must not report a clean revision (AGENTS.md
-                // §10, "prove provenance").
-                .sha(true)
+                .sha(false)
                 .commit_date(true)
                 .commit_timestamp(true)
-                .describe(true, true, None)
+                .describe(true, false, None)
                 .build(),
         )?
         .emit()?;

@@ -10,8 +10,6 @@ use crate::protocol::{
     read_registration, write_register_result,
 };
 #[cfg(feature = "noise")]
-use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
-#[cfg(feature = "noise")]
 use crate::transport::{NoiseKeys, NoiseStream};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,7 +21,7 @@ use rand::TryRng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
@@ -191,19 +189,6 @@ async fn upgrade_conn(
                 bail!(
                     "Client requested Noise, but this binary was built without the `noise` feature"
                 )
-            }
-        }
-        #[cfg(feature = "noise")]
-        NOISE_RESUME_SELECTOR => {
-            let keys = noise_keys.ok_or_else(|| {
-                anyhow!("Client requested a noise session resume, but the server has no Noise keys")
-            })?;
-            // A declined request ends here: the responder already wrote
-            // its verdict, and the client falls back to a full handshake
-            // on a fresh connection.
-            match keys.run_resume(conn).await? {
-                Some(stream) => Ok(ServerStream::Noise(Box::new(stream))),
-                None => bail!("Declined a noise session resume"),
             }
         }
         other => bail!("Unknown transport selector {other:#04x}"),
@@ -634,7 +619,6 @@ async fn do_control_channel_handshake(
         bound,
         server_config.control.heartbeat_interval,
         pool_size,
-        stripe_count(&server_config),
     );
 
     // Insert the new handle for this control channel
@@ -748,7 +732,7 @@ async fn do_data_channel_handshake(
     }
 
     handle
-        .data_channel
+        .data_ch_tx
         .send(new_data_channel(conn))
         .await
         .with_context(|| "Data channel for a stale control channel")?;
@@ -777,7 +761,7 @@ where
     tokio::spawn(async move {
         while let Some(stream) = bridge_rx.recv().await {
             if handle
-                .data_channel
+                .data_ch_tx
                 .send(DataChannel::Mux(stream))
                 .await
                 .is_err()
@@ -907,24 +891,26 @@ where
     }
 }
 
-/// A live control channel, kept alive by holding the three channel
-/// senders: dropping the handle shuts the control channel down (each is
-/// a `Sender`, so the type carries the direction).
+#[expect(
+    clippy::struct_field_names,
+    reason = "the handle deliberately holds the three channel senders whose \
+              lifetime keeps the control channel and its pools alive"
+)]
 pub struct ControlChannelHandle {
     // Shutdown the control channel by dropping it
-    shutdown: broadcast::Sender<bool>,
-    data_channel: mpsc::Sender<DataChannel>,
+    shutdown_tx: broadcast::Sender<bool>,
+    data_ch_tx: mpsc::Sender<DataChannel>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
-    data_ch_req: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
 }
 
 impl Clone for ControlChannelHandle {
     fn clone(&self) -> Self {
         ControlChannelHandle {
-            shutdown: self.shutdown.clone(),
-            data_channel: self.data_channel.clone(),
-            data_ch_req: self.data_ch_req.clone(),
+            shutdown_tx: self.shutdown_tx.clone(),
+            data_ch_tx: self.data_ch_tx.clone(),
+            data_ch_req_tx: self.data_ch_req_tx.clone(),
         }
     }
 }
@@ -983,24 +969,6 @@ async fn bind_with_retry(service: &RegisteredService) -> Result<BoundEndpoint> {
     }
 }
 
-/// Effective data channels per visitor connection for one registration.
-///
-/// `[server.data].stripe_count` with the `multiplex` feature (plus the
-/// measurement-only environment override), and `1` without it — a build
-/// without the feature can neither produce nor consume the striped
-/// command, so the unstriped shape is the only wire it speaks.
-fn stripe_count(server_config: &ServerConfig) -> usize {
-    #[cfg(feature = "multiplex")]
-    {
-        server_config.stripe_count()
-    }
-    #[cfg(not(feature = "multiplex"))]
-    {
-        let _ = server_config;
-        1
-    }
-}
-
 impl ControlChannelHandle {
     // Create a control channel handle for an already-bound service: spawn
     // the connection pool task and the control channel handling task.
@@ -1011,7 +979,6 @@ impl ControlChannelHandle {
         bound: BoundEndpoint,
         heartbeat_interval: u64,
         pool_size: usize,
-        stripe_count: usize,
     ) -> ControlChannelHandle {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -1069,7 +1036,6 @@ impl ControlChannelHandle {
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             control_task,
-                            stripe_count,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -1084,7 +1050,6 @@ impl ControlChannelHandle {
                 info!(service = %service.name, "Listening at {}", service.bind_addr);
                 let buffer_size = service.udp_buffer_size;
                 let data_ch_req_tx = data_ch_req_tx.clone();
-                spawn_udp_stats();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_udp_connection_pool::<DataChannel>(
@@ -1107,9 +1072,9 @@ impl ControlChannelHandle {
         }
 
         ControlChannelHandle {
-            shutdown: shutdown_tx,
-            data_channel: data_ch_tx,
-            data_ch_req: data_ch_req_tx,
+            shutdown_tx,
+            data_ch_tx,
+            data_ch_req_tx,
         }
     }
 }
@@ -1172,13 +1137,6 @@ impl ControlChannel {
 
 // Accept visitors on the pre-bound listener and pair each of them with a
 // data channel from the pool.
-//
-// `stripe_count` data channels are paired per visitor: `1` is the classic
-// one-channel shape; a higher count spreads the visitor connection over
-// that many parallel channels (a stripe group, see `crate::stripe`), which
-// multiplies its ceiling and window. The unstriped path (`stripe_count`
-// 1) is the default and stays the single-variable control for the striped
-// one.
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<C>(
     l: TcpListener,
@@ -1187,7 +1145,6 @@ async fn run_tcp_connection_pool<C>(
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
-    stripe_count: usize,
 ) -> Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1220,14 +1177,11 @@ where
                     }
                 }
                 Ok((mut incoming, addr)) => {
-                    // For every visitor, request to create a data channel:
-                    // one per stripe when the visitor connection is striped.
-                    for _ in 0..stripe_count {
-                        if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                            // An error indicates the control channel is broken
-                            // So break the loop
-                            break 'pool;
-                        }
+                    // For every visitor, request to create a data channel
+                    if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                        // An error indicates the control channel is broken
+                        // So break the loop
+                        break 'pool;
                     }
 
                     backoff = backoff_builder.build();
@@ -1238,51 +1192,36 @@ where
                     // defaults as the rest of the forwarding path
                     sock_opts.apply(&incoming);
 
-                    if stripe_count <= 1 {
-                        // Pair the visitor with a data channel. A broken
-                        // channel (e.g. stale pooled one) is discarded and
-                        // replaced.
-                        loop {
-                            // A visitor can be waiting for a data channel that
-                            // will never arrive once its control channel is gone,
-                            // so this loop watches both signals too.
-                            let next = tokio::select! {
-                                _ = shutdown_rx.recv() => None,
-                                _ = &mut control_task => None,
-                                ch = data_ch_rx.recv() => ch,
-                            };
-                            let Some(mut ch) = next else {
-                                break 'pool;
-                            };
-                            if write_and_flush(&mut ch, &cmd).await.is_ok() {
-                                tokio::spawn(async move {
-                                    let _ = copy_bidirectional_with_sizes(
-                                        &mut ch,
-                                        &mut incoming,
-                                        TCP_COPY_BUFFER_SIZE,
-                                        TCP_COPY_BUFFER_SIZE,
-                                    )
-                                    .await;
-                                });
-                                break;
-                            }
-                            // Current data channel is broken. Request for a new one
-                            if data_ch_req_tx.send(true).is_err() {
-                                break 'pool;
-                            }
+                    // Pair the visitor with a data channel. A broken channel
+                    // (e.g. stale pooled one) is discarded and replaced.
+                    loop {
+                        // A visitor can be waiting for a data channel that
+                        // will never arrive once its control channel is gone,
+                        // so this loop watches both signals too.
+                        let next = tokio::select! {
+                            _ = shutdown_rx.recv() => None,
+                            _ = &mut control_task => None,
+                            ch = data_ch_rx.recv() => ch,
+                        };
+                        let Some(mut ch) = next else {
+                            break 'pool;
+                        };
+                        if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                            tokio::spawn(async move {
+                                let _ = copy_bidirectional_with_sizes(
+                                    &mut ch,
+                                    &mut incoming,
+                                    TCP_COPY_BUFFER_SIZE,
+                                    TCP_COPY_BUFFER_SIZE,
+                                )
+                                .await;
+                            });
+                            break;
                         }
-                    } else if pair_striped_group(
-                        incoming,
-                        stripe_count,
-                        &mut data_ch_rx,
-                        &data_ch_req_tx,
-                        &mut shutdown_rx,
-                        &mut control_task,
-                    )
-                    .await?
-                    {
-                        // The control channel is gone; stop the pool.
-                        break 'pool;
+                        // Current data channel is broken. Request for a new one
+                        if data_ch_req_tx.send(true).is_err() {
+                            break 'pool;
+                        }
                     }
                 }
             },
@@ -1291,89 +1230,6 @@ where
 
     info!("Shutdown");
     Ok(())
-}
-
-/// Pair one visitor connection with a stripe group: gather `stripe_count`
-/// healthy data channels, announce each one as a stripe of the group, and
-/// spawn the group's forwarding.
-///
-/// Returns `Ok(true)` when the control channel ended mid-gather (the pool
-/// must stop) and `Ok(false)` once the group is forwarding. A broken pooled
-/// channel discards the whole attempt — the client already parked the
-/// group's stripes, and a retry under a fresh group id is the only way to
-/// keep the indices consistent.
-#[instrument(skip_all, fields(stripes = stripe_count))]
-async fn pair_striped_group<C>(
-    incoming: TcpStream,
-    stripe_count: usize,
-    data_ch_rx: &mut mpsc::Receiver<C>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
-    shutdown_rx: &mut broadcast::Receiver<bool>,
-    mut control_task: &mut tokio::task::JoinHandle<()>,
-) -> Result<bool>
-where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    // Each iteration is one gather attempt under a fresh group id.
-    'gather: loop {
-        let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
-        let cmds = stripe_cmds(group, stripe_count)?;
-        let mut gathered: Vec<C> = Vec::with_capacity(stripe_count);
-        loop {
-            let next = tokio::select! {
-                _ = shutdown_rx.recv() => None,
-                _ = &mut control_task => None,
-                ch = data_ch_rx.recv() => ch,
-            };
-            let Some(mut ch) = next else {
-                return Ok(true);
-            };
-            if write_and_flush(&mut ch, &cmds[gathered.len()])
-                .await
-                .is_ok()
-            {
-                gathered.push(ch);
-                if gathered.len() == stripe_count {
-                    break;
-                }
-            } else {
-                // A broken pooled channel: drop the attempt (the client's
-                // registry reaps its parked stripes) and gather a fresh one.
-                drop(gathered);
-                for _ in 0..stripe_count {
-                    if data_ch_req_tx.send(true).is_err() {
-                        return Ok(true);
-                    }
-                }
-                continue 'gather;
-            }
-        }
-        debug!("Visitor paired with a {stripe_count}-stripe group {group}");
-        let (read, write) = incoming.into_split();
-        crate::stripe::spawn_group(read, write, gathered);
-        return Ok(false);
-    }
-}
-
-/// Group ids for striped visitor connections: wrapping is fine — a group is
-/// transient, and the client prunes abandoned ones by age.
-static GROUP_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The per-stripe `StartForwardStripedTcp` commands of one gather attempt,
-/// in arrival order. Each is 7 bytes (tag + fixed-width group id + index +
-/// count), so `write_and_flush` emits it as a single frame.
-fn stripe_cmds(group: u32, stripe_count: usize) -> Result<Vec<Vec<u8>>> {
-    (0..stripe_count)
-        .map(|i| {
-            let cmd = DataChannelCmd::StartForwardStripedTcp(
-                group.to_be_bytes(),
-                u8::try_from(i).with_context(|| "stripe index exceeds u8")?,
-                u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?,
-            );
-            let bytes = postcard::to_stdvec(&cmd)?;
-            Ok::<Vec<u8>, anyhow::Error>(bytes)
-        })
-        .collect()
 }
 
 /// Visitor-bound datagram queue into one data-channel worker.
@@ -1509,21 +1365,13 @@ where
             }
             recv = l.recv_from(&mut buf) => match recv {
                 Ok((n, from)) => {
-                    match route_udp_datagram(
+                    route_udp_datagram(
                         &workers,
                         &routes,
                         &mut next_worker,
                         from,
                         Bytes::copy_from_slice(&buf[..n]),
-                    ) {
-                        UdpRouteOutcome::Enqueued => {}
-                        UdpRouteOutcome::DroppedQueueFull => {
-                            UDP_DROPS_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
-                        }
-                        UdpRouteOutcome::DroppedNoWorker => {
-                            UDP_DROPS_NO_WORKER.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    );
                 }
                 // Linux surfaces a stale ICMP error (the recipient of an
                 // earlier datagram has gone) as ECONNREFUSED on the next
@@ -1560,78 +1408,6 @@ where
     Ok(())
 }
 
-// --- visitor-datagram drop counters (opt-in line, MOLEHILL_UDP_STATS) -------
-//
-// The single socket reader never blocks: a full worker queue drops the
-// datagram, exactly what UDP peers tolerate, instead of head-of-line blocking
-// every other visitor. That design choice had no number attached to it — the
-// drop was visible only as a `debug!` line — so "is the queue depth right?"
-// could not be answered with evidence. These counters are that number.
-//
-// They count *datagrams the server refused to enqueue*, not datagrams lost in
-// the network or by the peer: `queue_full` is the drop the design accepts,
-// `no_worker` is a datagram that arrived while no data channel was ready (the
-// registration/reconnect window), which is a different failure and is
-// separated for that reason.
-
-/// Drops because the assigned worker's queue was full.
-static UDP_DROPS_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
-/// Drops because no data channel was ready at all (registration window).
-static UDP_DROPS_NO_WORKER: AtomicU64 = AtomicU64::new(0);
-/// Guards the one-time spawn of the periodic line.
-static UDP_STATS_SPAWNED: std::sync::Once = std::sync::Once::new();
-
-/// The two drop counters, for the periodic line and for tests.
-pub(crate) fn udp_drop_stats() -> (u64, u64) {
-    (
-        UDP_DROPS_QUEUE_FULL.load(Ordering::Relaxed),
-        UDP_DROPS_NO_WORKER.load(Ordering::Relaxed),
-    )
-}
-
-/// Spawn the periodic drop line, once per process, when
-/// `MOLEHILL_UDP_STATS` is set. Cumulative counters, like the KCP ones: a
-/// reader that knows the window (or takes the first and last line of a run)
-/// gets a drop *rate*, which is the number a queue-depth decision needs.
-///
-/// Deliberately independent of the KCP stats task: the default carrier is
-/// TCP, so a run can exercise the UDP path without any KCP session existing.
-fn spawn_udp_stats() {
-    if std::env::var_os("MOLEHILL_UDP_STATS").is_none() {
-        return;
-    }
-    UDP_STATS_SPAWNED.call_once(|| {
-        tokio::spawn(async {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let (queue_full, no_worker) = udp_drop_stats();
-                info!(
-                    queue_full,
-                    no_worker, "udp-stats: cumulative visitor-datagram drops"
-                );
-            }
-        });
-    });
-}
-
-/// What routing one visitor datagram did.
-///
-/// Returned rather than only counted, so the decision is testable without
-/// touching the process-global counters: a counter that can only be asserted
-/// on racily (several tests routing through the same statics in parallel) is a
-/// counter nobody can prove works. The caller counts the outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UdpRouteOutcome {
-    /// Handed to the peer's data channel (sticky or freshly assigned).
-    Enqueued,
-    /// The assigned channel's queue was full — the loss this design accepts.
-    DroppedQueueFull,
-    /// No data channel was ready (the registration/reconnect window).
-    DroppedNoWorker,
-}
-
 /// Send one visitor datagram to the data channel assigned to its source
 /// address, assigning (or re-assigning after a worker died) on the fly.
 ///
@@ -1644,7 +1420,7 @@ fn route_udp_datagram(
     next_worker: &mut usize,
     from: SocketAddr,
     mut data: Bytes,
-) -> UdpRouteOutcome {
+) {
     let now = Instant::now();
     let mut routes = routes.lock().unwrap_or_else(PoisonError::into_inner);
     let workers = workers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1656,11 +1432,11 @@ fn route_udp_datagram(
         match tx.try_send((from, data)) {
             Ok(()) => {
                 route.last_seen = now;
-                return UdpRouteOutcome::Enqueued;
+                return;
             }
             Err(TrySendError::Full(_)) => {
                 debug!("UDP worker queue full, dropping a datagram from {from}");
-                return UdpRouteOutcome::DroppedQueueFull;
+                return;
             }
             Err(TrySendError::Closed((_, back))) => {
                 // The assigned worker died; re-assign below.
@@ -1672,12 +1448,12 @@ fn route_udp_datagram(
     // (Re-)assign the peer to a worker, round-robin over the live ones.
     if workers.is_empty() {
         debug!("No UDP data channel is ready, dropping a datagram from {from}");
-        return UdpRouteOutcome::DroppedNoWorker;
+        return;
     }
     let idx = *next_worker % workers.len();
     *next_worker = next_worker.wrapping_add(1);
     let Some((id, tx)) = workers.iter().nth(idx).map(|(id, tx)| (*id, tx.clone())) else {
-        return UdpRouteOutcome::DroppedNoWorker; // Unreachable: the map is non-empty.
+        return; // Unreachable: the map is non-empty.
     };
     debug!("UDP peer {from} assigned to data channel {id}");
     routes.insert(
@@ -1687,14 +1463,8 @@ fn route_udp_datagram(
             last_seen: now,
         },
     );
-    match tx.try_send((from, data)) {
-        Ok(()) => UdpRouteOutcome::Enqueued,
-        Err(e) => {
-            // The freshly assigned channel refused it: same class as a full
-            // queue (a closed one loses the race with the worker's death).
-            debug!("Dropped a datagram from {from}: {e}");
-            UdpRouteOutcome::DroppedQueueFull
-        }
+    if let Err(e) = tx.try_send((from, data)) {
+        debug!("Dropped a datagram from {from}: {e}");
     }
 }
 
@@ -1840,71 +1610,6 @@ mod tests {
         let table = routes.lock().unwrap();
         assert_eq!(table.len(), 1);
         assert!(table.contains_key(&peer(1000)));
-    }
-
-    /// Routing reports *what it did*; the caller counts it. Asserting the
-    /// outcome keeps this deterministic — the counters are process-global and
-    /// several tests route through them in parallel, so the outcome, not the
-    /// static, is what a unit test can prove.
-    #[test]
-    fn routing_reports_each_drop_reason() {
-        // A worker with capacity 1: the second datagram for the same peer is
-        // refused by the queue.
-        let workers = Arc::new(Mutex::new(HashMap::new()));
-        let routes = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel(1);
-        workers.lock().unwrap().insert(0, tx);
-        let mut next = 0;
-
-        assert_eq!(
-            route_udp_datagram(
-                &workers,
-                &routes,
-                &mut next,
-                peer(4000),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::Enqueued
-        );
-        assert_eq!(
-            route_udp_datagram(
-                &workers,
-                &routes,
-                &mut next,
-                peer(4000),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::DroppedQueueFull,
-            "a full queue must say so"
-        );
-        // The queued datagram is still there: the drop decision lost nothing.
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err());
-
-        // No live channel at all is a different reason, and says so.
-        let empty: Arc<UdpWorkerMap> = Arc::new(Mutex::new(HashMap::new()));
-        assert_eq!(
-            route_udp_datagram(
-                &empty,
-                &routes,
-                &mut next,
-                peer(4100),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::DroppedNoWorker
-        );
-    }
-
-    /// The opt-in line exists so the design's accepted loss has a number; the
-    /// counters it reads must therefore be wired to the outcomes above.
-    #[test]
-    fn drop_counters_track_their_reason() {
-        let (full0, none0) = udp_drop_stats();
-        UDP_DROPS_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(udp_drop_stats().0, full0 + 1);
-        assert_eq!(udp_drop_stats().1, none0);
-        UDP_DROPS_NO_WORKER.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(udp_drop_stats().1, none0 + 1);
     }
 
     #[test]

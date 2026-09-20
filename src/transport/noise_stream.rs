@@ -20,9 +20,7 @@
 //!   plaintext staged and served progressively;
 //! - writes encrypt straight into the framing buffer behind the two-byte
 //!   header and address it by index — no per-record `set_len` dance, and no
-//!   `unsafe` anywhere in this module. A transport that takes owned records
-//!   (`AsyncWriteOwned`, KCP's writer channel) gets the record as one
-//!   `Bytes` instead, which removes the copy at its write boundary;
+//!   `unsafe` anywhere in this module;
 //! - the setup path allocates almost nothing: the handshake runs on stack
 //!   buffers (its messages are bounded by the pattern's tokens, well under
 //!   300 bytes), and the three 64 KiB record buffers come from a bounded
@@ -48,41 +46,7 @@ use pin_project::pin_project;
 use snow::{HandshakeState, TransportState};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use bytes::{Bytes, BytesMut};
-
-use crate::common::owned_write::AsyncWriteOwned;
-use crate::transport::noise_resume::ResumedCipher;
-
 const TAG_LEN: usize = 16;
-/// The record cipher of an established stream: the handshake-derived
-/// stateful transport state, or the symmetric-only state of a resumed
-/// session (`noise_resume`).
-enum RecordCipher {
-    Snow(TransportState),
-    Resumed(ResumedCipher),
-}
-
-impl RecordCipher {
-    /// Encrypt one record into `out`, returning its wire length.
-    fn encrypt(&mut self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, snow::Error> {
-        match self {
-            RecordCipher::Snow(t) => t.write_message(plaintext, out),
-            RecordCipher::Resumed(c) => c.encrypt(plaintext, out).map_err(|_| {
-                snow::Error::Input // a record buffer sizing bug: impossible on a sized record
-            }),
-        }
-    }
-
-    /// Decrypt one record into `out`, returning its plaintext length.
-    fn decrypt(&mut self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, snow::Error> {
-        match self {
-            RecordCipher::Snow(t) => t.read_message(ciphertext, out),
-            RecordCipher::Resumed(c) => {
-                c.decrypt(ciphertext, out).map_err(|_| snow::Error::Decrypt)
-            }
-        }
-    }
-}
 /// Largest Noise message: the wire format carries a `u16` length.
 const MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 /// Bound for a *handshake* message (not a record): every pattern the
@@ -211,7 +175,7 @@ enum ReadState {
     ShuttingDown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum WriteState {
     Idle,
     /// The record `write[start..end]` is being written to
@@ -219,14 +183,6 @@ enum WriteState {
     WritingMessage {
         start: usize,
         end: usize,
-        payload_len: usize,
-    },
-    /// An owned record in flight on a `TAKES_OWNED` transport: the
-    /// transport has accepted `offset` bytes of `record` (header +
-    /// ciphertext), which carries `payload_len` plaintext bytes.
-    WritingOwned {
-        record: Bytes,
-        offset: usize,
         payload_len: usize,
     },
     ShuttingDown,
@@ -237,7 +193,7 @@ pub struct NoiseStream<T> {
     #[pin]
     inner: T,
 
-    transport: RecordCipher,
+    transport: TransportState,
     read_state: ReadState,
     write_state: WriteState,
     write_clean_waker: Option<Waker>,
@@ -283,7 +239,7 @@ where
         mut inner: T,
         mut state: HandshakeState,
         verifier: F,
-    ) -> Result<(Self, Vec<u8>), NoiseStreamError> {
+    ) -> Result<Self, NoiseStreamError> {
         let mut f = Some(verifier);
         // Handshake messages are bounded by the pattern's tokens: at most
         // three key exchanges (≤ 56 bytes each for X448) plus tags and at
@@ -301,42 +257,32 @@ where
         let bufs = RecordBuffers::take();
         loop {
             if state.is_handshake_finished() {
-                // Captured before the state is consumed: the session's
-                // handshake hash is the cached secret a later resume
-                // proves possession of (`noise_resume`).
-                let handshake_hash = state.get_handshake_hash().to_vec();
-                let transport = RecordCipher::Snow(state.into_transport_mode()?);
-                return Ok((
-                    Self {
-                        inner,
-                        transport,
-                        read_state: ReadState::ReadingRecord,
-                        write_state: WriteState::Idle,
-                        write_clean_waker: None,
-                        bufs,
-                        read_start: 0,
-                        read_filled: 0,
-                        read_expected: UNKNOWN_FRAME_LEN,
-                        payload_len: 0,
-                    },
-                    handshake_hash,
-                ));
+                let transport = state.into_transport_mode()?;
+                return Ok(Self {
+                    inner,
+                    transport,
+                    read_state: ReadState::ReadingRecord,
+                    write_state: WriteState::Idle,
+                    write_clean_waker: None,
+                    bufs,
+                    read_start: 0,
+                    read_filled: 0,
+                    read_expected: UNKNOWN_FRAME_LEN,
+                    payload_len: 0,
+                });
             }
 
             if state.is_my_turn() {
                 let len = state.write_message(&[], &mut message)?;
-                // The u16 length field is the wire format's own bound and
-                // snow rejects a larger message, so the conversion cannot
-                // fail; an impossible failure surfaces as a stream error
-                // rather than a panic.
-                let len = u16::try_from(len).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "noise message length exceeds the u16 wire format",
-                    )
-                })?;
-                inner.write_u16_le(len).await?;
-                inner.write_all(&message[..usize::from(len)]).await?;
+                // Lengths are bounded by MAX_MESSAGE_LEN (u16::MAX):
+                // snow rejects larger messages, so the cast cannot
+                // truncate.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "message length is bounded by the u16 wire format"
+                )]
+                inner.write_u16_le(len as u16).await?;
+                inner.write_all(&message[..len]).await?;
                 inner.flush().await?;
             } else {
                 let len = inner.read_u16_le().await? as usize;
@@ -357,94 +303,15 @@ where
         }
     }
 
-    /// Run the handshake, returning the stream and the session's
-    /// handshake hash (the cached secret a resume proves possession of).
-    async fn handshake_with_hash(
-        inner: T,
-        state: HandshakeState,
-    ) -> Result<(Self, Vec<u8>), NoiseStreamError> {
-        Self::handshake_with_verifier(inner, state, |_| Ok(())).await
-    }
-
-    /// The plain handshake: no verifier, no resume material. Production
-    /// callers use the resume-aware variants below; this one remains the
-    /// simplest form (and the one the unit tests drive).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production connections run the resume-aware variants"
-        )
-    )]
     #[inline]
     pub async fn handshake(inner: T, state: HandshakeState) -> Result<Self, NoiseStreamError> {
-        let (stream, _hash) = Self::handshake_with_hash(inner, state).await?;
-        Ok(stream)
-    }
-
-    /// Run the initiator's side of a full handshake and then the resume
-    /// ticket exchange, caching the ticket under the server's static key.
-    /// The resulting stream is an ordinary handshake-derived one.
-    pub async fn handshake_and_take_ticket(
-        inner: T,
-        state: HandshakeState,
-        cache: &crate::transport::noise_resume::ClientResumeCache,
-        server_static: &[u8],
-    ) -> Result<Self, NoiseStreamError>
-    where
-        T: AsyncWriteOwned,
-    {
-        let (mut stream, handshake_hash) = Self::handshake_with_hash(inner, state).await?;
-        if !server_static.is_empty() {
-            crate::transport::noise_resume::client_take_ticket(
-                &mut stream,
-                cache,
-                server_static,
-                &handshake_hash,
-            )
-            .await?;
-        }
-        Ok(stream)
-    }
-
-    /// Run the responder's side of a full handshake and then the ticket
-    /// exchange, issuing a ticket when resume is configured.
-    pub async fn handshake_and_issue_ticket(
-        inner: T,
-        state: HandshakeState,
-        store: Option<&crate::transport::noise_resume::ServerResumeStore>,
-    ) -> Result<Self, NoiseStreamError>
-    where
-        T: AsyncWriteOwned,
-    {
-        let (mut stream, handshake_hash) = Self::handshake_with_hash(inner, state).await?;
-        crate::transport::noise_resume::server_issue_ticket(&mut stream, store, &handshake_hash)
-            .await?;
-        Ok(stream)
-    }
-
-    /// Build a stream that speaks a resumed session's record cipher. The
-    /// exchange itself (`noise_resume::client_resume` /
-    /// `server_resume`) ran on the raw socket before this point.
-    pub(crate) fn from_resumed(inner: T, cipher: ResumedCipher) -> Self {
-        Self {
-            inner,
-            transport: RecordCipher::Resumed(cipher),
-            read_state: ReadState::ReadingRecord,
-            write_state: WriteState::Idle,
-            write_clean_waker: None,
-            bufs: RecordBuffers::take(),
-            read_start: 0,
-            read_filled: 0,
-            read_expected: UNKNOWN_FRAME_LEN,
-            payload_len: 0,
-        }
+        Self::handshake_with_verifier(inner, state, |_| Ok(())).await
     }
 }
 
 impl<T> AsyncWrite for NoiseStream<T>
 where
-    T: AsyncWriteOwned,
+    T: AsyncWrite,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -458,60 +325,26 @@ where
         let write_message_buffer = &mut this.bufs.write;
 
         loop {
-            match state {
+            match *state {
                 WriteState::ShuttingDown => {
                     return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
                 }
                 WriteState::Idle => {
                     let payload_len = buf.len().min(MAX_MESSAGE_LEN - TAG_LEN);
-                    if payload_len > 0 && T::TAKES_OWNED {
-                        // The owned-record path: encrypt into a fresh
-                        // buffer and hand the whole record to the
-                        // transport by ownership. The channel boundary
-                        // copy disappears — the record buffer *is* the
-                        // transport's buffer — and the only copy left on
-                        // this path is the AEAD's own. `zeroed` pays one
-                        // memset the encrypt immediately overwrites; the
-                        // alternative (uninitialized memory handed to the
-                        // cipher) is not worth an unsafe block here.
-                        let mut record = BytesMut::zeroed(LENGTH_FIELD_LEN + payload_len + TAG_LEN);
-                        let message_len = transport
-                            .encrypt(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                        // `message_len` is bounded by MAX_MESSAGE_LEN
-                        // (u16::MAX); an impossible overrun is an error,
-                        // not a truncated record.
-                        let len = u16::try_from(message_len).map_err(|_| {
-                            std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                "noise record length exceeds the u16 wire format",
-                            )
-                        })?;
-                        record[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
-                        record.truncate(LENGTH_FIELD_LEN + message_len);
-                        *state = WriteState::WritingOwned {
-                            record: record.freeze(),
-                            offset: 0,
-                            payload_len,
-                        };
-                        continue;
-                    }
                     let message_len = transport
-                        .encrypt(
+                        .write_message(
                             &buf[..payload_len],
                             &mut write_message_buffer[LENGTH_FIELD_LEN..],
                         )
                         .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                     // `message_len` is bounded by MAX_MESSAGE_LEN
-                    // (u16::MAX); an impossible overrun is an error, not
-                    // a truncated record.
-                    let len = u16::try_from(message_len).map_err(|_| {
-                        std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "noise record length exceeds the u16 wire format",
-                        )
-                    })?;
-                    write_message_buffer[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
+                    // (u16::MAX), so the cast cannot truncate.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "message length is bounded by the u16 wire format"
+                    )]
+                    write_message_buffer[..LENGTH_FIELD_LEN]
+                        .copy_from_slice(&(message_len as u16).to_le_bytes());
                     *state = WriteState::WritingMessage {
                         start: 0,
                         end: LENGTH_FIELD_LEN + message_len,
@@ -523,9 +356,6 @@ where
                     end,
                     payload_len,
                 } => {
-                    // Copy the small fields out so the state can be
-                    // re-assigned below (the match holds a borrow of it).
-                    let (start, end, payload_len) = (*start, *end, *payload_len);
                     let n = ready!(
                         Pin::new(&mut inner).poll_write(cx, &write_message_buffer[start..end])
                     )?;
@@ -544,30 +374,6 @@ where
                         payload_len,
                     };
                 }
-                WriteState::WritingOwned {
-                    record,
-                    offset,
-                    payload_len,
-                } => {
-                    // The `Bytes` handle clone is O(1); the copy ends the
-                    // borrow of the state so it can be re-assigned below.
-                    let (record, offset, payload_len) = (record.clone(), *offset, *payload_len);
-                    let n = ready!(inner.as_mut().poll_write_owned(cx, record.slice(offset..)))?;
-                    let offset = offset + n;
-
-                    if offset == record.len() {
-                        *state = WriteState::Idle;
-                        if let Some(waker) = this.write_clean_waker.take() {
-                            waker.wake();
-                        }
-                        return Poll::Ready(Ok(payload_len));
-                    }
-                    *state = WriteState::WritingOwned {
-                        record,
-                        offset,
-                        payload_len,
-                    };
-                }
             }
         }
     }
@@ -578,7 +384,7 @@ where
             WriteState::ShuttingDown | WriteState::Idle => {
                 return Poll::Ready(Ok(()));
             }
-            WriteState::WritingMessage { .. } | WriteState::WritingOwned { .. } => {}
+            WriteState::WritingMessage { .. } => {}
         }
 
         *this.write_clean_waker = Some(cx.waker().clone());
@@ -679,7 +485,7 @@ where
                             // a memset for `ReadBuf::uninit` callers.
                             let out = read_buf.initialize_unfilled_to(plaintext_len);
                             let n = transport
-                                .decrypt(ciphertext, out)
+                                .read_message(ciphertext, out)
                                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                             if n > 0 {
                                 read_buf.advance(n);
@@ -694,7 +500,7 @@ where
                         // the record is empty): stage the plaintext and
                         // serve it progressively.
                         let n = transport
-                            .decrypt(ciphertext, &mut this.bufs.payload[..])
+                            .read_message(ciphertext, &mut this.bufs.payload[..])
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         *this.payload_len = n;
                         if n > 0 {
@@ -746,48 +552,6 @@ mod tests {
     use snow::Builder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
-    impl AsyncWriteOwned for tokio::io::DuplexStream {}
-
-    /// A duplex wrapper that opts into the owned-record path, so the
-    /// existing round-trip tests exercise `TAKES_OWNED = true` end to end.
-    struct OwnedDuplex(tokio::io::DuplexStream);
-
-    impl AsyncWriteOwned for OwnedDuplex {
-        const TAKES_OWNED: bool = true;
-    }
-
-    impl AsyncRead for OwnedDuplex {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncWrite for OwnedDuplex {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
-        }
-        fn poll_flush(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_flush(cx)
-        }
-        fn poll_shutdown(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
-        }
-    }
-
     async fn pair() -> (
         NoiseStream<tokio::io::DuplexStream>,
         NoiseStream<tokio::io::DuplexStream>,
@@ -804,45 +568,10 @@ mod tests {
         (c.unwrap(), s.unwrap())
     }
 
-    /// A `pair` over the owned-record path: the client's writes encrypt
-    /// into a fresh buffer and cross as one owned `Bytes` per record.
-    async fn owned_pair() -> (NoiseStream<OwnedDuplex>, NoiseStream<OwnedDuplex>) {
-        let (a, b) = duplex(1024 * 1024);
-        let params: snow::params::NoiseParams =
-            "Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let init = Builder::new(params.clone()).build_initiator().unwrap();
-        let resp = Builder::new(params).build_responder().unwrap();
-        let (c, s) = tokio::join!(
-            NoiseStream::handshake(OwnedDuplex(a), init),
-            NoiseStream::handshake(OwnedDuplex(b), resp)
-        );
-        (c.unwrap(), s.unwrap())
-    }
-
     #[tokio::test]
     async fn roundtrip_sizes() {
         let (mut c, mut s) = pair().await;
         for size in [1usize, 100, 1000, 16 * 1024, 32 * 1024, 65519, 65535, 70000] {
-            let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
-            c.write_all(&data).await.unwrap();
-            c.flush().await.unwrap();
-            let mut buf = vec![0; size];
-            s.read_exact(&mut buf).await.unwrap();
-            assert_eq!(buf, data, "size {size}");
-        }
-    }
-
-    #[tokio::test]
-    async fn roundtrip_sizes_through_the_owned_record_path() {
-        // Same byte-stream contract as `roundtrip_sizes`, but every write
-        // takes the owned-record path (encrypt into a fresh buffer, hand
-        // the record to the transport by ownership). The record state
-        // machine's partial-write bookkeeping is exercised by the sizes
-        // that exceed one `poll_write` (the duplex buffer is 1 MiB, so
-        // this drives the single-write completion path; the 64 KiB+ sizes
-        // cross the Noise record split and the staging path together).
-        let (mut c, mut s) = owned_pair().await;
-        for size in [1usize, 100, 1000, 16 * 1024, 32 * 1024, 65519, 70000] {
             let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 251).unwrap()).collect();
             c.write_all(&data).await.unwrap();
             c.flush().await.unwrap();
@@ -918,108 +647,6 @@ mod tests {
         assert_eq!(&buf, &[1, 2, 3]);
     }
 
-    /// Phase-level attribution of the connection-setup cost.
-    ///
-    /// **Run in release mode** (`cargo test --release`): curve25519-dalek
-    /// is 50-100x slower in debug, so the absolute numbers here say
-    /// nothing about production. What the phases show is the *split*:
-    /// which turns carry the DH exchanges (in this pattern: `es` on the
-    /// initiator's first turn, `ee` on the responder's, `ss` on the
-    /// initiator's second) and what the symmetric-only remainder is.
-    ///
-    /// That split is the input for a session-resume design: resume
-    /// replaces the DH turns with a cached-secret proof, so the
-    /// removable share is the sum of the DH turns.
-    #[test]
-    fn handshake_phase_attribution() {
-        use snow::params::NoiseParams;
-        use std::time::Instant;
-
-        // The production default pattern: the client knows the server's
-        // static key (NK), the server holds it (configured, generated once
-        // here exactly like a config-loaded key).
-        const N: usize = 500;
-        let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let server_keypair = Builder::new(params.clone()).generate_keypair().unwrap();
-        let server_private = server_keypair.private;
-        let server_public = server_keypair.public;
-        let mut msg = [0u8; MAX_HANDSHAKE_MESSAGE];
-        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
-
-        // (a) Initiator turn 1: build + write message 1 (`e`, `es` -> 1 DH).
-        let mut build_us = 0f64;
-        let mut init_turn1_us = 0f64;
-        for _ in 0..N {
-            let t = Instant::now();
-            let mut init = Builder::new(params.clone())
-                .remote_public_key(&server_public)
-                .unwrap()
-                .build_initiator()
-                .unwrap();
-            build_us += t.elapsed().as_secs_f64() * 1e6;
-            let t = Instant::now();
-            let len = init.write_message(&[], &mut msg).unwrap();
-            init_turn1_us += t.elapsed().as_secs_f64() * 1e6;
-            assert!(len > 0);
-        }
-        // (b) Responder turn: read message 1, write message 2 (`e`, `ee`).
-        let mut resp_turn_us = 0f64;
-        // (c) Initiator turn 2: read message 2, write message 3 (`s`, `ss`).
-        let mut init_turn2_us = 0f64;
-        // (d) Responder finish: read message 3, into transport mode.
-        let mut resp_finish_us = 0f64;
-        for _ in 0..N {
-            let mut init = Builder::new(params.clone())
-                .remote_public_key(&server_public)
-                .unwrap()
-                .build_initiator()
-                .unwrap();
-            let len = init.write_message(&[], &mut msg).unwrap();
-            let msg1 = msg[..len].to_vec();
-
-            let t = Instant::now();
-            let mut resp = Builder::new(params.clone())
-                .local_private_key(&server_private)
-                .unwrap()
-                .build_responder()
-                .unwrap();
-            resp.read_message(&msg1, &mut payload).unwrap();
-            let len = resp.write_message(&[], &mut msg).unwrap();
-            resp_turn_us += t.elapsed().as_secs_f64() * 1e6;
-            let msg2 = msg[..len].to_vec();
-
-            // NK is a two-message pattern: the initiator's last act is
-            // reading message 2, the responder's is writing it.
-            let t = Instant::now();
-            init.read_message(&msg2, &mut payload).unwrap();
-            assert!(init.is_handshake_finished());
-            init_turn2_us += t.elapsed().as_secs_f64() * 1e6;
-
-            let t = Instant::now();
-            assert!(resp.is_handshake_finished());
-            let _transport = resp.into_transport_mode().unwrap();
-            resp_finish_us += t.elapsed().as_secs_f64() * 1e6;
-        }
-        // `per` divides by N; converting the loop count through u32 keeps
-        // the division exact (N is far below 2^32).
-        let per = |us_total: f64| us_total / f64::from(u32::try_from(N).unwrap_or(u32::MAX));
-        eprintln!(
-            "handshake phase attribution (release build, N={N}):\n  \
-             build_initiator:        {:7.2} us\n  \
-             initiator turn1 (e,es): {:7.2} us\n  \
-             responder turn (e,ee):  {:7.2} us\n  \
-             initiator turn2 (read ee): {:7.2} us\n  \
-             responder finish:       {:7.2} us\n  \
-             state-machine sum:      {:7.2} us",
-            per(build_us),
-            per(init_turn1_us),
-            per(resp_turn_us),
-            per(init_turn2_us),
-            per(resp_finish_us),
-            per(build_us + init_turn1_us + resp_turn_us + init_turn2_us + resp_finish_us),
-        );
-    }
-
     #[tokio::test]
     async fn pooled_buffers_do_not_leak_stale_bytes() {
         // Cycle the pool: every pair takes a buffer set that a previous
@@ -1033,147 +660,5 @@ mod tests {
             s.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, payload, "round {round}");
         }
-    }
-
-    /// Time N full-handshake pairs (with the ticket exchange) and
-    /// return the per-pair microseconds.
-    fn time_full_pairs(
-        rt: &tokio::runtime::Runtime,
-        params: &snow::params::NoiseParams,
-        server_keypair: &snow::Keypair,
-        store: &std::sync::Arc<crate::transport::noise_resume::ServerResumeStore>,
-        cache: &std::sync::Arc<crate::transport::noise_resume::ClientResumeCache>,
-        n: usize,
-    ) -> f64 {
-        let mut total_us = 0f64;
-        for _ in 0..n {
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let store = std::sync::Arc::clone(store);
-            let cache = std::sync::Arc::clone(cache);
-            let params = params.clone();
-            let server_static = server_keypair.public.clone();
-            let server_private = server_keypair.private.clone();
-            let started = std::time::Instant::now();
-            rt.block_on(async move {
-                let (client_stream, server_stream) = tokio::join!(
-                    NoiseStream::handshake_and_take_ticket(
-                        client_io,
-                        Builder::new(params.clone())
-                            .remote_public_key(&server_static)
-                            .unwrap()
-                            .build_initiator()
-                            .unwrap(),
-                        &cache,
-                        &server_static,
-                    ),
-                    NoiseStream::handshake_and_issue_ticket(
-                        server_io,
-                        Builder::new(params)
-                            .local_private_key(&server_private)
-                            .unwrap()
-                            .build_responder()
-                            .unwrap(),
-                        Some(&store),
-                    )
-                );
-                client_stream.unwrap();
-                server_stream.unwrap();
-            });
-            total_us += started.elapsed().as_secs_f64() * 1e6;
-        }
-        // Dividing by the pair count through u32 keeps the division
-        // exact (n is far below 2^32).
-        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
-    }
-
-    /// Time N resumed exchanges and return the per-pair microseconds.
-    fn time_resumed_pairs(
-        rt: &tokio::runtime::Runtime,
-        store: &std::sync::Arc<crate::transport::noise_resume::ServerResumeStore>,
-        cache: &std::sync::Arc<crate::transport::noise_resume::ClientResumeCache>,
-        server_static: &[u8],
-        n: usize,
-    ) -> f64 {
-        let mut total_us = 0f64;
-        for _ in 0..n {
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let store = std::sync::Arc::clone(store);
-            let cache = std::sync::Arc::clone(cache);
-            let server_static = server_static.to_vec();
-            let request =
-                crate::transport::noise_resume::ResumeRequest::build(&cache, &server_static)
-                    .unwrap()
-                    .unwrap();
-            let started = std::time::Instant::now();
-            rt.block_on(async move {
-                let (_, _) = tokio::join!(
-                    async {
-                        let mut client_io = client_io;
-                        client_io
-                            .write_all(&[crate::transport::noise_resume::NOISE_RESUME_SELECTOR])
-                            .await
-                            .unwrap();
-                        crate::transport::noise_resume::client_resume(
-                            &mut client_io,
-                            &request,
-                            &cache,
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap()
-                    },
-                    async {
-                        let mut server_io = server_io;
-                        server_io.read_u8().await.unwrap(); // the selector
-                        crate::transport::noise_resume::server_resume(&mut server_io, &store)
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    }
-                );
-            });
-            total_us += started.elapsed().as_secs_f64() * 1e6;
-        }
-        // Dividing by the pair count through u32 keeps the division
-        // exact (n is far below 2^32).
-        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
-    }
-
-    /// Setup-cost comparison for the session-resume path (release mode —
-    /// see `handshake_phase_attribution`): a full-handshake pair (with
-    /// the ticket exchange) versus a resumed pair, both over a tokio
-    /// duplex so the exchange records and the IO are included. The DH
-    /// turns are what the resume removes.
-    #[test]
-    fn resume_setup_cost() {
-        use crate::transport::noise_resume::{ClientResumeCache, ServerResumeStore};
-
-        const N: usize = 200;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let params: snow::params::NoiseParams =
-            "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let server_keypair = Builder::new(params.clone()).generate_keypair().unwrap();
-        let store = std::sync::Arc::new(ServerResumeStore::new(&server_keypair.private));
-        let cache = std::sync::Arc::new(ClientResumeCache::default());
-
-        // One full pair with the ticket exchange, timed. The cache is
-        // kept across repetitions, like a long-lived client's.
-        let full = time_full_pairs(&rt, &params, &server_keypair, &store, &cache, N);
-        // Then N resumed exchanges from the cached ticket.
-        let resumed = time_resumed_pairs(&rt, &store, &cache, &server_keypair.public, N);
-
-        eprintln!(
-            "resume setup cost (release build, N={N}):\n  \
-             full handshake + ticket: {:7.2} us\n  \
-             resumed exchange:        {:7.2} us\n  \
-             saving:                  {:7.2} us",
-            full,
-            resumed,
-            full - resumed,
-        );
-        assert!(resumed < full, "the resume path did not remove the DH cost");
     }
 }

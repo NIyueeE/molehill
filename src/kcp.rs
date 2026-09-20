@@ -13,26 +13,13 @@
 //! - the SACK extensions the adapter uses (`Kcp::retransmit_sn`,
 //!   `Kcp::recv_queue_len`, `Kcp::rcv_nxt_sn`) add explicit gap recovery
 //!   beyond the reference;
-//! - `flush()` closes with one `Write::flush` call on the output, which
-//!   the reference never makes: the adapter uses it as the batch boundary
-//!   for its outbound datagrams (see `DatagramOut` in
-//!   `src/transport/kcp.rs`), and `Write::flush`'s default no-op keeps any
-//!   other output user unaffected;
-//! - stream-mode PUSH datagrams are emitted through
-//!   [`DatagramSink::write_datagram`] — a 24-byte header plus the segment's
-//!   own payload buffer by reference — so the engine's staging buffer and
-//!   the adapter's copy of the datagram both disappear on the send path;
-//!   a plain `Write` output keeps the default (pack, then write once),
-//!   which is byte-identical on the wire;
 //! - the reference's `IKCP_FASTACK_CONSERVE` semantics are implemented
 //!   unconditionally (the reference's shipped default: fast-retransmit
 //!   credit is gated on the ack timestamp);
 //! - `check()` returns a relative duration instead of the reference's
 //!   absolute timestamp (the adapter adds it to its own clock);
 //! - the `tokio`-feature code and the unused accessor methods are trimmed
-//!   (datagram mode, `set_interval`, the conv-adoption hook); `mtu` is the
-//!   one accessor kept back, because the adapter shrinks the datagram size to
-//!   the path MTU the kernel reports (`shrink_mtu`, see `transport::kcp`);
+//!   (datagram mode, `set_mtu`, `set_interval`, the conv-adoption hook);
 //! - buffers are grown through the safe `BytesMut::zeroed` instead of
 //!   `unsafe` length manipulation;
 //! - errors are molehill's own `Error` type.
@@ -54,7 +41,7 @@ use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::io::{self, Cursor, Read, Write};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 use log::{debug, trace};
 
@@ -88,45 +75,6 @@ const KCP_PROBE_INIT: u32 = 5000; // 5 secs to probe window size
 const KCP_PROBE_LIMIT: u32 = 120_000; // up to 120 secs to probe window
 const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
-// --- path statistics (opt-in) -------------------------------------------
-//
-// Cumulative counters for the KCP data path, read periodically when
-// `MOLEHILL_KCP_STATS=1` — the attribution tool the mux framing counters
-// provide for that engine: datagram rates beside the measured CPU turn a
-// throughput number into cost-per-datagram, which separates "the engine
-// does too much work per datagram" from "there are too many datagrams"
-// (the kcp4 arm runs ~1400-byte datagrams where TCP runs kernel-side
-// segmentation). A relaxed atomic add per datagram costs a few
-// nanoseconds against the datagram's own cost, and the counters are only
-// read by the adapter's stats task.
-
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-/// Datagrams accepted from the peer (one `input` call each).
-pub(crate) static KCP_DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
-/// Datagrams the engine emitted (`flush`/`update` output writes).
-pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
-/// Segment retransmissions: RTO-expired and fast-resend alike (a
-/// SACK-marked resend flows through the RTO path). Each one is a loss
-/// event with exact timing — feeding it to the pacer as a congestion
-/// signal was tried on 2026-09-23 and dropped by measurement (the cut
-/// outruns the PONG-probe recovery; see HANDOFF.md, "Phase 2 A/B —
-/// DROPPED"), so today this is an attribution counter: a rising rate is
-/// how a collapsing cell is recognized in a stats line.
-pub(crate) static KCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
-/// Ack entries sent to the peer (several may share one datagram).
-pub(crate) static KCP_ACKS_OUT: AtomicU64 = AtomicU64::new(0);
-
-/// Snapshot of the engine-side counters, for the periodic stats line.
-pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64) {
-    (
-        KCP_DATAGRAMS_IN.load(Relaxed),
-        KCP_DATAGRAMS_OUT.load(Relaxed),
-        KCP_RETRANSMITS.load(Relaxed),
-        KCP_ACKS_OUT.load(Relaxed),
-    )
-}
-
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
     assert!(buf.len() >= KCP_OVERHEAD);
@@ -158,17 +106,11 @@ struct KcpSegment {
     rto: u32,
     fastack: u32,
     xmit: u32,
-    /// The payload as an owned shared buffer: `Bytes` (not `BytesMut`) so a
-    /// datagram emission can hand the segment's own buffer to the output by
-    /// reference (an O(1) handle clone) instead of copying it through the
-    /// staging buffer — the send path's zero-copy half. The stream-mode
-    /// append path in `send` rebuilds the partial segment, which costs one
-    /// small copy per merge but keeps the bulk path allocation-light.
-    data: Bytes,
+    data: BytesMut,
 }
 
 impl KcpSegment {
-    fn new_with_data(data: Bytes) -> Self {
+    fn new_with_data(data: BytesMut) -> Self {
         KcpSegment {
             conv: 0,
             cmd: 0,
@@ -185,6 +127,12 @@ impl KcpSegment {
         }
     }
 
+    // The payload length is bounded by `mss` (≤ `mtu` − `KCP_OVERHEAD`), so
+    // the u32 wire field cannot truncate.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "payload length is bounded by `mss`, so the u32 wire field cannot truncate"
+    )]
     fn encode(&self, buf: &mut BytesMut) {
         assert!(
             buf.remaining_mut() >= self.encoded_len(),
@@ -194,52 +142,20 @@ impl KcpSegment {
             self
         );
 
-        buf.put_slice(&self.encode_header());
+        buf.put_u32_le(self.conv);
+        buf.put_u8(self.cmd);
+        buf.put_u8(self.frg);
+        buf.put_u16_le(self.wnd);
+        buf.put_u32_le(self.ts);
+        buf.put_u32_le(self.sn);
+        buf.put_u32_le(self.una);
+        buf.put_u32_le(self.data.len() as u32);
         buf.put_slice(&self.data);
-    }
-
-    /// Encode only the fixed header (no payload) into `out`.
-    ///
-    /// The `len` field is the payload length, so the wire bytes are exactly
-    /// the head of what `encode` would write. This is the two-iovec send
-    /// path's half that travels through staging.
-    fn encode_header(&self) -> [u8; KCP_OVERHEAD] {
-        let mut out = [0u8; KCP_OVERHEAD];
-        out[0..4].copy_from_slice(&self.conv.to_le_bytes());
-        out[4] = self.cmd;
-        out[5] = self.frg;
-        out[6..8].copy_from_slice(&self.wnd.to_le_bytes());
-        out[8..12].copy_from_slice(&self.ts.to_le_bytes());
-        out[12..16].copy_from_slice(&self.sn.to_le_bytes());
-        out[16..20].copy_from_slice(&self.una.to_le_bytes());
-        // The payload length is bounded by `mss`, so the u32 wire field
-        // cannot truncate; a saturated value would simply be rejected by
-        // the peer's segment parser.
-        let len = u32::try_from(self.data.len()).unwrap_or(u32::MAX);
-        out[20..24].copy_from_slice(&len.to_le_bytes());
-        out
     }
 
     fn encoded_len(&self) -> usize {
         KCP_OVERHEAD + self.data.len()
     }
-}
-
-/// The engine's output boundary: whole datagrams, as `Write`, plus the
-/// two-iovec emission the adapter batches into one `sendmmsg` call.
-///
-/// Every `write` from the engine is exactly one datagram (header + payload,
-/// at most one MTU). [`DatagramSink::write_datagram`] keeps the two parts
-/// separate — the header travels through the sink's staging buffer, the
-/// payload stays the segment's own `Bytes` — so neither the engine's
-/// staging buffer nor a sink-side copy touches the payload on the send
-/// path. The two shapes are byte-identical on the wire; a sink that does
-/// not need the split (the engine's own tests) packs the parts into one
-/// buffer and writes once.
-pub trait DatagramSink: Write {
-    /// Emit one datagram as a 24-byte header plus a payload reference.
-    /// Returns the datagram's total length.
-    fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize>;
 }
 
 #[derive(Default)]
@@ -255,17 +171,6 @@ impl<O: Write> Write for KcpOutput<O> {
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         self.0.flush()
-    }
-}
-
-impl<O: DatagramSink> KcpOutput<O> {
-    /// Emit one datagram as a header plus a payload reference, without
-    /// staging the payload (see [`DatagramSink`]). Returns the datagram's
-    /// total length, mirroring `Write::write`'s convention.
-    #[inline]
-    fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
-        trace!("[RO] {} + {} bytes", header.len(), payload.len());
-        self.0.write_datagram(header, payload)
     }
 }
 
@@ -432,30 +337,6 @@ impl<Output> Kcp<Output> {
         Kcp::construct(conv, output, true)
     }
 
-    /// The current maximum datagram size (header included).
-    pub fn mtu(&self) -> usize {
-        self.mtu
-    }
-
-    /// Lower the maximum datagram size, and the payload capacity that follows
-    /// from it. Returns the size now in force.
-    ///
-    /// **Shrink-only by contract.** The caller learns the path MTU from the
-    /// kernel, which can report a *larger* value than the current size (a
-    /// route change, a different peer, a cached PMTU that expired). Growing
-    /// back mid-session would re-fragment exactly what this call exists to
-    /// stop, on a path whose segment statistics KCP has already tuned; a
-    /// session that needs a bigger datagram starts a new session. The floor
-    /// keeps a payload of at least one byte, so the `mss > 0` invariant the
-    /// send path asserts cannot be broken by a nonsensical probe result.
-    pub fn shrink_mtu(&mut self, mtu: usize) -> usize {
-        if mtu < self.mtu {
-            self.mtu = mtu.max(KCP_OVERHEAD + 1);
-            self.mss = self.mtu - KCP_OVERHEAD;
-        }
-        self.mtu
-    }
-
     fn construct(conv: u32, output: Output, stream: bool) -> Self {
         Kcp {
             conv,
@@ -528,14 +409,12 @@ impl<Output> Kcp<Output> {
         }
     }
 
-    /// Receive data from buffer.
-    ///
-    /// The reference's slice API, kept as the zero-copy path's test
-    /// oracle: no production caller is left after the adapter moved to
-    /// `recv_owned`, so it is test-gated rather than left dead (or worse,
-    /// allowed-dead).
-    #[cfg(test)]
+    /// Receive data from buffer
     pub fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize> {
+        if self.rcv_queue.is_empty() {
+            return Err(Error::RecvQueueEmpty);
+        }
+
         let peeksize = self.peeksize()?;
 
         if peeksize > buf.len() {
@@ -543,42 +422,20 @@ impl<Output> Kcp<Output> {
             return Err(Error::UserBufTooSmall);
         }
 
-        let data = self.recv_pop()?;
-        buf[..data.len()].copy_from_slice(&data);
-
-        // `write_all` advanced the cursor by exactly `peeksize` in the
-        // pre-owned variant and `peeksize == data.len()` for the only
-        // mode this crate constructs (stream mode: one segment per
-        // message — see `recv_pop`).
-        debug_assert_eq!(data.len(), peeksize);
-        Ok(data.len())
-    }
-
-    /// Take the next received message with its buffer, no copy.
-    ///
-    /// This is the zero-copy read path: the segment's buffer is frozen
-    /// in place and handed to the caller as an owned `Bytes`, so a
-    /// reader that can batched-process owned chunks (the adapter's
-    /// reader channel) never copies the payload. `recv` remains for
-    /// callers that must write into a fixed slice and pays one copy.
-    ///
-    /// Stream mode (the only mode this crate constructs, see
-    /// `new_stream`) delivers exactly one segment per call — every
-    /// segment carries `frg == 0` — so the returned `Bytes` is the whole
-    /// message. A non-zero `frg` would mean message mode, which nothing
-    /// here builds; it answers `ExpectingFragment` like `recv` does
-    /// rather than guessing at a merge.
-    fn recv_pop(&mut self) -> KcpResult<Bytes> {
-        if self.rcv_queue.front().is_some_and(|seg| seg.frg != 0) {
-            return Err(Error::ExpectingFragment);
-        }
-
         let recover = self.rcv_queue.len() >= self.rcv_wnd as usize;
 
-        let Some(seg) = self.rcv_queue.pop_front() else {
-            return Err(Error::RecvQueueEmpty);
-        };
-        let data = seg.data.clone();
+        // Merge fragment
+        let mut cur = Cursor::new(buf);
+        while let Some(seg) = self.rcv_queue.pop_front() {
+            Write::write_all(&mut cur, &seg.data)?;
+
+            trace!("recv sn={}", seg.sn);
+
+            if seg.frg == 0 {
+                break;
+            }
+        }
+        assert_eq!(cur.position(), peeksize as u64);
 
         self.move_buf();
 
@@ -589,17 +446,11 @@ impl<Output> Kcp<Output> {
             self.probe |= KCP_ASK_TELL;
         }
 
-        Ok(data)
+        // `write_all` advanced the cursor by exactly `peeksize` (asserted above)
+        Ok(peeksize)
     }
 
-    /// Receive the next message as an owned buffer (see `recv_pop`).
-    pub fn recv_owned(&mut self) -> KcpResult<Bytes> {
-        self.recv_pop()
-    }
-
-    /// Check buffer size without actually consuming it.
-    /// Test-gated together with its only caller, `recv`.
-    #[cfg(test)]
+    /// Check buffer size without actually consuming it
     pub fn peeksize(&self) -> KcpResult<usize> {
         match self.rcv_queue.front() {
             Some(segment) => {
@@ -626,15 +477,12 @@ impl<Output> Kcp<Output> {
         }
     }
 
-    /// Send bytes into buffer, copying each segment's payload.
-    ///
-    /// The reference's slice API, kept as the owned path's test oracle: no
-    /// production caller is left after the adapter moved to `send_owned`,
-    /// so it is test-gated rather than left dead (or worse,
-    /// allowed-dead). `send_owned` is the write path; this one pays one
-    /// copy per segment and exists so the two can be compared byte for
-    /// byte.
-    #[cfg(test)]
+    // `frg` fits u8: `count` is checked against `KCP_WND_RCV` (128) below.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`frg` fits u8: `count` is checked against `KCP_WND_RCV` (128) below"
+    )]
+    /// Send bytes into buffer
     pub fn send(&mut self, mut buf: &[u8]) -> KcpResult<usize> {
         let mut sent_size = 0;
 
@@ -653,15 +501,9 @@ impl<Output> Kcp<Output> {
                         self.mss, l, extend
                     );
 
-                    // The shared payload is immutable, so the merge rebuilds
-                    // the partial segment: one copy of at most one MSS, paid
-                    // only when a previous write left the queue's tail
-                    // partially filled.
-                    let mut merged = BytesMut::with_capacity(l + extend);
-                    merged.extend_from_slice(&old.data);
-                    merged.extend_from_slice(&buf[..extend]);
-                    old.data = merged.freeze();
-                    buf = &buf[extend..];
+                    let (lf, rt) = buf.split_at(extend);
+                    old.data.extend_from_slice(lf);
+                    buf = rt;
 
                     old.frg = 0;
                     sent_size += extend;
@@ -693,101 +535,13 @@ impl<Output> Kcp<Output> {
 
             let (lf, rt) = buf.split_at(size);
 
-            let mut new_segment = KcpSegment::new_with_data(Bytes::copy_from_slice(lf));
+            let mut new_segment = KcpSegment::new_with_data(lf.into());
             buf = rt;
 
-            // `count` is checked against `KCP_WND_RCV` (128) above, so
-            // the fragment index fits u8; an impossible overshoot reports
-            // the same too-big-buffer error that check produces.
-            let frg = u8::try_from(count - i - 1).map_err(|_| Error::UserBufTooBig)?;
             new_segment.frg = if self.flags.has(KcpFlags::STREAM) {
                 0
             } else {
-                frg
-            };
-
-            self.snd_queue.push_back(new_segment);
-            sent_size += size;
-        }
-
-        Ok(sent_size)
-    }
-
-    /// Send an already-owned payload into buffer, sharing it per segment.
-    ///
-    /// The zero-copy write path: a caller that holds the bytes as an owned
-    /// `Bytes` (a Noise record's ciphertext) hands the buffer over, and each
-    /// MSS-sized segment is an O(1) `Bytes::slice` of it — no per-segment
-    /// copy. The window, ordering and error semantics are exactly `send`'s;
-    /// the only difference is where the bytes live.
-    pub fn send_owned(&mut self, mut data: Bytes) -> KcpResult<usize> {
-        let mut sent_size = 0;
-
-        assert!(self.mss > 0);
-
-        // append to previous segment in streaming mode (if possible)
-        if self.flags.has(KcpFlags::STREAM) {
-            if let Some(old) = self.snd_queue.back_mut() {
-                let l = old.data.len();
-                if l < self.mss {
-                    let capacity = self.mss - l;
-                    let extend = cmp::min(data.len(), capacity);
-
-                    trace!(
-                        "send stream mss={} last length={} extend={}",
-                        self.mss, l, extend
-                    );
-
-                    // The merge rebuilds the partial segment (same as
-                    // `send`), then the remainder stays a shared slice.
-                    let mut merged = BytesMut::with_capacity(l + extend);
-                    merged.extend_from_slice(&old.data);
-                    merged.extend_from_slice(&data[..extend]);
-                    old.data = merged.freeze();
-                    data = data.slice(extend..);
-
-                    old.frg = 0;
-                    sent_size += extend;
-                }
-            }
-
-            if data.is_empty() {
-                return Ok(sent_size);
-            }
-        }
-
-        let count = data.len().div_ceil(self.mss);
-
-        if count >= KCP_WND_RCV as usize {
-            debug!("send bufsize={} mss={} too large", data.len(), self.mss);
-            // stream mode already extended the queued segment: report the
-            // partial progress like the reference instead of erroring (a
-            // retry after the error would duplicate the appended bytes)
-            if self.flags.has(KcpFlags::STREAM) && sent_size > 0 {
-                return Ok(sent_size);
-            }
-            return Err(Error::UserBufTooBig);
-        }
-
-        let count = cmp::max(1, count);
-
-        for i in 0..count {
-            let size = cmp::min(self.mss, data.len());
-
-            // `split_to` takes the front `size` bytes out of the shared
-            // buffer and leaves the rest in `data`: an O(1) handle split,
-            // no copy.
-            let rest = data.split_to(size);
-            let mut new_segment = KcpSegment::new_with_data(rest);
-
-            // `count` is checked against `KCP_WND_RCV` (128) above, so
-            // the fragment index fits u8; an impossible overshoot reports
-            // the same too-big-buffer error that check produces.
-            let frg = u8::try_from(count - i - 1).map_err(|_| Error::UserBufTooBig)?;
-            new_segment.frg = if self.flags.has(KcpFlags::STREAM) {
-                0
-            } else {
-                frg
+                (count - i - 1) as u8
             };
 
             self.snd_queue.push_back(new_segment);
@@ -910,12 +664,18 @@ impl<Output> Kcp<Output> {
 
     // Mod-2^32 clock casts, both guarded: `rtt` by `rtt >= 0`, and the
     // cwnd recompute is clamped to `rmt_wnd` (≤ u16::MAX) right after.
+    // The single-pass segment parser deliberately stays one function:
+    // splitting it would thread the ack-selection state through helpers
+    // without clarifying the protocol loop.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
     /// Call this when you received a packet from raw connection
-    ///
-    /// One pass over the datagram's segments: `SegHead::parse` reads and
-    /// validates each header, the per-command arms branch on it, and the
-    /// congestion window is recomputed once the whole batch is consumed.
     pub fn input(&mut self, buf: &[u8]) -> KcpResult<usize> {
+        let input_size = buf.len();
+
         trace!("[RI] {} bytes", buf.len());
 
         if buf.len() < KCP_OVERHEAD {
@@ -933,48 +693,97 @@ impl<Output> Kcp<Output> {
 
         let mut buf = Cursor::new(buf);
         while buf.remaining() >= KCP_OVERHEAD {
-            let head = SegHead::parse(&mut buf, self.conv)?;
+            let conv = buf.get_u32_le();
+            if conv != self.conv {
+                // like the reference: a mismatched conversation is a hard
+                // error — the adapter routes sessions by (addr, conv) via
+                // `get_conv` before feeding datagrams to `input`
+                debug!("input conv={conv} expected conv={} not match", self.conv);
+                return Err(Error::ConvInconsistent(self.conv, conv));
+            }
 
-            self.rmt_wnd = head.wnd;
+            let cmd = buf.get_u8();
+            let frg = buf.get_u8();
+            let wnd = buf.get_u16_le();
+            let ts = buf.get_u32_le();
+            let sn = buf.get_u32_le();
+            let una = buf.get_u32_le();
+            let len = buf.get_u32_le() as usize;
 
-            self.parse_una(head.una);
+            if buf.remaining() < len {
+                debug!(
+                    "input bufsize={input_size} payload length={len} remaining={} not match",
+                    buf.remaining()
+                );
+                return Err(Error::SegmentDataSizeMismatch(len, buf.remaining()));
+            }
+
+            match cmd {
+                KCP_CMD_PUSH | KCP_CMD_ACK | KCP_CMD_WASK | KCP_CMD_WINS => {}
+                _ => {
+                    debug!("input cmd={cmd} unrecognized");
+                    return Err(Error::UnsupportedCmd(cmd));
+                }
+            }
+
+            self.rmt_wnd = wnd;
+
+            self.parse_una(una);
             self.shrink_buf();
 
             let mut has_read_data = false;
 
-            match head.cmd {
+            match cmd {
                 KCP_CMD_ACK => {
-                    // A negative timediff is a clock wrap, not an RTT
-                    // sample: the u32 conversion succeeds exactly when
-                    // the sample is non-negative, so it subsumes the
-                    // guard the reference checks explicitly.
-                    if let Ok(rtt) = u32::try_from(timediff(self.current, head.ts)) {
-                        self.update_ack(rtt);
+                    let rtt = timediff(self.current, ts);
+                    if rtt >= 0 {
+                        self.update_ack(rtt as u32);
                     }
-                    self.parse_ack(head.sn);
+                    self.parse_ack(sn);
                     self.shrink_buf();
 
                     if !flag {
                         flag = true;
-                        max_ack = head.sn;
-                        latest_ts = head.ts;
-                    } else if timediff(head.sn, max_ack) > 0 && timediff(head.ts, latest_ts) > 0 {
+                        max_ack = sn;
+                        latest_ts = ts;
+                    } else if timediff(sn, max_ack) > 0 && timediff(ts, latest_ts) > 0 {
                         // fastack-conserve (as the reference defines it):
                         // only a strictly newer ack replaces the max ack
-                        max_ack = head.sn;
-                        latest_ts = head.ts;
+                        max_ack = sn;
+                        latest_ts = ts;
                     }
 
                     trace!(
-                        "input ack: sn={} rtt={} rto={}",
-                        head.sn,
-                        timediff(self.current, head.ts),
+                        "input ack: sn={sn} rtt={} rto={}",
+                        timediff(self.current, ts),
                         self.rx_rto
                     );
                 }
                 KCP_CMD_PUSH => {
-                    trace!("input psh: sn={} ts={}", head.sn, head.ts);
-                    has_read_data = self.accept_push(&mut buf, &head)?;
+                    trace!("input psh: sn={sn} ts={ts}");
+
+                    if timediff(sn, self.rcv_nxt + u32::from(self.rcv_wnd)) < 0 {
+                        self.ack_push(sn, ts);
+                        if timediff(sn, self.rcv_nxt) >= 0 {
+                            // `BytesMut::zeroed` grows the payload buffer
+                            // safely to the wire-declared length
+                            let mut sbuf = BytesMut::zeroed(len);
+                            buf.read_exact(&mut sbuf)?;
+                            has_read_data = true;
+
+                            let mut segment = KcpSegment::new_with_data(sbuf);
+
+                            segment.conv = conv;
+                            segment.cmd = cmd;
+                            segment.frg = frg;
+                            segment.wnd = wnd;
+                            segment.ts = ts;
+                            segment.sn = sn;
+                            segment.una = una;
+
+                            self.parse_data(segment);
+                        }
+                    }
                 }
                 KCP_CMD_WASK => {
                     // ready to send back IKCP_CMD_WINS in ikcp_flush
@@ -984,14 +793,14 @@ impl<Output> Kcp<Output> {
                 }
                 KCP_CMD_WINS => {
                     // Do nothing
-                    trace!("input wins: {}", head.wnd);
+                    trace!("input wins: {wnd}");
                 }
                 _ => unreachable!(),
             }
 
             // Force skip unread data
             if !has_read_data {
-                let next_pos = buf.position() + head.len as u64;
+                let next_pos = buf.position() + len as u64;
                 buf.set_position(next_pos);
             }
         }
@@ -1000,89 +809,39 @@ impl<Output> Kcp<Output> {
             self.parse_fastack(max_ack, latest_ts);
         }
 
-        self.update_cwnd_after_acks(old_una);
-
-        KCP_DATAGRAMS_IN.fetch_add(1, Relaxed);
-        // The cursor cannot advance past the datagram it was created
-        // over, so the position always fits in `usize`.
-        Ok(usize::try_from(buf.position()).unwrap_or(usize::MAX))
-    }
-
-    /// The PUSH arm of [`Kcp::input`]: acknowledge the segment and, when
-    /// it is inside the receive window and in order, read its payload
-    /// into the receive pipeline as an owned shared buffer. Returns
-    /// whether the payload was consumed from the cursor — the caller
-    /// skips over it otherwise.
-    fn accept_push(&mut self, buf: &mut Cursor<&[u8]>, head: &SegHead) -> KcpResult<bool> {
-        if timediff(head.sn, self.rcv_nxt + u32::from(self.rcv_wnd)) >= 0 {
-            return Ok(false);
-        }
-        self.ack_push(head.sn, head.ts);
-        if timediff(head.sn, self.rcv_nxt) < 0 {
-            return Ok(false);
-        }
-        // The payload is handed to the segment as an owned shared buffer
-        // (`BytesMut::zeroed` grows the buffer safely to the
-        // wire-declared length), so the zero-copy read path (`recv_pop`)
-        // can freeze it with an O(1) handle clone.
-        let mut sbuf = BytesMut::zeroed(head.len);
-        buf.read_exact(&mut sbuf)?;
-
-        let mut segment = KcpSegment::new_with_data(sbuf.freeze());
-
-        segment.conv = head.conv;
-        segment.cmd = head.cmd;
-        segment.frg = head.frg;
-        segment.wnd = head.wnd;
-        segment.ts = head.ts;
-        segment.sn = head.sn;
-        segment.una = head.una;
-
-        self.parse_data(segment);
-        Ok(true)
-    }
-
-    /// The congestion-window recompute `input` performs once per datagram
-    /// batch, after the ack stream has advanced `snd_una` past
-    /// `old_una`: slow start steps the window, congestion avoidance
-    /// derives it from the byte counter, and the result is clamped to
-    /// the peer's advertised window.
-    fn update_cwnd_after_acks(&mut self, old_una: u32) {
-        if timediff(self.snd_una, old_una) <= 0 || self.cwnd >= self.rmt_wnd {
-            return;
-        }
-        let mss = self.mss;
-        if self.cwnd < self.ssthresh {
-            self.cwnd += 1;
-            self.incr += mss;
-        } else {
-            if self.incr < mss {
-                self.incr = mss;
+        if timediff(self.snd_una, old_una) > 0 && self.cwnd < self.rmt_wnd {
+            let mss = self.mss;
+            if self.cwnd < self.ssthresh {
+                self.cwnd += 1;
+                self.incr += mss;
+            } else {
+                if self.incr < mss {
+                    self.incr = mss;
+                }
+                self.incr += (mss * mss) / self.incr + (mss / 16);
+                if (self.cwnd as usize + 1) * mss <= self.incr {
+                    // self.cwnd += 1;
+                    self.cwnd = ((self.incr + mss - 1) / if mss > 0 { mss } else { 1 }) as u16;
+                }
             }
-            self.incr += (mss * mss) / self.incr + (mss / 16);
-            if (usize::from(self.cwnd) + 1) * mss <= self.incr {
-                // The line below is the vendored original; the assignment
-                // after it is what actually takes effect (it derives the
-                // window from the byte counter instead of stepping it),
-                // so the increment is dropped rather than kept as a
-                // comment.
-                self.cwnd = u16::try_from((self.incr + mss - 1) / if mss > 0 { mss } else { 1 })
-                    .unwrap_or(u16::MAX);
+            if self.cwnd > self.rmt_wnd {
+                self.cwnd = self.rmt_wnd;
+                self.incr = self.rmt_wnd as usize * mss;
             }
         }
-        if self.cwnd > self.rmt_wnd {
-            self.cwnd = self.rmt_wnd;
-            self.incr = self.rmt_wnd as usize * mss;
-        }
+
+        Ok(buf.position() as usize)
     }
 
+    // `rcv_queue.len()` < `rcv_wnd` ≤ u16::MAX by the guard below, so the
+    // u16 cast cannot truncate.
+    #[expect(clippy::cast_possible_truncation)]
     fn wnd_unused(&self) -> u16 {
-        // Saturates at 0 exactly when the queue is at (or past) the
-        // window, which is the reference's `else` branch; the queue is
-        // shorter than `rcv_wnd` ≤ u16::MAX whenever a positive value
-        // is produced.
-        self.rcv_wnd
-            .saturating_sub(u16::try_from(self.rcv_queue.len()).unwrap_or(u16::MAX))
+        if self.rcv_queue.len() < self.rcv_wnd as usize {
+            self.rcv_wnd - self.rcv_queue.len() as u16
+        } else {
+            0
+        }
     }
 
     fn probe_wnd_size(&mut self) {
@@ -1111,6 +870,10 @@ impl<Output> Kcp<Output> {
         }
     }
 
+    // Mod-2^32 clock casts, both guarded positive: the first by the
+    // `timediff(current, ts_flush) >= 0` early return above, the second by
+    // the per-segment `diff <= 0` early return.
+    #[expect(clippy::cast_sign_loss)]
     /// Determine when you should call `update`.
     /// Returns the relative delay in milliseconds until the next `update`
     /// is due (assuming no `input`/`send` in between) — a duration, unlike
@@ -1131,18 +894,14 @@ impl<Output> Kcp<Output> {
             return 0;
         }
 
-        // Both timediffs are positive by the early returns above (`diff
-        // <= 0` exits first), so the conversion cannot lose the sign;
-        // a wrap-around value of 0 simply means "due now".
-        let flush_due = u32::try_from(timediff(ts_flush, current)).unwrap_or(0);
+        let flush_due = timediff(ts_flush, current) as u32;
         for seg in &self.snd_buf {
             let diff = timediff(seg.resendts, current);
             if diff <= 0 {
                 return 0;
             }
-            let diff = u32::try_from(diff).unwrap_or(0);
-            if diff < resend_due {
-                resend_due = diff;
+            if (diff as u32) < resend_due {
+                resend_due = diff as u32;
             }
         }
 
@@ -1153,7 +912,10 @@ impl<Output> Kcp<Output> {
 
         minimal
     }
+    // `interval` is clamped to [10, 5000] by the match guards and `resend`
+    // is guarded by `resend >= 0`, so both i32→u32 casts are safe.
     #[inline]
+    #[expect(clippy::cast_sign_loss)]
     /// Fastest config: `nodelay(true, 20, 2, true)`.
     ///
     /// `nodelay`: default is disable (false)
@@ -1168,17 +930,14 @@ impl<Output> Kcp<Output> {
             self.rx_minrto = KCP_RTO_MIN;
         }
 
-        // The match arms clamp the interval into [10, 5000], so the
-        // surviving `i32` is always a valid `u32`; a negative `resend`
-        // leaves the previous value untouched.
         match interval {
             interval if interval < 10 => self.interval = 10,
             interval if interval > 5000 => self.interval = 5000,
-            _ => self.interval = u32::try_from(interval).unwrap_or(5000),
+            _ => self.interval = interval as u32,
         }
 
-        if let Ok(fastresend) = u32::try_from(resend) {
-            self.fastresend = fastresend;
+        if resend >= 0 {
+            self.fastresend = resend as u32;
         }
 
         self.flags.set(KcpFlags::NOCWND, nc);
@@ -1240,81 +999,9 @@ impl<Output> Kcp<Output> {
     }
 }
 
-/// One parsed KCP segment header, as read off the wire in [`Kcp::input`].
-///
-/// The fields are handed to [`Kcp::accept_push`] as one value so the
-/// receive path stays a function of the segment, not of eight loose
-/// locals.
-struct SegHead {
-    conv: u32,
-    cmd: u8,
-    frg: u8,
-    wnd: u16,
-    ts: u32,
-    sn: u32,
-    una: u32,
-    /// The wire-declared payload length (already checked to fit the
-    /// remaining bytes of the datagram).
-    len: usize,
-}
-
-impl SegHead {
-    /// Read one segment header off the wire, validating the conversation
-    /// id, the declared payload length and the command byte.
-    fn parse(buf: &mut Cursor<&[u8]>, expected_conv: u32) -> KcpResult<SegHead> {
-        let conv = buf.get_u32_le();
-        if conv != expected_conv {
-            // like the reference: a mismatched conversation is a hard
-            // error — the adapter routes sessions by (addr, conv) via
-            // `get_conv` before feeding datagrams to `input`
-            debug!("input conv={conv} expected conv={expected_conv} not match");
-            return Err(Error::ConvInconsistent(expected_conv, conv));
-        }
-        let cmd = buf.get_u8();
-        let frg = buf.get_u8();
-        let wnd = buf.get_u16_le();
-        let ts = buf.get_u32_le();
-        let sn = buf.get_u32_le();
-        let una = buf.get_u32_le();
-        let len = buf.get_u32_le() as usize;
-
-        if buf.remaining() < len {
-            debug!(
-                "input bufsize={} payload length={len} remaining={} not match",
-                buf.get_ref().len(),
-                buf.remaining()
-            );
-            return Err(Error::SegmentDataSizeMismatch(len, buf.remaining()));
-        }
-
-        match cmd {
-            KCP_CMD_PUSH | KCP_CMD_ACK | KCP_CMD_WASK | KCP_CMD_WINS => {}
-            _ => {
-                debug!("input cmd={cmd} unrecognized");
-                return Err(Error::UnsupportedCmd(cmd));
-            }
-        }
-
-        Ok(SegHead {
-            conv,
-            cmd,
-            frg,
-            wnd,
-            ts,
-            sn,
-            una,
-            len,
-        })
-    }
-}
-
-impl<Output: DatagramSink> Kcp<Output> {
+impl<Output: Write> Kcp<Output> {
     fn flush_ack_inner(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
         // flush acknowledges
-        KCP_ACKS_OUT.fetch_add(
-            u64::try_from(self.acklist.len()).unwrap_or(u64::MAX),
-            Relaxed,
-        );
         for &(sn, ts) in &self.acklist {
             if self.buf.len() + KCP_OVERHEAD > self.mtu {
                 self.output.write_all(&self.buf)?;
@@ -1371,6 +1058,12 @@ impl<Output: DatagramSink> Kcp<Output> {
         self.flush_ack_inner(&mut segment)
     }
 
+    // `inflight`/`resent` truncation: `snd_nxt - snd_una` is window-gated
+    // (≤ `snd_wnd` ≤ u16::MAX), and `change > 0` implies fast retransmit
+    // is enabled, so `resent` is `fastresend`, not u32::MAX. `flush` stays
+    // one function on purpose — it is the hot path and its steps share the
+    // segment/window state; splitting would obscure the flush order.
+    #[expect(clippy::cast_possible_truncation, clippy::too_many_lines)]
     /// Flush pending data in buffer.
     pub fn flush(&mut self) -> KcpResult<()> {
         if !self.flags.has(KcpFlags::UPDATED) {
@@ -1401,7 +1094,25 @@ impl<Output: DatagramSink> Kcp<Output> {
         }
 
         // move data from snd_queue to snd_buf
-        self.fill_snd_buf(cwnd, segment.wnd);
+        while timediff(self.snd_nxt, self.snd_una + u32::from(cwnd)) < 0 {
+            match self.snd_queue.pop_front() {
+                Some(mut new_segment) => {
+                    new_segment.conv = self.conv;
+                    new_segment.cmd = KCP_CMD_PUSH;
+                    new_segment.wnd = segment.wnd;
+                    new_segment.ts = self.current;
+                    new_segment.sn = self.snd_nxt;
+                    self.snd_nxt += 1;
+                    new_segment.una = self.rcv_nxt;
+                    new_segment.resendts = self.current;
+                    new_segment.rto = self.rx_rto;
+                    new_segment.fastack = 0;
+                    new_segment.xmit = 0;
+                    self.snd_buf.push_back(new_segment);
+                }
+                None => break,
+            }
+        }
 
         // calculate resent
         let resent = if self.fastresend > 0 {
@@ -1431,7 +1142,6 @@ impl<Output: DatagramSink> Kcp<Output> {
                 need_send = true;
                 snd_segment.xmit += 1;
                 self.xmit += 1;
-                KCP_RETRANSMITS.fetch_add(1, Relaxed);
                 if self.flags.has(KcpFlags::NODELAY) {
                     // nodelay steps the RTO by half instead of doubling it
                     let step = snd_segment.rto;
@@ -1449,7 +1159,6 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.fastack = 0;
                 snd_segment.resendts = self.current + snd_segment.rto;
                 change += 1;
-                KCP_RETRANSMITS.fetch_add(1, Relaxed);
             }
 
             if need_send {
@@ -1457,28 +1166,14 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.wnd = segment.wnd;
                 snd_segment.una = self.rcv_nxt;
 
-                // Two-iovec emission for the data path: when nothing is
-                // staged in the packing buffer, a PUSH segment goes out as
-                // header + payload reference — the segment's own buffer is
-                // handed to the sink by ownership share, so neither the
-                // engine's `buf` copy nor the sink's staging copy touches
-                // the payload. Packed acks (or a datagram that does not
-                // fit the two-iovec shape) keep the reference path, and
-                // the bytes are identical either way.
-                if self.buf.is_empty() && snd_segment.cmd == KCP_CMD_PUSH {
-                    let header = snd_segment.encode_header();
-                    let payload = snd_segment.data.clone();
-                    self.output.write_datagram(&header, &payload)?;
-                } else {
-                    let need = KCP_OVERHEAD + snd_segment.data.len();
+                let need = KCP_OVERHEAD + snd_segment.data.len();
 
-                    if self.buf.len() + need > self.mtu {
-                        self.output.write_all(&self.buf)?;
-                        self.buf.clear();
-                    }
-
-                    snd_segment.encode(&mut self.buf);
+                if self.buf.len() + need > self.mtu {
+                    self.output.write_all(&self.buf)?;
+                    self.buf.clear();
                 }
+
+                snd_segment.encode(&mut self.buf);
 
                 if snd_segment.xmit >= self.dead_link {
                     self.state = -1; // (IUINT32)-1
@@ -1493,60 +1188,14 @@ impl<Output: DatagramSink> Kcp<Output> {
         }
 
         // update ssthresh
-        self.update_ssthresh(change, resent, lost, prior_cwnd);
-
-        // Flush boundary: the adapter batches the datagrams this call
-        // emitted into a single channel message, so ask it to close the
-        // batch here. The default `Output::flush` is a no-op; the batching
-        // adapter treats this call as exactly that signal.
-        self.output.flush()?;
-
-        Ok(())
-    }
-
-    /// Move queued segments into the send buffer while the window allows,
-    /// tagging each with the window this flush advertises (`wnd`) under
-    /// its send-window bound (`cwnd`).
-    fn fill_snd_buf(&mut self, cwnd: u16, wnd: u16) {
-        while timediff(self.snd_nxt, self.snd_una + u32::from(cwnd)) < 0 {
-            match self.snd_queue.pop_front() {
-                Some(mut new_segment) => {
-                    new_segment.conv = self.conv;
-                    new_segment.cmd = KCP_CMD_PUSH;
-                    new_segment.wnd = wnd;
-                    new_segment.ts = self.current;
-                    new_segment.sn = self.snd_nxt;
-                    self.snd_nxt += 1;
-                    new_segment.una = self.rcv_nxt;
-                    new_segment.resendts = self.current;
-                    new_segment.rto = self.rx_rto;
-                    new_segment.fastack = 0;
-                    new_segment.xmit = 0;
-                    self.snd_buf.push_back(new_segment);
-                }
-                None => break,
-            }
-        }
-    }
-
-    /// Congestion bookkeeping after one flush: a fast-retransmit run
-    /// (`change`) halves the in-flight estimate, a timeout (`lost`)
-    /// halves the window this flush began with, and a zero window is
-    /// raised back to one — the reference's behaviour.
-    ///
-    /// `resent` is only read when `change > 0`, and that path implies
-    /// fast retransmit is enabled, so it is `fastresend` rather than the
-    /// `u32::MAX` "disabled" sentinel; both it and the window-gated
-    /// `inflight` therefore fit u16 without truncating.
-    fn update_ssthresh(&mut self, change: u32, resent: u32, lost: bool, prior_cwnd: u16) {
         if change > 0 {
             let inflight = self.snd_nxt - self.snd_una;
-            self.ssthresh = u16::try_from(inflight).unwrap_or(u16::MAX) / 2;
+            self.ssthresh = inflight as u16 / 2;
             if self.ssthresh < KCP_THRESH_MIN {
                 self.ssthresh = KCP_THRESH_MIN;
             }
-            self.cwnd = self.ssthresh + u16::try_from(resent).unwrap_or(u16::MAX);
-            self.incr = usize::from(self.cwnd) * self.mss;
+            self.cwnd = self.ssthresh + resent as u16;
+            self.incr = self.cwnd as usize * self.mss;
         }
 
         if lost {
@@ -1562,6 +1211,8 @@ impl<Output: DatagramSink> Kcp<Output> {
             self.cwnd = 1;
             self.incr = self.mss;
         }
+
+        Ok(())
     }
 
     /// Update state every 10ms ~ 100ms.
@@ -1591,280 +1242,5 @@ impl<Output: DatagramSink> Kcp<Output> {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![expect(
-        clippy::unwrap_used,
-        reason = "tests unwrap values they constructed themselves; the \
-                  payloads and engines are fixed inputs"
-    )]
-    use super::*;
-
-    /// One captured two-iovec emission: the staged header plus the payload
-    /// handle the sink received.
-    type SplitEntry = ([u8; KCP_OVERHEAD], Bytes);
-
-    /// A `Write` the test can read back: the engine's output, shared by
-    /// clone so the sender and the assertion see the same buffer.
-    #[derive(Clone, Default)]
-    struct SharedBuf(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
-
-    impl io::Write for SharedBuf {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.0.borrow_mut().extend_from_slice(data);
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The shrink is one-way: a later, larger probe result must not undo it.
-    /// Nothing else in the engine may write `mtu`/`mss`, so this is the whole
-    /// contract of the path-MTU adaptation.
-    #[test]
-    fn shrink_mtu_is_one_way_and_keeps_a_payload() {
-        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
-        assert_eq!(kcp.mtu(), KCP_MTU_DEF);
-        assert_eq!(kcp.mss, KCP_MTU_DEF - KCP_OVERHEAD);
-
-        assert_eq!(kcp.shrink_mtu(1252), 1252);
-        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
-
-        // A bigger path (or a stale cache) must not grow it back.
-        assert_eq!(kcp.shrink_mtu(9000), 1252);
-        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
-
-        // Nonsense cannot produce an empty payload: `send` asserts `mss > 0`.
-        assert_eq!(kcp.shrink_mtu(0), KCP_OVERHEAD + 1);
-        assert_eq!(kcp.mss, 1);
-    }
-
-    impl DatagramSink for SharedBuf {
-        /// The pack-and-write shape a plain `Write` output takes: the
-        /// reference behavior the two-iovec path must match byte for byte.
-        fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
-            let total = header.len() + payload.len();
-            assert!(
-                total <= KCP_MTU_DEF,
-                "a stream-mode datagram is at most one MTU"
-            );
-            let mut buf = [0u8; KCP_MTU_DEF];
-            buf[..header.len()].copy_from_slice(header);
-            buf[header.len()..total].copy_from_slice(payload);
-            self.write_all(&buf[..total])?;
-            Ok(total)
-        }
-    }
-
-    /// A `DatagramSink` that records what shape each datagram arrived in:
-    /// `packed` collects whole-datagram writes, `split` the two-iovec
-    /// emissions (header, payload handle) in order.
-    #[derive(Clone, Default)]
-    struct SplitCapture {
-        packed: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
-        split: std::rc::Rc<std::cell::RefCell<Vec<SplitEntry>>>,
-    }
-
-    impl io::Write for SplitCapture {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.packed.borrow_mut().extend_from_slice(data);
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl DatagramSink for SplitCapture {
-        fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
-            let mut hdr = [0u8; KCP_OVERHEAD];
-            hdr.copy_from_slice(header);
-            self.split.borrow_mut().push((hdr, payload.clone()));
-            Ok(header.len() + payload.len())
-        }
-    }
-
-    /// The datagrams of a PUSH-only flush, in order. Stream mode emits
-    /// exactly one segment per datagram (the engine's encode path), so
-    /// each datagram is a 24-byte header plus `mss` bytes — the final one
-    /// plus the remainder.
-    fn split_push_datagrams(buf: &[u8]) -> Vec<&[u8]> {
-        let mss = KCP_MTU_DEF - KCP_OVERHEAD;
-        let mut out = Vec::new();
-        let mut rest = buf;
-        while !rest.is_empty() {
-            let len = (KCP_OVERHEAD + mss).min(rest.len());
-            out.push(&rest[..len]);
-            rest = &rest[len..];
-        }
-        out
-    }
-
-    /// Drive `payload` through a loopback pair of engine instances and
-    /// return what each read API hands back. The two must agree byte for
-    /// byte: `recv` is the reference's buffer API, `recv_owned` the
-    /// zero-copy path the adapter now uses.
-    fn roundtrip(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let out = SharedBuf::default();
-        let mut sender = Kcp::new_stream(7, out.clone());
-        sender.update(1).unwrap();
-        assert_eq!(sender.send(payload).unwrap(), payload.len());
-        sender.flush().unwrap();
-        let wire = out.0.borrow().clone();
-        assert!(!wire.is_empty(), "the sender emitted nothing");
-
-        let mut copied_engine = Kcp::new_stream(7, SharedBuf::default());
-        let mut owned_engine = Kcp::new_stream(7, SharedBuf::default());
-        copied_engine.update(1).unwrap();
-        owned_engine.update(1).unwrap();
-        for datagram in split_push_datagrams(&wire) {
-            copied_engine.input(datagram).unwrap();
-            owned_engine.input(datagram).unwrap();
-        }
-
-        // Both APIs deliver one segment per call in stream mode, so
-        // both loops drain the same way.
-        let mut copied = Vec::new();
-        while copied.len() < payload.len() {
-            let mut chunk = vec![0u8; payload.len() - copied.len()];
-            let n = copied_engine.recv(&mut chunk).unwrap();
-            assert_ne!(
-                n,
-                0,
-                "recv stalled with {} of {} bytes",
-                copied.len(),
-                payload.len()
-            );
-            copied.extend_from_slice(&chunk[..n]);
-        }
-
-        let mut owned = Vec::new();
-        while let Ok(part) = owned_engine.recv_owned() {
-            owned.extend_from_slice(&part);
-            if owned.len() >= payload.len() {
-                break;
-            }
-        }
-
-        (copied, owned)
-    }
-
-    #[test]
-    fn recv_owned_matches_recv_byte_for_byte() {
-        // One datagram per case: a single flush emits exactly one
-        // segment (cwnd starts at 1 — slow start), so no ack round trip
-        // is needed. Multi-segment equivalence runs end to end through
-        // the adapter's 4 MiB bulk test, which now reads via
-        // `recv_owned`.
-        // (An empty payload queues no segment at all — nothing to
-        // deliver either way — so the check starts at one byte.)
-        for payload in [
-            &b"x"[..],
-            b"hello kcp",
-            &[0x5Au8; KCP_MTU_DEF - KCP_OVERHEAD], // exactly one MSS
-        ] {
-            let (copied, owned) = roundtrip(payload);
-            assert_eq!(copied, payload, "recv changed the byte stream");
-            assert_eq!(owned, payload, "recv_owned changed the byte stream");
-        }
-    }
-
-    #[test]
-    fn send_owned_matches_send_byte_for_byte() {
-        // The owned write path shares one buffer per segment; the wire
-        // bytes must be identical to the copying slice path. A payload
-        // spanning several MSS plus a partial tail exercises both the
-        // full-segment splits and the remainder.
-        let payload: Vec<u8> = (0..(3 * (KCP_MTU_DEF - KCP_OVERHEAD) + 17))
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect();
-
-        let copied_out = SharedBuf::default();
-        let mut copied_engine = Kcp::new_stream(7, copied_out.clone());
-        copied_engine.update(1).unwrap();
-        assert_eq!(copied_engine.send(&payload).unwrap(), payload.len());
-        copied_engine.flush().unwrap();
-
-        let owned_out = SharedBuf::default();
-        let mut owned_engine = Kcp::new_stream(7, owned_out.clone());
-        owned_engine.update(1).unwrap();
-        let record = Bytes::from(payload.clone());
-        assert_eq!(owned_engine.send_owned(record).unwrap(), payload.len());
-        owned_engine.flush().unwrap();
-
-        assert_eq!(
-            &*copied_out.0.borrow(),
-            &*owned_out.0.borrow(),
-            "the owned write path changed the wire bytes"
-        );
-        assert!(!copied_out.0.borrow().is_empty(), "nothing was emitted");
-    }
-
-    #[test]
-    fn recv_owned_empty_queue_errors() {
-        let mut engine = Kcp::new_stream(1, SharedBuf::default());
-        engine.update(1).unwrap();
-        assert!(matches!(engine.recv_owned(), Err(Error::RecvQueueEmpty)));
-        assert!(matches!(
-            engine.recv(&mut [0u8; 8]),
-            Err(Error::RecvQueueEmpty)
-        ));
-    }
-
-    #[test]
-    fn push_datagrams_emit_header_plus_payload_reference() {
-        // The send path's two-iovec boundary: a stream-mode PUSH datagram
-        // reaches the sink as a staged header plus the segment's own
-        // payload `Bytes` — no copy into any staging buffer. The wire
-        // bytes must still be exactly the packed form, and a retransmit
-        // re-emits the same buffer (the same allocation, not a copy of it).
-        let out = SplitCapture::default();
-        let mut engine = Kcp::new_stream(7, out.clone());
-        engine.update(1).unwrap();
-        let payload = Bytes::from(vec![0x5Au8; KCP_MTU_DEF - KCP_OVERHEAD]); // exactly one MSS
-        assert_eq!(engine.send(&payload).unwrap(), payload.len());
-        engine.flush().unwrap();
-
-        let sent = out.split.borrow().clone();
-        assert_eq!(sent.len(), 1, "one datagram per flush in stream mode");
-        let (hdr, got) = &sent[0];
-        // The header decodes to a PUSH segment carrying the payload length.
-        assert_eq!(hdr[4], KCP_CMD_PUSH, "cmd");
-        assert_eq!(hdr[5], 0, "frg (stream mode)");
-        let len = u32::from_le_bytes(hdr[20..24].try_into().unwrap());
-        assert_eq!(len as usize, payload.len(), "len field");
-        assert_eq!(got, &payload, "the payload content crossed intact");
-
-        // The wire bytes of the split form are the packed form: re-encode
-        // the same datagram through the pack path and compare.
-        let packed = SharedBuf::default();
-        let mut reference = Kcp::new_stream(7, packed.clone());
-        reference.update(1).unwrap();
-        reference.send(&payload).unwrap();
-        reference.flush().unwrap();
-        let mut wire = Vec::with_capacity(KCP_OVERHEAD + payload.len());
-        wire.extend_from_slice(hdr);
-        wire.extend_from_slice(got);
-        assert_eq!(
-            &wire,
-            &*packed.0.borrow(),
-            "split and packed wire bytes differ"
-        );
-
-        // A retransmit re-emits the same buffer (the engine holds the
-        // segment for ARQ): the handle's allocation must be unchanged,
-        // which is what "the payload crossed by reference" means.
-        engine.update(300).unwrap(); // past the segment's resendts
-        engine.flush().unwrap();
-        let resent = out.split.borrow();
-        assert!(resent.len() >= 2, "the retransmit did not re-emit");
-        assert!(
-            resent[1].1.as_ptr() == got.as_ptr(),
-            "the retransmit copied the payload"
-        );
     }
 }

@@ -91,19 +91,19 @@ echo "[release assets]"
 # In push mode (--commit) missing assets are a note, not a failure: a
 # historical tag legitimately predates the ritual, and re-pushing one to fix
 # a failed release must stay possible. At tag creation they are required.
-if exists_at "benches/scripts/soak/results-soak-v${version}.json"; then
-  echo "  ok    results-soak-v${version}.json committed"
+if exists_at "benches/scripts/bench/results-v${version}.json"; then
+  echo "  ok    results-v${version}.json committed"
 elif [ "$passed_commit" -eq 1 ]; then
-  echo "  note  results-soak-v${version}.json absent at this commit (historical tag?)"
+  echo "  note  results-v${version}.json absent at this commit (historical tag?)"
 else
-  fail "benches/scripts/soak/results-soak-v${version}.json missing — run the benchmark ritual (docs/release.md) and commit it"
+  fail "benches/scripts/bench/results-v${version}.json missing — run the benchmark ritual (docs/release.md) and commit it"
 fi
-if exists_at "assets/soak-v${version}.png"; then
-  echo "  ok    assets/soak-v${version}.png committed"
+if exists_at "assets/benchmark-v${version}.png"; then
+  echo "  ok    assets/benchmark-v${version}.png committed"
 elif [ "$passed_commit" -eq 1 ]; then
-  echo "  note  assets/soak-v${version}.png absent at this commit (historical tag?)"
+  echo "  note  assets/benchmark-v${version}.png absent at this commit (historical tag?)"
 else
-  fail "assets/soak-v${version}.png missing — run 'just soak-plot' and commit the chart"
+  fail "assets/benchmark-v${version}.png missing — run 'just bench-plot' and commit the chart"
 fi
 
 # --- container image build review (mechanical part) -------------------------
@@ -156,7 +156,7 @@ cat <<'EOF'
   [ ] Container image review: scratch + static musl; img/bin amd64+arm64
       layout; feature set server,client,noise,hot-reload,multiplex; the
       --help smoke test passed in the workflow run
-  [ ] Benchmark ritual done (docs/release.md): soak run, 'just soak-check'
+  [ ] Benchmark ritual done (docs/release.md): matrix run, 'just bench-check'
       green vs the previous tag (waivers recorded in HANDOFF.md), README
       benchmark section refreshed
   [ ] Heavy gates green on this commit: 'just check' (pre-commit + pre-push);

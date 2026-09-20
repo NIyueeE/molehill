@@ -16,7 +16,6 @@ mod cleanup;
 mod rtt;
 mod stream;
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::mux::tagged_stream::TaggedStream;
@@ -24,17 +23,16 @@ use crate::mux::{
     Config, DEFAULT_CREDIT,
     error::ConnectionError,
     frame::header::{self, CONNECTION_ID, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate},
-    frame::{self, Either, Frame},
+    frame::{self, Frame},
 };
 use crate::mux::{MAX_ACK_BACKLOG, Result};
 use cleanup::Cleanup;
+use futures::stream::SelectAll;
+use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
-use std::pin::Pin;
 use std::task::{Context, Waker};
 use std::{fmt, sync::Arc, task::Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 
 pub use stream::{State, Stream};
 
@@ -111,7 +109,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         self.inner = ConnectionState::Cleanup(active.cleanup(e));
                     }
                 },
-                ConnectionState::Cleanup(mut inner) => match Pin::new(&mut inner).poll(cx) {
+                ConnectionState::Cleanup(mut inner) => match inner.poll_unpin(cx) {
                     Poll::Ready(e) => {
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(Err(e));
@@ -149,7 +147,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
                         return Poll::Pending;
                     }
                 },
-                ConnectionState::Cleanup(mut cleanup) => match Pin::new(&mut cleanup).poll(cx) {
+                ConnectionState::Cleanup(mut cleanup) => match cleanup.poll_unpin(cx) {
                     Poll::Ready(ConnectionError::Closed) => {
                         self.inner = ConnectionState::Closed;
                         return Poll::Ready(None);
@@ -209,20 +207,15 @@ struct Active<T> {
     id: Id,
     mode: Mode,
     config: Arc<Config>,
-    socket: frame::Io<T>,
+    socket: Fuse<frame::Io<T>>,
     next_id: u32,
 
     streams: IntMap<StreamId, Arc<Mutex<stream::Shared>>>,
-    stream_receivers: Vec<TaggedStream<StreamId, StreamCommand>>,
+    stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     no_streams_waker: Option<Waker>,
 
     pending_read_frame: Option<Frame<()>>,
-    /// Frames taken from the stream receivers but not yet handed to the
-    /// socket writer. A queue rather than a single slot so the receivers
-    /// are polled on every iteration: tokio's mpsc clears a receiver's
-    /// waker registration when it wakes, so skipping the poll leaves the
-    /// connection sleeping with no registered waker for later sends.
-    pending_frames: VecDeque<Frame<()>>,
+    pending_write_frame: Option<Frame<()>>,
     new_outbound_stream_waker: Option<Waker>,
 
     rtt: rtt::Rtt,
@@ -257,7 +250,10 @@ pub(crate) enum Action {
 
 // The socket field is skipped because its type parameter `T` does not
 // implement `Debug` — that is why this impl is manual in the first place.
-// `finish_non_exhaustive` marks the omission as intentional.
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "the socket's type parameter is not Debug"
+)]
 impl<T> fmt::Debug for Active<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Connection")
@@ -267,9 +263,9 @@ impl<T> fmt::Debug for Active<T> {
             .field("streams", &self.streams.len())
             .field("next_id", &self.next_id)
             .field("pending_read_frame", &self.pending_read_frame)
-            .field("pending_frames", &self.pending_frames)
+            .field("pending_write_frame", &self.pending_write_frame)
             .field("rtt", &self.rtt)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -290,21 +286,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn new(socket: T, cfg: Config, mode: Mode) -> Self {
         let id = Id::next();
         tracing::debug!("new connection: {id} ({mode:?})");
-        let socket = frame::Io::new(id, socket);
+        let socket = frame::Io::new(id, socket).fuse();
         Active {
             id,
             mode,
             config: Arc::new(cfg),
             socket,
             streams: IntMap::default(),
-            stream_receivers: Vec::new(),
+            stream_receivers: SelectAll::default(),
             no_streams_waker: None,
             next_id: match mode {
                 Mode::Client => 1,
                 Mode::Server => 2,
             },
             pending_read_frame: None,
-            pending_frames: VecDeque::new(),
+            pending_write_frame: None,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
             accumulated_max_stream_windows: Arc::default(),
@@ -322,12 +318,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
-            if self.socket.is_idle() {
+            if self.socket.poll_ready_unpin(cx).is_ready() {
                 // Note `next_ping` does not register a waker and thus if not called regularly (idle
                 // connection) no ping is sent. This is deliberate as an idle connection does not
                 // need RTT measurements to increase its stream receive window.
                 if let Some(frame) = self.rtt.next_ping() {
-                    self.socket.start_frame(frame.into());
+                    self.socket.start_send_unpin(frame.into())?;
                     continue;
                 }
 
@@ -336,90 +332,51 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 if let Some(frame) = self
                     .pending_read_frame
                     .take()
-                    .or_else(|| self.pending_frames.pop_front())
+                    .or_else(|| self.pending_write_frame.take())
                 {
-                    self.socket.start_frame(frame);
+                    self.socket.start_send_unpin(frame)?;
                     continue;
                 }
             }
 
-            match Pin::new(&mut self.socket).poll_flush(cx)? {
-                Poll::Ready(()) => {
-                    // The writer just went idle. If frames are still
-                    // queued, write them in this same poll instead of
-                    // falling through to the socket read and returning
-                    // Pending: an idle writer registers no write waker,
-                    // the receivers are drained (no channel wake) and a
-                    // quiet socket registers no read wake — nothing would
-                    // ever wake the connection to continue, and the queued
-                    // frames (window updates included) would strand the
-                    // whole tunnel. The cooperative budget eventually
-                    // cuts a long drain short, and the resulting deferred
-                    // wake resumes it.
-                    if !self.pending_frames.is_empty() || self.pending_read_frame.is_some() {
+            match self.socket.poll_flush_unpin(cx)? {
+                Poll::Ready(()) | Poll::Pending => {}
+            }
+
+            if self.pending_write_frame.is_none() {
+                match self.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                        tracing::trace!(
+                            "{}/{}: sending: {}",
+                            self.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        self.pending_write_frame.replace(frame.into());
                         continue;
                     }
-                }
-                Poll::Pending => {}
-            }
-
-            {
-                let mut took_command = false;
-                for receiver in &mut self.stream_receivers {
-                    match receiver.poll_next(cx) {
-                        Poll::Ready(Some((id, Some(StreamCommand::SendFrame(frame))))) => {
-                            tracing::trace!(
-                                "{}/{}: sending: {}",
-                                self.id,
-                                frame.header().stream_id(),
-                                frame.header()
-                            );
-                            self.pending_frames.push_back(frame.into());
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
-                            tracing::trace!("{}/{}: sending close", self.id, id);
-                            self.pending_frames
-                                .push_back(Frame::close_stream(id, ack).into());
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(Some((id, None))) => {
-                            if let Some(frame) = self.on_drop_stream(id) {
-                                tracing::trace!("{}/{}: sending: {}", self.id, id, frame.header());
-                                self.pending_frames.push_back(frame);
-                            }
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(None) | Poll::Pending => {}
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                        tracing::trace!("{}/{}: sending close", self.id, id);
+                        self.pending_write_frame
+                            .replace(Frame::close_stream(id, ack).into());
+                        continue;
                     }
-                }
-                // A receiver that has reported its end (its stream was
-                // dropped) is finished: futures' `SelectAll` used to drop it
-                // for us, and a `Vec` grows without bound otherwise — the
-                // loop above is O(receivers) per poll, so a connection that
-                // serves many short-lived streams (connection churn) would
-                // poll thousands of dead receivers on every poll.
-                self.stream_receivers.retain(|r| !r.is_done());
-                if took_command {
-                    // Restart the loop so the queued frame is written in
-                    // this very poll: falling through to the socket read
-                    // would return Pending with the frame still unsent and
-                    // nothing left to wake the connection.
-                    continue;
-                }
-                if self.stream_receivers.iter().all(TaggedStream::is_done) {
-                    self.no_streams_waker = Some(cx.waker().clone());
+                    Poll::Ready(Some((id, None))) => {
+                        if let Some(frame) = self.on_drop_stream(id) {
+                            tracing::trace!("{}/{}: sending: {}", self.id, id, frame.header());
+                            self.pending_write_frame.replace(frame);
+                        }
+                        continue;
+                    }
+                    Poll::Ready(None) => {
+                        self.no_streams_waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending => {}
                 }
             }
 
             if self.pending_read_frame.is_none() {
-                match Pin::new(&mut self.socket).poll_next_frame(cx) {
+                match self.socket.poll_next_unpin(cx) {
                     Poll::Ready(Some(frame)) => {
                         match self.on_frame(frame?)? {
                             Action::None => {}
@@ -475,31 +432,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         Poll::Ready(Ok(stream))
     }
 
-    /// Wake a stream writer that parked on a full command channel: taking
-    /// this stream's command off the channel freed capacity for it.
-    fn wake_stream_writer(&mut self, stream_id: StreamId) {
-        if let Some(s) = self.streams.get(&stream_id) {
-            let mut shared = s.lock();
-            if let Some(w) = shared.writer.take() {
-                w.wake();
-            }
-        }
-    }
-
     fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame<()>> {
-        // on_drop_stream is normally called for streams still in the map;
-        // one already removed (a reset handled concurrently) has nothing
-        // left to inform the remote about.
-        let Some(s) = self.streams.remove(&stream_id) else {
-            tracing::trace!("{}: dropping unknown stream {}", self.id, stream_id);
-            return None;
-        };
+        // on_drop_stream is only called for streams still in the map.
+        #[expect(
+            clippy::expect_used,
+            reason = "the stream is in the map by construction"
+        )]
+        let s = self.streams.remove(&stream_id).expect("stream not found");
 
         tracing::trace!("{}: removing dropped stream {}", self.id, stream_id);
-        let frame;
-        let wakers = {
+        let frame = {
             let mut shared = s.lock();
-            frame = match shared.update_state(self.id, stream_id, State::Closed) {
+            let frame = match shared.update_state(self.id, stream_id, State::Closed) {
                 // The stream was dropped without calling `poll_close`.
                 // We reset the stream to inform the remote of the closure.
                 State::Open { .. } => {
@@ -531,9 +475,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 // remote end has already done so in the past.
                 State::Closed => None,
             };
-            (shared.reader.take(), shared.writer.take())
+            if let Some(w) = shared.reader.take() {
+                w.wake();
+            }
+            if let Some(w) = shared.writer.take() {
+                w.wake();
+            }
+            frame
         };
-        wake_both(&wakers);
         frame.map(Into::into)
     }
 
@@ -575,12 +524,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         if frame.header().flags().contains(header::RST) {
             // stream reset
             if let Some(s) = self.streams.get_mut(&stream_id) {
-                let wakers = {
-                    let mut shared = s.lock();
-                    shared.update_state(self.id, stream_id, State::Closed);
-                    (shared.reader.take(), shared.writer.take())
-                };
-                wake_both(&wakers);
+                let mut shared = s.lock();
+                shared.update_state(self.id, stream_id, State::Closed);
+                if let Some(w) = shared.reader.take() {
+                    w.wake();
+                }
+                if let Some(w) = shared.writer.take() {
+                    w.wake();
+                }
             }
             return Action::None;
         }
@@ -648,9 +599,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             }
 
             shared.buffer.push(frame.into_body());
-            let wakers = (shared.reader.take(), None);
-            drop(shared);
-            wake_both(&wakers);
+            if let Some(w) = shared.reader.take() {
+                w.wake();
+            }
         } else {
             tracing::trace!(
                 "{}/{}: data frame for unknown stream, possibly dropped earlier: {:?}",
@@ -676,12 +627,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         if frame.header().flags().contains(header::RST) {
             // stream reset
             if let Some(s) = self.streams.get_mut(&stream_id) {
-                let wakers = {
-                    let mut shared = s.lock();
-                    shared.update_state(self.id, stream_id, State::Closed);
-                    (shared.reader.take(), shared.writer.take())
-                };
-                wake_both(&wakers);
+                let mut shared = s.lock();
+                shared.update_state(self.id, stream_id, State::Closed);
+                if let Some(w) = shared.reader.take() {
+                    w.wake();
+                }
+                if let Some(w) = shared.writer.take() {
+                    w.wake();
+                }
             }
             return Action::None;
         }
@@ -730,17 +683,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             }
             if is_finish {
                 shared.update_state(self.id, stream_id, State::RecvClosed);
+
+                if let Some(w) = shared.reader.take() {
+                    w.wake();
+                }
             }
-            let wakers = (
-                if is_finish {
-                    shared.reader.take()
-                } else {
-                    None
-                },
-                shared.writer.take(),
-            );
-            drop(shared);
-            wake_both(&wakers);
+            if let Some(w) = shared.writer.take() {
+                w.wake();
+            }
         } else {
             tracing::trace!(
                 "{}/{}: window update for unknown stream, possibly dropped earlier: {:?}",
@@ -789,15 +739,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn make_new_inbound_stream(&mut self, id: StreamId, credit: u32) -> Stream {
         let config = self.config.clone();
 
-        // 10 is an arbitrary number. The depth paces the producer so it
-        // cannot run arbitrarily far ahead of the connection: an unbounded
-        // channel lets the writers queue whole windows of frames, the
-        // receiver's buffer grows with them, and `next_window_update`
-        // (bytes received minus still-buffered) shrinks accordingly —
-        // throttling the very sender the updates are meant to supply. The
-        // yamux send window is the protocol-level backpressure; this is
-        // the pacing that keeps it effective.
-        let (sender, receiver) = mpsc::channel(10);
+        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
         self.stream_receivers.push(TaggedStream::new(id, receiver));
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
@@ -817,15 +759,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     fn make_new_outbound_stream(&mut self, id: StreamId) -> Stream {
         let config = self.config.clone();
 
-        // 10 is an arbitrary number. The depth paces the producer so it
-        // cannot run arbitrarily far ahead of the connection: an unbounded
-        // channel lets the writers queue whole windows of frames, the
-        // receiver's buffer grows with them, and `next_window_update`
-        // (bytes received minus still-buffered) shrinks accordingly —
-        // throttling the very sender the updates are meant to supply. The
-        // yamux send window is the protocol-level backpressure; this is
-        // the pacing that keeps it effective.
-        let (sender, receiver) = mpsc::channel(10);
+        let (sender, receiver) = mpsc::channel(10); // 10 is an arbitrary number.
         self.stream_receivers.push(TaggedStream::new(id, receiver));
         if let Some(waker) = self.no_streams_waker.take() {
             waker.wake();
@@ -885,30 +819,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     }
 }
 
-/// Wake a stream's parked reader/writer.
-///
-/// Waking happens outside the stream's mutex on purpose: the woken task
-/// immediately contends for the same mutex, and a wake under the lock makes
-/// it spin on a multi-threaded runtime while the waker still holds it.
-fn wake_both(wakers: &(Option<Waker>, Option<Waker>)) {
-    if let Some(w) = wakers.0.as_ref() {
-        w.wake_by_ref();
-    }
-    if let Some(w) = wakers.1.as_ref() {
-        w.wake_by_ref();
-    }
-}
-
 impl<T> Active<T> {
     /// Close and drop all `Stream`s and wake any pending `Waker`s.
     fn drop_all_streams(&mut self) {
         for (id, s) in self.streams.drain() {
-            let wakers = {
-                let mut shared = s.lock();
-                shared.update_state(self.id, id, State::Closed);
-                (shared.reader.take(), shared.writer.take())
-            };
-            wake_both(&wakers);
+            let mut shared = s.lock();
+            shared.update_state(self.id, id, State::Closed);
+            if let Some(w) = shared.reader.take() {
+                w.wake();
+            }
+            if let Some(w) = shared.writer.take() {
+                w.wake();
+            }
         }
     }
 }

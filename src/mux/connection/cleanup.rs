@@ -1,6 +1,9 @@
 use crate::mux::connection::StreamCommand;
 use crate::mux::tagged_stream::TaggedStream;
 use crate::mux::{ConnectionError, StreamId};
+use futures::StreamExt;
+use futures::channel::mpsc;
+use futures::stream::SelectAll;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -9,13 +12,13 @@ use std::task::{Context, Poll};
 #[must_use]
 pub struct Cleanup {
     state: State,
-    stream_receivers: Vec<TaggedStream<StreamId, StreamCommand>>,
+    stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     error: Option<ConnectionError>,
 }
 
 impl Cleanup {
     pub(crate) fn new(
-        stream_receivers: Vec<TaggedStream<StreamId, StreamCommand>>,
+        stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
         error: ConnectionError,
     ) -> Self {
         Self {
@@ -40,23 +43,23 @@ impl Future for Cleanup {
                     }
                     this.state = State::DrainingStreamReceiver;
                 }
-                State::DrainingStreamReceiver => {
-                    // Drain everything immediately ready, then finish: the
-                    // cleanup is opportunistic and does not wait for the
-                    // receivers to close on their own.
-                    for receiver in &mut this.stream_receivers {
-                        while let Poll::Ready(Some(_)) = receiver.poll_next(cx) {}
+                State::DrainingStreamReceiver => match this.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some(cmd)) => {
+                        drop(cmd);
                     }
-                    // The error is set before draining starts; a None here
-                    // can only be a spurious wakeup, so report the generic
-                    // closed error rather than panicking.
-                    return Poll::Ready(this.error.take().unwrap_or(ConnectionError::Closed));
-                }
+                    Poll::Ready(None) | Poll::Pending => {
+                        // The error is set before draining starts; a None
+                        // here can only be a spurious wakeup, so report the
+                        // generic closed error rather than panicking.
+                        return Poll::Ready(this.error.take().unwrap_or(ConnectionError::Closed));
+                    }
+                },
             }
         }
     }
 }
 
+#[allow(clippy::enum_variant_names)]
 enum State {
     ClosingStreamReceiver,
     DrainingStreamReceiver,
