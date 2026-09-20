@@ -31,13 +31,6 @@ import time
 
 PKT = struct.Struct("<Id")  # seq, send timestamp
 
-# Reply-tail quiescence window: once every datagram is sent, stop waiting
-# this long after the last reply instead of idling to the wall bound. A
-# measurement parameter (AGENTS.md §10), sized in RTTs of the slowest
-# cell: the rtt100 path's end-to-end reply is ~600 ms, so 2 s is >3 RTTs
-# of slack for an in-flight tail.
-UDP_PING_QUIET_S = 2.0
-
 
 def pct(xs, p):
     if not xs:
@@ -54,15 +47,7 @@ def _reset_udp_socket(s, host: str, port: int) -> None:
 
 def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
                  timeout_s: float) -> dict:
-    """Steady same-socket UDP ping; returns the session-quality dict.
-
-    Stops at the wall bound OR once every datagram is sent and the replies
-    have gone quiet: a single lost datagram can never reach `count`, and
-    idling to the wall bound then spends two thirds of the timeout doing
-    nothing while holding the bench lock. The quiet window must cover the
-    path's own RTT — on the rtt100 cell the end-to-end reply takes ~600 ms,
-    so 2 s leaves several RTTs of slack for the tail.
-    """
+    """Steady same-socket UDP ping; returns the session-quality dict."""
     interval = interval_ms / 1000.0
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(3.0)  # a wedged tunnel must fail the probe, not hang the arm
@@ -74,14 +59,8 @@ def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
     start = time.perf_counter()
     next_send = start
     end_by = start + timeout_s
-    quiet_since = None
 
     while received < count and time.perf_counter() < end_by:
-        if sent >= count and quiet_since is None:
-            quiet_since = time.perf_counter()
-        elif quiet_since is not None \
-                and time.perf_counter() - quiet_since >= UDP_PING_QUIET_S:
-            break  # all datagrams sent and the reply tail has gone quiet
         now = time.perf_counter()
         wait = max(0.0, min(next_send - now, 0.002))
         r, _, _ = select.select([s], [], [], wait)
@@ -97,7 +76,6 @@ def run_udp_ping(host: str, port: int, count: int, interval_ms: int,
             if len(data) >= PKT.size:
                 seq, t0 = PKT.unpack_from(data)
                 now2 = time.perf_counter()
-                quiet_since = None
                 if seq in range(count):
                     received += 1
                     rtts.append((now2 - t0) * 1000.0)

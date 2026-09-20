@@ -124,14 +124,6 @@ def acquire_lock() -> None:
                 except OSError:
                     is_bench = False
                 if is_bench:
-                    # A caller that redirected stderr (a shell loop does)
-                    # would otherwise see only a non-zero exit and no
-                    # reason. Leave the reason on disk next to the lock so
-                    # the blocked run can be diagnosed after the fact.
-                    with contextlib.suppress(OSError):
-                        LOCK_PATH.with_suffix(".blocked").write_text(
-                            f"{time.strftime('%H:%M:%S')} pid {os.getpid()} "
-                            f"blocked by pid {pid}\n")
                     sys.exit(f"another bench run (pid {pid}) is active — "
                              "concurrent runs interfere with each other; "
                              "wait for it to finish")
@@ -141,7 +133,6 @@ def acquire_lock() -> None:
 
 def release_lock() -> None:
     LOCK_PATH.unlink(missing_ok=True)
-    LOCK_PATH.with_suffix(".blocked").unlink(missing_ok=True)
 
 
 # --- configuration -----------------------------------------------------------
@@ -163,15 +154,9 @@ class Knobs:
     churn_concurrency: int = 16
     cooldown_load_factor: float = 0.7  # wait until loadavg < nproc * factor
     cooldown_max_wait_s: float = 30.0
-    # Per-arm wall-clock budget for the watchdog. A shaped cell's probes each
-    # take seconds-to-minutes, so the budget scales with the configured test
-    # length and the cell's own timeout class rather than being flat; the
-    # floor keeps a loopback arm from being killed mid-setup.
-    arm_timeout_loopback_s: float = 300.0
-    arm_timeout_weak_s: float = 900.0
     udp_capacity_count: int = 10000
     udp_capacity_pps: float = 20000.0
-    scale_streams: int = 64  # below the yamux ceiling (count x MUX_MAX_STREAMS)
+    scale_streams: int = 64  # below the yamux ceiling (count x 32)
     pool_size: int = 8
     allow_port_hi: int = 25999  # server-side allow_ports upper bound
     udp_count: int = 200
@@ -201,28 +186,10 @@ class Knobs:
             churn_concurrency=e("CHURN_CONCURRENCY", 16),
             cooldown_load_factor=e("COOLDOWN_LOAD_FACTOR", 0.7),
             cooldown_max_wait_s=e("COOLDOWN_MAX_WAIT_S", 30.0),
-            arm_timeout_loopback_s=e("ARM_TIMEOUT_LOOPBACK_S", 300.0),
-            arm_timeout_weak_s=e("ARM_TIMEOUT_WEAK_S", 900.0),
             pool_size=e("POOL_SIZE", 8),
             udp_count=e("UDP_COUNT", 200),
             udp_interval_ms=e("UDP_INTERVAL_MS", 20),
         )
-
-    def arm_timeout(self, spec) -> float:
-        """Wall-clock budget for one arm, used by the bench's watchdog.
-
-        A weak (shaped) cell's probes each need their own timeout scaled by
-        the test length, and there are a dozen of them plus setup, so the
-        weak budget is the larger of the configured constant and that sum;
-        loopback arms get a tight floor because every probe there is fast.
-        """
-        if not spec.weak:
-            return self.arm_timeout_loopback_s
-        # the slowest per-probe class is a weak throughput test: the client
-        # timeout scales as secs*2+6, and the probe set repeats it for the
-        # 1/8/64-stream points plus the remaining probes
-        per_probe = self.molehill_secs_weak * 2 + 6
-        return max(self.arm_timeout_weak_s, per_probe * 12)
 
 
 @dataclass
@@ -1183,48 +1150,6 @@ def run_cpu_sampler(server_pid: int, client_pid: int, stop: threading.Event,
             if wall > 0:
                 out.append((i, (c[0] - p[0]) / wall))  # % of one core
         prev = cur
-
-
-MUX_STATS_RE = re.compile(
-    r"mux-stats: cumulative framing counters written=(\d+) read=(\d+) bytes=(\d+)"
-)
-
-
-def framing_stats(logs) -> dict:
-    """Parse molehill's periodic `mux-stats` lines out of an arm's logs.
-
-    Returns the last snapshot seen per process plus the elapsed window the
-    first-to-last delta covers, so a caller can turn counters into rates.
-    Only present when the arm ran with `MOLEHILL_MUX_STATS=1`; otherwise the
-    fields are absent rather than zero (an absent metric and a measured zero
-    mean different things).
-    """
-    snaps = []
-    for log in logs:
-        try:
-            lines = log.read_text(errors="replace").splitlines()
-        except OSError:
-            continue
-        first = last = None
-        for line in lines:
-            m = MUX_STATS_RE.search(line)
-            if m:
-                v = tuple(int(g) for g in m.groups())
-                first = first or v
-                last = v
-        if first is not None:
-            snaps.append((log.name, first, last))
-    if not snaps:
-        return {}
-    written = sum(s[2][0] - s[1][0] for s in snaps)
-    read = sum(s[2][1] - s[1][1] for s in snaps)
-    nbytes = sum(s[2][2] - s[1][2] for s in snaps)
-    return {
-        "frames_written_delta": written,
-        "frames_read_delta": read,
-        "frame_bytes_delta": nbytes,
-        "processes": len(snaps),
-    }
 
 
 def cpu_stats(samples: list) -> dict:

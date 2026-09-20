@@ -8,7 +8,7 @@
 Five figures plus markdown tables — every comparison is a SINGLE
 variable (no confounding):
 - main chart (`assets/benchmark-vX.Y.Z.png`): molehill's default (mux, plain
-  TCP) row vs the plain-TCP peers (frp, rathole, nps) — same-transport
+  TCP) row vs the plain-TCP peers (frp, rathole, bore) — same-transport
   competition. Encrypted tools (e.g. chisel's SSH tunnel) are deliberately
   absent: their numbers are not comparable on the plain-TCP axis.
 - mux chart (`assets/benchmark-mux-vX.Y.Z.png`): mux vs mux-off — the one
@@ -31,7 +31,6 @@ Usage: plot_bench.py [results.json]
 Default: newest results-v*.json in this directory.
 """
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -42,7 +41,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 script_dir = Path(__file__).parent
-PEERS = ("frp", "rathole", "nps")  # plain-TCP peers, no encryption
+PEERS = ("frp", "rathole", "bore")  # plain-TCP peers, no encryption
 
 # molehill family gets its own palette so it reads at a glance; peers share
 # a pastel cool palette that recedes behind it
@@ -55,14 +54,7 @@ PEER_PALETTE = ["#a3c6e8", "#b9dcb9", "#d5c2e0"]
 def pick_results():
     if len(sys.argv) > 1:
         return Path(sys.argv[1])
-    # Semantic version order, not lexical: v0.10.0 sorts BEFORE v0.8.0
-    # lexically ("1" < "8"), which would plot the wrong (older) file as
-    # "newest" once the version passes 0.9.x
-    def version_key(p: Path) -> tuple:
-        m = re.match(r"^results-v(\d+)\.(\d+)\.(\d+)", p.name)
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
-
-    files = sorted(script_dir.glob("results-v*.json"), key=version_key)
+    files = sorted(script_dir.glob("results-v*.json"))
     if not files:
         sys.exit("no results-v*.json found; run `just bench` first")
     return files[-1]
@@ -245,9 +237,8 @@ def render_main(results, meta, out_path):
     ax_crtt.set_ylabel("echo RTT p50 (ms, log)")
     ax_crtt.set_title("Connection-path latency per cell", fontsize=10)
 
-    # A peer without UDP forwarding carries no UDP metrics: drop it from
-    # the UDP panels so it does not occupy an empty slot (data-driven, so
-    # the panel follows whatever peers the run actually measured)
+    # bore is TCP-only and carries no UDP metrics: drop it from the UDP
+    # panels so it does not occupy an empty slot
     udp_tools = [t for t in tools
                  if read(results, t, loopback, "udp_rtt_ms") is not None]
 

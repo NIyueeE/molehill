@@ -21,12 +21,13 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::Poll;
 
-use crate::mux::{Config, Connection, Mode};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tracing::debug;
+use yamux::{Config, Connection, Mode};
 
 /// A multiplexed stream adapted to tokio's IO traits.
-pub type MuxStream = crate::mux::Stream;
+pub type MuxStream = Compat<yamux::Stream>;
 
 /// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
@@ -43,7 +44,7 @@ pub type MuxStream = crate::mux::Stream;
 /// writable without ever stalling the tunnel's inbound processing.
 struct SynAnnounce {
     stream: Option<MuxStream>,
-    reply: Option<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>,
+    reply: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
 }
 
 impl std::future::Future for SynAnnounce {
@@ -66,7 +67,7 @@ impl std::future::Future for SynAnnounce {
             Poll::Ready(Err(e)) => {
                 debug!(error = %e, "Failed to announce outbound multiplexed stream");
                 if let Some(reply) = this.reply.take() {
-                    let _ = reply.send(Err(crate::mux::ConnectionError::Closed));
+                    let _ = reply.send(Err(yamux::ConnectionError::Closed));
                 }
                 Poll::Ready(())
             }
@@ -105,37 +106,10 @@ pub(crate) fn mux_config() -> Config {
     config
 }
 
-/// Periodically log the framing counters when `MOLEHILL_MUX_STATS=1`.
-///
-/// A diagnostic facility for attributing cost to the framing path: the
-/// lines carry cumulative frame counts, so a reader that knows the window
-/// (or takes the first and last line of a run) gets frames/s, and beside
-/// the measured CPU that becomes CPU-per-frame. Off by default so normal
-/// operation is silent.
-fn spawn_framing_stats() {
-    if std::env::var_os("MOLEHILL_MUX_STATS").is_none() {
-        return;
-    }
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        // A missed tick is not worth catching up on: the counters are
-        // cumulative, so a late line still reports the true totals.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let (written, read, bytes) = crate::mux::framing_stats();
-            info!(
-                written,
-                read, bytes, "mux-stats: cumulative framing counters"
-            );
-        }
-    });
-}
-
 /// Handle to a client-side tunnel: allows opening data channels as streams.
 #[derive(Clone)]
 pub struct ClientTunnel {
-    open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>,
+    open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
 }
 
 impl ClientTunnel {
@@ -152,14 +126,14 @@ impl ClientTunnel {
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (open_tx, mut open_rx) =
-            mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
+            mpsc::channel::<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>(16);
 
-        spawn_framing_stats();
         tokio::spawn(async move {
-            let mut conn = Connection::new(io, config, Mode::Client);
-            let mut waiting: Option<
-                oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>,
-            > = None;
+            // yamux speaks the `futures-io` trait family; adapt the tokio
+            // socket once at the boundary.
+            let mut conn = Connection::new(io.compat(), config, Mode::Client);
+            let mut waiting: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>> =
+                None;
             // A freshly opened stream whose SYN announcement is in flight.
             // The announcement is driven inside the poll closure (via the
             // shared mutex, so the closure never captures it mutably),
@@ -174,8 +148,8 @@ impl ClientTunnel {
                     /// The pending announcement settled; its reply was
                     /// already delivered to the waiting caller.
                     Announced,
-                    Opened(Result<crate::mux::Stream, crate::mux::ConnectionError>),
-                    Inbound(Option<Result<crate::mux::Stream, crate::mux::ConnectionError>>),
+                    Opened(Result<yamux::Stream, yamux::ConnectionError>),
+                    Inbound(Option<Result<yamux::Stream, yamux::ConnectionError>>),
                 }
 
                 let step = poll_fn(|cx| {
@@ -227,7 +201,7 @@ impl ClientTunnel {
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                             Some(SynAnnounce {
-                                                stream: Some(stream),
+                                                stream: Some(stream.compat()),
                                                 reply: Some(reply),
                                             });
                                     }
@@ -260,13 +234,13 @@ impl ClientTunnel {
     }
 
     /// Open a new data channel as a multiplexed stream.
-    pub async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError> {
+    pub async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
         let (tx, rx) = oneshot::channel();
         self.open_tx
             .send(tx)
             .await
-            .map_err(|_| crate::mux::ConnectionError::Closed)?;
-        rx.await.map_err(|_| crate::mux::ConnectionError::Closed)?
+            .map_err(|_| yamux::ConnectionError::Closed)?;
+        rx.await.map_err(|_| yamux::ConnectionError::Closed)?
     }
 }
 
@@ -304,13 +278,13 @@ impl TunnelPool {
 
     /// Open a data-channel stream on the next tunnel, falling through to the
     /// remaining ones if a tunnel is already closed.
-    pub async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError> {
+    pub async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
         use std::sync::atomic::Ordering;
 
         let n = self.inner.tunnels.len();
         // Wrapping is fine: the index is only used modulo `n`.
         let start = self.inner.next.fetch_add(1, Ordering::Relaxed);
-        let mut last_err = crate::mux::ConnectionError::Closed;
+        let mut last_err = yamux::ConnectionError::Closed;
         for i in 0..n {
             match self.inner.tunnels[(start + i) % n].open_stream().await {
                 Ok(stream) => return Ok(stream),
@@ -331,13 +305,12 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("server tunnel driver started");
-    spawn_framing_stats();
-    let mut conn = Connection::new(io, config, Mode::Server);
+    let mut conn = Connection::new(io.compat(), config, Mode::Server);
     while let Some(result) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
         match result {
             Ok(stream) => {
                 debug!("server tunnel accepted an inbound stream");
-                if tx.send(stream).await.is_err() {
+                if tx.send(stream.compat()).await.is_err() {
                     break;
                 }
             }
@@ -597,7 +570,10 @@ mod tests {
                     .await
                     .expect("recv timed out")
                     .unwrap();
-            eprintln!("[test] got stream {i} debug={srv_stream:?} reading data");
+            eprintln!(
+                "[test] got stream {i} debug={:?} reading data",
+                srv_stream.get_ref()
+            );
             let mut buf = [0u8; 4];
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),

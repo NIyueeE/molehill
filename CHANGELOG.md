@@ -7,28 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- The per-tunnel mux stream cap is raised from 32 to 64
-  (`DEFAULT_MUX_MAX_STREAMS`), doubling the per-client concurrent
-  data-channel ceiling at the default `count = 4` (128 -> 256). The
-  yamux credit reservation grows from 8 MiB to 16 MiB of the 64 MiB
-  connection receive window, leaving 48 MiB (75%) for the window
-  auto-tuner; the pairing is guarded by a unit test that fails if the
-  reservation ever swallows half the window (the configuration that
-  measured a ~30x throughput drop). The per-tunnel data-channel ceiling
-  was probed directly on one host with `count = 1`: 15 concurrent
-  streams before (the cap minus the service's 16-stream pool and
-  iperf3's control stream) versus 47 after, with the 16th and 48th
-  opening failing in the respective runs. See HANDOFF.md, "Phase 4:
-  L2 landed".
-
 ### Performance
 
-- Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
-  now staged into one buffer with their 12-byte header and written in a
-  single call instead of two. Larger frame bodies keep the two-phase write
-  so a 16 KiB payload is never copied twice.
 - The Noise record stream (the `noise` transport) is leaner: reads
   accumulate the two-byte length header together with the ciphertext in one
   buffer — one `poll_read` sweep per record instead of a separate header
@@ -57,55 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1:1 with the frame reader's body ask. Details: HANDOFF.md, "Direct
   decrypt A/B".
 
-- Connection setup allocates almost nothing now. The handshake runs on
-  stack buffers (its messages are bounded by the pattern's tokens, well
-  under 300 bytes — the snowstorm original allocated two 64 KiB buffers
-  per handshake turn), and the three 64 KiB record buffers come from a
-  bounded pool (64 sets, ~12 MiB high-water): freed in one piece they
-  exceed the allocator's trim threshold, so without a pool every
-  connection re-faults and re-zeroes 48 pages. A counting-allocator +
-  getrusage probe (release build) measures pair setup at **232 us, 28
-  allocations and 4 KiB, zero minor faults — down from 312 us, 42
-  allocations and 900 KiB**. System level (same host, same method, 3
-  reps): the direct-mode noise arm's churn improves **+11.7% connects/s
-  and -10.7% first-byte p50**, with RSS **-24%**; the mux arm is unchanged
-  inside the spread (its tunnels are set up once per client). Details:
-  HANDOFF.md, "Connection-setup allocation measurement".
-
 ### Changed
-
-- The multiplexing engine (`multiplex` feature) is now maintained in-repo:
-  rust-yamux 0.14 was vendored into `src/mux/` — wire-identical with the
-  yamux specification, so 0.8.x peers keep interoperating — and the
-  `yamux` crate dependency is gone. Vendoring is a move, not a rewrite;
-  the deviations are mechanical (logging through `tracing`, `std`
-  instead of `web-time`/`static_assertions`, upstream property tests
-  dropped, the unused graceful-close subsystem removed). It puts the
-  framing path under molehill's own rules and unlocks changes that
-  call-site tuning cannot reach. Design and phased plan: HANDOFF.md,
-  "Direction ① design document".
-- The mux engine is now tokio-native: it speaks tokio's `AsyncRead` /
-  `AsyncWrite` directly instead of the futures-io traits behind a
-  tokio-util `Compat` shim, so the `futures` and `tokio-util`
-  dependencies are gone. The per-stream command channel is unbounded —
-  the yamux send window is the real backpressure (a frame is only queued
-  after its bytes consumed window credit), so the queue stays bounded by
-  the credit the peer granted. No wire change.
-- `poll_read` on a mux stream now delivers buffered bytes before
-  attempting the window update (the update needs command-channel
-  capacity, the delivery does not), and the connection's poll loop
-  drains its queued frames within one poll instead of sleeping with
-  frames still queued. Both close deadlock windows the futures-based
-  engine did not have: a reader parked on a full command channel while
-  holding buffered data starved the peer's sender of credit, and an
-  idle writer plus drained receivers plus a quiet socket left the
-  connection with no waker at all — the queued frames (window updates
-  included) never went out until an unrelated timeout broke the cycle.
-  The command channel stays bounded at 10 frames: the depth is pacing,
-  not backpressure — an unbounded queue lets writers run whole windows
-  ahead, the receiver's buffer grows with them, and the window update
-  shrinks with the buffer, throttling the very sender it is meant to
-  supply.
 
 - `MultiMap` — the two-key map behind the server's control-channel
   registry — is now plain safe Rust: the second key is stored in both maps
@@ -113,27 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/common/multi_map.rs` no longer contains `unsafe`, which leaves
   `src/transport/udp_batch.rs` as the single audited unsafe site.
 
-### Changed
-
-- `default_split_send_size` is now 32 KiB (the vendored yamux default was
-  16 KiB). Re-measured on the fixed engine — the earlier 16 KiB preference
-  came from a run polluted by the dead-receiver leak and its numbers are
-  not comparable: the 32 KiB split now measures +45.7% with
-  non-overlapping reps on the single-tunnel 8-stream loopback cell and
-  +5..9% on the shaped cells, everything else inside the spread.
-
 ### Fixed
 
-- Multiplexed connections no longer accumulate dead stream receivers.
-  The engine used futures' `SelectAll` for the per-stream command
-  receivers, which drops a sub-stream once it reports its end; the
-  tokio-native conversion replaced it with a `Vec` and never removed the
-  finished receivers. Every stream ever opened stayed in the vector, and
-  the connection's poll loop is O(receivers) — a client serving many
-  short-lived connections (connection churn) ended up polling thousands
-  of dead receivers on every poll: the single-tunnel churn rate measured
-  -29% and the first-byte p50 3.1 -> 7.1 ms against the pre-conversion
-  engine. Fixed by retaining only the live receivers.
 - `molehill --genkey` on a binary built without the `noise` feature names
   the feature correctly now ("noise", previously "nosie"). The
   `feature_not_compile` helper is cfg-gated to exist exactly when one of

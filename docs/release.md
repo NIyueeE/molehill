@@ -87,10 +87,8 @@ entries are PEP 723 python scripts run via `uv run`: runs are resumable (each
 completed arm is checkpointed together with the full meta), continue on
 error (a per-metric failure records `null` plus a `partial_metrics` list
 instead of a fake 0; a probe that is structurally out of range — the
-64-stream scale point above an arm's usable yamux ceiling (the cap
-`count × 64` minus the bench's own pooled channels and the client's
-control stream) — is skipped by design with its reason recorded the same
-way; the rate20
+64-stream scale point above an arm's `count × 32` yamux ceiling — is
+skipped by design with its reason recorded the same way; the rate20
 8-stream test wedges the single-test iperf3 server and records the timeout
 instead), refuse to run concurrently (a global lock — concurrent
 runs used to reap each other's live processes), and a killed run (Ctrl-C or
@@ -120,39 +118,6 @@ three hours at full rigor:
    file. **Performance must not regress vs the previous tag**; a violation
    blocks the tag until fixed or explicitly waived (record the waiver in
    `HANDOFF.md`).
-
-### Comparing two builds (development A/Bs)
-
-Outside the release ritual, an A/B between two commits is a `--ab` run plus
-a verdict — never two sequential runs. Machine drift between epochs is
-larger than the effects being measured on some cells (~12% was measured on
-the shaped cells), which is what hid both a real -11.8% regression and a
-leaked-receiver bug for a whole session, and what made a -31% "regression"
-turn out to be a bimodal cell landing on an outlier.
-
-```bash
-# build both binaries, then one interleaved run: the two binaries alternate
-# inside every cell, so both sample the same epochs
-TMPDIR=~/tmp MOLEHILL_BIN=... MOLEHILL_REPS=3 MOLEHILL_SECS=8 \
-  just bench --tools=molehill --cells=0/0,1%/10 --variants=mux,mux1 \
-       --ab /path/to/bin-a,/path/to/bin-b --fresh --out results-ab.json
-# verdict: per-cell medians, deltas, and whether the difference is claimable
-just bench-ab results-ab.json
-```
-
-`ab_compare.py` prints a CLAIM only where a round's rep ranges are disjoint
-(AGENTS.md §10); everything else is reported as inside-spread or
-median-only, and a claimable regression exits non-zero. It also accepts two
-independent files (`--baseline`) and warns that epoch drift is not
-cancelled there. Only the throughput metrics record a per-rep range in the
-schema, so they are the only ones that can reach a CLAIM; the engine's
-framing counters (`MOLEHILL_MUX_STATS=1`, which the bench sets itself) add
-`frames_per_s` and `cpu_pct_per_kframe` per arm, which separate "too many
-frames" from "too much work per frame" when a cell is CPU-bound.
-
-An arm that hangs is bounded by a wall-clock budget and recorded as an
-error, so a wedged probe cannot hold the bench lock and silently block
-every later run.
 4. Commit results JSON + new chart + README table **in the release commit**.
 5. `just tag` — the release review (`githooks/pre-tag`) must pass, then the
    annotated tag for `Cargo.toml`'s version is created locally. Pushing it
