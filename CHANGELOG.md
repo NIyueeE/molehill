@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-record `set_len` dance is gone, and with it the wrapper's `unsafe`
   code. Covered by new unit tests in `src/transport/noise_stream.rs`.
 
+### Changed
+
+- `MultiMap` — the two-key map behind the server's control-channel
+  registry — is now plain safe Rust: the second key is stored in both maps
+  instead of sharing one heap item between them through raw pointers.
+  `src/common/multi_map.rs` no longer contains `unsafe`, which leaves
+  `src/transport/udp_batch.rs` as the single audited unsafe site.
+
 ## [0.8.1] - 2026-09-11
 
 ### Fixed

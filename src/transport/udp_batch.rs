@@ -6,9 +6,11 @@
 //! from UDP GSO, and it changes nothing on the wire: the datagrams are
 //! byte-identical, so peers and protocol are unaffected.
 //!
-//! This module is an audited unsafe site (the other one is
-//! `src/common/multi_map.rs`): every unsafe item below carries a SAFETY
-//! comment. Non-Linux platforms keep the single-datagram tokio paths.
+//! This module is the one audited unsafe site in the codebase (the raw
+//! pointer map that used to share items between two hash maps was replaced
+//! by a safe two-key map in `src/common/multi_map.rs`): every unsafe item
+//! below carries a SAFETY comment. Non-Linux platforms keep the
+//! single-datagram tokio paths.
 
 #![cfg(target_os = "linux")]
 
