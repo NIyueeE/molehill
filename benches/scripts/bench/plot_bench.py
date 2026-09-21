@@ -31,7 +31,6 @@ Usage: plot_bench.py [results.json]
 Default: newest results-v*.json in this directory.
 """
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -55,14 +54,7 @@ PEER_PALETTE = ["#a3c6e8", "#b9dcb9", "#d5c2e0"]
 def pick_results():
     if len(sys.argv) > 1:
         return Path(sys.argv[1])
-    # Semantic version order, not lexical: v0.10.0 sorts BEFORE v0.8.0
-    # lexically ("1" < "8"), which would plot the wrong (older) file as
-    # "newest" once the version passes 0.9.x
-    def version_key(p: Path) -> tuple:
-        m = re.match(r"^results-v(\d+)\.(\d+)\.(\d+)", p.name)
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
-
-    files = sorted(script_dir.glob("results-v*.json"), key=version_key)
+    files = sorted(script_dir.glob("results-v*.json"))
     if not files:
         sys.exit("no results-v*.json found; run `just bench` first")
     return files[-1]

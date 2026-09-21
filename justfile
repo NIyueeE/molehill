@@ -87,13 +87,6 @@ bench-plot:
 bench-check:
     uv run benches/scripts/bench/check_regression.py
 
-# A/B verdict for one interleaved run (bench.py --ab BIN_A,BIN_B), or for two
-# independent files. Prints per-cell medians, deltas, and whether the
-# difference is claimable per AGENTS.md section 10 (non-overlapping reps).
-# Non-zero exit means a claimable regression was found.
-bench-ab:
-    uv run benches/scripts/bench/ab_compare.py
-
 # Fast dev loop: lib tests + the core integration subset (~1 min; the full
 # suite is ~72 s and runs on every push/CI — see docs/checks.md).
 test-fast:

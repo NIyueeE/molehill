@@ -9,7 +9,6 @@
 - **Control channel**: a connection between the server and the client that carries control commands for one registered service
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel
 - **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that carries many data channels as streams
-- **Stripe group**: a set of `K` data channels that carry one visitor connection together (see "Data-channel striping")
 
 ## Startup and registration
 
@@ -29,16 +28,6 @@ To reduce first-visitor latency, data channels are pre-created as a pool (per-se
 
 For UDP, the server maintains a per-service **session-affinity table**: a single reader task accepts datagrams from the service socket and routes every peer address to one data channel for the entry's lifetime (TTL-evicted after 300 s of inactivity). Routing every peer to a fixed channel — instead of letting all workers race on the socket — is what keeps one peer's packets on one path; the pool shards *distinct peers*, not packets.
 
-### Data-channel striping
-
-With `[server.data]stripe_count = K` (default `1`), the server pairs every visitor connection with `K` data channels instead of one and labels each with a `StartForwardStripedTcp(group, index, K)` command. The pair then forwards the connection over the group (`src/stripe.rs`):
-
-- Each direction numbers its chunks (`[u64 seq][u16 len][payload]` frames, 32 KiB payloads) and spreads them round-robin over the group's channels.
-- The receiving side reassembles by sequence number: out-of-order chunks wait in a bounded reorder map, contiguous ones are written to the destination. A frame always travels whole on one channel (a half-written frame cannot move — it would corrupt that channel's framing); a channel that refuses a frame *before* any byte of it is committed is skipped for that frame, so one backpressured channel does not stall the group.
-- A channel that ends mid-frame (not at a frame boundary) breaks the group instead of leaving the reassembler waiting for a sequence number that will never arrive.
-
-Three things follow from the arithmetic: the visitor's throughput ceiling is the sum of its channels' ceilings (a single stream is no longer capped by one tunnel), its in-flight window is the sum of the channels' windows, and each channel's framing work is driven by its own task. The cost is the reorder buffering (bounded by the engine's per-stream window plus one reorder queue per direction) and one data-channel wire addition — the striped command rides *after* the unchanged `StartForward*` commands, and channels that do not carry it are byte-identical to the unstriped path, so the yamux wire format (and 0.8.x peer interoperability) is untouched. Striping applies to TCP services; UDP keeps its one-channel-per-peer shape, where session affinity is the stronger constraint.
-
 ### Multiplexing
 
 With the `multiplex` feature (part of the default feature set) and `mode = "multiplex"` (the default), the client dials N connections per control session right after registering (`[client.data].default_count`, default 4, overridable per service) — the *tunnels* — each announced with a distinct hello so the server upgrades them to yamux sessions too. Data-channel opens spread across the tunnels round-robin (a dead tunnel is skipped transparently until the heartbeat-driven reconnect replaces the pool). The tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr` when set, else `[client.data].default_data_addr`, else the control endpoint) and are accepted by the server's data listener — the control listener itself when the addresses match, otherwise `[server.data].bind_addr`. From then on:
@@ -46,7 +35,7 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 - `CreateDataChannel` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
 - Per-stream framing is identical to the plain path (`StartForward*` command first), which keeps both modes testable against each other.
-- The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
+- The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification, see HANDOFF.md "Direction ① design document"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 
 `mode = "direct"` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.

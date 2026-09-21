@@ -18,7 +18,6 @@ pub mod logging;
 #[cfg(feature = "multiplex")]
 mod mux;
 mod protocol;
-mod stripe;
 mod transport;
 
 pub use cli::Cli;

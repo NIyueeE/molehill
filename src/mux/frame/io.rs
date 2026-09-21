@@ -95,9 +95,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
     /// Queue a frame for writing. The caller checks [`Io::is_idle`] first
     /// and drives the writer with [`Io::poll_flush`] afterwards.
     pub(crate) fn start_frame(&mut self, f: Frame<()>) {
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::mux::FRAMES_WRITTEN.fetch_add(1, Relaxed);
-        crate::mux::FRAME_BYTES.fetch_add(f.body.len() as u64, Relaxed);
         let header = header::encode(&f.header);
         let buffer = f.body;
         self.write_state = if buffer.len() <= COALESCE_BODY_MAX {
@@ -298,9 +295,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
                         let h = header.clone();
                         let v = std::mem::take(buffer);
                         this.read_state = ReadState::Init;
-                        crate::mux::FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        crate::mux::FRAME_BYTES
-                            .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         return Poll::Ready(Some(Ok(Frame { header: h, body: v })));
                     }
 

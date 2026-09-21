@@ -70,7 +70,6 @@ The measurements below justify the defaults and tell you when to deviate.
 | **`count = 4` (default)** | many concurrent streams, or a lossy path: independent tunnels isolate head-of-line blocking and **aggregate beyond a single flow** | 4 physical connections per service (FDs/ports/NAT mappings) and ~494% CPU against 216% for one tunnel; loopback 8-stream 19.5 vs 9.2 Gbit/s at `count = 1`, 1% loss 12.3 vs 4.5, burst loss 13.3 vs 4.5; the 10 ms HoL max is lower (80.7 vs 100.1 ms) |
 | **`count = 1`** | one long-lived stream, a tight connection budget, or the smallest footprint (~16 MiB with half the CPU) | one TCP-flow ceiling; no aggregation (loopback 8-stream 9.2 Gbit/s); every stream shares one retransmit domain |
 | **`carrier = "kcp"`** (experimental) | when TCP data tunnels are blocked or throttled, or for **latency-first UDP at high delay** | far behind the TCP carrier wherever the path is not the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, rtt10 0.79 vs 5.45, loss1 0.71 vs 7.74) at ~2.5-3x RSS (83 vs 26 MiB) and lower CPU; its clearest win is rtt100 session quality (max gap 20 ms vs the TCP arms' 100+) |
-| **`[server.data] stripe_count = K`** (experimental) | one long-lived stream must not be bounded by one tunnel flow: each visitor connection is spread over `K` data channels, so its ceiling and window are the sum of the channels' | `K×` the per-visitor data channels and tasks, receiver-side reorder buffering; the single-stream A/B and its cost side are recorded in HANDOFF.md, "Stripe A/B (K=4)" |
 | **noise** | encrypted transport wanted with **memory and simplicity first**: a pre-shared public key and no PKI | ~58% of single-stream and ~76% of 8-stream plain throughput (5.8/14.9 vs 10.0/19.5 Gbit/s), sub-millisecond RTT, ~4 MiB more RSS; CPU a wash (470% vs 494% of one core) |
 
 How to apply each choice: the `[client.data]` block holds the per-client
@@ -95,10 +94,6 @@ re-test:
 2. **One user or many, and how many concurrent connections?** A single
    long-lived session (SSH, one Minecraft player) → `direct` or the
    default mux both work; mux saves NAT mappings at low concurrency too.
-   When that one stream must not be bounded by a single tunnel flow
-   (bulk over one session), set `[server.data] stripe_count` (K=4) —
-   the connection then rides K parallel data channels, at K× channels
-   per visitor and a bounded reorder buffer.
    Many users / churn / multiple services → keep or raise `count`
    (each tunnel carries ~64 concurrent connections before the yamux
    ceiling — `count = 8` ≈ 512).
@@ -163,17 +158,6 @@ echo RTT track the group, and it carries UDP. Its head-of-line probe
 measures zero because a full-duplex bulk echo through its bridge stalls
 (one-directional bulk runs at 27 Gbit/s), which the chart renders as an
 absent slot rather than a zero.
-
-**Note (2026-09-21):** both tables above were measured on the engine
-before the dead-receiver leak was fixed (a client serving many
-short-lived connections polled thousands of finished stream receivers per
-poll — see "What landed" in `HANDOFF.md`). After the fix the
-single-tunnel 8-stream cell reads **+23.5%** relative to the pre-fix
-engine, the default mux arm's loopback 1/8-stream cells +6.6%/+5.2%, and
-churn is back at main's level; the reverted 32 KiB frame split ("phase 3")
-was a product of that polluted measurement and is re-adopted. The v0.8.1
-release table stays as that release's record — the new numbers land with
-the next full-matrix run and its chart.
 
 ### molehill: multiplexing cost (mux vs mux-off)
 

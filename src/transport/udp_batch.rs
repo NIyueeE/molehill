@@ -18,7 +18,6 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 
-use crate::kcp::KCP_OVERHEAD;
 use bytes::Bytes;
 
 /// Datagrams per syscall. 32 × ~1.5 KiB ≈ 48 KiB per wake; far below
@@ -276,33 +275,6 @@ unsafe impl Send for RecvBatch {}
 // SAFETY: same reasoning as the `Send` impl above.
 unsafe impl Sync for RecvBatch {}
 
-/// One datagram of a batch on its way to the wire.
-///
-/// Either a contiguous span of the batch's staging buffer, or a staged
-/// header plus an external payload — the engine segment's own buffer,
-/// sent as a second iovec so the payload is never copied for the wire.
-/// The two shapes are byte-identical on the wire: a datagram is a
-/// 24-byte header plus its payload either way.
-#[derive(Clone)]
-pub enum Span {
-    /// A whole datagram at `off..off + len` inside the batch buffer.
-    Staged { off: usize, len: usize },
-    /// A two-iovec datagram: a `KCP_OVERHEAD` header at `hdr_off` inside
-    /// the batch buffer, then `payload` by reference. The `Bytes` handle
-    /// is an O(1) share of the engine segment's buffer.
-    Split { hdr_off: usize, payload: Bytes },
-}
-
-impl Span {
-    /// The datagram's total length on the wire (header + payload).
-    pub fn len(&self) -> usize {
-        match self {
-            Span::Staged { len, .. } => *len,
-            Span::Split { payload, .. } => KCP_OVERHEAD + payload.len(),
-        }
-    }
-}
-
 /// Reusable `sendmmsg` state: the scatter-gather descriptors are owned here
 /// so their addresses stay stable across calls.
 pub struct SendBatch {
@@ -335,74 +307,34 @@ impl Default for SendBatch {
 impl SendBatch {
     pub fn new() -> Self {
         Self {
-            // A batch holds at most `BATCH` datagrams, and a two-iovec
-            // (split) datagram takes two of them.
-            iovs: Vec::with_capacity(2 * BATCH),
+            iovs: Vec::with_capacity(BATCH),
             msgs: Vec::with_capacity(BATCH),
         }
     }
 
-    /// Send the `spans` datagrams of one batch to one peer in a single
-    /// syscall. Each span is one datagram: either contiguous in the
-    /// batch's staging `buf` (one iovec), or a staged header plus an
-    /// external payload (two iovecs — the payload pointer is the engine
-    /// segment's own buffer, so no copy stages it). A partial send
-    /// (return value < `spans.len()`) drops the unsent tail, and
-    /// `Err(WouldBlock)` means the kernel send buffer is full — in both
-    /// cases the caller's ARQ re-emits the datagrams. Callers invoke this
-    /// through `UdpSocket::try_io` so the EAGAIN also clears tokio's
-    /// cached writability.
-    pub fn send_spans(
-        &mut self,
-        fd: RawFd,
-        peer: SocketAddr,
-        buf: &Bytes,
-        spans: &[Span],
-    ) -> io::Result<usize> {
-        let n = spans.len().min(BATCH);
+    /// Send up to `dgrams.len()` datagrams to one peer in a single syscall.
+    /// Returns the number sent, or `Err(WouldBlock)` when the kernel send
+    /// buffer is full (the caller retries next pump iteration; a partial
+    /// send drops the remainder, which KCP's ARQ absorbs — the segments
+    /// stay in the send buffer). Callers invoke this through
+    /// `UdpSocket::try_io` so the EAGAIN also clears tokio's cached
+    /// writability.
+    pub fn send(&mut self, fd: RawFd, peer: SocketAddr, dgrams: &[Bytes]) -> io::Result<usize> {
+        let n = dgrams.len().min(BATCH);
         let ss = storage_from_addr(peer);
         self.iovs.clear();
         self.msgs.clear();
-        for span in &spans[..n] {
-            let iov_start = self.iovs.len();
-            match span {
-                Span::Staged { off, len } => {
-                    self.iovs.push(libc::iovec {
-                        #[expect(unsafe_code, reason = "audited FFI: in-bounds pointer arithmetic")]
-                        // SAFETY: `off + len <= buf.len()` (the adapter only
-                        // records spans of complete datagrams it staged into
-                        // `buf`), and `buf` is borrowed for the whole call, so
-                        // the pointer stays valid and the iovec never reads
-                        // past the live allocation.
-                        iov_base: unsafe { buf.as_ptr().add(*off) } as *mut libc::c_void,
-                        iov_len: *len,
-                    });
-                }
-                Span::Split { hdr_off, payload } => {
-                    self.iovs.push(libc::iovec {
-                        #[expect(unsafe_code, reason = "audited FFI: in-bounds pointer arithmetic")]
-                        // SAFETY: `hdr_off + KCP_OVERHEAD <= buf.len()` for the
-                        // header (staged by the same `write_datagram` call
-                        // that recorded the span); `buf` is borrowed for the
-                        // whole call, so the pointer stays valid and the
-                        // iovec never reads past the live allocation.
-                        iov_base: unsafe { buf.as_ptr().add(*hdr_off) } as *mut libc::c_void,
-                        iov_len: KCP_OVERHEAD,
-                    });
-                    // SAFETY: `payload`'s allocation outlives the call (the
-                    // caller holds the `Bytes` in its span list) and
-                    // `payload.len()` is its exact length.
-                    self.iovs.push(libc::iovec {
-                        iov_base: payload.as_ptr() as *mut libc::c_void,
-                        iov_len: payload.len(),
-                    });
-                }
-            }
-            let msg_iovlen = self.iovs.len() - iov_start;
-            // SAFETY: `iov_start < self.iovs.len()`, same in-bounds
+        for d in &dgrams[..n] {
+            self.iovs.push(libc::iovec {
+                iov_base: d.as_ptr() as *mut libc::c_void,
+                iov_len: d.len(),
+            });
+        }
+        for i in 0..n {
+            // SAFETY: `i` < `self.iovs.len()`, same in-bounds
             // reasoning as `RecvBatch::recv`.
             #[expect(unsafe_code, reason = "audited FFI: in-bounds pointer arithmetic")]
-            let iov_ptr = unsafe { self.iovs.as_mut_ptr().add(iov_start) };
+            let iov_ptr = unsafe { self.iovs.as_mut_ptr().add(i) };
             self.msgs.push(libc::mmsghdr {
                 msg_hdr: {
                     let mut hdr = empty_msghdr();
@@ -414,7 +346,7 @@ impl SendBatch {
                         libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
                             .unwrap_or(0);
                     hdr.msg_iov = iov_ptr;
-                    hdr.msg_iovlen = msg_iovlen;
+                    hdr.msg_iovlen = 1;
                     hdr
                 },
                 msg_len: 0,
@@ -426,8 +358,8 @@ impl SendBatch {
                       non-blocking socket (the same pattern QUIC stacks use)"
         )]
         // SAFETY: `self.iovs`/`self.msgs` are this call's own live vectors,
-        // each iovec points into `buf` borrowed for the call, `ss` outlives
-        // the call, `fd` is a valid non-blocking UDP socket and
+        // each iovec points into a `Bytes` borrowed for the call, `ss`
+        // outlives the call, `fd` is a valid non-blocking UDP socket and
         // MSG_DONTWAIT prevents blocking.
         let sent = unsafe {
             libc::sendmmsg(

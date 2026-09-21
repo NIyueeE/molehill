@@ -70,7 +70,7 @@ re-enforces the version and changelog invariants remotely.
 
 Every tag refreshes the peer-comparison benchmark (matrix design and peer
 fetching live in `benches/scripts/bench/`; peers: frp, rathole (upstream),
-nps — each fetched as the **latest GitHub release** binary, never
+bore — each fetched as the **latest GitHub release** binary, never
 built from source, with the resolved versions recorded in the results meta
 and the chart footer). The matrix (schema v3) measures, per tool and network
 cell: TCP
@@ -80,7 +80,7 @@ one established connection), UDP session quality over one established session
 (RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
 bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
 as mux, noise, mux1 and kcp4 variants (mux-off additionally on the loopback
-cell); peers: frp / rathole / nps also run UDP arms, and all
+cell); peers: frp / rathole also run UDP arms, bore is TCP-only, and all
 three run a lean cell subset (loopback, rtt10, 1% loss, the two rate cells)
 — the peers chart plots only those cells. All bench
 entries are PEP 723 python scripts run via `uv run`: runs are resumable (each
@@ -120,56 +120,6 @@ three hours at full rigor:
    file. **Performance must not regress vs the previous tag**; a violation
    blocks the tag until fixed or explicitly waived (record the waiver in
    `HANDOFF.md`).
-
-### Comparing two builds (development A/Bs)
-
-Outside the release ritual, an A/B between two commits is a `--ab` run plus
-a verdict — never two sequential runs. Machine drift between epochs is
-larger than the effects being measured on some cells (~12% was measured on
-the shaped cells), which is what hid both a real -11.8% regression and a
-leaked-receiver bug for a whole session, and what made a -31% "regression"
-turn out to be a bimodal cell landing on an outlier.
-
-```bash
-# build both binaries, then one interleaved run: the two binaries alternate
-# inside every cell, so both sample the same epochs
-TMPDIR=~/tmp MOLEHILL_BIN=... MOLEHILL_REPS=3 MOLEHILL_SECS=8 \
-  just bench --tools=molehill --cells=0/0,1%/10 --variants=mux,mux1 \
-       --ab /path/to/bin-a,/path/to/bin-b --fresh --out results-ab.json
-# verdict: per-cell medians, deltas, and whether the difference is claimable
-just bench-ab results-ab.json
-```
-
-`ab_compare.py` prints a CLAIM only where a round's rep ranges are disjoint
-(AGENTS.md §10); everything else is reported as inside-spread or
-median-only, and a claimable regression exits non-zero. It also accepts two
-independent files (`--baseline`) and warns that epoch drift is not
-cancelled there. Only the throughput metrics record a per-rep range in the
-schema, so they are the only ones that can reach a CLAIM.
-
-**Read the verdict's sides with the mapping it prints.** The pair is sorted
-by label, so the first-printed value is not necessarily the left `--ab`
-entry — and two binaries built from different worktrees usually share the
-basename `molehill`, so their labels are disambiguated hashes. Every `--ab`
-results file therefore records `meta.ab_bin_paths` (label → resolved
-path), and the verdict tool prints that mapping before the table: a
-verdict read with the sides swapped inverts its meaning (a winning change
-was briefly reverted that way on 2026-09-23 — HANDOFF.md, "Phase 1 A/B").
-
-The engine's
-framing counters (`MOLEHILL_MUX_STATS=1`, which the bench sets itself) add
-`frames_per_s` and `cpu_pct_per_kframe` per arm, which separate "too many
-frames" from "too much work per frame" when a cell is CPU-bound. The KCP
-arm has the parallel instrument: `MOLEHILL_KCP_STATS=1` (set it in the
-environment — the bench's spawn env inherits it) adds a per-second
-`kcp-stats` line to each molehill process's log — datagrams in/out,
-retransmits, pump rounds and per-phase milliseconds — the attribution
-table for the `kcp4` arm's per-segment cost (HANDOFF.md, "KCP
-attribution").
-
-An arm that hangs is bounded by a wall-clock budget and recorded as an
-error, so a wedged probe cannot hold the bench lock and silently block
-every later run.
 4. Commit results JSON + new chart + README table **in the release commit**.
 5. `just tag` — the release review (`githooks/pre-tag`) must pass, then the
    annotated tag for `Cargo.toml`'s version is created locally. Pushing it
