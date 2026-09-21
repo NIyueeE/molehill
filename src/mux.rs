@@ -17,9 +17,8 @@
 //! allocation, the IO layer) need code ownership rather than call-site
 //! tuning. It is a move, not a rewrite — the engine stays wire-identical
 //! with the [yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md),
-//! so a 0.8.x peer keeps interoperating. The per-change record of the
-//! migration that followed the vendoring (what landed, what was measured
-//! and closed) is in HANDOFF.md, "What landed" and "Optimization route".
+//! so a 0.8.x peer keeps interoperating. The phased plan that follows the
+//! vendoring is recorded in HANDOFF.md, "Direction ① design document".
 //!
 //! Deviations from the vendored copy: logging goes through
 //! `tracing` instead of the `log` facade; `web-time` and
@@ -52,15 +51,20 @@ pub use crate::mux::frame::header::StreamId;
 
 const KIB: usize = 1024;
 const MIB: usize = KIB * 1024;
-/// `MIB` as `f64` for the flow-control window maths, written as the exact
-/// product `1024.0 * 1024.0` so no integer→float conversion is involved
-/// (2^20 is exactly representable either way).
-const MIB_F64: f64 = 1024.0 * 1024.0;
+/// `MIB` as `f64` for the flow-control window maths (lossless: 2^20 is
+/// exactly representable).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "MIB is 2^20, exactly representable in f64"
+)]
+const MIB_F64: f64 = MIB as f64;
 const GIB: usize = MIB * 1024;
 
-/// The default per-stream flow-control credit: 256 KiB, as per the yamux
-/// specification.
-pub const DEFAULT_CREDIT: u32 = 256 * 1024;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "256 KiB fits comfortably in u32"
+)]
+pub const DEFAULT_CREDIT: u32 = 256 * KIB as u32; // as per yamux specification
 
 pub type Result<T> = std::result::Result<T, ConnectionError>;
 
@@ -83,31 +87,7 @@ const MAX_ACK_BACKLOG: usize = 256;
 ///
 /// For details on why this concrete value was chosen, see
 /// <https://github.com/paritytech/yamux/issues/100>.
-const DEFAULT_SPLIT_SEND_SIZE: usize = 32 * KIB;
-
-/// Cumulative frame counters for the framing path, used by the optional
-/// periodic stats line (`MOLEHILL_MUX_STATS=1`).
-///
-/// They exist so a run can attribute cost to the path: frames/s beside the
-/// measured CPU turns a throughput number into CPU-per-frame, which is what
-/// separates "the engine does too much work per frame" from "there are too
-/// many frames". A relaxed atomic add per frame is a few nanoseconds against
-/// the frame's own cost, and the counters are only read by the stats task.
-pub(crate) static FRAMES_WRITTEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub(crate) static FRAMES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Body bytes only (the 12-byte headers excluded) across both directions.
-pub(crate) static FRAME_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Snapshot of the framing counters, for the periodic stats line.
-pub(crate) fn framing_stats() -> (u64, u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        FRAMES_WRITTEN.load(Relaxed),
-        FRAMES_READ.load(Relaxed),
-        FRAME_BYTES.load(Relaxed),
-    )
-}
+const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 
 /// Yamux configuration.
 ///
@@ -116,15 +96,9 @@ pub(crate) fn framing_stats() -> (u64, u64, u64) {
 /// - max. for the total receive window size across all streams of a connection = 1 GiB
 /// - max. number of streams = 512
 /// - read after close = true
-/// - split send size = 32 KiB (the vendored default is 16 KiB; adopted
-///   from a single-variable A/B that measured +45.7% non-overlapping on
-///   the single-tunnel 8-stream cell. That figure did NOT reproduce in
-///   the 2026-09-22 cumulative A/B against `main`, where the same cell
-///   measured +0.3% with the rounds alternating direction — the split
-///   stays the shipped default on no-regression grounds, not as a proven
-///   throughput win. The 16 KiB preference it replaced came from a run
-///   against the dead-receiver leak recorded in HANDOFF.md, "What
-///   landed" (`a424ccc`), whose numbers are not comparable either)
+/// - split send size = 16 KiB (the vendored default; a 32 KiB experiment
+///   measured -19%/-31% on the loopback cells for +4% on `loss1_rtt10` —
+///   see HANDOFF.md, "Phase 3 reverted")
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,
@@ -197,6 +171,18 @@ impl Config {
             stream at least the Yamux default window size"
         );
 
+        self
+    }
+
+    /// Allow or disallow streams to read from buffered data after
+    /// the connection has been closed.
+    /// Set the max. payload size used when sending data frames. Payloads larger
+    /// than the configured max. will be split.
+    // The frame-split lever (direction ① phase 3) adds the caller; until
+    // then the knob is part of the vendored config surface, unused here.
+    #[expect(dead_code, reason = "L1 (conditional frame split) adds the caller")]
+    pub fn set_split_send_size(&mut self, n: usize) -> &mut Self {
+        self.split_send_size = n;
         self
     }
 }

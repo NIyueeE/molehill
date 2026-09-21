@@ -2,6 +2,7 @@
 /.git/
 /.github/
 /target/
+/examples/
 /docs/
 /benches/
 

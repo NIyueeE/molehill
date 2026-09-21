@@ -23,7 +23,7 @@ use std::task::Poll;
 
 use crate::mux::{Config, Connection, Mode};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// A multiplexed stream adapted to tokio's IO traits.
 pub type MuxStream = crate::mux::Stream;
@@ -105,33 +105,6 @@ pub(crate) fn mux_config() -> Config {
     config
 }
 
-/// Periodically log the framing counters when `MOLEHILL_MUX_STATS=1`.
-///
-/// A diagnostic facility for attributing cost to the framing path: the
-/// lines carry cumulative frame counts, so a reader that knows the window
-/// (or takes the first and last line of a run) gets frames/s, and beside
-/// the measured CPU that becomes CPU-per-frame. Off by default so normal
-/// operation is silent.
-fn spawn_framing_stats() {
-    if std::env::var_os("MOLEHILL_MUX_STATS").is_none() {
-        return;
-    }
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        // A missed tick is not worth catching up on: the counters are
-        // cumulative, so a late line still reports the true totals.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let (written, read, bytes) = crate::mux::framing_stats();
-            info!(
-                written,
-                read, bytes, "mux-stats: cumulative framing counters"
-            );
-        }
-    });
-}
-
 /// Handle to a client-side tunnel: allows opening data channels as streams.
 #[derive(Clone)]
 pub struct ClientTunnel {
@@ -154,7 +127,6 @@ impl ClientTunnel {
         let (open_tx, mut open_rx) =
             mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
 
-        spawn_framing_stats();
         tokio::spawn(async move {
             let mut conn = Connection::new(io, config, Mode::Client);
             let mut waiting: Option<
@@ -331,7 +303,6 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("server tunnel driver started");
-    spawn_framing_stats();
     let mut conn = Connection::new(io, config, Mode::Server);
     while let Some(result) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
         match result {

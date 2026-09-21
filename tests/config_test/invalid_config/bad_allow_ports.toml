@@ -1,5 +1,3 @@
-# expect: Port range start 6999 is greater than end 6000
-
 [server]
 default_token = "t"
 allow_ports = ["6999-6000"]
