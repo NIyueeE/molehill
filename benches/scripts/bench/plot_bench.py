@@ -8,7 +8,7 @@
 Five figures plus markdown tables — every comparison is a SINGLE
 variable (no confounding):
 - main chart (`assets/benchmark-vX.Y.Z.png`): molehill's default (mux, plain
-  TCP) row vs the plain-TCP peers (frp, rathole, nps) — same-transport
+  TCP) row vs the plain-TCP peers (frp, rathole, bore) — same-transport
   competition. Encrypted tools (e.g. chisel's SSH tunnel) are deliberately
   absent: their numbers are not comparable on the plain-TCP axis.
 - mux chart (`assets/benchmark-mux-vX.Y.Z.png`): mux vs mux-off — the one
@@ -41,7 +41,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 script_dir = Path(__file__).parent
-PEERS = ("frp", "rathole", "nps")  # plain-TCP peers, no encryption
+PEERS = ("frp", "rathole", "bore")  # plain-TCP peers, no encryption
 
 # molehill family gets its own palette so it reads at a glance; peers share
 # a pastel cool palette that recedes behind it
@@ -237,9 +237,8 @@ def render_main(results, meta, out_path):
     ax_crtt.set_ylabel("echo RTT p50 (ms, log)")
     ax_crtt.set_title("Connection-path latency per cell", fontsize=10)
 
-    # A peer without UDP forwarding carries no UDP metrics: drop it from
-    # the UDP panels so it does not occupy an empty slot (data-driven, so
-    # the panel follows whatever peers the run actually measured)
+    # bore is TCP-only and carries no UDP metrics: drop it from the UDP
+    # panels so it does not occupy an empty slot
     udp_tools = [t for t in tools
                  if read(results, t, loopback, "udp_rtt_ms") is not None]
 

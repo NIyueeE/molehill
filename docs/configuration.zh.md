@@ -109,7 +109,7 @@ flowchart TD
 | `mode` | `"multiplex"`(默认) | 回环 1 流 10.9 Gbit/s,`direct` 为 19.3;8 流都到 ~27.7;multiplex 吸收建连成本(churn p99 ~3.5 ms)并节省 FD / 端口 / NAT 映射 |
 | `mode` | `"direct"` | 原始单流吞吐优先;每条流一条物理隧道(FD / 端口 / NAT 成本随流数增长) |
 | `count` | `1` | 单流上限(回环 8 流 9.0 Gbit/s);所有流共享一个重传域(loss5 HoL 最大 1157 ms) |
-| `count` | `4`(默认) | 聚合越过单流(loss1 8 流 15.4 vs 4.6 Gbit/s)并隔离队头阻塞(rtt10 HoL 最大 80.6 vs count=1 的 101.4 ms);yamux 上限 `count × 64` 并发连接 |
+| `count` | `4`(默认) | 聚合越过单流(loss1 8 流 15.4 vs 4.6 Gbit/s)并隔离队头阻塞(rtt10 HoL 最大 80.6 vs count=1 的 101.4 ms);yamux 上限 `count × 32` 并发连接 |
 | `count` | `8+` | ~256 并发连接;每服务 8 条物理隧道(NAT 映射 ×8) |
 | `carrier` | `"tcp"`(默认) | 每个实测格子都更快(noise 对照下回环 1 流 4.8 vs 2.5 Gbit/s;8 流 14.8 vs 5.9);RSS 24 vs 102 MiB |
 | `carrier` | `"kcp"` | 仅在 TCP 数据隧道被封锁/限速时,或高延迟路径上的 UDP 游戏 A/B:唯一实测赢面是 rtt100 的 UDP 会话质量(0% 丢包、最大包间隔 20 ms,而 TCP 各 arm 卡 100+ ms) |
@@ -224,7 +224,7 @@ FD 占用。
 
 - 决定权只在客户端(`[client.data].default_mode`);服务端按连接自动适配。
 - `mode = "direct"` 恢复每通道一条连接的行为。
-- 每条隧道的缓冲由内部固定默认值约束(64 MiB yamux 接收窗口、64 条流):
+- 每条隧道的缓冲由内部固定默认值约束(64 MiB yamux 接收窗口、32 条流):
   丢包积压有界且吞吐无损;这两个值固定是因为 yamux 将两者耦合(见
   internals.md)。
 - `count = N` 为每个服务打开 N 条并行隧道,数据通道轮询分摊。独立 TCP 流

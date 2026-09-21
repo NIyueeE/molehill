@@ -150,7 +150,9 @@ impl ClientTunnel {
                     Inbound(Option<Result<crate::mux::Stream, crate::mux::ConnectionError>>),
                 }
 
-                let step = poll_fn(|cx| {
+                // See the note on the server driver: the engine's poll
+                // loop must drain without cooperative-budget interruptions.
+                let step = tokio::task::unconstrained(poll_fn(|cx| {
                     // 1. Drive the pending SYN announcement first; while it
                     //    stays pending the inbound poll below keeps
                     //    registering wakers, so data keeps flowing under
@@ -185,7 +187,7 @@ impl ClientTunnel {
                         Poll::Ready(v) => Poll::Ready(Step::Inbound(v)),
                         Poll::Pending => Poll::Pending,
                     }
-                });
+                }));
 
                 tokio::select! {
                     _ = shutdown.changed() => break,
@@ -304,7 +306,16 @@ where
 {
     debug!("server tunnel driver started");
     let mut conn = Connection::new(io, config, Mode::Server);
-    while let Some(result) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
+    // The engine's poll loop drives tokio channels whose `poll_recv`
+    // consumes the cooperative budget; exhausting it mid-drain forces a
+    // yield (and a scheduler round-trip) before the queue is written. The
+    // futures-based engine had no such budget interaction — its drains ran
+    // to completion — so the driver runs unconstrained to keep the same
+    // behavior. The loop still returns Pending whenever the socket or the
+    // receivers have nothing more, so the task yields normally.
+    while let Some(result) =
+        tokio::task::unconstrained(poll_fn(|cx| conn.poll_next_inbound(cx))).await
+    {
         match result {
             Ok(stream) => {
                 debug!("server tunnel accepted an inbound stream");

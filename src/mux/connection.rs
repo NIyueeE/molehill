@@ -402,13 +402,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                         Poll::Ready(None) | Poll::Pending => {}
                     }
                 }
-                // A receiver that has reported its end (its stream was
-                // dropped) is finished: futures' `SelectAll` used to drop it
-                // for us, and a `Vec` grows without bound otherwise — the
-                // loop above is O(receivers) per poll, so a connection that
-                // serves many short-lived streams (connection churn) would
-                // poll thousands of dead receivers on every poll.
-                self.stream_receivers.retain(|r| !r.is_done());
                 if took_command {
                     // Restart the loop so the queued frame is written in
                     // this very poll: falling through to the socket read

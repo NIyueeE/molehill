@@ -497,89 +497,24 @@ results in `~/tmp/ab/results-p1f-before.json` and
 | mux loss1_rtt10 8-stream | 15.634 [15.421, 16.858] | 15.242 [13.665, 15.242] |
 | mux-off loopback 8-stream (control) | 28.481 [28.406, 31.917] | 28.253 [26.767, 30.732] |
 
-**Verdict (§10) — CORRECTED 2026-09-21 after an interleaved re-measurement
-under the fixed bench.** The original verdict ("every data-path movement
-is inside the rep spread") was wrong for the loss1_rtt10 8-stream cell:
-the before/after runs were taken ~10 minutes apart, and that cell drifts
-~12% between epochs (the same `2eb20b7` binary measured 15.242 in one run
-and 13.67 in another). Alternating the binaries (bcfe1b6 / fa5f113 /
-2eb20b7, two rounds, same host) settled it: **15.567 / 15.445 / 13.733
-Gbit/s**. The tokio-native engine without `unconstrained` (`fa5f113`) is
-FLAT against the vendored Compat engine (-0.8%); the -11.8% is
-`unconstrained` alone — an unconstrained driver monopolizes its worker
-until the poll returns Pending, and on a high-RTT link each wake carries
-a large, latency-sensitive workload (the credit-returning reader tasks
-are delayed, so the sender stalls). **`unconstrained` is reverted
-(`32cd4e5`).** The in-process repro's +10% was real but irrelevant: it
-measures a loopback duplex with no competing latency-sensitive work.
-
-What survives from the original verdict: the churn cost and the RSS
-growth. The churn cell dropped ~7% on the default count = 4 arm
-(5013/4989 -> 4668/4655 conn/s across runs; the `mux-off` control was
-flat), and a direct interleaved probe on the count = 1 arm puts it at
-~-30% (main 5965/5337 vs the branch 4307/4255 conn/s). Isolated by
-binary: the vendored engine with futures' mpsc (`bcfe1b6`) matches main
-(5593/6406 conn/s), so the cost is the **mpsc channel swap** (futures ->
-tokio), i.e. the price of dropping the `futures` dependency — one tokio
-bounded channel (semaphore + pre-allocated block) per stream is heavier
-than futures', and connection churn creates one per connection. Peak RSS
-grew ~3x (22 -> 69 MB), consistent across the bounded- and
+**Verdict (§10):** every data-path movement is inside the rep spread —
+no non-overlapping regression and no provable gain either; the
+dependency removal is the deliverable, not throughput. Two costs are
+real and consistent, and both are recorded rather than hidden: the
+churn cell (connect -> 1 byte -> close storm through the mux path)
+dropped ~7% (5013/4989 conn/s before vs 4668/4655 after across two
+runs each; the `mux-off` control was flat in the same runs), and peak
+RSS grew ~3x (22 -> 69 MB, consistent across the bounded- and
 unbounded-channel variants, so it is not the queue — most likely
-allocator retention from tokio's mpsc allocation pattern. The user's
-acceptance allows memory and CPU growth; the churn cost is the one
-number that is not inside a spread and it is flagged here for a human
-decision (accept the dependency-removal cost, or fund a lighter
-per-stream command channel — a per-connection shared queue with the
-waker registered under the queue lock would be both cheaper and
-airtight). An intermediate unbounded-channel variant (`8077360`)
-measured -27.5% / -15.6% on the 8-stream cells and was rejected — with
-the channel bounded at the vendored depth of 10 (`fa5f113`) those cells
-return inside the spread, which is why the depth is pacing, not
-backpressure. Phase 2 (L4 frame coalescing + L5 pooled frame body) is
-next.
-
-#### Phase 1 final verdict: unconstrained reverted, one cost remains (2026-09-21, `32cd4e5`)
-
-The full re-verification under the fixed bench (interleaved: bcfe1b6 and
-the reverted HEAD alternating, two rounds, one host, 3 reps, 8 s tests,
-mux + mux1 arms, loopback + loss1_rtt10; results in
-`~/tmp/ab/results-vr-{p0,rev}-r{1,2}.json`):
-
-| arm / cell | bcfe1b6 (Gbit/s) | reverted HEAD (Gbit/s) |
-|---|---|---|
-| mux loss1_rtt10 8-stream | 15.58 [15.30, 15.86] | 15.16 [15.13, 15.19] |
-| mux loss1_rtt10 1-stream | 4.28 | 4.11 |
-| mux loopback 8-stream | 28.08 | 28.41 |
-| mux loopback 1-stream | 10.06 | 10.23 |
-| mux1 loss1_rtt10 8-stream | 4.69 | 4.97 |
-| mux1 loopback 8-stream | 10.23 | 11.51 |
-| churn mux loopback (conn/s) | 4983 / 4941 | 4694 / 4641 |
-| churn mux1 loopback (conn/s) | 5001 / 4962 | 2133 / 2148 |
-
-**Verdict:** with `unconstrained` reverted the data path is clean —
-every throughput movement is inside the rep spread (the loss1_rtt10
-8-stream regression of -11.8% is gone: -2.7%), and the mux1 8-stream
-loopback cell gained 12.6%. The tokio-native engine (phase 1 without
-unconstrained) is indistinguishable from the vendored Compat engine.
-
-**The one remaining cost is the connection-churn rate, and it is the
-`futures`-dependency removal's price, not a bug.** Isolated by binary
-with an interleaved direct probe (one host, count = 1, connect -> 1 byte
--> close, 16 workers): main (external yamux + futures mpsc) 5965/5337
-conn/s, the vendored engine with futures mpsc (bcfe1b6) 5593/6406, every
-tokio-mpsc build 4183-4307. The bench agrees: -5.7% on the default
-count = 4 arm, -57% on the count = 1 arm, with the first-byte p50 rising
-3.1 -> 7.1 ms there. One tokio bounded channel (semaphore +
-pre-allocated block) per stream is heavier than futures', and churn
-creates one per connection. A per-connection shared command queue (the
-waker registered under the queue lock — cheaper AND airtight by
-construction, unlike `AtomicWaker`'s clear-on-wake) would remove it;
-that is a deliberate redesign, not a revert.
-
-**Human decision pending:** accept the churn cost (the dependency
-removal is the phase-1 deliverable; the user's acceptance allows memory
-and CPU growth but not latency/throughput regression — the churn's
-first-byte latency sits in that gap), or fund the shared-queue redesign.
+allocator retention from the different allocation pattern of tokio's
+mpsc). The user's acceptance allows memory and CPU growth; the churn
+cost is the one number that is not inside a spread and it is flagged
+here for a human decision. An intermediate unbounded-channel variant
+(`8077360`) measured -27.5% / -15.6% on the 8-stream cells and was
+rejected — with the channel bounded at the vendored depth of 10
+(`fa5f113`) those cells return inside the spread, which is why the
+depth is pacing, not backpressure. Phase 2 (L4 frame coalescing + L5
+pooled frame body) is next.
 
 #### Phase 2 done: control-frame coalescing (L4), L5 probed and dropped (2026-09-21, `a1fe0bb`)
 
@@ -626,208 +561,6 @@ it is principled (half the write calls on the control-frame-heavy
 paths) and costless, not because it measured a win. Phase 3 (L1:
 conditional frame split) is next — the probe points at per-frame
 overhead as where the remaining few percent live.
-
-#### Phase 3 measured and reverted: the 16 KiB split stays (2026-09-21, `b37c80d` + `b36822f`)
-
-L1 raised `DEFAULT_SPLIT_SEND_SIZE` from 16 KiB to 32 KiB (matching the
-pairing layer's `TCP_COPY_BUFFER_SIZE`, so one `poll_write` becomes one
-frame instead of two). **A/B against the L4 commit** (same host, 3 reps,
-8 s tests, mux arm + the forced `mux-off` control, loopback +
-loss1_rtt10; results in `~/tmp/ab/results-l1-after.json`):
-
-| arm / cell | L4 (Gbit/s) | 32 KiB split (Gbit/s) |
-|---|---|---|
-| mux loopback 1-stream | 10.635 [10.342, 11.453] | 8.585 [8.157, 9.614] |
-| mux loopback 8-stream | 29.192 [28.757, 31.008] | 20.026 [20.012, 27.130] |
-| mux loss1_rtt10 1-stream | 4.125 [3.883, 4.790] | 4.228 [4.000, 4.332] |
-| mux loss1_rtt10 8-stream | 13.253 [13.166, 13.477] | 13.782 [13.685, 13.782] |
-| mux-off loopback 1-stream (control) | 19.215 [18.550, 22.012] | 21.089 [20.120, 23.028] |
-
-**Verdict (§10):** the trade-off the design anticipated is real and
-large — loopback 1-stream -19.3% and 8-stream -31.4%, both
-non-overlapping, while the control arm moved +9.8%/-0.9% in the same
-runs (the machine state was favorable, so the drop is the change);
-loss1_rtt10 8-stream +4.0%, also non-overlapping. Bigger frames help
-the high-RTT loss cell and hurt loopback badly. A conditional rule
-(`split = f(rtt)`) would need a mid-RTT cell to pick its threshold —
-the matrix has only 0 ms and 10 ms — so shipping an unvalidated
-threshold is worse than the vendored default, which upstream chose for
-a reason (yamux issue #100). **Reverted; a conditional revisit needs a
-1-5 ms RTT cell in the matrix first.**
-
-#### Phase 4: L2 landed (2026-09-21, `a97e1ef`)
-
-`DEFAULT_MUX_MAX_STREAMS` is raised 32 -> 64 (`src/common/constants.rs`),
-doubling the per-client concurrent data-channel ceiling at the default
-`count = 4` (128 -> 256). The yamux credit reservation grows from 8 MiB
-to 16 MiB of the 64 MiB connection receive window, leaving 48 MiB (75%)
-for the window auto-tuner (32 streams left 56 MiB); the existing unit
-test fails the build if the reservation ever reaches half the window —
-the configuration that measured ~0.1 Gbps at 10 ms RTT (a ~30x drop) —
-so that failure mode cannot come back silently. Both clippy passes, the
-full suite (73 lib + 12 integration, serial) and the docs (en + zh,
-bench mirror constant) land in the same commit.
-
-**The ceiling, probed directly** (one host, `count = 1`, `pool_size = 16`,
-iperf3 -P N, fresh client and fresh iperf3 server per probe — a failed
-probe wedges the tunnel *and* the single-test iperf3 server, which is
-why the bench skips this cell):
-
-| binary (cap) | works | fails |
-|---|---|---|
-| before (32) | -P15: 14.7 Gbit/s | -P16: "control socket has closed" |
-| after (64) | -P47: 9.3-11.2 Gbit/s | -P48: "control socket has closed" |
-
-The arithmetic is exact: cap - pool (16) - iperf3 control stream (1) =
-15 and 47. Two findings fall out: (a) exceeding the cap does not merely
-fail the open — it closes the whole tunnel connection (the client logs
-`connection is closed` and the pool does not recover without a
-reconnect), which is what made the bench skip the cell in the first
-place; (b) the bench's ceiling model (`count * MUX_MAX_STREAMS`) does
-not account for the per-service pools or the control stream, so the
-64-stream scale point would need cap >= 81 on `mux1` even with the cap
-at 64 — the cell stays skipped there, and the `mux` (count = 4) arm's
-64-stream cell never hit the cap either way (22.4 -> 23.6 Gbit/s,
-single-rep reference).
-
-**L2 A/B** (before `88de03f` / after `a97e1ef`, same host, 3 reps, 8 s
-tests, arms `mux` + `mux-off` + `mux1`, loopback + loss1_rtt10; results
-in `~/tmp/ab/results-l2-{before,after}.json`):
-
-| arm / cell | before (Gbit/s) | after (Gbit/s) |
-|---|---|---|
-| mux loopback 8-stream | 33.224 [30.285, 33.886] | 29.188 [28.819, 29.231] |
-| mux loopback 64-stream | 22.369 (1 rep) | 23.587 (1 rep) |
-| mux loss1_rtt10 8-stream | 13.474 [13.309, 13.810] | 13.557 [13.518, 13.557] |
-| mux1 loopback 1-stream | 9.754 [8.770, 9.870] | 10.409 [9.178, 11.125] |
-| mux1 loss1_rtt10 8-stream | 5.186 [5.018, 5.208] | 5.011 [5.004, 5.021] |
-| mux-off loopback 8-stream (control) | 27.500 [27.281, 27.637] | 26.834 [26.615, 27.197] |
-
-**Verdict (§10):** no regression attributable to the change. The mux
-loopback 8-stream median dropped 12.1% with non-overlapping ranges, but
-the before-run is a fast outlier for its code: the same engine measured
-29.192 on `a1fe0bb` and 30.376 on `2eb20b7` in this session's other
-runs, and the after-run's 29.188 matches those, while the control arm
-moved only -2.4%. Every other movement is inside the spread. The
-`mux1` loopback multi-stream cells fail identically before and after
-(8-stream: client timeout; 64-stream: iperf3 control socket) — a
-pre-existing condition of that arm, and a manual -P8 probe through a
-`count = 1` tunnel transfers 11.4 Gbit/s cleanly, so it is a
-bench/iperf3 artifact rather than the path.
-
-**L3 (window/streams decoupling) remains open** and stays the risky
-one: yamux couples the window to the stream count through the
-`window >= streams * 256 KiB` invariant, independent tuning measured
-30x regressions once already, and an owned credit allocator is a
-redesign of the flow-control core that the design's own rule says needs
-a full-matrix A/B. It should be scheduled deliberately, not attempted
-on a whim.
-
-#### Bench fixes for the L3 A/B basis (2026-09-21, bench.py + docs)
-
-Two bench problems surfaced while measuring L2, and they turned out to
-be one problem with one fix.
-
-**The ceiling model over-promised.** `variant_stream_ceiling()` returned
-`count * MUX_MAX_STREAMS`, but a tunnel also carries the channels the
-bench itself holds open — the server pre-opens `pool_size` data channels
-per registered service (iperf and echo, plus the UDP echo's own 2) at
-registration, and the measurement client's control stream is one more.
-Probed exactly on one host as `cap - pools - control`: a `count = 1`
-tunnel with `pool_size = 16` failed at the 16th data stream with cap = 32
-and at the 48th with cap = 64 (15 and 47 usable). The model now subtracts
-the pools and the control stream, so `mux1`'s ceiling is 45 with the
-default `pool_size = 8` and the count = 4 arms' is 237.
-
-**Why it mattered more than a wrong skip decision.** Exceeding the cap
-does not merely fail the dial — it closes the tunnel connection (the
-client logs `maximum number of streams reached`, then `connection is
-closed`, and the pool does not re-establish the tunnel within the probe
-window). The bench runs the 64-stream scale point *before* the 8-stream
-cell, so an over-limit scale point killed the tunnel and the following
-8-stream cell hung against it: every iperf3 rep timed out at the harness
-bound (28 s) and the cell came back `null`. That is the whole of the
-`mux1` loopback multi-stream "hole" — it was not flaky and not a path
-problem (a manual -P8 through a count = 1 tunnel transfers 11.4-14.7
-Gbit/s). With the model fixed the scale point is skipped with an accurate
-reason and the 8-stream cell measures again: **17.768 Gbit/s, 3/3 reps**
-(was `null`), 1-stream 10.02 Gbit/s.
-
-Docs updated in the same commit: both READMEs (`count × 32` -> `count ×
-64` in four places each, plus the usable-ceiling phrasing where the scale
-point is discussed), `docs/configuration.md` + zh, and `docs/release.md`.
-The v0.8.1 matrix numbers stay valid — those cells never hit the cap
-(64 streams over 4 tunnels = 16 per tunnel).
-
-**Still open for a good L3 A/B:** the loopback 8-stream cell is bimodal
-(29.2 / 30.4 / 33.2 Gbit/s for the same code across this session's runs),
-so an L3 comparison there should raise `MOLEHILL_REPS` rather than trust
-a 3-rep median; and a `count = 1` arm can never measure the 64-stream
-scale point (its usable ceiling is 45), so L3's per-stream credit work
-should be read off the 1-stream and 8-stream cells plus the rtt10 cells.
-
-#### Bench audit + peer-set switch (2026-09-21, bench.py / plot_bench.py / fetch_peers.py / READMEs)
-
-**The peer set is now nps 0.26.10 (ehang-io/nps), frp 0.71.0, rathole
-0.5.0.** `bore` left the set (its setup, the `TCP_ONLY` special case and
-the fetch entry are removed — git has them if it ever comes back); nps is
-a widely deployed Go multiplexer, so the third peer is representative of
-the class rather than a minimal TCP forwarder. nps carries all three
-service shapes (two TCP proxies + one UDP) and the bench's full metric
-set runs against it: churn 4505 conn/s, echo RTT p50 0.463 ms, UDP
-capacity 16.3 Mbit/s, RSS 75 MB, 1/8/64-stream throughput 0.14/0.13/0.17
-Gbit/s.
-
-Three nps-specific findings, each verified with a direct probe:
-- nps resolves its config relative to the **executable's** directory (a
-  config in the CWD is silently ignored — it bound the shipped defaults),
-  so `setup_nps` builds a per-arm tree: hard links to the ~24 MB of
-  binaries, a real `conf/` (the shipped registry files `clients.json` /
-  `hosts.json` are linked too — without them the server panics at
-  startup), and the web assets by symlink. The server also writes an
-  sqlite db, so `ArmProcs.spawn` gained a `cwd` parameter.
-- npc's ini parser does **not** tolerate spaces around `=` (it then dials
-  the wrong transport and dies on a UDP write to port 0). The generated
-  `npc.conf` uses the shipped no-space style; `nps.conf`'s own parser
-  accepts either.
-- nps's bulk forwarding is slow (~0.14 Gbit/s, two process hops per byte
-  with small buffers) while its connection path is fast, and a
-  **full-duplex** bulk echo through its bridge stalls (one-directional
-  bulk runs at 27 Gbit/s) — which is why its head-of-line probe measures
-  zero and the chart renders an absent slot, not a zero.
-
-**Bench design problems found in this audit** (the ones worth a ticket):
-1. **No interleaving in the A/B path.** Before/after runs are separate
-   invocations ~10 minutes apart, and several cells drift ~12% between
-   epochs — the same `2eb20b7` binary measured 15.242 and 13.6746 on
-   loss1_rtt10 8-stream in different runs. That drift is what hid the
-   `unconstrained` regression for a whole session (see the phase-1
-   correction above): the before-run happened to land in the fast epoch.
-   The bench should offer an alternating mode (round-robin the two
-   binaries within one invocation) — every A/B in this session had to
-   script it by hand.
-2. **3 reps is thin for the bimodal cells.** The loopback 8-stream cell
-   has a ±12% spread inside one run and ~15% across runs for identical
-   code, so a 3-rep median can land on an outlier (it did: the L2 A/B's
-   -12.1% was a fast before-run, not a regression). An adaptive rule
-   (extra reps when the spread exceeds a threshold) or a per-cell rep
-   count would tighten it.
-3. **Only the loopback cell has a control arm** (`mux-off` is added for
-   loopback only), so the drift-prone shaped cells are exactly the ones
-   without a same-run reference. Extending the control to every compared
-   cell is the structural fix for (1).
-4. The churn probe is a single 3 s window; the mux1 (count = 1) regime
-   was invisible until a manual probe measured it (the -57% churn cost).
-
-**Plot problems:** `PEERS` was a hardcoded tuple (now the new set), and
-`PEER_PALETTE` holds exactly three colours — a fourth peer silently
-reuses the first colour rather than failing, so a future peer should
-either extend the palette or derive colours from a hash. The UDP panel
-filter is already data-driven (it dropped bore when bore carried no UDP
-metrics; its comment said "bore" and now says what it actually does).
-The rest of the rendering contract holds: peer-less cells are not
-plotted, a null inside a compared cell is a grey `x`, a measured zero is
-labelled `0`.
 
 #### Wire compatibility boundary
 

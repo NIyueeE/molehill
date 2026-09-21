@@ -7,22 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- The per-tunnel mux stream cap is raised from 32 to 64
-  (`DEFAULT_MUX_MAX_STREAMS`), doubling the per-client concurrent
-  data-channel ceiling at the default `count = 4` (128 -> 256). The
-  yamux credit reservation grows from 8 MiB to 16 MiB of the 64 MiB
-  connection receive window, leaving 48 MiB (75%) for the window
-  auto-tuner; the pairing is guarded by a unit test that fails if the
-  reservation ever swallows half the window (the configuration that
-  measured a ~30x throughput drop). The per-tunnel data-channel ceiling
-  was probed directly on one host with `count = 1`: 15 concurrent
-  streams before (the cap minus the service's 16-stream pool and
-  iperf3's control stream) versus 47 after, with the 16th and 48th
-  opening failing in the respective runs. See HANDOFF.md, "Phase 4:
-  L2 landed".
-
 ### Performance
 
 - Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
@@ -115,16 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Multiplexed connections no longer accumulate dead stream receivers.
-  The engine used futures' `SelectAll` for the per-stream command
-  receivers, which drops a sub-stream once it reports its end; the
-  tokio-native conversion replaced it with a `Vec` and never removed the
-  finished receivers. Every stream ever opened stayed in the vector, and
-  the connection's poll loop is O(receivers) — a client serving many
-  short-lived connections (connection churn) ended up polling thousands
-  of dead receivers on every poll: the single-tunnel churn rate measured
-  -29% and the first-byte p50 3.1 -> 7.1 ms against the pre-conversion
-  engine. Fixed by retaining only the live receivers.
 - `molehill --genkey` on a binary built without the `noise` feature names
   the feature correctly now ("noise", previously "nosie"). The
   `feature_not_compile` helper is cfg-gated to exist exactly when one of

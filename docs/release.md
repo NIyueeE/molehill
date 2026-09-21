@@ -87,10 +87,8 @@ entries are PEP 723 python scripts run via `uv run`: runs are resumable (each
 completed arm is checkpointed together with the full meta), continue on
 error (a per-metric failure records `null` plus a `partial_metrics` list
 instead of a fake 0; a probe that is structurally out of range — the
-64-stream scale point above an arm's usable yamux ceiling (the cap
-`count × 64` minus the bench's own pooled channels and the client's
-control stream) — is skipped by design with its reason recorded the same
-way; the rate20
+64-stream scale point above an arm's `count × 32` yamux ceiling — is
+skipped by design with its reason recorded the same way; the rate20
 8-stream test wedges the single-test iperf3 server and records the timeout
 instead), refuse to run concurrently (a global lock — concurrent
 runs used to reap each other's live processes), and a killed run (Ctrl-C or
