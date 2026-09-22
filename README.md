@@ -51,8 +51,8 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 Single-machine comparison (all on loopback, `visitor -> server -> client ->
 backend`); everything is measured **through the tunnel** — iperf3 and the
 probes dial each tool's exposed port, never the backend. Peers are the
-latest GitHub release builds (frp 0.71.0, rathole 0.5.0 upstream, bore
-0.6.0). Network cells (netem on `lo`, every leg affected) and the metric
+latest GitHub release builds (frp 0.71.0, rathole 0.5.0 upstream, nps
+0.26.10). Network cells (netem on `lo`, every leg affected) and the metric
 set are described in [Methodology](#methodology). These are the v0.8.0
 matrix carried forward into v0.8.1 (the patch changes no forwarding path;
 see `CHANGELOG.md`), and the v0.7.2 baseline ran a single-tunnel default on
@@ -65,7 +65,7 @@ The measurements below justify the defaults and tell you when to deviate.
 
 | Config | Use it when | Cost measured |
 |---|---|---|
-| **`mode = "multiplex"` (default)** | one client exposes **multiple services**, or connections churn (HTTP/game sessions); connection resources matter (FDs, ports, **NAT mappings** — every physical tunnel behind a NAT costs one mapping) | 10.0 Gbit/s single-stream on loopback (19.2 with `mode = "direct"` — one yamux stream is bounded by one tunnel flow), 19.5 at 8 streams; the yamux ceiling caps concurrent connections at `count × 32` (128 at the default `count = 4` — 64 works) |
+| **`mode = "multiplex"` (default)** | one client exposes **multiple services**, or connections churn (HTTP/game sessions); connection resources matter (FDs, ports, **NAT mappings** — every physical tunnel behind a NAT costs one mapping) | 10.0 Gbit/s single-stream on loopback (19.2 with `mode = "direct"` — one yamux stream is bounded by one tunnel flow), 19.5 at 8 streams; the yamux ceiling caps concurrent connections at `count × 64` (256 at the default `count = 4`) |
 | **`mode = "direct"`** | one service or a few long-lived streams (SSH); **raw throughput first** (bulk transfers): 19.2/23.3 Gbit/s on loopback | one physical tunnel per stream: FDs/ports/NAT mappings scale with stream count; per-connection setup is real (churn p99 ~3.5 ms at 16-way concurrency) but invisible at `pool_size = 8`; smallest footprint (~15.5 MiB) and lower CPU (~515% vs ~494% at four tunnels, but 216% at one) |
 | **`count = 4` (default)** | many concurrent streams, or a lossy path: independent tunnels isolate head-of-line blocking and **aggregate beyond a single flow** | 4 physical connections per service (FDs/ports/NAT mappings) and ~494% CPU against 216% for one tunnel; loopback 8-stream 19.5 vs 9.2 Gbit/s at `count = 1`, 1% loss 12.3 vs 4.5, burst loss 13.3 vs 4.5; the 10 ms HoL max is lower (80.7 vs 100.1 ms) |
 | **`count = 1`** | one long-lived stream, a tight connection budget, or the smallest footprint (~16 MiB with half the CPU) | one TCP-flow ceiling; no aggregation (loopback 8-stream 9.2 Gbit/s); every stream shares one retransmit domain |
@@ -95,8 +95,8 @@ re-test:
    long-lived session (SSH, one Minecraft player) → `direct` or the
    default mux both work; mux saves NAT mappings at low concurrency too.
    Many users / churn / multiple services → keep or raise `count`
-   (each tunnel carries ~32 concurrent connections before the yamux
-   ceiling — `count = 8` ≈ 256).
+   (each tunnel carries ~64 concurrent connections before the yamux
+   ceiling — `count = 8` ≈ 512).
 3. **What does the path look like, and do you forward UDP?** If TCP data
    tunnels are blocked or throttled, or you need latency-first UDP at high
    delay, A/B `carrier = "kcp"` (its rtt100 session max gap is 20 ms against
@@ -106,7 +106,7 @@ re-test:
    as 2% in a third). For lossy/wifi paths keep `count >= 4` — it aggregates
    (1% loss 8-stream 12.3 vs 4.5 Gbit/s) and keeps the 10 ms HoL max
    lower — and pick `count` for the per-tunnel connection ceiling
-   (`count = 1 -> 32` connections, `count = 4 -> 128`).
+   (`count = 1 -> 64` connections, `count = 4 -> 256`).
 
 Validate with the exposure you care about: `ping`/in-game feel for
 latency, `iperf3` on the exposed port for raw throughput, and the
@@ -137,6 +137,38 @@ rathole's 12.2 and bore's 13.8) and within ~10% of rathole at 8 streams
 100 ms cell holds ~1001 ms. In the 1%-loss cell the group lands at
 3.8-4.2 Gbit/s (frp 0.8). The shaped cells converge on the configured link
 rate (see Methodology).
+
+**Peer set updated 2026-09-21: bore is replaced by nps 0.26.10** (ehang-io,
+a widely deployed Go multiplexer — a more representative third peer than a
+minimal TCP forwarder). The table and chart above are the v0.8.1 release
+measurement and still describe that release; the next full matrix run
+regenerates both with the new set. A focused loopback re-measurement with
+the new set on one host (molehill at full rigor, peers at one rep):
+
+| Tool | 1-stream | 8-stream | echo RTT p50 | Memory | churn conn/s |
+|---|---|---|---|---|---|
+| **molehill (mux)** | **10.99** | **31.40** | **0.264 ms** | 62.0 MiB | 4562 |
+| rathole 0.5.0 | 11.03 | 27.15 | 0.247 ms | 21.7 MiB | 4881 |
+| frp 0.71.0 | 4.64 | 7.97 | 0.389 ms | 68.1 MiB | 4333 |
+| nps 0.26.10 | 0.14 | 0.13 | 0.463 ms | 75.0 MiB | 4505 |
+
+nps is a slow bulk forwarder (two process hops per byte with small
+buffers: ~0.14 Gbit/s) but is not a slow *connector* — its churn rate and
+echo RTT track the group, and it carries UDP. Its head-of-line probe
+measures zero because a full-duplex bulk echo through its bridge stalls
+(one-directional bulk runs at 27 Gbit/s), which the chart renders as an
+absent slot rather than a zero.
+
+**Note (2026-09-21):** both tables above were measured on the engine
+before the dead-receiver leak was fixed (a client serving many
+short-lived connections polled thousands of finished stream receivers per
+poll — see "What landed" in `HANDOFF.md`). After the fix the
+single-tunnel 8-stream cell reads **+23.5%** relative to the pre-fix
+engine, the default mux arm's loopback 1/8-stream cells +6.6%/+5.2%, and
+churn is back at main's level; the reverted 32 KiB frame split ("phase 3")
+was a product of that polluted measurement and is re-adopted. The v0.8.1
+release table stays as that release's record — the new numbers land with
+the next full-matrix run and its chart.
 
 ### molehill: multiplexing cost (mux vs mux-off)
 
@@ -244,7 +276,9 @@ p99 ~3.5-3.7 ms — the pool absorbs per-connection setup). CPU tracks the
 tunnel count (one tunnel 216% of one core, four ~471-515%) and memory
 separates mux-off/mux1 (~16 MiB) from mux (22) and KCP (83). The 64-stream
 point is a working-point reference (14.9 Gbit/s at the default, 18.0
-direct); `mux1` has no point by design (64 > its `count × 32` ceiling). The
+direct); `mux1` has no point by design (64 streams exceed its single
+tunnel's usable ceiling of 45 — the cap minus the bench's pooled channels
+and the client's control stream). The
 mixed workload keeps 11.5 Gbit/s while sharing the client with an
 interactive service (21.1 direct, 1.3 on KCP).
 
@@ -271,7 +305,7 @@ interactive service (21.1 direct, 1.3 on KCP).
   cells, while the pure-delay, 5%-loss, burst-loss and jitter cells are
   molehill-only stories told by the count and carrier charts.
 - **Metrics**: TCP throughput (1/8/64 streams — 64 is the working point
-  below the yamux ceiling of `count × 32` concurrent connections; the
+  below the yamux ceiling of `count × 64` concurrent connections; the
   headline is the sender's bytes over the **measured window** (falling back
   to the receiver's count when a fast sender's writes were all absorbed by
   the `-O` warm-up and backpressure blocked the measured window — recorded
@@ -338,8 +372,9 @@ interactive service (21.1 direct, 1.3 on KCP).
   probe's pinger loss was 100% for the default arms in two runs and 2% in a
   third, so **a UDP-under-load weakness is NOT claimed**: it does not
   reproduce (variance, not a path property).
-  An arm whose yamux ceiling (`count × 32`) is below the
-  64-stream scale point skips that probe by design (reason in
+  An arm whose usable yamux ceiling (the cap `count × 64` minus the
+  bench's own pooled channels and the client's control stream) is below
+  the 64-stream scale point skips that probe by design (reason in
   `partial_metrics`). Charts plot only the
   rows and cells that take part in a comparison (a peer-less cell or a
   structurally skipped probe is not drawn at all); a value missing inside a

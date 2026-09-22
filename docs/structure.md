@@ -56,6 +56,7 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `src/logging.rs` | colored span-aware log formatter |
 | `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (+ vendored `noise_stream.rs` record wrapper, ported from snowstorm) / multiplex / kcp implementations |
 | `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the adapter's SACK extensions; kept in-repo so nothing external needs patching and the module follows molehill's own rules |
+| `src/mux.rs` + `src/mux/` | the yamux framing engine — vendored from rust-yamux 0.14 and maintained in-repo (like the KCP engine), wire-identical with the yamux specification and tokio-native (tokio IO traits, no compat shim); the `multiplex` transport integrates it through `src/transport/multiplex.rs` |
 
 ## Tests, benches, examples, docs
 
@@ -64,7 +65,7 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the control-channel teardown case, valid/invalid configs |
-| `benches/` | Peer-comparison benchmark matrix (`bench/`: uv/PEP 723 python — runner, peer fetch, chart, regression gate), mux e2e smoke (`mux/repro_e2e.py`), HTTP latency (vegeta) and memory-sampling scripts |
+| `benches/` | Peer-comparison benchmark matrix (`scripts/bench/`: uv/PEP 723 python — runner, peer fetch, chart, A/B verdict, regression gate), mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`) and memory-sampling scripts (`scripts/mem/`) |
 | `docs/configuration.md` (Complete examples / Deployment) | ready-to-run configs and systemd/container deployment files, as code blocks (previously the `examples/` directory) |
 | `docs/` | documentation set — one owner per topic, everything else links (see below) |
 

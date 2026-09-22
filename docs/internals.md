@@ -35,7 +35,7 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 - `CreateDataChannel` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
 - Per-stream framing is identical to the plain path (`StartForward*` command first), which keeps both modes testable against each other.
-- rust-yamux auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
+- The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 
 `mode = "direct"` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.

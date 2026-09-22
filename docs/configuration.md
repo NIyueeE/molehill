@@ -106,7 +106,7 @@ flowchart TD
 | `mode` | `"multiplex"` (default) | 1-stream 10.9 Gbit/s on loopback vs 19.3 for `direct`; at 8 streams both reach ~27.7; multiplex absorbs per-connection setup (churn p99 ~3.5 ms) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
 | `count` | `1` | single-flow ceiling (loopback 8-str 9.0 Gbit/s); every stream shares one retransmit domain (loss5 HoL max 1157 ms) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 15.4 vs 4.6 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 101.4 ms at count=1); yamux ceiling `count × 32` concurrent connections |
+| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 15.4 vs 4.6 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 101.4 ms at count=1); yamux ceiling `count × 64` concurrent connections |
 | `count` | `8+` | ~256 concurrent connections; 8 physical tunnels per service (NAT mappings ×8) |
 | `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-str 4.8 vs 2.5 Gbit/s against the noise control; 8-str 14.8 vs 5.9); RSS 24 vs 102 MiB |
 | `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or A/B for a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0% loss, 20 ms max inter-packet gap vs 100+ ms for the TCP arms) |
@@ -228,7 +228,7 @@ handshake) and cuts FD usage under many concurrent visitors.
   adapts per connection automatically.
 - `mode = "direct"` restores the one-connection-per-channel path.
 - Per-tunnel buffering is bounded by internal defaults (64 MiB yamux receive
-  window, 32 streams) — bounded loss backlog without throughput loss; the
+  window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
 - `count = N` opens N parallel tunnels per service and spreads data channels
   across them round-robin. Independent TCP flows isolate head-of-line

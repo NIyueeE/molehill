@@ -42,8 +42,9 @@ noise = ["base64", "snow", "pin-project"]
 # Configuration hot-reload support
 hot-reload = ["notify"]
 
-# Multiplex many data channels over one physical connection (yamux)
-multiplex = ["dep:yamux", "tokio-util/compat"]
+# Multiplex many data channels over one physical connection (yamux engine,
+# maintained in-repo under src/mux)
+multiplex = [ "dep:parking_lot", "dep:nohash-hasher"]
 
 # Default feature releasing embedded devices
 embedded = ["server", "client", "hot-reload", "noise"]
@@ -102,13 +103,13 @@ async-http-proxy = { version = "1.2", features = [
 ] }
 async-socks5 = "0.6"
 url = { version = "2.2", features = ["serde"] }
-tokio-util = { version = "0.7.9", optional = true }
-yamux = { version = "0.14", optional = true }
 snow = { version = "0.10", features = ["ring-accelerated"], optional = true }
 pin-project = { version = "1.1.13", optional = true }
 log = "0.4.34"
 thiserror = "2.0.20"
 libc = "0.2.189"
+parking_lot = { version = "0.12.5", optional = true }
+nohash-hasher = { version = "0.2.0", optional = true }
 
 [build-dependencies]
 vergen = { version = "10.0.2", default-features = false, features = ["build", "cargo"] }

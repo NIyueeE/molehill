@@ -32,7 +32,7 @@ UA = {"User-Agent": "molehill-bench-peer-fetch",
       "Accept": "application/vnd.github+json"}
 
 # tool -> binary path relative to PEER_DIR once installed
-BIN = {"frp": "frp/frps", "bore": "bore", "rathole": "rathole"}
+BIN = {"frp": "frp/frps", "rathole": "rathole", "nps": "nps/nps"}
 
 
 def http_get(url: str) -> bytes:
@@ -104,25 +104,6 @@ def main() -> None:
         "frp", "fatedier/frp",
         lambda v: [f"frp_{v}_linux_{frp_arch}.tar.gz"], install_frp)
 
-    # ---- bore: bore-v<ver>-x86_64-unknown-linux-musl.tar.gz ---------------
-    def install_bore(ver: str, blob: bytes) -> None:
-        tarball = PEER_DIR / "bore.tar.gz"
-        tarball.write_bytes(blob)
-        with tarfile.open(tarball) as t:
-            t.extractall(filter="data", path=PEER_DIR)
-        tarball.unlink()
-        if not (PEER_DIR / "bore").exists():
-            for cand in PEER_DIR.glob("bore*/bore"):
-                shutil.move(str(cand), PEER_DIR / "bore")
-                break
-        (PEER_DIR / "bore").chmod(0o755)
-
-    fetch_release(
-        "bore", "ekzhang/bore",
-        lambda v: [f"bore-v{v}-{rust_arch}-unknown-linux-musl.tar.gz",
-                   f"bore-v{v}-{rust_arch}-unknown-linux-gnu.tar.gz"],
-        install_bore)
-
     # ---- rathole (upstream): rathole-x86_64-unknown-linux-{gnu,musl}.zip --
     def install_rathole(ver: str, blob: bytes) -> None:
         zp = PEER_DIR / "rathole.zip"
@@ -137,6 +118,41 @@ def main() -> None:
         shutil.move(str(candidates[0]), PEER_DIR / "rathole")
         (PEER_DIR / "rathole").chmod(0o755)
         shutil.rmtree(ex, ignore_errors=True)
+
+    # ---- nps (ehang-io/nps): separate server + client tarballs ------------
+    # nps is not a single-binary peer: the release ships a server tarball
+    # (`nps`, `conf/`, `web/`) and a client tarball (`npc`), so it gets its
+    # own two-asset fetch instead of `fetch_release`'s one.
+    nps_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
+    if nps_arch is None:
+        sys.exit(f"unsupported arch for nps: {arch}")
+
+    def fetch_nps() -> None:
+        ver, assets = latest_release("ehang-io/nps")
+        if cached("nps", ver):
+            print(f"nps: cached {ver}")
+            return
+        nps_dir = PEER_DIR / "nps"
+        shutil.rmtree(nps_dir, ignore_errors=True)
+        nps_dir.mkdir(parents=True, exist_ok=True)
+        for role in ("server", "client"):
+            name = pick_asset(assets, [f"linux_{nps_arch}_{role}.tar.gz"])
+            print(f"nps: downloading {name}")
+            tarball = PEER_DIR / f"nps-{role}.tar.gz"
+            tarball.write_bytes(http_get(
+                f"https://github.com/ehang-io/nps/releases/download/v{ver}"
+                f"/{name}"))
+            with tarfile.open(tarball) as t:
+                t.extractall(filter="data", path=nps_dir)
+            tarball.unlink()
+        for binary in ("nps", "npc"):
+            path = nps_dir / binary
+            if not path.exists():
+                sys.exit(f"nps: {binary} not found in the release archive")
+            path.chmod(0o755)
+        (PEER_DIR / ".nps-release-version").write_text(ver)
+
+    fetch_nps()
 
     fetch_release(
         "rathole", "rathole-org/rathole",

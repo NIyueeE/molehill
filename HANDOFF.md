@@ -1,626 +1,219 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-20 (superseding the 2026-09-11 state below where
-> they overlap), still on the v0.8.1 patch line with three uncommitted-to-a-
-> tag commits on `main`: the leaner Noise record stream (backlog item done,
-> A/B +9.0% / +8.0% on the two non-overlapping cells — see "Leaner noise
-> stream A/B"), the `MultiMap` unsafe elimination, and the
-> `feature_not_compile` cfg-gating plus waiver normalization (see "Unsafe
-> and lint-waiver audit"). `src/transport/udp_batch.rs` is now the only
-> unsafe site in the codebase. Everything below is otherwise as of
-> 2026-09-11: the `merge-tcp4` branch was fast-forwarded into `main` and
-> deleted, `v0.8.0` is released, `v0.8.1` is the control-channel teardown
-> fix recorded under "Control-channel teardown" below, with the benchmark
-> matrix carried forward unchanged. The UDP
-> session-affinity fix, the template lint migration and the benchmark-matrix
-> rework (uv/PEP 723, schema v3 through-tunnel measurements) have landed, the
-> benchmark measurement method was revised on 2026-09-10/11 (rate-cell
-> shaping, per-rep throughput isolation, a UDP capacity ladder — see the
-> "Method revision" paragraph below), and the v0.8.0 baseline was then
-> re-measured in full from it on host `0b073ddbf222` (52 arms, zero holes,
-> charts and README regenerated). Shipped work is recorded in
-> [CHANGELOG.md](CHANGELOG.md), and design details (protocol, muxing, UDP
-> session affinity) live in [docs/internals.md](docs/internals.md). This file
-> only tracks what is still open.
+> State as of 2026-09-21. Branch `perf/data-path-optimizations` (40 commits
+> ahead of `main`, pushed, **not merged**) contains the complete mux-engine
+> migration: rust-yamux 0.14 is now an in-repo, tokio-native engine
+> (`src/mux/`), and the mux transport drives it directly
+> (`src/transport/multiplex.rs`, no Compat shim). Shipped work is recorded in
+> [CHANGELOG.md](CHANGELOG.md); design details live in
+> [docs/internals.md](docs/internals.md). This file tracks what is open and
+> what was decided.
+
+## Where things stand
+
+**The migration is complete on its own terms and the engine is clean.**
+
+- The data path beats `main` everywhere that can be claimed and loses
+  nowhere: interleaved 3-round A/B, mux + mux1 arms, loopback + loss1_rtt10,
+  24 paired rep ranges of which 21 overlap and the three that do not all
+  favour the branch (`results-final-ab.json`). The churn regime that
+  regressed mid-migration is fixed and now at parity.
+- `main` (`8584945`) is untouched and releasable; nothing here is merged.
+- Performance is **not** an open item: every lever the vendoring was meant
+  to unlock has either landed with a measurement or been closed by one (see
+  "Optimization route" below). The two remaining gaps are structural
+  (multi-tunnel scheduling) and environmental (the host's 32 MB socket cap),
+  not knobs.
+- Known bug found and fixed on the way: the `SelectAll` → `Vec` conversion
+  dropped the receiver removal, so a client serving many short-lived
+  connections polled thousands of dead stream receivers per poll
+  (`a424ccc`).
+
+## What landed (each one commit + one single-variable A/B)
+
+| Change | Commit | Verdict |
+|---|---|---|
+| in-repo yamux 0.14, wire-identical | `92fdde0` | behaviour-identical to the crate |
+| tokio-native engine IO (Compat gone) | `20ac557` | the -6.6..+23.5% column of the final A/B |
+| stream cap 32 → 64 | `a97e1ef` | ceiling probe: 15 → 47 usable streams |
+| control-frame coalescing (L4) | `a1fe0bb` | 8-stream +5.7..9.2%, ranges overlap |
+| frame split 16 → 32 KiB | `fda6fd6` | mux1 loopback 8-stream +45.7% non-overlapping |
+| drop finished stream receivers | `a424ccc` | the churn fix above |
+| `--ab` interleaved A/B in bench.py | `fc87a6c` | cancel epoch drift between binaries |
+| framing counters in the bench | `efbcac4` | frames/s + cpu-per-frame per arm |
+| A/B verdict tool (`ab_compare.py`) | `040edbe` | encodes the §10 claim rule |
+| arm watchdog + lock diagnostics | `040edbe` | a hung arm no longer blocks the matrix |
+| peers: bore → nps 0.26.10 | `79855a1` | frp/rathole/nps; all three carry every probe |
+
+## Optimization route: closed
+
+Every candidate was measured rather than argued. The record for each:
+
+| Candidate | Outcome | Evidence |
+|---|---|---|
+| L0 Compat shim, L1 split size, L2 cap, L4 coalescing | **landed** | table above |
+| L3 window/streams decoupling | **parked — premise refuted** | 4× the connection window moved nothing on any cell; the rtt100 ceiling is outside the engine (mux-off gives the same number) |
+| L5 frame-body pool | **dropped** | cpu/frame identical to within 1% on every cell |
+| explicit `SO_RCVBUF`/`SO_SNDBUF` | **dropped — refuted** | a fixed 8 MiB cost -26% on rtt100 1-stream; kernel auto-tuning wins |
+| UDP sendq 1024 → 128 | **dropped** | no cell moved; RSS +2..12% the wrong way |
+| write-path body copy | **architecturally required** | a frame must own its body to cross the command channel |
+| churn cost blamed on the mpsc swap | **wrong diagnosis** | it was the leaked receivers; the swap is innocent |
+
+**The two things left are not single-variable optimizations**, recorded
+rather than attempted:
+
+1. **Per-frame cost scales with tunnel count** — ~35% lower on one tunnel
+   than on four (0.0248 vs 0.0395 cpu%/kframe) at the same frame size and
+   rate. So the residual mux-vs-mux-off gap is driver scheduling, not
+   per-frame fixed work; reducing it means changing the multi-tunnel
+   structure, and the direct mode already wins those cells.
+2. **The rtt100 ceiling is the host's** — that cell needs ~50 MB of in-flight
+   window while the kernel caps a socket at 32 MB, and the mux window is
+   already 64 MB. Raising it needs `SO_RCVBUFFORCE` privileges a normal
+   deployment lacks.
 
 ## Backlog
 
 ### Next recommended improvement: single control channel per client
 
-Dynamic registration removed per-service server config, but the client still
-keeps one control connection **and** one mux tunnel per service. Consolidate
-to one physical control connection per client (plus the shared tunnel
-pool), with
-register/unregister messages multiplexed over it. With mux now stable this is
-mostly plumbing and yields another order-of-magnitude FD/handshake reduction
-for many-service clients. (Per-service `mode`/`count`/`carrier` overrides
-landed in 0.8, so mixing data paths per service is already possible without
-waiting for the consolidation.)
+The client still keeps one control connection **and** one mux tunnel per
+service. Consolidating to one control connection per client (plus the shared
+tunnel pool) is mostly plumbing now that the mux engine is stable, and gives
+another order-of-magnitude FD/handshake reduction for many-service clients.
+Per-service `mode`/`count`/`carrier` overrides landed in 0.8, so mixing data
+paths per service already works without waiting for this.
 
-### Other deferred work
+### Open items
 
-- [x] Leaner Noise record stream (done 2026-09-20, `0870bf1`): the wrapper
-      is in-repo (`src/transport/noise_stream.rs`, vendored from snowstorm
-      0.4.0 and adapted to snow 0.10 — snowstorm is unmaintained and pinned
-      to snow 0.9, so the upgrade required vendoring it). The read path now
-      accumulates the two-byte length header together with the ciphertext
-      in one buffer — one `poll_read` sweep per record instead of a
-      separate header read first — and decrypts in place from that buffer;
-      a record that coalesces with its successor in a single wake is
-      consumed without an extra copy. Writes encrypt straight into the
-      framing buffer behind the header and address it by index; both
-      buffers are allocated once and never resized, which retired the
-      per-record `set_len` dance and with it the module's `unsafe`. The
-      wire format is unchanged (u16 ciphertext length, tag included — the
-      value the writer has always stored). Unit tests cover 1 B–70000 B
-      round trips (max-size and multi-record writes), coalesced small
-      records, and the zero-length record that must not surface as an EOF.
-      **A/B measured** (same host, 3 reps, 8 s tests, noise arm, loopback +
-      loss1_rtt10, before `4903fb4` vs after `0870bf1`): see the
-      "Leaner noise stream A/B" note below. The default pattern stays
-      BLAKE2s: the cipher is ring-served for every pattern (the hash only
-      runs in the handshake), so a pattern change would add wire churn for
-      zero gain.
-- [ ] KCP pacer slow-recovery study: PONG-timeout cuts (x0.75) recover at
-      only +5% per 4 clean PONGs (2 s cadence) — on sustained loss the
-      pacing rate can pin low for minutes. Not the dominant factor in the
-      measured cells (window-bound), but worth revisiting if KCP gets
+- [ ] KCP pacer slow-recovery study: PONG-timeout cuts (x0.75) recover at only
+      +5% per 4 clean PONGs — on sustained loss the pacing rate can pin low
+      for minutes. Not dominant in the measured cells; revisit if KCP gets
       production use.
-- [ ] HTTP API for configuration (hot reload currently files-only)
+- [ ] HTTP API for configuration (hot reload is files-only today)
 - [ ] Per-service visitor IP allowlist (`allowed_visitors`)
-- [ ] Per-service bandwidth limiting (token bucket around copy loops)
-- [ ] Lower default `udp_send_queue_size` (64–128)
-- [ ] Gate tracing span creation on level filter if profiling shows overhead
-- [ ] QUIC transport on main (implemented and measured; parked in the
-      `archive/transport-test` tag — N×TCP won every comparable cell and
-      the QUIC leg lacks peer auth). Revisit if a UDP-only path or
-      multi-stream loss isolation becomes a requirement
-- [ ] Buffer pooling under high churn (measure first)
-- [ ] Replace the python (uv/PEP 723) bench/test entries with `cargo-script`
-      once it reaches Rust stable — the single-language test entry would drop
-      the uv/python runtime dependency; until then `uv run` stays the entry
-- [ ] Zero-copy splice/sendfile: deliberately not recommended (keep as-is)
+- [ ] Per-service bandwidth limiting (token bucket around the copy loops)
+- [ ] Replace the python bench/test entries with `cargo-script` once it is
+      stable — until then `uv run` stays the entry
+- [ ] QUIC transport on main: implemented and measured, parked in the
+      `archive/transport-test` tag (N×TCP won every comparable cell, and the
+      QUIC leg lacks peer auth). Revisit if a UDP-only path or multi-stream
+      loss isolation becomes a requirement.
 
-- [x] Re-baseline the README benchmark chapter on the merged defaults
-      (done in the v0.8.0 matrix): results-v0.8.0.json, six charts (incl.
-      the new cost chart) and the tables now describe the count=4 default,
-      the ring-accelerated noise rows, and the new cells/metrics.
-      **Regression-gate verdict (v0.8.0 vs v0.7.2): not a comparison.** The
-      v0.7.2 file predates the measurement revision and comes from another
-      container (the gate itself prints `different hosts`), so it measures a
-      different instrument: only same-method results — v0.8.0 and later — are
-      comparable, and nothing read through that boundary is a regression
-      signal. No waiver is claimed because there is no comparable baseline to
-      regress against; `results-v0.8.0.json` is what every later run is gated
-      against.
+### Deliberately not doing
 
-### Leaner noise stream A/B (2026-09-20)
+- Zero-copy splice/sendfile: measured, not recommended (keep as-is).
+- Tracing span gating: the backlog asked for it "if profiling shows
+  overhead"; no profiler on this host, and the framing counters show the
+  per-frame cost is dominated by work a level-filtered macro does not touch.
+- Upstream tracking of rust-yamux fixes: no tracking; the in-repo engine is
+  maintained for molehill's own scenarios only.
 
-A/B of the leaner record stream against its parent (`4903fb4`), same host,
-same method, both binaries freshly built (before `d75ac826`, after
-`d7877f80` — the reported commit SHA differs, which is the §10 provenance
-check; an earlier same-tree build shared a build timestamp with the
-pre-change one and was rebuilt from the committed tree for this reason).
-Noise arm (`count=4` + noise), 3 reps, 8 s per test, loopback and
-loss1_rtt10 cells, `bench.py --tools=molehill --cells=0/0,1%/10
---variants=noise` (the runner force-adds the `mux-off` loopback control to
-every loopback cell — bench.py:389 — so both runs carry the same three
-arms). Results: `results-before.json` / `results-after.json` in the run
-scratch (`~/tmp/ab/`). Headline is the median of 3 reps with the rep range
-beside it:
+## Transport layer: what was compared, and where KCP stands
+
+Four carriers were implemented, integration-tested end to end and measured
+against each other (the QUIC arm's history survives in the local
+`archive/transport-test` tag):
+
+| Arm | Topology | Status |
+|---|---|---|
+| 0 | 1 TCP tunnel | `count = 1` |
+| 1 | N TCP tunnels (bench N=4) | **default (`count = 4`)** |
+| 2 | N KCP sessions (bench N=4) | merged, optional (`carrier = "kcp"`) |
+| 3 | 1 QUIC connection (quinn) | **archived** — behind on loss cells (quinn "too many gaps" at rtt10), no peer auth on the QUIC leg, and N×TCP measured better in every comparable cell |
+
+**KCP's measured position:** it loses throughput to a TCP carrier in *every*
+cell (loopback ~2.5 vs ~11 Gbit/s 1-stream; loss5/rtt100 ~0.03 vs ~0.28) and
+wins the latency axis on the worst cell (udp p50 601 vs 826 ms, HoL max gap
+1515 vs 1808 ms over the noise-TCP arm). So KCP is **not an optimization
+direction** — it is a capability with a defensible niche: UDP-only paths
+(TCP blocked or throttled by firewall/NAT) plus latency-first interactive
+traffic on high-loss, high-RTT links. Trying to make it win on throughput
+would mean re-tuning an upstream congestion controller that is deliberately
+not yamux-shaped, and the numbers say that is not where its value is.
+
+The one KCP item still open is the **pacer slow-recovery study** (backlog):
+PONG-timeout cuts recover at only +5% per 4 clean PONGs, so on sustained loss
+the pacing rate can pin low for minutes. Not dominant in the measured cells.
+
+Also measured and closed in the same round: window doubling bought +29%
+single-stream on loss1/rtt10 and +20% on loss5/rtt100 at ~2x RSS, and a 5 ms
+flush interval was rejected (loopback 8-stream -3x).
+
+## How to A/B on this branch
+
+Sequential before/after runs are **not usable** — several cells drift ~12%
+between epochs, which is what hid both a real regression and a bug for a
+whole session, and made a -31% "regression" turn out to be a bimodal cell on
+an outlier. Always:
+
+```bash
+TMPDIR=~/tmp MOLEHILL_REPS=3 MOLEHILL_SECS=8 MOLEHILL_SECS_WEAK=10 \
+  just bench --tools=molehill --cells=0/0,1%/10 --variants=mux,mux1 \
+       --ab /path/to/bin-a,/path/to/bin-b --fresh --out results-ab.json
+just bench-ab results-ab.json     # CLAIM only where reps are disjoint
+```
+
+Details in [docs/release.md](docs/release.md) ("Comparing two builds").
+
+## Legacy state (2026-09-11, still accurate)
+
+- `v0.8.0` and `v0.8.1` are released; `v0.8.1` is the control-channel
+  teardown fix recorded in "Control-channel teardown" below, with the
+  benchmark matrix carried forward unchanged.
+- The benchmark measurement method was revised 2026-09-10/11 (rate-cell
+  shaping, per-rep throughput isolation, a UDP capacity ladder); the v0.8.0
+  baseline was re-measured in full from it on host `0b073ddbf222` (52 arms,
+  zero holes, charts and README regenerated).
+- Only same-method results (`results-v0.8.0.json` and later) are comparable.
+  The v0.7.2 file predates the revision and comes from another container, so
+  it measures a different instrument and is never a regression signal.
+- `src/transport/udp_batch.rs` is the only `unsafe` site in the codebase
+  (the recvmmsg/sendmmsg FFI), audited 2026-09-20.
+
+## Appendix: measurements for work already released
+
+Referenced by [CHANGELOG.md](CHANGELOG.md), kept here so the release notes
+do not need to carry the tables.
+
+### Leaner Noise record stream (`0870bf1`, released)
+
+`count=4` + noise arm, 3 reps, 8 s, loopback + loss1_rtt10, against parent
+`4903fb4`; both binaries freshly built with the commit SHA verified
+(§10 provenance). The `mux-off` control arm never touches `NoiseStream`, so
+it shows what the instrument did.
 
 | arm / cell | before (Gbit/s) | after (Gbit/s) |
 |---|---|---|
 | noise loopback 1-stream | 4.601 [3.987, 4.832] | **5.016 [4.854, 5.276]** |
 | noise loopback 8-stream | 16.884 [15.239, 17.446] | 14.813 [11.739, 16.826] |
-| noise loopback 64-stream (1 rep) | 14.661 | 15.072 |
-| noise loss1_rtt10 1-stream | 3.715 [3.699, 4.225] | 3.759 [3.429, 3.886] |
 | noise loss1_rtt10 8-stream | 8.212 [7.925, 8.555] | **8.869 [8.733, 9.046]** |
 | mux-off loopback 1-stream (control) | 20.815 [18.195, 23.775] | 19.843 [19.122, 19.895] |
 | mux-off loopback 8-stream (control) | 31.193 [26.481, 31.917] | 30.259 [26.387, 31.105] |
 
-**Verdict (§10 — claim only outside the spread):** two cells improve with
-**non-overlapping rep ranges** — loopback 1-stream **+9.0%** median and
-loss1_rtt10 8-stream **+8.0%** median. Both are cells where the per-record
-cost is visible (single stream is record-latency-bound; the loss cell adds
-reordering that makes the merged read pay). Everything else sits inside
-the spread and is **not** a claim: loopback 8-stream's median moved -12%
-but its ranges overlap and the after spread is wider (one slow rep at
-11.7 — watch it if it recurs), loss1 1-stream +1.2%, and the 64-stream
-points are single-rep references. The plain-path control (mux-off, which
-never touches `NoiseStream`) shows no systematic change, so the deltas
-belong to the noise path, not the instrument. Secondary metrics on the
-noise loopback arm: CPU avg 464.5% -> 440.1% (directional, one sample per
-arm), echo p50 0.274 -> 0.283 ms and churn first-byte p50 3.21 -> 3.15 ms
-flat, RSS avg 26.2 -> 29.0 MiB (the buffers are the same size; treat as
-noise until it recurs). This is a focused A/B, **not** a re-baselining:
-the release matrix stays `results-v0.8.0.json` until a full same-method
-run refreshes it.
+Two cells improve with **non-overlapping** reps: loopback 1-stream **+9.0%**
+and loss1_rtt10 8-stream **+8.0%** — both cells where the per-record cost is
+visible. Everything else is inside the spread and not a claim (loopback
+8-stream's -12% median has overlapping ranges; the 64-stream points are
+single-rep references). Secondary: CPU 464.5% → 440.1% (directional),
+echo p50 and churn first-byte flat, RSS 26.2 → 29.0 MiB (same buffer sizes;
+treated as noise). A focused A/B, not a re-baselining.
 
-### Unsafe and lint-waiver audit (2026-09-20)
+### Direct decrypt into the caller's buffer (`e463391`, released)
 
-Enumerated every `unsafe` item and every lint waiver in `src/` (AGENTS.md
-§2) and acted on the findings:
+Same method on the default `count=4` + noise arm: **+12.3%** on the loopback
+8-stream cell (non-overlapping). The plain-path control moved nothing, and
+the `noise-direct` arm shows the plain path is already at its ceiling — the
+gain belongs to the decrypt, not the instrument.
 
-- `src/common/multi_map.rs` — **eliminated**. The dual-key control-channel
-  map shared one heap item between two hash maps through raw pointers
-  (plus matching `unsafe impl Send/Sync` and a manual `Drop`). Storing the
-  second key in both maps — as `map2`'s key and inside `map1`'s value —
-  makes `remove1` total with no shared ownership; API and semantics
-  (including duplicate-key rejection) are unchanged, `get2` pays one extra
-  hash lookup.
-- `src/transport/noise_stream.rs` — **eliminated** by the leaner rewrite
-  above (the `set_len`-over-uninitialized-capacity pattern is gone).
-- `src/transport/udp_batch.rs` — **cannot be eliminated**. `recvmmsg`/
-  `sendmmsg` have no safe Rust surface, the sockaddr casts are inherent to
-  the FFI, and the batching win is measured (+28–33% loopback 1-stream on
-  the KCP arm). It is now the **only** unsafe site in the codebase, every
-  unsafe item carrying a SAFETY comment plus an `#[expect(unsafe_code,
-  reason = ...)]`. The two cross-references between the sites' module docs
-  ("the other one is …") were stale in both directions and are fixed.
-- Waiver sweep: `src/common/helper.rs` held the codebase's only `#[allow]`
-  (`dead_code` on `feature_not_compile`) — replaced by real cfg gating per
-  §2, so the item exists exactly when one of its `cfg(not(feature = ...))`
-  callers does. Two KCP-engine cast waivers carried comment-only reasons
-  and moved to the attribute-reason style; five more keep their
-  multi-line design comments (guarded casts, deliberate single-function
-  flush/input), which is the form §2 asks for. The noise_stream rewrite
-  removed its three `unsafe_code` waivers outright. No `#[allow]` remains
-  in `src/`.
-- Not actionable now: `snow` is the last network-layer protocol engine
-  still owned by an external crate (yamux is the dependency-sinking
-  candidate if that line continues — see the transport-comparison record).
+### Connection-setup allocation (`3297d65`, released)
 
-### Benchmark ritual (per tag — see docs/release.md)
+Counting-allocator + getrusage probe over `NoiseStream` pair setups
+(release build — in debug, curve25519-dalek is 50-100× slower and the probe
+reported a bogus 19.5 ms/pair): 312 → 232 µs CPU, 900 KiB → 4 KiB
+allocated, 16 → 0 minor faults per pair. System level the direct-mode churn
+arm gained +11.7% connects/s and -10.7% first-byte p50 with RSS -24%. The
+interesting row: moving the handshake onto stack buffers alone *slowed*
+setup (transient 64 KiB buffers had been ballast keeping glibc from trimming
+the freed record buffers back to the OS) — hence the pool, not just the
+stack allocation.
 
-The ritual steps, gate thresholds and the uv/PEP 723 runner are documented
-in [docs/release.md](docs/release.md). Environment-specific notes: loss
-cells need `CAP_NET_ADMIN` (granted in the current container — netem cells
-run; without it loss cells auto-skip and rtt cells run via the userspace
-`weakproxy.py` fallback); bore's `--to` only accepts a bare host (port 7835
-implied), so proxied cells shift its control port to 127.0.0.2. Runner
-lifecycle: a global lock refuses concurrent runs (they used to reap each
-other's live processes); Ctrl-C/SIGTERM leave a clean state (arms killed,
-netem removed, full meta checkpointed); `--fresh` backs up the previous
-results file to `.bak` first; the full matrix is ~3 hours at full rigor
-(trim with `--tools/--cells/--variants`).
-
-Known measurement limits (2026-09-09, fixed in the runner, recorded in the
-README methodology): on rate-limited cells (netem `rate` on loopback),
-eight parallel iperf3 streams wedge iperf3's single-test server — netem's
-packet `limit` counts GSO-sized segments (up to 64 KiB), so the buffer
-holds seconds of data at 20 Mbit/s and the final results exchange never
-completes; the wedged server then dies with EBADF, which used to poison
-every later arm of the cell with refused dials. The runner now isolates
-backends per arm (SIGKILL cleanup + EADDRINUSE retry) and runs the 8-stream
-test after the cheap probes; the rate20 8-stream slot is null with the
-timeout reason in `partial_metrics` (rate100 measures both). The 2026-09-09
-targeted re-runs refreshed the rate cells, the loss2b25 steady-RTT probes
-and the fake-zero HoL entries on the same host — all of which the
-2026-09-10/11 revision below then replaced.
-
-**Method revision (2026-09-10, this thread) — the above diagnosis was
-half-wrong and is superseded.** Decisive measurements on this host with a
-plain (tunnel-free) iperf3 pair across the shaped `lo`:
-- The shaper itself was the bigger problem. `netem rate 100mbit delay
-  20ms limit 1` carries 18 Mbit/s with `-P 8`; the same test at `limit
-  1000` carries 99.6 Mbit/s. The rate cells had been shaped with a queue
-  so shallow that whole GSO segments were tail-dropped, so a "rate cell"
-  number was largely a property of the shaper. `bench_lib.RATE_QUEUE_LIMIT`
-  is now 2000 and is recorded in the results meta (`netem_rate_limit`).
-- The remaining `null`s were harness repetition hygiene, not the path: with
-  per-rep isolation plus a client timeout scaled to the test length, the
-  same kcp4 `rate100_rtt20` cell that used to return `null` measures 3/3
-  reps at both 1 stream (~0.098-0.103 Gbit/s) and 8 streams
-  (~0.091-0.106 Gbit/s) — i.e. at the 100 Mbit/s link ceiling. A stalled
-  rep used to wedge the single-test iperf3 server and starve every later
-  rep (`Backends.run_throughput` now restarts it after a failure).
-- Throughput convention: the headline is bytes over the measured window,
-  with the receiver's own (drain-inclusive) window recorded too, because at
-  a shaped cell `sum_received.seconds` runs well past the sender's and made
-  the two figures look like different tests.
-- UDP capacity: one 20k-pps burst sat ~2x above the forwarder's knee
-  (measured 2k/5k pps -> 0% loss, 10k -> 30% at ~9.5 Mbit/s delivered,
-  20k -> 100%), so `loss_pct` carried no information. It is now two points
-  (paced + saturating, reported by delivered Mbit/s), sampled BEFORE the
-  bulk-UDP HoL blast because the UDP path does not recover within an arm
-  after a 50 Mbit/s burst (the HoL probe's own pinger then records 100%
-  loss) — a forwarder finding worth its own look.
-- Two further measurement bugs were caught while validating that revision,
-  both from reading the per-rep raw JSON the runner now keeps:
-  1. iperf3's per-interval `seconds` is not the interval span (the interval
-     after `-O` reports warm-up + interval), so summing it gave 9.0 s for an
-     8 s test and deflated the loopback headline ~12%. The window is now
-     `sum(end - start)` over non-omitted intervals.
-  2. At `rate20_rtt40` the sender's post-omit count is 0 for the whole
-     measured window — its `-O` warm-up dumped 153 MB at 1.22 Gbit/s into
-     the shaper and backpressure blocked the rest — so every tool (molehill
-     AND the TCP peers) reported a 0.0 Gbit/s 8-stream cell. The headline is
-     now the sender's bytes over the measured window, falling back to the
-     receiver's count only when the sender's accounting is degenerate
-     (receiver > 2x sender); the rate20 8-stream value is then ~0.02 Gbit/s
-     (the shaped link rate) instead of 0.
-- `iperf-raw/` artifacts are written per ARM **and CELL** (the work dir is
-  per run, so arms used to overwrite each other's evidence; a first fix
-  without the cell name still let cells overwrite each other), and
-  `audit_results.py` is the completeness gate: `None` holes, arm errors,
-  per-stream inconsistencies, missing sampler output, and the throughput
-  endpoint invariant (exposed port != backend port) — it exits non-zero on
-  holes/errors. That endpoint check exists because the opposite mistake
-  shipped a whole invalid baseline (see the VOID note above).
-
-Consequence: **no pre-revision number is comparable to the refreshed
-baseline** (the revision changed the shaping model and the throughput
-window/accounting, and the refresh ran on `0b073ddbf222`); the full
-re-measure was done on 2026-09-10 (52 arms; `audit_results.py` reports zero
-holes and zero arm errors) and `results-v0.8.0.json` + the charts + the
-README chapter now describe that run. The v0.7.2 regression gate is
-therefore informational only, and a rate-cell-only difference against it is
-never a signal.
-
-### Baseline refresh notes (2026-09-10/11, host 0b073ddbf222)
-
-> **The refresh was re-run on 2026-09-10 after an endpoint bug, and the
-> corrected baseline is what is committed now.** An intermediate refresh
-> was measured with `Backends.run_throughput` dialing the iperf3 BACKEND
-> instead of the tunnel's exposed port, so its TCP figures were the
-> loopback ceiling with every tool bypassed (loopback 1-stream 48-54
-> Gbit/s instead of the tunnel's ~10). Fixed by `fix(bench): dial the
-> exposed endpoint and isolate every sample`: the endpoint
-> is explicit (`_throughput_exposed_port` / `_bench_backend_port`), equal
-> ports raise, and `audit_results.py` fails such a run. The final baseline is
-> one same-host run of the corrected method (52 arms, zero holes, zero arm
-> errors, guard clean) and the README/strategy numbers are derived from it.
-> Caught by diffing a raw artifact's `connected` port against the cell's port
-> map — the reason raw artifacts are kept, and the first rule of AGENTS.md
-> §10.
-
-- Corrected outcome, tunnel-measured on `0b073ddbf222` (one run of the
-  revised method): Noise retains ~58%/76% of plain throughput, `count = 4`
-  aggregates at 8 streams (loopback 19.5 vs 9.2 Gbit/s, 1% loss 12.3 vs
-  4.5), and the KCP carrier stays far behind TCP wherever the path is not
-  the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, ~3x RSS = 83 vs
-  26 MiB), with UDP-only paths and rtt100 session quality as its uses.
-- **The UDP-under-load lead is retracted.** The head-of-line probe's paced
-  pinger lost 100% of its datagrams on the default arms in two earlier runs
-  and 2% in this one; the ladder probe shows no reproducible penalty either.
-  Treat it as variance, not a path property. The code-level hypothesis
-  (sticky per-peer affinity plus drop-on-full in `route_udp_datagram`, with
-  the server's routed queue hardcoded to `DEFAULT_UDP_SENDQ_SIZE` = 1024 and
-  `udp_send_queue_size` honoured only client-side) is still worth a look as a
-  fairness question. **The instruments were run (2026-09-11) and settle
-  nothing**: the stock pinger lost 8.3% then 10.8% in the same arm, and the
-  rolling-socket control lost 100% — but that control is invalid (a 200 ms
-  socket lifetime is shorter than the lazy UDP session establishment plus
-  the ~100 ms path RTT, so replies to a closed socket are simply lost). No
-  `queue full` drops were captured at that loss level. Net: the lead is
-  variance; the fairness question stays open with no demonstrated defect.
-  Re-running `~/tmp/udp_affinity_probe.py` (or `focused_run.py --hol-udp`)
-  with a socket lifetime of ~1 s and `RUST_LOG=molehill_rathole=debug` is
-  the next step if it is ever picked up.
-- Structural gaps that remain (each with a typed reason in the data): the
-  20 Mbit/s rate cell's 8-stream slot (`null`, client timeout — eight
-  parallel streams cannot finish through that bottleneck) and kcp4's rtt100
-  8-stream slot. Everything else is measured.
-- The UDP ladder replaces the two-point probe: 500 pps to the configured
-  burst rate, 2000-datagram bursts, 1.5 s drain, tolerance `max(2%, cell
-  loss + 2pp)`. Measured: unshaped loopback is a lower bound (27.2 Mbit/s at
-  the top step), the 10 ms cell bends at 12 000 pps (10.9 Mbit/s), the
-  100 ms cell at 1 000-2 000 pps (0.7-1.4 Mbit/s); loss cells have no step
-  inside tolerance, so the knee plus its delivered rate is the informative
-  pair there.
-- Container note: the environment was recycled twice during this work
-  (hostnames `ebb615bff576` -> `fbf069a0506b` -> `0b073ddbf222`; the final
-  baseline is entirely from `0b073ddbf222`, verified via the results meta).
-  A recycle wipes `/tmp` AND the benchmark tooling: `sudo apt-get install -y
-  iperf3 iproute2` (i.e. `just bench-deps`) must run again, and runs should
-  keep their scratch under `~/tmp` (`TMPDIR=$HOME/tmp`), which survives.
-- `focused_run.py` no longer applies a netem to unshaped cells and dials the
-  exposed port, so it is a usable independent check (loopback ~10 Gbit/s,
-  matching the matrix).
-- History note (2026-09-11): the 24 fix-on-fix commits on top of `0f44213`
-  were folded into seven topical commits and `merge-tcp4` was force-pushed
-  once; the branch was then fast-forwarded into `main` (19 thematic commits,
-  no merge commit) and both it and the pre-rewrite backup
-  `backup/merge-tcp4-20260911` (`4c70eeb`, identical tree) were deleted.
-- Open after the v0.8.1 release (none block it): the UDP fairness question
-  above (instrument ready, no claim) and a single-window full-matrix re-run
-  on the target host (this baseline was assembled across one run plus three
-  targeted merges after the container recycle, and v0.8.1 carries it forward
-  unchanged). The KCP loss cells were
-  re-measured with the current post-conserve binary in this baseline, so that
-  item is closed, and the `merge-tcp4` -> `main` merge is done.
-
-### Control-channel teardown (2026-09-11, the v0.8.1 fix)
-
-Found while smoke-testing a migrated 0.8 config: after a client's health check
-removed a service and its control channel then died (reset), the service could
-not re-register — `Port N is already in use` — until the **server** was
-restarted.
-
-Root cause: the connection pool that owns the bound public listener only ever
-stopped when a *new* registration took the service over (dropping the entry's
-`ControlChannelHandle`, which closes the broadcast both the pool and the
-control task watch). A channel that ended by itself therefore left its pool —
-and its listener — alive forever, and `bind_with_retry`'s 5 s window expired
-against a leak rather than a race. Evidence: the old channel logged
-`Control channel shutdown` with **no** matching `run_tcp_connection_pool:
-Shutdown`, and a live `LISTEN` socket remained on the port.
-
-Fix: the pool also takes the control task's `JoinHandle` and stops with it
-(`select!` arm in both pools, plus the TCP pairing loop, which could otherwise
-wait forever for a data channel that no control channel will ever create).
-Wrong turns worth recording, because both looked right and broke the restart
-path in `tests/integration_test.rs`:
-- removing the service's map entry from a cleanup task that awaited the
-  control task — it interacts with takeover churn (a client restart leaves the
-  old client's service tasks alive briefly, and both clients then re-register
-  in turn), which turned into a registration ping-pong;
-- `impl Drop for ControlChannelHandle` sending the shutdown — the data-plane
-  path *clones* that handle (`get2(&nonce).cloned()`), so any tunnel finishing
-  tore the whole service down.
-
-Deterministic repro: start a client whose service is unhealthy, let the health
-check remove it, then bring the local service back — the re-registration used
-to be rejected and now succeeds (verified against a migrated
-production-shaped config with three `carrier = "kcp"` services).
-`finished_control_channel_releases_its_ports` fails without the fix (the
-exposed port stays bound 10 s after the client left) and passes with it; it
-needs the short-heartbeat fixture `tests/for_tcp/teardown_release.toml`
-because the server's control channel has no read loop and notices a dead
-client only on a failed heartbeat write.
-
-Chart/runner follow-up (2026-09-10): absent measurements used to render as a
-fake `0.0` bar in the cost chart (`mux1`'s unmeasured 64-stream and
-mixed-bulk slots), and the two structural nulls looked like opaque runner
-failures. `plot_bench.py` now marks a value missing inside a compared panel
-with a grey `x`, and no longer draws rows/cells that are not part of a
-comparison: the molehill-vs-peers per-cell panels plot only the five cells
-the peers run, the mux chart is a single loopback row, and the cost chart's
-64-stream panel omits `mux1`. `bench.py` skips by design the 64-stream scale
-point above an arm's `count × 32` yamux ceiling (reason in
-`partial_metrics`);
-`bench_lib.throughput()` surfaces iperf3's own error/exit status instead of a
-bare `KeyError`; `hol_probe.ping_tcp` records a connected pinger that
-completes zero or one round trip as a stall (`ping_max_gap_ms` = the elapsed
-wait) instead of `null`.
-
-Targeted refreshes on the re-created container (`ebb615bff576`; **superseded** —
-the 2026-09-10/11 revision replaced the whole file with a single run on
-`0b073ddbf222`): `mux1` loopback (mixed bulk 9.0 Gbit/s, previously inherited
-the wedged iperf3 server), and frp/rathole `rate20_rtt40` (HoL now
-3003 / 1986 ms; both had zero-or-one pinger replies over repeated runs, so the
-probe change — not a transient — is what records them). The host could not
-reproduce the baseline for `mux-off` (~20% low: 22.6 vs 28.0 Gbit/s 8-stream
-under current load), which is one reason that file was rebuilt from scratch
-instead of patched further.
-
-KCP optimization refresh (2026-09-10, full rigor, kcp4 arm only — also
-superseded by the 2026-09-11 re-measure on `0b073ddbf222`, which is what the
-committed file holds):
-loopback 1-stream 2.496 -> 3.191 Gbit/s (+28%, A/B against the
-pre-optimization code on the same host: 2.405), rtt10 8-stream 0.39 ->
-0.653 (+67%), loss1 0.356/0.413 -> 0.418/0.686 (+17%/+66%), loss2b25
-0.353/0.382 -> 0.393/0.691 (+11%/+81%), loss5 0.025/0.045 -> 0.029/0.038
-(two complementary passes merged), rate100 0.023 -> 0.028, rate20 0.005
--> 0.004 (floor), jitter 0.127/0.114 -> 0.151/0.176, rtt100 0.04/0.051
--> 0.038/0.064. Cell fragility notes: loopback 8-stream measures ~1.4
-today for BOTH code versions (A/B: old code 1.116, new 1.453; the
-committed 5.9 was not reproducible on this host — same story as
-`mux-off` above); rtt100 1-stream flaked to 0.008 in one pass and the
-backfill's 0.038/old-code's 0.04 stand; rate100 1-stream flaked to
-0.008 in the first pass, the backfill's 0.028 matches the old code's
-0.025; rate100/rate20 8-stream stayed unrecordable: the 8-parallel-stream
-iperf3 client timed out on every rep at the shaped bottleneck
-(`iperf3 -P 8` wedges the single-test server; each attempt was killed
-by the 30 s harness timeout — same reason the committed rate100 8s
-was a fake zero and rate20 8s was already None). **Superseded by the
-2026-09-10 method revision below: these slots are measurable now.** Peer
-binaries are
-cached under `~/tmp/bench-peers` (not `/tmp`, which session cleanup wipes)
-and pinned to the baseline versions (frp 0.71.0 / rathole 0.5.0 / bore
-0.6.0), fetched directly because the unauthenticated GitHub API was
-rate-limited.
-
-KCP in-repo self-maintenance (2026-09-10): the KCP protocol engine moved
-from the `third_party/kcp` path dependency into `src/kcp/`, maintained as
-molehill's own module whose algorithm follows the reference C
-implementation by skywind3000. A path dependency cannot be published —
-cargo strips it and compiles against the registry version, so `cargo
-publish` would have failed against the unpatched crates.io kcp 0.6.0 (the
-release workflow's `publish-crate` job runs in parallel with
-release/docker, so the failure would surface only after the GitHub Release
-and image were already out). `cargo package` now verifies cleanly.
-
-KCP alignment pass (2026-09-10, audited against skywind3000/kcp master):
-fastack-conserve — the kcp crate 0.6.0 cargo feature was INVERTED vs the C
-define (feature ON = the aggressive/unconditional variant), so every
-molehill release so far shipped the aggressive variant while its docs
-claimed "conserve"; the engine now implements the reference's ts-gated
-conserve semantics. Wire-visible only under loss/reordering: the kcp4 loss
-cells in the benchmark were measured with the aggressive variant; the
-2026-09-10/11 re-measure on `0b073ddbf222` used the post-conserve binary, so
-that item is closed. Other fixes: the timeout ssthresh now halves the flush-entry cwnd
-(`prior_cwnd`) like the reference; `KCP_PROBE_INIT` 7000→5000; stream-mode
-`send` reports partial progress instead of erroring after appending
-(unreachable in the adapter, which chunks at 64 KiB); `peeksize` no longer
-overflows on a hostile `frg = 255`; the dead conv-adoption hook
-(`input_conv`) removed (the adapter routes by (addr, conv) via `get_conv`).
-Remaining benign deltas: relative `check()` return, `Err(NeedUpdate)` on
-pre-first-update flush, bool `nodelay` (the reference's nodelay=2 mode is
-unreachable — the adapter uses 1).
-
-KCP optimization pass (2026-09-10, two tuning changes on top of the
-absorption, both validated against the committed baseline on the same
-host):
-- datagram IO batching on Linux (`recvmmsg`/`sendmmsg`, up to 32
-  datagrams per syscall — `src/transport/udp_batch.rs`, the second
-  audited unsafe site after `src/common/multi_map.rs`): loopback
-  1-stream +28-33% (A/B: 2.405 -> 3.191), weak cells flat-to-better;
-  the EAGAIN path runs through `UdpSocket::try_io`, which clears
-  tokio's cached readiness, so the park-then-drain loops never spin;
-  a full kernel send buffer drops the datagram and KCP's ARQ re-emits
-  it on the next flush.
-- SACK thresholds 50 ms / 32 segments -> 10 ms / 16: the old cooldown
-  sat ABOVE the nodelay RTO floor (~30 ms), so the SACK fired only
-  after the RTO had already retransmitted — it was inert on loss
-  cells. Tuned, the SACK beats the RTO backoff: the loss cells in the
-  refresh above improved +11-81% (1-stream and 8-stream).
-MTU is NOT a tuning direction (IP-fragmentation risk on real paths):
-the `set_mtu` probe (1400 -> 8000 measured +84%..+476% on the weak
-cells but -29% loopback 8-stream) was reverted and removed from the
-tuning space.
-
-Comparability boundary (v0.7.2 era): results files before schema v3 measured
-throughput by dialing the **backend directly** (bypassing the tunnel), so
-every tool
-reported the loopback iperf3 ceiling (~46 Gbit/s) regardless of tool or cell;
-the rtt cells ran via `weakproxy` (client↔server delay only), which the
-bypassed throughput never traversed. `results-v0.7.2.json` was refreshed in
-place with schema-v3 through-tunnel data; `results-v0.7.0.json` is the
-pre-matrix (v1) baseline and is only kept for history. The gate's baseline
-line is v0.8.0 vs v0.7.2 — a cross-method comparison rather than a gate: the
-v0.7.2 file predates the revision and comes from another container, so only
-v0.8.0-and-later same-method results are comparable (see the baseline
-paragraph above).
-
-## Transport comparison: 4 arms implemented, 3 merged (decision record)
-
-All four arms were implemented, committed and integration-tested end to end
-on the `transport-test` branch (kcp_tunnel and quic_tunnel ran their full
-lifecycle in the serial suite). The branch is **deleted**; the comparison
-history (including the QUIC arm) survives in the local tag
-`archive/transport-test`. **Fork decision:** arms 0-2 (N×TCP default, KCP
-optional) are merged into `main`; **arm 3 (QUIC) was left out** —
-behind on loss cells (quinn "too many gaps" at rtt10), no peer auth on the
-QUIC leg, and N×TCP measured better in every comparable cell. The bench
-matrix on main covers mux / mux-off / mux1 / noise / kcp4 only.
-
-| Arm | Topology | Stack | Status |
-|-----|----------|-------|--------|
-| 0 (baseline) | 1 TCP tunnel | transport `T` (Noise by default) + yamux | main (`[client.data].default_count = 1`) |
-| 1 | N TCP tunnels (bench: N=4) | N × (`T` + yamux), round-robin stream placement | main (default `default_count = 4`) |
-| 2 | N KCP sessions (bench: N=4) | N × (UDP + KCP + Noise + yamux) — KCP replaces only the plaintext TCP leg | main (optional `default_carrier = "kcp"`) |
-| 3 | 1 QUIC connection | quinn (built-in transport crypto, no Noise/yamux); data channels = native QUIC bi-streams | **archived** (`archive/transport-test` tag; not on main) |
-
-Design decisions (merged part):
-
-- Config surface on main (0.8 layout): `[client.data]` holds the client-wide
-  defaults (`default_mode` = `multiplex`/`direct`, `default_count` = N
-  (default **4**; arms 1/2), `default_carrier` = `"tcp"`|`"kcp"`,
-  `default_data_addr` = data-plane endpoint, defaults to the service's control
-  endpoint) and each `[client.services.<name>]` can overlay
-  `mode`/`count`/`carrier` plus `remote_addr`/`heartbeat_timeout`/
-  `retry_interval`/`token` (defaults in `[client.control]` / `[client]`);
-  per-service transport: `[client.services.<name>].transport` with
-  `type` ("noise" / "plain" / unset = follow `[client.transport].type`)
-  and per-service `noise` keys (fallback to the global keys); the client is dual-transport per service
-  (`ClientStream`/`ClientTransport` enums, the KCP Noise wrapping uses the
-  service's effective keys);
-  the server declares no carriers (v3): the registration carries the
-  service's carrier, and the server lazily binds its KCP UDP listener on
-  the first `kcp` registration (bind failures are precise registration
-  rejections); the listener uses `[server.data].bind_addr` (default = the
-  control address). The
-  yamux window/stream knobs (`mux_receive_window` / `mux_max_streams`) were
-  removed from the config surface and fixed at 64 MiB / 32 — yamux couples
-  them and independent tuning measured 30x regressions. Server needs no
-  arm-1 change: every tunnel hello carries the same session nonce and feeds
-  the same pool.
-- KCP: crate `kcp` 0.6 (pure-Rust port of the C reference; state machine
-  only) behind a thin in-repo tokio adapter (`src/transport/kcp.rs`):
-  per-session pump task owning `Kcp` + UDP socket (select: writer channel /
-  socket recv / `check()`-driven timer), bounded channels both ways for
-  backpressure (`wait_snd()` cap on the write side), server listener
-  demultiplexes sessions by `(peer addr, conv)` from `get_conv()`.
-  **Fixed parameters (recorded for the comparison):** stream mode,
-  `set_nodelay(true, 10ms, fast-resend 2, nc=1)`, snd window 2048 / rcv
-  window 4096 segments (~2.8/5.7 MiB in flight at MTU 1400), 32 MiB socket
-  buffers (a full-window burst overflows the ~208 KiB kernel default even on
-  loopback, and every drop escalates that segment's RTO x1.5), dead_link
-  default 20. Noise rides on top of the
-  KCP byte stream (`NoiseStream<KcpStream>`) iff the control transport is
-  `noise` (same keys/pattern); `carrier = "kcp"` composes with both `plain`
-  and `noise`.
-  Keepalive: a 2 s adapter-level PING/PONG keeps idle tunnels warm (NAT
-  mappings) and doubles as the pacer's RTT/congestion signal; a vanished
-  peer is still only confirmed on the next write (dead-link after ~20
-  RTOs).
-  **v3 (0.8):** every connection starts with a one-byte transport
-  selector (`0x00` plain / `0x01` noise) — the server accepts both on one
-  listener and `[server.transport]` holds only the Noise keys (no `type`;
-  the client decides, informed by the noise-vs-plain bench); KCP sessions
-  use the same selector on their byte stream. The `kcp` carrier is
-  client-declared in the registration, so `[server.data].carriers` is
-  gone and the UDP listener binds lazily on first use (no KCP clients =
-  no UDP socket open).
-  **Matrix trims (0.8):** peers run the loopback / rtt10 / loss1 cells
-  plus the rate cells (reference points), probe durations shortened
-  (hol 5 s, steady ping 100, weak cells 10 s), and `just bench-fast`
-  gives a ~2-min molehill-only dev smoke matrix into results-dev.json
-  (excluded from plot/regression). `just test-fast` runs the lib + core
-  integration subset (~1 min vs the ~72 s full suite).
-  **New metrics (0.8):** CPU% (per-process utime/stime delta, one-core
-  base — the noise/KCP tradeoff rows finally have data), connection
-  churn (connects/sec + setup-to-first-byte p50/p99 under 16 concurrent
-  short connectors — the mux-vs-direct and pool_size guidance data),
-  sustained UDP capacity (paced 20k pps, delivered pps + loss), a
-  64-stream scale point, a mixed workload (iperf bulk + interactive
-  latency on two services of one client concurrently), and per-rep
-  min/max spread on throughput. New cells: rate-limited r100/20 and
-  r20/40 (netem rate; fall back to plain weakproxy without a modern
-  iproute2) and a jittery j20/10. Two real findings surfaced by the new
-  probes: (1) yamux's fixed 32-streams-per-tunnel ceiling caps mux at
-  count x 32 concurrent connections — at the default count=4 that is
-  128, where the path starts failing (64 is the measured working point);
-  **Throttle design (0.8):** the full matrix saturates every core by
-  design and once froze the dev host; it now self-throttles — bench.py
-  raises its nice value to 10 and every arm waits for loadavg < 0.7 x
-  nproc (max 30 s) before starting, which both keeps the host responsive
-  and makes each arm start from a quiet machine (cleaner numbers). The
-  churn probe was cut to 16 concurrent connectors x 3 s (still a storm;
-  ~1/4 the CPU) and the 64-stream scale metric runs a single rep (it is
-  a working-point reference, not a statistic).
-  (2) an unpaced UDP blast (>100k pps) wedges the shared mux tunnel
-  (subsequent TCP metrics fail) while direct mode stays healthy — mux
-  shares one sendq across services, so a pathological UDP flood can
-  starve TCP on the same client. Neither is gated by bench-check yet.
-  **Measured outcomes (optimization round, results-opt-*.json):** window
-  doubling bought +29% single-stream on loss1/rtt10 and +20% on
-  loss5/rtt100 (loopback flat) at ~2x RSS; a 5 ms flush interval was
-  rejected (loopback 8-stream -3x). KCP still loses throughput to TCP
-  carriers in every cell (loopback ~2.5 vs ~11 Gbps 1-stream; loss5/rtt100
-  ~0.03 vs ~0.28) but wins the latency axis on the worst cell: udp p50
-  601 vs 826 ms and hol max gap 1515 vs 1808 ms over the noise-TCP arm.
-  Its defensible use case: UDP-only paths (TCP blocked/throttled by
-  firewall/NAT) plus latency-first interactive traffic on high-loss,
-  high-RTT links.
-- QUIC: quinn (ring backend) + rcgen self-signed ephemeral server cert,
-  client uses a no-op cert verifier — the tunnel payload is still bound to
-  an authenticated control channel via the session-nonce hello, but the
-  arm is **experimental: no peer authentication on the QUIC leg**. First
-  bi-stream carries `DataChannelTunnelHello`/ack, later bi-streams are data
-  channels (`DataChannel::Quic` on the server, one QUIC connection per
-  control session).
-- Feature `kcp` is additive and in the **default set** so the single
-  `target/release/molehill` the bench tooling builds covers the tcp/kcp
-  arms (embedded/minimal/container builds keep their explicit slim feature
-  lists and are unaffected).
-- Merge status: the merged part (arms 0-2 + the bench arms below) is in
-  `main` (fast-forwarded on 2026-09-11, no merge commit);
-  the QUIC arm and the full comparison history live in the local tag
-  `archive/transport-test`. Bench variants on main are `mux` (plain,
-  `count = 4`, the default baseline), `mux-off` (plain, `mode = "direct"`,
-  loopback-only control), `mux1` (plain, `count = 1`), `noise`
-  (`count = 4`) and `kcp4` (noise, `count = 4`, `carrier = "kcp"`). `kcp`
-  is in the default feature set so
-  the tooling's single `target/release/molehill` covers the merged arms
-  (repro_e2e.py documents that default-features expectation).
-
-## References
-
-- rust-yamux: <https://github.com/paritytech/yamux>
-- rathole benchmark: <https://github.com/rathole-org/rathole#benchmark>
-- frp docs: <https://gofrp.org/en/docs/>
-- KCP reference implementation: <https://github.com/skywind3000/kcp>
-- quinn: <https://github.com/quinn-rs/quinn>

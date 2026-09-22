@@ -11,9 +11,22 @@
 //!   two-byte header read first, and a record that coalesces with its
 //!   successor in a single wake is decrypted from the same buffer with no
 //!   extra copy;
+//! - when the caller's buffer holds a whole record (the plaintext length is
+//!   known from the ciphertext length, so the output region can be sized
+//!   exactly), the decrypt writes **straight into the caller's buffer**
+//!   through tokio's `ReadBuf::initialize_unfilled_to` — no staging copy.
+//!   A caller that asks for less than a record (the yamux frame reader's
+//!   12-byte header and body reads, a small `read_exact`) still gets the
+//!   plaintext staged and served progressively;
 //! - writes encrypt straight into the framing buffer behind the two-byte
 //!   header and address it by index — no per-record `set_len` dance, and no
-//!   `unsafe` anywhere in this module.
+//!   `unsafe` anywhere in this module;
+//! - the setup path allocates almost nothing: the handshake runs on stack
+//!   buffers (its messages are bounded by the pattern's tokens, well under
+//!   300 bytes), and the three 64 KiB record buffers come from a bounded
+//!   pool — freed in one piece they exceed the allocator's trim threshold
+//!   and the next connection would re-fault and re-zero every page, which
+//!   measured at ~1/6 of the connection-setup CPU.
 //!
 //! Ported from snowstorm 0.4.0 (<https://github.com/black-binary/snowstorm>),
 //! Apache-2.0. Changes vs upstream: the error type is trimmed to what this
@@ -25,6 +38,7 @@ use std::{
     fmt::Debug,
     io::ErrorKind,
     pin::Pin,
+    sync::Mutex,
     task::{Context, Poll, Waker, ready},
 };
 
@@ -35,12 +49,85 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 const TAG_LEN: usize = 16;
 /// Largest Noise message: the wire format carries a `u16` length.
 const MAX_MESSAGE_LEN: usize = u16::MAX as usize;
+/// Bound for a *handshake* message (not a record): every pattern the
+/// config accepts stays far below this — see `handshake_with_verifier`.
+const MAX_HANDSHAKE_MESSAGE: usize = 1024;
 const LENGTH_FIELD_LEN: usize = std::mem::size_of::<u16>();
 /// Largest on-wire record: the length header plus a maximal ciphertext.
 const MAX_FRAME_LEN: usize = LENGTH_FIELD_LEN + MAX_MESSAGE_LEN;
 /// Sentinel for "the record's length header has not been decoded yet".
 /// Every real record is at least a tag long, so 0 is never a valid length.
 const UNKNOWN_FRAME_LEN: usize = 0;
+
+/// Upper bound on pooled buffer sets. Each set is 192 KiB, so the pool
+/// retains at most ~12 MiB — and only up to the connection high-water mark,
+/// never preallocated.
+const RECORD_POOL_CAP: usize = 64;
+
+/// The three per-connection record buffers of a [`NoiseStream`], pooled.
+///
+/// Measured on a connection-setup probe (release build, one host): the
+/// 192 KiB a stream allocates is not cheap to churn. Freed in one piece it
+/// exceeds glibc's 128 KiB trim threshold, so the allocator returns it to
+/// the OS and the next connection re-faults and re-zeroes every page — 48
+/// minor faults per connection, ~1/6 of the pair-setup CPU. A bounded
+/// free-list keeps a warm set around instead: no faults, no memset, no
+/// malloc traffic per connection.
+///
+/// Reused buffers keep their old contents (ciphertext and plaintext from
+/// the previous connection). That is safe — every region is written before
+/// it is read: the scratch is filled by `poll_read` before parsing, the
+/// payload buffer by the decrypt before serving, and the write buffer by
+/// the encrypt before the length header is set — and nothing stale reaches
+/// the wire. It does mean plaintext lingers in pooled memory until reuse,
+/// exactly as it does in any freed buffer.
+struct RecordBuffers {
+    /// Ciphertext accumulation for reads (header + ciphertext of one record).
+    scratch: Vec<u8>,
+    /// Decrypt output for records served progressively.
+    payload: Vec<u8>,
+    /// Framing buffer for writes (length header + ciphertext).
+    write: Vec<u8>,
+}
+
+static RECORD_POOL: Mutex<Vec<RecordBuffers>> = Mutex::new(Vec::new());
+
+impl RecordBuffers {
+    fn new() -> Self {
+        RecordBuffers {
+            scratch: vec![0; MAX_FRAME_LEN],
+            payload: vec![0; MAX_MESSAGE_LEN],
+            write: vec![0; LENGTH_FIELD_LEN + MAX_MESSAGE_LEN],
+        }
+    }
+
+    /// Take a set from the pool, or allocate a fresh one.
+    fn take() -> Self {
+        match RECORD_POOL.lock() {
+            Ok(mut pool) => pool.pop().unwrap_or_else(Self::new),
+            // A poisoned pool lock only means some thread panicked while
+            // holding it; the buffer sets themselves stay valid.
+            Err(poisoned) => poisoned.into_inner().pop().unwrap_or_else(Self::new),
+        }
+    }
+}
+
+impl Drop for RecordBuffers {
+    fn drop(&mut self) {
+        let mut pool = match RECORD_POOL.lock() {
+            Ok(pool) => pool,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if pool.len() < RECORD_POOL_CAP {
+            pool.push(RecordBuffers {
+                scratch: std::mem::take(&mut self.scratch),
+                payload: std::mem::take(&mut self.payload),
+                write: std::mem::take(&mut self.write),
+            });
+        }
+        // Over the cap the set is simply dropped, which frees it.
+    }
+}
 
 /// Errors the wrapper surfaces: the handshake or transport state machine
 /// failed, or the underlying IO failed.
@@ -77,11 +164,11 @@ type NoiseStreamResult<T> = Result<T, NoiseStreamError>;
 
 #[derive(Debug, Clone, Copy)]
 enum ReadState {
-    /// At a record boundary: `read_scratch[read_start..read_filled]` holds
+    /// At a record boundary: `scratch[read_start..read_filled]` holds
     /// zero or more bytes of the next record — the head of a record that
     /// coalesced with its predecessor in a single read wake.
     ReadingRecord,
-    /// A decrypted record is being served from `read_payload_buffer`;
+    /// A decrypted record is being served from the payload buffer;
     /// `served` of its bytes have already reached the caller.
     ServingPayload { served: usize },
     /// EOF or shutdown: further reads return Ok with nothing filled.
@@ -91,7 +178,7 @@ enum ReadState {
 #[derive(Debug, Clone, Copy)]
 enum WriteState {
     Idle,
-    /// The record `write_message_buffer[start..end]` is being written to
+    /// The record `write[start..end]` is being written to
     /// the inner stream; it carries `payload_len` plaintext bytes.
     WritingMessage {
         start: usize,
@@ -111,25 +198,18 @@ pub struct NoiseStream<T> {
     write_state: WriteState,
     write_clean_waker: Option<Waker>,
 
-    /// Ciphertext accumulation buffer, allocated once at `MAX_FRAME_LEN`:
-    /// `read_scratch[read_start..read_filled]` are the bytes of the record
-    /// in progress, and a successor record may already sit behind it,
-    /// consumed in place without copying. `read_expected` is the record's
-    /// total wire length once its header has been decoded, else
-    /// `UNKNOWN_FRAME_LEN`.
-    read_scratch: Vec<u8>,
+    /// The pooled record buffers: `scratch[read_start..read_filled]` are
+    /// the bytes of the record in progress, and a successor record may
+    /// already sit behind it, consumed in place without copying.
+    /// `read_expected` is the record's total wire length once its header
+    /// has been decoded, else `UNKNOWN_FRAME_LEN`.
+    bufs: RecordBuffers,
     read_start: usize,
     read_filled: usize,
     read_expected: usize,
 
     /// Decrypt output of the current record: `payload_len` valid bytes.
-    read_payload_buffer: Vec<u8>,
     payload_len: usize,
-
-    /// Write framing buffer, allocated once at `LENGTH_FIELD_LEN +
-    /// MAX_MESSAGE_LEN`: the length header at `[..LENGTH_FIELD_LEN]`, the
-    /// ciphertext behind it.
-    write_message_buffer: Vec<u8>,
 }
 
 impl<T: Debug> Debug for NoiseStream<T> {
@@ -161,6 +241,20 @@ where
         verifier: F,
     ) -> Result<Self, NoiseStreamError> {
         let mut f = Some(verifier);
+        // Handshake messages are bounded by the pattern's tokens: at most
+        // three key exchanges (≤ 56 bytes each for X448) plus tags and at
+        // most one 32-byte PSK per message — under 300 bytes for every
+        // pattern the config accepts. Stack buffers keep the setup path
+        // free of the two 64 KiB per-turn heap allocations the snowstorm
+        // original made (512 KiB per connection pair). snow rejects a
+        // message that does not fit, so an unexpected pattern fails the
+        // handshake loudly instead of truncating; the inbound length is
+        // checked for the same reason.
+        let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
+        // Taken before the loop so a failed handshake returns the set to
+        // the pool through its Drop.
+        let bufs = RecordBuffers::take();
         loop {
             if state.is_handshake_finished() {
                 let transport = state.into_transport_mode()?;
@@ -170,18 +264,13 @@ where
                     read_state: ReadState::ReadingRecord,
                     write_state: WriteState::Idle,
                     write_clean_waker: None,
-                    read_scratch: vec![0; MAX_FRAME_LEN],
+                    bufs,
                     read_start: 0,
                     read_filled: 0,
                     read_expected: UNKNOWN_FRAME_LEN,
-                    read_payload_buffer: vec![0; MAX_MESSAGE_LEN],
                     payload_len: 0,
-                    write_message_buffer: vec![0; LENGTH_FIELD_LEN + MAX_MESSAGE_LEN],
                 });
             }
-
-            let mut message = vec![0; MAX_MESSAGE_LEN];
-            let mut payload = vec![0; MAX_MESSAGE_LEN];
 
             if state.is_my_turn() {
                 let len = state.write_message(&[], &mut message)?;
@@ -197,6 +286,12 @@ where
                 inner.flush().await?;
             } else {
                 let len = inner.read_u16_le().await? as usize;
+                if len > MAX_HANDSHAKE_MESSAGE {
+                    return Err(NoiseStreamError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "handshake message too long",
+                    )));
+                }
                 inner.read_exact(&mut message[..len]).await?;
                 state.read_message(&message[..len], &mut payload)?;
                 if let Some(pubkey) = state.get_remote_static()
@@ -227,7 +322,7 @@ where
         let mut inner = this.inner;
         let state = this.write_state;
         let transport = this.transport;
-        let write_message_buffer = this.write_message_buffer;
+        let write_message_buffer = &mut this.bufs.write;
 
         loop {
             match *state {
@@ -332,7 +427,7 @@ where
                 }
                 ReadState::ServingPayload { served } => {
                     let take = (*this.payload_len - served).min(read_buf.remaining());
-                    read_buf.put_slice(&this.read_payload_buffer[served..served + take]);
+                    read_buf.put_slice(&this.bufs.payload[served..served + take]);
                     let served = served + take;
 
                     if served == *this.payload_len {
@@ -359,8 +454,8 @@ where
                         && *this.read_filled - *this.read_start >= LENGTH_FIELD_LEN
                     {
                         let header = [
-                            this.read_scratch[*this.read_start],
-                            this.read_scratch[*this.read_start + 1],
+                            this.bufs.scratch[*this.read_start],
+                            this.bufs.scratch[*this.read_start + 1],
                         ];
                         *this.read_expected =
                             LENGTH_FIELD_LEN + usize::from(u16::from_le_bytes(header));
@@ -372,13 +467,41 @@ where
                         && *this.read_filled - *this.read_start >= *this.read_expected
                     {
                         let start = *this.read_start;
-                        let ciphertext = &this.read_scratch
+                        let ciphertext = &this.bufs.scratch
                             [start + LENGTH_FIELD_LEN..start + *this.read_expected];
-                        let n = transport
-                            .read_message(ciphertext, &mut this.read_payload_buffer[..])
-                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                        let plaintext_len = *this.read_expected - LENGTH_FIELD_LEN - TAG_LEN;
                         *this.read_start += *this.read_expected;
                         *this.read_expected = UNKNOWN_FRAME_LEN;
+
+                        if plaintext_len > 0 && read_buf.remaining() >= plaintext_len {
+                            // The caller's buffer holds the whole record:
+                            // decrypt straight into it, no staging copy. The
+                            // plaintext length is known from the ciphertext
+                            // length (a fixed-size tag), so the output region
+                            // can be sized exactly — and
+                            // `initialize_unfilled_to` is a plain slice view
+                            // for the standard `ReadBuf::new` caller (the
+                            // region is already initialized) that only pays
+                            // a memset for `ReadBuf::uninit` callers.
+                            let out = read_buf.initialize_unfilled_to(plaintext_len);
+                            let n = transport
+                                .read_message(ciphertext, out)
+                                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+                            if n > 0 {
+                                read_buf.advance(n);
+                                return Poll::Ready(Ok(()));
+                            }
+                            // Zero plaintext from a non-empty record cannot
+                            // happen with an AEAD; consume and continue.
+                            continue;
+                        }
+
+                        // The caller's buffer is smaller than the record (or
+                        // the record is empty): stage the plaintext and
+                        // serve it progressively.
+                        let n = transport
+                            .read_message(ciphertext, &mut this.bufs.payload[..])
+                            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         *this.payload_len = n;
                         if n > 0 {
                             *state = ReadState::ServingPayload { served: 0 };
@@ -395,14 +518,15 @@ where
                     // record in progress always fits once it starts at
                     // offset 0.
                     if *this.read_filled == MAX_FRAME_LEN {
-                        this.read_scratch
+                        this.bufs
+                            .scratch
                             .copy_within(*this.read_start..*this.read_filled, 0);
                         *this.read_filled -= *this.read_start;
                         *this.read_start = 0;
                     }
 
                     let mut scratch_read_buf =
-                        ReadBuf::new(&mut this.read_scratch[*this.read_filled..MAX_FRAME_LEN]);
+                        ReadBuf::new(&mut this.bufs.scratch[*this.read_filled..MAX_FRAME_LEN]);
                     ready!(inner.as_mut().poll_read(cx, &mut scratch_read_buf))?;
                     let n = scratch_read_buf.filled().len();
                     if n == 0 {
@@ -472,14 +596,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_length_write_is_not_eof() {
+    async fn small_caller_buffer_stages_the_record() {
         let (mut c, mut s) = pair().await;
-        c.write_all(&[1, 2, 3]).await.unwrap();
-        c.write_all(&[]).await.unwrap();
-        c.write_all(&[4, 5, 6]).await.unwrap();
+        let data: Vec<u8> = (0..1000u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        c.write_all(&data).await.unwrap();
         c.flush().await.unwrap();
-        let mut buf = [0u8; 6];
+        // 10-byte reads are far below the record size, so every read goes
+        // through the staged path; it must never surface as an EOF.
+        let mut got = Vec::with_capacity(data.len());
+        let mut buf = [0u8; 10];
+        while got.len() < data.len() {
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(n > 0, "staged path must not surface EOF mid-record");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn exact_fit_and_coalesced_records() {
+        let (mut c, mut s) = pair().await;
+        let small = vec![7u8; 100];
+        let large = vec![9u8; 40_000];
+        c.write_all(&small).await.unwrap();
+        c.write_all(&large).await.unwrap();
+        c.flush().await.unwrap();
+        // One buffer spanning both records: the first read serves the small
+        // record, the second the large one at the exact-fit boundary.
+        let mut buf = vec![0; small.len() + large.len()];
         s.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&buf[..small.len()], &small[..]);
+        assert_eq!(&buf[small.len()..], &large[..]);
+    }
+
+    #[tokio::test]
+    async fn empty_record_does_not_look_like_eof() {
+        let (mut c, mut s) = pair().await;
+        // `write_all` never calls poll_write with an empty buffer, so drive
+        // the empty record through poll_write directly.
+        let n = std::future::poll_fn(|cx| std::pin::Pin::new(&mut c).poll_write(cx, &[]))
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        c.write_all(&[1, 2, 3]).await.unwrap();
+        c.flush().await.unwrap();
+        let mut buf = [0u8; 3];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn pooled_buffers_do_not_leak_stale_bytes() {
+        // Cycle the pool: every pair takes a buffer set that a previous
+        // pair may have used, with different contents each round.
+        for round in 0..8u8 {
+            let (mut c, mut s) = pair().await;
+            let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8 ^ round).collect();
+            c.write_all(&payload).await.unwrap();
+            c.flush().await.unwrap();
+            let mut buf = vec![0; payload.len()];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, payload, "round {round}");
+        }
     }
 }

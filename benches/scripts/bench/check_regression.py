@@ -16,10 +16,22 @@ baseline predates them. Thresholds are percent unless noted, env-overridable.
 """
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 DIR = Path(__file__).parent
+
+# results-vX.Y.Z.json parsed into a comparable tuple. A LEXICAL sort puts
+# v0.10.0 before v0.8.0 ("1" < "8"), which would make the gate compare the
+# wrong pair of files once the version passes 0.9.x — a silent gate
+# failure, not a loud one.
+VERSION_RE = re.compile(r"^results-v(\d+)\.(\d+)\.(\d+)")
+
+
+def version_key(p: Path) -> tuple:
+    m = VERSION_RE.match(p.name)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
 
 DEFAULTS = {
     "REG_RTT_P50_PCT": 15, "REG_RTT_P99_PCT": 20, "REG_THR_PCT": 5,
@@ -47,7 +59,7 @@ def molehill_key(results: dict):
 def pick_files():
     cur = sys.argv[1] if len(sys.argv) > 1 else ""
     base = sys.argv[2] if len(sys.argv) > 2 else ""
-    files = sorted(DIR.glob("results-v*.json"), key=lambda p: p.name)
+    files = sorted(DIR.glob("results-v*.json"), key=version_key)
     if not cur:
         cur = str(files[-1]) if files else ""
         if not cur:
@@ -55,7 +67,7 @@ def pick_files():
             sys.exit(1)
     if not base:
         older = [f for f in files
-                 if f.name < Path(cur).name]  # lexical = version order here
+                 if version_key(f) < version_key(Path(cur))]
         base = str(older[-1]) if older else ""
         if not base:
             print(f"no baseline found older than {Path(cur).name}",

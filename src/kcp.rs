@@ -820,7 +820,11 @@ impl<Output> Kcp<Output> {
                 }
                 self.incr += (mss * mss) / self.incr + (mss / 16);
                 if (self.cwnd as usize + 1) * mss <= self.incr {
-                    // self.cwnd += 1;
+                    // The line below is the vendored original; the assignment
+                    // after it is what actually takes effect (it derives the
+                    // window from the byte counter instead of stepping it),
+                    // so the increment is dropped rather than kept as a
+                    // comment.
                     self.cwnd = ((self.incr + mss - 1) / if mss > 0 { mss } else { 1 }) as u16;
                 }
             }
