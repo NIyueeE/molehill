@@ -162,11 +162,10 @@ code-level.**
   2. `version` in `Cargo.toml` equals the tag version;
   3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`;
   4. `just check` is green on the tagged commit;
-  5. the benchmark ritual is done (docs/release.md):
-     `results-soak-vX.Y.Z.json`, the new chart, and the README benchmark
-     table are refreshed in the release commit, and `just soak-check` is
-     green against the previous tag — capacity, SLO and drift must not
-     regress.
+  5. the benchmark ritual is done (docs/release.md): `results-vX.Y.Z.json`,
+     the new chart, and the README benchmark table are refreshed in the
+     release commit, and `just bench-check` is green against the previous
+     tag — performance must not regress.
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 
@@ -276,14 +275,14 @@ revision) and are as binding as the lint discipline in §2.
   forwards to. The pre-schema-v3 results dialed the backend and reported the
   loopback iperf3 ceiling (~46 Gbit/s) for every tool; the same error
   reappeared when a sampler was refactored to reuse the backend port. Record
-  the endpoint in the data (the port the probe dials vs the backend's) and
-  assert the invariant: the Soak runner raises when a throughput sample
-  dials the backend instead of the tool's exposed port.
+  the endpoint in the data (`_throughput_exposed_port` /
+  `_bench_backend_port`) and assert the invariant:
+  `bench_lib.run_throughput` raises when they are equal and
+  `audit_results.py` fails the run.
 - **Instrument parameters are part of the method.** Queue depth, pacing
   rate, client timeout and the window convention change the result, so they
-  are recorded in the results meta (the stage order, the settle window, the
-  sample rates) and stated in the README. A constant buried in a function
-  is a method nobody can audit: a
+  are recorded in the results meta (`netem_rate_limit`) and stated in the
+  README. A constant buried in a function is a method nobody can audit: a
   hardcoded shallow queue shaped rate cells at ~30% of the nominal rate for
   a whole baseline.
 - **One failure must not poison the next sample.** A wedged iperf3 server
@@ -313,8 +312,8 @@ revision) and are as binding as the lint discipline in §2.
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
   every reader of a key you touch, and keep a completeness gate in the
-  ritual (`soak_check.py`: the completeness of every test's series, the
-  endpoint invariant, the SLO verdicts).
+  ritual (`audit_results.py`: holes, nested fields, sampler output, endpoint
+  invariant).
 - **Prove provenance.** A run must correspond to a committed revision and a
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that

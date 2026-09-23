@@ -9,7 +9,6 @@
 - **Control channel**: a connection between the server and the client that carries control commands for one registered service
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel
 - **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that carries many data channels as streams
-- **Stripe group**: a set of `K` data channels that carry one visitor connection together (see "Data-channel striping")
 
 ## Startup and registration
 
@@ -28,16 +27,6 @@ When a visitor connects to a registered service's endpoint, the server sends a `
 To reduce first-visitor latency, data channels are pre-created as a pool (per-service `pool_size`, default 8 for TCP / 2 for UDP, clamped by the server's `max_pool_size`). New channels are requested on demand: per visitor for TCP, and whenever a UDP channel dies so the pool keeps its size.
 
 For UDP, the server maintains a per-service **session-affinity table**: a single reader task accepts datagrams from the service socket and routes every peer address to one data channel for the entry's lifetime (TTL-evicted after 300 s of inactivity). Routing every peer to a fixed channel — instead of letting all workers race on the socket — is what keeps one peer's packets on one path; the pool shards *distinct peers*, not packets.
-
-### Data-channel striping
-
-With `[server.data]stripe_count = K` (default `1`), the server pairs every visitor connection with `K` data channels instead of one and labels each with a `StartForwardStripedTcp(group, index, K)` command. The pair then forwards the connection over the group (`src/stripe.rs`):
-
-- Each direction numbers its chunks (`[u64 seq][u16 len][payload]` frames, 32 KiB payloads) and spreads them round-robin over the group's channels.
-- The receiving side reassembles by sequence number: out-of-order chunks wait in a bounded reorder map, contiguous ones are written to the destination. A frame always travels whole on one channel (a half-written frame cannot move — it would corrupt that channel's framing); a channel that refuses a frame *before* any byte of it is committed is skipped for that frame, so one backpressured channel does not stall the group.
-- A channel that ends mid-frame (not at a frame boundary) breaks the group instead of leaving the reassembler waiting for a sequence number that will never arrive.
-
-Three things follow from the arithmetic: the visitor's throughput ceiling is the sum of its channels' ceilings (a single stream is no longer capped by one tunnel), its in-flight window is the sum of the channels' windows, and each channel's framing work is driven by its own task. The cost is the reorder buffering (bounded by the engine's per-stream window plus one reorder queue per direction) and one data-channel wire addition — the striped command rides *after* the unchanged `StartForward*` commands, and channels that do not carry it are byte-identical to the unstriped path, so the yamux wire format (and 0.8.x peer interoperability) is untouched. Striping applies to TCP services; UDP keeps its one-channel-per-peer shape, where session affinity is the stronger constraint.
 
 ### Multiplexing
 

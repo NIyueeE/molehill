@@ -1,0 +1,1653 @@
+{
+  "meta": {
+    "schema": 3,
+    "date": "2026-09-22",
+    "topology": "loopback visitor->server->client->backend",
+    "transport": "plain tcp + noise (molehill variants)",
+    "reps": 2,
+    "peer_reps": 1,
+    "secs_per_rep_loopback": 6,
+    "secs_per_rep_weak": 8,
+    "peer_secs_per_rep_loopback": 5,
+    "peer_secs_per_rep_weak": 6,
+    "hol_probe_seconds": 5.0,
+    "churn_seconds": 3.0,
+    "churn_concurrency": 16,
+    "udp_capacity_datagrams": 10000,
+    "udp_capacity_pps": 20000.0,
+    "netem_rate_limit": 2000,
+    "latency_samples": 300,
+    "memory_samples_interval_s": 0.5,
+    "hostname": "1cb438346ebe",
+    "kernel": "6.12.0-160000.37-default",
+    "cpu": "Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz",
+    "cells": [
+      {
+        "name": "loopback",
+        "loss_pct": 0.0,
+        "burst_pct": 0.0,
+        "rate_mbit": 0.0,
+        "rtt_ms": 0.0,
+        "jitter_ms": 0.0,
+        "mech": "direct",
+        "loss_model": ""
+      }
+    ],
+    "tool_versions": {
+      "molehill": "0.8.1"
+    },
+    "note": "KCP baseline on this host with the current bench: smoke1 (loopback) + smoke2 (loss1_rtt10, rtt100), 2 reps x 2 rounds, 6s loopback / 8s weak tests"
+  },
+  "results": {
+    "molehill 0.8.1 (noise)": {
+      "loopback": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 6.7879,
+        "retransmits_1stream": 0,
+        "throughput_1stream_min_gbps": 5.2373,
+        "throughput_1stream_max_gbps": 6.7879,
+        "throughput_1stream_received_gbps": 6.7902,
+        "throughput_1stream_received_own_window_gbps": 5.6571,
+        "throughput_1stream_receiver_window_s": 6.001,
+        "throughput_1stream_sent_only_gbps": 6.7879,
+        "throughput_1stream_median_rep": 1,
+        "throughput_1stream_per_stream_bytes": [
+          4242407424
+        ],
+        "throughput_1stream_reps_ok": 2,
+        "throughput_8streams_gbps": 20.3016,
+        "retransmits_8streams": 136,
+        "throughput_8streams_min_gbps": 16.9577,
+        "throughput_8streams_max_gbps": 20.3016,
+        "throughput_8streams_received_gbps": 20.3183,
+        "throughput_8streams_received_own_window_gbps": 16.9196,
+        "throughput_8streams_receiver_window_s": 6.005,
+        "throughput_8streams_sent_only_gbps": 20.3016,
+        "throughput_8streams_median_rep": 0,
+        "throughput_8streams_per_stream_bytes": [
+          1975123968,
+          1906180096,
+          1441529856,
+          1887698944,
+          1260912640,
+          1256980480,
+          1275854848,
+          1686503424
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": 15.7611,
+        "retransmits_64streams": 1419,
+        "throughput_64streams_min_gbps": 15.7611,
+        "throughput_64streams_max_gbps": 15.7611,
+        "throughput_64streams_received_gbps": 15.8121,
+        "throughput_64streams_received_own_window_gbps": 15.777,
+        "throughput_64streams_receiver_window_s": 6.016,
+        "throughput_64streams_sent_only_gbps": 15.7611,
+        "throughput_64streams_median_rep": 0,
+        "throughput_64streams_per_stream_bytes": [
+          274595840,
+          266338304,
+          217055232,
+          270008320,
+          224264192,
+          136314880,
+          217055232,
+          182059008,
+          220069888,
+          153747456,
+          214958080,
+          252313600,
+          214827008,
+          132513792,
+          209453056,
+          200540160,
+          211156992,
+          126222336,
+          209846272,
+          208142336,
+          207486976,
+          128712704,
+          205914112,
+          222167040,
+          204472320,
+          250347520,
+          201326592,
+          129630208,
+          198967296,
+          242483200,
+          203948032,
+          229507072,
+          125566976,
+          244842496,
+          197525504,
+          195035136,
+          144310272,
+          136314880,
+          201981952,
+          200933376,
+          196608000,
+          218759168,
+          149553152,
+          194117632,
+          119668736,
+          194641920,
+          190971904,
+          158334976,
+          116260864,
+          121241600,
+          189005824,
+          123469824,
+          109182976,
+          135266304,
+          215744512,
+          183238656,
+          120979456,
+          134086656,
+          200278016,
+          172883968,
+          116260864,
+          180879360,
+          178651136,
+          93716480
+        ],
+        "throughput_64streams_reps_ok": 1,
+        "echo_rtt_ms": {
+          "p50": 0.261,
+          "p95": 0.317,
+          "p99": 0.333,
+          "mean": 0.264
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.325,
+          "p95": 0.512,
+          "p99": 0.563,
+          "mean": 0.333
+        },
+        "udp_rtt_ms": {
+          "p50": 0.411,
+          "p95": 0.583,
+          "p99": 0.612,
+          "mean": 0.425
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.095,
+        "udp_max_gap_ms": 20.376,
+        "churn": {
+          "connects": 15150,
+          "success_pct": 100.0,
+          "connects_per_s": 5050.0,
+          "setup_first_byte_ms_p50": 3.092,
+          "setup_first_byte_ms_p95": 3.357,
+          "setup_first_byte_ms_p99": 3.497,
+          "setup_first_byte_ms_mean": 3.097
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.68,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 999.9,
+              "offered_pps": 1000.0,
+              "offered_mbit": 1.36,
+              "delivered_mbit": 1.36,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1999.9,
+              "offered_pps": 2000.0,
+              "offered_mbit": 2.72,
+              "delivered_mbit": 2.72,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 3999.5,
+              "offered_pps": 4000.0,
+              "offered_mbit": 5.44,
+              "delivered_mbit": 5.44,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 7998.2,
+              "offered_pps": 8000.0,
+              "offered_mbit": 10.88,
+              "delivered_mbit": 10.88,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 11996.1,
+              "offered_pps": 12000.0,
+              "offered_mbit": 16.32,
+              "delivered_mbit": 16.31,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 15992.6,
+              "offered_pps": 16000.0,
+              "offered_mbit": 21.76,
+              "delivered_mbit": 21.75,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2720000,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 19991.5,
+              "offered_pps": 20000.0,
+              "offered_mbit": 27.2,
+              "delivered_mbit": 27.19,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 3400000,
+              "within_tolerance": true
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 2.0,
+          "capacity_mbit": 27.19,
+          "capacity_pps": 19991.5,
+          "capacity_offered_pps": 20000.0,
+          "capacity_loss_pct": 0.0,
+          "capacity_is_lower_bound": true,
+          "knee_offered_pps": null,
+          "knee_loss_pct": null
+        },
+        "mixed_bulk_latency": {
+          "bulk_gbps": 6.503,
+          "echo_p50_ms": 0.298,
+          "echo_p99_ms": 0.917,
+          "echo_mean_ms": 0.325
+        },
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.346,
+          "ping_rtt_ms": {
+            "p50": 0.276,
+            "p95": 0.83,
+            "p99": 0.937,
+            "mean": 0.341
+          },
+          "ping_max_gap_ms": 33.411
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.112,
+            "p95": 0.183,
+            "p99": 0.221,
+            "mean": 0.12
+          },
+          "ping_max_gap_ms": 33.52,
+          "ping_sent": 150,
+          "ping_received": 150,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 17517,
+          "client_avg_kb": 12362,
+          "total_avg_kb": 29879,
+          "total_peak_kb": 80600,
+          "samples": 178
+        },
+        "cpu": {
+          "server_avg_pct": 184.2,
+          "client_avg_pct": 184.2,
+          "total_avg_pct": 368.4,
+          "total_peak_pct": 1154.8,
+          "samples": 356
+        },
+        "framing": {
+          "frames_written_delta": 2396316,
+          "frames_read_delta": 2317377,
+          "frame_bytes_delta": 129732224312,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 26727.1,
+          "avg_frame_bytes": 27522.4,
+          "cpu_pct_per_kframe": 0.0782,
+          "arm_seconds": 89.7
+        }
+      },
+      "loss1_rtt10": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 3.797,
+        "retransmits_1stream": 599,
+        "throughput_1stream_min_gbps": 3.797,
+        "throughput_1stream_max_gbps": 3.797,
+        "throughput_1stream_received_gbps": 3.8279,
+        "throughput_1stream_received_own_window_gbps": 3.7832,
+        "throughput_1stream_receiver_window_s": 8.094,
+        "throughput_1stream_sent_only_gbps": 3.797,
+        "throughput_1stream_median_rep": 0,
+        "throughput_1stream_per_stream_bytes": [
+          3796893696
+        ],
+        "throughput_1stream_reps_ok": 1,
+        "throughput_8streams_gbps": 12.8889,
+        "retransmits_8streams": 2417,
+        "throughput_8streams_min_gbps": 12.4726,
+        "throughput_8streams_max_gbps": 12.8889,
+        "throughput_8streams_received_gbps": 13.0228,
+        "throughput_8streams_received_own_window_gbps": 12.7802,
+        "throughput_8streams_receiver_window_s": 8.15,
+        "throughput_8streams_sent_only_gbps": 12.8889,
+        "throughput_8streams_median_rep": 1,
+        "throughput_8streams_per_stream_bytes": [
+          1094582272,
+          1799749632,
+          2261254144,
+          935329792,
+          2243297280,
+          1297219584,
+          1172963328,
+          2082209792
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 101.128,
+          "p95": 337.007,
+          "p99": 1140.246,
+          "mean": 149.062
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.702,
+          "p95": 289.17,
+          "p99": 1140.323,
+          "mean": 90.087
+        },
+        "udp_rtt_ms": {
+          "p50": 60.508,
+          "p95": 60.718,
+          "p99": 100.649,
+          "mean": 61.668
+        },
+        "udp_loss_pct": 5.0,
+        "udp_jitter_ms": 1.322,
+        "udp_max_gap_ms": 80.239,
+        "churn": {
+          "connects": 346,
+          "success_pct": 99.71,
+          "connects_per_s": 115.3,
+          "setup_first_byte_ms_p50": 100.992,
+          "setup_first_byte_ms_p95": 329.15,
+          "setup_first_byte_ms_p99": 1146.713,
+          "setup_first_byte_ms_mean": 143.639
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 1935,
+              "loss_pct": 3.25,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.66,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 3.0,
+          "capacity_mbit": null,
+          "capacity_pps": null,
+          "capacity_offered_pps": null,
+          "capacity_loss_pct": null,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 500.0,
+          "knee_loss_pct": 3.25
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.034,
+          "ping_rtt_ms": {
+            "p50": 60.64,
+            "p95": 286.361,
+            "p99": 307.153,
+            "mean": 74.718
+          },
+          "ping_max_gap_ms": 307.157
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 138.906,
+            "p95": 138.906,
+            "p99": 138.906,
+            "mean": 99.692
+          },
+          "ping_max_gap_ms": 111.827,
+          "ping_sent": 150,
+          "ping_received": 2,
+          "ping_loss_pct": 98.67
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 21561,
+          "client_avg_kb": 16940,
+          "total_avg_kb": 38502,
+          "total_peak_kb": 86488,
+          "samples": 204
+        },
+        "cpu": {
+          "server_avg_pct": 77.7,
+          "client_avg_pct": 81.9,
+          "total_avg_pct": 159.6,
+          "total_peak_pct": 871.0,
+          "samples": 408
+        },
+        "framing": {
+          "frames_written_delta": 1154041,
+          "frames_read_delta": 1150454,
+          "frame_bytes_delta": 71372778859,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 11242.0,
+          "avg_frame_bytes": 30971.1,
+          "cpu_pct_per_kframe": 0.0693,
+          "arm_seconds": 102.7
+        }
+      },
+      "rtt100": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25202,
+        "_bench_backend_port": 25290,
+        "throughput_1stream_gbps": 0.6668,
+        "retransmits_1stream": 0,
+        "throughput_1stream_min_gbps": 0.6207,
+        "throughput_1stream_max_gbps": 0.6668,
+        "throughput_1stream_received_gbps": 0.6979,
+        "throughput_1stream_received_own_window_gbps": 0.6065,
+        "throughput_1stream_receiver_window_s": 9.206,
+        "throughput_1stream_sent_only_gbps": 0.6668,
+        "throughput_1stream_median_rep": 0,
+        "throughput_1stream_per_stream_bytes": [
+          666763264
+        ],
+        "throughput_1stream_reps_ok": 2,
+        "throughput_8streams_gbps": 1.0621,
+        "retransmits_8streams": 0,
+        "throughput_8streams_min_gbps": 1.0356,
+        "throughput_8streams_max_gbps": 1.0621,
+        "throughput_8streams_received_gbps": 1.2015,
+        "throughput_8streams_received_own_window_gbps": 1.0462,
+        "throughput_8streams_receiver_window_s": 9.188,
+        "throughput_8streams_sent_only_gbps": 1.0621,
+        "throughput_8streams_median_rep": 1,
+        "throughput_8streams_per_stream_bytes": [
+          55574528,
+          178126848,
+          55705600,
+          178520064,
+          167116800,
+          166985728,
+          104202240,
+          155975680
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 1001.334,
+          "p95": 1001.539,
+          "p99": 1001.512,
+          "mean": 1001.325
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 600.684,
+          "p95": 600.792,
+          "p99": 801.036,
+          "mean": 606.94
+        },
+        "udp_rtt_ms": {
+          "p50": 600.576,
+          "p95": 600.805,
+          "p99": 600.9,
+          "mean": 600.589
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.072,
+        "udp_max_gap_ms": 20.435,
+        "churn": {
+          "connects": 48,
+          "success_pct": 100.0,
+          "connects_per_s": 16.0,
+          "setup_first_byte_ms_p50": 1001.369,
+          "setup_first_byte_ms_p95": 1200.765,
+          "setup_first_byte_ms_p99": 1200.838,
+          "setup_first_byte_ms_mean": 1034.533
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.68,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1000.0,
+              "offered_pps": 1000.0,
+              "offered_mbit": 1.36,
+              "delivered_mbit": 1.36,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 1530,
+              "loss_pct": 23.5,
+              "pps": 1999.8,
+              "offered_pps": 2000.0,
+              "offered_mbit": 2.72,
+              "delivered_mbit": 2.08,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 2.0,
+          "capacity_mbit": 1.36,
+          "capacity_pps": 1000.0,
+          "capacity_offered_pps": 1000.0,
+          "capacity_loss_pct": 0.0,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 2000.0,
+          "knee_loss_pct": 23.5
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.003,
+          "ping_rtt_ms": {
+            "p50": 600.544,
+            "p95": 801.601,
+            "p99": 801.601,
+            "mean": 634.042
+          },
+          "ping_max_gap_ms": 801.605
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 600.569,
+            "p95": 600.569,
+            "p99": 600.569,
+            "mean": 600.569
+          },
+          "ping_max_gap_ms": 600.569,
+          "ping_sent": 150,
+          "ping_received": 1,
+          "ping_loss_pct": 99.33
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 8773,
+          "client_avg_kb": 8424,
+          "total_avg_kb": 17197,
+          "total_peak_kb": 36284,
+          "samples": 326
+        },
+        "cpu": {
+          "server_avg_pct": 4.9,
+          "client_avg_pct": 5.3,
+          "total_avg_pct": 10.3,
+          "total_peak_pct": 56.0,
+          "samples": 652
+        },
+        "framing": {
+          "frames_written_delta": 161739,
+          "frames_read_delta": 161003,
+          "frame_bytes_delta": 7890573436,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 979.6,
+          "avg_frame_bytes": 24448.5,
+          "cpu_pct_per_kframe": 0.0319,
+          "arm_seconds": 165.1
+        }
+      }
+    },
+    "molehill 0.8.1 (kcp4)": {
+      "loopback": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 3.1044,
+        "retransmits_1stream": 1,
+        "throughput_1stream_min_gbps": 1.8775,
+        "throughput_1stream_max_gbps": 3.1044,
+        "throughput_1stream_received_gbps": 3.1038,
+        "throughput_1stream_received_own_window_gbps": 3.1037,
+        "throughput_1stream_receiver_window_s": 6.001,
+        "throughput_1stream_sent_only_gbps": 3.1044,
+        "throughput_1stream_median_rep": 0,
+        "throughput_1stream_per_stream_bytes": [
+          2328494080
+        ],
+        "throughput_1stream_reps_ok": 2,
+        "throughput_8streams_gbps": 6.3364,
+        "retransmits_8streams": 122,
+        "throughput_8streams_min_gbps": 1.4662,
+        "throughput_8streams_max_gbps": 6.3364,
+        "throughput_8streams_received_gbps": 6.2984,
+        "throughput_8streams_received_own_window_gbps": 5.2443,
+        "throughput_8streams_receiver_window_s": 6.006,
+        "throughput_8streams_sent_only_gbps": 6.3364,
+        "throughput_8streams_median_rep": 0,
+        "throughput_8streams_per_stream_bytes": [
+          580386816,
+          103415808,
+          897581056,
+          637140992,
+          681836544,
+          59113472,
+          590872576,
+          410386432
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": 7.9071,
+        "retransmits_64streams": 1249,
+        "throughput_64streams_min_gbps": 7.9071,
+        "throughput_64streams_max_gbps": 7.9071,
+        "throughput_64streams_received_gbps": 7.8992,
+        "throughput_64streams_received_own_window_gbps": 6.5494,
+        "throughput_64streams_receiver_window_s": 6.035,
+        "throughput_64streams_sent_only_gbps": 7.9071,
+        "throughput_64streams_median_rep": 0,
+        "throughput_64streams_per_stream_bytes": [
+          95420416,
+          83623936,
+          92930048,
+          90570752,
+          63045632,
+          87949312,
+          91095040,
+          89915392,
+          62652416,
+          84803584,
+          90046464,
+          93585408,
+          60555264,
+          82837504,
+          90439680,
+          91488256,
+          54132736,
+          82706432,
+          88866816,
+          84672512,
+          55705600,
+          81133568,
+          89128960,
+          84541440,
+          54657024,
+          85065728,
+          85590016,
+          85983232,
+          56623104,
+          83361792,
+          85852160,
+          86900736,
+          56360960,
+          78643200,
+          82575360,
+          86114304,
+          57802752,
+          82706432,
+          82837504,
+          78381056,
+          55050240,
+          81526784,
+          82051072,
+          82051072,
+          57016320,
+          80871424,
+          79560704,
+          81788928,
+          54919168,
+          78512128,
+          77725696,
+          82968576,
+          76414976,
+          83361792,
+          74317824,
+          81002496,
+          52953088,
+          57409536,
+          75235328,
+          51773440,
+          78118912,
+          74317824,
+          71565312,
+          73662464
+        ],
+        "throughput_64streams_reps_ok": 1,
+        "echo_rtt_ms": {
+          "p50": 0.3,
+          "p95": 0.359,
+          "p99": 0.375,
+          "mean": 0.307
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.428,
+          "p95": 0.603,
+          "p99": 0.625,
+          "mean": 0.434
+        },
+        "udp_rtt_ms": {
+          "p50": 0.43,
+          "p95": 0.607,
+          "p99": 0.665,
+          "mean": 0.449
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.091,
+        "udp_max_gap_ms": 20.432,
+        "churn": {
+          "connects": 14465,
+          "success_pct": 100.0,
+          "connects_per_s": 4821.7,
+          "setup_first_byte_ms_p50": 3.237,
+          "setup_first_byte_ms_p95": 3.532,
+          "setup_first_byte_ms_p99": 3.683,
+          "setup_first_byte_ms_mean": 3.243
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.68,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1000.0,
+              "offered_pps": 1000.0,
+              "offered_mbit": 1.36,
+              "delivered_mbit": 1.36,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1999.9,
+              "offered_pps": 2000.0,
+              "offered_mbit": 2.72,
+              "delivered_mbit": 2.72,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 3999.6,
+              "offered_pps": 4000.0,
+              "offered_mbit": 5.44,
+              "delivered_mbit": 5.44,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 7998.2,
+              "offered_pps": 8000.0,
+              "offered_mbit": 10.88,
+              "delivered_mbit": 10.88,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 11994.8,
+              "offered_pps": 12000.0,
+              "offered_mbit": 16.32,
+              "delivered_mbit": 16.31,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 15999.5,
+              "offered_pps": 16000.0,
+              "offered_mbit": 21.76,
+              "delivered_mbit": 21.76,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2720000,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 19998.3,
+              "offered_pps": 20000.0,
+              "offered_mbit": 27.2,
+              "delivered_mbit": 27.2,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 3400000,
+              "within_tolerance": true
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 2.0,
+          "capacity_mbit": 27.2,
+          "capacity_pps": 19998.3,
+          "capacity_offered_pps": 20000.0,
+          "capacity_loss_pct": 0.0,
+          "capacity_is_lower_bound": true,
+          "knee_offered_pps": null,
+          "knee_loss_pct": null
+        },
+        "mixed_bulk_latency": {
+          "bulk_gbps": 0.3808,
+          "echo_p50_ms": 0.335,
+          "echo_p99_ms": 0.49,
+          "echo_mean_ms": 0.343
+        },
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.193,
+          "ping_rtt_ms": {
+            "p50": 0.283,
+            "p95": 0.692,
+            "p99": 1.131,
+            "mean": 0.342
+          },
+          "ping_max_gap_ms": 33.414
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.148,
+            "p95": 0.188,
+            "p99": 0.233,
+            "mean": 0.15
+          },
+          "ping_max_gap_ms": 33.495,
+          "ping_sent": 150,
+          "ping_received": 150,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 69548,
+          "client_avg_kb": 28119,
+          "total_avg_kb": 97668,
+          "total_peak_kb": 290284,
+          "samples": 186
+        },
+        "cpu": {
+          "server_avg_pct": 162.7,
+          "client_avg_pct": 139.9,
+          "total_avg_pct": 302.6,
+          "total_peak_pct": 1225.3,
+          "samples": 372
+        },
+        "framing": {
+          "frames_written_delta": 989932,
+          "frames_read_delta": 929811,
+          "frame_bytes_delta": 39483732624,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 10608.1,
+          "avg_frame_bytes": 20567.2,
+          "cpu_pct_per_kframe": 0.1576,
+          "arm_seconds": 93.3
+        }
+      },
+      "loss1_rtt10": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 0.4636,
+        "retransmits_1stream": 79,
+        "throughput_1stream_min_gbps": 0.4306,
+        "throughput_1stream_max_gbps": 0.4636,
+        "throughput_1stream_received_gbps": 0.4725,
+        "throughput_1stream_received_own_window_gbps": 0.4104,
+        "throughput_1stream_receiver_window_s": 8.06,
+        "throughput_1stream_sent_only_gbps": 0.4636,
+        "throughput_1stream_median_rep": 1,
+        "throughput_1stream_per_stream_bytes": [
+          405667840
+        ],
+        "throughput_1stream_reps_ok": 2,
+        "throughput_8streams_gbps": 0.7897,
+        "retransmits_8streams": 176,
+        "throughput_8streams_min_gbps": 0.6852,
+        "throughput_8streams_max_gbps": 0.7897,
+        "throughput_8streams_received_gbps": 0.9492,
+        "throughput_8streams_received_own_window_gbps": 0.6906,
+        "throughput_8streams_receiver_window_s": 9.624,
+        "throughput_8streams_sent_only_gbps": 0.7897,
+        "throughput_8streams_median_rep": 1,
+        "throughput_8streams_per_stream_bytes": [
+          55967744,
+          75235328,
+          117702656,
+          69206016,
+          105512960,
+          94371840,
+          68419584,
+          104726528
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 101.13,
+          "p95": 1111.754,
+          "p99": 1126.969,
+          "mean": 185.275
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.731,
+          "p95": 60.922,
+          "p99": 288.575,
+          "mean": 63.428
+        },
+        "udp_rtt_ms": {
+          "p50": 60.559,
+          "p95": 60.723,
+          "p99": 98.715,
+          "mean": 61.343
+        },
+        "udp_loss_pct": 2.5,
+        "udp_jitter_ms": 1.163,
+        "udp_max_gap_ms": 60.077,
+        "churn": {
+          "connects": 335,
+          "success_pct": 100.0,
+          "connects_per_s": 111.7,
+          "setup_first_byte_ms_p50": 101.002,
+          "setup_first_byte_ms_p95": 342.161,
+          "setup_first_byte_ms_p99": 1139.014,
+          "setup_first_byte_ms_mean": 157.121
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 1920,
+              "loss_pct": 4.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.65,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 3.0,
+          "capacity_mbit": null,
+          "capacity_pps": null,
+          "capacity_offered_pps": null,
+          "capacity_loss_pct": null,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 500.0,
+          "knee_loss_pct": 4.0
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.032,
+          "ping_rtt_ms": {
+            "p50": 60.552,
+            "p95": 282.036,
+            "p99": 284.974,
+            "mean": 74.55
+          },
+          "ping_max_gap_ms": 284.979
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 67.513,
+            "p95": 75.506,
+            "p99": 75.506,
+            "mean": 67.815
+          },
+          "ping_max_gap_ms": 41.39,
+          "ping_sent": 150,
+          "ping_received": 3,
+          "ping_loss_pct": 98.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 57654,
+          "client_avg_kb": 22388,
+          "total_avg_kb": 80041,
+          "total_peak_kb": 320676,
+          "samples": 222
+        },
+        "cpu": {
+          "server_avg_pct": 25.6,
+          "client_avg_pct": 17.5,
+          "total_avg_pct": 43.1,
+          "total_peak_pct": 137.9,
+          "samples": 444
+        },
+        "framing": {
+          "frames_written_delta": 182243,
+          "frames_read_delta": 180376,
+          "frame_bytes_delta": 6444179414,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 1634.1,
+          "avg_frame_bytes": 17771.2,
+          "cpu_pct_per_kframe": 0.1189,
+          "arm_seconds": 111.5
+        }
+      },
+      "rtt100": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25202,
+        "_bench_backend_port": 25290,
+        "throughput_1stream_gbps": 0.011,
+        "retransmits_1stream": 0,
+        "throughput_1stream_min_gbps": 0.011,
+        "throughput_1stream_max_gbps": 0.011,
+        "throughput_1stream_received_gbps": 0.0097,
+        "throughput_1stream_received_own_window_gbps": 0.009,
+        "throughput_1stream_receiver_window_s": 8.601,
+        "throughput_1stream_sent_only_gbps": 0.011,
+        "throughput_1stream_median_rep": 1,
+        "throughput_1stream_per_stream_bytes": [
+          11010048
+        ],
+        "throughput_1stream_reps_ok": 1,
+        "throughput_8streams_gbps": null,
+        "retransmits_8streams": null,
+        "throughput_8streams_min_gbps": null,
+        "throughput_8streams_max_gbps": null,
+        "throughput_8streams_reps_ok": 0,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 1000.943,
+          "p95": 1001.059,
+          "p99": 1001.043,
+          "mean": 1000.935
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 600.448,
+          "p95": 600.55,
+          "p99": 800.854,
+          "mean": 606.695
+        },
+        "udp_rtt_ms": {
+          "p50": 600.364,
+          "p95": 600.471,
+          "p99": 600.484,
+          "mean": 600.364
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.049,
+        "udp_max_gap_ms": 20.306,
+        "churn": {
+          "connects": 48,
+          "success_pct": 100.0,
+          "connects_per_s": 16.0,
+          "setup_first_byte_ms_p50": 1000.994,
+          "setup_first_byte_ms_p95": 1200.201,
+          "setup_first_byte_ms_p99": 1200.24,
+          "setup_first_byte_ms_mean": 1034.207
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.68,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1000.0,
+              "offered_pps": 1000.0,
+              "offered_mbit": 1.36,
+              "delivered_mbit": 1.36,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 795,
+              "loss_pct": 60.25,
+              "pps": 1999.8,
+              "offered_pps": 2000.0,
+              "offered_mbit": 2.72,
+              "delivered_mbit": 1.08,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 2.0,
+          "capacity_mbit": 1.36,
+          "capacity_pps": 1000.0,
+          "capacity_offered_pps": 1000.0,
+          "capacity_loss_pct": 0.0,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 2000.0,
+          "knee_loss_pct": 60.25
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.004,
+          "ping_rtt_ms": {
+            "p50": 600.79,
+            "p95": 801.394,
+            "p99": 801.394,
+            "mean": 625.786
+          },
+          "ping_max_gap_ms": 801.398
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": null,
+          "ping_max_gap_ms": null,
+          "ping_sent": 150,
+          "ping_received": 0,
+          "ping_loss_pct": 100.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 14929,
+          "client_avg_kb": 13286,
+          "total_avg_kb": 28216,
+          "total_peak_kb": 49412,
+          "samples": 311
+        },
+        "cpu": {
+          "server_avg_pct": 3.3,
+          "client_avg_pct": 3.2,
+          "total_avg_pct": 6.5,
+          "total_peak_pct": 32.0,
+          "samples": 622
+        },
+        "partial_metrics": [
+          "throughput_8streams: client timed out after 28s (harness bound, test may still have been transferring)",
+          "throughput_8streams: last rep: client timed out after 28s (harness bound, test may still have been transferring)"
+        ],
+        "framing": {
+          "frames_written_delta": 15229,
+          "frames_read_delta": 13785,
+          "frame_bytes_delta": 103771634,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 96.8,
+          "avg_frame_bytes": 3576.6,
+          "cpu_pct_per_kframe": 0.224,
+          "arm_seconds": 157.4
+        }
+      }
+    },
+    "molehill 0.8.1 (mux-off)": {
+      "loopback": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 20.0308,
+        "retransmits_1stream": 133,
+        "throughput_1stream_min_gbps": 19.3597,
+        "throughput_1stream_max_gbps": 20.0308,
+        "throughput_1stream_received_gbps": 20.014,
+        "throughput_1stream_received_own_window_gbps": 20.0107,
+        "throughput_1stream_receiver_window_s": 6.001,
+        "throughput_1stream_sent_only_gbps": 20.0308,
+        "throughput_1stream_median_rep": 1,
+        "throughput_1stream_per_stream_bytes": [
+          15022161920
+        ],
+        "throughput_1stream_reps_ok": 2,
+        "throughput_8streams_gbps": 33.886,
+        "retransmits_8streams": 146,
+        "throughput_8streams_min_gbps": 27.7697,
+        "throughput_8streams_max_gbps": 33.886,
+        "throughput_8streams_received_gbps": 33.8722,
+        "throughput_8streams_received_own_window_gbps": 28.2044,
+        "throughput_8streams_receiver_window_s": 6.007,
+        "throughput_8streams_sent_only_gbps": 33.886,
+        "throughput_8streams_median_rep": 0,
+        "throughput_8streams_per_stream_bytes": [
+          2672951296,
+          2520907776,
+          2562195456,
+          2645819392,
+          2733506560,
+          2602434560,
+          2740322304,
+          2708996096
+        ],
+        "throughput_8streams_reps_ok": 2,
+        "throughput_64streams_gbps": 21.6749,
+        "retransmits_64streams": 8108,
+        "throughput_64streams_min_gbps": 21.6749,
+        "throughput_64streams_max_gbps": 21.6749,
+        "throughput_64streams_received_gbps": 22.6106,
+        "throughput_64streams_received_own_window_gbps": 22.0121,
+        "throughput_64streams_receiver_window_s": 6.074,
+        "throughput_64streams_sent_only_gbps": 21.6749,
+        "throughput_64streams_median_rep": 0,
+        "throughput_64streams_per_stream_bytes": [
+          587464704,
+          559284224,
+          259784704,
+          186253312,
+          658112512,
+          246022144,
+          174456832,
+          177209344,
+          204079104,
+          222035968,
+          189399040,
+          277610496,
+          227409920,
+          209321984,
+          331481088,
+          214827008,
+          187301888,
+          217448448,
+          211156992,
+          165937152,
+          271581184,
+          214564864,
+          371589120,
+          221904896,
+          298975232,
+          246808576,
+          203161600,
+          345767936,
+          268042240,
+          184811520,
+          192544768,
+          204210176,
+          269352960,
+          191627264,
+          252051456,
+          221773824,
+          311820288,
+          223739904,
+          195821568,
+          381288448,
+          189661184,
+          232259584,
+          193331200,
+          213778432,
+          290193408,
+          369491968,
+          212467712,
+          318767104,
+          183238656,
+          188612608,
+          233308160,
+          174981120,
+          229900288,
+          204734464,
+          193855488,
+          161480704,
+          250216448,
+          175112192,
+          242614272,
+          216268800,
+          222822400,
+          186253312,
+          301989888,
+          258736128
+        ],
+        "throughput_64streams_reps_ok": 1,
+        "echo_rtt_ms": {
+          "p50": 0.217,
+          "p95": 0.248,
+          "p99": 0.261,
+          "mean": 0.219
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 0.318,
+          "p95": 0.474,
+          "p99": 0.53,
+          "mean": 0.315
+        },
+        "udp_rtt_ms": {
+          "p50": 0.409,
+          "p95": 0.586,
+          "p99": 0.651,
+          "mean": 0.421
+        },
+        "udp_loss_pct": 0.0,
+        "udp_jitter_ms": 0.093,
+        "udp_max_gap_ms": 20.414,
+        "churn": {
+          "connects": 15090,
+          "success_pct": 100.0,
+          "connects_per_s": 5030.0,
+          "setup_first_byte_ms_p50": 3.103,
+          "setup_first_byte_ms_p95": 3.374,
+          "setup_first_byte_ms_p99": 3.503,
+          "setup_first_byte_ms_mean": 3.109
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.68,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1000.0,
+              "offered_pps": 1000.0,
+              "offered_mbit": 1.36,
+              "delivered_mbit": 1.36,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 1999.9,
+              "offered_pps": 2000.0,
+              "offered_mbit": 2.72,
+              "delivered_mbit": 2.72,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 3999.6,
+              "offered_pps": 4000.0,
+              "offered_mbit": 5.44,
+              "delivered_mbit": 5.44,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 7998.3,
+              "offered_pps": 8000.0,
+              "offered_mbit": 10.88,
+              "delivered_mbit": 10.88,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 11996.1,
+              "offered_pps": 12000.0,
+              "offered_mbit": 16.32,
+              "delivered_mbit": 16.31,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 15999.3,
+              "offered_pps": 16000.0,
+              "offered_mbit": 21.76,
+              "delivered_mbit": 21.76,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2720000,
+              "within_tolerance": true
+            },
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 2000,
+              "loss_pct": 0.0,
+              "pps": 19997.9,
+              "offered_pps": 20000.0,
+              "offered_mbit": 27.2,
+              "delivered_mbit": 27.2,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 3400000,
+              "within_tolerance": true
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 2.0,
+          "capacity_mbit": 27.2,
+          "capacity_pps": 19997.9,
+          "capacity_offered_pps": 20000.0,
+          "capacity_loss_pct": 0.0,
+          "capacity_is_lower_bound": true,
+          "knee_offered_pps": null,
+          "knee_loss_pct": null
+        },
+        "mixed_bulk_latency": {
+          "bulk_gbps": 21.102,
+          "echo_p50_ms": 0.268,
+          "echo_p99_ms": 0.987,
+          "echo_mean_ms": 0.285
+        },
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.363,
+          "ping_rtt_ms": {
+            "p50": 0.307,
+            "p95": 0.485,
+            "p99": 0.523,
+            "mean": 0.32
+          },
+          "ping_max_gap_ms": 33.437
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 0.087,
+            "p95": 0.125,
+            "p99": 0.18,
+            "mean": 0.096
+          },
+          "ping_max_gap_ms": 33.506,
+          "ping_sent": 150,
+          "ping_received": 150,
+          "ping_loss_pct": 0.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 7661,
+          "client_avg_kb": 7861,
+          "total_avg_kb": 15522,
+          "total_peak_kb": 21788,
+          "samples": 179
+        },
+        "cpu": {
+          "server_avg_pct": 208.7,
+          "client_avg_pct": 197.5,
+          "total_avg_pct": 406.2,
+          "total_peak_pct": 1319.8,
+          "samples": 358
+        }
+      }
+    }
+  }
+}

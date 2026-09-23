@@ -49,15 +49,14 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `src/lib.rs` | library root: run-mode detection, main event loop, config-watcher lifecycle |
 | `src/cli.rs` | clap-derive CLI definitions |
 | `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands), postcard serialization, protocol version |
-| `src/common.rs` + `src/common/` | constants, DNS/keepalive/retry helpers, `MultiMap`, the `AsyncWriteOwned` owned-write capability boundary (`owned_write.rs`) |
+| `src/common.rs` + `src/common/` | constants, DNS/keepalive/retry helpers, `MultiMap` |
 | `src/config.rs` + `src/config/` | TOML parsing/validation (`Config`, `ClientConfig`, …, `MaskedString`), hot-reload watcher |
 | `src/core/client.rs` | client mode: control channel, auth, registration, data-channel requests |
 | `src/core/server.rs` | server mode: registration policy, eager binding, connection pools |
 | `src/logging.rs` | colored span-aware log formatter |
-| `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (the `noise_stream.rs` record wrapper — ported from snowstorm and since extended in-repo: one-sweep record reads, direct decrypt into the caller's buffer, owned-record writes, opt-in session resume) / multiplex / kcp implementations |
-| `src/kcp.rs` + `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the SACK extensions the adapter needs; kept in-repo so nothing external needs patching and the module follows molehill's own rules. The tokio adapter around it (pump task, channels, send batching / receive coalescing, pacer, keepalive) is `src/transport/kcp.rs` |
+| `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (+ vendored `noise_stream.rs` record wrapper, ported from snowstorm) / multiplex / kcp implementations |
+| `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the adapter's SACK extensions; kept in-repo so nothing external needs patching and the module follows molehill's own rules |
 | `src/mux.rs` + `src/mux/` | the yamux framing engine — vendored from rust-yamux 0.14 and maintained in-repo (like the KCP engine), wire-identical with the yamux specification and tokio-native (tokio IO traits, no compat shim); the `multiplex` transport integrates it through `src/transport/multiplex.rs` |
-| `src/stripe.rs` | the stripe group: spreads one visitor connection over K data channels with numbered 32 KiB chunks (`[server.data] stripe_count`, default 1 = off) — the frame a chunk is read into crosses to the stripe by ownership, and the receiver reassembles by sequence number; design in docs/internals.md, "Data-channel striping" |
 
 ## Tests, benches, examples, docs
 

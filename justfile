@@ -4,8 +4,7 @@
 default:
     @just --list
 
-# One-time setup per clone: activate git hooks + install missing check tools
-# (the ruff gate needs uv/uvx; `just powerset` needs cargo-hack).
+# One-time setup per clone: activate git hooks + install missing check tools.
 setup:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -20,17 +19,6 @@ setup:
             cargo install "$tool" --locked
         fi
     done
-    if command -v uvx >/dev/null 2>&1; then
-        echo "ok:      uvx"
-    else
-        echo "install: uvx  (the python bench gate; run:"
-        echo "          curl -LsSf https://astral.sh/uv/install.sh | sh)"
-    fi
-    if command -v cargo-hack >/dev/null 2>&1; then
-        echo "ok:      cargo-hack"
-    else
-        echo "missing: cargo-hack (needed by 'just powerset'; install: cargo install cargo-hack --locked)"
-    fi
     echo "setup complete"
 
 # Auto-fix formatting across the workspace.
@@ -41,7 +29,7 @@ fmt:
 test:
     cargo test -- --test-threads=1
 
-# Run the full check chain (identical to hooks + CI: fmt/secrets/machete/docs/ruff/clippy + audit/deny/outdated/test).
+# Run the full check chain (identical to hooks + CI: fmt/secrets/machete/docs/clippy + audit/deny/outdated/test).
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -76,26 +64,35 @@ bench-deps:
     sudo apt-get install -y iperf3 iproute2
 
 # Fetch the latest GitHub release binaries of the peer tools (frp, rathole,
-# nps) into ~/tmp/bench-peers — nothing is built from source.
-soak-peers:
-    uv run benches/scripts/soak/fetch_peers.py
+# bore) into ~/tmp/bench-peers — nothing is built from source.
+bench-peers:
+    uv run benches/scripts/bench/fetch_peers.py
 
-# Run the soak benchmark: a tool (or a batch of them) through the scripted
-# workload under the stage schedule. Test types: capacity / rrul / soak /
-# cost / screen — see docs/release.md, "Benchmarks".
-# Example (fast development A/B between two builds):
-#   just soak --test=screen --path=clean --streams-max=8 --ab bin-a,bin-b
-soak *ARGS:
-    uv run benches/scripts/soak/soak.py {{ARGS}}
+# Run the full benchmark matrix (molehill arms at full rigor; loss cells need netem).
+bench:
+    uv run benches/scripts/bench/bench.py
 
-# Render the charts + markdown tables from the latest results file.
-soak-plot:
-    uv run benches/scripts/soak/soak_plot.py
+# Quick perf sanity for the dev loop: molehill only, loopback + loss1 cells,
+# one rep, short durations. Writes results-dev.json — excluded from the
+# version-picked files plot/regression use, so it can never pollute a
+# release baseline.
+bench-fast:
+    MOLEHILL_REPS=1 MOLEHILL_SECS=4 MOLEHILL_SECS_WEAK=6 uv run benches/scripts/bench/bench.py --tools=molehill --cells=0/0,1%/10 --variants=mux,noise,kcp4 --fresh --out benches/scripts/bench/results-dev.json
 
-# The gate: latest results vs the previous release's file (pre-tag ritual).
-# With --screen <file>: the verdict of a development A/B run.
-soak-check *ARGS:
-    uv run benches/scripts/soak/soak_check.py {{ARGS}}
+# Render the README chart + markdown tables from the latest results file.
+bench-plot:
+    uv run benches/scripts/bench/plot_bench.py
+
+# Regression gate: latest results vs the previous tag's file (pre-tag ritual).
+bench-check:
+    uv run benches/scripts/bench/check_regression.py
+
+# A/B verdict for one interleaved run (bench.py --ab BIN_A,BIN_B), or for two
+# independent files. Prints per-cell medians, deltas, and whether the
+# difference is claimable per AGENTS.md section 10 (non-overlapping reps).
+# Non-zero exit means a claimable regression was found.
+bench-ab:
+    uv run benches/scripts/bench/ab_compare.py
 
 # Fast dev loop: lib tests + the core integration subset (~1 min; the full
 # suite is ~72 s and runs on every push/CI — see docs/checks.md).
@@ -106,11 +103,6 @@ test-fast:
 # Lint the python bench/test entries (ruff via uvx; also in the pre-commit gate).
 py-lint:
     uvx ruff check benches/scripts/
-    uvx ruff format --check benches/scripts/
-
-# Auto-fix the python bench/test entries' formatting (ruff format).
-py-fmt:
-    uvx ruff format benches/scripts/
 
 # Build the scratch container image from a release musl binary (see Containerfile).
 container:
