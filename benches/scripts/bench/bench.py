@@ -184,11 +184,11 @@ class ArmProcs:
 _NOISE_KEYS = None
 
 
-def noise_keys() -> tuple:
+def noise_keys(binary: str) -> tuple:
     """Generate once per run and cache a Noise keypair via `--genkey`."""
     global _NOISE_KEYS
     if _NOISE_KEYS is None:
-        out = subprocess.run([knobs_bin(), "--genkey"], capture_output=True,
+        out = subprocess.run([binary, "--genkey"], capture_output=True,
                              text=True, timeout=30, check=False).stdout
         priv = pub = ""
         lines = out.splitlines()
@@ -234,7 +234,7 @@ def molehill_config(work: Path, variant: str, knobs: Knobs, p: dict) -> Path:
         transport = "plain"
     noise_s = noise_c = ""
     if transport == "noise":
-        priv, pub = noise_keys()
+        priv, pub = noise_keys(knobs.molehill_bin)
         noise_s = f'[server.transport.noise]\nlocal_private_key = "{priv}"\n'
         noise_c = f'[client.transport.noise]\nremote_public_key = "{pub}"\n'
     data_s_block = f"[server.data]\n{data_s}" if data_s else ""
@@ -282,15 +282,14 @@ udp_send_queue_size = 1024
     return d
 
 
-def start_molehill(procs: ArmProcs, d: Path, variant: str = "") -> None:
+def start_molehill(procs: ArmProcs, d: Path, variant: str = "",
+                   binary: str = "") -> None:
     env = stripe_env(variant)
-    procs.spawn([knobs_bin(), "--server", str(d / "server.toml")],
+    procs.spawn([binary, "--server", str(d / "server.toml")],
                 role="server", env=env)
-    procs.spawn([knobs_bin(), "--client", str(d / "client.toml")],
+    procs.spawn([binary, "--client", str(d / "client.toml")],
                 role="client", env=env)
 
-
-_KNOBS = {"bin": None}
 
 # The framing counters are the bench's attribution tool (frames/s and
 # CPU/frame per arm), so every molehill arm runs with them on. Setting it
@@ -306,14 +305,11 @@ MUX_STATS_ENV = {**MUX_STATS_ENV,
                  "MOLEHILL_TCP_BUFFER_BYTES": _maybe_buf} if _maybe_buf else MUX_STATS_ENV
 
 
-def knobs_bin() -> str:
-    return _KNOBS["bin"]
-
 
 def setup_molehill(variant: str, knobs: Knobs, p: dict, procs: ArmProcs,
                    work: Path) -> None:
     d = molehill_config(work, variant, knobs, p)
-    start_molehill(procs, d, variant)
+    start_molehill(procs, d, variant, knobs.molehill_bin)
 
 
 def setup_frp(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
@@ -653,7 +649,7 @@ def mixed_bulk_latency(backends, iperf_exposed: int, echo_port: int,
 
 def tool_version(knobs: Knobs) -> str:
     try:
-        out = subprocess.run([knobs_bin(), "--version"],
+        out = subprocess.run([knobs.molehill_bin, "--version"],
                              capture_output=True, text=True,
                              check=False, timeout=15).stdout
         return next((l.split()[2] for l in out.splitlines()
@@ -1082,7 +1078,6 @@ def main():
 
     knobs = Knobs.from_env()
     knobs.pool_size = args.pool_size
-    _KNOBS["bin"] = knobs.molehill_bin
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
     cells = [parse_cell(c.strip()) for c in args.cells.split(",") if c.strip()]
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
@@ -1205,6 +1200,9 @@ def main():
                     for ab_round in range(1, knobs.molehill_reps + 1):
                         for ab_bin in ab_bins:
                             if ab_bin is not None:
+                                # `knobs.molehill_bin` is what every spawn
+                                # site reads, so this alone swaps the
+                                # interleave's binary.
                                 knobs.molehill_bin = ab_bin
                             # The label must distinguish the two binaries:
                             # merge_arm keys results by (tool, cell), so two

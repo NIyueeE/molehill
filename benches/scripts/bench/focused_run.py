@@ -36,7 +36,7 @@ from pathlib import Path
 BENCH_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BENCH_DIR))
 
-import bench as matrix  # noqa: E402  (sets matrix._KNOBS via main() normally)
+import bench as matrix  # noqa: E402
 from bench_lib import (  # noqa: E402
     Backends,
     CellSpec,
@@ -90,7 +90,6 @@ def main() -> int:
     args = ap.parse_args()
 
     knobs = Knobs.from_env()
-    matrix._KNOBS["bin"] = knobs.molehill_bin
     if not Path(knobs.molehill_bin).is_file():
         raise SystemExit(f"molehill binary missing: {knobs.molehill_bin} "
                          "(build it first: just build / cargo build "

@@ -647,6 +647,110 @@ mod tests {
         assert_eq!(&buf, &[1, 2, 3]);
     }
 
+    /// Phase-level attribution of the connection-setup cost.
+    ///
+    /// **Run in release mode** (`cargo test --release`): curve25519-dalek
+    /// is 50-100x slower in debug, so the absolute numbers here say
+    /// nothing about production. What the phases show is the *split*:
+    /// which turns carry the DH exchanges (in this pattern: `es` on the
+    /// initiator's first turn, `ee` on the responder's, `ss` on the
+    /// initiator's second) and what the symmetric-only remainder is.
+    ///
+    /// That split is the input for a session-resume design: resume
+    /// replaces the DH turns with a cached-secret proof, so the
+    /// removable share is the sum of the DH turns.
+    #[test]
+    fn handshake_phase_attribution() {
+        use snow::params::NoiseParams;
+        use std::time::Instant;
+
+        // The production default pattern: the client knows the server's
+        // static key (NK), the server holds it (configured, generated once
+        // here exactly like a config-loaded key).
+        const N: usize = 500;
+        let params: NoiseParams = "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let server_keypair = Builder::new(params.clone()).generate_keypair().unwrap();
+        let server_private = server_keypair.private;
+        let server_public = server_keypair.public;
+        let mut msg = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
+
+        // (a) Initiator turn 1: build + write message 1 (`e`, `es` -> 1 DH).
+        let mut build_us = 0f64;
+        let mut init_turn1_us = 0f64;
+        for _ in 0..N {
+            let t = Instant::now();
+            let mut init = Builder::new(params.clone())
+                .remote_public_key(&server_public)
+                .unwrap()
+                .build_initiator()
+                .unwrap();
+            build_us += t.elapsed().as_secs_f64() * 1e6;
+            let t = Instant::now();
+            let len = init.write_message(&[], &mut msg).unwrap();
+            init_turn1_us += t.elapsed().as_secs_f64() * 1e6;
+            assert!(len > 0);
+        }
+        // (b) Responder turn: read message 1, write message 2 (`e`, `ee`).
+        let mut resp_turn_us = 0f64;
+        // (c) Initiator turn 2: read message 2, write message 3 (`s`, `ss`).
+        let mut init_turn2_us = 0f64;
+        // (d) Responder finish: read message 3, into transport mode.
+        let mut resp_finish_us = 0f64;
+        for _ in 0..N {
+            let mut init = Builder::new(params.clone())
+                .remote_public_key(&server_public)
+                .unwrap()
+                .build_initiator()
+                .unwrap();
+            let len = init.write_message(&[], &mut msg).unwrap();
+            let msg1 = msg[..len].to_vec();
+
+            let t = Instant::now();
+            let mut resp = Builder::new(params.clone())
+                .local_private_key(&server_private)
+                .unwrap()
+                .build_responder()
+                .unwrap();
+            resp.read_message(&msg1, &mut payload).unwrap();
+            let len = resp.write_message(&[], &mut msg).unwrap();
+            resp_turn_us += t.elapsed().as_secs_f64() * 1e6;
+            let msg2 = msg[..len].to_vec();
+
+            // NK is a two-message pattern: the initiator's last act is
+            // reading message 2, the responder's is writing it.
+            let t = Instant::now();
+            init.read_message(&msg2, &mut payload).unwrap();
+            assert!(init.is_handshake_finished());
+            init_turn2_us += t.elapsed().as_secs_f64() * 1e6;
+
+            let t = Instant::now();
+            assert!(resp.is_handshake_finished());
+            let _transport = resp.into_transport_mode().unwrap();
+            resp_finish_us += t.elapsed().as_secs_f64() * 1e6;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "N is a compile-time constant far below 2^52"
+        )]
+        let per = |us_total: f64| us_total / N as f64;
+        eprintln!(
+            "handshake phase attribution (release build, N={N}):\n  \
+             build_initiator:        {:7.2} us\n  \
+             initiator turn1 (e,es): {:7.2} us\n  \
+             responder turn (e,ee):  {:7.2} us\n  \
+             initiator turn2 (read ee): {:7.2} us\n  \
+             responder finish:       {:7.2} us\n  \
+             state-machine sum:      {:7.2} us",
+            per(build_us),
+            per(init_turn1_us),
+            per(resp_turn_us),
+            per(init_turn2_us),
+            per(resp_finish_us),
+            per(build_us + init_turn1_us + resp_turn_us + init_turn2_us + resp_finish_us),
+        );
+    }
+
     #[tokio::test]
     async fn pooled_buffers_do_not_leak_stale_bytes() {
         // Cycle the pool: every pair takes a buffer set that a previous

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> **Measurement note (2026-09-23): the benchmark harness's `--ab` mode was
+> broken** — it spawned the default binary on both sides of an interleave,
+> so every A/B quoted below (and in the release notes since v0.8.0's
+> per-entry figures) compared one binary against itself where it used
+> `--ab`. Those figures are withdrawn until re-measured with the fixed
+> harness (`064c55a`); the first A/B taken with the fix is the striping
+> entry below. Figures taken as two separate runs (the KCP experiments,
+> the noise-stream pairs) are unaffected. See HANDOFF.md, "The `--ab`
+> harness bug".
+
 ### Added
 
 - **Data-channel striping** (`[server.data] stripe_count = K`): a visitor
@@ -19,7 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/stripe.rs`), not on yamux, so the engine's wire format — and 0.8.x
   peer interoperability — is untouched, and channels that do not carry the
   new command are byte-identical to before. Default `1` (off); TCP services
-  only. See docs/internals.md, "Data-channel striping".
+  only. An interleaved A/B against the parent revision on the loopback cell
+  (3 rounds, 8 s tests, both binaries' commit SHAs verified) measures
+  **+48.7%** on 1-stream with non-overlapping rep ranges (10.73 -> 15.96
+  Gbit/s), 8-stream inside its spread (+5.1%), and a median-only cost side
+  (churn -7.7%, CPU +40.8%, RSS +8.7%, sub-ms latency +5%); cpu-per-frame
+  halves. Details and the inertness check at K=1: HANDOFF.md, "Stripe A/B
+  (K=4)". See docs/internals.md, "Data-channel striping".
 
 ### Changed
 

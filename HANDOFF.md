@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-23. Branch `perf/data-path-optimizations` (53 commits
+> State as of 2026-09-23. Branch `perf/data-path-optimizations` (55 commits
 > ahead of `main`, pushed, **not merged**) contains the complete mux-engine
 > migration: rust-yamux 0.14 is now an in-repo, tokio-native engine
 > (`src/mux/`), and the mux transport drives it directly
@@ -8,6 +8,14 @@
 > [CHANGELOG.md](CHANGELOG.md); design details live in
 > [docs/internals.md](docs/internals.md). This file tracks what is open and
 > what was decided.
+>
+> **Read this first (2026-09-23, late session): the `--ab` harness was
+> broken.** `bench.py --ab` assigned `knobs.molehill_bin` per arm but every
+> spawn site read a frozen global, so every `--ab` run on this branch —
+> including both "final cumulative A/B" runs — measured the DEFAULT binary
+> against itself. Their non-overlapping claims are withdrawn; see "The
+> `--ab` harness bug" below. The fix is `064c55a`; the first A/B taken with
+> the fixed harness is the stripe experiment ("Stripe A/B (K=4)").
 
 ## Where things stand
 
@@ -19,15 +27,20 @@
   control): latency at parity or better on every arm/cell, throughput at
   parity with the favourable movements at the shaped cells, memory/CPU
   inside the accepted band, and no claimable regression that survives a
-  focused re-measurement — see "Final cumulative A/B" below. The older
+  focused re-measurement — see "Final cumulative A/B" below. **Caveat
+  (2026-09-23): that run's `--ab` interleave spawned one binary on both
+  sides (the harness bug), so its arm-to-arm movements are interleaved
+  same-binary noise, not binary differences.** The older
   `results-final-ab-2026-09-21.json` claim (mux + mux1, 24 paired ranges, 21
-  overlapping) is the 2026-09-21 session's record.
+  overlapping) is the 2026-09-21 session's record — also taken through the
+  broken `--ab`.
 - `main` (`8584945`) is untouched and releasable; nothing here is merged.
-- Performance is **not** an open item: every lever the vendoring was meant
-  to unlock has either landed with a measurement or been closed by one (see
-  "Optimization route" below). The two remaining gaps are structural
-  (multi-tunnel scheduling) and environmental (the host's 32 MB socket cap),
-  not knobs.
+- The stripe prototype landed (`f91e6bb`) with a measuring A/B that answers
+  the single-stream-ceiling question — "Stripe A/B (K=4)" below. With the
+  ceiling partly recovered, the two structural gaps of the optimization
+  route (multi-tunnel scheduling, the host socket cap) are addressable by
+  configuration rather than by engine work; the route table below is
+  annotated where that changes the picture.
 - Known bug found and fixed on the way: the `SelectAll` → `Vec` conversion
   dropped the receiver removal, so a client serving many short-lived
   connections polled thousands of dead stream receivers per poll
@@ -40,7 +53,8 @@
   results-file ordering, the RSS key that never matched (the memory axis
   was missing from every A/B verdict), the udp ping waiting out its full
   wall bound, and the checkpoint dying on a wiped output directory (the
-  "What landed" table lists them with commits).
+  "What landed" table lists them with commits). A sixth, the `--ab`
+  binary-swap bug above, was found while A/B-ing the stripe prototype.
 
 ## What landed (each one commit + one single-variable A/B)
 
@@ -64,6 +78,8 @@
 | bench: RSS key that exists | `675be8a` | `total_kb` never matched; the memory axis was missing from every A/B verdict |
 | bench: framing counters go missing loudly | this commit | a framed arm with zero mux-stats lines now records a typed partial_metric instead of silently dropping the attribution column (the 2026-09-22 final A/B lost it that way — see below) |
 | bench/doc hygiene (phase-2 review) | `7fb0e39` `b36ba03` `0a06123` | doc-example test covers all 4 markdown files; bore→nps + 5 stale references fixed; the three non-reproducing A/B figures annotated; dead `PaceState.rtt_ms`, 2 stale lint waivers removed — behaviour-neutral (KCP smoke inside the baseline spread) |
+| data-channel striping (K data channels per visitor) | `f91e6bb` | the prototype + its A/B: loopback 1-stream **+48.7% non-overlapping** (10.73 → 15.96 Gbit/s), 8-stream parity, churn -7.7% median-only, CPU +40.8% median-only — "Stripe A/B (K=4)" |
+| bench: `--ab` spawns the binary it is given | `064c55a` | harness bug fix: every earlier `--ab` run compared the default binary against itself — "The `--ab` harness bug" |
 
 ## Optimization route: closed
 
@@ -90,10 +106,20 @@ rather than attempted:
    rate. So the residual mux-vs-mux-off gap is driver scheduling, not
    per-frame fixed work; reducing it means changing the multi-tunnel
    structure, and the direct mode already wins those cells.
+   *Update (2026-09-23):* the stripe A/B measures the mechanism behind
+   this — cpu/kframe halves on the striped arm (0.051 → 0.031) because
+   one connection's frames now spread over four drivers. The structural
+   fix is "spread each connection's frames", which `stripe_count` now
+   does from configuration.
 2. **The rtt100 ceiling is the host's** — that cell needs ~50 MB of in-flight
    window while the kernel caps a socket at 32 MB, and the mux window is
    already 64 MB. Raising it needs `SO_RCVBUFFORCE` privileges a normal
    deployment lacks.
+   *Update (2026-09-23):* `stripe_count = K` multiplies the in-flight
+   window by K without any privilege (K streams × the engine window), so
+   the shaped-cell ceiling is now also addressable from configuration;
+   the rtt100 cell itself is untested by the stripe A/B (loopback only)
+   and is the first follow-up measurement if the feature is enabled.
 
 ## Backlog
 
@@ -105,6 +131,37 @@ tunnel pool) is mostly plumbing now that the mux engine is stable, and gives
 another order-of-magnitude FD/handshake reduction for many-service clients.
 Per-service `mode`/`count`/`carrier` overrides landed in 0.8, so mixing data
 paths per service already works without waiting for this.
+
+**Scoping notes (2026-09-23, from the stripe session):**
+
+- *Protocol shape.* The control channel must stay 0.8.x-interoperable, so
+  the consolidated form is a **new hello variant** (e.g.
+  `ControlChannelHelloMulti`), not a silent change to the v3 grammar: the
+  client announces which dialect it speaks and the server adapts per
+  connection, exactly like `DataChannelTunnelHello` does on the data
+  listener. Commands then need a service id (`CreateDataChannel`,
+  `HeartBeat` carry one), and the server keeps per-service state (pool
+  task, heartbeat timer, data-ch request channel) keyed under one client
+  session. The auth handshake stays per connection (the nonce/token
+  exchange is what binds the session).
+- *Measurement.* The bench's probes all dial the exposed port, so a
+  control-channel consolidation is invisible to them — the honest axes
+  are FD/handshake counts per client and a cold-start/reconnect probe
+  that has to be ADDED (e.g. time from client start to every registered
+  port answering, for an N-service client). Per §10 ("a metric without
+  contrast is not a measurement"), the change ships with its probe or not
+  at all; the FD-count axis is directly measurable from the client
+  process's `/proc/<pid>/fd` in-process or via the bench's process table.
+- *Handshake resume (the latency half).* The Noise handshake is a full
+  pattern run per connection (232 µs/pair measured, DH-dominated). A
+  resume path (cache the handshake state, prove possession with a MAC on
+  reconnect, server-issued ticket + nonce for replay protection) is a
+  crypto-protocol change on top of `src/transport/noise.rs`, and the PSK
+  support already present (`psk`/`psk_location` in `[transport.noise]`) is
+  NOT a substitute — it still runs a full DH exchange, it only adds a
+  second authenticator. Design it as its own commit with its own probe
+  (reconnect-time benchmark), after the control-channel consolidation
+  lands.
 
 ### Open items
 
@@ -311,7 +368,103 @@ NOT part of the branch-vs-main comparison — they are exercised by the
 release baseline (`results-v0.8.1.json`, same code as `main` plus the
 noise-stream work) but not A/B'd against it. If one of those regimes
 matters for a merge decision, that is the remaining bench work;
-everything measured above holds within its stated cells.
+everything measured above holds within its stated cells — except that the
+whole run shared one binary across its `--ab` sides, so its arm-to-arm
+movements measure that binary against itself (see "The `--ab` harness
+bug").
+
+## The `--ab` harness bug (found 2026-09-23, fixed in `064c55a`)
+
+**Every `--ab` run on this branch measured the DEFAULT binary against
+itself.** `bench.py`'s `--ab` loop assigned `knobs.molehill_bin = ab_bin`
+per arm, but every spawn site (`start_molehill`, `noise_keys`,
+`tool_version`) read the module-level `_KNOBS["bin"]` global, seeded once
+from the environment before the cell loop and never updated. The label
+suffix (`(ab1:molehill-main)` vs `(ab1:molehill-head)`) therefore did not
+describe what ran: both sides of every interleave were the same binary,
+sampling the same epochs.
+
+Affected files: `results-final-ab-2026-09-21.json`,
+`results-ab-final-2026-09-22.json`,
+`results-ab-final-2026-09-22-loss5.json`,
+`results-ab-mux-loss5-focus.json`. Their "branch vs main" movements are
+interleaved same-binary noise, and their non-overlapping claims are
+withdrawn — §10's provenance rule ("a run must correspond to a committed
+revision and a freshly built binary; check the binary's reported
+version/hash before trusting its numbers") failed silently because the
+label checked out while the process did not.
+
+What still stands: the per-change A/Bs taken as two separate invocations
+(`MOLEHILL_BIN` per run, then `ab_compare --baseline` — e.g. the leaner
+noise-stream pair and the direct-decrypt pair), the KCP experiment files,
+and the release baselines: those did compare the binary each run named.
+The 2026-09-22 "cumulative A/B" must not be quoted as branch-vs-`main`
+evidence until it is re-run with the fixed harness — that re-run is the
+outstanding bench work for a merge decision.
+
+The fix removes the global entirely: the binary path now lives only in
+`knobs` (which the interleave swaps), and the spawn helpers take it as a
+parameter.
+
+## Stripe A/B (K=4): the single-stream ceiling experiment
+
+The prototype: `[server.data] stripe_count = K` spreads a visitor
+connection over K data channels ( Design: docs/internals.md,
+"Data-channel striping"). The experiment arm differs from `mux` only by
+the per-arm `MOLEHILL_STRIPE_COUNT=4` measurement override — configs are
+identical, and a binary that predates the striped command ignores the
+variable, so the baseline arms are the unstriped path by construction.
+
+One interleaved `--ab` run with the FIXED harness: loopback, arms
+`mux` / `mux-stripe` + the loopback `mux-off` control, 3 rounds × 3 reps ×
+8 s; binary A = `5e6719c` (parent), binary B = `f91e6bb` (stripe), both
+freshly built with the commit SHA verified from `--version` before the
+run. Data: `results-stripe-k4.json` (18 arms, audited: 0 cell errors, 0
+holes).
+
+| axis | base (`5e6719c`) | stripe (`f91e6bb`) | verdict |
+|---|---|---|---|
+| **1-stream throughput** | 10.73 [9.08, 14.06] | 15.96 [15.43, 15.98] | **CLAIM favourable +48.7% (non-overlapping, all 3 rounds)** |
+| 8-stream throughput | 18.35 | 19.29 | inside spread, +5.1% |
+| churn connects/s | 5052.7 | 4665.7 | median-only -7.7% |
+| echo RTT p50 | 0.265 ms | 0.278 ms | median-only +4.9% |
+| udp RTT p50 | 0.417 ms | 0.437 ms | median-only +4.8% |
+| HoL max gap | 33.44 ms | 33.42 ms | no change |
+| RSS | 22.9 MiB | 24.9 MiB | median-only +8.7% |
+| CPU | 427.1% | 601.2% | median-only +40.8% |
+| cpu/kframe | 0.051 | 0.031 | median-only -40.0% |
+
+Reference points from the same run: the direct mode (`mux-off`, both
+binaries at parity — 19.9–21.9 Gbit/s 1-stream) is the no-tax ceiling, and
+the unstriped mux arm is the taxed one: 10.73 vs ~20.4 is the 2.19x tax
+this host's loopback cell shows; striping recovers 1.7 of the ~10.7 Gbit/s
+of it (a residual ~1.27x gap to direct remains). The cpu/kframe halving is
+the ①-scaling effect the design predicted (frames spread over four driver
+tasks instead of one).
+
+**Inertness at K=1** (the prototype's own non-regression check): the `mux`
+arm, same run — 1-stream 9.376 vs 9.259 (inside spread), 8-stream
++3.2% inside spread, churn +0.1%, CPU +0.7%, RSS +2.1%. The single-rep
+64-stream cell showed base 19.38 vs stripe 16.89 (-12.9% disjoint in one
+round), which the claim rule flags as a regression — a focused 5-round
+re-measurement (`results-mux64-focus.json`, 16 arms, audited clean)
+re-fired the same claim (-12.8%), so it was not a three-round artifact.
+The cell is single-rep by construction and **bimodal on both binaries**:
+over the 13 rounds combined, base spans 16.46-19.54 (median 19.1, 2 of 7
+rounds in the low mode) and stripe 16.77-19.55 (median 16.8, 1 of 6 in the
+high mode) — the distributions overlap completely, so per §10 ("refuse to
+build a claim on a difference inside it") the difference is a mode-frequency
+shift inside the cell's own span, not a claim in either direction. The
+multi-rep cells of the same arm (1-stream, 8-stream) show the prototype
+inert. Follow-up, recorded: the bench's 64-stream scale point is
+single-rep, which makes that cell structurally undecidable; making it
+multi-rep (like the other throughput points) is a bench change on its own.
+
+**Reading:** the tax is real and striping removes more than half of it on
+the strongest cell, at a bounded cost (churn -7.7%, CPU +40.8%, RSS +8.7%,
+sub-millisecond latency +5% — all median-only, none claimable). The
+mechanism works as designed (ceiling ×K, window ×K, cpu/kframe ÷K), and
+the residue is the reassembly path, not the protocol.
 
 ## How to A/B on this branch
 
