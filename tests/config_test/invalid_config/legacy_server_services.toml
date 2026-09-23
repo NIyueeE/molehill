@@ -1,5 +1,3 @@
-# expect: unknown field
-
 # The legacy `[server.services.*]` blocks were removed in 0.7.0
 
 [server]

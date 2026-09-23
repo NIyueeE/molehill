@@ -52,15 +52,20 @@ pub use crate::mux::frame::header::StreamId;
 
 const KIB: usize = 1024;
 const MIB: usize = KIB * 1024;
-/// `MIB` as `f64` for the flow-control window maths, written as the exact
-/// product `1024.0 * 1024.0` so no integer→float conversion is involved
-/// (2^20 is exactly representable either way).
-const MIB_F64: f64 = 1024.0 * 1024.0;
+/// `MIB` as `f64` for the flow-control window maths (lossless: 2^20 is
+/// exactly representable).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "MIB is 2^20, exactly representable in f64"
+)]
+const MIB_F64: f64 = MIB as f64;
 const GIB: usize = MIB * 1024;
 
-/// The default per-stream flow-control credit: 256 KiB, as per the yamux
-/// specification.
-pub const DEFAULT_CREDIT: u32 = 256 * 1024;
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "256 KiB fits comfortably in u32"
+)]
+pub const DEFAULT_CREDIT: u32 = 256 * KIB as u32; // as per yamux specification
 
 pub type Result<T> = std::result::Result<T, ConnectionError>;
 
@@ -197,6 +202,18 @@ impl Config {
             stream at least the Yamux default window size"
         );
 
+        self
+    }
+
+    /// Allow or disallow streams to read from buffered data after
+    /// the connection has been closed.
+    /// Set the max. payload size used when sending data frames. Payloads larger
+    /// than the configured max. will be split.
+    // The frame-split lever (direction ① phase 3) adds the caller; until
+    // then the knob is part of the vendored config surface, unused here.
+    #[expect(dead_code, reason = "L1 (conditional frame split) adds the caller")]
+    pub fn set_split_send_size(&mut self, n: usize) -> &mut Self {
+        self.split_send_size = n;
         self
     }
 }

@@ -10,20 +10,15 @@ just setup        # activate git hooks + install missing check tools
 just check        # run the full chain (same as CI)
 ```
 
-`just setup` installs the four cargo check tools (machete, audit, outdated,
-deny) and reports `uvx` / `cargo-hack` when they are missing. The python
-gates (ruff lint + format) additionally need `uv`/`uvx` on PATH, installed
-with `curl -LsSf https://astral.sh/uv/install.sh | sh` (AGENTS.md §1).
-
 ## Check gates
 
 The authoritative gate tables — every command, what it does, and what to do
-when a gate blocks you — live in [docs/checks.md](docs/checks.md). In short:
-fast gates (fmt, secret scan, machete, docs↔code alignment, ruff lint +
-format, strict clippy ×2) on every commit, heavy gates (audit, deny, outdated,
-serial tests) on every push, and CI runs the whole chain via `just check`
-plus the feature powerset, the per-feature test matrix, the minimal-size
-check, the musl static build, and 4-platform builds.
+when a gate blocks you — live in [docs/checks.md](docs/checks.md) (简体中文:
+[docs/checks.zh.md](docs/checks.zh.md)). In short: fast gates (fmt, secret
+scan, machete, docs↔code alignment, strict clippy) on every commit, heavy
+gates (audit, deny, outdated, serial tests) on every push, and CI runs the
+whole chain via `just check` plus feature powerset, per-feature test matrix,
+minimal-size check, and 4-platform builds.
 
 The full discipline — including when a lint waiver is acceptable — lives in
 [AGENTS.md](AGENTS.md). In short: fix code first; waivers are code-level,

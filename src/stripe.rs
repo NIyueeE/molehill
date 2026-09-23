@@ -163,11 +163,13 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
     }
 
     /// Write one framed chunk, completing the whole frame before returning.
-    ///
-    /// The frame (header + payload, the sequence number inside the header)
-    /// is handed over by ownership: the read buffer became the frame, so
-    /// the send direction copies nothing on its own account (link S1).
-    pub async fn send_owned(&mut self, frame: Bytes) -> io::Result<()> {
+    pub async fn send(&mut self, seq: u64, payload: &[u8]) -> io::Result<()> {
+        let mut header = [0u8; STRIPE_HEADER_LEN];
+        encode_header(&mut header, seq, payload.len())?;
+        let mut frame = BytesMut::with_capacity(STRIPE_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload);
+        let frame = frame.freeze();
         std::future::poll_fn(|cx| self.poll_send(cx, &frame)).await
     }
 
@@ -228,35 +230,20 @@ impl<W: AsyncWrite + Unpin> StripeSender<W> {
 }
 
 /// Send direction: copy `src` into the group, chunk by chunk.
-///
-/// Each chunk is read directly into the payload region of its frame
-/// buffer — behind the 10-byte header, which is written in front once
-/// the read length is known — so the frame crosses to the stripe by
-/// ownership and the payload is copied zero times (link S1).
 async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut src: R,
     mut sender: StripeSender<W>,
 ) -> anyhow::Result<()> {
+    let mut buf = BytesMut::zeroed(STRIPE_CHUNK_SIZE);
     let mut seq = 0u64;
     loop {
-        let mut frame = BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE);
-        // Reserve the header room; the read appends behind it.
-        frame.resize(STRIPE_HEADER_LEN, 0);
-        let n = match src.read_buf(&mut frame).await {
+        let n = match src.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => anyhow::bail!("stripe source read failed: {e}"),
         };
-        encode_header(
-            (&mut frame[..STRIPE_HEADER_LEN])
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("stripe frame header slice"))?,
-            seq,
-            n,
-        )
-        .map_err(|e| anyhow::anyhow!("stripe frame header: {e}"))?;
         sender
-            .send_owned(frame.freeze())
+            .send(seq, &buf[..n])
             .await
             .map_err(|e| anyhow::anyhow!("stripe write failed: {e}"))?;
         seq += 1;
@@ -701,7 +688,7 @@ mod tests {
         let payload = [0xAB; 100];
         let waker = noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut fut = Box::pin(sender.send_owned(frame_bytes(7, &payload)));
+        let mut fut = Box::pin(sender.send(7, &payload));
         assert!(
             fut.as_mut().poll(&mut cx).is_ready(),
             "the frame should complete on the writable stripe"
@@ -724,7 +711,7 @@ mod tests {
         let payload = [0xCD; 200];
         let waker = noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut fut = Box::pin(sender.send_owned(frame_bytes(3, &payload)));
+        let mut fut = Box::pin(sender.send(3, &payload));
         let mut polls = 0;
         loop {
             polls += 1;

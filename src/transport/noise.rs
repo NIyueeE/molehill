@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use super::{AddrMaybeCached, NoiseStream, TcpTransport, Transport};
-use crate::common::owned_write::AsyncWriteOwned;
 use crate::config::{NoiseConfig, TransportConfig};
 use crate::transport::noise_resume::{
     self, ClientResumeCache, NOISE_RESUME_SELECTOR, ResumeRequest, ServerResumeStore,
@@ -138,12 +137,12 @@ impl NoiseKeys {
     /// the exchange, and report the outcome.
     async fn try_resume<S>(&self, mut stream: S) -> Result<ResumeAttempt<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         let Some(server_static) = self.remote_public_key.as_deref() else {
             return Ok(ResumeAttempt::NotAttempted(stream)); // no known static key
         };
-        let Some(request) = ResumeRequest::build(&self.client_cache, server_static)? else {
+        let Some(request) = ResumeRequest::build(&self.client_cache, server_static) else {
             return Ok(ResumeAttempt::NotAttempted(stream)); // nothing cached
         };
         stream.write_all(&[NOISE_RESUME_SELECTOR]).await?;
@@ -162,7 +161,7 @@ impl NoiseKeys {
     /// re-dial with a full handshake.
     pub(crate) async fn wrap_initiator<S>(&self, stream: S) -> Result<NoiseStream<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         if self.resume_enabled() {
             match self.try_resume(stream).await? {
@@ -181,7 +180,7 @@ impl NoiseKeys {
     /// makes the *next* connection resumable.
     pub(crate) async fn wrap_initiator_full<S>(&self, mut stream: S) -> Result<NoiseStream<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         stream.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
         stream.flush().await?;
@@ -203,7 +202,7 @@ impl NoiseKeys {
     /// stream, issuing a session-resume ticket when configured.
     pub(crate) async fn wrap_responder<S>(&self, stream: S) -> Result<NoiseStream<S>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         // The exchange always runs (see `wrap_initiator_full`); the store
         // decides whether this handshake earns a ticket.
@@ -218,7 +217,7 @@ impl NoiseKeys {
     /// declined (the caller drops the connection).
     pub(crate) async fn run_resume<S>(&self, mut stream: S) -> Result<Option<NoiseStream<S>>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
+        S: AsyncRead + AsyncWrite + Unpin,
     {
         match noise_resume::server_resume(&mut stream, &self.server_store).await? {
             Some(cipher) => Ok(Some(NoiseStream::from_resumed(stream, cipher))),

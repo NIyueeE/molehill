@@ -25,10 +25,7 @@ pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
-/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake. The
-/// opt-in session-resume selector (`0x02`, `noise_resume.rs`) is a
-/// third value on the same byte, and an old peer rejects it the same way
-/// it rejects an unknown protocol version.
+/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake.
 pub const PLAIN_SELECTOR: u8 = 0x00;
 pub const NOISE_SELECTOR: u8 = 0x01;
 
@@ -349,25 +346,26 @@ struct PacketLength {
 }
 
 impl PacketLength {
-    /// Encoded length of a protocol value, or 0 on the impossible
-    /// serialization failure (a fixed-size value cannot fail to
-    /// serialize; a 0 length would surface as a read/deserialize error
-    /// at the use site rather than as a panic).
-    fn encoded_len<T: serde::Serialize>(value: &T) -> usize {
-        postcard::to_stdvec(value).map_or(0, |v| v.len())
-    }
-
+    // Infallible: serializing compile-time-known fixed-size values.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "serializing compile-time-known fixed-size values cannot fail"
+    )]
     pub fn new() -> PacketLength {
         let username = "default";
         let d = digest(username.as_bytes());
-        let hello = Self::encoded_len(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d));
+        let hello = postcard::to_stdvec(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
+            .unwrap()
+            .len();
         #[cfg(feature = "client")]
-        let c_cmd = Self::encoded_len(&ControlChannelCmd::CreateDataChannel);
+        let c_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)
+            .unwrap()
+            .len();
         #[cfg(feature = "client")]
-        let ack = Self::encoded_len(&Ack::Ok);
+        let ack = postcard::to_stdvec(&Ack::Ok).unwrap().len();
 
         #[cfg(feature = "server")]
-        let auth = Self::encoded_len(&Auth(d));
+        let auth = postcard::to_stdvec(&Auth(d)).unwrap().len();
         PacketLength {
             hello,
             #[cfg(feature = "client")]

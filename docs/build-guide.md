@@ -20,8 +20,7 @@ For example, to build `molehill` with the `client` and `noise` feature:
 cargo build --release --no-default-features --features client,noise
 ```
 
-(Note that the default feature set is `server`, `client`, `noise`,
-`hot-reload`, `multiplex` and `kcp`.)
+(Note that the default feature set also contains `multiplex` and `kcp`.)
 
 ## Minimalize the binary
 
