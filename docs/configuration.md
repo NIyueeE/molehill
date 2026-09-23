@@ -146,6 +146,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
 [client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
 protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -191,6 +192,7 @@ local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
 
 ## Dynamic service registration
@@ -393,6 +395,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
 [client.services.ssh] # A service to forward
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -432,6 +435,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
 
 ### Noise (encrypted transport)

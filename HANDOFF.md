@@ -80,6 +80,8 @@
 | bench/doc hygiene (phase-2 review) | `7fb0e39` `b36ba03` `0a06123` | doc-example test covers all 4 markdown files; bore→nps + 5 stale references fixed; the three non-reproducing A/B figures annotated; dead `PaceState.rtt_ms`, 2 stale lint waivers removed — behaviour-neutral (KCP smoke inside the baseline spread) |
 | data-channel striping (K data channels per visitor) | `f91e6bb` | the prototype + its A/B: loopback 1-stream **+48.7% non-overlapping** (10.73 → 15.96 Gbit/s), 8-stream parity, churn -7.7% median-only, CPU +40.8% median-only — "Stripe A/B (K=4)" |
 | bench: `--ab` spawns the binary it is given | `064c55a` | harness bug fix: every earlier `--ab` run compared the default binary against itself — "The `--ab` harness bug" |
+| noise setup-cost phase probe | `7b19457` | the DH turns are ~97% of the ~445 us a handshake pair costs — the input for the resume design |
+| Noise session resume (opt-in) | this commit | setup 442.7 -> 38.5 us per pair (-91%), release-mode probe; full suite + the resumed integration scenario green |
 
 ## Optimization route: closed
 
@@ -465,6 +467,68 @@ the strongest cell, at a bounded cost (churn -7.7%, CPU +40.8%, RSS +8.7%,
 sub-millisecond latency +5% — all median-only, none claimable). The
 mechanism works as designed (ceiling ×K, window ×K, cpu/kframe ÷K), and
 the residue is the reassembly path, not the protocol.
+
+## Noise session resume: the setup-cost experiment
+
+The premise (session resume saves the handshake's cost) was measured
+before it was built: a release-mode phase attribution over the production
+pattern (`noise_stream.rs`, `handshake_phase_attribution`, `7b19457`)
+showed the DH turns at ~97% of the ~445 us a pair costs on the state
+machine (initiator turn 1 `e,es` ~122 us, responder turn `e,ee` ~233 us,
+initiator turn 2 the `ee` read ~72 us; everything else <1 us).
+
+The implementation (`src/transport/noise_resume.rs`, opt-in via
+`[transport.noise] resume = true` on both sides):
+
+- **Ticket.** After a full handshake the responder seals the session's
+  handshake hash with a key derived from its Noise static private key
+  and returns it as the first exchange record; the client caches it per
+  server static key. The client's first record after the handshake is a
+  one-byte `want` — the exchange runs on *every* full handshake, on both
+  sides, because that byte is what tells the responder an exchange
+  follows (gating it per side deadlocks: the responder would block on a
+  byte the initiator never sends). What the configuration decides is
+  whether a ticket is *issued* and whether a cached one is *attempted*.
+- **Resumed connect** (selector `0x02`): the client sends
+  `[ticket][client_nonce][MAC]`, the responder verifies (open the seal,
+  check the 24 h TTL, check the MAC, reserve the nonce) and answers
+  `[status][server_nonce][MAC]`; both derive fresh record keys with
+  HKDF-SHA256 over the cached hash and both nonces and speak
+  ChaCha20-Poly1305 with the Noise nonce convention. Old servers reject
+  the unknown selector cleanly, and the client falls back to a full
+  handshake on a fresh connection.
+- **Replay/FS.** A repeated `(ticket, client nonce)` is rejected (the
+  store reserves the nonce), a captured request cannot be completed
+  without the cached hash, and the tradeoff is documented in
+  docs/transport.md: resumed sessions' keys derive without a fresh DH,
+  so a later static-key compromise reaches them — hence opt-in.
+
+**Measurement** (`noise_stream.rs`, `resume_setup_cost`, release build,
+N=200, in-process pairs over a tokio duplex with the exchange records
+and IO included):
+
+| shape | per pair |
+|---|---|
+| full handshake + ticket exchange | 442.70 us |
+| resumed exchange | 38.52 us |
+| saving | 404.18 us (91%) |
+
+The saving matches the phase attribution (the DH turns are the
+difference), and the resumed pair's 38.5 us is symmetric crypto plus the
+two records. End-to-end correctness is covered by the integration
+scenario `noise_session_resume` (a client restart over the noise
+fixture with `resume = true`, engaging the selector-0x02 path — the test
+run logs 16 resumed sessions for the control channel, pools and
+tunnels), plus unit tests for the ticket seal/unseal, tamper, staleness,
+replay and decline paths.
+
+**What is not yet measured**: a bench-level reconnect-latency axis. The
+bench's probes dial the exposed port and never tear down a control
+channel, so the 404 us saved per reconnect has no bench cell today; the
+in-process probe is the evidence (the same standard the connection-setup
+allocation probe `3297d65` was held to). A cold-start/reconnect probe
+would be the follow-up, and it belongs with the single-control-channel
+item (below).
 
 ## How to A/B on this branch
 

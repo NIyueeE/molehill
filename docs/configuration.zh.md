@@ -148,6 +148,7 @@ local_private_key = "key_encoded_in_base64" # 可选
 remote_public_key = "key_encoded_in_base64" # 可选
 psk = "key_encoded_in_base64" # 可选。预共享密钥(32 字节,base64 编码)。pattern 必须包含 PSK 修饰符(如 Noise_KKpsk0_...)
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
+resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
 
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
 protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"
@@ -193,6 +194,7 @@ local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # 可选。预共享密钥(32 字节,base64 编码)。pattern 必须包含 PSK 修饰符(如 Noise_KKpsk0_...)
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
+resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
 ```
 
 ## 动态服务注册
@@ -376,6 +378,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
 
 [client.services.ssh] # A service to forward
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -415,6 +418,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
 ```
 
 ### Noise(加密传输)

@@ -296,6 +296,60 @@ async fn multiplex_tunnel_pool() -> Result<()> {
     Ok(())
 }
 
+/// Noise session resume: the client caches the server's ticket on the
+/// first full handshake and the next control connection (after the
+/// client restarts) resumes the session instead of repeating the key
+/// exchanges (transport selector 0x02). The service must behave
+/// identically across the restart — same replies, same payloads.
+#[cfg(feature = "noise")]
+#[tokio::test]
+async fn noise_session_resume() -> Result<()> {
+    init();
+
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/noise_resume.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    echo_hitter(exposed_addrs(Type::Tcp).0, Type::Tcp)
+        .await
+        .unwrap();
+
+    // Restart the client: the control channel reconnects and the resume
+    // path engages (the server's ticket from the first connection is
+    // cached client-side).
+    info!("restart the client onto the resumed session");
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client);
+    let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    echo_hitter(exposed_addrs(Type::Tcp).0, Type::Tcp)
+        .await
+        .unwrap();
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
 /// Per-service data-plane overrides: the fixture keeps
 /// `mode = "multiplex"` (count 1) as the client-wide default while one
 /// service forces `mode = "direct"` — both data paths must work side by

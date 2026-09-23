@@ -860,11 +860,11 @@ async fn establish_one_kcp_tunnel(
         #[cfg(feature = "noise")]
         if let Some(cfg) = &opts.noise {
             let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-            // v3 transport selector: announce this session speaks Noise
-            // (over the KCP byte stream, same rule as TCP).
-            let mut s = stream;
-            s.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
-            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator(s).await?))
+            // Full handshake + v3 selector byte (the wrapper owns the
+            // selector): KCP tunnels establish once per control session,
+            // so a resume attempt has nothing cached yet and would only
+            // add a round trip.
+            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator_full(stream).await?))
         } else {
             let mut s = stream;
             s.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;

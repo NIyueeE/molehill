@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Noise session resume** (`[transport.noise] resume = true`, default
+  off): a reconnect proves possession of the previous session's
+  handshake hash with a MAC instead of repeating the handshake's key
+  exchanges. The server issues a ticket (sealed with a key derived from
+  its Noise static private key) after a full handshake; the client caches
+  it and, on the next connect, sends it with a fresh nonce and MAC
+  (transport selector `0x02`). Both sides then derive fresh record keys
+  from the cached hash plus two nonces (HKDF-SHA256 over
+  ChaCha20-Poly1305). Tickets expire after 24 h, a repeated
+  `(ticket, nonce)` pair is rejected, and any failure declines cleanly so
+  the client falls back to a full handshake. Measured on this host
+  (release build, in-process pair over a duplex, the default pattern):
+  **442.7 -> 38.5 us per connection pair** — the handshake's key
+  exchanges are ~97% of the setup CPU and resume removes them. The
+  tradeoff is forward secrecy on resumed sessions (their keys derive
+  without a fresh DH), which is why it is opt-in. See docs/transport.md,
+  "Noise session resume".
 - **Data-channel striping** (`[server.data] stripe_count = K`): a visitor
   connection can be spread over `K` parallel data channels — a *stripe
   group* — instead of one. Each direction numbers its 32 KiB chunks and

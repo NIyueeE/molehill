@@ -10,6 +10,8 @@ use crate::protocol::{
     read_registration, write_register_result,
 };
 #[cfg(feature = "noise")]
+use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
+#[cfg(feature = "noise")]
 use crate::transport::{NoiseKeys, NoiseStream};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -189,6 +191,19 @@ async fn upgrade_conn(
                 bail!(
                     "Client requested Noise, but this binary was built without the `noise` feature"
                 )
+            }
+        }
+        #[cfg(feature = "noise")]
+        NOISE_RESUME_SELECTOR => {
+            let keys = noise_keys.ok_or_else(|| {
+                anyhow!("Client requested a noise session resume, but the server has no Noise keys")
+            })?;
+            // A declined request ends here: the responder already wrote
+            // its verdict, and the client falls back to a full handshake
+            // on a fresh connection.
+            match keys.run_resume(conn).await? {
+                Some(stream) => Ok(ServerStream::Noise(Box::new(stream))),
+                None => bail!("Declined a noise session resume"),
             }
         }
         other => bail!("Unknown transport selector {other:#04x}"),

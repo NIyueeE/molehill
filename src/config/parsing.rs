@@ -371,6 +371,13 @@ pub struct NoiseConfig {
     pub psk: Option<MaskedString>,
     #[serde(default)]
     pub psk_location: Option<u8>,
+    /// Noise session resume: a reconnect that proves possession of the
+    /// previous session's handshake hash with a MAC instead of repeating
+    /// the handshake's key exchanges. Opt-in (default off) because a
+    /// resumed session's keys derive without a fresh DH — see
+    /// docs/transport.md, "Noise session resume".
+    #[serde(default)]
+    pub resume: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]

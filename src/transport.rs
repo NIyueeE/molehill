@@ -88,6 +88,10 @@ pub use noise::NoiseTransport;
 pub(crate) mod noise_stream;
 #[cfg(feature = "noise")]
 pub(crate) use noise_stream::NoiseStream;
+/// Noise session resume: a reconnect that skips the handshake's DH turns.
+/// Both the TCP and the KCP Noise paths go through it.
+#[cfg(feature = "noise")]
+pub(crate) mod noise_resume;
 // Key material: the Noise transport, the server's dual-transport accept,
 // and the KCP tunnel path (Noise-over-KCP) all build sessions from it.
 #[cfg(feature = "noise")]
