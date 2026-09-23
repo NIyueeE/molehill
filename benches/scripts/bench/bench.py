@@ -103,6 +103,22 @@ PEER_BINS = {"frp": "frps", "rathole": "rathole", "nps": "nps"}
 # skipped deliberately instead of failing an over-limit dial.
 MUX_MAX_STREAMS = 64
 
+# The stripe experiment's arm: the default mux shape (multiplex, count = 4)
+# with every visitor connection spread over STRIPE_ARMS parallel data
+# channels. The stripe count rides the environment (the server-side
+# `stripe_count` knob's measurement-only override), so the config on the
+# wire stays identical to the `mux` arm and a binary that predates the
+# striped data-channel command ignores the variable entirely.
+STRIPE_ARMS = {"mux-stripe": 4}
+
+
+def stripe_env(variant: str) -> dict | None:
+    """Per-arm environment for the stripe experiment, or None."""
+    stripes = STRIPE_ARMS.get(variant)
+    if not stripes:
+        return None
+    return {**MUX_STATS_ENV, "MOLEHILL_STRIPE_COUNT": str(stripes)}
+
 
 def variant_stream_ceiling(variant: str, pool_size: int) -> int | None:
     """Concurrent data-stream ceiling of a molehill arm, or None when the
@@ -121,7 +137,12 @@ def variant_stream_ceiling(variant: str, pool_size: int) -> int | None:
     if count is None:
         return None
     reserved = 2 * pool_size + 2  # iperf + echo pools, plus the UDP echo pool
-    return count * MUX_MAX_STREAMS - reserved - 1
+    # A striped visitor connection holds `stripes` streams on the tunnels,
+    # so the number of concurrent visitors the arm can carry is the stream
+    # budget divided by the stripe count (`mux-stripe` sets
+    # MOLEHILL_STRIPE_COUNT, below).
+    stripes = STRIPE_ARMS.get(variant, 1)
+    return (count * MUX_MAX_STREAMS - reserved - 1) // stripes
 
 
 class ArmProcs:
@@ -135,7 +156,7 @@ class ArmProcs:
         self.logs: list[Path] = []
 
     def spawn(self, cmd: list, tool: bool = True,
-              cwd: Path | None = None, role: str = "") -> None:
+              cwd: Path | None = None, role: str = "", env: dict | None = None) -> None:
         # `role` keeps a multi-process arm's streams apart: without it every
         # process of one arm appends to the same file, and a parser cannot
         # tell their lines (or their counters) apart.
@@ -145,7 +166,7 @@ class ArmProcs:
         log = self.work / f"{name}.log"
         with open(log, "ab") as f:
             pid = subprocess.Popen(cmd, stdout=f, stderr=f, cwd=cwd,
-                                   env=MUX_STATS_ENV).pid
+                                   env=env or MUX_STATS_ENV).pid
         record_pid(self.work, pid)
         self.pids.append(pid)
         if tool:
@@ -261,11 +282,12 @@ udp_send_queue_size = 1024
     return d
 
 
-def start_molehill(procs: ArmProcs, d: Path) -> None:
+def start_molehill(procs: ArmProcs, d: Path, variant: str = "") -> None:
+    env = stripe_env(variant)
     procs.spawn([knobs_bin(), "--server", str(d / "server.toml")],
-                role="server")
+                role="server", env=env)
     procs.spawn([knobs_bin(), "--client", str(d / "client.toml")],
-                role="client")
+                role="client", env=env)
 
 
 _KNOBS = {"bin": None}
@@ -291,7 +313,7 @@ def knobs_bin() -> str:
 def setup_molehill(variant: str, knobs: Knobs, p: dict, procs: ArmProcs,
                    work: Path) -> None:
     d = molehill_config(work, variant, knobs, p)
-    start_molehill(procs, d)
+    start_molehill(procs, d, variant)
 
 
 def setup_frp(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
@@ -991,6 +1013,23 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
                     "cpu_pct_per_kframe": round(cpu_pct * 1000 / (written + read), 4),
                     "arm_seconds": round(elapsed, 1),
                 }
+        elif any(f"({v})" in label for v in ("mux", "mux1", "noise", "kcp4")):
+            # A framed arm with no mux-stats lines at all is an INSTRUMENT
+            # failure, not a metric that happens to be zero: the bench sets
+            # MOLEHILL_MUX_STATS=1 for every molehill spawn, so the engine's
+            # counters were either not emitted or the logs were lost. A whole
+            # matrix once ran with this silently absent (the host's
+            # environment dropped the env mid-session) and only the missing
+            # framing_cpu column hinted at it — record the reason instead
+            # (AGENTS.md §10: every failure leaves evidence). Re-assign
+            # because `partial_metrics` was already attached to the entry
+            # above; the list is shared, but the assignment keeps the intent
+            # local to this branch.
+            partial.append(
+                "framing: no mux-stats lines in this arm's logs "
+                "(MOLEHILL_MUX_STATS=1 is set for every spawn; the engine "
+                "counters were not emitted — attribution metrics absent)")
+            entry["partial_metrics"] = partial
     except ArmTimeout as e:
         # A hung arm is recorded like any other failure so the matrix moves
         # on; the partial probes it did finish are discarded because their

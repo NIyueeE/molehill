@@ -67,6 +67,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 | **`count = 4`(默认)** | 并发流多,或链路有损:独立隧道隔离队头阻塞并**聚合超过单流** | 每服务 4 条物理连接(FD/端口/NAT 映射),CPU 约 494% 单核(单隧道 216%);回环 8 流 19.5 vs `count = 1` 的 9.2 Gbit/s,1% 丢包 12.3 vs 4.5,突发丢包 13.3 vs 4.5;10 ms 的 HoL 最大值更低(80.7 vs 100.1 ms) |
 | **`count = 1`** | 单条长连接、连接预算紧张,或要最小足迹与更低的 CPU(约 16 MiB / 216%) | 单 TCP 流天花板;没有聚合(回环 8 流 9.2 Gbit/s);所有流共享一个重传域 |
 | **`carrier = "kcp"`**(实验性) | TCP 数据隧道被封锁/限速时,或**高延迟下的延迟优先 UDP** | 只要路径不是瓶颈就远落后于 TCP 载体(回环 8 流 1.1 vs 14.9 Gbit/s、rtt10 0.79 vs 5.45、loss1 0.71 vs 7.74),RSS 约 2.5-3 倍(83 vs 26 MiB)、CPU 更低;最明确的优势是 rtt100 会话质量(最大包间隔 20 ms vs TCP 各 arm 的 100+) |
+| **`[server.data] stripe_count = K`**(实验性) | 单条长连接不能被单条隧道流钉死:每个访客连接摊到 `K` 条数据通道上,其天花板与在途窗口成为各通道之和 | 每访客 `K×` 数据通道与任务,接收侧重排缓冲;单流 A/B 及其代价面记录在 HANDOFF.md"Stripe A/B (K=4)" |
 | **noise** | 要加密且**内存与简单性优先**:预共享公钥、无 PKI | 单流约为明文的 58%、8 流约 76%(5.8/14.9 vs 10.0/19.5 Gbit/s),RTT 亚毫秒,RSS 多约 4 MiB;CPU 持平(470% vs 494% 单核) |
 
 如何应用:全局默认在 `[client.data]`,每个服务可在自己的
@@ -88,7 +89,9 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 2. **单人还是多人?并发连接多少?** 单条长连接(SSH、单玩家 Minecraft)→
    `direct` 或默认 mux 都行;低并发下 mux 还省 NAT 映射。多人/高频开合/
    多服务 → 保持或加大 `count`(每条隧道约承载 64 条并发连接,yamux
-   上限——`count = 8` ≈ 512)。
+   上限——`count = 8` ≈ 512)。若这一条流不能被单条隧道流钉死(单会话
+   大流量),设置 `[server.data] stripe_count`(K=4)——连接随即跑在 K
+   条并行数据通道上,代价是每访客 K× 通道与有界的重排缓冲。
 3. **路径什么状况,是否转发 UDP?** 若 TCP 数据隧道被封锁/限速,或需要
    高延迟下的延迟优先 UDP,值得 A/B 试 `carrier = "kcp"`(rtt100 会话最大
    间隔 20 ms vs TCP 各 arm 的 100+)。否则保持 TCP 载体:UDP 阶梯与队头

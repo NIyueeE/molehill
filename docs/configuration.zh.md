@@ -185,6 +185,7 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔。设为
 
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
+# stripe_count = 4 # 可选。每个访客连接使用的数据通道数。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带")
 
 [server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 v3 传输选择器字节开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)

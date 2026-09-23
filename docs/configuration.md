@@ -183,6 +183,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
+# stripe_count = 4 # Optional. Data channels per visitor connection. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping")
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a v3 transport selector byte); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Data-channel striping** (`[server.data] stripe_count = K`): a visitor
+  connection can be spread over `K` parallel data channels — a *stripe
+  group* — instead of one. Each direction numbers its 32 KiB chunks and
+  spreads them round-robin over the group; the receiver reassembles by
+  sequence number, so the connection behaves like one stream whose ceiling
+  and in-flight window are the sum of its channels'. The framing lives on
+  the data channel (`StartForwardStripedTcp` command, `[seq][len]` frames,
+  `src/stripe.rs`), not on yamux, so the engine's wire format — and 0.8.x
+  peer interoperability — is untouched, and channels that do not carry the
+  new command are byte-identical to before. Default `1` (off); TCP services
+  only. See docs/internals.md, "Data-channel striping".
+
 ### Changed
 
 - The per-tunnel mux stream cap is raised from 32 to 64

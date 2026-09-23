@@ -548,6 +548,16 @@ pub struct ServerControlConfig {
 pub struct ServerDataConfig {
     /// Data-plane listener; defaults to `[server.control].bind_addr`.
     pub bind_addr: Option<String>,
+    /// Data channels per visitor connection.
+    ///
+    /// `1` (the default) is the classic shape: one data channel per
+    /// visitor. A higher count spreads every visitor connection over that
+    /// many parallel data channels ("stripes"), which multiplies its
+    /// throughput ceiling and in-flight window; both ends must be able to
+    /// speak the striped data-channel framing (a molehill new enough to
+    /// know the `StartForwardStripedTcp` command on both sides). See
+    /// `docs/internals.md` ("Data-channel striping").
+    pub stripe_count: Option<u16>,
 }
 
 /// The server owns no per-service configuration. Services are registered at
@@ -598,6 +608,15 @@ impl ServerConfig {
             .bind_addr
             .as_deref()
             .unwrap_or(self.control.bind_addr.as_str())
+    }
+
+    /// Effective data channels per visitor connection: the configured
+    /// `[server.data].stripe_count` clamped to `1..=MAX_STRIPES` (an
+    /// environment override for measurements wins when set — see
+    /// `crate::stripe::stripe_count`).
+    #[cfg(feature = "multiplex")]
+    pub fn stripe_count(&self) -> usize {
+        crate::stripe::stripe_count(self.data.stripe_count)
     }
 
     /// Without the multiplex feature the data plane follows the control

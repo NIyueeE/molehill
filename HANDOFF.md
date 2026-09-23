@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-23. Branch `perf/data-path-optimizations` (40 commits
+> State as of 2026-09-23. Branch `perf/data-path-optimizations` (53 commits
 > ahead of `main`, pushed, **not merged**) contains the complete mux-engine
 > migration: rust-yamux 0.14 is now an in-repo, tokio-native engine
 > (`src/mux/`), and the mux transport drives it directly
@@ -18,9 +18,9 @@
   loss1_rtt10 + rtt100 + loss5_rtt100, mux/noise/mux1/kcp4 + the mux-off
   control): latency at parity or better on every arm/cell, throughput at
   parity with the favourable movements at the shaped cells, memory/CPU
-  inside the accepted band, and no claimable regression that survives the
-  per-round breakdown — see "Final cumulative A/B" below. The older
-  `results-final-ab.json` claim (mux + mux1, 24 paired ranges, 21
+  inside the accepted band, and no claimable regression that survives a
+  focused re-measurement — see "Final cumulative A/B" below. The older
+  `results-final-ab-2026-09-21.json` claim (mux + mux1, 24 paired ranges, 21
   overlapping) is the 2026-09-21 session's record.
 - `main` (`8584945`) is untouched and releasable; nothing here is merged.
 - Performance is **not** an open item: every lever the vendoring was meant
@@ -35,16 +35,19 @@
 - KCP was re-measured end to end with the current bench on this host and
   three candidate optimizations were tested by interleaved A/B; all three
   are closed with measurements (none landed) — "KCP on the current bench"
-  below. Two bench feedback-side bugs were found and fixed on the way
-  (inverted churn direction in the verdict tool, lexical results-file
-  ordering).
+  below. Five bench feedback-side issues were found and fixed on the way:
+  the inverted churn direction in the verdict tool, the lexical
+  results-file ordering, the RSS key that never matched (the memory axis
+  was missing from every A/B verdict), the udp ping waiting out its full
+  wall bound, and the checkpoint dying on a wiped output directory (the
+  "What landed" table lists them with commits).
 
 ## What landed (each one commit + one single-variable A/B)
 
 | Change | Commit | Verdict |
 |---|---|---|
 | in-repo yamux 0.14, wire-identical | `92fdde0` | behaviour-identical to the crate |
-| tokio-native engine IO (Compat gone) | `20ac557` | the -6.6..+23.5% column of the final A/B |
+| tokio-native engine IO (Compat gone) | `20ac557` | the -6.6..+23.5% column of the 2026-09-21 final A/B (the 2026-09-22 re-run shows the mux arm's loopback cells inside its noise floor — see "Final cumulative A/B") |
 | stream cap 32 → 64 | `a97e1ef` | ceiling probe: 15 → 47 usable streams |
 | control-frame coalescing (L4) | `a1fe0bb` | 8-stream +5.7..9.2%, ranges overlap |
 | frame split 16 → 32 KiB | `fda6fd6` | mux1 loopback 8-stream +45.7% non-overlapping (2026-09-21 A/B; the figure did not reproduce in the 2026-09-22 cumulative run — the same cell measured +0.3% with rounds alternating direction — so the default stands on no-regression grounds, not as a proven win) |
@@ -59,6 +62,8 @@
 | bench: udp ping quiescence + meta | `40d54ad` | same numbers, ~7 s less wall per weak arm |
 | bench: checkpoint dir recreated | `baa4eab` | a wiped output path no longer kills a live run |
 | bench: RSS key that exists | `675be8a` | `total_kb` never matched; the memory axis was missing from every A/B verdict |
+| bench: framing counters go missing loudly | this commit | a framed arm with zero mux-stats lines now records a typed partial_metric instead of silently dropping the attribution column (the 2026-09-22 final A/B lost it that way — see below) |
+| bench/doc hygiene (phase-2 review) | `7fb0e39` `b36ba03` `0a06123` | doc-example test covers all 4 markdown files; bore→nps + 5 stale references fixed; the three non-reproducing A/B figures annotated; dead `PaceState.rtt_ms`, 2 stale lint waivers removed — behaviour-neutral (KCP smoke inside the baseline spread) |
 
 ## Optimization route: closed
 
@@ -178,10 +183,8 @@ direction** — it is a capability with a defensible niche: UDP-only paths
 traffic on high-loss, high-RTT links. Trying to make it win on throughput
 would mean re-tuning an upstream congestion controller that is deliberately
 not yamux-shaped, and the numbers say that is not where its value is.
-
-Also measured and closed in the same round: window doubling bought +29%
-single-stream on loss1/rtt10 and +20% on loss5/rtt100 at ~2x RSS, and a 5 ms
-flush interval was rejected (loopback 8-stream -3x).
+(Those figures are the v0.8.0 matrix's; the section below re-measures the
+same cells with the current bench on a second host.)
 
 ### KCP on the current bench (2026-09-22, host `1cb438346ebe`)
 
@@ -228,7 +231,7 @@ control on loopback; branch `d798100`+bench fixes vs `main` `8584945`,
 both binaries freshly built with the commit SHA verified) followed by a
 loss5_rtt100 run (mux / noise / kcp4) and a focused 5-round re-measurement
 of the one cell that fired an unfavourable claim. The old
-`results-final-ab.json` claim (mux + mux1, loopback + loss1, 24 paired
+`results-final-ab-2026-09-21.json` claim (mux + mux1, loopback + loss1, 24 paired
 ranges, 21 overlapping) is the 2026-09-21 session's; this one re-runs it
 with the current bench and adds the noise, kcp4 and loss5 arms.
 
@@ -287,6 +290,29 @@ against `main` on any axis. Data: `results-ab-final-2026-09-22.json`
 (78 arms, audited: 0 cell errors, one documented kcp4 rtt100 gap, no
 unexplained holes).
 
+**One data caveat, recorded:** that run's file carries **no
+`framing_cpu` column** (0/78 arms) — the host's environment dropped the
+`MOLEHILL_MUX_STATS` propagation sometime between 20:44 and 02:11 that
+night, so the engine's per-frame attribution was silently absent from
+the final run and the loss5/focus runs. The throughput, latency, memory
+and CPU verdicts above are unaffected (they come from iperf3 and the
+samplers, not the framing counters), and every framing number quoted in
+this document comes from the experiment runs, where the counters were
+present and verified. The symptom could not be reproduced afterwards
+with the identical bench code and binaries (a 1-rep rerun produced 6 472
+stats lines), so it is filed as an environment fault; the bench now
+records a typed `partial_metrics` note when a framed arm produces no
+mux-stats lines, so the same silent loss cannot recur unnoticed.
+
+**Scope, stated plainly:** the cumulative claim covers four of the nine
+matrix cells (loopback, loss1_rtt10, rtt100, loss5_rtt100). The pure-delay
+rtt10 cell, the two rate-shaped cells (r100/r20) and the jitter cell are
+NOT part of the branch-vs-main comparison — they are exercised by the
+release baseline (`results-v0.8.1.json`, same code as `main` plus the
+noise-stream work) but not A/B'd against it. If one of those regimes
+matters for a merge decision, that is the remaining bench work;
+everything measured above holds within its stated cells.
+
 ## How to A/B on this branch
 
 Sequential before/after runs are **not usable** — several cells drift ~12%
@@ -303,11 +329,29 @@ just bench-ab results-ab.json     # CLAIM only where reps are disjoint
 
 Details in [docs/release.md](docs/release.md) ("Comparing two builds").
 
+### Environment notes (this host, measured 2026-09-22/23)
+
+- **Verify `iperf3` before a long run.** The container's apt layer dropped
+  the `iperf3` package twice mid-session without a reboot. The bench then
+  fails *cleanly* — every arm records the `Backends: … [Errno 2] iperf3`
+  error with its reason (continue-on-error, no fabricated numbers) — but a
+  whole matrix spends its hour producing nothing.
+- **/tmp is periodically wiped.** It took one 35-minute final A/B with it
+  (every checkpoint of the run). The checkpoint now recreates its output
+  directory (`baa4eab`), but keep `--out` and logs under `~/tmp` or the
+  repo regardless.
+- **`timeout N` orphans the run.** The wrapper signals `uv run`, not the
+  python child, which keeps executing and holds the bench lock — a later
+  invocation then exits immediately with "another bench run is active".
+  Let the orphan finish (or reap it) before starting the next run.
+
 ## Legacy state (2026-09-11, still accurate)
 
 - `v0.8.0` and `v0.8.1` are released; `v0.8.1` is the control-channel
-  teardown fix recorded in "Control-channel teardown" below, with the
-  benchmark matrix carried forward unchanged.
+  teardown fix (a service whose control channel ended kept its public port
+  bound until a new registration took it over — recorded in CHANGELOG.md's
+  `## [0.8.1]` section), with the benchmark matrix carried forward
+  unchanged.
 - The benchmark measurement method was revised 2026-09-10/11 (rate-cell
   shaping, per-rep throughput isolation, a UDP capacity ladder); the v0.8.0
   baseline was re-measured in full from it on host `0b073ddbf222` (52 arms,

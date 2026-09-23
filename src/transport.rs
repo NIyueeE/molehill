@@ -126,7 +126,7 @@ pub struct SocketOpts {
 }
 
 impl SocketOpts {
-    fn none() -> SocketOpts {
+    pub(crate) fn none() -> SocketOpts {
         SocketOpts {
             nodelay: None,
             keepalive: None,
