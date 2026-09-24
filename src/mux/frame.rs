@@ -11,12 +11,21 @@
 pub mod header;
 mod io;
 
-use futures::future::Either;
 use header::{Data, GoAway, Header, Ping, StreamId, WindowUpdate};
 use std::{convert::TryInto, num::TryFromIntError};
 
 pub use io::FrameDecodeError;
 pub(crate) use io::Io;
+
+/// Type-level left-or-right marker for frame bodies, replacing
+/// `futures::future::Either` (which the tokio-native engine does not
+/// otherwise need). Never instantiated — it only carries the `Data` /
+/// `WindowUpdate` marker types so the flag traits can be implemented per
+/// side.
+#[derive(Debug)]
+pub(crate) struct Either<L, R> {
+    _marker: std::marker::PhantomData<(L, R)>,
+}
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]

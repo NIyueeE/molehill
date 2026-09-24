@@ -8,7 +8,7 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use futures::future::Either;
+use super::Either;
 use std::fmt;
 
 /// The message frame header.
@@ -287,10 +287,8 @@ impl StreamId {
         StreamId(val)
     }
 
-    // TODO: remove and use is multiple_of() on the next minor release.
-    #[allow(clippy::manual_is_multiple_of)]
     pub fn is_server(self) -> bool {
-        self.0 % 2 == 0
+        self.0.is_multiple_of(2)
     }
 
     pub fn is_client(self) -> bool {

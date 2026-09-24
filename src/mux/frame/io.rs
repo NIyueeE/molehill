@@ -13,18 +13,22 @@ use super::{
     header::{self, HeaderDecodeError},
 };
 use crate::mux::connection::Id;
-use futures::{prelude::*, ready};
 use std::{
     fmt, io,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Maximum Yamux frame body length
 ///
 /// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
 ///
 /// Chosen based on intuition in past iterations.
+/// Bodies up to this size are written together with their header in one
+/// buffer (see [`Io::start_frame`]).
+pub(crate) const COALESCE_BODY_MAX: usize = 512;
+
 const MAX_FRAME_BODY_LEN: usize = crate::mux::MIB;
 
 /// A [`Stream`] and writer of [`Frame`] values.
@@ -82,10 +86,51 @@ impl fmt::Debug for WriteState {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
-    type Error = io::Error;
+impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
+    /// Whether the frame writer is idle and can accept a new frame.
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.write_state, WriteState::Init)
+    }
 
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    /// Queue a frame for writing. The caller checks [`Io::is_idle`] first
+    /// and drives the writer with [`Io::poll_flush`] afterwards.
+    pub(crate) fn start_frame(&mut self, f: Frame<()>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::mux::FRAMES_WRITTEN.fetch_add(1, Relaxed);
+        crate::mux::FRAME_BYTES.fetch_add(f.body.len() as u64, Relaxed);
+        let header = header::encode(&f.header);
+        let buffer = f.body;
+        self.write_state = if buffer.len() <= COALESCE_BODY_MAX {
+            // One buffer, one write: header first, then the body. The copy
+            // is trivial at this size and it halves the write calls for the
+            // control frames (SYN/ACK/FIN/window update/ping) that dominate
+            // light-load and churn traffic. Larger bodies keep the two-phase
+            // write so the payload is never copied twice.
+            let mut combined = Vec::with_capacity(header.len() + buffer.len());
+            combined.extend_from_slice(&header);
+            combined.extend_from_slice(&buffer);
+            WriteState::Body {
+                buffer: combined,
+                offset: 0,
+            }
+        } else {
+            WriteState::Header {
+                header,
+                buffer,
+                offset: 0,
+            }
+        };
+    }
+
+    /// Drive the frame writer to completion, then flush the socket.
+    pub(crate) fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = Pin::into_inner(self);
+        ready!(Pin::new(&mut *this).drive_write(cx))?;
+        Pin::new(&mut this.socket).poll_flush(cx)
+    }
+
+    /// Run the frame-writer state machine until it is idle or pending.
+    fn drive_write(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = Pin::into_inner(self);
         loop {
             tracing::trace!("{}: write: {:?}", this.id, this.write_state);
@@ -160,29 +205,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
             }
         }
     }
-
-    fn start_send(self: Pin<&mut Self>, f: Frame<()>) -> Result<(), Self::Error> {
-        let header = header::encode(&f.header);
-        let buffer = f.body;
-        self.get_mut().write_state = WriteState::Header {
-            header,
-            buffer,
-            offset: 0,
-        };
-        Ok(())
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = Pin::into_inner(self);
-        ready!(this.poll_ready_unpin(cx))?;
-        Pin::new(&mut this.socket).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = Pin::into_inner(self);
-        ready!(this.poll_ready_unpin(cx))?;
-        Pin::new(&mut this.socket).poll_close(cx)
-    }
 }
 
 /// The stages of reading a new `Frame`.
@@ -202,10 +224,12 @@ enum ReadState {
     },
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
-    type Item = Result<Frame<()>, FrameDecodeError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
+    /// Read the next frame off the socket.
+    pub(crate) fn poll_next_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<()>, FrameDecodeError>>> {
         let this = &mut *self;
         loop {
             tracing::trace!("{}: read: {:?}", this.id, this.read_state);
@@ -251,16 +275,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                     }
 
                     let buf = &mut buffer[*offset..header::HEADER_SIZE];
-                    match ready!(Pin::new(&mut this.socket).poll_read(cx, buf))? {
-                        0 => {
-                            if *offset == 0 {
-                                return Poll::Ready(None);
-                            }
-                            let e = FrameDecodeError::Io(io::ErrorKind::UnexpectedEof.into());
-                            return Poll::Ready(Some(Err(e)));
+                    let mut read_buf = ReadBuf::new(buf);
+                    ready!(Pin::new(&mut this.socket).poll_read(cx, &mut read_buf))?;
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        if *offset == 0 {
+                            return Poll::Ready(None);
                         }
-                        n => *offset += n,
+                        let e = FrameDecodeError::Io(io::ErrorKind::UnexpectedEof.into());
+                        return Poll::Ready(Some(Err(e)));
                     }
+                    *offset += n;
                 }
                 ReadState::Body {
                     ref header,
@@ -273,17 +298,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                         let h = header.clone();
                         let v = std::mem::take(buffer);
                         this.read_state = ReadState::Init;
+                        crate::mux::FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::mux::FRAME_BYTES
+                            .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         return Poll::Ready(Some(Ok(Frame { header: h, body: v })));
                     }
 
                     let buf = &mut buffer[*offset..body_len];
-                    match ready!(Pin::new(&mut this.socket).poll_read(cx, buf))? {
-                        0 => {
-                            let e = FrameDecodeError::Io(io::ErrorKind::UnexpectedEof.into());
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        n => *offset += n,
+                    let mut read_buf = ReadBuf::new(buf);
+                    ready!(Pin::new(&mut this.socket).poll_read(cx, &mut read_buf))?;
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        let e = FrameDecodeError::Io(io::ErrorKind::UnexpectedEof.into());
+                        return Poll::Ready(Some(Err(e)));
                     }
+                    *offset += n;
                 }
             }
         }

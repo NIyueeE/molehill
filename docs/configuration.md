@@ -103,15 +103,15 @@ flowchart TD
 
 | Decision | Option | Measured basis |
 |---|---|---|
-| `mode` | `"multiplex"` (default) | 1-stream 10.9 Gbit/s on loopback vs 19.3 for `direct`; at 8 streams both reach ~27.7; multiplex absorbs per-connection setup (churn p99 ~3.5 ms) and saves FDs / ports / NAT mappings |
+| `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | single-flow ceiling (loopback 8-str 9.0 Gbit/s); every stream shares one retransmit domain (loss5 HoL max 1157 ms) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 15.4 vs 4.6 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 101.4 ms at count=1); yamux ceiling `count × 32` concurrent connections |
+| `count` | `1` | single-flow ceiling (loopback 8-str 9.2 Gbit/s); every stream shares one retransmit domain (loss5 HoL max 2.5 s vs 1.6 s at count=4) |
+| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 100.1 ms at count=1); yamux ceiling `count × 64` concurrent connections |
 | `count` | `8+` | ~256 concurrent connections; 8 physical tunnels per service (NAT mappings ×8) |
-| `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-str 4.8 vs 2.5 Gbit/s against the noise control; 8-str 14.8 vs 5.9); RSS 24 vs 102 MiB |
+| `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-str 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport; 8-str 14.9 vs 1.1 — the kcp4 8-stream cell is the documented cold-start bimodal one, see HANDOFF.md); RSS 26 vs 85 MiB |
 | `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or A/B for a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0% loss, 20 ms max inter-packet gap vs 100+ ms for the TCP arms) |
-| transport | `"plain"` | 10.9 / 27.7 Gbit/s (1/8 streams) on loopback |
-| transport | `"noise"` | 4.8 / 14.8 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
+| transport | `"plain"` | 10.0 / 19.5 Gbit/s (1/8 streams) on loopback |
+| transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels, never splits one session (session affinity) |
 
 **Validate the choice** with the exposure you care about: `ping` / in-game
@@ -146,6 +146,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
 [client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
 protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -183,6 +184,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
+# stripe_count = 4 # Optional. Data channels per visitor connection. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping")
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a v3 transport selector byte); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
@@ -190,6 +192,7 @@ local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
 
 ## Dynamic service registration
@@ -228,7 +231,7 @@ handshake) and cuts FD usage under many concurrent visitors.
   adapts per connection automatically.
 - `mode = "direct"` restores the one-connection-per-channel path.
 - Per-tunnel buffering is bounded by internal defaults (64 MiB yamux receive
-  window, 32 streams) — bounded loss backlog without throughput loss; the
+  window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
 - `count = N` opens N parallel tunnels per service and spreads data channels
   across them round-robin. Independent TCP flows isolate head-of-line
@@ -238,8 +241,12 @@ handshake) and cuts FD usage under many concurrent visitors.
   re-establishes the pool. Default: 4; `1` reproduces single-tunnel behavior.
 - **Experimental (transport comparison arms):** `carrier = "kcp"` runs the
   data plane as KCP-over-UDP sessions instead of TCP connections (feature
-  `kcp`, in the default set). KCP is a userspace ARQ protocol: faster loss
-  recovery than TCP at the cost of CPU. The crypto stack is unchanged — with
+  `kcp`, in the default set). KCP is a userspace ARQ protocol that trades
+  throughput for UDP session quality: it loses to the TCP carriers in every
+  measured cell (often by an order of magnitude) while its UDP echo is
+  measurably cleaner under loss and at high RTT (0% loss and a ~20 ms max
+  inter-packet gap at rtt100, where the TCP arms sit above 100 ms), at
+  several times the CPU and RSS. The crypto stack is unchanged — with
   transport `noise` the same Noise handshake wraps each KCP session — and
   yamux still carries the data channels, so `count` applies as usual. The
   server opens its UDP listener lazily — the first registration that
@@ -392,6 +399,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
 [client.services.ssh] # A service to forward
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -431,6 +439,7 @@ local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
 
 ### Noise (encrypted transport)

@@ -1,19 +1,19 @@
-use futures::Stream;
-use std::pin::Pin;
 use std::task::{Context, Poll};
+use tokio::sync::mpsc::Receiver;
 
-/// A stream that yields its tag with every item.
-#[pin_project::pin_project]
-pub struct TaggedStream<K, S> {
+/// A stream-command receiver tagged with the stream it belongs to.
+///
+/// Yields `(id, Some(command))` per command and `(id, None)` exactly once
+/// when the receiver is exhausted — the semantics the engine got from
+/// futures' `SelectAll` before going tokio-native — then `None` forever.
+pub(crate) struct TaggedStream<K, T> {
     key: K,
-    #[pin]
-    inner: S,
-
+    inner: Receiver<T>,
     reported_none: bool,
 }
 
-impl<K, S> TaggedStream<K, S> {
-    pub fn new(key: K, inner: S) -> Self {
+impl<K, T> TaggedStream<K, T> {
+    pub(crate) fn new(key: K, inner: Receiver<T>) -> Self {
         Self {
             key,
             inner,
@@ -21,31 +21,29 @@ impl<K, S> TaggedStream<K, S> {
         }
     }
 
-    pub fn inner_mut(&mut self) -> &mut S {
+    pub(crate) fn inner_mut(&mut self) -> &mut Receiver<T> {
         &mut self.inner
+    }
+
+    /// Whether this receiver has already reported its end.
+    pub(crate) fn is_done(&self) -> bool {
+        self.reported_none
     }
 }
 
-impl<K, S> Stream for TaggedStream<K, S>
-where
-    K: Copy,
-    S: Stream,
-{
-    type Item = (K, Option<S::Item>);
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.project();
-
-        if *this.reported_none {
+impl<K: Copy, T> TaggedStream<K, T> {
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<(K, Option<T>)>> {
+        if self.reported_none {
             return Poll::Ready(None);
         }
 
-        if let Some(item) = futures::ready!(this.inner.poll_next(cx)) {
-            Poll::Ready(Some((*this.key, Some(item))))
-        } else {
-            *this.reported_none = true;
-
-            Poll::Ready(Some((*this.key, None)))
+        match self.inner.poll_recv(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some((self.key, Some(item)))),
+            Poll::Ready(None) => {
+                self.reported_none = true;
+                Poll::Ready(Some((self.key, None)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }

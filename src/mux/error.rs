@@ -70,15 +70,3 @@ impl From<FrameDecodeError> for ConnectionError {
         ConnectionError::Decode(e)
     }
 }
-
-impl From<futures::channel::mpsc::SendError> for ConnectionError {
-    fn from(_: futures::channel::mpsc::SendError) -> Self {
-        ConnectionError::Closed
-    }
-}
-
-impl From<futures::channel::oneshot::Canceled> for ConnectionError {
-    fn from(_: futures::channel::oneshot::Canceled) -> Self {
-        ConnectionError::Closed
-    }
-}

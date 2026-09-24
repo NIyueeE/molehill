@@ -10,6 +10,8 @@ use crate::protocol::{
     read_registration, write_register_result,
 };
 #[cfg(feature = "noise")]
+use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
+#[cfg(feature = "noise")]
 use crate::transport::{NoiseKeys, NoiseStream};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
@@ -189,6 +191,19 @@ async fn upgrade_conn(
                 bail!(
                     "Client requested Noise, but this binary was built without the `noise` feature"
                 )
+            }
+        }
+        #[cfg(feature = "noise")]
+        NOISE_RESUME_SELECTOR => {
+            let keys = noise_keys.ok_or_else(|| {
+                anyhow!("Client requested a noise session resume, but the server has no Noise keys")
+            })?;
+            // A declined request ends here: the responder already wrote
+            // its verdict, and the client falls back to a full handshake
+            // on a fresh connection.
+            match keys.run_resume(conn).await? {
+                Some(stream) => Ok(ServerStream::Noise(Box::new(stream))),
+                None => bail!("Declined a noise session resume"),
             }
         }
         other => bail!("Unknown transport selector {other:#04x}"),
@@ -619,6 +634,7 @@ async fn do_control_channel_handshake(
         bound,
         server_config.control.heartbeat_interval,
         pool_size,
+        stripe_count(&server_config),
     );
 
     // Insert the new handle for this control channel
@@ -969,6 +985,24 @@ async fn bind_with_retry(service: &RegisteredService) -> Result<BoundEndpoint> {
     }
 }
 
+/// Effective data channels per visitor connection for one registration.
+///
+/// `[server.data].stripe_count` with the `multiplex` feature (plus the
+/// measurement-only environment override), and `1` without it — a build
+/// without the feature can neither produce nor consume the striped
+/// command, so the unstriped shape is the only wire it speaks.
+fn stripe_count(server_config: &ServerConfig) -> usize {
+    #[cfg(feature = "multiplex")]
+    {
+        server_config.stripe_count()
+    }
+    #[cfg(not(feature = "multiplex"))]
+    {
+        let _ = server_config;
+        1
+    }
+}
+
 impl ControlChannelHandle {
     // Create a control channel handle for an already-bound service: spawn
     // the connection pool task and the control channel handling task.
@@ -979,6 +1013,7 @@ impl ControlChannelHandle {
         bound: BoundEndpoint,
         heartbeat_interval: u64,
         pool_size: usize,
+        stripe_count: usize,
     ) -> ControlChannelHandle {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -1036,6 +1071,7 @@ impl ControlChannelHandle {
                             data_ch_req_tx,
                             shutdown_rx_clone,
                             control_task,
+                            stripe_count,
                         )
                         .await
                         .with_context(|| "Failed to run TCP connection pool")
@@ -1137,6 +1173,13 @@ impl ControlChannel {
 
 // Accept visitors on the pre-bound listener and pair each of them with a
 // data channel from the pool.
+//
+// `stripe_count` data channels are paired per visitor: `1` is the classic
+// one-channel shape; a higher count spreads the visitor connection over
+// that many parallel channels (a stripe group, see `crate::stripe`), which
+// multiplies its ceiling and window. The unstriped path (`stripe_count`
+// 1) is the default and stays the single-variable control for the striped
+// one.
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<C>(
     l: TcpListener,
@@ -1145,6 +1188,7 @@ async fn run_tcp_connection_pool<C>(
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
+    stripe_count: usize,
 ) -> Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1177,11 +1221,14 @@ where
                     }
                 }
                 Ok((mut incoming, addr)) => {
-                    // For every visitor, request to create a data channel
-                    if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                        // An error indicates the control channel is broken
-                        // So break the loop
-                        break 'pool;
+                    // For every visitor, request to create a data channel:
+                    // one per stripe when the visitor connection is striped.
+                    for _ in 0..stripe_count {
+                        if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                            // An error indicates the control channel is broken
+                            // So break the loop
+                            break 'pool;
+                        }
                     }
 
                     backoff = backoff_builder.build();
@@ -1192,36 +1239,51 @@ where
                     // defaults as the rest of the forwarding path
                     sock_opts.apply(&incoming);
 
-                    // Pair the visitor with a data channel. A broken channel
-                    // (e.g. stale pooled one) is discarded and replaced.
-                    loop {
-                        // A visitor can be waiting for a data channel that
-                        // will never arrive once its control channel is gone,
-                        // so this loop watches both signals too.
-                        let next = tokio::select! {
-                            _ = shutdown_rx.recv() => None,
-                            _ = &mut control_task => None,
-                            ch = data_ch_rx.recv() => ch,
-                        };
-                        let Some(mut ch) = next else {
-                            break 'pool;
-                        };
-                        if write_and_flush(&mut ch, &cmd).await.is_ok() {
-                            tokio::spawn(async move {
-                                let _ = copy_bidirectional_with_sizes(
-                                    &mut ch,
-                                    &mut incoming,
-                                    TCP_COPY_BUFFER_SIZE,
-                                    TCP_COPY_BUFFER_SIZE,
-                                )
-                                .await;
-                            });
-                            break;
+                    if stripe_count <= 1 {
+                        // Pair the visitor with a data channel. A broken
+                        // channel (e.g. stale pooled one) is discarded and
+                        // replaced.
+                        loop {
+                            // A visitor can be waiting for a data channel that
+                            // will never arrive once its control channel is gone,
+                            // so this loop watches both signals too.
+                            let next = tokio::select! {
+                                _ = shutdown_rx.recv() => None,
+                                _ = &mut control_task => None,
+                                ch = data_ch_rx.recv() => ch,
+                            };
+                            let Some(mut ch) = next else {
+                                break 'pool;
+                            };
+                            if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                                tokio::spawn(async move {
+                                    let _ = copy_bidirectional_with_sizes(
+                                        &mut ch,
+                                        &mut incoming,
+                                        TCP_COPY_BUFFER_SIZE,
+                                        TCP_COPY_BUFFER_SIZE,
+                                    )
+                                    .await;
+                                });
+                                break;
+                            }
+                            // Current data channel is broken. Request for a new one
+                            if data_ch_req_tx.send(true).is_err() {
+                                break 'pool;
+                            }
                         }
-                        // Current data channel is broken. Request for a new one
-                        if data_ch_req_tx.send(true).is_err() {
-                            break 'pool;
-                        }
+                    } else if pair_striped_group(
+                        incoming,
+                        stripe_count,
+                        &mut data_ch_rx,
+                        &data_ch_req_tx,
+                        &mut shutdown_rx,
+                        &mut control_task,
+                    )
+                    .await?
+                    {
+                        // The control channel is gone; stop the pool.
+                        break 'pool;
                     }
                 }
             },
@@ -1230,6 +1292,89 @@ where
 
     info!("Shutdown");
     Ok(())
+}
+
+/// Pair one visitor connection with a stripe group: gather `stripe_count`
+/// healthy data channels, announce each one as a stripe of the group, and
+/// spawn the group's forwarding.
+///
+/// Returns `Ok(true)` when the control channel ended mid-gather (the pool
+/// must stop) and `Ok(false)` once the group is forwarding. A broken pooled
+/// channel discards the whole attempt — the client already parked the
+/// group's stripes, and a retry under a fresh group id is the only way to
+/// keep the indices consistent.
+#[instrument(skip_all, fields(stripes = stripe_count))]
+async fn pair_striped_group<C>(
+    incoming: TcpStream,
+    stripe_count: usize,
+    data_ch_rx: &mut mpsc::Receiver<C>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    shutdown_rx: &mut broadcast::Receiver<bool>,
+    mut control_task: &mut tokio::task::JoinHandle<()>,
+) -> Result<bool>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // Each iteration is one gather attempt under a fresh group id.
+    'gather: loop {
+        let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
+        let cmds = stripe_cmds(group, stripe_count)?;
+        let mut gathered: Vec<C> = Vec::with_capacity(stripe_count);
+        loop {
+            let next = tokio::select! {
+                _ = shutdown_rx.recv() => None,
+                _ = &mut control_task => None,
+                ch = data_ch_rx.recv() => ch,
+            };
+            let Some(mut ch) = next else {
+                return Ok(true);
+            };
+            if write_and_flush(&mut ch, &cmds[gathered.len()])
+                .await
+                .is_ok()
+            {
+                gathered.push(ch);
+                if gathered.len() == stripe_count {
+                    break;
+                }
+            } else {
+                // A broken pooled channel: drop the attempt (the client's
+                // registry reaps its parked stripes) and gather a fresh one.
+                drop(gathered);
+                for _ in 0..stripe_count {
+                    if data_ch_req_tx.send(true).is_err() {
+                        return Ok(true);
+                    }
+                }
+                continue 'gather;
+            }
+        }
+        debug!("Visitor paired with a {stripe_count}-stripe group {group}");
+        let (read, write) = incoming.into_split();
+        crate::stripe::spawn_group(read, write, gathered);
+        return Ok(false);
+    }
+}
+
+/// Group ids for striped visitor connections: wrapping is fine — a group is
+/// transient, and the client prunes abandoned ones by age.
+static GROUP_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The per-stripe `StartForwardStripedTcp` commands of one gather attempt,
+/// in arrival order. Each is 7 bytes (tag + fixed-width group id + index +
+/// count), so `write_and_flush` emits it as a single frame.
+fn stripe_cmds(group: u32, stripe_count: usize) -> Result<Vec<Vec<u8>>> {
+    (0..stripe_count)
+        .map(|i| {
+            let cmd = DataChannelCmd::StartForwardStripedTcp(
+                group.to_be_bytes(),
+                u8::try_from(i).with_context(|| "stripe index exceeds u8")?,
+                u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?,
+            );
+            let bytes = postcard::to_stdvec(&cmd)?;
+            Ok::<Vec<u8>, anyhow::Error>(bytes)
+        })
+        .collect()
 }
 
 /// Visitor-bound datagram queue into one data-channel worker.

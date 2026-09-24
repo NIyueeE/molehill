@@ -1,0 +1,350 @@
+{
+  "meta": {
+    "schema": 3,
+    "date": "2026-09-23",
+    "topology": "loopback visitor->server->client->backend",
+    "transport": "plain tcp + noise (molehill variants)",
+    "reps": 1,
+    "peer_reps": 1,
+    "secs_per_rep_loopback": 12,
+    "secs_per_rep_weak": 10,
+    "peer_secs_per_rep_loopback": 5,
+    "peer_secs_per_rep_weak": 6,
+    "hol_probe_seconds": 5.0,
+    "churn_seconds": 3.0,
+    "churn_concurrency": 16,
+    "udp_capacity_datagrams": 10000,
+    "udp_capacity_pps": 20000.0,
+    "udp_ping_datagrams": 200,
+    "udp_ping_interval_ms": 20,
+    "netem_rate_limit": 2000,
+    "latency_samples": 300,
+    "memory_samples_interval_s": 0.5,
+    "hostname": "0d6ebe171f3b",
+    "kernel": "6.12.0-160000.37-default",
+    "cpu": "Intel(R) Xeon(R) CPU E5-2666 v3 @ 2.90GHz",
+    "cells": [
+      {
+        "name": "loss1_rtt10",
+        "loss_pct": 1.0,
+        "burst_pct": 0.0,
+        "rate_mbit": 0.0,
+        "rtt_ms": 10.0,
+        "jitter_ms": 0.0,
+        "mech": "netem",
+        "loss_model": "random 1%"
+      }
+    ],
+    "tool_versions": {
+      "molehill": "0.8.1"
+    }
+  },
+  "results": {
+    "molehill 0.8.1 (kcp4) (ab1:molehill-703a753c)": {
+      "loss1_rtt10": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 0.4325,
+        "retransmits_1stream": 75,
+        "throughput_1stream_min_gbps": 0.4325,
+        "throughput_1stream_max_gbps": 0.4325,
+        "throughput_1stream_received_gbps": 0.4179,
+        "throughput_1stream_received_own_window_gbps": 0.4154,
+        "throughput_1stream_receiver_window_s": 10.061,
+        "throughput_1stream_sent_only_gbps": 0.4325,
+        "throughput_1stream_median_rep": 0,
+        "throughput_1stream_per_stream_bytes": [
+          540672000
+        ],
+        "throughput_1stream_reps_ok": 1,
+        "throughput_8streams_gbps": 0.7592,
+        "retransmits_8streams": 199,
+        "throughput_8streams_min_gbps": 0.7592,
+        "throughput_8streams_max_gbps": 0.7592,
+        "throughput_8streams_received_gbps": 0.7927,
+        "throughput_8streams_received_own_window_gbps": 0.6913,
+        "throughput_8streams_receiver_window_s": 11.467,
+        "throughput_8streams_sent_only_gbps": 0.7592,
+        "throughput_8streams_median_rep": 0,
+        "throughput_8streams_per_stream_bytes": [
+          128450560,
+          109838336,
+          71565312,
+          80609280,
+          56492032,
+          250347520,
+          141688832,
+          110100480
+        ],
+        "throughput_8streams_reps_ok": 1,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 101.271,
+          "p95": 329.172,
+          "p99": 1121.113,
+          "mean": 147.08
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.77,
+          "p95": 285.339,
+          "p99": 531.862,
+          "mean": 83.746
+        },
+        "udp_rtt_ms": {
+          "p50": 60.563,
+          "p95": 60.739,
+          "p99": 88.229,
+          "mean": 61.26
+        },
+        "udp_loss_pct": 4.0,
+        "udp_jitter_ms": 1.289,
+        "udp_max_gap_ms": 60.381,
+        "churn": {
+          "connects": 319,
+          "success_pct": 100.0,
+          "connects_per_s": 106.3,
+          "setup_first_byte_ms_p50": 101.075,
+          "setup_first_byte_ms_p95": 1103.807,
+          "setup_first_byte_ms_p99": 1143.655,
+          "setup_first_byte_ms_mean": 167.495
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 1924,
+              "loss_pct": 3.8,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.65,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 3.0,
+          "capacity_mbit": null,
+          "capacity_pps": null,
+          "capacity_offered_pps": null,
+          "capacity_loss_pct": null,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 500.0,
+          "knee_loss_pct": 3.8
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.032,
+          "ping_rtt_ms": {
+            "p50": 60.648,
+            "p95": 61.487,
+            "p99": 285.557,
+            "mean": 66.872
+          },
+          "ping_max_gap_ms": 285.559
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 88.834,
+            "p95": 105.872,
+            "p99": 105.872,
+            "mean": 85.043
+          },
+          "ping_max_gap_ms": 61.817,
+          "ping_sent": 150,
+          "ping_received": 3,
+          "ping_loss_pct": 98.0
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 58532,
+          "client_avg_kb": 20600,
+          "total_avg_kb": 79132,
+          "total_peak_kb": 298236,
+          "samples": 189
+        },
+        "cpu": {
+          "server_avg_pct": 19.8,
+          "client_avg_pct": 14.4,
+          "total_avg_pct": 34.2,
+          "total_peak_pct": 129.9,
+          "samples": 378
+        },
+        "framing": {
+          "frames_written_delta": 120866,
+          "frames_read_delta": 119576,
+          "frame_bytes_delta": 4006852333,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 1273.8,
+          "avg_frame_bytes": 16664.5,
+          "cpu_pct_per_kframe": 0.1422,
+          "arm_seconds": 94.9
+        }
+      }
+    },
+    "molehill 0.8.1 (kcp4) (ab1:molehill-580e51e5)": {
+      "loss1_rtt10": {
+        "status": "ok",
+        "_throughput_endpoint": "exposed",
+        "_throughput_exposed_port": 25102,
+        "_bench_backend_port": 25190,
+        "throughput_1stream_gbps": 0.0019,
+        "retransmits_1stream": 0,
+        "throughput_1stream_min_gbps": 0.0019,
+        "throughput_1stream_max_gbps": 0.0019,
+        "throughput_1stream_received_gbps": 0.0019,
+        "throughput_1stream_received_own_window_gbps": 0.0018,
+        "throughput_1stream_receiver_window_s": 10.518,
+        "throughput_1stream_sent_only_gbps": 0.0001,
+        "throughput_1stream_sender_degenerate_reps": 1,
+        "throughput_1stream_median_rep": 0,
+        "throughput_1stream_per_stream_bytes": [
+          131072
+        ],
+        "throughput_1stream_reps_ok": 1,
+        "throughput_8streams_gbps": null,
+        "retransmits_8streams": null,
+        "throughput_8streams_min_gbps": null,
+        "throughput_8streams_max_gbps": null,
+        "throughput_8streams_reps_ok": 0,
+        "throughput_64streams_gbps": null,
+        "echo_rtt_ms": {
+          "p50": 101.18,
+          "p95": 312.221,
+          "p99": 1118.107,
+          "mean": 136.261
+        },
+        "tcp_steady_rtt_ms": {
+          "p50": 60.723,
+          "p95": 83.132,
+          "p99": 288.627,
+          "mean": 66.313
+        },
+        "udp_rtt_ms": {
+          "p50": 60.512,
+          "p95": 60.688,
+          "p99": 90.49,
+          "mean": 60.997
+        },
+        "udp_loss_pct": 3.5,
+        "udp_jitter_ms": 0.76,
+        "udp_max_gap_ms": 56.803,
+        "churn": {
+          "connects": 352,
+          "success_pct": 100.0,
+          "connects_per_s": 117.3,
+          "setup_first_byte_ms_p50": 101.051,
+          "setup_first_byte_ms_p95": 333.049,
+          "setup_first_byte_ms_p99": 1137.462,
+          "setup_first_byte_ms_mean": 150.82
+        },
+        "udp_capacity": {
+          "steps": [
+            {
+              "datagrams_sent": 2000,
+              "datagrams_received": 1925,
+              "loss_pct": 3.75,
+              "pps": 500.0,
+              "offered_pps": 500.0,
+              "offered_mbit": 0.68,
+              "delivered_mbit": 0.65,
+              "shaped_rate_mbit": null,
+              "probe_rcvbuf_bytes": 2097152,
+              "within_tolerance": false
+            }
+          ],
+          "ladder_pps": [
+            500.0,
+            1000.0,
+            2000.0,
+            4000.0,
+            8000.0,
+            12000.0,
+            16000.0,
+            20000.0
+          ],
+          "tolerance_pct": 3.0,
+          "capacity_mbit": null,
+          "capacity_pps": null,
+          "capacity_offered_pps": null,
+          "capacity_loss_pct": null,
+          "capacity_is_lower_bound": false,
+          "knee_offered_pps": 500.0,
+          "knee_loss_pct": 3.75
+        },
+        "mixed_bulk_latency": null,
+        "hol": {
+          "mode": "tcp",
+          "bulk_gbps": 0.034,
+          "ping_rtt_ms": {
+            "p50": 60.626,
+            "p95": 60.983,
+            "p99": 288.118,
+            "mean": 66.939
+          },
+          "ping_max_gap_ms": 288.122
+        },
+        "hol_udp": {
+          "mode": "udp",
+          "bulk_gbps": 0.1,
+          "ping_rtt_ms": {
+            "p50": 68.106,
+            "p95": 101.974,
+            "p99": 178.957,
+            "mean": 73.589
+          },
+          "ping_max_gap_ms": 294.482,
+          "ping_sent": 150,
+          "ping_received": 127,
+          "ping_loss_pct": 15.33
+        },
+        "memory_rss_kb": {
+          "server_avg_kb": 25098,
+          "client_avg_kb": 18687,
+          "total_avg_kb": 43785,
+          "total_peak_kb": 100256,
+          "samples": 155
+        },
+        "cpu": {
+          "server_avg_pct": 8.8,
+          "client_avg_pct": 7.7,
+          "total_avg_pct": 16.5,
+          "total_peak_pct": 115.9,
+          "samples": 310
+        },
+        "partial_metrics": [
+          "throughput_8streams: iperf3 error: control socket has closed unexpectedly",
+          "throughput_8streams: last rep: iperf3 error: control socket has closed unexpectedly"
+        ],
+        "framing": {
+          "frames_written_delta": 78884,
+          "frames_read_delta": 73409,
+          "frame_bytes_delta": 586346643,
+          "processes": 2
+        },
+        "framing_cpu": {
+          "frames_per_s": 1006.4,
+          "avg_frame_bytes": 3850.1,
+          "cpu_pct_per_kframe": 0.1083,
+          "arm_seconds": 78.4
+        }
+      }
+    }
+  }
+}

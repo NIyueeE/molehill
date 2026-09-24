@@ -17,10 +17,11 @@
 //! allocation, the IO layer) need code ownership rather than call-site
 //! tuning. It is a move, not a rewrite — the engine stays wire-identical
 //! with the [yamux specification](https://github.com/hashicorp/yamux/blob/master/spec.md),
-//! so a 0.8.x peer keeps interoperating. The phased plan that follows the
-//! vendoring is recorded in HANDOFF.md, "Direction ① design document".
+//! so a 0.8.x peer keeps interoperating. The per-change record of the
+//! migration that followed the vendoring (what landed, what was measured
+//! and closed) is in HANDOFF.md, "What landed" and "Optimization route".
 //!
-//! Deviations from the vendored copy, all mechanical: logging goes through
+//! Deviations from the vendored copy: logging goes through
 //! `tracing` instead of the `log` facade; `web-time` and
 //! `static_assertions` are replaced by `std` equivalents; the upstream
 //! property tests (their `quickcheck` dev-dependency) are dropped in
@@ -31,9 +32,10 @@
 //!
 //! - [`Connection`], which wraps the underlying I/O resource, e.g. a socket, and
 //!   provides methods for opening outbound or accepting inbound streams.
-//! - [`Stream`], which implements [`futures::io::AsyncRead`] and
-//!   [`futures::io::AsyncWrite`] (tokio's traits via tokio-util's `Compat`
-//!   until the engine goes tokio-native).
+//! - [`Stream`], which implements tokio's `AsyncRead` / `AsyncWrite` traits
+//!   directly — the engine is tokio-native since the futures-io layer was
+//!   dropped, so the transport passes its sockets and streams in without a
+//!   compatibility shim.
 
 #![forbid(unsafe_code)]
 
@@ -86,7 +88,31 @@ const MAX_ACK_BACKLOG: usize = 256;
 ///
 /// For details on why this concrete value was chosen, see
 /// <https://github.com/paritytech/yamux/issues/100>.
-const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
+const DEFAULT_SPLIT_SEND_SIZE: usize = 32 * KIB;
+
+/// Cumulative frame counters for the framing path, used by the optional
+/// periodic stats line (`MOLEHILL_MUX_STATS=1`).
+///
+/// They exist so a run can attribute cost to the path: frames/s beside the
+/// measured CPU turns a throughput number into CPU-per-frame, which is what
+/// separates "the engine does too much work per frame" from "there are too
+/// many frames". A relaxed atomic add per frame is a few nanoseconds against
+/// the frame's own cost, and the counters are only read by the stats task.
+pub(crate) static FRAMES_WRITTEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FRAMES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Body bytes only (the 12-byte headers excluded) across both directions.
+pub(crate) static FRAME_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of the framing counters, for the periodic stats line.
+pub(crate) fn framing_stats() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FRAMES_WRITTEN.load(Relaxed),
+        FRAMES_READ.load(Relaxed),
+        FRAME_BYTES.load(Relaxed),
+    )
+}
 
 /// Yamux configuration.
 ///
@@ -95,7 +121,15 @@ const DEFAULT_SPLIT_SEND_SIZE: usize = 16 * KIB;
 /// - max. for the total receive window size across all streams of a connection = 1 GiB
 /// - max. number of streams = 512
 /// - read after close = true
-/// - split send size = 16 KiB
+/// - split send size = 32 KiB (the vendored default is 16 KiB; adopted
+///   from a single-variable A/B that measured +45.7% non-overlapping on
+///   the single-tunnel 8-stream cell. That figure did NOT reproduce in
+///   the 2026-09-22 cumulative A/B against `main`, where the same cell
+///   measured +0.3% with the rounds alternating direction — the split
+///   stays the shipped default on no-regression grounds, not as a proven
+///   throughput win. The 16 KiB preference it replaced came from a run
+///   against the dead-receiver leak recorded in HANDOFF.md, "What
+///   landed" (`a424ccc`), whose numbers are not comparable either)
 #[derive(Debug, Clone)]
 pub struct Config {
     max_connection_receive_window: Option<usize>,

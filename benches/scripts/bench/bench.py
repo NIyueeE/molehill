@@ -29,8 +29,6 @@ Machine notes (moved from the retired run_bench.sh):
   game-like session sees, not the configured loss rate
 - a leftover netem qdisc from a killed run is replaced and removed by the
   startup capability probe, so a crashed run cannot keep delaying loopback
-- bore's `--to` takes a bare host (port 7835 implied): in weakproxy cells its
-  control port moves to 127.0.0.2 so the proxy can hold 127.0.0.1:7835
 - knobs are env-tunable (see bench_lib.Knobs): molehill runs at full rigor
   (3 reps), peers at reduced rigor (1 rep) — the regression gate only gates
   molehill's default (mux) row
@@ -42,6 +40,7 @@ Machine notes (moved from the retired run_bench.sh):
 """
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -69,6 +68,7 @@ from bench_lib import (
     churn,
     cpu_stats,
     dump_results,
+    framing_stats,
     latency,
     load_results,
     mem_stats,
@@ -94,22 +94,56 @@ def _handle_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
-TCP_ONLY = {"bore"}  # peers without UDP forwarding (UDP metrics omitted)
-PEER_BINS = {"frp": "frps", "bore": "bore", "rathole": "rathole"}
+PEER_BINS = {"frp": "frps", "rathole": "rathole", "nps": "nps"}
 
 # yamux's default max concurrent streams per tunnel
-# (DEFAULT_MUX_MAX_STREAMS in src/common/constants.rs): an arm's practical
-# stream ceiling is its tunnel count x this, so a scale test above the
-# ceiling is skipped deliberately instead of failing an over-limit dial.
-MUX_MAX_STREAMS = 32
+# (DEFAULT_MUX_MAX_STREAMS in src/common/constants.rs). An arm's *usable*
+# data-stream ceiling is its tunnel count x this, minus the channels the
+# bench itself holds open on those tunnels (see
+# `variant_stream_ceiling`), so a scale test above the usable ceiling is
+# skipped deliberately instead of failing an over-limit dial.
+MUX_MAX_STREAMS = 64
+
+# The stripe experiment's arm: the default mux shape (multiplex, count = 4)
+# with every visitor connection spread over STRIPE_ARMS parallel data
+# channels. The stripe count rides the environment (the server-side
+# `stripe_count` knob's measurement-only override), so the config on the
+# wire stays identical to the `mux` arm and a binary that predates the
+# striped data-channel command ignores the variable entirely.
+STRIPE_ARMS = {"mux-stripe": 4}
 
 
-def variant_stream_ceiling(variant: str) -> int | None:
+def stripe_env(variant: str) -> dict | None:
+    """Per-arm environment for the stripe experiment, or None."""
+    stripes = STRIPE_ARMS.get(variant)
+    if not stripes:
+        return None
+    return {**MUX_STATS_ENV, "MOLEHILL_STRIPE_COUNT": str(stripes)}
+
+
+def variant_stream_ceiling(variant: str, pool_size: int) -> int | None:
     """Concurrent data-stream ceiling of a molehill arm, or None when the
-    arm has no mux layer (direct mode). `mux1` runs one tunnel -> 32; the
-    count = 4 arms -> 128."""
+    arm has no mux layer (direct mode). `mux1` runs one tunnel -> 64; the
+    count = 4 arms -> 256.
+
+    The cap counts *streams*, and a tunnel also carries the channels the
+    bench itself holds open: the server pre-opens `pool_size` data
+    channels per registered service (iperf and echo here, plus the UDP
+    echo's own 2) at registration, and the measurement client's control
+    stream is one more. The usable data-stream ceiling is what remains.
+    Probed exactly on one host as cap - pools - control: a count = 1
+    tunnel with pool_size = 16 failed at the 16th data stream with
+    cap = 32 and at the 48th with cap = 64, i.e. 15 and 47 usable."""
     count = {"mux1": 1, "mux-off": None, "noise-direct": None}.get(variant, 4)
-    return None if count is None else count * MUX_MAX_STREAMS
+    if count is None:
+        return None
+    reserved = 2 * pool_size + 2  # iperf + echo pools, plus the UDP echo pool
+    # A striped visitor connection holds `stripes` streams on the tunnels,
+    # so the number of concurrent visitors the arm can carry is the stream
+    # budget divided by the stripe count (`mux-stripe` sets
+    # MOLEHILL_STRIPE_COUNT, below).
+    stripes = STRIPE_ARMS.get(variant, 1)
+    return (count * MUX_MAX_STREAMS - reserved - 1) // stripes
 
 
 class ArmProcs:
@@ -120,15 +154,25 @@ class ArmProcs:
         self.label = label
         self.pids = []
         self.tool_pids = []  # the proxied tool's own pids (RSS sampler input)
+        self.logs: list[Path] = []
 
-    def spawn(self, cmd: list, tool: bool = True) -> None:
-        log = self.work / f"{self.label.replace(' ', '_').replace('/', '_')}.log"
+    def spawn(self, cmd: list, tool: bool = True,
+              cwd: Path | None = None, role: str = "", env: dict | None = None) -> None:
+        # `role` keeps a multi-process arm's streams apart: without it every
+        # process of one arm appends to the same file, and a parser cannot
+        # tell their lines (or their counters) apart.
+        name = self.label.replace(" ", "_").replace("/", "_")
+        if role:
+            name = f"{name}.{role}"
+        log = self.work / f"{name}.log"
         with open(log, "ab") as f:
-            pid = subprocess.Popen(cmd, stdout=f, stderr=f).pid
+            pid = subprocess.Popen(cmd, stdout=f, stderr=f, cwd=cwd,
+                                   env=env or MUX_STATS_ENV).pid
         record_pid(self.work, pid)
         self.pids.append(pid)
         if tool:
             self.tool_pids.append(pid)
+        self.logs.append(log)
 
     def kill(self) -> None:
         for pid in self.pids:
@@ -141,11 +185,11 @@ class ArmProcs:
 _NOISE_KEYS = None
 
 
-def noise_keys() -> tuple:
+def noise_keys(binary: str) -> tuple:
     """Generate once per run and cache a Noise keypair via `--genkey`."""
     global _NOISE_KEYS
     if _NOISE_KEYS is None:
-        out = subprocess.run([knobs_bin(), "--genkey"], capture_output=True,
+        out = subprocess.run([binary, "--genkey"], capture_output=True,
                              text=True, timeout=30, check=False).stdout
         priv = pub = ""
         lines = out.splitlines()
@@ -158,6 +202,38 @@ def noise_keys() -> tuple:
             raise RuntimeError(f"noise keygen failed: {out[:200]}")
         _NOISE_KEYS = (priv, pub)
     return _NOISE_KEYS
+
+
+def ab_suffixes(bins: list) -> dict:
+    """{binary path: label suffix} — unique for every given binary.
+
+    The suffix distinguishes the two sides of an `--ab` interleave:
+    `merge_arm` keys results by (tool, cell), so two arms sharing a
+    label overwrite each other, and `ab_compare.py` pairs rounds by
+    parsing the suffix — a collision there reads as "not an A/B pair"
+    and the whole interleave is silently dropped. The short basename
+    keeps the chart legend readable, but two binaries built from
+    different worktrees usually share it (`target/release/molehill`),
+    so a collision falls back to a short hash of the full path: still
+    distinct, still stable across the run's three rounds.
+
+    A `None` entry (every run without `--ab`, and every non-molehill
+    tool) is skipped — those arms use no suffix at all.
+    """
+    by_name: dict = {}
+    for b in bins:
+        if b is None:
+            continue
+        by_name.setdefault(Path(b).name, []).append(b)
+    out = {}
+    for name, same in by_name.items():
+        for b in same:
+            label = name
+            if len(same) > 1:
+                digest = hashlib.sha256(str(Path(b).resolve()).encode()).hexdigest()
+                label = f"{name}-{digest[:8]}"
+            out[b] = label
+    return out
 
 
 def molehill_config(work: Path, variant: str, knobs: Knobs, p: dict) -> Path:
@@ -191,7 +267,7 @@ def molehill_config(work: Path, variant: str, knobs: Knobs, p: dict) -> Path:
         transport = "plain"
     noise_s = noise_c = ""
     if transport == "noise":
-        priv, pub = noise_keys()
+        priv, pub = noise_keys(knobs.molehill_bin)
         noise_s = f'[server.transport.noise]\nlocal_private_key = "{priv}"\n'
         noise_c = f'[client.transport.noise]\nremote_public_key = "{pub}"\n'
     data_s_block = f"[server.data]\n{data_s}" if data_s else ""
@@ -239,22 +315,34 @@ udp_send_queue_size = 1024
     return d
 
 
-def start_molehill(procs: ArmProcs, d: Path) -> None:
-    procs.spawn([knobs_bin(), "--server", str(d / "server.toml")])
-    procs.spawn([knobs_bin(), "--client", str(d / "client.toml")])
+def start_molehill(procs: ArmProcs, d: Path, variant: str = "",
+                   binary: str = "") -> None:
+    env = stripe_env(variant)
+    procs.spawn([binary, "--server", str(d / "server.toml")],
+                role="server", env=env)
+    procs.spawn([binary, "--client", str(d / "client.toml")],
+                role="client", env=env)
 
 
-_KNOBS = {"bin": None}
+# The framing counters are the bench's attribution tool (frames/s and
+# CPU/frame per arm), so every molehill arm runs with them on. Setting it
+# here rather than relying on the caller's shell keeps a forgotten variable
+# from silently turning the metric into an absent field.
+MUX_STATS_ENV = {**os.environ, "MOLEHILL_MUX_STATS": "1"}
+# A second, opt-in instrumentation switch: an explicit data-socket buffer
+# size. The rtt100 cell is bounded outside the engine (see HANDOFF), and
+# this is the variable that decides whether the kernel's auto-tuned window
+# is the binding constraint there. Unset leaves the kernel alone.
+_maybe_buf = os.environ.get("BENCH_TCP_BUFFER_BYTES")
+MUX_STATS_ENV = {**MUX_STATS_ENV,
+                 "MOLEHILL_TCP_BUFFER_BYTES": _maybe_buf} if _maybe_buf else MUX_STATS_ENV
 
-
-def knobs_bin() -> str:
-    return _KNOBS["bin"]
 
 
 def setup_molehill(variant: str, knobs: Knobs, p: dict, procs: ArmProcs,
                    work: Path) -> None:
     d = molehill_config(work, variant, knobs, p)
-    start_molehill(procs, d)
+    start_molehill(procs, d, variant, knobs.molehill_bin)
 
 
 def setup_frp(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
@@ -336,27 +424,107 @@ token = "bench"
     procs.spawn([str(peer), "--client", str(d / "client.toml")])
 
 
-def setup_bore(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
-    """TCP-only: two `bore local` instances (iperf + echo), no UDP arm."""
-    peer = Path(knobs.peer_dir) / "bore"
-    if p["mech"] == "weakproxy":
-        procs.spawn([str(peer), "server", "--bind-addr", "127.0.0.2",
-                     "--bind-tunnels", "127.0.0.1",
-                     "--min-port", str(p["iperf_exposed"] - 2),
-                     "--max-port", str(p["echo_exposed"] + 2)])
-    else:
-        procs.spawn([str(peer), "server", "--bind-addr", "127.0.0.1",
-                     "--min-port", str(p["iperf_exposed"] - 2),
-                     "--max-port", str(p["echo_exposed"] + 2)])
-    for _ in range(50):
-        if wait_port(7835, 0.5):
-            break
-    for exposed, backend in ((p["iperf_exposed"], p["iperf_backend"]),
-                             (p["echo_exposed"], p["echo_backend"])):
-        procs.spawn([str(peer), "local", str(backend), "--to", "127.0.0.1",
-                     "--port", str(exposed)])
-        if not wait_port(exposed, 3):
-            raise TimeoutError(f"bore tunnel {exposed} not ready")
+def setup_nps(knobs: Knobs, p: dict, procs: ArmProcs, work: Path) -> None:
+    """nps: one server (`nps`) plus one client (`npc`) holding all proxies.
+
+    nps multiplexes every proxy over its bridge connection — the same
+    shape as molehill's mux arm and frp — so it is a like-for-like peer.
+    Crypt and compress are OFF (the example npc.conf ships them on): the
+    plain-TCP peers are the unencrypted, uncompressed reference points.
+
+    nps resolves its config relative to the EXECUTABLE's directory — a
+    config in the CWD is silently ignored (verified: it bound the shipped
+    defaults instead) — so each arm builds its own tree next to the work
+    dir: hard links to the ~24 MB of binaries (same inode, and
+    /proc/self/exe resolves to this path), a real `conf/` to customise,
+    and the shipped web assets by symlink. The server also writes an
+    sqlite db, so it runs with this directory as its CWD.
+    """
+    d = work / "nps"
+    d.mkdir(exist_ok=True)
+    peer = Path(knobs.peer_dir) / "nps"
+    for binary in ("nps", "npc"):
+        target = d / binary
+        if not target.exists():
+            try:
+                os.link(peer / binary, target)
+            except OSError:  # different filesystem: fall back to a copy
+                shutil.copy2(peer / binary, target)
+        target.chmod(0o755)
+    conf = d / "conf"
+    conf.mkdir(exist_ok=True)
+    # nps also reads its registries (clients.json, hosts.json, ...) from
+    # the same directory and panics when they are missing, so link every
+    # shipped file that is not the config itself.
+    for shipped in (peer / "conf").iterdir():
+        if shipped.name != "nps.conf" and not (conf / shipped.name).exists():
+            os.link(shipped, conf / shipped.name)
+    # The web UI is mandatory in nps.conf; it takes a free slot in the
+    # arm's port band, and the http/https proxy ports stay empty so
+    # nothing privileged is opened.
+    (conf / "nps.conf").write_text(f"""appname = nps
+runmode = pro
+http_proxy_ip =
+http_proxy_port =
+https_proxy_port =
+bridge_type = tcp
+bridge_ip = 127.0.0.1
+bridge_port = {p['control']}
+public_vkey = bench
+log_level = 6
+web_host = 127.0.0.1
+web_username = bench
+web_password = bench
+web_ip = 127.0.0.1
+web_port = {p['nps_web']}
+allow_ports = {p['iperf_exposed']}-{p['udp_exposed']}
+allow_flow_limit = false
+allow_rate_limit = false
+allow_tunnel_num_limit = false
+allow_local_proxy = false
+allow_connection_num_limit = false
+allow_multi_ip = false
+system_info_display = false
+disconnect_timeout = 60
+""")
+    (d / "web").symlink_to(peer / "web", target_is_directory=True)
+    # No spaces around `=`: npc's ini parser keeps them (verified — the
+    # client then dials the wrong transport and dies on a UDP write to
+    # port 0), while nps.conf's parser accepts either.
+    (d / "npc.conf").write_text(f"""[common]
+server_addr=127.0.0.1:{p['client_dial']}
+conn_type=tcp
+vkey=bench
+auto_reconnection=true
+crypt=false
+compress=false
+max_conn=1000
+disconnect_timeout=60
+
+[tcp_iperf]
+mode=tcp
+target_addr=127.0.0.1:{p['iperf_backend']}
+server_port={p['iperf_exposed']}
+
+[tcp_echo]
+mode=tcp
+target_addr=127.0.0.1:{p['echo_backend']}
+server_port={p['echo_exposed']}
+
+[udp_udpecho]
+mode=udp
+target_addr=127.0.0.1:{p['udp_backend']}
+server_port={p['udp_exposed']}
+""")
+    procs.spawn([str(d / "nps")], cwd=d)
+    if not wait_port(p["control"], 10):
+        raise TimeoutError("nps bridge port did not open")
+    procs.spawn([str(d / "npc"), "-config", str(d / "npc.conf")], cwd=d)
+    # The TCP tunnels only: a UDP task has no listening TCP port to wait
+    # for (the bench's own UDP probe is what exercises it).
+    for port in (p["iperf_exposed"], p["echo_exposed"]):
+        if not wait_port(port, 10):
+            raise TimeoutError(f"nps tunnel {port} not ready")
 
 
 def _start_weakproxy(procs: ArmProcs, p: dict) -> None:
@@ -379,6 +547,8 @@ def cell_port_map(base: int, off: int, mech: str) -> dict:
         # KCP tunnel listener (UDP): distinct within the tool band and below
         # the backend block at base+90
         "kcp_bind": base + off + 6,
+        # nps's web UI (nps.conf requires one): a free slot in the band
+        "nps_web": base + off + 8,
         "iperf_backend": base + 90,
         "echo_backend": base + 91,
         "udp_backend": base + 92,
@@ -407,11 +577,11 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                     raise
                 return procs
             arms.append((f"molehill {tool_version(knobs)} ({variant})",
-                         start, True, True, variant_stream_ceiling(variant)))
+                         start, True, True,
+                         variant_stream_ceiling(variant, knobs.pool_size)))
     else:
         setup = {"frp": setup_frp, "rathole": setup_rathole,
-                 "bore": setup_bore}[tool]
-        has_udp = tool not in TCP_ONLY
+                 "nps": setup_nps}[tool]
 
         def start():
             procs = ArmProcs(work, f"{tool} {spec.name}")
@@ -422,7 +592,7 @@ def build_arms(tool: str, spec, variants: list, knobs: Knobs, p: dict,
                 procs.kill()
                 raise
             return procs
-        arms.append((f"{tool} {peer_version(tool, knobs)}", start, has_udp,
+        arms.append((f"{tool} {peer_version(tool, knobs)}", start, True,
                      False, None))
     return arms
 
@@ -512,7 +682,7 @@ def mixed_bulk_latency(backends, iperf_exposed: int, echo_port: int,
 
 def tool_version(knobs: Knobs) -> str:
     try:
-        out = subprocess.run([knobs_bin(), "--version"],
+        out = subprocess.run([knobs.molehill_bin, "--version"],
                              capture_output=True, text=True,
                              check=False, timeout=15).stdout
         return next((l.split()[2] for l in out.splitlines()
@@ -523,7 +693,8 @@ def tool_version(knobs: Knobs) -> str:
 
 def peer_version(tool: str, knobs: Knobs) -> str:
     """Best-effort version string: peers print it in different places
-    (frp on stderr, rathole as a 'Build Version:' line, bore on stdout);
+    (frp on stderr, rathole as a 'Build Version:' line, nps as a
+    'Version:' line);
     fall back to the release-version marker written by fetch_peers.py,
     then to the upstream release version constant."""
     binname = PEER_BINS[tool]
@@ -603,6 +774,31 @@ def _thr_fields(prefix: str, thr) -> dict:
     return out
 
 
+class ArmTimeout(Exception):
+    """One arm exceeded its wall-clock budget (see `arm_watchdog`)."""
+
+
+def arm_watchdog(seconds: float):
+    """Arm a wall-clock alarm for one arm, returning its previous handler.
+
+    A hung arm is the failure mode this guards: a wedged iperf3 client or a
+    tunnel that stopped forwarding used to leave the run sitting on a
+    blocking read for as long as the OS allowed, which looks identical to a
+    slow cell from outside and (worse) holds the bench lock, so every later
+    invocation exits immediately without producing results. The alarm makes
+    the hang a recorded error instead.
+
+    The previous handler is returned so the caller can restore it, and the
+    alarm is one-shot: an arm that finishes in time never sees it.
+    """
+    def _fire(signum, frame):
+        raise ArmTimeout(f"arm exceeded {seconds:g}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    return previous
+
+
 def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
             stream_ceiling: int | None, knobs: Knobs, p: dict, mech: str,
             data: dict, out_path: Path, base: int, work: Path) -> None:
@@ -632,6 +828,14 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         print(f"RESULT [{spec.name}] {label}: error: {entry['error']}",
               flush=True)
         return
+    # The arm's wall-clock span: the denominator for the framing rates, and
+    # the window the CPU average covers (the sampler runs for the same span).
+    arm_t0 = time.monotonic()
+    # A shaped cell's probes are far slower than a loopback one, so the
+    # budget scales with the test length rather than being a flat constant:
+    # the sum of the per-probe timeouts plus headroom for setup and teardown.
+    budget = knobs.arm_timeout(spec)
+    previous_handler = arm_watchdog(budget)
     try:
         if not wait_port(p["iperf_exposed"], 25) or \
                 not wait_port(p["echo_exposed"], 25):
@@ -725,9 +929,17 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         # wedge the shared mux tunnel, and the TCP metrics must not inherit
         # that state. The scale stream count stays below the yamux ceiling
         # (count x MUX_MAX_STREAMS): an arm whose ceiling is lower than the
-        # scale point (count = 1 -> 32) is skipped deliberately — attempting
-        # it wedges the per-arm iperf3 server and poisons the mixed-workload
-        # probe that follows.
+        # scale point is skipped for an arm whose ceiling is below it
+        # (deliberately: attempting it wedges the per-arm iperf3 server and
+        # poisons the mixed-workload probe that follows). The ceiling
+        # model subtracts the bench's own pooled channels and the client's
+        # control stream, so a count = 1 arm's ceiling (45 with the default
+        # pool_size = 8) sits below the 64-stream scale point and the cell
+        # is skipped for it; the count = 4 arms (237) run it. Attempting it
+        # anyway does not merely fail the dial: exceeding the cap closes
+        # the tunnel connection, and the 8-stream cell that runs after
+        # this one then hangs against the dead tunnel (observed: every
+        # iperf3 rep timing out at the harness bound).
         if spec.name == "loopback" and (stream_ceiling is None
                                         or knobs.scale_streams
                                         <= stream_ceiling):
@@ -801,9 +1013,62 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
         }
         if partial:
             entry["partial_metrics"] = partial
+        # Read molehill's framing counters while the processes are still
+        # alive: their logs are the source, and the delta across the arm's
+        # stats lines is what turns counters into a rate.
+        framing = framing_stats(procs.logs)
+        if framing:
+            entry["framing"] = framing
+            # The attribution metric: throughput alone cannot tell "too much
+            # work per frame" from "too many frames", and the engine's whole
+            # cost is their product. Note the directions are counted
+            # separately: a frame is written once and read once (on opposite
+            # processes), so the wire rate is the written total while the
+            # per-frame cost divides by the work actually done, which is the
+            # written + read total. Absent for mux-off, which has no engine.
+            cpu = entry.get("cpu") or {}
+            cpu_pct = cpu.get("total_avg_pct") or 0.0
+            written = framing.get("frames_written_delta", 0)
+            read = framing.get("frames_read_delta", 0)
+            nbytes = framing.get("frame_bytes_delta", 0)
+            elapsed = max(1.0, time.monotonic() - arm_t0)
+            if (written + read) and cpu_pct:
+                entry["framing_cpu"] = {
+                    "frames_per_s": round(written / elapsed, 1),
+                    # Both directions contribute to the byte total, so the
+                    # average body size divides by the frames *processed*
+                    # (written + read), not by the written count alone.
+                    "avg_frame_bytes": round(nbytes / (written + read), 1),
+                    "cpu_pct_per_kframe": round(cpu_pct * 1000 / (written + read), 4),
+                    "arm_seconds": round(elapsed, 1),
+                }
+        elif any(f"({v})" in label for v in ("mux", "mux1", "noise", "kcp4")):
+            # A framed arm with no mux-stats lines at all is an INSTRUMENT
+            # failure, not a metric that happens to be zero: the bench sets
+            # MOLEHILL_MUX_STATS=1 for every molehill spawn, so the engine's
+            # counters were either not emitted or the logs were lost. A whole
+            # matrix once ran with this silently absent (the host's
+            # environment dropped the env mid-session) and only the missing
+            # framing_cpu column hinted at it — record the reason instead
+            # (AGENTS.md §10: every failure leaves evidence). Re-assign
+            # because `partial_metrics` was already attached to the entry
+            # above; the list is shared, but the assignment keeps the intent
+            # local to this branch.
+            partial.append(
+                "framing: no mux-stats lines in this arm's logs "
+                "(MOLEHILL_MUX_STATS=1 is set for every spawn; the engine "
+                "counters were not emitted — attribution metrics absent)")
+            entry["partial_metrics"] = partial
+    except ArmTimeout as e:
+        # A hung arm is recorded like any other failure so the matrix moves
+        # on; the partial probes it did finish are discarded because their
+        # windows are not comparable to a completed arm's.
+        entry = {"status": "error", "error": f"ArmTimeout: {e}"}
     except Exception as e:  # continue-on-error: record and move on
         entry = {"status": "error", "error": f"{type(e).__name__}: {e}"}
     finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
         procs.kill()
         backends.stop()
     merge_arm(data, label, spec.name, entry, out_path)
@@ -814,8 +1079,8 @@ def run_arm(label: str, spec, start_fn, has_udp: bool, full_rigor: bool,
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--tools", default="molehill,frp,rathole,bore",
-                    help="comma list: molehill,frp,rathole,bore")
+    ap.add_argument("--tools", default="molehill,frp,rathole,nps",
+                    help="comma list: molehill,frp,rathole,nps")
     ap.add_argument("--cells",
                     default="0/0,0/10,0/100,1%/10,5%/100,2:25/10,"
                             "r100/20,r20/40,j20/10",
@@ -830,6 +1095,12 @@ def main():
     ap.add_argument("--fresh", action="store_true",
                     help="discard existing results instead of merging")
     ap.add_argument("--pool-size", type=int, default=8)
+    ap.add_argument("--ab", metavar="BIN_A,BIN_B",
+                    help="interleave two molehill binaries inside every cell "
+                         "(round-robin over rounds) so the epoch drift that "
+                         "defeats sequential before/after runs is shared by "
+                         "both; comma-free paths only, and each run writes "
+                         "its own --out. See AGENTS.md section 10")
     args = ap.parse_args()
 
     # Yield to interactive/system tasks: the matrix saturates every core it
@@ -840,7 +1111,6 @@ def main():
 
     knobs = Knobs.from_env()
     knobs.pool_size = args.pool_size
-    _KNOBS["bin"] = knobs.molehill_bin
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
     cells = [parse_cell(c.strip()) for c in args.cells.split(",") if c.strip()]
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
@@ -890,6 +1160,12 @@ def main():
         "churn_concurrency": knobs.churn_concurrency,
         "udp_capacity_datagrams": knobs.udp_capacity_count,
         "udp_capacity_pps": knobs.udp_capacity_pps,
+        # the steady UDP ping's own shape: count x interval sets how long
+        # the session is observed and what one "lost datagram" is worth
+        # (a method parameter — AGENTS.md §10 — recorded so the loss_pct
+        # denominator is auditable)
+        "udp_ping_datagrams": knobs.udp_count,
+        "udp_ping_interval_ms": knobs.udp_interval_ms,
         # netem rate-cell queue depth: a measurement parameter that changes
         # the result (see bench_lib.RATE_QUEUE_LIMIT), recorded so a weak
         # rate cell can be attributed to the tool rather than the shaper
@@ -936,28 +1212,61 @@ def main():
                     if tool != "molehill" and not peer_cell(spec):
                         continue
                     off = {"molehill": 0, "frp": 20, "rathole": 40,
-                           "bore": 60}[tool]
+                           "nps": 80}[tool]
                     p = cell_port_map(base, off, mech)
-                    if tool == "bore" and mech == "weakproxy":
-                        # bore's control port is fixed at 7835; the weakproxy
-                        # holds 127.0.0.1:7835 so the server moves to .2
-                        p["weakproxy_cmd"] = [
-                            sys.executable,
-                            str(Path(__file__).parent / "weakproxy.py"),
-                            "7835", "127.0.0.2:7835", f"{spec.rtt:g}"]
-                        p["client_dial"] = 7835
-                    elif mech == "weakproxy":
+                    if mech == "weakproxy":
                         p["weakproxy_cmd"] = [
                             sys.executable,
                             str(Path(__file__).parent / "weakproxy.py"),
                             str(p["client_dial"]),
                             f"127.0.0.1:{p['control']}", f"{spec.rtt:g}"]
-                    for (label, start_fn, has_udp, full_rigor,
-                         stream_ceiling) in build_arms(
-                            tool, spec, variants, knobs, p, work):
-                        run_arm(label, spec, start_fn, has_udp, full_rigor,
-                                stream_ceiling, knobs, p, mech, data,
-                                out_path, base, work)
+                    # --ab: run this cell's molehill arms once per binary,
+                    # then repeat and average per round; the two binaries
+                    # alternate within each round so both sample the same
+                    # epochs (sequential before/after runs are defeated by
+                    # ~12% epoch drift on the shaped cells — see HANDOFF).
+                    # Peers never take part: they are reference points.
+                    ab_bins = ([b for b in args.ab.split(",") if b]
+                               if args.ab and tool == "molehill" else [None])
+                    if len(ab_bins) > 2:
+                        raise SystemExit("--ab takes exactly two binaries")
+                    # Unique label per binary (see `ab_suffixes`): two
+                    # worktree builds share the basename `molehill`, and a
+                    # colliding suffix would make the two sides overwrite
+                    # each other and `ab_compare` see no pair at all.
+                    ab_label = ab_suffixes(ab_bins)
+                    # Record which label is which path in the results meta:
+                    # `ab_compare` sorts the pair by label, so a reader who
+                    # assumes "first printed = A = the left --ab entry" can
+                    # silently read a verdict backwards (it happened: a
+                    # winning change was read as a regression and reverted).
+                    data["meta"]["ab_bin_paths"] = {
+                        ab_label[b]: str(Path(b).resolve())
+                        for b in ab_bins
+                        if b is not None
+                    }
+                    for ab_round in range(1, knobs.molehill_reps + 1):
+                        for ab_bin in ab_bins:
+                            if ab_bin is not None:
+                                # `knobs.molehill_bin` is what every spawn
+                                # site reads, so this alone swaps the
+                                # interleave's binary.
+                                knobs.molehill_bin = ab_bin
+                            # The label must distinguish the two binaries:
+                            # merge_arm keys results by (tool, cell), so two
+                            # arms sharing a label would overwrite each
+                            # other in the same file. The short basename
+                            # keeps the chart's legend readable.
+                            suffix = ("" if ab_bin is None
+                                      else f" (ab{ab_round}:"
+                                           f"{ab_label[ab_bin]})")
+                            for (label, start_fn, has_udp, full_rigor,
+                                 stream_ceiling) in build_arms(
+                                    tool, spec, variants, knobs, p, work):
+                                run_arm(label + suffix, spec, start_fn,
+                                        has_udp, full_rigor, stream_ceiling,
+                                        knobs, p, mech, data, out_path, base,
+                                        work)
             finally:
                 netem.off()
     except KeyboardInterrupt:

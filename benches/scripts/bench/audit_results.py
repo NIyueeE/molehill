@@ -36,7 +36,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", nargs="?", default="benches/scripts/bench/"
                     "results-v0.8.0.json")
-    ap.add_argument("--udp-tools", default="molehill,frp,rathole")
+    ap.add_argument("--udp-tools", default="molehill,frp,rathole,nps")
     ap.add_argument("--show-ok", action="store_true")
     args = ap.parse_args()
 

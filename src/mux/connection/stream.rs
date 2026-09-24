@@ -16,18 +16,11 @@ use crate::mux::{
     chunks::Chunks,
     connection::{self, StreamCommand, rtt},
     frame::{
-        Frame,
+        Either, Frame,
         header::{Data, Header, StreamId, WindowUpdate},
     },
 };
 use flow_control::FlowController;
-use futures::{
-    SinkExt,
-    channel::mpsc,
-    future::Either,
-    io::{AsyncRead, AsyncWrite},
-    ready,
-};
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     fmt, io,
@@ -35,6 +28,8 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Waker},
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc;
 
 mod flow_control;
 
@@ -202,18 +197,37 @@ impl Stream {
         }
     }
 
+    /// Park this stream's task until the connection's command channel has
+    /// capacity again (`wake_stream_writer` on the connection retries us).
+    ///
+    /// The capacity re-check after storing the waker closes a lost-wakeup
+    /// race: the connection runs on another task and may free capacity —
+    /// finding no waker to wake — between the caller's capacity check and
+    /// the store below. Re-checking after the store is airtight: a wake
+    /// after the store sees the stored waker, a wake before it is caught
+    /// by the re-check.
+    fn park_on_full_channel(&mut self, cx: &mut Context<'_>) {
+        self.shared().writer = Some(cx.waker().clone());
+        if self.sender.capacity() > 0
+            && let Some(w) = self.shared().writer.take()
+        {
+            w.wake();
+        }
+    }
+
     /// Send new credit to the sending side via a window update message if
     /// permitted.
-    fn send_window_update(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn send_window_update(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.shared.lock().state.can_read() {
             return Poll::Ready(Ok(()));
         }
 
-        ready!(
-            self.sender
-                .poll_ready(cx)
-                .map_err(|_| self.write_zero_err())?
-        );
+        // Check channel capacity before consuming the credit: on a full
+        // channel the next poll retries from here and nothing is lost.
+        if self.sender.capacity() == 0 {
+            self.park_on_full_channel(cx);
+            return Poll::Pending;
+        }
 
         let Some(credit) = self.shared.lock().next_window_update() else {
             return Poll::Ready(Ok(()));
@@ -222,91 +236,33 @@ impl Stream {
         let mut frame = Frame::window_update(self.id, credit).right();
         self.add_flag(frame.header_mut());
         let cmd = StreamCommand::SendFrame(frame);
+        // Capacity was checked immediately above and this task is the only
+        // sender on the channel, so a full channel here is not reachable;
+        // a closed one means the connection is gone.
         self.sender
-            .start_send(cmd)
+            .try_send(cmd)
             .map_err(|_| self.write_zero_err())?;
 
         Poll::Ready(Ok(()))
     }
 }
 
-/// Byte data produced by the [`futures::stream::Stream`] impl of [`Stream`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Packet(Vec<u8>);
-
-impl AsRef<[u8]> for Packet {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
-    }
-}
-
-impl futures::stream::Stream for Stream {
-    type Item = io::Result<Packet>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        if !self.config.read_after_close && self.sender.is_closed() {
-            return Poll::Ready(None);
-        }
-
-        match self.send_window_update(cx) {
-            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-            // Continue reading buffered data even though sending a window update blocked.
-            Poll::Ready(Ok(())) | Poll::Pending => {}
-        }
-
-        let mut shared = self.shared();
-
-        if let Some(bytes) = shared.buffer.pop() {
-            let off = bytes.offset();
-            let mut vec = bytes.into_vec();
-            if off != 0 {
-                // This should generally not happen when the stream is used only as
-                // a `futures::stream::Stream` since the whole point of this impl is
-                // to consume chunks atomically. It may perhaps happen when mixing
-                // this impl and the `AsyncRead` one.
-                tracing::debug!(
-                    "{}/{}: chunk has been partially consumed",
-                    self.conn,
-                    self.id
-                );
-                vec = vec.split_off(off);
-            }
-            return Poll::Ready(Some(Ok(Packet(vec))));
-        }
-
-        // Buffer is empty, let's check if we can expect to read more data.
-        if !shared.state().can_read() {
-            tracing::debug!("{}/{}: eof", self.conn, self.id);
-            return Poll::Ready(None); // stream has been reset
-        }
-
-        // Since we have no more data at this point, we want to be woken up
-        // by the connection when more becomes available for us.
-        shared.reader = Some(cx.waker().clone());
-
-        Poll::Pending
-    }
-}
-
-// Like the `futures::stream::Stream` impl above, but copies bytes into the
-// provided mutable slice.
 impl AsyncRead for Stream {
     fn poll_read(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if !self.config.read_after_close && self.sender.is_closed() {
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(()));
         }
 
-        match self.send_window_update(cx) {
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-            // Continue reading buffered data even though sending a window update blocked.
-            Poll::Ready(Ok(())) | Poll::Pending => {}
-        }
-
-        // Copy data from stream buffer.
+        // Copy data from stream buffer FIRST: delivering buffered bytes
+        // needs no channel capacity, while the window update below does.
+        // Parking on a full command channel while data is still buffered
+        // starves the peer's sender (its credit only comes back through
+        // that update) and can deadlock the tunnel — the buffered data is
+        // exactly what breaks the cycle.
         let mut shared = self.shared();
         let mut n = 0;
         while let Some(chunk) = shared.buffer.front_mut() {
@@ -314,29 +270,52 @@ impl AsyncRead for Stream {
                 shared.buffer.pop();
                 continue;
             }
-            let k = std::cmp::min(chunk.len(), buf.len() - n);
-            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
+            let k = std::cmp::min(chunk.len(), buf.remaining());
+            buf.put_slice(&chunk.as_ref()[..k]);
             n += k;
             chunk.advance(k);
-            if n == buf.len() {
+            if buf.remaining() == 0 {
                 break;
             }
         }
 
+        // Attempt the window update on every poll, delivered data or not:
+        // the credit math accounts for what is still buffered, so firing
+        // early is correct and keeps the peer's sender supplied steadily
+        // (waiting for an empty buffer sends fewer, burstier updates). The
+        // delivery above already happened, so a channel that parks here
+        // never holds buffered data hostage — the update retries on the
+        // next poll.
+        drop(shared);
+        match self.send_window_update(cx) {
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) | Poll::Pending => {}
+        }
+
         if n > 0 {
             tracing::trace!("{}/{}: read {} bytes", self.conn, self.id, n);
-            return Poll::Ready(Ok(n));
+            return Poll::Ready(Ok(()));
         }
+
+        let mut shared = self.shared();
 
         // Buffer is empty, let's check if we can expect to read more data.
         if !shared.state().can_read() {
             tracing::debug!("{}/{}: eof", self.conn, self.id);
-            return Poll::Ready(Ok(0)); // stream has been reset
+            return Poll::Ready(Ok(())); // stream has been reset
         }
 
         // Since we have no more data at this point, we want to be woken up
         // by the connection when more becomes available for us.
         shared.reader = Some(cx.waker().clone());
+        // Re-check after storing: the connection may have pushed data in
+        // between (a lost-wakeup race: the wake found no waker to wake
+        // yet).
+        if shared.buffer.len() > 0
+            && let Some(w) = shared.reader.take()
+        {
+            w.wake();
+        }
 
         Poll::Pending
     }
@@ -345,14 +324,15 @@ impl AsyncRead for Stream {
 impl AsyncWrite for Stream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        cx: &mut Context,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(
-            self.sender
-                .poll_ready(cx)
-                .map_err(|_| self.write_zero_err())?
-        );
+        // Park the writer on a full command channel before any window is
+        // consumed; `wake_stream_writer` on the connection retries us.
+        if self.sender.capacity() == 0 {
+            self.park_on_full_channel(cx);
+            return Poll::Pending;
+        }
         let body = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
@@ -362,6 +342,14 @@ impl AsyncWrite for Stream {
             if shared.send_window() == 0 {
                 tracing::trace!("{}/{}: no more credit left", self.conn, self.id);
                 shared.writer = Some(cx.waker().clone());
+                // Re-check after storing: a window update from the
+                // connection may have landed in between (a lost-wakeup
+                // race: the wake found no waker to wake yet).
+                if shared.send_window() > 0
+                    && let Some(w) = shared.writer.take()
+                {
+                    w.wake();
+                }
                 return Poll::Pending;
             }
             let k = std::cmp::min(shared.send_window() as usize, buf.len());
@@ -402,27 +390,30 @@ impl AsyncWrite for Stream {
         }
 
         let cmd = StreamCommand::SendFrame(frame);
+        // Capacity was checked immediately above and this task is the only
+        // sender on the channel, so a full channel here is not reachable;
+        // a closed one means the connection is gone.
         self.sender
-            .start_send(cmd)
+            .try_send(cmd)
             .map_err(|_| self.write_zero_err())?;
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        self.sender
-            .poll_flush_unpin(cx)
-            .map_err(|_| self.write_zero_err())
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Commands are queued in the channel by `try_send`; there is
+        // nothing to wait for here (futures' mpsc `Sink` flush was a
+        // no-op as well).
+        Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.is_closed() {
             return Poll::Ready(Ok(()));
         }
-        ready!(
-            self.sender
-                .poll_ready(cx)
-                .map_err(|_| self.write_zero_err())?
-        );
+        if self.sender.capacity() == 0 {
+            self.park_on_full_channel(cx);
+            return Poll::Pending;
+        }
         let ack = if self.flag == Flag::Ack {
             self.flag = Flag::None;
             true
@@ -431,8 +422,11 @@ impl AsyncWrite for Stream {
         };
         tracing::trace!("{}/{}: close", self.conn, self.id);
         let cmd = StreamCommand::CloseStream { ack };
+        // Capacity was checked immediately above and this task is the only
+        // sender on the channel, so a full channel here is not reachable;
+        // a closed one means the connection is gone.
         self.sender
-            .start_send(cmd)
+            .try_send(cmd)
             .map_err(|_| self.write_zero_err())?;
         self.shared()
             .update_state(self.conn, self.id, State::SendClosed);

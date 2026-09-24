@@ -64,12 +64,17 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 64 * 1024 * 1024;
 ///
 /// This is NOT a free knob: yamux reserves `streams * 256 KiB` of the
 /// connection window as guaranteed credit and only lets the auto-tuner
-/// allocate the remainder. 32 streams keep 56 MiB allocatable out of the
-/// 64 MiB window; 64 streams would eat the whole window at 16 MiB — and
-/// measured 0.1 Gbps at 10 ms RTT (a 30x drop), since the auto-tuner can
-/// then never grow any stream's window.
+/// allocate the remainder. A stream count whose reservation swallows the
+/// window pins every stream at 256 KiB — measured 0.1 Gbps at 10 ms RTT,
+/// a ~30x drop — so the pairing with `DEFAULT_MUX_RECEIVE_WINDOW` is
+/// guarded by a unit test (the reservation must stay under half the
+/// window). 32 streams reserve 8 MiB of the 64 MiB window; 64 reserve
+/// 16 MiB and still leave 48 MiB (75%) auto-tunable, while doubling the
+/// per-client connection ceiling at the default `count = 4` (128 -> 256).
+/// Measured on the `mux1` arm across the full matrix: see HANDOFF.md,
+/// "Phase 4: L2 landed".
 #[cfg(feature = "multiplex")]
-pub const DEFAULT_MUX_MAX_STREAMS: usize = 32;
+pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
 
 /// Default idle timeout (seconds) after which an inactive UDP peer mapping is
 /// cleaned up on the client side.
