@@ -92,6 +92,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate climbs from 0% to 30%+ as the cell collapses, while the 1- and
   8-stream cells retransmit nothing. Table and method: HANDOFF.md,
   "KCP attribution (Phase 0)". An instrument, not a behaviour change.
+- The KCP attribution instrument's delivery phase is split and a
+  timer-scope bug fixed: the "deliver" timer's binding outlived its
+  statement, so it booked the rest of the pump round (the SACK check,
+  the ack flush, the wire drain, the liveness tail) into the delivery
+  phase — the Phase 0 table's "delivery 2.46 us per sent segment" was
+  mostly the wire drain. The phase is now block-scoped, `kcp-stats`
+  gains `segments_delivered`, `recv_empty`, `ms_deliver_spill` and
+  `ms_deliver_recv`, and the re-based loopback kcp4 table (1 rep x 8 s,
+  both processes) reads: sender per segment — writer 0.60 us, wire
+  drain 2.55 us, input 0.09, update 0.01 (pump body ~3.26 us, pump
+  rounds 3002/s against 4842/s before send batching landed);
+  receiver per segment — input 0.42, deliver 0.41 (recv loop 0.40,
+  spill 0.01), output 0.42, with 8.0 segments per reader message. The
+  Phase 0 "sender delivery anomaly" is retired as an artifact; the
+  re-aimed targets (the wire drain on the send side, the recv-loop
+  copies on the receive side) are exactly what the zero-copy route's
+  first links remove. Also recorded: the full-path copy map and the
+  L1-L3/M1/N1/S1 link sequence in HANDOFF.md, "Zero-copy route".
+- Link L1 of the zero-copy route landed: the KCP read path hands the
+  engine's own segment buffers to the reader channel BY OWNERSHIP
+  (`Kcp::recv_owned` freezes each segment in place; the reader-channel
+  message is a `ReadBatch` of parts), so both per-byte copies the
+  receive path paid (into the caller's buffer, then into the
+  coalescing blob) are gone — the Phase-1 receive batching is now free
+  (reference-count moves, not memcpys). The engine's buffer-API `recv`
+  became a thin wrapper over the same core and is test-gated; new
+  engine tests lock the two read APIs byte-for-byte identical.
+  Measured per delivered segment (interleaved A/B, 3 rounds x 3 reps,
+  cells loopback / loss1_rtt10 / rtt100, kcp4 arm + the loopback
+  mux-off control, both binaries' SHAs verified): the recv loop fell
+  **0.72-0.79 -> 0.042-0.046 us on loss1_rtt10 (-94%)** and
+  0.30-0.58 -> 0.045-0.051 us on loopback, with the
+  segments-per-reader-message ratio held (11.6 identical on loss1,
+  ~8 on loopback) and the input/output phases unchanged. No
+  attributable throughput regression; rtt100 1-stream +5.4%
+  non-overlapping is recorded as directional (that cell has no control
+  arm to establish its bias floor and swung -13.5% in the previous
+  A/B), and CPU / RSS / cpu-per-kframe moved favourably on every cell
+  (median-only). Details and the full table: HANDOFF.md, "Link L1 A/B".
+- Link L2 of the zero-copy route landed: stream-mode PUSH datagrams are
+  emitted by the engine as a 24-byte header plus the segment's own
+  payload buffer by reference (`DatagramSink::write_datagram`; the
+  segment payload type moved from `BytesMut` to `Bytes`), and the
+  adapter's batch carries the payload as a second iovec
+  (`Span::Split`) that `sendmmsg` writes directly — the engine's
+  staging buffer and the adapter's batch copy both disappear on the
+  send path, so a sent byte is copied zero times between the app write
+  and the syscall. The wire bytes are identical to the packed form
+  (engine test locks them byte-for-byte and the retransmit re-emits the
+  same allocation); ack/probe datagrams keep the packed path.
+  Measured (interleaved A/B, 3 rounds x 3 reps, cells loopback /
+  loss1_rtt10 / rtt100, kcp4 arm + the loopback mux-off control, both
+  binaries' SHAs verified): no attributable throughput change —
+  loopback 1-stream -0.2% and 64-stream -1.0% non-overlapping (the
+  control arm's own noise on those cells is +/-9%), the 8-stream cells
+  inside their spreads, and the rtt100 1-stream -40% claim is not
+  attributable (that cell is bimodal on both binaries — the parent
+  itself sampled the 0.01 Gbit/s mode twice — and the medians differ by
+  rep count, inside the cell's documented 7x spread). CPU moved
+  favourably on loopback (-4.6%) and rtt100 (-11.3%), median-only; RSS
+  +12.4%/+16.7% median-only on loopback/loss1 (a pacer-denied span now
+  holds its payload `Bytes` instead of a staged copy, bounded by the
+  32-datagram batch). Details: HANDOFF.md, "Link L2 A/B".
+- Link L3 of the zero-copy route landed: the kcp4+noise write path hands
+  the Noise record to the writer channel **by ownership** — the record
+  buffer the AEAD encrypted into *is* the transport's buffer, gated by
+  the `TAKES_OWNED` const so a plain-TCP transport keeps the pooled
+  path — and the engine's `send_owned` shares it per segment with O(1)
+  `Bytes` splits, so both remaining per-byte copies on that path (the
+  channel copy and the engine's segment copy) are gone and a sent byte
+  is copied zero times between the app write and the syscall, AEAD
+  aside. The engine's slice `send` is now only the owned path's test
+  oracle (byte-for-byte lock). Measured (interleaved A/B, 3 rounds x
+  3 reps, cells loopback / loss1_rtt10, kcp4 arm + the mux-off control,
+  both binaries' SHAs verified; the run was interrupted at the start of
+  the rtt100 cell, so that cell is not part of the comparison):
+  **+5.7%** on loopback 1-stream and **+24.4%** on loopback 64-stream
+  (both non-overlapping, the latter exceeding the control arm's own
+  +11.3% bias on that cell); the loss1_rtt10 -0.3%/-0.4% tool claims sit
+  inside the cell's own ±7% rep spread with comparable retransmits, and
+  the mux-off control's -10.3% on loopback 1-stream is that cell's
+  ordering bias (the plain-TCP arm shares no code with this change, and
+  the same control measured +11.3% on 64-stream). CPU / RSS /
+  cpu-per-kframe all median-only favourable or flat. Details: HANDOFF.md,
+  "Link L3 A/B".
+- Link S1 of the zero-copy route landed: the stripe send direction
+  reads each chunk **directly into the payload region of its frame
+  buffer** — behind the 10-byte header, which is written in front once
+  the read length is known — and hands the whole frame to the stripe by
+  ownership, so the send direction's staging copy is gone (the read
+  buffer becomes the frame). The stripe write itself keeps the borrowed
+  boundary (`WriteHalf` hides the inner owned-write capability), and the
+  wire format and the round-robin/commit semantics are unchanged. An
+  interleaved A/B against the parent revision (3 rounds, 3 reps, 8 s
+  tests, loopback cell, mux-stripe arm + the unstriped `mux` inertness
+  control + the mux-off control, both binaries' commit SHAs verified)
+  measures **+9.7%** on the stripe arm's 1-stream (17.098 -> 18.758
+  Gbit/s, the head ahead in all 3 rounds) — inside the cell's spread, so
+  recorded as directional, not claimed — with 8-stream at parity
+  (-3.3%, inside spread) and the unstriped control unchanged. The cost
+  is the per-chunk frame buffer allocated per read instead of reused:
+  RSS +10.7% and CPU +3.3% on the opt-in stripe arm (median-only). The
+  same link's sibling on the default arms, M1 (owned mux frame bodies),
+  was reverted after its A/B — it failed the gate on four cells
+  (including both single-rep 64-stream points) with RSS +25% on the
+  default arms; the evidence and the identified cost mechanism are in
+  HANDOFF.md, "Link M1 A/B". Details: HANDOFF.md, "Link S1 A/B".
 - The KCP data path (carrier `kcp`) amortizes its per-segment
   bookkeeping: the engine's outbound datagrams stage in a reusable
   ~46 KiB buffer and cross the pump channel as ONE message per batch

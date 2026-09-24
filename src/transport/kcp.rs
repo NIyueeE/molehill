@@ -49,18 +49,33 @@
 //! SACK gap notification: 10 ms cooldown, 16-segment pile-up (below the
 //! nodelay RTO floor, so the SACK beats the RTO backoff).
 //!
-//! **IO batching** (userspace and syscall): the engine's datagrams stage
-//! in a reusable per-session buffer and cross to the pump as ONE channel
-//! message per batch (`DatagramOut` — closed at 32 datagrams, the ~46 KiB
-//! staging cap, or the engine's flush boundary), and the reader side
-//! coalesces consecutive segments into one channel message per ~16 KiB
-//! (`deliver_recv`). On Linux the wire path then batches with
+//! **IO batching and the zero-copy send path** (userspace and syscall):
+//! the engine's datagrams stage in a reusable per-session buffer and
+//! cross to the pump as ONE channel message per batch (`DatagramOut` —
+//! closed at 32 datagrams, the ~46 KiB staging cap, or the engine's flush
+//! boundary). Stream-mode PUSH datagrams take the engine's
+//! `write_datagram` boundary instead: the 24-byte header stages while the
+//! payload travels as a second iovec that points at the engine segment's
+//! own buffer, so the payload is copied zero times between the app write
+//! and `sendmmsg`. The reader side hands the engine's own segment buffers
+//! to the reader channel BY OWNERSHIP (`recv_owned` freezes each segment
+//! in place; no payload copy on the read path), batched into one
+//! `ReadBatch` message per ~16 KiB (`deliver_recv`). On Linux the wire
+//! path then batches with
 //! `recvmmsg`/`sendmmsg` (up to 32 datagrams per syscall, the
 //! amortization QUIC stacks get from UDP GSO — see `udp_batch.rs`). All
 //! of it is pure amortization: the datagrams and the byte stream are
 //! byte-identical to one message per datagram, and the wire format is
 //! untouched. Other platforms keep single-datagram calls (with the same
 //! userspace batching).
+//!
+//! **The owned write path** (link L3): the writer channel carries whole
+//! owned buffers, and the engine's `send_owned` shares each one per
+//! segment (O(1) `Bytes` splits) — no per-segment copy. Over Noise, the
+//! record layer encrypts into a fresh buffer and hands the record over by
+//! ownership (`RecordWrite`), so the channel boundary is a move rather
+//! than a copy; a transport that cannot take owned records (plain TCP)
+//! keeps the pooled-buffer path.
 //!
 //! Security note: KCP provides reliability, not confidentiality. In the
 //! arm-2 stack Noise rides **on top** of `KcpStream`
@@ -76,7 +91,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::kcp::{KCP_OVERHEAD, Kcp, get_conv};
+use crate::kcp::{DatagramSink, KCP_OVERHEAD, Kcp, get_conv};
 use anyhow::{Context as _, Result, bail};
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -85,6 +100,8 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, trace, warn};
+
+use crate::transport::udp_batch::Span;
 
 /// KCP flush interval in ms (`nodelay` mode; also the pump's timer floor
 /// and the retransmit RTO base). 10 ms is the measured sweet spot:
@@ -130,16 +147,18 @@ const CLOSE_QUIET_ROUNDS: u32 = 3;
 /// stalls. 32 MiB absorbs the largest burst with headroom; requests are
 /// clamped by the system's `rmem_max`/`wmem_max`.
 const KCP_SOCKET_BUF_BYTES: usize = 32 * 1024 * 1024;
-/// Inbound app-data channel depth (messages of one coalesced blob, up to
-/// `COALESCE_LIMIT_BYTES`, or one segment under reader backpressure); half
-/// the ARQ receive window in segments, so reader bursts never force
-/// datagram drops at the pump (the spill queue absorbs the rest). While
-/// the reader keeps up the depth holds ~16 KiB per message, so a FULLY
-/// stalled reader (the peer still sending inside its window) parks up to
-/// `INBOUND_CHANNEL_DEPTH` blobs ≈ 32 MiB here, against ~2.8 MiB of
-/// single-segment messages before coalescing — the pressure check in
-/// `deliver_recv` switches the tail of the fill back to one segment per
-/// message, so only the already-queued blobs are oversized.
+/// Inbound app-data channel depth (messages of one `ReadBatch`, at most
+/// `COALESCE_LIMIT_BYTES` across its parts, or one segment under reader
+/// backpressure); half the ARQ receive window in segments, so reader
+/// bursts never force datagram drops at the pump (the spill queue absorbs
+/// the rest). While the reader keeps up the depth holds ~16 KiB per
+/// message, so a FULLY stalled reader (the peer still sending inside its
+/// window) parks up to `INBOUND_CHANNEL_DEPTH` batches ≈ 32 MiB here,
+/// against ~2.8 MiB of single-segment messages before coalescing — the
+/// pressure check in `deliver_recv` switches the tail of the fill back
+/// to one segment per message, so only the already-queued batches are
+/// oversized. The parts move by ownership, so this bounds residency,
+/// not copies.
 const INBOUND_CHANNEL_DEPTH: usize = 2048;
 /// Writer → pump channel depth (writes, not bytes).
 const OUTBOUND_CHANNEL_DEPTH: usize = 64;
@@ -159,9 +178,6 @@ const MAX_LISTENER_SESSIONS: usize = 4096;
 /// rounds (and with tokio's uniform select fairness, steal iterations from
 /// the writer arm) at high link rates.
 const INPUT_BATCH_LIMIT: usize = 512;
-/// Receive scratch buffer: one KCP stream-mode `recv` returns at most one
-/// segment (<= MTU - overhead).
-const RECV_BUF: usize = 2048;
 /// Inbound datagram scratch buffer (one datagram is at most one MTU).
 const DGRAM_BUF: usize = 2048;
 /// Arm-2 MTU (KCP's protocol default; never tuned — see the module docs).
@@ -172,12 +188,16 @@ const KCP_MTU: usize = 1400;
 /// appending never reallocates inside a batch (≈46 KiB).
 const BATCH_STAGE_BYTES: usize =
     crate::transport::udp_batch::BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
-/// Reader-side coalescing target: consecutive segments are merged into
-/// one channel message up to this size (the mux/yamux/Noise reader above
-/// asks for ~24 such segments per frame, so this cuts the reader-channel
-/// hops by roughly that factor). Bounded so a blob never exceeds a
-/// handful of segments.
+/// Reader-side coalescing target: consecutive segments are batched into
+/// one channel message up to this many bytes (the mux/yamux/Noise reader
+/// above asks for ~24 such segments per frame, so this cuts the
+/// reader-channel hops by roughly that factor). The parts move by
+/// ownership, so the limit bounds the message's total bytes, not a copy.
 const COALESCE_LIMIT_BYTES: usize = 16 * 1024;
+/// Part-count bound for one message: the byte budget above usually
+/// binds first (~11 MSS-sized parts); this caps the `parts` vector for
+/// streams of very small segments.
+const MAX_READ_PARTS: usize = 32;
 /// Reader-channel permits below which coalescing stops: under reader
 /// backpressure each segment flushes on its own again, which keeps the
 /// stall residency of the (bounded) channel at the pre-coalescing
@@ -289,14 +309,25 @@ pub(crate) static KCP_SACKS_SENT: AtomicU64 = AtomicU64::new(0);
 /// Completed pump rounds (select iterations): the scheduling granularity
 /// of all per-segment work.
 pub(crate) static KCP_PUMP_ROUNDS: AtomicU64 = AtomicU64::new(0);
-/// Coalesced blobs handed to the reader channel (several consecutive
-/// segments merged into one message — the receive-path amortization; the
-/// ratio `datagrams_in / blobs_out` is the hop reduction it achieves).
+/// Reader-channel messages handed over (several consecutive segments
+/// batched into one message — the receive-path amortization; the ratio
+/// `datagrams_in / blobs_out` is the hop reduction it achieves).
 pub(crate) static KCP_BLOBS_OUT: AtomicU64 = AtomicU64::new(0);
+/// Receive-queue segments handed to the reader channel (before batching):
+/// the denominator for a per-segment delivery cost.
+pub(crate) static KCP_SEGMENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+/// `recv` calls that found the receive queue empty — the fixed per-round
+/// probe every delivery round pays, separated from the data path so the
+/// two can be attributed apart.
+pub(crate) static KCP_RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Coarse phase durations, in nanoseconds, accumulated across all
-/// sessions of this process.
+/// sessions of this process. `KCP_NS_DELIVER` is the whole delivery
+/// phase and stays for continuity; the two splits below carve the spill
+/// flush and the receive-queue drain out of it.
 pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_NS_DELIVER_RECV: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_WRITER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_OUTPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_UPDATE: AtomicU64 = AtomicU64::new(0);
@@ -332,9 +363,13 @@ pub(crate) struct KcpStats {
     pub acks_out: u64,
     pub sacks_sent: u64,
     pub blobs_out: u64,
+    pub segments_delivered: u64,
+    pub recv_empty: u64,
     pub pump_rounds: u64,
     pub ms_input: f64,
     pub ms_deliver: f64,
+    pub ms_deliver_spill: f64,
+    pub ms_deliver_recv: f64,
     pub ms_writer: f64,
     pub ms_output: f64,
     pub ms_update: f64,
@@ -358,9 +393,13 @@ pub(crate) fn kcp_stats() -> KcpStats {
         acks_out: kcp_engine_stats().3,
         sacks_sent: KCP_SACKS_SENT.load(Ordering::Relaxed),
         blobs_out: KCP_BLOBS_OUT.load(Ordering::Relaxed),
+        segments_delivered: KCP_SEGMENTS_DELIVERED.load(Ordering::Relaxed),
+        recv_empty: KCP_RECV_EMPTY.load(Ordering::Relaxed),
         pump_rounds: KCP_PUMP_ROUNDS.load(Ordering::Relaxed),
         ms_input: ms(&KCP_NS_INPUT),
         ms_deliver: ms(&KCP_NS_DELIVER),
+        ms_deliver_spill: ms(&KCP_NS_DELIVER_SPILL),
+        ms_deliver_recv: ms(&KCP_NS_DELIVER_RECV),
         ms_writer: ms(&KCP_NS_WRITER),
         ms_output: ms(&KCP_NS_OUTPUT),
         ms_update: ms(&KCP_NS_UPDATE),
@@ -394,9 +433,13 @@ fn spawn_kcp_stats() {
                     acks_out = s.acks_out,
                     sacks_sent = s.sacks_sent,
                     blobs_out = s.blobs_out,
+                    segments_delivered = s.segments_delivered,
+                    recv_empty = s.recv_empty,
                     pump_rounds = s.pump_rounds,
                     ms_input = format!("{:.3}", s.ms_input),
                     ms_deliver = format!("{:.3}", s.ms_deliver),
+                    ms_deliver_spill = format!("{:.3}", s.ms_deliver_spill),
+                    ms_deliver_recv = format!("{:.3}", s.ms_deliver_recv),
                     ms_writer = format!("{:.3}", s.ms_writer),
                     ms_output = format!("{:.3}", s.ms_output),
                     ms_update = format!("{:.3}", s.ms_update),
@@ -414,20 +457,38 @@ type AcquirePermitFuture = dyn std::future::Future<
     > + Send;
 
 /// One batch of outbound datagrams on its way to the wire: a single
-/// contiguous buffer holding up to `BATCH` engine datagrams plus the
-/// `(offset, len)` span of each inside it. Batching is pure
-/// amortization — the datagrams are byte-identical to one message per
-/// datagram; it replaces N channel messages and N `Bytes` allocations
-/// with one of each. The pacer may deny individual spans, in which case
-/// only that span is dropped and KCP's ARQ re-emits the segment on the
-/// next flush.
+/// contiguous buffer holding the staged datagrams plus the span of each
+/// inside it. Batching is pure amortization — the datagrams are
+/// byte-identical to one message per datagram; it replaces N channel
+/// messages and N `Bytes` allocations with one of each. A PUSH datagram
+/// travels as two iovecs — a staged 24-byte header plus the engine
+/// segment's own payload buffer by reference ([`Span::Split`]) — so the
+/// payload is not copied into the staging buffer either. The pacer may
+/// deny individual spans, in which case only that span is dropped and
+/// KCP's ARQ re-emits the segment on the next flush.
 struct DgramBatch {
     buf: Bytes,
-    spans: Vec<(usize, usize)>,
+    spans: Vec<Span>,
+}
+
+/// One batch of received segments on its way to the reader: the engine's
+/// own segment buffers, handed over by ownership (`recv_owned` freezes
+/// each segment's `BytesMut` in place), batched into one channel
+/// message. No payload copy happens on this path — the parts move by
+/// reference count, so a byte is copied once by the engine's `input`
+/// parse (its ownership copy) and never again until the reader above
+/// consumes it. The byte stream, the delivery order and the
+/// window-broadcast timing are identical to one segment per message.
+pub(crate) struct ReadBatch {
+    /// The segments, in delivery order; each is one complete stream-mode
+    /// message (≤ one MSS).
+    pub parts: Vec<Bytes>,
 }
 
 /// Collects `Kcp` output as whole datagrams: each `Write::write` call from
-/// `flush`/`update` is exactly one datagram (at most MTU bytes). Datagrams
+/// `flush`/`update` is exactly one datagram (at most MTU bytes), staged
+/// contiguously, while each [`DatagramSink::write_datagram`] call is one
+/// two-iovec datagram (staged header + payload by reference). Datagrams
 /// stage in a reusable buffer and travel to the pump as one
 /// [`DgramBatch`] per batch — the batch closes at `BATCH` datagrams, at
 /// the staging cap, or at the engine's flush boundary (`Write::flush`,
@@ -436,8 +497,8 @@ struct DatagramOut {
     tx: mpsc::UnboundedSender<DgramBatch>,
     /// Batch in progress: staged datagrams, back to back.
     staging: BytesMut,
-    /// One `(offset, len)` per staged datagram, in emission order.
-    spans: Vec<(usize, usize)>,
+    /// One span per staged datagram, in emission order.
+    spans: Vec<Span>,
 }
 
 impl DatagramOut {
@@ -481,7 +542,10 @@ impl io::Write for DatagramOut {
             return Ok(0);
         }
         self.staging.extend_from_slice(buf);
-        self.spans.push((self.staging.len() - buf.len(), buf.len()));
+        self.spans.push(Span::Staged {
+            off: self.staging.len() - buf.len(),
+            len: buf.len(),
+        });
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
         if self.spans.len() >= crate::transport::udp_batch::BATCH
             || self.staging.len() >= BATCH_STAGE_BYTES
@@ -497,6 +561,42 @@ impl io::Write for DatagramOut {
         // caps in `write` keep the message bounded.
         self.emit();
         Ok(())
+    }
+}
+
+impl DatagramSink for DatagramOut {
+    /// One two-iovec datagram: the header stages into the batch buffer,
+    /// the payload stays the engine segment's own `Bytes` (an O(1) handle
+    /// share — no copy). This is the send path's zero-copy half; the wire
+    /// bytes are identical to the packed `write` path above.
+    fn write_datagram(&mut self, header: &[u8], payload: &Bytes) -> io::Result<usize> {
+        if header.is_empty() {
+            // Unreachable through the engine (the header is the fixed
+            // 24 bytes), but an empty header would corrupt the framing.
+            return Ok(0);
+        }
+        let hdr_off = self.staging.len();
+        self.staging.extend_from_slice(header);
+        if payload.is_empty() {
+            // A header-only datagram (message mode's empty segment): stage
+            // it whole rather than send an empty second iovec.
+            self.spans.push(Span::Staged {
+                off: hdr_off,
+                len: header.len(),
+            });
+        } else {
+            self.spans.push(Span::Split {
+                hdr_off,
+                payload: payload.clone(),
+            });
+        }
+        crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
+        if self.spans.len() >= crate::transport::udp_batch::BATCH
+            || self.staging.len() >= BATCH_STAGE_BYTES
+        {
+            self.emit();
+        }
+        Ok(header.len() + payload.len())
     }
 }
 
@@ -531,15 +631,24 @@ fn ms_now(start: Instant) -> u32 {
     start.elapsed().as_millis() as u32
 }
 
-/// Split one app write into `Kcp::send`-safe chunks.
-fn kcp_send_all(kcp: &mut Kcp<DatagramOut>, data: &[u8]) -> Result<()> {
-    let mut rest = data;
-    while !rest.is_empty() {
-        let (head, tail) = rest.split_at(rest.len().min(SEND_CHUNK));
-        match kcp.send(head) {
+/// Hand one owned write to the engine, sharing it per segment.
+///
+/// The zero-copy write path (link L3): the buffer the writer handed over
+/// becomes the segments' payloads by reference — `send_owned` splits it
+/// with O(1) `Bytes` handles, so no per-segment copy is paid. Chunking
+/// stays `Kcp::send`-safe (each call under the engine's segment bound).
+fn kcp_send_owned_all(kcp: &mut Kcp<DatagramOut>, mut data: Bytes) -> Result<()> {
+    while !data.is_empty() {
+        let head = if data.len() > SEND_CHUNK {
+            data.split_to(SEND_CHUNK)
+        } else {
+            std::mem::take(&mut data)
+        };
+        let want = head.len();
+        match kcp.send_owned(head) {
             // Stream mode queues the whole chunk or fails; a partial accept
             // would duplicate bytes on resend, so treat it as fatal.
-            Ok(n) if n == head.len() => rest = tail,
+            Ok(n) if n == want => {}
             Ok(_) => bail!("KCP send made partial progress"),
             Err(e) => bail!("KCP send failed: {e}"),
         }
@@ -619,33 +728,36 @@ enum Delivery {
     ReaderGone,
 }
 
-/// Where one coalesced blob ended up.
+/// Where one batched message ended up.
 enum BlobFlush {
     /// Handed to the reader channel.
     Sent,
-    /// The channel is full; the blob went to the spill queue.
+    /// The channel is full; the batch went to the spill queue.
     Spilled,
     /// The reader half is gone.
     Closed,
 }
 
-/// Hand the coalesced blob to the reader channel, or spill it when the
-/// channel is full (the pump never blocks on the reader). The staging
-/// buffer is replaced with a full-size one, so a busy link reallocates
-/// once per blob instead of doubling its way there.
-fn flush_blob(
-    in_tx: &mpsc::Sender<Bytes>,
-    coalesce: &mut BytesMut,
-    spill: &mut std::collections::VecDeque<Bytes>,
+/// Hand the collected parts to the reader channel as ONE message, or
+/// spill them when the channel is full (the pump never blocks on the
+/// reader). The parts vector is replaced with a full-capacity one, so a
+/// busy link reallocates once per message instead of doubling its way
+/// there.
+fn flush_parts(
+    in_tx: &mpsc::Sender<ReadBatch>,
+    parts: &mut Vec<Bytes>,
+    spill: &mut std::collections::VecDeque<ReadBatch>,
 ) -> BlobFlush {
-    let blob = std::mem::replace(coalesce, BytesMut::with_capacity(COALESCE_LIMIT_BYTES)).freeze();
-    match in_tx.try_send(blob) {
+    let batch = ReadBatch {
+        parts: std::mem::replace(parts, Vec::with_capacity(MAX_READ_PARTS)),
+    };
+    match in_tx.try_send(batch) {
         Ok(()) => {
             KCP_BLOBS_OUT.fetch_add(1, Ordering::Relaxed);
             BlobFlush::Sent
         }
-        Err(TrySendError::Full(blob)) => {
-            spill.push_back(blob);
+        Err(TrySendError::Full(batch)) => {
+            spill.push_back(batch);
             BlobFlush::Spilled
         }
         Err(TrySendError::Closed(_)) => BlobFlush::Closed,
@@ -653,56 +765,81 @@ fn flush_blob(
 }
 
 /// Move received app data from the KCP receive queue to the reader channel
-/// without ever blocking: chunks the bounded channel cannot take spill to a
-/// local queue (and stay in KCP's queue otherwise), which shrinks the
+/// without ever blocking: batches the bounded channel cannot take spill to
+/// a local queue (and stay in KCP's queue otherwise), which shrinks the
 /// advertised window until the reader catches up — backpressure through the
 /// protocol instead of a parked pump.
 ///
-/// While the reader keeps up, consecutive segments (each ≤ one MSS in
-/// stream mode) are coalesced into one blob of up to `COALESCE_LIMIT_BYTES`
-/// before entering the channel: the mux/yamux reader above asks for ~24
-/// segments per frame, so one message per blob cuts its channel hops by
-/// about that factor. Coalescing changes the message granularity only —
-/// the byte stream, the delivery order and the window-broadcast timing are
-/// untouched. Under reader backpressure (`in_tx` nearly full) the blob is
-/// flushed per segment again, keeping the stall residency of the bounded
-/// channel at the pre-coalescing granularity.
+/// The segments move BY OWNERSHIP: the engine hands each segment's buffer
+/// over (`recv_owned` freezes it in place), so no payload copy happens
+/// here — this is the read half of the zero-copy route (link L1). While
+/// the reader keeps up, consecutive segments (each ≤ one MSS in stream
+/// mode) are batched into one message of up to `COALESCE_LIMIT_BYTES` /
+/// `MAX_READ_PARTS` parts: the mux/yamux reader above asks for ~24
+/// segments per frame, so one message per batch cuts its channel hops by
+/// about that factor. Batching changes the message granularity only — the
+/// byte stream, the delivery order and the window-broadcast timing are
+/// untouched. Under reader backpressure (`in_tx` nearly full) each
+/// segment flushes on its own again, keeping the stall residency of the
+/// bounded channel at the pre-coalescing granularity.
 fn deliver_recv(
     kcp: &mut Kcp<DatagramOut>,
-    in_tx: &mpsc::Sender<Bytes>,
-    spill: &mut std::collections::VecDeque<Bytes>,
-    recv_buf: &mut [u8],
-    coalesce: &mut BytesMut,
+    in_tx: &mpsc::Sender<ReadBatch>,
+    spill: &mut std::collections::VecDeque<ReadBatch>,
+    parts: &mut Vec<Bytes>,
 ) -> Delivery {
     let mut delivered = false;
 
-    // Flush the spill queue from earlier rounds first.
-    while let Some(front) = spill.front() {
-        match in_tx.try_send(front.clone()) {
-            Ok(()) => {
-                spill.pop_front();
-                delivered = true;
+    // Flush the spill queue from earlier rounds first. Taking the batch
+    // out and putting it back on a full channel keeps this loop
+    // allocation-free (a `front.clone()` of the parts vector would
+    // allocate once per spill entry per round).
+    {
+        let _t = PhaseTimer::new(&KCP_NS_DELIVER_SPILL);
+        while let Some(batch) = spill.pop_front() {
+            match in_tx.try_send(batch) {
+                Ok(()) => delivered = true,
+                Err(TrySendError::Full(batch)) => {
+                    spill.push_front(batch);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => return Delivery::ReaderGone,
             }
-            Err(TrySendError::Full(_)) => break,
-            Err(TrySendError::Closed(_)) => return Delivery::ReaderGone,
         }
     }
 
     // Then drain the KCP receive queue into the channel (or the spill).
     if spill.is_empty() {
+        let _t = PhaseTimer::new(&KCP_NS_DELIVER_RECV);
+        let mut parts_bytes = 0usize;
         loop {
-            match kcp.recv(recv_buf) {
-                Ok(0)
-                | Err(crate::kcp::Error::RecvQueueEmpty | crate::kcp::Error::ExpectingFragment) => {
+            match kcp.recv_owned() {
+                Err(crate::kcp::Error::RecvQueueEmpty | crate::kcp::Error::ExpectingFragment) => {
+                    // The fixed empty probe every delivery round pays:
+                    // counted apart from data segments so the two costs
+                    // can be attributed separately.
+                    KCP_RECV_EMPTY.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
-                Ok(n) => {
-                    coalesce.extend_from_slice(&recv_buf[..n]);
-                    if coalesce.len() >= COALESCE_LIMIT_BYTES
+                Ok(data) => {
+                    KCP_SEGMENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                    // A zero-length segment carries no bytes for the
+                    // reader (and `poll_read` would skip it): stop here,
+                    // the same way the buffer API's `Ok(0)` did.
+                    if data.is_empty() {
+                        break;
+                    }
+                    parts_bytes += data.len();
+                    parts.push(data);
+                    if parts_bytes >= COALESCE_LIMIT_BYTES
+                        || parts.len() >= MAX_READ_PARTS
                         || in_tx.capacity() <= COALESCE_PRESSURE_PERMITS
                     {
-                        match flush_blob(in_tx, coalesce, spill) {
-                            BlobFlush::Sent => delivered = true,
+                        match flush_parts(in_tx, parts, spill) {
+                            BlobFlush::Sent => {
+                                delivered = true;
+                                parts_bytes = 0;
+                            }
                             // Channel full: stop delivering this round; the
                             // rest stays in KCP's queue and shrinks the
                             // advertised window.
@@ -717,10 +854,10 @@ fn deliver_recv(
                 }
             }
         }
-        // A partial blob at the loop's end (the receive queue ran dry
+        // A partial batch at the loop's end (the receive queue ran dry
         // before the coalescing target was reached).
-        if !coalesce.is_empty() {
-            match flush_blob(in_tx, coalesce, spill) {
+        if !parts.is_empty() {
+            match flush_parts(in_tx, parts, spill) {
                 BlobFlush::Sent => delivered = true,
                 BlobFlush::Spilled | BlobFlush::Closed => {}
             }
@@ -735,7 +872,7 @@ enum Drain {
     /// All queued writes were encoded into the ARQ queue (the caller then
     /// flushes once).
     Flushed,
-    /// `kcp_send_all` failed midway — the pump must exit.
+    /// `kcp_send_owned_all` failed midway — the pump must exit.
     Fatal,
 }
 
@@ -743,6 +880,11 @@ enum Drain {
 /// One select arm handles the whole batch: tokio's uniform select fairness
 /// would otherwise starve the writer arm down to a fraction of the link
 /// rate when the inbound channel is permanently ready under load.
+///
+/// Every message is an owned buffer (a Noise record's ciphertext on the
+/// kcp4+noise path, a copied slice on the others), so it is handed to the
+/// engine by ownership — `send_owned` shares it per segment and the write
+/// path pays no per-segment copy.
 fn drain_writer(
     kcp: &mut Kcp<DatagramOut>,
     out_rx: &mut mpsc::UnboundedReceiver<Bytes>,
@@ -751,7 +893,7 @@ fn drain_writer(
 ) -> Drain {
     let mut data = first;
     loop {
-        if let Err(e) = kcp_send_all(kcp, &data) {
+        if let Err(e) = kcp_send_owned_all(kcp, data) {
             warn!("KCP session send failed: {e:#}");
             return Drain::Fatal;
         }
@@ -955,17 +1097,22 @@ async fn drain_dgrams(
 
         let mut send_batch = crate::transport::udp_batch::SendBatch::new();
         // Spans the pacer allowed from the batch in hand (= the whole batch
-        // unless the rate is currently cut).
-        let mut allowed: Vec<(usize, usize)> =
-            Vec::with_capacity(crate::transport::udp_batch::BATCH);
+        // unless the rate is currently cut). A `Span::Split` clones the
+        // payload's `Bytes` handle (an O(1) refcount share), never the
+        // payload itself.
+        let mut allowed: Vec<Span> = Vec::with_capacity(crate::transport::udp_batch::BATCH);
         loop {
             let Ok(batch) = dgram_rx.try_recv() else {
                 return;
             };
             allowed.clear();
-            for &(off, len) in &batch.spans {
-                if pace.pacer.allow(Instant::now(), len, pace.rate_bps).is_ok() {
-                    allowed.push((off, len));
+            for span in &batch.spans {
+                if pace
+                    .pacer
+                    .allow(Instant::now(), span.len(), pace.rate_bps)
+                    .is_ok()
+                {
+                    allowed.push(span.clone());
                 }
                 // denied: drop just this span, ARQ holds the segment
             }
@@ -1002,15 +1149,32 @@ async fn drain_dgrams(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // No sendmmsg here, so a two-iovec (split) datagram is reassembled
+        // into one buffer before the single-datagram send — the copy this
+        // platform pays, byte-identical on the wire.
+        let mut dgram_buf = [0u8; KCP_MTU + KCP_OVERHEAD];
         while let Ok(batch) = dgram_rx.try_recv() {
-            for &(off, len) in &batch.spans {
-                match pace.pacer.allow(Instant::now(), len, pace.rate_bps) {
+            for span in &batch.spans {
+                let (header, payload): (&[u8], &[u8]) = match span {
+                    Span::Staged { off, len } => (&batch.buf[*off..*off + *len], &[]),
+                    Span::Split { hdr_off, payload } => (
+                        &batch.buf[*hdr_off..*hdr_off + KCP_OVERHEAD],
+                        payload.as_ref(),
+                    ),
+                };
+                let total = header.len() + payload.len();
+                if total > dgram_buf.len() {
+                    continue; // cannot happen: one datagram is at most one MTU
+                }
+                match pace.pacer.allow(Instant::now(), total, pace.rate_bps) {
                     Ok(()) => {
                         // Same park-then-try pattern as the Linux path.
                         if net.socket.writable().await.is_err() {
                             return;
                         }
-                        match net.socket.try_send_to(&batch.buf[off..off + len], net.peer) {
+                        dgram_buf[..header.len()].copy_from_slice(header);
+                        dgram_buf[header.len()..total].copy_from_slice(payload);
+                        match net.socket.try_send_to(&dgram_buf[..total], net.peer) {
                             Ok(_) => *sent_any = true,
                             // WouldBlock: drop and let the ARQ re-emit on the
                             // next flush; tokio's try_send_to clears the
@@ -1034,7 +1198,7 @@ fn closing_quiescent(
     sent_any: bool,
     delivered: bool,
     kcp: &Kcp<DatagramOut>,
-    spill: &std::collections::VecDeque<Bytes>,
+    spill: &std::collections::VecDeque<ReadBatch>,
     quiet_rounds: &mut u32,
     close_deadline: Instant,
 ) -> bool {
@@ -1078,7 +1242,7 @@ async fn maybe_sack(
     kcp: &mut Kcp<DatagramOut>,
     net: &SessionNet,
     delivered: bool,
-    spill: &std::collections::VecDeque<Bytes>,
+    spill: &std::collections::VecDeque<ReadBatch>,
     last_sack_sent: &mut Instant,
 ) {
     if !delivered
@@ -1117,10 +1281,9 @@ async fn pump_tail(
     kcp: &mut Kcp<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
-    in_tx: &mpsc::Sender<Bytes>,
-    spill: &mut std::collections::VecDeque<Bytes>,
-    recv_buf: &mut [u8; RECV_BUF],
-    coalesce: &mut BytesMut,
+    in_tx: &mpsc::Sender<ReadBatch>,
+    spill: &mut std::collections::VecDeque<ReadBatch>,
+    parts: &mut Vec<Bytes>,
     dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
     last_sack_sent: &mut Instant,
     ack_flush_due: &mut bool,
@@ -1134,12 +1297,19 @@ async fn pump_tail(
     // because parking would delay the acks/datagrams of everything
     // arriving meanwhile and the peer's RTO escalates (x1.5 per
     // retransmit in nodelay mode) into seconds-long stalls.
-    let _t = PhaseTimer::new(&KCP_NS_DELIVER);
-    let delivered = match deliver_recv(kcp, in_tx, spill, recv_buf, coalesce) {
-        Delivery::Done { delivered } => delivered,
-        Delivery::ReaderGone => {
-            debug!("KCP session reader gone, closing (peer {})", net.peer);
-            return Tail::Exit;
+    //
+    // The block is load-bearing: a `let _t = ...;` binding drops at the
+    // end of its SCOPE, not its statement, so without the explicit block
+    // this timer would book everything below (SACK, ack flush, the wire
+    // drain) into the delivery phase.
+    let delivered = {
+        let _t = PhaseTimer::new(&KCP_NS_DELIVER);
+        match deliver_recv(kcp, in_tx, spill, parts) {
+            Delivery::Done { delivered } => delivered,
+            Delivery::ReaderGone => {
+                debug!("KCP session reader gone, closing (peer {})", net.peer);
+                return Tail::Exit;
+            }
         }
     };
 
@@ -1201,7 +1371,7 @@ async fn run_session(
     mut dgram_rx: mpsc::UnboundedReceiver<DgramBatch>,
     mut out_rx: mpsc::UnboundedReceiver<Bytes>,
     out_sem: Arc<Semaphore>,
-    in_tx: mpsc::Sender<Bytes>,
+    in_tx: mpsc::Sender<ReadBatch>,
 ) {
     let start = Instant::now();
     // Prime the clock: `flush`/`check` require one `update` call first.
@@ -1215,11 +1385,11 @@ async fn run_session(
     let mut closing = false;
     let mut close_deadline = Instant::now() + CLOSE_FLUSH_TIMEOUT;
     let mut quiet_rounds: u32 = 0;
-    let mut recv_buf = [0u8; RECV_BUF];
-    // Reader-channel coalescing staging (see `deliver_recv`).
-    let mut coalesce = BytesMut::with_capacity(COALESCE_LIMIT_BYTES);
-    // Chunks recv'd but not yet accepted by the reader channel.
-    let mut spill: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    // Reader-channel batching staging: the engine's segment buffers,
+    // collected into one message (see `deliver_recv`).
+    let mut parts: Vec<Bytes> = Vec::with_capacity(MAX_READ_PARTS);
+    // Batches recv'd but not yet accepted by the reader channel.
+    let mut spill: std::collections::VecDeque<ReadBatch> = std::collections::VecDeque::new();
     let mut ack_flush_due = false;
     // Adaptive send pacing + keepalive/RTT probing (see `PaceState`).
     let mut pace = PaceState::new(start);
@@ -1295,8 +1465,7 @@ async fn run_session(
             &mut pace,
             &in_tx,
             &mut spill,
-            &mut recv_buf,
-            &mut coalesce,
+            &mut parts,
             &mut dgram_rx,
             &mut last_sack_sent,
             &mut ack_flush_due,
@@ -1337,7 +1506,7 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     // `Sender` has no poll-based send for `AsyncWrite::poll_write`.
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let out_sem = Arc::new(Semaphore::new(OUTBOUND_CHANNEL_DEPTH));
-    let (in_tx, in_rx) = mpsc::channel(INBOUND_CHANNEL_DEPTH);
+    let (in_tx, in_rx) = mpsc::channel::<ReadBatch>(INBOUND_CHANNEL_DEPTH);
 
     spawn_kcp_stats();
     tokio::spawn(run_session(
@@ -1366,8 +1535,12 @@ pub struct KcpStream {
     /// does not export the future type, so it is type-erased here.
     out_acquire: Option<Pin<Box<AcquirePermitFuture>>>,
 
-    in_rx: Option<mpsc::Receiver<Bytes>>,
-    read_pending: Option<Bytes>,
+    in_rx: Option<mpsc::Receiver<ReadBatch>>,
+    /// Parts of the batch in hand, in delivery order. One `poll_read`
+    /// serves at most one part's worth (the reader above buffers across
+    /// reads itself), so the granularity the reader sees is unchanged
+    /// from the per-segment messages — only the channel hops fell.
+    read_queue: std::collections::VecDeque<Bytes>,
 }
 
 impl std::fmt::Debug for KcpStream {
@@ -1383,14 +1556,94 @@ impl KcpStream {
     fn new(
         out_tx: mpsc::UnboundedSender<Bytes>,
         out_sem: Arc<Semaphore>,
-        in_rx: mpsc::Receiver<Bytes>,
+        in_rx: mpsc::Receiver<ReadBatch>,
     ) -> KcpStream {
         KcpStream {
             out_tx: Some(out_tx),
             out_sem,
             out_acquire: None,
             in_rx: Some(in_rx),
-            read_pending: None,
+            read_queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Capacity gate shared by both write paths: acquire one permit
+    /// (registering the waker when the pump is behind).
+    fn acquire_write_permit(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<tokio::sync::OwnedSemaphorePermit, io::Error>> {
+        match self.out_sem.clone().try_acquire_owned() {
+            Ok(permit) => Poll::Ready(Ok(permit)),
+            Err(tokio::sync::TryAcquireError::Closed) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "KCP session closed",
+            ))),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let fut = self.out_acquire.get_or_insert_with(|| {
+                    Box::pin(self.out_sem.clone().acquire_owned()) as Pin<Box<AcquirePermitFuture>>
+                });
+                match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        self.out_acquire = None;
+                        Poll::Ready(Ok(permit))
+                    }
+                    // The semaphore is never closed explicitly; treat it as
+                    // a dead session anyway.
+                    Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "KCP session closed",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+/// The owned-record write boundary: a whole record crosses to the pump by
+/// ownership — no copy at the channel, and the engine shares it per
+/// segment. This is link L3's half on the stream side; the record producer
+/// is the Noise layer's owned-record path.
+impl crate::common::owned_write::AsyncWriteOwned for KcpStream {
+    const TAKES_OWNED: bool = true;
+
+    fn poll_write_owned(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        record: Bytes,
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        if record.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if me.out_tx.is_none() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "KCP session write half already shut down",
+            )));
+        }
+        // Capacity gate: acquire one permit (registering the waker when the
+        // pump is behind), then hand the record to the unbounded channel.
+        let permit = std::task::ready!(me.acquire_write_permit(cx))?;
+        let n = record.len();
+        match me.out_tx.as_ref() {
+            Some(tx) => match tx.send(record) {
+                Ok(()) => {
+                    permit.forget();
+                    Poll::Ready(Ok(n))
+                }
+                // Pump gone: the session is dead.
+                Err(_) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "KCP session closed",
+                ))),
+            },
+            // Checked above; the half cannot close while this poll runs.
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "KCP session write half already shut down",
+            ))),
         }
     }
 }
@@ -1403,12 +1656,12 @@ impl AsyncRead for KcpStream {
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
         loop {
-            if let Some(mut pending) = me.read_pending.take() {
-                let n = std::cmp::min(buf.remaining(), pending.len());
-                buf.put_slice(&pending[..n]);
-                pending.advance(n);
-                if !pending.is_empty() {
-                    me.read_pending = Some(pending);
+            if let Some(front) = me.read_queue.front_mut() {
+                let n = std::cmp::min(buf.remaining(), front.len());
+                buf.put_slice(&front[..n]);
+                front.advance(n);
+                if front.is_empty() {
+                    me.read_queue.pop_front();
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -1417,10 +1670,13 @@ impl AsyncRead for KcpStream {
                 return Poll::Ready(Ok(()));
             };
             match rx.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) if !chunk.is_empty() => {
-                    me.read_pending = Some(chunk);
+                Poll::Ready(Some(batch)) => {
+                    for part in batch.parts {
+                        if !part.is_empty() {
+                            me.read_queue.push_back(part);
+                        }
+                    }
                 }
-                Poll::Ready(Some(_empty)) => {} // skip, poll again
                 Poll::Ready(None) => {
                     me.in_rx = None; // EOF from here on
                 }
@@ -1440,52 +1696,31 @@ impl AsyncWrite for KcpStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let Some(tx) = me.out_tx.as_ref() else {
+        if me.out_tx.is_none() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "KCP session write half already shut down",
             )));
-        };
+        }
         // Capacity gate: acquire one permit (registering the waker when the
         // pump is behind), then hand the write to the unbounded channel.
-        let permit = match me.out_sem.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Poll::Ready(Err(io::Error::new(
+        let permit = std::task::ready!(me.acquire_write_permit(cx))?;
+        match me.out_tx.as_ref() {
+            Some(tx) => match tx.send(Bytes::copy_from_slice(buf)) {
+                Ok(()) => {
+                    permit.forget();
+                    Poll::Ready(Ok(buf.len()))
+                }
+                // Pump gone: the session is dead.
+                Err(_) => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "KCP session closed",
-                )));
-            }
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
-                let fut = me.out_acquire.get_or_insert_with(|| {
-                    Box::pin(me.out_sem.clone().acquire_owned()) as Pin<Box<AcquirePermitFuture>>
-                });
-                match Pin::new(fut).poll(cx) {
-                    Poll::Ready(Ok(permit)) => {
-                        me.out_acquire = None;
-                        permit
-                    }
-                    // The semaphore is never closed explicitly; treat it as
-                    // a dead session anyway.
-                    Poll::Ready(Err(_)) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "KCP session closed",
-                        )));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        };
-        match tx.send(Bytes::copy_from_slice(buf)) {
-            Ok(()) => {
-                permit.forget();
-                Poll::Ready(Ok(buf.len()))
-            }
-            // Pump gone: the session is dead.
-            Err(_) => Poll::Ready(Err(io::Error::new(
+                ))),
+            },
+            // Checked above; the half cannot close while this poll runs.
+            None => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "KCP session closed",
+                "KCP session write half already shut down",
             ))),
         }
     }
@@ -1940,6 +2175,7 @@ mod tests {
     #![expect(
         clippy::unwrap_used,
         clippy::expect_used,
+        clippy::panic,
         clippy::cast_possible_truncation,
         reason = "tests unwrap values they just constructed; test windows are far below usize::MAX"
     )]
@@ -1980,8 +2216,11 @@ mod tests {
         assert_eq!(batch.spans.len(), crate::transport::udp_batch::BATCH);
         // Spans tile the buffer: contiguous, in order, no gaps.
         let mut off = 0;
-        for &(o, len) in &batch.spans {
-            assert_eq!((o, len), (off, dgram.len()));
+        for span in &batch.spans {
+            let Span::Staged { off: o, len } = span else {
+                panic!("a packed write must stage its whole datagram");
+            };
+            assert_eq!((*o, *len), (off, dgram.len()));
             off += len;
         }
         assert_eq!(off, batch.buf.len());
@@ -1993,6 +2232,46 @@ mod tests {
         std::io::Write::flush(&mut out).unwrap();
         let batch = rx.try_recv().expect("flush must close the batch");
         assert_eq!(batch.spans.len(), 1);
+    }
+
+    #[test]
+    fn push_datagrams_travel_as_a_header_plus_a_payload_reference() {
+        // The engine's two-iovec boundary: a PUSH datagram crosses the
+        // channel as a staged header plus the segment's own payload `Bytes`
+        // — the same handle, not a copy. The retransmit re-emits the very
+        // same buffer, so the two payload pointers must match.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut out = DatagramOut::new(tx);
+        let payload = Bytes::from_static(b"the payload is shared, not copied");
+
+        crate::kcp::DatagramSink::write_datagram(&mut out, b"0123456789abcdef01234567", &payload)
+            .unwrap();
+        std::io::Write::flush(&mut out).unwrap();
+        let batch = rx.try_recv().expect("the datagram must cross the channel");
+        assert_eq!(batch.spans.len(), 1);
+        let Span::Split {
+            hdr_off,
+            payload: got,
+        } = &batch.spans[0]
+        else {
+            panic!("a PUSH datagram must travel split (header + payload)");
+        };
+        // The staged header is the first 24 bytes of the batch buffer.
+        assert_eq!(
+            &batch.buf[*hdr_off..*hdr_off + KCP_OVERHEAD],
+            b"0123456789abcdef01234567"
+        );
+        // Same allocation as the engine segment's buffer: no copy.
+        assert!(
+            std::ptr::eq(got.as_ptr(), payload.as_ptr()),
+            "the payload was copied instead of shared"
+        );
+
+        // A packed (non-split) datagram still stages whole.
+        std::io::Write::write_all(&mut out, b"packed").unwrap();
+        std::io::Write::flush(&mut out).unwrap();
+        let batch = rx.try_recv().expect("the packed datagram must cross");
+        assert!(matches!(batch.spans.as_slice(), [Span::Staged { .. }]));
     }
 
     #[tokio::test]
@@ -2025,6 +2304,62 @@ mod tests {
             blobs * 3 < segments,
             "coalescing did not merge: {blobs} blobs for {segments} segments"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_reader_resumes_with_intact_stream() {
+        // A reader that parks mid-stream while the tunnel keeps sending,
+        // then drains slowly in small reads: the batched (`ReadBatch`)
+        // zero-copy path must hand back an intact, in-order byte stream.
+        // (The pump's deep spill queue only engages past 2048 unread
+        // messages — ~32 MiB with the ~11-segment batches — which is a
+        // bench-cell scale, not a unit-test one; its zero-alloc
+        // take/put-back loop shares this ordering guarantee.)
+        const PAYLOAD: usize = 512 * 1024;
+        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let addr = acceptor.local_addr().unwrap();
+
+        let mut client = connect(addr, 0x0BAD_F00D).await.unwrap();
+        let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+        // The write pushes the whole payload through the tunnel (the
+        // writer half is unbounded, so this returns once KCP accepted
+        // the bytes) and is what makes the server adopt the session.
+        client.write_all(&payload).await.unwrap();
+
+        let session = tokio::time::timeout(Duration::from_secs(10), acceptor.accept())
+            .await
+            .expect("accept timed out")
+            .expect("acceptor closed");
+        let mut session = session.stream;
+
+        // Read only a slice, then stall: the writer keeps pushing, so the
+        // reader channel (2048 messages) fills and delivery spills.
+        let head = 64 * 1024;
+        let mut got = read_exact_timeout(&mut session, head).await;
+        // Give the pump time to fill the channel and spill while the
+        // reader is parked (one KCP flush interval is 10 ms; the payload
+        // is ~380 segments, so a few intervals suffice).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Now drain the rest slowly, a small chunk at a time.
+        let mut chunk = vec![0u8; 4096];
+        while got.len() < PAYLOAD {
+            let want = (PAYLOAD - got.len()).min(chunk.len());
+            let n = tokio::time::timeout(Duration::from_secs(30), session.read(&mut chunk[..want]))
+                .await
+                .expect("slow-reader drain timed out")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(got.len(), PAYLOAD, "spill path lost bytes");
+        assert_eq!(got, payload, "spill path reordered or corrupted bytes");
+
+        // Keep the writer half referenced until here so the session
+        // cannot close mid-drain.
+        drop(client);
     }
 
     #[tokio::test]
@@ -2064,6 +2399,14 @@ mod tests {
         assert!(
             after.pump_rounds > before.pump_rounds,
             "no pump round was counted"
+        );
+        assert!(
+            after.segments_delivered > before.segments_delivered,
+            "no delivered segment was counted"
+        );
+        assert!(
+            after.recv_empty > before.recv_empty,
+            "no empty receive probe was counted"
         );
         // Every phase that ran for this transfer books time, even on a
         // quiet loopback session.

@@ -11,6 +11,7 @@
 pub mod header;
 mod io;
 
+use bytes::Bytes;
 use header::{Data, GoAway, Header, Ping, StreamId, WindowUpdate};
 use std::{convert::TryInto, num::TryFromIntError};
 
@@ -28,17 +29,22 @@ pub(crate) struct Either<L, R> {
 }
 
 /// A Yamux message frame consisting of header and body.
+///
+/// The body is an owned `Bytes`: a frame that crosses the stream command
+/// channel moves its payload by reference instead of copying it into a
+/// fresh `Vec` (the write path's staging copy), and the read path freezes
+/// the receive buffer in place. The wire format is untouched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame<T> {
     header: Header<T>,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 impl<T> Frame<T> {
     pub fn new(header: Header<T>) -> Self {
         Frame {
             header,
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 
@@ -100,7 +106,7 @@ impl Frame<()> {
 }
 
 impl Frame<Data> {
-    pub fn data(id: StreamId, b: Vec<u8>) -> Result<Self, TryFromIntError> {
+    pub fn data(id: StreamId, b: Bytes) -> Result<Self, TryFromIntError> {
         Ok(Frame {
             header: Header::data(id, b.len().try_into()?),
             body: b,
@@ -132,7 +138,7 @@ impl Frame<Data> {
         len
     }
 
-    pub fn into_body(self) -> Vec<u8> {
+    pub fn into_body(self) -> Bytes {
         self.body
     }
 }
@@ -141,7 +147,7 @@ impl Frame<WindowUpdate> {
     pub fn window_update(id: StreamId, credit: u32) -> Self {
         Frame {
             header: Header::window_update(id, credit),
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 }
@@ -153,7 +159,7 @@ impl Frame<Ping> {
 
         Frame {
             header,
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 
@@ -166,14 +172,14 @@ impl Frame<GoAway> {
     pub fn protocol_error() -> Self {
         Frame {
             header: Header::protocol_error(),
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 
     pub fn internal_error() -> Self {
         Frame {
             header: Header::internal_error(),
-            body: Vec::new(),
+            body: Bytes::new(),
         }
     }
 }

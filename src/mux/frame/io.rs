@@ -13,6 +13,7 @@ use super::{
     header::{self, HeaderDecodeError},
 };
 use crate::mux::connection::Id;
+use bytes::{Bytes, BytesMut};
 use std::{
     fmt, io,
     pin::Pin,
@@ -56,11 +57,11 @@ enum WriteState {
     Init,
     Header {
         header: [u8; header::HEADER_SIZE],
-        buffer: Vec<u8>,
+        buffer: Bytes,
         offset: usize,
     },
     Body {
-        buffer: Vec<u8>,
+        buffer: Bytes,
         offset: usize,
     },
     Poisoned,
@@ -106,11 +107,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
             // control frames (SYN/ACK/FIN/window update/ping) that dominate
             // light-load and churn traffic. Larger bodies keep the two-phase
             // write so the payload is never copied twice.
-            let mut combined = Vec::with_capacity(header.len() + buffer.len());
+            let mut combined = BytesMut::with_capacity(header.len() + buffer.len());
             combined.extend_from_slice(&header);
             combined.extend_from_slice(&buffer);
             WriteState::Body {
-                buffer: combined,
+                buffer: combined.freeze(),
                 offset: 0,
             }
         } else {
@@ -220,7 +221,7 @@ enum ReadState {
     Body {
         header: header::Header<()>,
         offset: usize,
-        buffer: Vec<u8>,
+        buffer: BytesMut,
     },
 }
 
@@ -268,7 +269,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
                         this.read_state = ReadState::Body {
                             header,
                             offset: 0,
-                            buffer: vec![0; body_len],
+                            buffer: BytesMut::zeroed(body_len),
                         };
 
                         continue;
@@ -296,7 +297,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
 
                     if *offset == body_len {
                         let h = header.clone();
-                        let v = std::mem::take(buffer);
+                        // The receive buffer freezes in place: the frame
+                        // body moves to the stream buffer by ownership.
+                        let v = std::mem::take(buffer).freeze();
                         this.read_state = ReadState::Init;
                         crate::mux::FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         crate::mux::FRAME_BYTES
