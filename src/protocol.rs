@@ -346,26 +346,25 @@ struct PacketLength {
 }
 
 impl PacketLength {
-    // Infallible: serializing compile-time-known fixed-size values.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "serializing compile-time-known fixed-size values cannot fail"
-    )]
+    /// Encoded length of a protocol value, or 0 on the impossible
+    /// serialization failure (a fixed-size value cannot fail to
+    /// serialize; a 0 length would surface as a read/deserialize error
+    /// at the use site rather than as a panic).
+    fn encoded_len<T: serde::Serialize>(value: &T) -> usize {
+        postcard::to_stdvec(value).map_or(0, |v| v.len())
+    }
+
     pub fn new() -> PacketLength {
         let username = "default";
         let d = digest(username.as_bytes());
-        let hello = postcard::to_stdvec(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap()
-            .len();
+        let hello = Self::encoded_len(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d));
         #[cfg(feature = "client")]
-        let c_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)
-            .unwrap()
-            .len();
+        let c_cmd = Self::encoded_len(&ControlChannelCmd::CreateDataChannel);
         #[cfg(feature = "client")]
-        let ack = postcard::to_stdvec(&Ack::Ok).unwrap().len();
+        let ack = Self::encoded_len(&Ack::Ok);
 
         #[cfg(feature = "server")]
-        let auth = postcard::to_stdvec(&Auth(d)).unwrap().len();
+        let auth = Self::encoded_len(&Auth(d));
         PacketLength {
             hello,
             #[cfg(feature = "client")]

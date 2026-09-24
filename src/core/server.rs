@@ -748,7 +748,7 @@ async fn do_data_channel_handshake(
     }
 
     handle
-        .data_ch_tx
+        .data_channel
         .send(new_data_channel(conn))
         .await
         .with_context(|| "Data channel for a stale control channel")?;
@@ -777,7 +777,7 @@ where
     tokio::spawn(async move {
         while let Some(stream) = bridge_rx.recv().await {
             if handle
-                .data_ch_tx
+                .data_channel
                 .send(DataChannel::Mux(stream))
                 .await
                 .is_err()
@@ -907,26 +907,24 @@ where
     }
 }
 
-#[expect(
-    clippy::struct_field_names,
-    reason = "the handle deliberately holds the three channel senders whose \
-              lifetime keeps the control channel and its pools alive"
-)]
+/// A live control channel, kept alive by holding the three channel
+/// senders: dropping the handle shuts the control channel down (each is
+/// a `Sender`, so the type carries the direction).
 pub struct ControlChannelHandle {
     // Shutdown the control channel by dropping it
-    shutdown_tx: broadcast::Sender<bool>,
-    data_ch_tx: mpsc::Sender<DataChannel>,
+    shutdown: broadcast::Sender<bool>,
+    data_channel: mpsc::Sender<DataChannel>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req: mpsc::UnboundedSender<bool>,
 }
 
 impl Clone for ControlChannelHandle {
     fn clone(&self) -> Self {
         ControlChannelHandle {
-            shutdown_tx: self.shutdown_tx.clone(),
-            data_ch_tx: self.data_ch_tx.clone(),
-            data_ch_req_tx: self.data_ch_req_tx.clone(),
+            shutdown: self.shutdown.clone(),
+            data_channel: self.data_channel.clone(),
+            data_ch_req: self.data_ch_req.clone(),
         }
     }
 }
@@ -1108,9 +1106,9 @@ impl ControlChannelHandle {
         }
 
         ControlChannelHandle {
-            shutdown_tx,
-            data_ch_tx,
-            data_ch_req_tx,
+            shutdown: shutdown_tx,
+            data_channel: data_ch_tx,
+            data_ch_req: data_ch_req_tx,
         }
     }
 }

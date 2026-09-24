@@ -355,28 +355,24 @@ impl AsyncWrite for Stream {
             let k = std::cmp::min(shared.send_window() as usize, buf.len());
             let k = std::cmp::min(k, self.config.split_send_size);
             // `k` is bounded by the send window two lines above, so the
-            // subtraction cannot underflow and the cast cannot truncate.
-            #[expect(
-                clippy::expect_used,
-                reason = "k is bounded by the send window by construction"
-            )]
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "k is bounded by the u32 send window"
-            )]
-            shared
-                .consume_send_window(k as u32)
-                .expect("not exceed receive window");
+            // conversion and the window subtraction below cannot fail;
+            // a failure would mean a flow-control bug, which surfaces
+            // as a write error instead of a panic.
+            let Ok(credit) = u32::try_from(k) else {
+                return Poll::Ready(Err(self.write_zero_err()));
+            };
+            if let Err(e) = shared.consume_send_window(credit) {
+                return Poll::Ready(Err(io::Error::other(e)));
+            }
             Vec::from(&buf[..k])
         };
         let n = body.len();
         // `k` (hence the body length) is bounded by the split size and
         // the window, both far below u32::MAX.
-        #[expect(
-            clippy::expect_used,
-            reason = "frame body length is bounded by u32::MAX"
-        )]
-        let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
+        let mut frame = match Frame::data(self.id, body) {
+            Ok(frame) => frame.left(),
+            Err(_) => return Poll::Ready(Err(self.write_zero_err())),
+        };
         self.add_flag(frame.header_mut());
         tracing::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
 

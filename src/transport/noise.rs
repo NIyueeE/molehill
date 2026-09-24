@@ -143,7 +143,7 @@ impl NoiseKeys {
         let Some(server_static) = self.remote_public_key.as_deref() else {
             return Ok(ResumeAttempt::NotAttempted(stream)); // no known static key
         };
-        let Some(request) = ResumeRequest::build(&self.client_cache, server_static) else {
+        let Some(request) = ResumeRequest::build(&self.client_cache, server_static)? else {
             return Ok(ResumeAttempt::NotAttempted(stream)); // nothing cached
         };
         stream.write_all(&[NOISE_RESUME_SELECTOR]).await?;

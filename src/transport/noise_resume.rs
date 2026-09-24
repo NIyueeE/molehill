@@ -295,16 +295,16 @@ fn record_nonce(counter: u64) -> Nonce {
 }
 
 /// A fresh random nonce/identifier from the system RNG.
-fn random_bytes<const N: usize>() -> [u8; N] {
+///
+/// A failure is propagated, exactly like the crate's other RNG call sites
+/// (`handshake_control_channel`, the KCP conversation id): a missing
+/// secure nonce must fail the connection, not panic the process.
+fn random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
     let mut out = [0u8; N];
-    #[expect(
-        clippy::expect_used,
-        reason = "the system RNG failing leaves no secure nonce; every other                   rng call site in this crate treats it as fatal too"
-    )]
     rand::rngs::SysRng
         .try_fill_bytes(&mut out)
-        .expect("system rng");
-    out
+        .map_err(|e| std::io::Error::other(format!("system rng: {e}")))?;
+    Ok(out)
 }
 
 /// The current unix time in seconds, or 0 if the clock is behind the
@@ -319,9 +319,14 @@ fn unix_now() -> u64 {
 
 /// Seal a ticket: the AEAD covers the ticket id, the issue time and the
 /// handshake hash under the server's ticket key.
-fn seal_ticket(ticket_key: &[u8; 32], id: u64, issued: u64, hh: &[u8; 32]) -> Option<Vec<u8>> {
+fn seal_ticket(
+    ticket_key: &[u8; 32],
+    id: u64,
+    issued: u64,
+    hh: &[u8; 32],
+) -> std::io::Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(ticket_key));
-    let nonce_bytes = random_bytes::<12>();
+    let nonce_bytes = random_bytes::<12>()?;
     let mut plain = Vec::with_capacity(TICKET_PLAIN_LEN);
     plain.extend_from_slice(&id.to_be_bytes());
     plain.extend_from_slice(&issued.to_be_bytes());
@@ -332,12 +337,12 @@ fn seal_ticket(ticket_key: &[u8; 32], id: u64, issued: u64, hh: &[u8; 32]) -> Op
     let mut sealed = plain;
     cipher
         .encrypt_in_place(Nonce::from_slice(&nonce_bytes), b"", &mut sealed)
-        .ok()?;
+        .map_err(|_| std::io::Error::other("ticket seal failed"))?;
     debug_assert_eq!(sealed.len(), TICKET_PLAIN_LEN + TAG_LEN);
     let mut ticket = Vec::with_capacity(TICKET_LEN);
     ticket.extend_from_slice(&nonce_bytes);
     ticket.extend_from_slice(&sealed);
-    Some(ticket)
+    Ok(ticket)
 }
 
 /// Open a sealed ticket, returning `(id, issued, handshake hash)`.
@@ -445,13 +450,13 @@ impl ServerResumeStore {
     }
 
     /// Seal and remember a fresh ticket for a completed handshake.
-    fn issue(&self, hh: &[u8]) -> Vec<u8> {
-        let id = u64::from_be_bytes(random_bytes::<8>());
+    fn issue(&self, hh: &[u8]) -> std::io::Result<Vec<u8>> {
+        let id = u64::from_be_bytes(random_bytes::<8>()?);
         let issued = unix_now();
         let mut hh_arr = [0u8; 32];
         let n = hh.len().min(32);
         hh_arr[..n].copy_from_slice(&hh[..n]);
-        let ticket = seal_ticket(&self.ticket_key, id, issued, &hh_arr).unwrap_or_default();
+        let ticket = seal_ticket(&self.ticket_key, id, issued, &hh_arr)?;
         let mut entries = self
             .entries
             .lock()
@@ -467,7 +472,7 @@ impl ServerResumeStore {
                 last_client_nonce: None,
             },
         );
-        ticket
+        Ok(ticket)
     }
 
     /// Verify a resume request: open the ticket, check its age and the
@@ -531,17 +536,19 @@ pub struct ResumeRequest {
 }
 
 impl ResumeRequest {
-    /// Build a request from the client cache, or `None` when there is no
-    /// cached session for this server static key.
-    pub fn build(cache: &ClientResumeCache, server_static: &[u8]) -> Option<Self> {
-        let (ticket, handshake_hash) = cache.take(server_static)?;
-        Some(ResumeRequest {
+    /// Build a request from the client cache, or `Ok(None)` when there is
+    /// no cached session for this server static key.
+    pub fn build(cache: &ClientResumeCache, server_static: &[u8]) -> std::io::Result<Option<Self>> {
+        let Some((ticket, handshake_hash)) = cache.take(server_static) else {
+            return Ok(None);
+        };
+        Ok(Some(ResumeRequest {
             server_static: server_static.to_vec(),
             ticket,
             handshake_hash,
-            client_nonce: random_bytes::<NONCE_LEN>(),
+            client_nonce: random_bytes::<NONCE_LEN>()?,
             mac: None,
-        })
+        }))
     }
 
     fn mac(&self) -> [u8; MAC_LEN] {
@@ -554,18 +561,23 @@ impl ResumeRequest {
     }
 
     /// Serialize the request: `[u16 ticket_len][ticket][nonce][mac]`.
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> std::io::Result<Vec<u8>> {
         let mac = self.mac();
         let mut out = Vec::with_capacity(2 + TICKET_LEN + NONCE_LEN + MAC_LEN);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a sealed ticket is TICKET_LEN bytes by construction"
-        )]
-        out.extend_from_slice(&(self.ticket.len() as u16).to_be_bytes());
+        // A cached ticket is exactly TICKET_LEN bytes by construction; an
+        // impossible overrun fails the request instead of truncating the
+        // wire length.
+        let ticket_len = u16::try_from(self.ticket.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "resume ticket exceeds the u16 wire length",
+            )
+        })?;
+        out.extend_from_slice(&ticket_len.to_be_bytes());
         out.extend_from_slice(&self.ticket);
         out.extend_from_slice(&self.client_nonce);
         out.extend_from_slice(&mac);
-        out
+        Ok(out)
     }
 
     /// Parse a request off the stream (the MAC is carried, not checked,
@@ -620,7 +632,7 @@ pub async fn server_resume<T: AsyncRead + AsyncWrite + Unpin>(
         warn!("declined a noise resume request");
         return Ok(None);
     };
-    let server_nonce = random_bytes::<NONCE_LEN>();
+    let server_nonce = random_bytes::<NONCE_LEN>()?;
     let server_mac_key = role_key(&hh, b"server-mac");
     let mut mac_input = Vec::with_capacity(16 + 2 * NONCE_LEN);
     mac_input.extend_from_slice(b"server-verdict");
@@ -651,8 +663,7 @@ pub async fn client_resume<T: AsyncRead + AsyncWrite + Unpin>(
     request: &ResumeRequest,
     cache: &ClientResumeCache,
 ) -> Result<Option<ResumedCipher>, std::io::Error> {
-    let encoded = request.encode();
-    conn.write_all(&encoded).await?;
+    conn.write_all(&request.encode()?).await?;
     conn.flush().await?;
 
     let mut status = [0u8; 1];
@@ -739,15 +750,19 @@ pub async fn server_issue_ticket<T: AsyncRead + AsyncWrite + Unpin>(
     let mut want = [0u8; 1];
     conn.read_exact(&mut want).await?;
     let ticket = match (want[0] == 1, store) {
-        (true, Some(store)) => store.issue(handshake_hash),
+        (true, Some(store)) => store.issue(handshake_hash)?,
         _ => Vec::new(),
     };
     let mut out = Vec::with_capacity(2 + ticket.len());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "TICKET_LEN fits u16 by construction"
-    )]
-    out.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+    // A sealed ticket is exactly TICKET_LEN bytes; an impossible overrun
+    // fails the exchange instead of truncating the wire length.
+    let ticket_len = u16::try_from(ticket.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "resume ticket exceeds the u16 wire length",
+        )
+    })?;
+    out.extend_from_slice(&ticket_len.to_be_bytes());
     out.extend_from_slice(&ticket);
     conn.write_all(&out).await?;
     conn.flush().await?;
@@ -782,7 +797,7 @@ mod tests {
     }
 
     fn issued_ticket(store: &ServerResumeStore) -> (Vec<u8>, ClientResumeCache) {
-        let ticket = store.issue(&HANDSHAKE_HASH);
+        let ticket = store.issue(&HANDSHAKE_HASH).unwrap();
         let cache = ClientResumeCache::default();
         cache.store(&SERVER_KEY, ticket.clone(), HANDSHAKE_HASH);
         (ticket, cache)
@@ -795,7 +810,7 @@ mod tests {
         let (_ticket, cache) = issued_ticket(&store);
         let cache = std::sync::Arc::new(cache);
 
-        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap();
+        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap().unwrap();
         let initiator = tokio::spawn({
             let cache = std::sync::Arc::clone(&cache);
             async move { client_resume(&mut a, &request, &cache).await }
@@ -831,7 +846,7 @@ mod tests {
         cache.store(&SERVER_KEY, ticket, HANDSHAKE_HASH); // cache the tampered copy
         let cache = std::sync::Arc::new(cache);
 
-        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap();
+        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap().unwrap();
         let initiator = tokio::spawn({
             let cache = std::sync::Arc::clone(&cache);
             async move { client_resume(&mut a, &request, &cache).await }
@@ -846,7 +861,10 @@ mod tests {
             "the initiator ignored the decline"
         );
         // The declined entry is gone from the client's cache.
-        assert!(ResumeRequest::build(&cache, &SERVER_KEY).is_none());
+        assert!(matches!(
+            ResumeRequest::build(&cache, &SERVER_KEY),
+            Ok(None)
+        ));
     }
 
     #[tokio::test]
@@ -865,7 +883,7 @@ mod tests {
         }
         let cache = std::sync::Arc::new(cache);
 
-        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap();
+        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap().unwrap();
         let initiator = tokio::spawn({
             let cache = std::sync::Arc::clone(&cache);
             async move { client_resume(&mut a, &request, &cache).await }
@@ -886,7 +904,7 @@ mod tests {
         let cache = std::sync::Arc::new(cache);
 
         // First use succeeds.
-        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap();
+        let request = ResumeRequest::build(&cache, &SERVER_KEY).unwrap().unwrap();
         let initiator = tokio::spawn({
             let request = request.clone();
             let cache = std::sync::Arc::clone(&cache);
@@ -921,7 +939,7 @@ mod tests {
     fn a_ticket_from_another_server_key_does_not_open() {
         let store_a = ServerResumeStore::new(&[7u8; 32]);
         let store_b = ServerResumeStore::new(&[8u8; 32]);
-        let ticket = store_a.issue(&HANDSHAKE_HASH);
+        let ticket = store_a.issue(&HANDSHAKE_HASH).unwrap();
         // Open with the wrong key: the AEAD tag fails.
         let (mut a, mut b) = (ticket.clone(), ticket.clone());
         assert!(open_ticket_for_test(&store_b.ticket_key, &mut a).is_none());

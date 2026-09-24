@@ -1395,7 +1395,13 @@ Details in [docs/release.md](docs/release.md) ("Comparing two builds").
   The v0.7.2 file predates the revision and comes from another container, so
   it measures a different instrument and is never a regression signal.
 - `src/transport/udp_batch.rs` is the only `unsafe` site in the codebase
-  (the recvmmsg/sendmmsg FFI), audited 2026-09-20.
+  (the recvmmsg/sendmmsg FFI), audited 2026-09-20 and reduced on
+  2026-09-24: the send address is now built by `socket2` and every
+  iovec pointer is derived from a bounds-checked index, so the unsafe
+  left is the two zeroed C templates, the kernel-ABI address read, the
+  two `mmsg` calls, and the `Send`/`Sync` impls (19 items -> 8). The same
+  pass cut the production-code lint waivers from 49 to 14 — the record is
+  in CHANGELOG.md's `## [Unreleased]`.
 
 ## Appendix: measurements for work already released
 

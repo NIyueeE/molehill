@@ -325,15 +325,18 @@ where
 
             if state.is_my_turn() {
                 let len = state.write_message(&[], &mut message)?;
-                // Lengths are bounded by MAX_MESSAGE_LEN (u16::MAX):
-                // snow rejects larger messages, so the cast cannot
-                // truncate.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "message length is bounded by the u16 wire format"
-                )]
-                inner.write_u16_le(len as u16).await?;
-                inner.write_all(&message[..len]).await?;
+                // The u16 length field is the wire format's own bound and
+                // snow rejects a larger message, so the conversion cannot
+                // fail; an impossible failure surfaces as a stream error
+                // rather than a panic.
+                let len = u16::try_from(len).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "noise message length exceeds the u16 wire format",
+                    )
+                })?;
+                inner.write_u16_le(len).await?;
+                inner.write_all(&message[..usize::from(len)]).await?;
                 inner.flush().await?;
             } else {
                 let len = inner.read_u16_le().await? as usize;
@@ -476,13 +479,15 @@ where
                             .encrypt(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         // `message_len` is bounded by MAX_MESSAGE_LEN
-                        // (u16::MAX), so the cast cannot truncate.
-                        #[expect(
-                            clippy::cast_possible_truncation,
-                            reason = "message length is bounded by the u16 wire format"
-                        )]
-                        record[..LENGTH_FIELD_LEN]
-                            .copy_from_slice(&(message_len as u16).to_le_bytes());
+                        // (u16::MAX); an impossible overrun is an error,
+                        // not a truncated record.
+                        let len = u16::try_from(message_len).map_err(|_| {
+                            std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                "noise record length exceeds the u16 wire format",
+                            )
+                        })?;
+                        record[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
                         record.truncate(LENGTH_FIELD_LEN + message_len);
                         *state = WriteState::WritingOwned {
                             record: record.freeze(),
@@ -498,13 +503,15 @@ where
                         )
                         .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                     // `message_len` is bounded by MAX_MESSAGE_LEN
-                    // (u16::MAX), so the cast cannot truncate.
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "message length is bounded by the u16 wire format"
-                    )]
-                    write_message_buffer[..LENGTH_FIELD_LEN]
-                        .copy_from_slice(&(message_len as u16).to_le_bytes());
+                    // (u16::MAX); an impossible overrun is an error, not
+                    // a truncated record.
+                    let len = u16::try_from(message_len).map_err(|_| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "noise record length exceeds the u16 wire format",
+                        )
+                    })?;
+                    write_message_buffer[..LENGTH_FIELD_LEN].copy_from_slice(&len.to_le_bytes());
                     *state = WriteState::WritingMessage {
                         start: 0,
                         end: LENGTH_FIELD_LEN + message_len,
@@ -993,11 +1000,9 @@ mod tests {
             let _transport = resp.into_transport_mode().unwrap();
             resp_finish_us += t.elapsed().as_secs_f64() * 1e6;
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "N is a compile-time constant far below 2^52"
-        )]
-        let per = |us_total: f64| us_total / N as f64;
+        // `per` divides by N; converting the loop count through u32 keeps
+        // the division exact (N is far below 2^32).
+        let per = |us_total: f64| us_total / f64::from(u32::try_from(N).unwrap_or(u32::MAX));
         eprintln!(
             "handshake phase attribution (release build, N={N}):\n  \
              build_initiator:        {:7.2} us\n  \
@@ -1076,12 +1081,9 @@ mod tests {
             });
             total_us += started.elapsed().as_secs_f64() * 1e6;
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "n is a compile-time constant far below 2^52"
-        )]
-        let per_pair = total_us / n as f64;
-        per_pair
+        // Dividing by the pair count through u32 keeps the division
+        // exact (n is far below 2^32).
+        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     /// Time N resumed exchanges and return the per-pair microseconds.
@@ -1100,6 +1102,7 @@ mod tests {
             let server_static = server_static.to_vec();
             let request =
                 crate::transport::noise_resume::ResumeRequest::build(&cache, &server_static)
+                    .unwrap()
                     .unwrap();
             let started = std::time::Instant::now();
             rt.block_on(async move {
@@ -1131,12 +1134,9 @@ mod tests {
             });
             total_us += started.elapsed().as_secs_f64() * 1e6;
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "n is a compile-time constant far below 2^52"
-        )]
-        let per_pair = total_us / n as f64;
-        per_pair
+        // Dividing by the pair count through u32 keeps the division
+        // exact (n is far below 2^32).
+        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     /// Setup-cost comparison for the session-resume path (release mode —

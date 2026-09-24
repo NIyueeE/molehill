@@ -273,16 +273,14 @@ impl Pacer {
 
     /// Try to allow `n` bytes at `now`; on denial return how long until
     /// enough tokens accrue at `rate_bps`.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "datagram sizes are bounded by the 1400-byte MTU, far \
-                  below f64's exact integer range"
-    )]
     fn allow(&mut self, now: Instant, n: usize, rate_bps: f64) -> Result<(), Duration> {
         let dt = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + dt * rate_bps / 8.0).min(PACER_BUCKET_BYTES);
-        let need = n as f64;
+        // `n` is a batch of datagrams, each bounded by the MTU; the
+        // conversion is exact for any real batch and a saturated value
+        // merely parks the pacer on a demand it can never satisfy.
+        let need = f64::from(u32::try_from(n).unwrap_or(u32::MAX));
         if self.tokens >= need {
             self.tokens -= need;
             Ok(())
@@ -622,10 +620,18 @@ fn tune_socket_buffers(socket: &UdpSocket) {
 }
 
 /// Milliseconds since `start`, on KCP's wrapping u32 clock.
+///
+/// The `as u32` below is the wrap itself, not a truncation: KCP's
+/// protocol clock runs in milliseconds modulo 2^32 (~49.7 days) and its
+/// `timediff` arithmetic handles the wraparound by design. Masking the
+/// low 32 bits (`u32::try_from(millis & u32::MAX)`) is a lint-free
+/// equivalent, but it reads as a checked conversion with a dead
+/// fallback rather than as the protocol clock this is.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "KCP's protocol clock is a wrapping u32 of milliseconds; its \
-              timediff arithmetic handles the 49-day wraparound by design"
+    reason = "the u32 clock wraps modulo 2^32 by protocol design and \
+              `timediff` handles the 49-day wraparound; the masked \
+              `try_from` equivalent is strictly less clear about it"
 )]
 fn ms_now(start: Instant) -> u32 {
     start.elapsed().as_millis() as u32
@@ -967,15 +973,13 @@ impl PaceState {
     /// RTT is only a validity gate here (a PONG with insane timestamps is
     /// a clock wrap or a stray frame, not evidence of a clean path); the
     /// pacing signal is the PONG timeout, not its size.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "RTT deltas are bounded by the 5 s sanity window, far \
-                  below f64's exact integer range"
-    )]
     fn on_pong(&mut self, ping_us: u64, now_us: u64) {
         if ping_us == self.last_ping_us && self.ping_outstanding {
-            let rtt_ms = (now_us.saturating_sub(ping_us) as f64) / 1000.0;
-            if (0.05..=5000.0).contains(&rtt_ms) {
+            // The sanity window is tested on the integer microseconds
+            // (50 us .. 5 s) before any conversion, so no precision is
+            // lost for the values that can pass it.
+            let rtt_us = now_us.saturating_sub(ping_us);
+            if (50..=5_000_000).contains(&rtt_us) {
                 self.clean_pongs += 1;
                 if self.clean_pongs >= 4 {
                     self.rate_bps = (self.rate_bps * PACER_UP_FACTOR).min(PACER_MAX_BPS);
@@ -997,12 +1001,6 @@ impl PaceState {
 
 /// Handle an adapter control frame (NOT a KCP segment). `start` anchors
 /// the pump's microsecond clock for RTT computation.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the microsecond clock wraps after ~584k years of uptime; \
-              a truncated value merely yields a bad RTT sample that the \
-              sanity window rejects"
-)]
 async fn handle_ctrl(
     kind: u8,
     payload: &[u8],
@@ -1022,7 +1020,7 @@ async fn handle_ctrl(
         CTRL_PONG => {
             let mut ts = [0u8; 8];
             ts.copy_from_slice(&payload[..8]);
-            let now_us = start.elapsed().as_micros() as u64;
+            let now_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
             pace.on_pong(u64::from_le_bytes(ts), now_us);
         }
         CTRL_SACK => {
@@ -1044,10 +1042,6 @@ async fn handle_ctrl(
 /// Send the periodic adapter PING (keepalive + RTT probe); when the
 /// previous PING went unanswered, cut the pacing rate first (the pacer is
 /// the congestion-control stand-in with nc=1).
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "same microsecond-clock truncation reasoning as handle_ctrl"
-)]
 async fn maybe_ping(
     kcp: &Kcp<DatagramOut>,
     net: &SessionNet,
@@ -1068,7 +1062,7 @@ async fn maybe_ping(
         pace.on_ping_timeout();
     }
     pace.last_ping = Instant::now();
-    let us = start.elapsed().as_micros() as u64;
+    let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     pace.last_ping_us = us;
     pace.ping_outstanding = true;
     let f = ctrl_frame(kcp.conv(), CTRL_PING, &us.to_le_bytes());
@@ -1269,27 +1263,37 @@ enum Tail {
     Exit,
 }
 
+/// The per-round pump state [`pump_tail`] drives, bundled from the locals
+/// of `run_session`: everything the tail reads or writes besides the
+/// session's own `Kcp`, `SessionNet` and `PaceState`.
+struct PumpTailCtx<'a> {
+    /// Channel into the reader half of the stream.
+    in_tx: &'a mpsc::Sender<ReadBatch>,
+    /// Batches received but not yet accepted by the reader channel.
+    spill: &'a mut std::collections::VecDeque<ReadBatch>,
+    /// Coalescing staging for one reader-channel message.
+    parts: &'a mut Vec<Bytes>,
+    /// Staged outbound datagram batches waiting for the wire.
+    dgram_rx: &'a mut mpsc::UnboundedReceiver<DgramBatch>,
+    /// Last SACK gap notification (throttled by `SACK_COOLDOWN`).
+    last_sack_sent: &'a mut Instant,
+    /// Whether the batch just consumed still owes an ack flush.
+    ack_flush_due: &'a mut bool,
+    /// Whether this round put anything on the wire.
+    sent_any: &'a mut bool,
+    /// Quiet-round counter for the close-flush decision.
+    quiet_rounds: &'a mut u32,
+}
+
 /// One pump round after its select: deliver received data, notify gaps,
 /// flush the batch's acks, push KCP's datagrams onto the wire, and check
 /// liveness. Split out of `run_session` so the select stays readable.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the pump's per-round state is exactly this set; bundling it \
-              into a context struct would only move the field list"
-)]
 async fn pump_tail(
     kcp: &mut Kcp<DatagramOut>,
     net: &SessionNet,
     pace: &mut PaceState,
-    in_tx: &mpsc::Sender<ReadBatch>,
-    spill: &mut std::collections::VecDeque<ReadBatch>,
-    parts: &mut Vec<Bytes>,
-    dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
-    last_sack_sent: &mut Instant,
-    ack_flush_due: &mut bool,
-    sent_any: &mut bool,
+    tail: &mut PumpTailCtx<'_>,
     closing: bool,
-    quiet_rounds: &mut u32,
     close_deadline: Instant,
 ) -> Tail {
     // Deliver received app data to the reader half — strictly non-blocking
@@ -1304,7 +1308,7 @@ async fn pump_tail(
     // drain) into the delivery phase.
     let delivered = {
         let _t = PhaseTimer::new(&KCP_NS_DELIVER);
-        match deliver_recv(kcp, in_tx, spill, parts) {
+        match deliver_recv(kcp, tail.in_tx, tail.spill, tail.parts) {
             Delivery::Done { delivered } => delivered,
             Delivery::ReaderGone => {
                 debug!("KCP session reader gone, closing (peer {})", net.peer);
@@ -1315,12 +1319,12 @@ async fn pump_tail(
 
     // SACK gap detection (see `maybe_sack`): tell the peer to resend
     // the missing segment instead of waiting out the RTO backoff.
-    maybe_sack(kcp, net, delivered, spill, last_sack_sent).await;
+    maybe_sack(kcp, net, delivered, tail.spill, tail.last_sack_sent).await;
 
     // 3) Flush acks for the batch just consumed — now that delivery has
     //    drained the receive queue, the advertised window is honest.
-    if *ack_flush_due {
-        *ack_flush_due = false;
+    if *tail.ack_flush_due {
+        *tail.ack_flush_due = false;
         if let Err(e) = flush_after_batch(kcp) {
             warn!("KCP session ack flush failed: {e}");
             return Tail::Exit;
@@ -1331,7 +1335,7 @@ async fn pump_tail(
     //    pacer (see `drain_dgrams`).
     {
         let _t = PhaseTimer::new(&KCP_NS_OUTPUT);
-        drain_dgrams(dgram_rx, net, pace, sent_any).await;
+        drain_dgrams(tail.dgram_rx, net, pace, tail.sent_any).await;
     }
 
     if kcp.is_dead_link() {
@@ -1345,13 +1349,13 @@ async fn pump_tail(
         // With the reader still alive this is a half-close — keep
         // serving reads; a vanished peer is bounded by the dead-link
         // check above.
-        if in_tx.is_closed()
+        if tail.in_tx.is_closed()
             && closing_quiescent(
-                *sent_any,
+                *tail.sent_any,
                 delivered,
                 kcp,
-                spill,
-                quiet_rounds,
+                tail.spill,
+                tail.quiet_rounds,
                 close_deadline,
             )
         {
@@ -1463,15 +1467,17 @@ async fn run_session(
             &mut kcp,
             &net,
             &mut pace,
-            &in_tx,
-            &mut spill,
-            &mut parts,
-            &mut dgram_rx,
-            &mut last_sack_sent,
-            &mut ack_flush_due,
-            &mut sent_any,
+            &mut PumpTailCtx {
+                in_tx: &in_tx,
+                spill: &mut spill,
+                parts: &mut parts,
+                dgram_rx: &mut dgram_rx,
+                last_sack_sent: &mut last_sack_sent,
+                ack_flush_due: &mut ack_flush_due,
+                sent_any: &mut sent_any,
+                quiet_rounds: &mut quiet_rounds,
+            },
             closing,
-            &mut quiet_rounds,
             close_deadline,
         )
         .await

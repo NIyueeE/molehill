@@ -358,6 +358,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its `#[cfg(not(feature = ...))]` callers does, instead of being
   `allow(dead_code)`d away in full-feature builds.
 
+### Changed
+
+- **Lint-hygiene pass over the data path: 49 -> 14 in-code lint waivers in
+  production code (70 -> 25 including test modules), and the `unsafe`
+  surface cut from 19 items to 8.** No wire-format, protocol or
+  scheduling change; the full suite and both clippy passes are green.
+  The waivers were removed by fixing the code rather than by relaxing a
+  level: `expect_used`/`unwrap_used` sites became real error paths (the
+  Noise session-resume module now propagates a system-RNG failure like the
+  crate's other two RNG sites — the old waiver claimed panic was the
+  house rule, which the code itself disproved), `cast_*` sites became
+  `try_from` conversions whose unreachable fallbacks are benign, the
+  vendored KCP engine's `input`/`flush` were split into the helpers their
+  own `too_many_lines` reasons described (segment parse, PUSH accept, the
+  cwnd recompute, the ssthresh bookkeeping), and `pump_tail`'s per-round
+  state became one `PumpTailCtx` instead of twelve parameters. The
+  dead `Config::set_split_send_size` setter was deleted (AGENTS.md §9: no
+  corpses). Two waivers survive on purpose: `ms_now`'s u32 clock is KCP's
+  modulo-2^32 protocol clock (the `as u32` *is* the wrap), and the
+  `kcp-stats` `ms()` helper has no `f64: From<u64>` to use.
+- `src/transport/udp_batch.rs` — still the single audited unsafe site —
+  now keeps `unsafe` only at the FFI boundary: the two zeroed `msghdr` /
+  `sockaddr_storage` templates (musl's private padding fields rule out a
+  struct literal), the kernel-ABI cast that reads a received address back,
+  the `recvmmsg`/`sendmmsg` calls, and the `Send`/`Sync` impls the
+  reusable descriptor arrays need (the receive batch needs both — its
+  reader borrow lives across an await). Everything else is safe: iovec
+  pointers come from `ptr::from_mut` on bounds-checked indices, staged
+  spans from range-sliced `Bytes`, and the send address from
+  `socket2::SockAddr::from(peer)` instead of a hand-built storage — which
+  also means a **scoped IPv6 peer now carries its flowinfo and scope id**
+  onto the wire, where the hand-built storage dropped both. 14 unsafe
+  blocks -> 5, 5 unsafe items -> 3.
+
 ## [0.8.1] - 2026-09-11
 
 ### Fixed
