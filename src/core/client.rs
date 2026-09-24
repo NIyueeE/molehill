@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot, watch};
@@ -40,7 +40,7 @@ use crate::transport::multiplex::{ClientTunnel, TunnelPool};
 use crate::common::constants::MAX_MUX_TUNNELS;
 use crate::common::constants::{
     DEFAULT_TCP_POOL_SIZE, DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS,
-    DEFAULT_UDP_POOL_SIZE, DEFAULT_UDP_SENDQ_SIZE, run_control_chan_backoff,
+    DEFAULT_UDP_POOL_SIZE, DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
 };
 
 /// The server rejected this service's registration (port not allowed, port
@@ -145,11 +145,6 @@ impl tokio::io::AsyncRead for ClientStream {
         }
     }
 }
-
-/// Owned-write capability: the plain TCP socket and the Noise-over-TCP
-/// wrapper both take the borrowed path (a socket write is the kernel
-/// copy), so `TAKES_OWNED` stays false and the forwarding loop copies.
-impl crate::common::owned_write::AsyncWriteOwned for ClientStream {}
 
 impl tokio::io::AsyncWrite for ClientStream {
     fn poll_write(
@@ -547,21 +542,6 @@ impl tokio::io::AsyncRead for TunnelStream {
 }
 
 #[cfg(feature = "multiplex")]
-impl crate::common::owned_write::AsyncWriteOwned for TunnelStream {
-    const TAKES_OWNED: bool = true;
-
-    fn poll_write_owned(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: bytes::Bytes,
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            TunnelStream::Yamux(s) => std::pin::Pin::new(s).poll_write_owned(cx, buf),
-        }
-    }
-}
-
-#[cfg(feature = "multiplex")]
 impl tokio::io::AsyncWrite for TunnelStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -624,22 +604,6 @@ impl tokio::io::AsyncRead for ClientDataChannel {
             ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "multiplex")]
             ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl crate::common::owned_write::AsyncWriteOwned for ClientDataChannel {
-    const TAKES_OWNED: bool = true;
-
-    fn poll_write_owned(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: bytes::Bytes,
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_write_owned(cx, buf),
-            #[cfg(feature = "multiplex")]
-            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_write_owned(cx, buf),
         }
     }
 }
@@ -947,12 +911,7 @@ async fn run_data_channel_for_tcp<S>(
     sock_opts: SocketOpts,
 ) -> Result<()>
 where
-    S: tokio::io::AsyncRead
-        + tokio::io::AsyncWrite
-        + crate::common::owned_write::AsyncWriteOwned
-        + Unpin
-        + Send
-        + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("New data channel starts forwarding");
 
@@ -962,12 +921,13 @@ where
     // The leg towards the local service needs explicit socket options;
     // without them Nagle stays enabled and interactive traffic stalls.
     sock_opts.apply(&local);
-    // The forwarding copy with the data-channel write taking owned
-    // buffers (link M1): the local service's bytes become the yamux frame
-    // body by ownership, so the frame-body staging copy is gone. A data
-    // channel that cannot take owned buffers (plain transport stream)
-    // falls back to the borrowed copy.
-    let _ = crate::common::forward::forward_bidirectional(&mut conn, &mut local).await;
+    let _ = copy_bidirectional_with_sizes(
+        &mut conn,
+        &mut local,
+        TCP_COPY_BUFFER_SIZE,
+        TCP_COPY_BUFFER_SIZE,
+    )
+    .await;
     Ok(())
 }
 

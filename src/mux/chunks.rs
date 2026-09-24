@@ -10,8 +10,6 @@
 
 use std::{collections::VecDeque, io};
 
-use bytes::Bytes;
-
 /// A sequence of [`Chunk`] values.
 ///
 /// [`Chunks::len`] considers all [`Chunk`] elements and computes the total
@@ -38,7 +36,7 @@ impl Chunks {
     }
 
     /// Add another chunk of bytes to the end.
-    pub(crate) fn push(&mut self, x: Bytes) {
+    pub(crate) fn push(&mut self, x: Vec<u8>) {
         self.len += x.len();
         if !x.is_empty() {
             self.seq.push_back(Chunk {
@@ -60,15 +58,13 @@ impl Chunks {
     }
 }
 
-/// A `Chunk` wraps a `std::io::Cursor<Bytes>`.
+/// A `Chunk` wraps a `std::io::Cursor<Vec<u8>>`.
 ///
 /// It provides a byte-slice view and a way to advance the cursor so the
-/// shared buffer can be consumed in steps. The frame body arrives here as
-/// an owned `Bytes` (frozen in place on the read path), so the stream
-/// buffer holds the frame's own allocation rather than a copy of it.
+/// vector can be consumed in steps.
 #[derive(Debug)]
 pub(crate) struct Chunk {
-    cursor: io::Cursor<Bytes>,
+    cursor: io::Cursor<Vec<u8>>,
 }
 
 impl Chunk {
@@ -84,10 +80,10 @@ impl Chunk {
 
     /// The sum of bytes that the cursor has been `advance`d over.
     pub(crate) fn offset(&self) -> usize {
-        // A Cursor over an in-memory Bytes never exceeds usize::MAX.
+        // A Cursor over a Vec<u8> never exceeds usize::MAX.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "cursor position over an in-memory buffer fits usize"
+            reason = "cursor position over an in-memory Vec fits usize"
         )]
         let pos = self.cursor.position() as usize;
         pos
@@ -99,7 +95,7 @@ impl Chunk {
     /// from the current position to the end.
     pub(crate) fn advance(&mut self, amount: usize) {
         assert!({
-            // the new position must not exceed the buffer's length
+            // the new position must not exceed the vector's length
             let pos = self.offset().checked_add(amount);
             let max = self.cursor.get_ref().len();
             pos.is_some() && pos <= Some(max)

@@ -1,4 +1,4 @@
-use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, UDP_ROUTE_TTL_SECS};
+use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP_ROUTE_TTL_SECS};
 use crate::common::helper::write_and_flush;
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
@@ -27,7 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
+    copy_bidirectional_with_sizes,
+};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -124,11 +127,6 @@ impl AsyncRead for ServerStream {
         }
     }
 }
-
-/// Owned-write capability: the plain TCP socket and the Noise-over-TCP
-/// wrapper both take the borrowed path (a socket write is the kernel
-/// copy), so `TAKES_OWNED` stays false and the forwarding loop copies.
-impl crate::common::owned_write::AsyncWriteOwned for ServerStream {}
 
 impl AsyncWrite for ServerStream {
     fn poll_write(
@@ -687,22 +685,6 @@ impl tokio::io::AsyncRead for DataChannel {
 }
 
 #[cfg(feature = "multiplex")]
-impl crate::common::owned_write::AsyncWriteOwned for DataChannel {
-    const TAKES_OWNED: bool = true;
-
-    fn poll_write_owned(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: bytes::Bytes,
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match &mut *self {
-            DataChannel::Raw(s) => std::pin::Pin::new(s).poll_write_owned(cx, buf),
-            DataChannel::Mux(s) => std::pin::Pin::new(s).poll_write_owned(cx, buf),
-        }
-    }
-}
-
-#[cfg(feature = "multiplex")]
 impl tokio::io::AsyncWrite for DataChannel {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -1209,12 +1191,7 @@ async fn run_tcp_connection_pool<C>(
     stripe_count: usize,
 ) -> Result<()>
 where
-    C: tokio::io::AsyncRead
-        + tokio::io::AsyncWrite
-        + crate::common::owned_write::AsyncWriteOwned
-        + Unpin
-        + Send
-        + 'static,
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     info!("Listening at {}", l.local_addr()?);
     let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)?;
@@ -1280,17 +1257,11 @@ where
                             };
                             if write_and_flush(&mut ch, &cmd).await.is_ok() {
                                 tokio::spawn(async move {
-                                    // The forwarding copy with the
-                                    // data-channel write taking owned
-                                    // buffers (link M1): the visitor's
-                                    // bytes become the yamux frame body
-                                    // by ownership, so the frame-body
-                                    // staging copy is gone. A data
-                                    // channel that cannot take owned
-                                    // buffers (plain transport stream)
-                                    // falls back to the borrowed copy.
-                                    let _ = crate::common::forward::forward_bidirectional(
-                                        &mut ch, &mut incoming,
+                                    let _ = copy_bidirectional_with_sizes(
+                                        &mut ch,
+                                        &mut incoming,
+                                        TCP_COPY_BUFFER_SIZE,
+                                        TCP_COPY_BUFFER_SIZE,
                                     )
                                     .await;
                                 });

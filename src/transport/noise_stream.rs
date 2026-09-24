@@ -21,8 +21,8 @@
 //! - writes encrypt straight into the framing buffer behind the two-byte
 //!   header and address it by index — no per-record `set_len` dance, and no
 //!   `unsafe` anywhere in this module. A transport that takes owned records
-//!   (`RecordWrite`, KCP's writer channel) gets the record as one `Bytes`
-//!   instead, which removes the copy at its write boundary;
+//!   (`AsyncWriteOwned`, KCP's writer channel) gets the record as one
+//!   `Bytes` instead, which removes the copy at its write boundary;
 //! - the setup path allocates almost nothing: the handshake runs on stack
 //!   buffers (its messages are bounded by the pattern's tokens, well under
 //!   300 bytes), and the three 64 KiB record buffers come from a bounded

@@ -20,7 +20,6 @@ use crate::mux::{
         header::{Data, Header, StreamId, WindowUpdate},
     },
 };
-use bytes::Bytes;
 use flow_control::FlowController;
 use parking_lot::{Mutex, MutexGuard};
 use std::{
@@ -322,110 +321,6 @@ impl AsyncRead for Stream {
     }
 }
 
-impl Stream {
-    /// Write an owned buffer, sharing it as the frame body.
-    ///
-    /// The zero-copy write path (link M1): the caller's buffer becomes the
-    /// frame body by an O(1) `Bytes::slice`, so the staging copy the
-    /// borrowed `poll_write` pays is gone. Window, flag and split
-    /// semantics are identical to `poll_write` — same bytes, same frames,
-    /// same order.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "the AsyncWriteOwned boundary hands the buffer over by value; \
-                  the body shares it as the frame body"
-    )]
-    pub(crate) fn poll_write_owned(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: Bytes,
-    ) -> Poll<io::Result<usize>> {
-        // Park the writer on a full command channel before any window is
-        // consumed; `wake_stream_writer` on the connection retries us.
-        if self.sender.capacity() == 0 {
-            self.park_on_full_channel(cx);
-            return Poll::Pending;
-        }
-        let body = {
-            let mut shared = self.shared();
-            if !shared.state().can_write() {
-                tracing::debug!("{}/{}: can no longer write", self.conn, self.id);
-                return Poll::Ready(Err(self.write_zero_err()));
-            }
-            if shared.send_window() == 0 {
-                tracing::trace!("{}/{}: no more credit left", self.conn, self.id);
-                shared.writer = Some(cx.waker().clone());
-                // Re-check after storing: a window update from the
-                // connection may have landed in between (a lost-wakeup
-                // race: the wake found no waker to wake yet).
-                if shared.send_window() > 0
-                    && let Some(w) = shared.writer.take()
-                {
-                    w.wake();
-                }
-                return Poll::Pending;
-            }
-            let k = std::cmp::min(shared.send_window() as usize, buf.len());
-            let k = std::cmp::min(k, self.config.split_send_size);
-            // `k` is bounded by the send window two lines above, so the
-            // subtraction cannot underflow and the cast cannot truncate.
-            #[expect(
-                clippy::expect_used,
-                reason = "k is bounded by the send window by construction"
-            )]
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "k is bounded by the u32 send window"
-            )]
-            shared
-                .consume_send_window(k as u32)
-                .expect("not exceed receive window");
-            // O(1) share of the caller's buffer.
-            buf.slice(..k)
-        };
-        let n = body.len();
-        // `k` (hence the body length) is bounded by the split size and
-        // the window, both far below u32::MAX.
-        #[expect(
-            clippy::expect_used,
-            reason = "frame body length is bounded by u32::MAX"
-        )]
-        let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
-        self.add_flag(frame.header_mut());
-        tracing::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
-
-        // technically, the frame hasn't been sent yet on the wire but from the perspective of this data structure, we've queued the frame for sending
-        // We are tracking this information:
-        // a) to be consistent with outbound streams
-        // b) to correctly test our behaviour around timing of when ACKs are sent. See `ack_timing.rs` test.
-        if frame.header().flags().contains(ACK) {
-            self.shared()
-                .update_state(self.conn, self.id, State::Open { acknowledged: true });
-        }
-
-        let cmd = StreamCommand::SendFrame(frame);
-        // Capacity was checked immediately above and this task is the only
-        // sender on the channel, so a full channel here is not reachable;
-        // a closed one means the connection is gone.
-        self.sender
-            .try_send(cmd)
-            .map_err(|_| self.write_zero_err())?;
-        Poll::Ready(Ok(n))
-    }
-}
-
-impl crate::common::owned_write::AsyncWriteOwned for Stream {
-    const TAKES_OWNED: bool = true;
-
-    fn poll_write_owned(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: Bytes,
-    ) -> Poll<io::Result<usize>> {
-        Stream::poll_write_owned(self, cx, buf)
-    }
-}
-
 impl AsyncWrite for Stream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -472,7 +367,7 @@ impl AsyncWrite for Stream {
             shared
                 .consume_send_window(k as u32)
                 .expect("not exceed receive window");
-            Bytes::copy_from_slice(&buf[..k])
+            Vec::from(&buf[..k])
         };
         let n = body.len();
         // `k` (hence the body length) is bounded by the split size and

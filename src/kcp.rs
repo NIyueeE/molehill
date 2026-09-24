@@ -697,10 +697,10 @@ impl<Output> Kcp<Output> {
     /// Send an already-owned payload into buffer, sharing it per segment.
     ///
     /// The zero-copy write path: a caller that holds the bytes as an owned
-    /// `Bytes` (a Noise record's ciphertext, a yamux frame body) hands the
-    /// buffer over, and each MSS-sized segment is an O(1) `Bytes::slice` of
-    /// it — no per-segment copy. The window, ordering and error semantics
-    /// are exactly `send`'s; the only difference is where the bytes live.
+    /// `Bytes` (a Noise record's ciphertext) hands the buffer over, and each
+    /// MSS-sized segment is an O(1) `Bytes::slice` of it — no per-segment
+    /// copy. The window, ordering and error semantics are exactly `send`'s;
+    /// the only difference is where the bytes live.
     pub fn send_owned(&mut self, mut data: Bytes) -> KcpResult<usize> {
         let mut sent_size = 0;
 

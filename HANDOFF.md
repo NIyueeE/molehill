@@ -514,6 +514,14 @@ must not be quoted.
 
 ## Zero-copy route: the full-path copy map (2026-09-24)
 
+**Route closed 2026-09-24.** Every link resolved: three landed
+(L1/L2/L3 on the kcp4 arm), one landed on mechanism (S1, opt-in), one
+reverted after its A/B failed the gate (M1), one parked with its
+premise refuted (N1). The landed set is confirmed against `main` by the
+final cumulative A/B at the end of this section — latency at parity,
+throughput net-positive on all four arms, CPU net-positive; the costs
+found and their handling are in each link's record below.
+
 A code-level review of every hop on the data path (all arms), counting
 userspace copies per application byte. The headline: **the copy burden
 is asymmetric across arms — the TCP arm pays W2/W4/K1-K4 inside the
@@ -527,7 +535,7 @@ without touching the wire format.
 | # | copy | where | removable |
 |---|---|---|---|
 | W1 | kernel → `copy_bidirectional_with_sizes` stack buffer | src/core/server.rs:1260 | no (syscall; that buffer is also the write buffer) |
-| W2 | stack buffer → yamux frame body (`Vec::from(&buf[..k])`) | src/mux/connection/stream.rs:365 | **yes (M1)** |
+| W2 | stack buffer → yamux frame body (`Vec::from(&buf[..k])`) | src/mux/connection/stream.rs:365 | **yes — OPEN: M1 attempted it and was reverted after its A/B (see "Link M1 A/B")** |
 | W3 | frame body → Noise record ciphertext | src/transport/noise_stream.rs:447 | no (AEAD; ciphertext must be contiguous with the 2 B length header) |
 | W4 | ciphertext → kernel | tokio | no (syscall) |
 | K1 | record → `Bytes::copy_from_slice` for the out_tx channel | src/transport/kcp.rs (`KcpStream::poll_write`) | **yes (L3)** |
@@ -535,23 +543,23 @@ without touching the wire format.
 | K3 | segment → engine `self.buf` (encode) | src/kcp.rs:197 | **yes (L2)** |
 | K4 | datagram → DatagramOut batch staging | src/transport/kcp.rs (`DatagramOut::write`) | **yes (L2)** |
 | R1 | kernel → Noise `bufs.scratch` (record accumulation) | src/transport/noise_stream.rs | no (record framing needs the length header first) |
-| R2 | scratch plaintext → caller buffer (decrypt) | noise_stream.rs (incl. the e463391 fast path) | **yes (N1: read the whole record into the caller's buffer and decrypt in place)** |
+| R2 | the decrypt's ciphertext read (the `bufs.payload` staging copy this row first named was already removed by the e463391 fast path) | noise_stream.rs (incl. the e463391 fast path) | **no — parked with N1, premise refuted: see "Link N1" below** |
 | R3 | mux frame body → stream read buffer | src/mux/connection.rs (`into_body`) | no (already a move) |
 | R4 | stream buffer → `copy_bidirectional` stack buffer | tokio | no (that copy IS the socket write) |
 | K5 | recvmmsg batch buffer → owned `Bytes` per datagram | src/transport/kcp.rs (ingress) | no (batch buffers are reused; per-datagram allocation would be worse) |
 | K6 | datagram → segment data (`input()` parse) | src/kcp.rs | no (ownership copy; input buffers are transient) |
 | K7 | segment → `recv_buf` | src/transport/kcp.rs (`deliver_recv`) | **yes (L1)** |
 | K8 | `recv_buf` → coalesce blob | src/transport/kcp.rs (`deliver_recv`) | **yes (L1)** |
-| S1 | read chunk → stripe frame body | src/stripe.rs:170 | **yes (S1: `send` takes `Bytes`, the read buffer becomes the frame)** |
+| S1 | read chunk → stripe frame body | src/stripe.rs:170 | **yes — done (S1 landed): the read buffer becomes the frame** |
 
 Not attempted (recorded so it is not re-litigated): the syscall
 boundaries; the write-path AEAD copy (W3); splice/sendfile (already
 measured and not recommended); io_uring / UDP `MSG_ZEROCOPY` (1.4 KiB
 datagrams are below the threshold and conflict with the batch design);
 the L5 frame-body pool (dropped by measurement — cpu/frame identical —
-note M1 removes the COPY, which L5 did not); the QUIC-style segment
-ring-buffer that would remove per-segment allocation (the rewrite the
-KCP plan excludes).
+note the reverted M1 would have removed the COPY, which L5 did not);
+the QUIC-style segment ring-buffer that would remove per-segment
+allocation (the rewrite the KCP plan excludes).
 
 ### Sequence (one commit + one single-variable A/B per link)
 
@@ -560,20 +568,24 @@ KCP plan excludes).
 | **L1** KCP receive owned-segment (`recv_owned`, `ReadBatch { parts: Vec<Bytes> }`) | K7+K8 | kcp4 | low |
 | **L2** KCP send two-iovec datagrams (header in staging + payload by reference, `msg_iovlen = 2`) | K3+K4 | kcp4 | medium (engine Output boundary + sendmmsg) |
 | **L3** KCP write owned records (Noise produces owned records; `KcpStream` owned write; deepened to `send_owned`) | K1+K2 | kcp4 | medium |
-| **M1** mux frame body owned write (`Frame.body` Vec→Bytes + owned write API + an owned proxy loop) | W2 + one alloc/frame | all mux arms | medium |
-| **N1** Noise in-place record decrypt on the read fast path | R2 | noise, kcp4 | medium |
-| **S1** stripe owned chunk | S1 | stripe (opt-in) | low |
+| ~~**M1** mux frame body owned write (`Frame.body` Vec→Bytes + owned write API + an owned proxy loop)~~ | ~~W2 + one alloc/frame~~ | ~~all mux arms~~ | **attempted and reverted — failed its A/B gate** ("Link M1 A/B", below) |
+| ~~**N1** Noise in-place record decrypt on the read fast path~~ | ~~R2~~ | ~~noise, kcp4~~ | **parked — premise refuted** ("Link N1", below) |
+| **S1** stripe owned chunk | S1 | stripe (opt-in) | low — landed on mechanism |
 
 Order rationale: kcp4's copy density is highest and the arm is isolated
 (the cleanest single-variable A/B); L2/L3 share the engine Output
-boundary and are consecutive; M1/N1 touch the default arm and the
-vendored engine / Noise state machine, after the technique is proven on
-KCP; S1 last (opt-in arm). Expected magnitude is honest: L1 ≈ 0.2-0.3
-µs per received segment (~15% of the receiver's cost, visible at the
-8/64-stream and loss cells), L2+L3 ≈ 0.3-0.4 µs per sent segment (~6%,
-the loopback 1-stream cell is sender-bound and is where a claimable win
-would show), M1/N1 ≈ 2-5% CPU on the default arms. Not a step change;
-the step change is the excluded QUIC-style rewrite.
+boundary and are consecutive; S1 last (opt-in arm). N1 was dropped
+after its read-path audit (the premise did not survive the e463391
+fast path that landed before it) and M1 after its A/B (the gate failed
+on four cells with a +25% RSS cost on the default arms — the evidence
+and the identified cost mechanism are in "Link M1 A/B"). Expected
+magnitude is honest: L1 ≈ 0.2-0.3 µs per received segment (~15% of the
+receiver's cost, visible at the 8/64-stream and loss cells), L2+L3 ≈
+0.3-0.4 µs per sent segment (~6%, the loopback 1-stream cell is
+sender-bound and is where a claimable win would show); the ~2-5%
+CPU the M1/N1 pair was expected to bring to the default arms was not
+realized by either link. Not a step change; the step change is the
+excluded QUIC-style rewrite.
 
 ### The attribution re-baseline (2026-09-24, loopback kcp4, 1 rep × 8 s)
 
@@ -820,8 +832,6 @@ non-overlapping 1-stream or cpu-per-segment win) is met on the covered
 cells — two claimable favourable throughput cells, every secondary axis
 median-only favourable or flat, no attributable regression.
 
-<<<<<<< Updated upstream
-=======
 ### Link N1 (2026-09-24): parked — the premise did not survive the read-path audit
 
 The map's R2 row ("scratch plaintext → caller buffer (decrypt)") was
@@ -995,7 +1005,6 @@ Recorded as a mechanism change with the throughput upside explicitly
 not claimed, on the same no-regression grounds the frame-split change
 landed on.
 
->>>>>>> Stashed changes
 ## Final cumulative A/B: branch vs `main` (2026-09-22, host `9201f86b86a8`)
 
 One interleaved `--ab` run (3 rounds × 3 reps × 8 s, cells loopback /
@@ -1088,6 +1097,101 @@ everything measured above holds within its stated cells — except that the
 whole run shared one binary across its `--ab` sides, so its arm-to-arm
 movements measure that binary against itself (see "The `--ab` harness
 bug").
+
+**Superseded 2026-09-24:** this section's run is void (the harness bug
+below). The valid cumulative comparison is the next section, run with
+the fixed harness and the current tree.
+
+## Final cumulative A/B: branch vs `main` (2026-09-24, host `a249c64b88c6`)
+
+The re-run the 2026-09-22 section's void status called for — the first
+VALID branch-vs-main comparison after the `--ab` harness fix
+(`064c55a`). One interleaved `--ab` run: 3 rounds x 3 reps x 8 s, cells
+loopback / loss1_rtt10 / rtt100, arms mux / noise / mux1 / kcp4 plus
+the auto-appended mux-off control on loopback; binaries freshly built
+from `main` `8584945` and the branch tip `2c6d5e1` (L1+L2+L3+S1, M1
+reverted), both commit SHAs verified from `--version` before the run.
+Verdict read with the printed `ab_bin_paths` mapping: `molehill-38be37ba`
+= main (A side, ran first each round), `molehill-9d54fcaf` = branch
+(B side). Data `results-ab-final-2026-09-24.json`, audited: 78 arms, 0
+cell errors, 0 holes, 24 warnings (the recurring "no mux-stats lines"
+partial_metrics on ab1's kcp4/mux1/noise arm-runs — the typed-loud
+failure mode `f5e6719c` added, the same environment fault the 2026-09-22
+run lost silently — plus the documented rtt100 8-stream gaps and one
+zero-byte stream). Scope: the same three of nine matrix cells the
+2026-09-22 run claimed; loss5_rtt100, rtt10, the rate-shaped and jitter
+cells remain un-A/B'd.
+
+**Latency — no regression anywhere.** Every arm/cell at parity on echo
+p50/p95/p99, tcp steady, udp p50/p99 and HoL max gap (almost all <1%;
+rtt100 cells 0.0% by construction). Medians moved favourably in places:
+noise loss1 jitter -62.5%, mux/mux1/noise rtt100 jitter -95 to -97%,
+udp p50 -5 to -7% on the kcp4 and noise loopback cells, mux1 loss1 HoL
+gap -9.1%.
+
+**Throughput — net strongly favourable; 15 claimable cells vs 6, of
+which five are not attributable:**
+
+| arm / cell | branch vs main | reading |
+|---|---|---|
+| kcp4 loopback | 1-stream **+34.2%** (3.092→4.150, branch ahead 3/3), 64-stream **+14.8%** | the zero-copy route's cells; consistent |
+| kcp4 loss1_rtt10 | 1-stream **+6.6%** | claim |
+| kcp4 rtt100 | 1-stream **+43.9%** (0.057→0.082) | claim |
+| kcp4 loopback 8-stream | -40.8% | **not attributable** — the documented bimodal cell (both inside 0.4-3.2); main's ab3 (1.069) sits inside the branch's own range |
+| mux1 loopback | 8-stream **+51.1%** (10.289→15.550) | claim |
+| mux1 loss1_rtt10 | 8-stream **+13.3%** | claim |
+| mux1 rtt100 | 8-stream **+17.2%** | claim |
+| mux loopback | 64-stream **+9.0%** | claim |
+| mux loopback | 1-stream -12.2%, 8-stream -17.0% | **attributable cost** — see below |
+| mux loss1_rtt10 | 8-stream -6.2% | claim, alongside the loss1 CPU cost below |
+| mux rtt100 | 8-stream **+6.6%** | claim |
+| noise loopback | 8-stream **+15.3%**, 64-stream **+13.7%** | claims |
+| noise loopback / loss1 1-stream | -0.2% / -0.2% | hair claims (0.2%), inside any spread |
+| noise loss1_rtt10 | 8-stream **+43.9%** | claim |
+| noise rtt100 | 8-stream **+6.3%** | claim |
+| mux-off control loopback | 1-stream **+6.5%**, 8-stream **+1.2%**, 64-stream -8.2% | the control's own reading; the 64-stream claim is that single-rep cell's bimodality (both span 23-27) |
+
+The mux arm's loopback 1/8-stream cost is the one real throughput
+finding: main ahead in 3 of 3 rounds at 8-stream (28.4/31.8/26.2 vs
+23.7/23.6/22.9) and 2 of 3 at 1-stream, and the mux-off control at the
+same cells reads +6.5%/+1.2% FAVOURABLE for the branch — so it is not
+the run's ordering bias (which runs the other way there). It is
+attributable to the branch's mux-path changes (the vendored engine and
+the stream-cap raise are the only mux-path differences; cpu/kframe is
+flat at 0.046→0.045, so the cost is the data path's throughput bound,
+not per-frame work). Localizing it — an A/B of the cap raise alone, or
+of the vendoring alone — is the follow-up bench item recorded here.
+
+**CPU — net favourable** (median-only except where noted): kcp4 loopback
+**-17.2%** and cpu/kframe **-14.5%**, noise loopback **-16.1%** /
+cpu/kframe **-14.3%**, mux1 loopback **-10.3%** / loss1 **-20.7%**,
+mux loopback -3.5%, mux rtt100 -7.4%. The cost cells: mux/noise loss1
+**+37.2%/+45.0%** with cpu/kframe +37.3%/+45.0% — measured on ab2/ab3
+with the framing counters present (frames/s flat: 15.0-15.8k main vs
+15.7-16.2k branch, avg frame bytes identical at ~31.8 KiB), i.e. the
+branch's per-frame CPU on the lossy cell genuinely rose while the
+cell's 8-stream throughput rose +43.9% (noise) / fell -6.2% (mux).
+Which branch change pays it is not isolable from this cumulative run
+(no mux-off control exists on the loss cell); recorded, not explained.
+
+**Memory — the one axis that regresses, as the user ruled it out of the
+gate**: kcp4 loopback RSS **+194%** (main [76, 69, 70] MiB vs branch
+[206, 170, 206], higher in all 3 rounds) — the KCP send staging (46 KiB
+per session) plus the receive-coalescing/parts residency, times the 64
+concurrent sessions that cell holds; loss1 cells +23-105% correlate with
+their throughput movements; rtt100 +5-36%; mux/mux1/noise loopback
++0-13%. The Phase 1 record's "+73%" was against a different parent; the
+cumulative figure is this one.
+
+**Reading:** the branch does not regress the latency axis anywhere, is
+strongly net-positive on throughput across all four arms and all three
+cells (the kcp4 and mux1 arms gain on every cell; the shaped cells gain
+most), and is net-positive on CPU — against one attributable mux-arm
+loopback cost (-12%/-17% at 1/8-stream), one loss1 CPU cost (+37-45%
+median-only, mechanism unisolated), and the kcp4 memory doubling the
+user ruled out. The favourable cells include the ones the zero-copy
+route targeted: kcp4 loopback 1-stream +34.2% (L1's stability plus L3's
+write path), kcp4 rtt100 1-stream +43.9%, mux1 8-stream +51.1%.
 
 ## The `--ab` harness bug (found 2026-09-23, fixed in `064c55a`)
 

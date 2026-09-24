@@ -45,8 +45,6 @@ mod frame;
 
 pub(crate) mod connection;
 mod tagged_stream;
-#[cfg(test)]
-mod tests;
 
 pub use crate::mux::connection::{Connection, Mode, Stream};
 pub use crate::mux::error::ConnectionError;

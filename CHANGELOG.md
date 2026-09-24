@@ -219,8 +219,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU -7.2% and cpu/kframe -20.7% (median-only); the loopback 8-stream
   cell's -39% is that cell's documented cold-start bimodality
   (0.4-3.2 Gbit/s modes), not a claim. One open cost: loopback RSS +73%
-  median-only — the coalesced-blob channel residency, bounded at
-  ~32 MiB under a full reader stall. Details: HANDOFF.md, "Phase 1 A/B".
+  median-only against its own parent (the coalesced-blob channel
+  residency, bounded at ~32 MiB per session under a full reader stall);
+  the cumulative figure against `main` — from the first valid
+  branch-vs-main A/B (2026-09-24) — is **+194%** on that cell, the
+  per-session staging and coalescing residency times the 64 concurrent
+  sessions the cell holds (HANDOFF.md, "Final cumulative A/B",
+  2026-09-24). Details: HANDOFF.md, "Phase 1 A/B".
 - Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
   now staged into one buffer with their 12-byte header and written in a
   single call instead of two. Larger frame bodies keep the two-phase write

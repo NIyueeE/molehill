@@ -73,9 +73,9 @@
 //! owned buffers, and the engine's `send_owned` shares each one per
 //! segment (O(1) `Bytes` splits) — no per-segment copy. Over Noise, the
 //! record layer encrypts into a fresh buffer and hands the record over by
-//! ownership (`RecordWrite`), so the channel boundary is a move rather
-//! than a copy; a transport that cannot take owned records (plain TCP)
-//! keeps the pooled-buffer path.
+//! ownership (`AsyncWriteOwned`, the shared owned-write boundary), so the
+//! channel boundary is a move rather than a copy; a transport that cannot
+//! take owned records (plain TCP) keeps the pooled-buffer path.
 //!
 //! Security note: KCP provides reliability, not confidentiality. In the
 //! arm-2 stack Noise rides **on top** of `KcpStream`
