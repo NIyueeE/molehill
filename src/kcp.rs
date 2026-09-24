@@ -13,6 +13,11 @@
 //! - the SACK extensions the adapter uses (`Kcp::retransmit_sn`,
 //!   `Kcp::recv_queue_len`, `Kcp::rcv_nxt_sn`) add explicit gap recovery
 //!   beyond the reference;
+//! - `flush()` closes with one `Write::flush` call on the output, which
+//!   the reference never makes: the adapter uses it as the batch boundary
+//!   for its outbound datagrams (see `DatagramOut` in
+//!   `src/transport/kcp.rs`), and `Write::flush`'s default no-op keeps any
+//!   other output user unaffected;
 //! - the reference's `IKCP_FASTACK_CONSERVE` semantics are implemented
 //!   unconditionally (the reference's shipped default: fast-retransmit
 //!   credit is gated on the ack timestamp);
@@ -93,9 +98,13 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 pub(crate) static KCP_DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
 /// Datagrams the engine emitted (`flush`/`update` output writes).
 pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
-/// Segment retransmissions: RTO-expired and fast-resend alike. Each one
-/// is a loss event with exact timing — the congestion signal the
-/// adapter's pacer can use instead of keepalive timeouts.
+/// Segment retransmissions: RTO-expired and fast-resend alike (a
+/// SACK-marked resend flows through the RTO path). Each one is a loss
+/// event with exact timing — feeding it to the pacer as a congestion
+/// signal was tried on 2026-09-23 and dropped by measurement (the cut
+/// outruns the PONG-probe recovery; see HANDOFF.md, "Phase 2 A/B —
+/// DROPPED"), so today this is an attribution counter: a rising rate is
+/// how a collapsing cell is recognized in a stats line.
 pub(crate) static KCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 /// Ack entries sent to the peer (several may share one datagram).
 pub(crate) static KCP_ACKS_OUT: AtomicU64 = AtomicU64::new(0);

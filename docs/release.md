@@ -145,7 +145,18 @@ just bench-ab results-ab.json
 median-only, and a claimable regression exits non-zero. It also accepts two
 independent files (`--baseline`) and warns that epoch drift is not
 cancelled there. Only the throughput metrics record a per-rep range in the
-schema, so they are the only ones that can reach a CLAIM; the engine's
+schema, so they are the only ones that can reach a CLAIM.
+
+**Read the verdict's sides with the mapping it prints.** The pair is sorted
+by label, so the first-printed value is not necessarily the left `--ab`
+entry — and two binaries built from different worktrees usually share the
+basename `molehill`, so their labels are disambiguated hashes. Every `--ab`
+results file therefore records `meta.ab_bin_paths` (label → resolved
+path), and the verdict tool prints that mapping before the table: a
+verdict read with the sides swapped inverts its meaning (a winning change
+was briefly reverted that way on 2026-09-23 — HANDOFF.md, "Phase 1 A/B").
+
+The engine's
 framing counters (`MOLEHILL_MUX_STATS=1`, which the bench sets itself) add
 `frames_per_s` and `cpu_pct_per_kframe` per arm, which separate "too many
 frames" from "too much work per frame" when a cell is CPU-bound. The KCP

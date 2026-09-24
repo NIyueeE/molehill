@@ -313,13 +313,14 @@ impl SendBatch {
     }
 
     /// Send the `spans` datagrams of one contiguous `buf` to one peer in a
-    /// single syscall. Each span is `(offset, len)` into `buf`; spans are
-    /// what a batching adapter produces when it stages several engine
-    /// datagrams into one buffer and drops the spans its pacer denied
-    /// (see `DatagramOut`). Semantics (partial send, EAGAIN) match `send`.
-    ///
-    /// Returns the number of spans sent, or `Err(WouldBlock)` when the
-    /// kernel send buffer is full.
+    /// single syscall. Each span is `(offset, len)` into `buf` — what a
+    /// batching adapter produces when it stages several engine datagrams
+    /// into one buffer and drops the spans its pacer denied (see
+    /// `DatagramOut`). A partial send (return value < `spans.len()`) drops
+    /// the unsent tail, and `Err(WouldBlock)` means the kernel send buffer
+    /// is full — in both cases the caller's ARQ re-emits the datagrams.
+    /// Callers invoke this through `UdpSocket::try_io` so the EAGAIN also
+    /// clears tokio's cached writability.
     pub fn send_spans(
         &mut self,
         fd: RawFd,
@@ -333,14 +334,11 @@ impl SendBatch {
         self.msgs.clear();
         for &(off, len) in &spans[..n] {
             self.iovs.push(libc::iovec {
-                // SAFETY of the pointer: `off + len` is within `buf` (the
-                // adapter only records spans of complete datagrams it
-                // staged into `buf`), and `buf` is borrowed for the whole
-                // call, so the pointer stays valid and the iovec length
-                // never reads past it.
                 #[expect(unsafe_code, reason = "audited FFI: in-bounds pointer arithmetic")]
-                // SAFETY: `off <= off + len <= buf.len()`, so the computed
-                // pointer is within the frozen buffer's live allocation.
+                // SAFETY: `off + len <= buf.len()` (the adapter only records
+                // spans of complete datagrams it staged into `buf`), and
+                // `buf` is borrowed for the whole call, so the pointer stays
+                // valid and the iovec never reads past the live allocation.
                 iov_base: unsafe { buf.as_ptr().add(off) } as *mut libc::c_void,
                 iov_len: len,
             });

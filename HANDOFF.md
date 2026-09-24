@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-23. Branch `perf/data-path-optimizations` (55 commits
+> State as of 2026-09-23. Branch `perf/data-path-optimizations` (71 commits
 > ahead of `main`, pushed, **not merged**) contains the complete mux-engine
 > migration: rust-yamux 0.14 is now an in-repo, tokio-native engine
 > (`src/mux/`), and the mux transport drives it directly
@@ -16,6 +16,18 @@
 > against itself. Their non-overlapping claims are withdrawn; see "The
 > `--ab` harness bug" below. The fix is `064c55a`; the first A/B taken with
 > the fixed harness is the stripe experiment ("Stripe A/B (K=4)").
+>
+> **Two follow-up harness fixes (2026-09-23, KCP session), both label-layer
+> only:** `2754142` — two worktree binaries share the basename `molehill`,
+> so the `--ab` label suffix collided and the two sides silently overwrote
+> each other (`ab_compare` saw no pair at all); `5d1d9dd` — `ab_compare`
+> sorts a pair by label, so a verdict's first-printed value is NOT
+> necessarily the left `--ab` entry, and every `--ab` file now records
+> `meta.ab_bin_paths` (label → path) which the verdict tool prints before
+> the table. **Read every older `--ab` verdict in this file with that
+> mapping in mind** — the KCP Phase 1 A/B was misread exactly this way and
+> its winning change was briefly reverted ("Phase 1 A/B — LANDED", the
+> misread post-mortem).
 
 ## Where things stand
 
@@ -55,6 +67,19 @@
   wall bound, and the checkpoint dying on a wiped output directory (the
   "What landed" table lists them with commits). A sixth, the `--ab`
   binary-swap bug above, was found while A/B-ing the stripe prototype.
+- **2026-09-23 follow-up session on the KCP data path** (plan: attack the
+  kcp4 arm's structural per-segment cost and feedback latency with the
+  attribution table as the target): the `MOLEHILL_KCP_STATS` attribution
+  counters landed (`66fb0d2`), send batching + receive coalescing landed
+  on its A/B after a misread revert (`ec9b322`), the ARQ loss-event pacer
+  was closed by measurement (`bea6317` reverts `eb4a491`), and the rtt100
+  8-stream wedge was attributed to the stream-establishment layer above
+  KCP and recorded as a known structural limit (`416aafe`). Sections
+  "KCP attribution (Phase 0)" through "Phase 3" below. Two more bench
+  feedback-side issues were found and fixed on the way, both label-layer:
+  the `--ab` label collision between same-named worktree binaries
+  (`2754142`) and the unrecorded label↔path mapping that let a verdict be
+  read backwards (`5d1d9dd`).
 
 ## What landed (each one commit + one single-variable A/B)
 
@@ -82,6 +107,10 @@
 | bench: `--ab` spawns the binary it is given | `064c55a` | harness bug fix: every earlier `--ab` run compared the default binary against itself — "The `--ab` harness bug" |
 | noise setup-cost phase probe | `7b19457` | the DH turns are ~97% of the ~445 us a handshake pair costs — the input for the resume design |
 | Noise session resume (opt-in) | this commit | setup 442.7 -> 38.5 us per pair (-91%), release-mode probe; full suite + the resumed integration scenario green |
+| KCP path attribution counters (`MOLEHILL_KCP_STATS`) | `66fb0d2` | the per-segment phase table the kcp4 optimization route was planned against: 5.63 µs/sent segment (sender), 1.68 µs/received segment (receiver), ~81% of the sender's CPU attributed — "KCP attribution (Phase 0)" |
+| KCP send batching + receive coalescing | `ec9b322` | one channel message per ~32 outbound datagrams, one per ~16 KiB inbound: **+6.6% loopback 1-stream, +7.6% loopback 64-stream, +9.3% loss1_rtt10 8-stream (all non-overlapping)**, CPU -7.2% / cpu-per-kframe -20.7% median-only; RSS +73% median-only is the open cost — "Phase 1 A/B" |
+| bench: `--ab` labels unique per binary | `2754142` | two worktree builds share the basename `molehill`; a colliding suffix made the interleave's sides overwrite each other and `ab_compare` see no pair |
+| bench: record the label↔path mapping | `5d1d9dd` | `meta.ab_bin_paths` in every `--ab` file + printed by the verdict tool, after a verdict read with the sides swapped briefly reverted a winning change |
 
 ## Optimization route: closed
 
@@ -339,7 +368,7 @@ Three findings that set the targets:
 The attribution table's two largest phases (delivery 2.46 µs/segment and
 the wire drain 2.46 µs/segment on the sender) were attacked by one
 commit (`a38bf4b`, re-landed as `ec9b322` after the misread revert
-below): outbound datagrams stage in a reusable ~48 KiB buffer and cross
+below): outbound datagrams stage in a reusable ~46 KiB buffer and cross
 the pump channel as ONE message per batch (closed at 32 datagrams, the
 staging cap, or the engine's flush boundary — the engine's `flush` now
 calls `Output::flush`), and the reader side coalesces consecutive

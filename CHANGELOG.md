@@ -85,23 +85,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pump's cost per segment at the 1-stream cell: **~5.6 µs per sent
   segment** on the sender (delivery 2.5, wire drain 2.5, writer 0.6)
   and **~1.7 µs per received segment** on the receiver (delivery 0.8,
-  wire drain 0.5, input 0.4) — phase wall-times in total cover ~90% of
-  the sender process's measured CPU. The same run exposed a loss signal
+  wire drain 0.5, input 0.4) — phase wall-times in total cover ~81% of
+  the sender process's measured CPU over the whole run (7.95 vs 9.8 µs
+  CPU per sent segment). The same run exposed a loss signal
   the pacer never sees: at the 64-stream cell the sender's retransmit
   rate climbs from 0% to 30%+ as the cell collapses, while the 1- and
   8-stream cells retransmit nothing. Table and method: HANDOFF.md,
   "KCP attribution (Phase 0)". An instrument, not a behaviour change.
 - The KCP data path (carrier `kcp`) amortizes its per-segment
   bookkeeping: the engine's outbound datagrams stage in a reusable
-  ~48 KiB buffer and cross the pump channel as ONE message per batch
+  ~46 KiB buffer and cross the pump channel as ONE message per batch
   (closed at 32 datagrams, the staging cap, or the engine's flush
-  boundary - `Kcp::flush` now calls `Output::flush`), and the reader
+  boundary — `Kcp::flush` now calls `Output::flush`), and the reader
   side coalesces consecutive segments into one channel message per
   ~16 KiB while the reader keeps up (per-segment granularity returns
   under reader backpressure). Channel messages and `Bytes`
   allocations per segment fall ~32x on the send side and ~8-11x on the
   receive side (measured by the new `blobs_out` counter); the wire
-  datagrams, the byte stream and the ARQ semantics are unchanged - a
+  datagrams, the byte stream and the ARQ semantics are unchanged — a
   pacer denial still drops only the denied datagram. An interleaved A/B
   against the parent revision (3 rounds, 3 reps, 8 s tests, cells
   loopback / loss1_rtt10 / rtt100, kcp4 arm + the loopback mux-off
@@ -111,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CPU -7.2% and cpu/kframe -20.7% (median-only); the loopback 8-stream
   cell's -39% is that cell's documented cold-start bimodality
   (0.4-3.2 Gbit/s modes), not a claim. One open cost: loopback RSS +73%
-  median-only - the coalesced-blob channel residency, bounded at
+  median-only — the coalesced-blob channel residency, bounded at
   ~32 MiB under a full reader stall. Details: HANDOFF.md, "Phase 1 A/B".
 - Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
   now staged into one buffer with their 12-byte header and written in a

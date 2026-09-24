@@ -51,7 +51,7 @@
 //!
 //! **IO batching** (userspace and syscall): the engine's datagrams stage
 //! in a reusable per-session buffer and cross to the pump as ONE channel
-//! message per batch (`DatagramOut` — closed at 32 datagrams, the ~48 KiB
+//! message per batch (`DatagramOut` — closed at 32 datagrams, the ~46 KiB
 //! staging cap, or the engine's flush boundary), and the reader side
 //! coalesces consecutive segments into one channel message per ~16 KiB
 //! (`deliver_recv`). On Linux the wire path then batches with
@@ -138,7 +138,8 @@ const KCP_SOCKET_BUF_BYTES: usize = 32 * 1024 * 1024;
 /// stalled reader (the peer still sending inside its window) parks up to
 /// `INBOUND_CHANNEL_DEPTH` blobs ≈ 32 MiB here, against ~2.8 MiB of
 /// single-segment messages before coalescing — the pressure check in
-/// `deliver_recv` keeps the tail of the fill at one segment per message.
+/// `deliver_recv` switches the tail of the fill back to one segment per
+/// message, so only the already-queued blobs are oversized.
 const INBOUND_CHANNEL_DEPTH: usize = 2048;
 /// Writer → pump channel depth (writes, not bytes).
 const OUTBOUND_CHANNEL_DEPTH: usize = 64;
@@ -168,11 +169,11 @@ const DGRAM_BUF: usize = 2048;
 const KCP_MTU: usize = 1400;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
-/// appending never reallocates inside a batch. ≈48 KiB per wake.
+/// appending never reallocates inside a batch (≈46 KiB).
 const BATCH_STAGE_BYTES: usize =
     crate::transport::udp_batch::BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
 /// Reader-side coalescing target: consecutive segments are merged into
-/// one channel message up to this size (the mux/Yamux/Noise reader above
+/// one channel message up to this size (the mux/yamux/Noise reader above
 /// asks for ~24 such segments per frame, so this cuts the reader-channel
 /// hops by roughly that factor). Bounded so a blob never exceeds a
 /// handful of segments.

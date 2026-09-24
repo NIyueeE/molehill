@@ -106,15 +106,15 @@ flowchart TD
 
 | 决策 | 选项 | 实测依据 |
 |---|---|---|
-| `mode` | `"multiplex"`(默认) | 回环 1 流 10.9 Gbit/s,`direct` 为 19.3;8 流都到 ~27.7;multiplex 吸收建连成本(churn p99 ~3.5 ms)并节省 FD / 端口 / NAT 映射 |
+| `mode` | `"multiplex"`(默认) | 回环 1 流 10.0 Gbit/s,`direct` 为 19.2;8 流分别 19.5 vs 23.3;multiplex 吸收建连成本(churn ~4.8k 连接/s)并节省 FD / 端口 / NAT 映射 |
 | `mode` | `"direct"` | 原始单流吞吐优先;每条流一条物理隧道(FD / 端口 / NAT 成本随流数增长) |
-| `count` | `1` | 单流上限(回环 8 流 9.0 Gbit/s);所有流共享一个重传域(loss5 HoL 最大 1157 ms) |
-| `count` | `4`(默认) | 聚合越过单流(loss1 8 流 15.4 vs 4.6 Gbit/s)并隔离队头阻塞(rtt10 HoL 最大 80.6 vs count=1 的 101.4 ms);yamux 上限 `count × 64` 并发连接 |
+| `count` | `1` | 单流上限(回环 8 流 9.2 Gbit/s);所有流共享一个重传域(loss5 HoL 最大 2.5 s,count=4 为 1.6 s) |
+| `count` | `4`(默认) | 聚合越过单流(loss1 8 流 12.3 vs 4.5 Gbit/s)并隔离队头阻塞(rtt10 HoL 最大 80.6 vs count=1 的 100.1 ms);yamux 上限 `count × 64` 并发连接 |
 | `count` | `8+` | ~256 并发连接;每服务 8 条物理隧道(NAT 映射 ×8) |
-| `carrier` | `"tcp"`(默认) | 每个实测格子都更快(noise 对照下回环 1 流 4.8 vs 2.5 Gbit/s;8 流 14.8 vs 5.9);RSS 24 vs 102 MiB |
+| `carrier` | `"tcp"`(默认) | 每个实测格子都更快(noise 传输下回环 1 流 5.8 vs kcp4 的 3.7 Gbit/s;8 流 14.9 vs 1.1——kcp4 的 8 流格子是已记录的冷启动双模,见 HANDOFF.md);RSS 26 vs 85 MiB |
 | `carrier` | `"kcp"` | 仅在 TCP 数据隧道被封锁/限速时,或高延迟路径上的 UDP 游戏 A/B:唯一实测赢面是 rtt100 的 UDP 会话质量(0% 丢包、最大包间隔 20 ms,而 TCP 各 arm 卡 100+ ms) |
-| transport | `"plain"` | 回环 10.9 / 27.7 Gbit/s(1/8 流) |
-| transport | `"noise"` | 4.8 / 14.8 Gbit/s;RTT 代价亚毫秒;满载 CPU 持平 |
+| transport | `"plain"` | 回环 10.0 / 19.5 Gbit/s(1/8 流) |
+| transport | `"noise"` | 5.8 / 14.9 Gbit/s;RTT 代价亚毫秒;满载 CPU 持平 |
 | `pool_size` | 8 TCP / 2 UDP(默认) | 16 路并发下建连到首字节 p99 ~3.5 ms;UDP 把不同访客分片到不同通道,绝不拆分单个会话(会话亲和) |
 
 **验证选择**用你关心的口径:延迟用 `ping` / 游戏手感,原始吞吐用暴露
@@ -235,8 +235,10 @@ FD 占用。
   某条隧道死亡时,开启请求会透明地落到存活隧道,直到常规心跳重连重建整个
   池。默认:4;`1` 恢复单隧道行为。
 - **实验性(传输层对比选项):** `carrier = "kcp"` 把数据面换成 KCP-over-UDP
-  会话而不是 TCP 连接(特性 `kcp`,属于默认特性集)。KCP 是用户态 ARQ 协议:
-  丢包恢复比 TCP 快,代价是 CPU。加密栈不变——transport 为 `noise` 时同样的
+  会话而不是 TCP 连接(特性 `kcp`,属于默认特性集)。KCP 是用户态 ARQ 协议,
+  用吞吐换 UDP 会话质量:它在每个实测格子的吞吐都输给 TCP carrier(常常差一个
+  数量级),但丢包和高 RTT 下的 UDP 回声实测更干净(rtt100 下 0% 丢包、最大
+  包间隔约 20 ms,而 TCP 各 arm 在 100 ms 以上),CPU 与 RSS 是数倍。加密栈不变——transport 为 `noise` 时同样的
   Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`count` 照常生效。
   服务端在第一条声明 `kcp` carrier 的注册到达时才打开 UDP 监听——绑定失败
   会变成精确的注册拒绝;没有 KCP 客户端的服务端永远不会打开 UDP socket。

@@ -55,7 +55,7 @@ docs: [configuration](configuration.md), [transport](transport.md),
 | `src/core/server.rs` | server mode: registration policy, eager binding, connection pools |
 | `src/logging.rs` | colored span-aware log formatter |
 | `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (+ vendored `noise_stream.rs` record wrapper, ported from snowstorm) / multiplex / kcp implementations |
-| `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the adapter's SACK extensions; kept in-repo so nothing external needs patching and the module follows molehill's own rules |
+| `src/kcp.rs` + `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the SACK extensions the adapter needs; kept in-repo so nothing external needs patching and the module follows molehill's own rules. The tokio adapter around it (pump task, channels, send batching / receive coalescing, pacer, keepalive) is `src/transport/kcp.rs` |
 | `src/mux.rs` + `src/mux/` | the yamux framing engine — vendored from rust-yamux 0.14 and maintained in-repo (like the KCP engine), wire-identical with the yamux specification and tokio-native (tokio IO traits, no compat shim); the `multiplex` transport integrates it through `src/transport/multiplex.rs` |
 
 ## Tests, benches, examples, docs

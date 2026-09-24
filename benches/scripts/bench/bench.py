@@ -216,9 +216,14 @@ def ab_suffixes(bins: list) -> dict:
     different worktrees usually share it (`target/release/molehill`),
     so a collision falls back to a short hash of the full path: still
     distinct, still stable across the run's three rounds.
+
+    A `None` entry (every run without `--ab`, and every non-molehill
+    tool) is skipped — those arms use no suffix at all.
     """
     by_name: dict = {}
     for b in bins:
+        if b is None:
+            continue
         by_name.setdefault(Path(b).name, []).append(b)
     out = {}
     for name, same in by_name.items():
@@ -1236,7 +1241,9 @@ def main():
                     # silently read a verdict backwards (it happened: a
                     # winning change was read as a regression and reverted).
                     data["meta"]["ab_bin_paths"] = {
-                        ab_label[b]: str(Path(b).resolve()) for b in ab_bins
+                        ab_label[b]: str(Path(b).resolve())
+                        for b in ab_bins
+                        if b is not None
                     }
                     for ab_round in range(1, knobs.molehill_reps + 1):
                         for ab_bin in ab_bins:
