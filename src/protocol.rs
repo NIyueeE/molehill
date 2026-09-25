@@ -25,7 +25,10 @@ pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
-/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake.
+/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake. The
+/// opt-in session-resume selector (`0x02`, `noise_resume.rs`) is a
+/// third value on the same byte, and an old peer rejects it the same way
+/// it rejects an unknown protocol version.
 pub const PLAIN_SELECTOR: u8 = 0x00;
 pub const NOISE_SELECTOR: u8 = 0x01;
 
@@ -127,10 +130,31 @@ pub enum ControlChannelCmd {
     HeartBeat,
 }
 
+/// Variant names mirror the wire contract and stay stable across versions.
+#[expect(clippy::enum_variant_names, reason = "wire-contract variant names")]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
     StartForwardTcp,
     StartForwardUdp,
+    /// Striped TCP forwarding: this data channel is stripe `index` of
+    /// `count` of the group named by the fixed 4 bytes (big-endian `u32`).
+    /// After this command the channel carries `[u64 seq][u16 len][payload]`
+    /// frames instead of a raw byte stream, and the receiver reassembles
+    /// them in `seq` order across the whole group (see the `stripe`
+    /// module).
+    ///
+    /// The group id is a fixed-width byte array rather than a `u32` on
+    /// purpose: postcard encodes integers as varints, so a `u32` would make
+    /// this command's length depend on its value, while every other data
+    /// command is fixed-size (the tag alone decides the length the reader
+    /// must consume).
+    ///
+    /// Self-describing on purpose: the variant tag is read first and only
+    /// the striped variant carries the 6-byte suffix, so plain channels keep
+    /// their exact 1-byte command wire format and old peers keep parsing
+    /// them unchanged. A peer that does not know this variant fails loudly
+    /// on the unknown tag instead of silently reframing payload bytes.
+    StartForwardStripedTcp([u8; 4], u8, u8),
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -322,35 +346,28 @@ struct PacketLength {
     auth: usize,
     #[cfg(feature = "client")]
     c_cmd: usize,
-    #[cfg(feature = "client")]
-    d_cmd: usize,
 }
 
 impl PacketLength {
-    // Infallible: serializing compile-time-known fixed-size values.
-    #[expect(
-        clippy::unwrap_used,
-        reason = "serializing compile-time-known fixed-size values cannot fail"
-    )]
+    /// Encoded length of a protocol value, or 0 on the impossible
+    /// serialization failure (a fixed-size value cannot fail to
+    /// serialize; a 0 length would surface as a read/deserialize error
+    /// at the use site rather than as a panic).
+    fn encoded_len<T: serde::Serialize>(value: &T) -> usize {
+        postcard::to_stdvec(value).map_or(0, |v| v.len())
+    }
+
     pub fn new() -> PacketLength {
         let username = "default";
         let d = digest(username.as_bytes());
-        let hello = postcard::to_stdvec(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap()
-            .len();
+        let hello = Self::encoded_len(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d));
         #[cfg(feature = "client")]
-        let c_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)
-            .unwrap()
-            .len();
+        let c_cmd = Self::encoded_len(&ControlChannelCmd::CreateDataChannel);
         #[cfg(feature = "client")]
-        let d_cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)
-            .unwrap()
-            .len();
-        #[cfg(feature = "client")]
-        let ack = postcard::to_stdvec(&Ack::Ok).unwrap().len();
+        let ack = Self::encoded_len(&Ack::Ok);
 
         #[cfg(feature = "server")]
-        let auth = postcard::to_stdvec(&Auth(d)).unwrap().len();
+        let auth = Self::encoded_len(&Auth(d));
         PacketLength {
             hello,
             #[cfg(feature = "client")]
@@ -359,8 +376,6 @@ impl PacketLength {
             auth,
             #[cfg(feature = "client")]
             c_cmd,
-            #[cfg(feature = "client")]
-            d_cmd,
         }
     }
 }
@@ -511,15 +526,42 @@ pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize control cmd")
 }
 
+/// Read one [`DataChannelCmd`].
+///
+/// The command is tag-dispatched instead of fixed-width: `StartForwardTcp`
+/// and `StartForwardUdp` stay 1-byte commands, while the striped variant
+/// carries a 6-byte suffix, so its tag is read first and the suffix only
+/// when the tag says one follows. This keeps the plain wire format
+/// byte-identical while letting the reader tell the commands apart without
+/// out-of-band agreement.
 #[cfg(feature = "client")]
 pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
+    let mut buf = [0u8; 7]; // 1 tag byte + the largest suffix below
+    let suffix = match read_cmd_tag(conn, &mut buf).await? {
+        0 => {
+            return Ok(DataChannelCmd::StartForwardTcp);
+        }
+        1 => {
+            return Ok(DataChannelCmd::StartForwardUdp);
+        }
+        2 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
+        tag => bail!("Unknown data channel command tag {tag:#x}"),
+    };
+    conn.read_exact(&mut buf[1..=suffix])
         .await
-        .with_context(|| "Failed to read cmd")?;
-    postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize data cmd")
+        .with_context(|| "Failed to read data cmd")?;
+    postcard::from_bytes(&buf[..=suffix]).with_context(|| "Failed to deserialize data cmd")
+}
+
+/// Read the command's variant tag into `buf[0]`, returning it.
+#[cfg(feature = "client")]
+async fn read_cmd_tag<T: AsyncRead + Unpin>(conn: &mut T, buf: &mut [u8; 7]) -> Result<u8> {
+    conn.read_exact(&mut buf[..1])
+        .await
+        .with_context(|| "Failed to read data cmd")?;
+    Ok(buf[0])
 }
 
 #[cfg(test)]
@@ -654,6 +696,56 @@ mod tests {
         let bytes = postcard::to_stdvec(&cmd).unwrap();
         let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
         assert!(matches!(back, DataChannelCmd::StartForwardUdp));
+    }
+
+    #[test]
+    fn plain_data_cmds_keep_their_one_byte_wire_form() {
+        // The plain commands' single-byte tag is the wire-compat guarantee
+        // for peers that predate the striped variant: the reader dispatches
+        // on the tag, so a plain command can never be mistaken for one that
+        // carries a suffix.
+        let tcp = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp).unwrap();
+        let udp = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp).unwrap();
+        assert_eq!(tcp.len(), 1);
+        assert_eq!(udp.len(), 1);
+        assert_ne!(tcp[0], udp[0]);
+
+        // The striped command is fixed 7 bytes for every group id: the
+        // group id is 4 wire bytes, not a varint u32.
+        for group in [0u32, 1, 0x7f, 0x80, 0xdead_beef, u32::MAX] {
+            let bytes = postcard::to_stdvec(&DataChannelCmd::StartForwardStripedTcp(
+                group.to_be_bytes(),
+                3,
+                4,
+            ))
+            .unwrap();
+            assert_eq!(
+                bytes.len(),
+                7,
+                "group {group:#x} changed the command length"
+            );
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn read_data_cmd_dispatches_every_variant() {
+        use tokio::io::duplex;
+
+        for cmd in [
+            DataChannelCmd::StartForwardTcp,
+            DataChannelCmd::StartForwardUdp,
+            DataChannelCmd::StartForwardStripedTcp(0xdead_beefu32.to_be_bytes(), 3, 4),
+        ] {
+            let (mut tx, mut rx) = duplex(64);
+            tx.write_all(&postcard::to_stdvec(&cmd).unwrap())
+                .await
+                .unwrap();
+            let back = read_data_cmd(&mut rx).await.unwrap();
+            let a = postcard::to_stdvec(&cmd).unwrap();
+            let b = postcard::to_stdvec(&back).unwrap();
+            assert_eq!(a, b, "read_data_cmd changed the command on the wire");
+        }
     }
 
     #[test]
@@ -808,6 +900,5 @@ mod tests {
         assert!(len.ack > 0);
         assert!(len.auth > 0);
         assert!(len.c_cmd > 0);
-        assert!(len.d_cmd > 0);
     }
 }

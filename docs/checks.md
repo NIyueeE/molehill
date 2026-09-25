@@ -4,7 +4,7 @@ Three layered gates guard the repository, split by moment and weight:
 
 | Moment | Gate | Weight | What it guards |
 |--------|------|--------|----------------|
-| every commit | `githooks/pre-commit` | fast (~1 min) | code quality: fmt, secrets, machete, docs sync, ruff, clippy ×2 |
+| every commit | `githooks/pre-commit` | fast (~1 min) | code quality: fmt, secrets, machete, docs sync, ruff lint + format, clippy ×2 |
 | every push | `githooks/pre-push` | heavy (minutes) | security & dependency policy & freshness & tests (audit, deny, outdated, test) |
 | every release tag | `githooks/pre-tag` | light (seconds) | release state: tag↔version, changelog section, bench assets, container-job greps + advisory checklist |
 
@@ -33,7 +33,8 @@ survives to the tag — `release.yml` itself only runs once a tag is pushed).
 ## Tools
 
 The cargo gates use four external tools; `just setup` installs any that are
-missing (and activates the git hooks):
+missing, activates the git hooks, and reports `uvx` / `cargo-hack` when they
+are absent:
 
 ```bash
 cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
@@ -41,9 +42,11 @@ cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
 
 `cargo fmt` and `cargo clippy` come with the toolchain declared in
 `rust-toolchain.toml` (`channel = "stable"` + clippy/rustfmt components).
-The python bench/test entries and the ruff gate run through `uv` / `uvx`
-(PEP 723 scripts, see docs/release.md); install uv with
-`curl -LsSf https://astral.sh/uv/install.sh | sh`.
+The python bench/test entries and the two ruff gates (lint + format) run
+through `uv` / `uvx` (PEP 723 scripts, see docs/release.md); install uv with
+`curl -LsSf https://astral.sh/uv/install.sh | sh`. `just powerset` needs
+`cargo-hack` (CI's `features` job installs it; locally:
+`cargo install cargo-hack --locked`).
 
 ## On every commit — `githooks/pre-commit`
 
@@ -54,8 +57,9 @@ The python bench/test entries and the ruff gate run through `uv` / `uvx`
 | 3 | machete | `cargo machete` | unused dependencies |
 | 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
 | 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
-| 6 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
-| 7 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
+| 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
+| 7 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
+| 8 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
 
 Note the template difference: clippy runs twice (default features, then
 `server,client` only) instead of once with `--all-features`, because the
@@ -69,10 +73,10 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 
 | # | Gate | Command | Purpose |
 |---|------|---------|---------|
-| 8 | audit | `cargo audit` | RustSec security advisories |
-| 9 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
-| 10 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
-| 11 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
+| 9 | audit | `cargo audit` | RustSec security advisories |
+| 10 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
+| 11 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
+| 12 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
 
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.
@@ -91,11 +95,11 @@ commit; nothing here is a heavy gate.
 
 | # | Check | Purpose |
 |---|-------|---------|
-| 12 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
-| 13 | dated, non-empty `## [x.y.z] - YYYY-MM-DD` in `CHANGELOG.md` | release notes single source |
-| 14 | `results-vX.Y.Z.json` + `assets/benchmark-vX.Y.Z.png` committed | benchmark ritual deliverables |
-| 15 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
-| 16 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
+| 13 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
+| 14 | dated, non-empty `## [x.y.z] - YYYY-MM-DD` in `CHANGELOG.md` | release notes single source |
+| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed | benchmark ritual deliverables |
+| 16 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
+| 17 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 
 At tag creation (local mode only) it additionally requires a clean working
 tree and that the tag does not exist yet. On a tag push (evaluated against a
@@ -112,8 +116,17 @@ just tag     # release review (githooks/pre-tag) + create the local v* tag
 just tag-check   # run only the release review, without tagging
 ```
 
-Other recipes: `just fmt` (auto-fix), `just test`, `just powerset` (feature
-powerset via cargo-hack, CI's `features` job), `just container` (scratch image).
+Other recipes: `just fmt` / `just py-fmt` (auto-fix), `just test` (the full
+serial suite), `just test-fast` (lib tests + the core integration subset,
+~1 min), `just powerset` (feature powerset via cargo-hack, CI's `features`
+job), `just py-lint` (both ruff gates, also in the pre-commit gate),
+`just bench-deps` (iperf3 + tc/netem on the benchmark host), `just soak`
+(the tool under test through the scripted workload and stage schedule),
+`just soak-peers` (fetch the peer tools' latest release binaries),
+`just soak-plot` (charts + markdown tables from the latest results file),
+`just soak-check` (the gate: latest results vs the previous release's file;
+`--screen <file>` for a development A/B verdict), `just container` (scratch
+image).
 
 ## When a gate blocks you
 

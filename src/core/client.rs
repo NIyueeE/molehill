@@ -418,6 +418,42 @@ struct RunDataChannelArgs {
     service: ClientServiceConfig,
     /// Shared UDP hub for the service; `Some` iff this is a UDP service.
     udp: Option<Arc<UdpHub>>,
+    /// Stripe-group registry of the service session: stripes of one
+    /// visitor connection arrive as independent data channels and park
+    /// here until the group is complete (see [`crate::stripe`]).
+    #[cfg(feature = "multiplex")]
+    stripes: Arc<crate::stripe::StripeGroups<ClientDataChannel>>,
+}
+
+/// The service session's stripe-group registry type (a no-op stand-in
+/// without the `multiplex` feature, which can never receive a striped
+/// command).
+#[cfg(feature = "multiplex")]
+type StripeRegistry = crate::stripe::StripeGroups<ClientDataChannel>;
+#[cfg(not(feature = "multiplex"))]
+type StripeRegistry = ();
+
+impl RunDataChannelArgs {
+    /// The session's stripe-group registry. Without the `multiplex` feature
+    /// a striped command can never arrive, and the registry degenerates to
+    /// a unit reference the (unreachable) striped arm ignores.
+    #[cfg(feature = "multiplex")]
+    fn stripes(&self) -> &StripeRegistry {
+        &self.stripes
+    }
+
+    #[cfg(not(feature = "multiplex"))]
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        allow(
+            clippy::unused_self,
+            reason = "the unit stand-in has no field to read; the multiplex arm keeps the method shape"
+        )
+    )]
+    fn stripes(&self) -> &StripeRegistry {
+        const UNIT: () = ();
+        &UNIT
+    }
 }
 
 async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<ClientStream> {
@@ -454,7 +490,13 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     let conn = do_data_channel_handshake(args.clone()).await?;
 
     // Forward
-    forward_data_channel(conn, &args.service, args.udp.clone()).await
+    forward_data_channel(
+        ClientDataChannel::Raw(conn),
+        &args.service,
+        args.udp.clone(),
+        args.stripes(),
+    )
+    .await
 }
 
 /// The established tunnel(s) of one control session, per `[client].tunnel`:
@@ -535,24 +577,98 @@ impl tokio::io::AsyncWrite for TunnelStream {
 async fn run_mux_data_channel(args: &Arc<RunDataChannelArgs>, tunnel: &Tunnels) -> Result<()> {
     let stream = tunnel.open_stream().await?;
     trace!("Multiplexed data channel opened");
-    forward_data_channel(stream, &args.service, args.udp.clone()).await
+    forward_data_channel(
+        ClientDataChannel::Mux(stream),
+        &args.service,
+        args.udp.clone(),
+        args.stripes(),
+    )
+    .await
+}
+
+/// One opened data channel, as one concrete type so a stripe group's
+/// registry can park stripes that arrive on either path.
+enum ClientDataChannel {
+    Raw(ClientStream),
+    #[cfg(feature = "multiplex")]
+    Mux(TunnelStream),
+}
+
+impl tokio::io::AsyncRead for ClientDataChannel {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "multiplex")]
+            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ClientDataChannel {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "multiplex")]
+            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "multiplex")]
+            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "multiplex")]
+            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
 }
 
 /// Wait for the server's forwarding command and start copying traffic.
-async fn forward_data_channel<S>(
-    mut conn: S,
+///
+/// `stripes` is the service session's stripe-group registry: a command that
+/// announces a striped channel registers the stream in its group here, and
+/// the registrar of the group's last stripe dials the local service once
+/// and forwards the whole group (see [`crate::stripe`]).
+async fn forward_data_channel(
+    mut conn: ClientDataChannel,
     service: &ClientServiceConfig,
     udp_hub: Option<Arc<UdpHub>>,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "only the multiplex build can receive striped commands"
+        )
+    )]
+    stripes: &StripeRegistry,
+) -> Result<()> {
+    let sock_opts = SocketOpts::from_client_cfg(service);
     match read_data_cmd(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
             if service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            let sock_opts = SocketOpts::from_client_cfg(service);
             run_data_channel_for_tcp(conn, &service.local_addr, sock_opts).await?;
         }
         DataChannelCmd::StartForwardUdp => {
@@ -562,6 +678,32 @@ where
             let hub = udp_hub
                 .ok_or_else(|| anyhow!("Service {} has no UDP forwarding hub", service.name))?;
             run_data_channel_for_udp(conn, hub).await?;
+        }
+        #[cfg(feature = "multiplex")]
+        DataChannelCmd::StartForwardStripedTcp(group_bytes, index, count) => {
+            if service.service_type != ServiceType::Tcp {
+                bail!("Expect TCP traffic. Please check the configuration.")
+            }
+            let group = u32::from_be_bytes(group_bytes);
+            if let Some(done) =
+                stripes.register(group, index, count, conn, &service.local_addr, sock_opts)?
+            {
+                // The group is complete: one local connection, shared by
+                // every stripe of the group.
+                debug!("Stripe group {group} complete with {count} stripes");
+                let local = TcpStream::connect(&done.local_addr)
+                    .await
+                    .with_context(|| format!("Failed to connect to {}", done.local_addr))?;
+                done.sock_opts.apply(&local);
+                let (read, write) = local.into_split();
+                crate::stripe::spawn_group(read, write, done.streams);
+            }
+        }
+        #[cfg(not(feature = "multiplex"))]
+        DataChannelCmd::StartForwardStripedTcp(..) => {
+            bail!(
+                "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
+            );
         }
     }
     Ok(())
@@ -718,11 +860,11 @@ async fn establish_one_kcp_tunnel(
         #[cfg(feature = "noise")]
         if let Some(cfg) = &opts.noise {
             let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-            // v3 transport selector: announce this session speaks Noise
-            // (over the KCP byte stream, same rule as TCP).
-            let mut s = stream;
-            s.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
-            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator(s).await?))
+            // Full handshake + v3 selector byte (the wrapper owns the
+            // selector): KCP tunnels establish once per control session,
+            // so a resume attempt has nothing cached yet and would only
+            // add a round trip.
+            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator_full(stream).await?))
         } else {
             let mut s = stream;
             s.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
@@ -1110,6 +1252,42 @@ fn build_udp_hub(service: &ClientServiceConfig) -> Option<Arc<UdpHub>> {
     }
 }
 
+/// Spawn one requested data channel: a stream off the tunnel pool when the
+/// service multiplexes its data plane, a fresh transport connection
+/// otherwise. Each one joins its stripe group if the server labels it as a
+/// stripe (see [`crate::stripe`]).
+fn spawn_data_channel(
+    args: Arc<RunDataChannelArgs>,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "only the multiplex build has tunnels to clone"
+        )
+    )]
+    tunnel: Option<&Tunnels>,
+) {
+    #[cfg(feature = "multiplex")]
+    let tunnel = tunnel.cloned();
+    tokio::spawn(
+        async move {
+            let res = {
+                #[cfg(feature = "multiplex")]
+                match tunnel {
+                    Some(t) => run_mux_data_channel(&args, &t).await,
+                    None => run_data_channel(args).await,
+                }
+                #[cfg(not(feature = "multiplex"))]
+                run_data_channel(args).await
+            };
+            if let Err(e) = res.with_context(|| "Failed to run the data channel") {
+                warn!("{:#}", e);
+            }
+        }
+        .instrument(Span::current()),
+    );
+}
+
 // Handle of a control channel
 // Dropping it will also drop the actual control channel
 struct ControlChannelHandle {
@@ -1149,10 +1327,6 @@ impl ControlChannel {
         // Establish the multiplexed tunnel pool if enabled: `count` extra
         // connections, each carrying future data channels as yamux streams,
         // spread round-robin.
-        #[cfg_attr(
-            not(feature = "multiplex"),
-            allow(unused_variables, reason = "only bound in the multiplex arm")
-        )]
         let (tunnel, _tunnel_shutdown_tx) = if self.data.enabled {
             #[cfg(feature = "multiplex")]
             match establish_tunnels(
@@ -1185,6 +1359,8 @@ impl ControlChannel {
             socket_opts,
             service: self.service.clone(),
             udp: build_udp_hub(&self.service),
+            #[cfg(feature = "multiplex")]
+            stripes: Arc::new(crate::stripe::StripeGroups::new()),
         });
 
         loop {
@@ -1194,25 +1370,7 @@ impl ControlChannel {
                     debug!( "Received {:?}", val);
                     match val {
                         ControlChannelCmd::CreateDataChannel => {
-                            let args = data_ch_args.clone();
-                            #[cfg(feature = "multiplex")]
-                            let tunnel = tunnel.clone();
-                            tokio::spawn(async move {
-                                let res = {
-                                    #[cfg(feature = "multiplex")]
-                                    match &tunnel {
-                                        Some(t) => run_mux_data_channel(&args, t).await,
-                                        None => run_data_channel(args).await,
-                                    }
-                                    #[cfg(not(feature = "multiplex"))]
-                                    run_data_channel(args).await
-                                };
-                                if let Err(e) =
-                                    res.with_context(|| "Failed to run the data channel")
-                                {
-                                    warn!("{:#}", e);
-                                }
-                            }.instrument(Span::current()));
+                            spawn_data_channel(data_ch_args.clone(), tunnel.as_ref());
                         },
                         ControlChannelCmd::HeartBeat => ()
                     }

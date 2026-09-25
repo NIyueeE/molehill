@@ -29,7 +29,8 @@ To use it, an X25519 keypair is needed.
 
 ### Generate a keypair
 
-Run `molehill --genkey`, which generates a keypair using the default X25519 algorithm (pass `x448` for X448):
+Run `molehill --genkey`, which generates an X25519 keypair (the only curve the
+shipped `snow` backend provides):
 
 ```sh
 $ molehill --genkey
@@ -117,7 +118,12 @@ remote_public_key = "server-pub-key-here"
 
 ### Pre-shared keys
 
-`psk` and `psk_location` add a pre-shared key to the handshake. The pattern must include a PSK modifier (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`), the key must be 32 bytes base64-encoded, and both sides must use the same `psk` and `psk_location`:
+`psk` and `psk_location` add a pre-shared key to the handshake. The key is
+only used when the configured `pattern` carries a PSK modifier at
+`psk_location` (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`); with a pattern
+that has none, the value is silently ignored rather than rejected. The key must
+decode to exactly 32 bytes (checked when a handshake is set up), and both sides
+must use the same `psk` and `psk_location`:
 
 ```toml
 [server.transport.noise]
@@ -133,6 +139,46 @@ local_private_key = "client-priv-key-here"
 remote_public_key = "server-pub-key-here"
 psk = "the-same-32-byte-key-in-base64"
 psk_location = 0
+```
+
+### Noise session resume
+
+With `resume = true` (both sides, default off), a reconnect does not
+repeat the handshake's key exchanges: after a full handshake the server
+issues a ticket sealed with a key derived from its Noise static private
+key, and the client caches it together with the session's handshake
+hash. On the next connect the client offers the ticket with a fresh
+nonce and a MAC proving it holds the cached hash; the server verifies
+and both sides derive fresh record keys from the cached hash plus two
+fresh nonces (HKDF-SHA256 over ChaCha20-Poly1305). The connection starts
+with transport selector `0x02` instead of `0x01`; peers that do not know
+the selector reject it and the client falls back to a full handshake
+(which re-issues the ticket).
+
+Measured on this host (release build, in-process pair over a duplex, the
+default pattern): the full handshake plus the ticket exchange costs
+~451 us per pair, a resumed exchange ~39 us — the handshake's key
+exchanges are ~97% of the setup CPU, and resume removes them. The
+remaining cost is symmetric crypto plus two round trips.
+
+The tradeoff is forward secrecy: the original session keeps its
+DH-derived keys, but a resumed session's keys derive from the cached
+hash, so a later compromise of the server's static key (or of the
+client's cache) reaches the resumed sessions' traffic. That is the
+standard session-resumption tradeoff — leave `resume = false` (the
+default) when per-connection forward secrecy matters more than
+reconnect latency. Tickets expire after 24 hours, and a repeated
+`(ticket, nonce)` pair is rejected, so a captured resume request cannot
+be replayed or shared between sessions.
+
+```toml
+[server.transport.noise]
+local_private_key = "server-priv-key-here"
+resume = true
+
+[client.transport.noise]
+remote_public_key = "server-pub-key-here"
+resume = true
 ```
 
 ### Other patterns

@@ -1,3 +1,5 @@
+# expect: remote_bind_addr
+
 [client]
 default_token = "t"
 
