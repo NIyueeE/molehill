@@ -12,6 +12,11 @@ opens its own section here.
 
 ## [0.9.0] - 2026-09-25
 
+> The published benchmark numbers were measured on `710186c`. This release
+> differs from it by the platform-build fix CI forced, which is a no-op on the
+> measured platform; the reasoning is in HANDOFF.md, "Provenance of the
+> published v0.9.0 numbers".
+
 ### Changed
 
 - **The benchmark model was replaced: the measurement matrix is retired and
