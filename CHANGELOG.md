@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet: v0.9.0 below is the state being prepared, and the next change
+opens its own section here.
+
+## [0.9.0] - 2026-09-25
+
 ### Changed
 
 - **The benchmark model was replaced: the measurement matrix is retired and
@@ -34,8 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model. Recipes: `just soak` / `soak-plot` / `soak-check` / `soak-peers`;
   the release review now requires `results-soak-vX.Y.Z.json` and
   `assets/soak-vX.Y.Z.png`.
-
-## [0.9.0] - 2026-09-24
 
 > **Measurement note.** Several A/B figures quoted below were first taken
 > with the benchmark harness's broken `--ab` mode, which spawned the default
@@ -377,6 +380,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cell of any matrix (it had only ever been measured on loopback before). Every
   figure in this section quoted from an affected run has been re-taken or
   explicitly withdrawn above.
+
+- **The Soak harness had three defects that made parts of a run wrong or
+  unreadable, all of them silent.** (1) The Noise keypair helper raised
+  `NameError` on first use: the memo it read was never defined, so every
+  `noise` / `kcp4` / `noise-direct` variant died before it measured
+  anything. (2) The single-run lock and the stale-process sweep both
+  identified a live run by the string `bench.py` — the runner the matrix
+  retired — so concurrent runs stopped being refused and the sweep could
+  kill a live run's processes. (3) The SLO, the soak/cost load fractions and
+  the per-stage statistics were partly dead: `SOAK_SLO_RTT_P99_MS` and
+  `SOAK_SOAK_LOAD_FRACTION` were accepted and ignored, the capacity verdict
+  ignored the interactive error rate that its own SLO documents, and the
+  charts computed every per-stage statistic against a time base that
+  selected no samples at all (so no stage percentile was ever drawn). The
+  runner now records the revision, the binary version, the endpoints each
+  probe dialed and every knob it used, and `soak_check.py` re-checks the
+  endpoint invariant, the series completeness and the absolute SLO against
+  that record before it compares anything to a baseline.
+
+
+### Changed
+
+- **The Soak charts were rebuilt around one question per figure.** The first
+  release's set mixed a linear RTT axis (a single 7000 ms outlier flattened
+  every stage below 100 ms), a missing legend entry for the throughput line
+  and a "loss events" panel that plotted a constant `1` for every loss. The
+  set is now: the master (per tool, log RTT with per-stage p50/p99 and the
+  bulk throughput over the shared stage schedule, wedges marked on the
+  bottom edge), `-stages.png` (small multiples — one panel per stage, a
+  lollipop per tool, so tool-vs-tool per condition reads at a glance),
+  `-capacity.png`, `-udp.png` (RTT plus a sliding loss *rate* derived from
+  the probe's own attempt stream), `-drift.png` (with every fitted slope
+  printed) and `-cost.png`. Each figure carries its method constants and
+  revision in the footer, and a tool keeps its colour across the whole set.
+- The python bench scripts are format-checked as well as lint-checked: the
+  pre-commit chain now runs `uvx ruff format --check benches/scripts/`
+  beside `uvx ruff check`, `just py-lint` runs both and `just py-fmt`
+  auto-fixes. The ruff waiver list shrank to the one entry that is true of
+  every script here (they measure PATH binaries), with the rest waived
+  inline at their own sites and a named reason each.
+- **The documentation set was given an ownership contract.** Every page now
+  owns one topic and links to the others (the routing table is in AGENTS.md
+  §3, the audience-and-scope table in docs/structure.md): the landing pages
+  describe what is true now, `docs/benchmarks.md` (+ its Chinese mirror) is
+  the home of the benchmark method — what is measured, how to read the
+  charts, the stage schedule, the SLO, the test types, the per-decision
+  measurements and how to reproduce a run — `docs/configuration.md` owns what
+  each setting does and hands the measured costs to that page, and
+  `docs/release.md` owns the ritual instead of re-explaining the method.
+  Migration and deprecation narrative ("what replaced the old tables") is out
+  of the user-facing pages; it lives in this changelog, the release notes and
+  HANDOFF.md. `githooks/check-docs` now enforces the parts that can be
+  grepped: every page has an owner, user-facing pages have a mirror with the
+  same structure, and the READMEs link each page in their own language.
+- **The configuration, transport and contributor documentation was aligned
+  with the code it describes.** Five documented behaviours were wrong or
+  unenforced and are now stated as they are: privileged ports inside an
+  `allow_ports` range are *not* treated specially (the OS decides), the
+  tunnel-count ceiling is 64 streams per tunnel, `retry_interval` is the
+  backoff cap rather than a fixed interval (after three tries the client
+  falls back to 1 s), `nodelay` only reaches the sockets the client owns,
+  and a `psk` is silently unused unless the configured noise `pattern`
+  carries a PSK modifier. The `x448` keygen promise was dropped (the
+  shipped `snow` backend has no X448). The `count × 64` arithmetic, the
+  `[client.data]` behaviour in a multiplex-less build and the
+  `MOLEHILL_STRIPE_COUNT` override are stated where they belong, and the
+  Chinese configuration page regained the facts it had dropped for
+  `resume`. The landing pages, the release ritual and the contributor docs
+  were re-grouped by audience (users vs contributors) and stripped of the
+  retired measurement matrix's vocabulary.
+- A release now fails fast on a stale ritual: `release.yml` refuses an
+  undated changelog section and a missing `results-soak-vX.Y.Z.json` /
+  `assets/soak-vX.Y.Z.png`, and both it and the test-build workflow take a
+  concurrency group so two runs cannot race on the same release or cache.
+  The `githooks/check-docs` gate now checks every command a hook runs (not
+  only `cargo` ones), checks the reverse direction (a documented gate that
+  no hook runs), and pins the docs index on both READMEs. `--version` now
+  reports the commit SHA it always printed a line for, and marks a dirty
+  tree.
 
 ## [0.8.1] - 2026-09-11
 

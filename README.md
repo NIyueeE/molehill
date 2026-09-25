@@ -26,6 +26,10 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 
 - [molehill](#molehill)
   - [Features](#features)
+  - [Benchmarks](#benchmarks)
+    - [Choosing a configuration](#choosing-a-configuration)
+    - [molehill vs the plain-TCP peers](#molehill-vs-the-plain-tcp-peers)
+    - [How to read these charts](#how-to-read-these-charts)
   - [Quickstart](#quickstart)
   - [Deployment](#deployment)
     - [Binary](#binary)
@@ -49,15 +53,13 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 ## Benchmarks
 
 Single-machine comparison (`visitor -> server -> client -> backend`, all four
-hops on one machine); everything is measured **through the tunnel** — the
-probes dial each tool's exposed port, never the backend it forwards to.
-Peers are the latest GitHub release builds (frp, rathole upstream, nps —
-versions recorded per run in the results meta). Each tool is driven through
-one identical workload while the network condition follows a stage schedule
-(netem on `lo`, every leg affected, changed in place so the tool's session
-is never rebuilt); the metric set and the test types are described in
-[Methodology](#methodology). These are v0.9.0 numbers from this host; only
-same-model, same-host runs are comparable with each other.
+hops on one machine). Everything is measured **through the tunnel**: the probes
+dial each tool's exposed port, never the backend it forwards to. The peers are
+the latest GitHub release builds (frp, rathole upstream, nps, versions recorded
+with each run). Every tool is driven through the identical workload while the
+network condition follows a scripted stage schedule, changed in place, so a
+tool's session is never rebuilt — how it adapts to a degrading and then
+recovering path is part of the measurement.
 
 ### Choosing a configuration
 
@@ -93,15 +95,13 @@ questions about your workload; change one thing at a time and re-test:
    head-of-line blocking — and pick `count` for the per-tunnel connection
    ceiling (`count = 1 -> 64` connections, `count = 4 -> 256`).
 
-**Measuring the choice for yourself.** The v0.9.0 model answers these with
-two numbers per configuration instead of one throughput figure: the
-**sustainable load** (how many bulk streams the tool carries while a fresh
-interactive connection still meets the 50 ms SLO) and the **cost at the
-operating point** (CPU-seconds per carried Gbit/s). `just soak --test=screen
---ab <parent>,<head>` A/Bs two builds of *your* workload in minutes and
-prints whether the difference is a claim or directional. The retired matrix
-quoted per-cell averages here; they are gone, because an average per cold
-cell cannot answer "what happens while the path changes".
+Two numbers decide between these options, and they are best measured on your
+own path rather than read off a table: the **sustainable load** (how many bulk
+streams the tool carries while a fresh interactive connection still meets the
+50 ms SLO) and the **cost at the operating point** (CPU-seconds per carried
+Gbit/s). What the published runs measured, and how to run the same comparison
+on your own hardware, is in [Benchmarks](docs/benchmarks.md); the settings
+themselves are in [Configuration](docs/configuration.md#choosing-your-configuration-decision-tree).
 
 ### molehill vs the plain-TCP peers
 
@@ -115,6 +115,12 @@ interactive stream's RTT, the shaded bands the path classes, the dashed
 line the SLO (p99 <= 50 ms).
 
 ![Soak: molehill and the peers over the stage schedule](assets/soak-v0.9.0.png)
+
+The same run as small multiples — one panel per stage, a lollipop per tool
+(dot = p50, bar = p99, tick = worst second), so "who wins which condition"
+reads without a table:
+
+![Interactive RTT per stage, per tool](assets/soak-v0.9.0-stages.png)
 
 **Interactive stream RTT p99, per stage** (ms; "wedge" = the stream went
 silent for > 5 s and recovered):
@@ -131,11 +137,8 @@ rtt100 -> 0.02 at rate100 -> **20.1 on the return to clean**; frp 5.9 ->
 2.2 -> 5.9; rathole 16.9 -> 2.5 -> 17.0; nps 0.14 throughout.
 
 **What these shapes say.** Every tool degrades under a bad path and every
-tool recovers on the return to clean — that recovery is the point of the
-last band, and a tool that stayed wedged would be a finding (one was: the
-first version of this harness shaped the control channel too, and the
-heartbeat timeout wedged the tools at rate100; the harness now leaves the
-control plane unshaped, which is stated in the method). The interactive
+tool recovers on the return to clean — that recovery is what the last band
+measures, and a tool that stayed wedged would be a finding. The interactive
 stream's p99 is what a new visitor actually feels: under saturation it is
 the number that separates tools, and it is where the throughput axis is
 blind — molehill and rathole carry nearly the same bulk on the clean stage
@@ -144,75 +147,27 @@ versus 81 ms, and on the 1%-loss cell both carry ~4.9 Gbit/s but the
 interactive stream sits at 1334 ms versus 1311 ms. The peers are driven by
 the same workload and charted in the same panels; the drift axis (open fds,
 RSS and CPU slopes over the run) is in `soak-v0.9.0-drift.png` and the UDP
-session's RTT/loss in `soak-v0.9.0-udp.png`.
+session's RTT/loss in `soak-v0.9.0-udp.png` (a sliding loss *rate*, not a
+count of loss events).
 
-### How to read the numbers (and what replaced the old tables)
+### How to read these charts
 
-The v0.9.0 release replaced the measurement model: the retired matrix
-measured *cells* (one average per tool per network condition, cold-started
-per cell, reported as a median over reps) and this one measures *workloads
-over time*. The old per-cell tables and their charts (throughput-per-cell,
-the count/carrier/transport comparisons as separate charts) are gone with
-it; the release notes of v0.8.x keep their historical numbers, and the
-model's method is documented in [Methodology](#methodology) and
-[docs/release.md](docs/release.md). A number from the retired model is never
-a regression signal against a new one — a cell average cannot see a wedge,
-and this run found several.
+- The dashed red line is the **SLO**: an interactive stream should keep p99 at
+  or under 50 ms. Green bands are the healthy control stages, grey ones are
+  deliberately degraded, and the last band repeats the clean condition to show
+  recovery.
+- Response times are on a **logarithmic** axis — a bad path costs three orders
+  of magnitude, and on a linear axis the healthy stages would be invisible. The
+  solid step line is each stage's median, the dashed one its p99, and a red bar
+  on the bottom edge marks a **wedge**: the stream went silent for more than
+  five seconds.
+- The second figure shows the same run as one panel per stage (dot = median,
+  bar = p99, tick = worst single second), which is the comparison to read when
+  you care about one condition rather than the whole schedule.
 
-### Methodology
-
-- **The unit of measurement is a workload, not a cell.** Every tool is
-  driven through the same client-side workload — one interactive stream (a
-  fresh TCP connection to the echo service per ping, the SLO instrument), N
-  bulk TCP streams (iperf3), C short connections per second (the churn
-  connector) and one UDP session — while the path follows a scripted stage
-  schedule. The tool's processes start once and the shaping changes in place
-  (`tc qdisc change` per tool class), so the session is never rebuilt and
-  the *adaptation* is part of the measurement.
-- **Stages**: `clean` (150 s — cold start plus baseline), `rtt100`, `loss1`,
-  `loss5`, `rate100`, `rate20`, `jitter` (120 s each), then `clean` again
-  (150 s — the recovery axis). The order, the durations, the guard band and
-  every sample rate are recorded in the results meta, because they are
-  method parameters (AGENTS.md §10).
-- **The SLO is a method constant**: an interactive-stream RTT p99 of 50 ms
-  with zero errors — the line on every chart and the break condition of the
-  capacity test.
-- **Test types**: `capacity` (ramp the bulk load until the interactive
-  stream breaks the SLO — the sustainable load plus the full response-time
-  curve), `rrul` (N = cpu count, and the interactive stream's RTT
-  distribution *over time* — the queueing-under-load detector), `soak` (a
-  long rotating-path run: the drift/leak axis), `cost` (CPU-seconds per
-  carried Gbit/s at a fixed operating point), `screen` (a fast development
-  A/B, interleaved inside every load step).
-- **Isolation**: each tool owns its port band and, when tools run
-  concurrently, its own HTB class with an independent netem — two tools in a
-  batch never share a rate bucket, a loss process or a queue. The batch size
-  comes from the host's CPU budget (cores ÷ CPU-per-pair, recorded in the
-  meta). The interactive and UDP probes run in their own processes, so the
-  harness is never inside the measured path.
-- **Everything is externally observable**: throughput and retransmits from
-  iperf3's per-interval stream, RTT/loss/jitter from the probes, RSS / CPU
-  / open-fd / thread counts from `/proc`. That is what makes the peers
-  measurable with the same workload — and what keeps molehill's internal
-  instrumentation (the mux/KCP counters) out of the comparison.
-- **Derived numbers**: per stage the p50/p99/max of each series, the worst
-  1-second window (the stability axis), the drift slope (a leak is a slope,
-  not a level) and flat segments — an interactive stream silent for more
-  than 5 s is recorded as a wedge with its duration, never as a bare null.
-- **Parallelism is validated, not assumed**: the same tool is run alone and
-  inside a full batch; if the per-stage numbers disagree outside the claim
-  rule, the batch size is what it actually is on this host, and that number
-  is recorded.
-- **Discipline**: the warm-up guard band is excluded from the derived
-  statistics, every failure leaves its typed reason, and no verdict tool
-  publishes a single averaged number without the distribution beside it. The
-  retired matrix (v0.8.x and earlier) measured cold cells with medians over
-  reps — a different instrument; its numbers live in git history and the
-  release notes and are never a regression signal against this model.
-- **Reproduce**: `just soak-peers` → `just soak` → `just soak-plot` →
-  `just soak-check` (raw data in
-  `benches/scripts/soak/results-soak-v0.9.0.json`; ritual and gate in
-  docs/release.md).
+These are v0.9.0 numbers from one host, and only runs of the same model on the
+same host compare directly. The method, the stage schedule, the test types and
+how to reproduce it all: [Benchmarks](docs/benchmarks.md).
 
 ## Quickstart
 
@@ -334,15 +289,17 @@ deployments.
 
 ## Documentation
 
-Using molehill:
+For people running molehill:
 
 - [Configuration](./docs/configuration.md) — full configuration specification, logging, tuning
 - [Transport](./docs/transport.md) — Noise Protocol setup
+- [Benchmarks](./docs/benchmarks.md) — how the published numbers are produced, how to read them, how to reproduce them
 - [Build guide](./docs/build-guide.md) — build customization, minimal binary
 - [Internals](./docs/internals.md) — how control/data channels work
 - [Configuration examples](./docs/configuration.md#complete-examples) — configs for common scenarios (systemd & container deployments included)
 
-Contributing & engineering:
+For people changing it (contributor and governance docs are English-only by
+decision — see [AGENTS.md](./AGENTS.md) §3):
 
 - [Checks](./docs/checks.md) — what every gate runs, how to handle a block
 - [Lint policy](./docs/lint-policy.md) — lint levels and waiver rules
@@ -362,7 +319,7 @@ runs just the docs-alignment check (`docs.yml`) instead:
 
 ```bash
 just setup   # activate git hooks (core.hooksPath githooks) + install check tools
-just check   # fmt / secrets / machete / docs / clippy + audit / deny / outdated / test
+just check   # fmt / secrets / machete / docs / ruff (check + format) / clippy + audit / deny / outdated / test
 just tag     # release review (githooks/pre-tag) + create the local v* tag
 ```
 

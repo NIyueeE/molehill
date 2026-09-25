@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> State as of 2026-09-23. Branch `perf/data-path-optimizations` (71 commits
+> State as of 2026-09-25. Branch `perf/data-path-optimizations` (100 commits
 > ahead of `main`, pushed, **not merged**) contains the complete mux-engine
 > migration: rust-yamux 0.14 is now an in-repo, tokio-native engine
 > (`src/mux/`), and the mux transport drives it directly
@@ -1235,6 +1235,155 @@ user ruled out. The favourable cells include the ones the zero-copy
 route targeted: kcp4 loopback 1-stream +34.2% (L1's stability plus L3's
 write path), kcp4 rtt100 1-stream +43.9%, mux1 8-stream +51.1%.
 
+## Release preparation (2026-09-25): what this session changed, and what it left open
+
+The branch was prepared for the v0.9.0 tag. Everything below is committed on
+`perf/data-path-optimizations`; the tag itself is a human act (AGENTS.md §5)
+and has **not** been created.
+
+### Fixed in the harness (three silent defects, each with a real consequence)
+
+1. **`lib.noise_keys` raised `NameError` on first use** — the function read a
+   module global that was never defined, so every `noise` / `kcp4` /
+   `noise-direct` variant died before measuring anything. It is now an
+   `functools.cache`d function keyed by binary path (so a screen's build swap
+   cannot reuse another build's keypair).
+2. **The single-run lock and the stale-process sweep looked for `bench.py`**
+   — the runner the matrix retired. Consequences: concurrent soak runs were
+   no longer refused, and `sweep_stale` could SIGKILL a live run's processes.
+   Both now identify the runner by `lib.RUNNER_NAME`.
+3. **Instrumentation that was accepted and ignored**: `SOAK_SLO_RTT_P99_MS`
+   and `SOAK_SOAK_LOAD_FRACTION` were read into `Knobs` and never used; the
+   capacity verdict ignored the interactive error rate its own SLO documents;
+   `SOAK_RAMP_STEP` / `SOAK_STAGE_TIMEOUT_S` were dead. Dead knobs are
+   deleted, live ones are wired, and the meta records every knob the run used
+   (`slo`, `load_fractions`, `streams_max`, `settle_s`, sample rates) plus
+   `revision`, `molehill_bin`, `molehill_version` and the opt-in
+   `instrumentation` set (§10: provenance and instrument parameters).
+4. **The charts' per-stage statistics selected no samples at all** — the
+   stage windows were computed in one time base and applied in another, so
+   every "stage p50/p99" overlay the new plot draws was silently empty until
+   it was fixed. `soak_plot` now separates `stage_windows` (absolute, for
+   selecting samples) from `stage_spans` (relative, for drawing).
+
+The runner no longer forces `MOLEHILL_MUX_STATS=1` on every molehill spawn:
+that was molehill-only work inside the measured path, the peers have no
+equivalent, and nothing in the Soak model parses the lines. Diagnostics are
+opt-in via the environment and recorded in the meta when set.
+
+### The gate (`soak_check.py`) is now a self-check plus a comparison
+
+Step 1 checks the run against itself: series completeness per claimed
+coverage axis, the throughput endpoint invariant (recorded in the data as
+`endpoints`, re-checked by the gate), and the absolute SLO applied **per
+clean stage** — a saturated `rrul` stage is above the SLO by design and is
+reported as a note. The SLO gates molehill; a peer that misses it is reported
+with its number (`rathole` 81/78 ms, `nps` 74/82 ms on the v0.9.0 clean
+stages) and does not block. Step 2 is the per-type comparison against the
+previous tag's file, now including the worst-1s threshold that the docs
+always listed but no code applied.
+
+**Open, and the reason the committed v0.9.0 results report 5 LEGACY checks:**
+`results-soak-v0.9.0.json` was produced before the harness recorded
+`revision` and `endpoints`. Its numbers stand (the measurement path is
+unchanged apart from an extra `udp_attempt` line per UDP ping, which the loss
+rate now needs), but the gate cannot verify the endpoint invariant or tie the
+run to a checkout from that file. Two ways to close it, both a human call:
+re-run the ritual with the current harness (hours, on the bench host), or
+record the waiver here. **The re-run is the better option and is
+recommended.** `soak_check.py` prints the count in its summary so this cannot
+be forgotten silently.
+
+### Documentation: truthfulness pass, audience split, and an ownership contract
+
+The pages were reorganised so each topic has exactly one home, because the
+previous arrangement had grown a habit of recording the same fact — or a
+narration *about* the repository — in several places, including in the
+user-facing pages. The rule and its routing table now live in AGENTS.md §3
+("One topic, one home"), and the audience-and-scope table (owner + "does not
+own" per page) in docs/structure.md. What moved:
+
+- the benchmark method left the README for `docs/benchmarks.md` (+ `.zh.md`):
+  what is measured, how to read each chart, the stage schedule, the SLO, the
+  test types, the per-decision measurements, comparability and how to
+  reproduce a run (including the two-build screen). The README keeps the
+  numbers, three bullets on reading them and a link;
+- the measured per-decision cost table left `docs/configuration.md` for the
+  same page (with its provenance); configuration keeps the design trade-off
+  per setting, so a reader sees *what changes* there and *what it cost* in one
+  place;
+- `docs/release.md` no longer re-explains the method: it owns the ritual, the
+  artifacts and the gate;
+- the README no longer carries the "what replaced the old tables" narrative,
+  the release-gate mechanics or harness-development asides — this file and
+  CHANGELOG.md keep that record;
+- the Chinese landing page's measured-configuration table (which had no
+  English counterpart and cited this file) was replaced by the same structure
+  the English page uses, pointing at the measurement page.
+
+The gate enforces what it can: a page without an owner in docs/structure.md
+fails, as does a user-facing page whose mirror is missing or has a different
+heading structure, or a README that does not link its own language's page.
+
+- Five documented behaviours were wrong or unenforced and now say what the
+  code does: the privileged-port rule in `allow_ports` (**never implemented**
+  — the whitelist admits any port it contains; the OS decides whether the
+  bind succeeds), the tunnel-count ceiling (64 streams per tunnel), the
+  `retry_interval` backoff-cap semantics (and the 1 s fallback after three
+  tries), the real scope of `nodelay` (client-side sockets only), and the PSK
+  requirement (silently unused without a PSK modifier in `pattern`).
+  `--genkey x448` was dropped (the shipped `snow` backend has no X448).
+- The configuration pages' per-decision cost table is now labelled: its
+  numbers come from the **retired per-cell model** and are not comparable
+  with the Soak figures above it (the v0.9.0 run covers the default arm
+  only).
+- Docs are grouped by audience: README/configuration/transport for people
+  running molehill (Chinese mirrors kept), contributor and governance docs
+  English-only per AGENTS.md §3.
+
+### Open items this session recorded but did not close
+
+1. **The configuration test gaps** (audit of the docs against `tests/`, ranked
+   by user impact). Fixed in this session: the three vacuous tests
+   (`type = "udp"` had been renamed to `protocol`, and two invalid fixtures
+   failed on a missing `remote_bind_addr` instead of the defect they name —
+   every invalid fixture now declares `# expect: <substring>` and the harness
+   asserts it) and a `documented_defaults_are_pinned` test covering the
+   documented heartbeat/pool/retry/UDP/health-check/keepalive defaults.
+   Still missing, in priority order:
+   - `allow_ports` **rejection** end to end (nothing asserts the client's
+     "Port rejected" path or the empty-whitelist master switch);
+   - `health_check` end to end (unregister → visitors fail fast → re-register);
+   - per-service `token` / `heartbeat_timeout` / `retry_interval` resolution;
+   - `max_pool_size` clamping; the UDP knobs' documented effects;
+   - a PSK handshake (and the "pattern must carry a PSK modifier" rule);
+   - hot-reload service add/delete/modify;
+   - `--genkey` curve behaviour (now documented as X25519-only);
+   - the doc-example parse gate is `#[cfg(feature = "multiplex")]`, so the
+     `embedded` legs never parse the documented examples.
+2. **The privileged-port rule** is documented as *not* implemented. If the
+   stricter behaviour is wanted, it is a code change (reject a registration
+   whose port is <1024 and is admitted only by a range) plus a test — a
+   behaviour decision for the human, not a doc fix.
+3. **The Soak variant sweep** (`mux-off`, `noise`, `mux1`, `kcp4`) has still
+   not been measured with the new model, which is why the configuration
+   page's decision table still quotes the retired model.
+4. `docs/build-guide.md` claims a 574 KiB `x86_64-unknown-linux-glibc` binary
+   (the label is not a real triple) and says nothing about the musl/embedded
+   artifacts the release actually ships.
+
+### Peripheral infrastructure hardened
+
+`githooks/check-docs` now checks every command a hook runs (not only `cargo`
+ones), checks the reverse direction (a documented gate that no hook runs),
+and pins the docs index on both READMEs; `githooks/pre-commit` and `just
+py-lint` run `uvx ruff format --check` beside the lint. `release.yml` refuses
+an undated changelog section and a missing soak result/chart, takes a
+concurrency group, and checks out full history so `--version` can report a
+real revision (`build.rs` now emits the SHA and marks a dirty tree). The
+retired matrix's last two files (`benches/scripts/bench/results-v0.9.0.json*`)
+are deleted, which makes the CHANGELOG's removal claim true.
+
 ## The `--ab` harness bug (found 2026-09-23, fixed in `064c55a`)
 
 **Every `--ab` run on this branch measured the DEFAULT binary against
@@ -1392,27 +1541,31 @@ item (below).
 
 ## How to A/B on this branch
 
-Sequential before/after runs are **not usable** — several cells drift ~12%
-between epochs, which is what hid both a real regression and a bug for a
-whole session, and made a -31% "regression" turn out to be a bimodal cell on
-an outlier. Always:
+Sequential before/after runs are **not usable** — the path drifts between
+epochs, which is what hid both a real regression and a harness bug for a
+whole session. The Soak model's answer is a single interleaved run:
 
 ```bash
-TMPDIR=~/tmp MOLEHILL_REPS=3 MOLEHILL_SECS=8 MOLEHILL_SECS_WEAK=10 \
-  just bench --tools=molehill --cells=0/0,1%/10 --variants=mux,mux1 \
-       --ab /path/to/bin-a,/path/to/bin-b --fresh --out results-ab.json
-just bench-ab results-ab.json     # CLAIM only where reps are disjoint
+# both builds freshly compiled; one screen run over one path class
+just soak --test=screen --path=loss1 --streams-max=8 \
+     --ab /path/to/bin-a,/path/to/bin-b --out results-screen.json
+just soak-check --screen results-screen.json   # per-step verdict
 ```
 
-Details in [docs/release.md](docs/release.md) ("Comparing two builds").
+The verdict names a CLAIM only where every step favours the same build by
+more than the threshold; anything else is *directional*. The retired matrix's
+`--ab` mode and its `MOLEHILL_REPS` / `--cells` interface are gone with the
+matrix — this section is the current recipe. Details in
+[docs/release.md](docs/release.md) ("Comparing two builds (development
+screening)").
 
 ### Environment notes (this host, measured 2026-09-22/23)
 
 - **Verify `iperf3` before a long run.** The container's apt layer dropped
   the `iperf3` package twice mid-session without a reboot. The bench then
-  fails *cleanly* — every arm records the `Backends: … [Errno 2] iperf3`
+  fails *cleanly* — every test records the `Backends: … [Errno 2] iperf3`
   error with its reason (continue-on-error, no fabricated numbers) — but a
-  whole matrix spends its hour producing nothing.
+  whole run spends its hour producing nothing.
 - **/tmp is periodically wiped.** It took one 35-minute final A/B with it
   (every checkpoint of the run). The checkpoint now recreates its output
   directory (`baa4eab`), but keep `--out` and logs under `~/tmp` or the
@@ -1506,20 +1659,22 @@ drift run are the follow-up measurements. The release gate had no
 same-model baseline (this is the first Soak release), so v0.9.0 is gated by
 the absolute SLO — stated in docs/release.md.
 
-## Legacy state (2026-09-11, still accurate)
+## Legacy state (2026-09-11; the entries below are history, re-checked
+2026-09-25)
 
 - `v0.8.0` and `v0.8.1` are released; `v0.8.1` is the control-channel
   teardown fix (a service whose control channel ended kept its public port
   bound until a new registration took it over — recorded in CHANGELOG.md's
-  `## [0.8.1]` section), with the benchmark matrix carried forward
-  unchanged.
-- The benchmark measurement method was revised 2026-09-10/11 (rate-cell
-  shaping, per-rep throughput isolation, a UDP capacity ladder); the v0.8.0
+  `## [0.8.1]` section).
+- The retired matrix's method was revised 2026-09-10/11, and its v0.8.0
   baseline was re-measured in full from it on host `0b073ddbf222` (52 arms,
-  zero holes, charts and README regenerated).
-- Only same-method results (`results-v0.8.0.json` and later) are comparable.
-  The v0.7.2 file predates the revision and comes from another container, so
-  it measures a different instrument and is never a regression signal.
+  zero holes). Those result files are no longer in the tree; their numbers
+  live in git history and the v0.8.x release notes.
+- Only same-model results are comparable: the matrix's cell averages (v0.8.x,
+  git history) and the Soak model's time series (v0.9.0 onward) are different
+  instruments, and within the Soak model only same-schema, same-host runs
+  compare — the results meta records `workload_version`, the host and the
+  harness revision for exactly that reason.
 - `src/transport/udp_batch.rs` is the only `unsafe` site in the codebase
   (the recvmmsg/sendmmsg FFI), audited 2026-09-20 and reduced on
   2026-09-24: the send address is now built by `socket2` and every
@@ -1527,7 +1682,7 @@ the absolute SLO — stated in docs/release.md.
   left is the two zeroed C templates, the kernel-ABI address read, the
   two `mmsg` calls, and the `Send`/`Sync` impls (19 items -> 8). The same
   pass cut the production-code lint waivers from 49 to 14 — the record is
-  in CHANGELOG.md's `## [Unreleased]`.
+  in CHANGELOG.md's `## [0.9.0]` section.
 
 ## Appendix: measurements for work already released
 

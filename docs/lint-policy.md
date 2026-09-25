@@ -1,9 +1,11 @@
 # Lint policy
 
 
-All lints live in `Cargo.toml` `[lints]`; the table below is the single source
-of truth. Changing a lint level requires updating this page **in the same
-commit** — `githooks/check-docs` enforces the mechanical part.
+All Rust lints live in `Cargo.toml` `[lints]`; the table below is the single
+source of truth. The python bench scripts have their own lint *and* format
+gate (`ruff.toml`, run as `uvx ruff check` + `uvx ruff format --check` in
+pre-commit). Changing a lint level or a waiver requires updating this page
+**in the same commit** — `githooks/check-docs` enforces the mechanical part.
 
 ## Declared lints
 
@@ -40,8 +42,22 @@ Only two legitimate scenarios:
    audit noise from dependencies themselves.
 
 Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
-`githooks/pre-commit`, or any check command. All extra checks (machete, audit,
-deny, outdated, docs-sync, secret scan) follow the same discipline.
+`ruff.toml`, `githooks/pre-commit`, or any check command. All extra checks
+(machete, audit, deny, outdated, docs-sync, secret scan, the python gates)
+follow the same discipline.
+
+### Python (ruff)
+
+The bench/test scripts under `benches/scripts/` are held to the same rule:
+fix the code first. `ruff.toml`'s `ignore` list is reserved for a property
+that is true of every script in scope — today exactly one, S602/S603/S607,
+because these scripts measure *external* binaries reached through `PATH`
+(iperf3, tc, ss, vegeta, the peers), where resolving a different program
+would measure something other than the documented tool. Every other waiver
+is written inline at its own site (`# noqa: <rule>`) with a one-line reason,
+the python equivalent of `#[expect(clippy::...)]` plus its reason comment.
+`uvx ruff check` and `uvx ruff format --check` are the two gates; `just
+py-fmt` applies the formatter's fixes.
 
 ## Deviations from the rust-agents-template lint set
 

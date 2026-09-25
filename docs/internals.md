@@ -49,7 +49,7 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 - The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 
-`mode = "direct"` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.
+`mode = "direct"` restores the one-connection-per-channel behavior: every data channel is its own transport connection, so nothing is multiplexed and each visitor connection pays the full connection setup (TCP connect plus, with `noise`, the Noise handshake). That is a design trade-off, not a performance claim — the measured comparison lives in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements), and the choice between the two is the decision tree in [Configuration](configuration.md).
 
 ## UDP
 

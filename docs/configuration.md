@@ -75,18 +75,9 @@ A typical setup:
 
 The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
 transport — are the right starting point for almost everyone. Deviate only
-when the tree says so. The v0.9.0 model measures a configuration as a workload
-over a stage schedule and reports the sustainable load and the cost at the
-operating point (raw data in
-`benches/scripts/soak/results-soak-v0.9.0.json`, charts and tables in the
-README's Benchmarks chapter) — but that release run covers the **default arm
-only**. The per-decision numbers in the table below are from the **retired
-per-cell model** (v0.8.x method: one cold average per cell, medians over
-reps). They are a different instrument, they are not comparable with the
-v0.9.0 Soak numbers, and they are directional guidance rather than a
-measurement of the shipped default. Re-measuring the variants (`mux-off`,
-`noise`, `mux1`, `kcp4`) with the Soak model is open work, recorded in
-`HANDOFF.md`.
+when the tree says so, change one thing at a time, and measure the result on
+your own path: the published runs, their numbers and how to reproduce them are
+in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
@@ -106,27 +97,29 @@ flowchart TD
     J --> Z
 ```
 
-### What each choice costs (retired per-cell model, directional)
+### What each choice costs (what you trade)
 
-| Decision | Option | Measured basis (retired model — see the note above) |
+| Decision | Option | What you give up / gain |
 |---|---|---|
-| `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
-| `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | single-flow ceiling (loopback 8-str 9.2 Gbit/s); every stream shares one retransmit domain (loss5 HoL max 2.5 s vs 1.6 s at count=4) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 100.1 ms at count=1); yamux ceiling `count × 64` concurrent connections |
-| `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
-| `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-str 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport; 8-str 14.9 vs 1.1 — the kcp4 8-stream cell is the documented cold-start bimodal one, see HANDOFF.md); RSS 26 vs 85 MiB |
-| `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or A/B for a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0% loss, 20 ms max inter-packet gap vs 100+ ms for the TCP arms) |
-| transport | `"plain"` | 10.0 / 19.5 Gbit/s (1/8 streams) on loopback |
-| transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
-| `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels, never splits one session (session affinity) |
+| `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
+| `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
+| `count` | `1` | single-flow throughput ceiling; every stream shares one retransmit domain, so one loss event stalls them together |
+| `count` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `count × 64` concurrent connections |
+| `count` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
+| `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
+| `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + `count` for the ceiling |
+| transport | `"plain"` | no encryption; lowest per-byte cost |
+| transport | `"noise"` | encrypted wire with a single pre-shared keypair; a sub-millisecond RTT cost and no CPU penalty under full load |
+| `pool_size` | 8 TCP / 2 UDP (defaults) | enough warm data channels to absorb churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
+
+The measured cost of each option — including the figures these trade-offs come
+from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
 **Validate the choice** with the exposure you care about: `ping` / in-game
 feel for latency, `iperf3` on the exposed port for raw throughput, and the
-real traffic of your service. For local A/B of configurations,
-`just soak --test=screen --ab <parent>,<head>` A/Bs two builds of your
-own workload in minutes (docs/release.md, "Comparing two builds
-(development screening)").
+real traffic of your service. To compare two configurations or two builds on
+your own hardware, [Benchmarks](benchmarks.md#reproduce-it-yourself) has the
+commands.
 
 Here is the full configuration specification:
 
