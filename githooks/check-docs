@@ -20,24 +20,61 @@ expect() {
   fi
 }
 
-# 1) every cargo command in every hook must be documented in the checks docs
+# 1) every command a hook runs must be documented in the checks docs. The
+#    filter keeps real commands (cargo/uvx/git/just and the repo's own gates)
+#    and drops shell builtins, assignments and comments, so a gate that is
+#    renamed in a hook immediately shows up as a docs failure here.
 for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
   if [ ! -f "$hook" ]; then
     echo "  FAIL  $hook missing (see docs/checks.md)" >&2
     errors=$((errors + 1))
     continue
   fi
+  # Extract the gate *commands*, not whole shell lines: a hook line may be a
+  # pipeline or carry control flow (`git diff … | githooks/docs-only || x=0`),
+  # and requiring that literal text in the docs would document noise. The
+  # reverse check below extracts commands the same way, so both directions
+  # speak about the same thing.
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
-  done < <(grep -E '^cargo ' "$hook")
+  done < <(sed -e 's/[[:space:]]*#.*$//' "$hook" \
+             | grep -oE '(cargo [a-z-]+|uvx [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
+             | sort -u)
 done
+
+# 1b) the reverse direction: every gate docs/checks.md presents as a command
+#     must still exist somewhere in the hooks. Without this a gate can be
+#     deleted while its documentation keeps claiming it runs.
+while IFS= read -r cmd; do
+  [ -n "$cmd" ] || continue
+  found=0
+  for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
+    if grep -qF -- "$cmd" "$hook" 2>/dev/null; then found=1; break; fi
+  done
+  if [ "$found" -eq 1 ]; then
+    echo "  ok    documented gate still exists: $cmd"
+  else
+    echo "  FAIL  docs/checks.md documents a gate no hook runs: $cmd" >&2
+    errors=$((errors + 1))
+  fi
+done < <(awk '
+           /^## / { in_gate = ($0 ~ /pre-commit|pre-push|pre-tag/) }
+           in_gate { print }
+         ' docs/checks.md \
+           | grep -oE '`(cargo [a-z-]+|uvx [a-z]+|githooks/[a-z-]+)[^`]*`' \
+           | tr -d '`' | sort -u)
 
 # 2) every lint declared in Cargo.toml [lints] must be documented in the lint-policy docs
 while IFS= read -r lint; do
   [ -n "$lint" ] || continue
   expect "lint documented: $lint" docs/lint-policy.md '`'"$lint"'`'
-done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0} f && /=/{split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k}' Cargo.toml)
+done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0}
+              # comments are prose, not lint declarations: a `=` inside one
+              # (e.g. a code sample) is not a lint level
+              f && /=/ && $0 !~ /^[ \t]*#/ {
+                split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k
+              }' Cargo.toml)
 
 # 3) rustc edition
 edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)
@@ -58,6 +95,12 @@ expect "just setup documented" README.md 'just setup'
 expect "just setup documented" README.zh.md 'just setup'
 expect "just check documented" README.md 'just check'
 expect "just check documented" README.zh.md 'just check'
+# The benchmark commands live on the method's page (one topic, one home);
+# the READMEs link to it instead of repeating the recipe.
+expect "just soak documented" docs/benchmarks.md 'just soak'
+expect "just soak documented (zh)" docs/benchmarks.zh.md 'just soak'
+expect "just soak-check documented" docs/benchmarks.md 'just soak-check'
+expect "just soak-peers documented" docs/benchmarks.md 'just soak-peers'
 
 # 6) hooks activation instruction
 expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'
@@ -69,7 +112,45 @@ expect "docs gate documented" docs/checks.md 'githooks/check-docs'
 # 8) READMEs must link the modular governance docs (index integrity, per language)
 for doc in checks lint-policy release structure; do
   expect "README links docs/$doc.md" README.md "docs/$doc.md"
+  expect "README.zh links docs/$doc.md" README.zh.md "docs/$doc.md"
 done
+
+# 8b) user-facing docs keep a Chinese mirror and both READMEs link the page
+#     in their own language (AGENTS.md §3)
+for doc in configuration transport benchmarks; do
+  expect "docs/$doc.md linked from README" README.md "docs/$doc.md"
+  expect "docs/$doc.zh.md linked from README.zh" README.zh.md "docs/$doc.zh.md"
+  if [ ! -f "docs/$doc.zh.md" ]; then
+    echo "  FAIL  docs/$doc.zh.md missing (user-facing docs keep a mirror)" >&2
+    errors=$((errors + 1))
+    continue
+  fi
+  # A section added to one language only is the usual way a mirror drifts:
+  # the heading count is a cheap, greppable proxy for "same structure".
+  en_headings=$(grep -c '^#' "docs/$doc.md")
+  zh_headings=$(grep -c '^#' "docs/$doc.zh.md")
+  if [ "$en_headings" -eq "$zh_headings" ]; then
+    echo "  ok    docs/$doc.md and its mirror have the same structure ($en_headings headings)"
+  else
+    echo "  FAIL  docs/$doc.md has $en_headings headings, docs/$doc.zh.md has $zh_headings — the mirror drifted" >&2
+    errors=$((errors + 1))
+  fi
+done
+
+# 8c) the ownership contract lists every docs/ page, so a new page without a
+#     stated owner (and audience) fails here instead of drifting
+while IFS= read -r page; do
+  name="$(basename "$page")"
+  case "$name" in
+    *.zh.md) continue ;;
+  esac
+  if grep -qF "\`$name\`" docs/structure.md; then
+    echo "  ok    docs/$name has an owner in docs/structure.md"
+  else
+    echo "  FAIL  docs/$name is not listed in docs/structure.md's ownership table" >&2
+    errors=$((errors + 1))
+  fi
+done < <(git ls-files 'docs/*.md')
 
 # 9) CI must run the same chain
 if [ -f .github/workflows/ci.yml ]; then

@@ -88,6 +88,10 @@ pub use noise::NoiseTransport;
 pub(crate) mod noise_stream;
 #[cfg(feature = "noise")]
 pub(crate) use noise_stream::NoiseStream;
+/// Noise session resume: a reconnect that skips the handshake's DH turns.
+/// Both the TCP and the KCP Noise paths go through it.
+#[cfg(feature = "noise")]
+pub(crate) mod noise_resume;
 // Key material: the Noise transport, the server's dual-transport accept,
 // and the KCP tunnel path (Noise-over-KCP) all build sessions from it.
 #[cfg(feature = "noise")]
@@ -95,6 +99,12 @@ pub(crate) use noise::NoiseKeys;
 
 #[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
 pub(crate) mod kcp;
+
+/// The portable half of an outbound datagram batch: the batch's shape, which
+/// every platform shares, as opposed to the syscall that sends it. Gated with
+/// `kcp` and not with the platform, because the non-Linux send path uses it.
+#[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
+pub(crate) mod dgram;
 
 // Batch UDP datagram IO (recvmmsg/sendmmsg) for the KCP carrier on Linux.
 #[cfg(all(
@@ -126,7 +136,7 @@ pub struct SocketOpts {
 }
 
 impl SocketOpts {
-    fn none() -> SocketOpts {
+    pub(crate) fn none() -> SocketOpts {
         SocketOpts {
             nodelay: None,
             keepalive: None,

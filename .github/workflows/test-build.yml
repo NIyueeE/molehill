@@ -21,6 +21,12 @@ run-name: Test build ${{ inputs.ref }} [${{ inputs.targets }}]
 permissions:
   contents: read
 
+# One dispatch per ref: an artifacts-only build has no reason to run twice at
+# once, and the matrix legs would compete for the same cache keys.
+concurrency:
+  group: test-build-${{ inputs.ref }}
+  cancel-in-progress: true
+
 jobs:
   plan:
     name: plan matrix
