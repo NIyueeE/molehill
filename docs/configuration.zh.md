@@ -79,10 +79,14 @@
 ## 选择配置(决策树)
 
 默认配置——`mode = "multiplex"`、`count = 4`、`carrier = "tcp"`、明文
-传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。下表数字
-来自 v0.9.0 模型:每个配置按阶段日程上的工作负载测量,报告可持续负载与工
-作点成本(原始数据在 `benches/scripts/soak/results-soak-v0.9.0.json`,图表
-与完整表格见 README「基准测试」一章):
+传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。v0.9.0 模型把
+一个配置当作阶段日程上的工作负载来测,报告可持续负载与工作点成本(原始数据在
+`benches/scripts/soak/results-soak-v0.9.0.json`,图表与完整表格见
+README「基准测试」一章)——但那一轮发布运行**只覆盖默认 arm**。下表逐项决策
+的数字来自**已退役的逐格模型**(v0.8.x 方法:每格一次冷启动平均、对重复取
+中位数)。那是另一套仪器,与 v0.9.0 的 Soak 数字不可比,只能当作方向性参考,
+而不是对出厂默认配置的实测。用 Soak 模型重测各 variant(`mux-off`、`noise`、
+`mux1`、`kcp4`)仍是待办,记录在 `HANDOFF.md`:
 
 ```mermaid
 flowchart TD
@@ -93,7 +97,7 @@ flowchart TD
     D -- "是,且原始吞吐优先" --> E["mode = direct"]
     D -- "否:多服务、多用户、<br/>高连接频率" --> F{"并发连接很多?"}
     E --> Z["完成——按需用<br/>[client.services.*] 覆盖"]
-    F -- "> ~100 并发" --> G["count = 8 或更高"]
+    F -- "> ~256 并发" --> G["count = 8 或更高"]
     F -- 一般 --> H["保持 count = 4"]
     G --> I{"路径质量?"}
     H --> I
@@ -102,15 +106,15 @@ flowchart TD
     J --> Z
 ```
 
-### 每个选择的花费(实测)
+### 每个选择的花费(退役的逐格模型,仅作方向参考)
 
-| 决策 | 选项 | 实测依据 |
+| 决策 | 选项 | 实测依据(退役模型,见下方说明) |
 |---|---|---|
 | `mode` | `"multiplex"`(默认) | 回环 1 流 10.0 Gbit/s,`direct` 为 19.2;8 流分别 19.5 vs 23.3;multiplex 吸收建连成本(churn ~4.8k 连接/s)并节省 FD / 端口 / NAT 映射 |
 | `mode` | `"direct"` | 原始单流吞吐优先;每条流一条物理隧道(FD / 端口 / NAT 成本随流数增长) |
 | `count` | `1` | 单流上限(回环 8 流 9.2 Gbit/s);所有流共享一个重传域(loss5 HoL 最大 2.5 s,count=4 为 1.6 s) |
 | `count` | `4`(默认) | 聚合越过单流(loss1 8 流 12.3 vs 4.5 Gbit/s)并隔离队头阻塞(rtt10 HoL 最大 80.6 vs count=1 的 100.1 ms);yamux 上限 `count × 64` 并发连接 |
-| `count` | `8+` | ~256 并发连接;每服务 8 条物理隧道(NAT 映射 ×8) |
+| `count` | `8+` | ~512 并发连接(8 条隧道 × 每条 64 条 yamux 流);每服务 8 条物理隧道(NAT 映射 ×8) |
 | `carrier` | `"tcp"`(默认) | 每个实测格子都更快(noise 传输下回环 1 流 5.8 vs kcp4 的 3.7 Gbit/s;8 流 14.9 vs 1.1——kcp4 的 8 流格子是已记录的冷启动双模,见 HANDOFF.md);RSS 26 vs 85 MiB |
 | `carrier` | `"kcp"` | 仅在 TCP 数据隧道被封锁/限速时,或高延迟路径上的 UDP 游戏 A/B:唯一实测赢面是 rtt100 的 UDP 会话质量(0% 丢包、最大包间隔 20 ms,而 TCP 各 arm 卡 100+ ms) |
 | transport | `"plain"` | 回环 10.0 / 19.5 Gbit/s(1/8 流) |
@@ -120,7 +124,7 @@ flowchart TD
 **验证选择**用你关心的口径:延迟用 `ping` / 游戏手感,原始吞吐用暴露
 端口的 `iperf3`,真实流量看暴露服务的行为。本地 A/B 配置用
 `just soak --test=screen --ab <parent>,<head>` 可在分钟级对你自己的负
-载做 A/B(docs/release.md,「Screening during development」)。
+载做 A/B(docs/release.md,「Comparing two builds (development screening)」)。
 
 以下是完整的配置规范:
 
@@ -131,7 +135,7 @@ default_token = "change-me" # 必填。必须与 `[server].default_token` 一致
 [client.control] # 必填。控制通道默认值:鉴权、注册、心跳
 default_remote_addr = "example.com:2333" # 必填。服务端地址
 default_heartbeat_timeout = 40 # 可选。设为 0 可禁用应用层心跳检测。取值必须大于 `server.control.heartbeat_interval`。默认:40 秒
-default_retry_interval = 1 # 可选。重连服务端的间隔。默认:1 秒
+default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:延迟从 1 秒开始、按 3 倍增长并带抖动,最高不超过该值(抖动会让单次睡眠最长达到该上限的两倍),共 3 次重试;退避耗尽后客户端回落到固定 1 秒的重试循环。默认:1 秒
 
 [client.data] # 可选。所有服务的数据面默认值(特性 `multiplex`,默认构建的一部分)。每个服务都可以单独覆盖 default_mode/default_count/default_carrier——见下方 `[client.services.*]` 里的按服务键
 # default_data_addr = "example.com:2343" # 可选。数据面端点;默认为服务的控制端点(设置了 `client.services.<name>.remote_addr` 时用该地址,否则用 `client.control.default_remote_addr`)。`default_carrier = "kcp"` 时 KCP 会话用 UDP 拨控制地址——TCP 控制与 UDP KCP 可以共用一个端口(协议不同互不冲突)
@@ -147,22 +151,22 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。仅客户端。通过 `
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如所示
 local_private_key = "key_encoded_in_base64" # 可选
 remote_public_key = "key_encoded_in_base64" # 可选
-psk = "key_encoded_in_base64" # 可选。预共享密钥(32 字节,base64 编码)。pattern 必须包含 PSK 修饰符(如 Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
 protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"
 local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址
 remote_bind_addr = "0.0.0.0:8081" # 必填。该服务在服务端暴露的公网地址。必须被服务端的 `allow_ports` 覆盖
 nodelay = true # 可选。该服务数据通道的 TCP_NODELAY。默认:即使不设置也为 true;设为 `false` 关闭
-retry_interval = 1 # 可选。重连服务端的间隔。默认:继承 `client.control.default_retry_interval`
+retry_interval = 1 # 可选。按服务的重连退避上限,语义与 `client.control.default_retry_interval` 相同。默认:继承 `client.control.default_retry_interval`
 token = "service-specific-token" # 可选。仅对本服务覆盖 `client.default_token`——例如对使用独立 token 的服务端做鉴权 # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # 可选。仅对本服务覆盖 `client.control.default_remote_addr`——它的控制通道(默认还包括数据面)拨向这个服务端。让同一个客户端可以把服务分散到多个 molehill 服务端
 heartbeat_timeout = 60 # 可选。仅对本服务覆盖 `client.control.default_heartbeat_timeout`——例如该服务对端的服务端心跳间隔不同
 udp_forwarder_ipv6 = false # 可选。UDP 转发器连接本地服务时优先使用 IPv6(仅 UDP 服务)。默认:false
 mode = "multiplex" # 可选。仅对本服务覆盖 `client.data.default_mode`:"multiplex"(默认)或 "direct"
-count = 4 # 可选。仅对本服务覆盖 `client.data.default_count`;仅在 `mode = "multiplex"` 时有效。不设则继承默认值
+count = 4 # 可选。仅对本服务覆盖 `client.data.default_count`;仅在 `mode = "multiplex"` 时有效,并收敛到 1..=64。不设则继承默认值
 carrier = "tcp" # 可选。仅对本服务覆盖 `client.data.default_carrier`;仅在 `mode = "multiplex"` 时有效。不设则继承默认值
 transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" = 加密,"plain" = 明文;不设 = 跟随 `client.transport.type`)与 `noise` 密钥(本服务加密时使用;不设 = 用 `client.transport.noise`)。让同一个客户端明文与加密服务并存——例如拨向不同服务端、带自己公钥的服务
 pool_size = 8 # 可选。预建立的数据通道数。默认:TCP 为 8,UDP 为 2。受服务端 `max_pool_size` 限制。对 UDP 而言,这会把不同的访客分片到不同通道;每个访客固定钉在一个通道上(会话亲和)
@@ -178,7 +182,7 @@ udp_send_queue_size = 1024 # 可选。每条数据通道的出站数据报队列
 
 [server]
 default_token = "change-me" # 必填。必须与 `[client].default_token` 一致
-allow_ports = ["6000-6999", "8080"] # 启用动态注册的必填项。为空或缺失:拒绝所有注册。特权端口(<1024)必须显式列出
+allow_ports = ["6000-6999", "8080"] # 启用动态注册的必填项。为空或缺失:拒绝所有注册。请求的端口只要被某个条目包含就会被放行(单个端口,或覆盖它的范围——1024 以下的特权端口同样如此)
 max_pool_size = 16 # 可选。应用于每个服务请求的 pool_size 的上限。默认:不限制
 
 [server.control] # 必填。控制通道监听器
@@ -187,15 +191,15 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔。设为
 
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
-# stripe_count = 4 # 可选。每个访客连接使用的数据通道数。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带")
+# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带")。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
 
 [server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 v3 传输选择器字节开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # 可选。预共享密钥(32 字节,base64 编码)。pattern 必须包含 PSK 修饰符(如 Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 ```
 
 ## 动态服务注册
@@ -210,7 +214,11 @@ resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise 
 3. 服务端校验:
    - **白名单**:请求的端口必须被 `allow_ports` 覆盖;为空/缺失的
      `allow_ports` 会拒绝*每一次*注册(这也是完全禁用该特性的方式);
-   - **特权端口**:低于 1024 的端口必须显式列出;
+   - **特权端口**:没有单独规则——白名单条目(单个端口或范围)同样
+     放行其中的 1024 以下端口。绑定它们仍会失败,除非服务端具备操作系统
+     特权(root,或调低
+     `net.ipv4.ip_unprivileged_port_start`);所以服务端确有特权时,
+     建议把要暴露的特权端口逐个列出;
    - **冲突**:端口已被占用时,注册失败并返回 `Port already in use`。
 4. 成功时服务端立即绑定该端口并开始转发。
 
@@ -251,7 +259,9 @@ FD 占用。
   接收窗口 4096 段、MTU 1400、32 MiB socket 缓冲。保活:适配器层每 2 秒的
   PING/PONG 让空闲隧道保持活跃(NAT 映射)并探测路径 RTT;对端消失仍只在
   下一次写入时确认(约 20 次 RTO 后判死)。
-- 编译时去掉该特性则完全移除这个选项,始终使用每通道一条连接。
+- 编译时去掉该特性则完全移除这个选项,而且这样的构建根本不能看到相应的表:
+  配置里出现 `[client.data]` 或 `[server.data]` 就会被拒绝(未知键——
+  `deny_unknown_fields`)。删掉这两个表之后,数据面始终走每通道一条连接。
 
 **按服务覆盖。** `[client.data]` 存放默认值;每个服务可以在自己的
 `[client.services.<name>]` 块里单独覆盖 `mode`、`count` 与 `carrier`。
@@ -315,10 +325,18 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 连接。这对延迟与交互式应用(SSH、rdp、Minecraft 服务器)有益,但会略微
 降低带宽。
 
+`nodelay` 只有客户端会采纳,而且只作用于客户端为某个服务自己建立的两类
+socket:每通道一条连接路径上的数据通道连接,以及它连向本地服务的 TCP
+连接。其余 socket 一律保持 nodelay:控制通道两端始终设置 TCP_NODELAY,
+客户端的多路复用隧道沿用同一套控制通道选项,服务端对每条数据通道自己这
+一端以及面向访客的 socket 也始终使用固定的低延迟默认值(nodelay +
+keepalive)。因此 `nodelay = false` 无法让这些 socket 重新启用 Nagle。
+
 这些 socket 上也默认启用 TCP keepalive(空闲 20 秒、探测间隔 8 秒),因此
 被 NAT 或中间设备静默丢弃的池化数据通道会被检测到,而不会发给访客。
 
-如果带宽更重要,可以在每个服务上用 `nodelay = false` 关闭 TCP_NODELAY。
+如果带宽更重要,可以在每个服务上用 `nodelay = false` 关闭 TCP_NODELAY
+——只作用于上面那些客户端侧 socket。
 
 ## 完整示例
 
@@ -365,7 +383,7 @@ default_token = "default_token_if_not_specify" # security-scan:allow documentati
 [client.control]
 default_remote_addr = "myserver.com:2333" # Necessary. The address of the server
 default_heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. Must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
-default_retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
+default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:延迟从 1 秒开始、按 3 倍增长并带抖动,最高不超过该值(抖动会让单次睡眠最长达到该上限的两倍),共 3 次重试;退避耗尽后客户端回落到固定 1 秒的重试循环。默认:1 秒
 
 # Data-plane options (`[client.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
@@ -379,9 +397,9 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect to the server 
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
 [client.services.ssh] # A service to forward
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
@@ -419,9 +437,9 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume (see `docs/transport.md`, "Noise session resume")
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 ```
 
 ### Noise(加密传输)
@@ -938,6 +956,7 @@ WantedBy=multi-user.target
 | `Protocol version mismatched ... Please update` | 一端运行的是旧版 molehill。两端一起升级(协议 v3 自 0.8 起;v2 自 0.7.0 起)。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
+| 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |
 | 反复出现 `Heartbeat timed out` | `client.control.default_heartbeat_timeout <= server.control.heartbeat_interval`,或网络路径丢弃了连接。 |
 | Noise 握手失败 | 两端的密钥对、`psk` 或 pattern 不匹配。 |
 | 启动时 `Proxy URL is missing the port` | `proxy` URL 缺少端口;修复配置。 |

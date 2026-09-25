@@ -29,7 +29,8 @@ To use it, an X25519 keypair is needed.
 
 ### Generate a keypair
 
-Run `molehill --genkey`, which generates a keypair using the default X25519 algorithm (pass `x448` for X448):
+Run `molehill --genkey`, which generates an X25519 keypair (the only curve the
+shipped `snow` backend provides):
 
 ```sh
 $ molehill --genkey
@@ -117,7 +118,12 @@ remote_public_key = "server-pub-key-here"
 
 ### Pre-shared keys
 
-`psk` and `psk_location` add a pre-shared key to the handshake. The pattern must include a PSK modifier (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`), the key must be 32 bytes base64-encoded, and both sides must use the same `psk` and `psk_location`:
+`psk` and `psk_location` add a pre-shared key to the handshake. The key is
+only used when the configured `pattern` carries a PSK modifier at
+`psk_location` (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`); with a pattern
+that has none, the value is silently ignored rather than rejected. The key must
+decode to exactly 32 bytes (checked when a handshake is set up), and both sides
+must use the same `psk` and `psk_location`:
 
 ```toml
 [server.transport.noise]
