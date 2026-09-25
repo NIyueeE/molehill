@@ -23,7 +23,7 @@ use std::task::Poll;
 
 use crate::mux::{Config, Connection, Mode};
 use tokio::sync::{mpsc, oneshot};
-use tracing::debug;
+use tracing::{debug, info};
 
 /// A multiplexed stream adapted to tokio's IO traits.
 pub type MuxStream = crate::mux::Stream;
@@ -105,6 +105,33 @@ pub(crate) fn mux_config() -> Config {
     config
 }
 
+/// Periodically log the framing counters when `MOLEHILL_MUX_STATS=1`.
+///
+/// A diagnostic facility for attributing cost to the framing path: the
+/// lines carry cumulative frame counts, so a reader that knows the window
+/// (or takes the first and last line of a run) gets frames/s, and beside
+/// the measured CPU that becomes CPU-per-frame. Off by default so normal
+/// operation is silent.
+fn spawn_framing_stats() {
+    if std::env::var_os("MOLEHILL_MUX_STATS").is_none() {
+        return;
+    }
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        // A missed tick is not worth catching up on: the counters are
+        // cumulative, so a late line still reports the true totals.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let (written, read, bytes) = crate::mux::framing_stats();
+            info!(
+                written,
+                read, bytes, "mux-stats: cumulative framing counters"
+            );
+        }
+    });
+}
+
 /// Handle to a client-side tunnel: allows opening data channels as streams.
 #[derive(Clone)]
 pub struct ClientTunnel {
@@ -127,6 +154,7 @@ impl ClientTunnel {
         let (open_tx, mut open_rx) =
             mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
 
+        spawn_framing_stats();
         tokio::spawn(async move {
             let mut conn = Connection::new(io, config, Mode::Client);
             let mut waiting: Option<
@@ -150,9 +178,7 @@ impl ClientTunnel {
                     Inbound(Option<Result<crate::mux::Stream, crate::mux::ConnectionError>>),
                 }
 
-                // See the note on the server driver: the engine's poll
-                // loop must drain without cooperative-budget interruptions.
-                let step = tokio::task::unconstrained(poll_fn(|cx| {
+                let step = poll_fn(|cx| {
                     // 1. Drive the pending SYN announcement first; while it
                     //    stays pending the inbound poll below keeps
                     //    registering wakers, so data keeps flowing under
@@ -187,7 +213,7 @@ impl ClientTunnel {
                         Poll::Ready(v) => Poll::Ready(Step::Inbound(v)),
                         Poll::Pending => Poll::Pending,
                     }
-                }));
+                });
 
                 tokio::select! {
                     _ = shutdown.changed() => break,
@@ -305,17 +331,9 @@ where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     debug!("server tunnel driver started");
+    spawn_framing_stats();
     let mut conn = Connection::new(io, config, Mode::Server);
-    // The engine's poll loop drives tokio channels whose `poll_recv`
-    // consumes the cooperative budget; exhausting it mid-drain forces a
-    // yield (and a scheduler round-trip) before the queue is written. The
-    // futures-based engine had no such budget interaction — its drains ran
-    // to completion — so the driver runs unconstrained to keep the same
-    // behavior. The loop still returns Pending whenever the socket or the
-    // receivers have nothing more, so the task yields normally.
-    while let Some(result) =
-        tokio::task::unconstrained(poll_fn(|cx| conn.poll_next_inbound(cx))).await
-    {
+    while let Some(result) = poll_fn(|cx| conn.poll_next_inbound(cx)).await {
         match result {
             Ok(stream) => {
                 debug!("server tunnel accepted an inbound stream");

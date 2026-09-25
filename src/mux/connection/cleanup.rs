@@ -57,7 +57,6 @@ impl Future for Cleanup {
     }
 }
 
-#[allow(clippy::enum_variant_names)]
 enum State {
     ClosingStreamReceiver,
     DrainingStreamReceiver,

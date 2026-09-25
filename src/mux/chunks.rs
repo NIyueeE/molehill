@@ -80,13 +80,11 @@ impl Chunk {
 
     /// The sum of bytes that the cursor has been `advance`d over.
     pub(crate) fn offset(&self) -> usize {
-        // A Cursor over a Vec<u8> never exceeds usize::MAX.
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "cursor position over an in-memory Vec fits usize"
-        )]
-        let pos = self.cursor.position() as usize;
-        pos
+        // A cursor over a `Vec<u8>` never advances past the vector's
+        // length, so the position always fits in `usize`; an impossible
+        // overshoot reads as "fully consumed", which keeps every
+        // derived slice in range.
+        usize::try_from(self.cursor.position()).unwrap_or(self.cursor.get_ref().len())
     }
 
     /// Move the cursor position by `amount` bytes.
