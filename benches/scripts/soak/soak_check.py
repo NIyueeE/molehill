@@ -3,41 +3,61 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Soak gate: decide whether a change moved what it claimed to move.
+"""Soak gate: decide whether a run is trustworthy, and whether it regressed.
 
-Two verdicts, one rule each — never a single averaged number:
+Two modes, both refusing to reduce a run to a single averaged number:
 
-1. `soak_check.py [current.json [baseline.json]]` — the release gate.
-   Compares the current run against the previous release's run, per tool,
-   per test type, with per-type thresholds. A violation exits non-zero.
+1. `soak_check.py [current.json [baseline.json]]` — the release gate. First
+   the run is checked *against itself*: every test must have the series its
+   coverage claims, every throughput sample must have dialed the tool's
+   exposed port rather than its backend, and every test must meet the
+   absolute SLO. Then, when a baseline exists, each test type is compared to
+   it under per-type thresholds. A violation exits non-zero.
 2. `soak_check.py --screen <screen.json>` — the development A/B verdict:
    per-step medians, the effect size and a CLAIM / directional / no-claim
    decision for the two builds a `--test=screen` run interleaved.
 
-The screen's decision is deliberately conservative: with the per-step
-aggregates the runner records, a CLAIM needs every step to agree in sign
-and to exceed the documented threshold; anything else is reported as
-directional with its effect size, which is what "should I pursue this
-direction?" actually needs.
+The self-check is what makes the first release gate meaningful: with no
+baseline the absolute SLO is the only verdict available, and it can only be
+believed if the run is complete and was measured on the right endpoint.
 """
+
 import json
 import os
 import sys
 from pathlib import Path
 
 # Per-type gate thresholds (percent unless noted). They are method
-# constants — recorded in the results meta, overridable for experiments.
+# constants — the env var of the same name overrides one for an experiment.
 THRESHOLDS = {
-    "capacity_streams_pct": 10.0,   # sustainable-load drop
-    "capacity_rtt_p99_pct": 25.0,   # response-time curve at matched load
-    "rrul_rtt_p99_pct": 25.0,       # per-stage interactive p99
-    "rrul_worst_1s_pct": 30.0,      # per-stage worst second
+    "capacity_streams_pct": 10.0,  # sustainable-load drop
+    "capacity_rtt_p99_pct": 25.0,  # response-time curve at matched load
+    "rrul_rtt_p99_pct": 25.0,  # per-stage interactive p99
+    "rrul_worst_1s_pct": 30.0,  # per-stage worst second
     "cost_cpu_per_gbit_pct": 15.0,  # the fixed operating point
-    "drift_fds_per_min": 1.0,       # soak leak axis (absolute)
-    "drift_rss_mb_per_min": 50.0,   # soak leak axis (absolute)
+    "drift_fds_per_min": 1.0,  # soak leak axis (absolute)
+    "drift_rss_mb_per_min": 50.0,  # soak leak axis (absolute)
 }
 # The screen's claim threshold: same direction on every step AND this much.
 SCREEN_CLAIM_PCT = 15.0
+# A screen needs at least this many steps to carry a claim at all.
+SCREEN_MIN_STEPS = 2
+# `--screen <file>` takes the flag plus one path.
+SCREEN_ARGS = 2
+# The interactive error rate may rise by at most this much (percentage
+# points) before it counts as a regression.
+ERROR_RATE_RISE_PP = 5.0
+# The tool this repository releases. The SLO is *its* contract: the peer
+# tools are measured under the same workload for context, and a peer that
+# misses the SLO is a finding about the peer, not a block on this release.
+SUBJECT = "molehill"
+# Every coverage axis a test claims, and the series that has to carry it.
+COVERAGE_SERIES = {
+    "tcp_bulk": "throughput_bulk_gbps",
+    "tcp_interactive": "rtt_interactive_ms",
+    "tcp_churn": "churn_setup_ms",
+    "udp_session": "rtt_udp_ms",
+}
 
 
 def env_pct(name: str) -> float:
@@ -53,167 +73,420 @@ def pct_change(base, cur) -> float | None:
     return (cur - base) / base * 100.0
 
 
-def gate(cur: dict, base: dict) -> int:
-    cur_tools = {t["tool"]: t for t in cur["tests"] if not t.get("error")}
-    base_tools = {t["tool"]: t for t in base["tests"] if not t.get("error")}
-    violations = 0
-    print(f"current : {cur['meta'].get('date')} "
-          f"({', '.join(cur_tools) or 'no tools'})")
-    print(f"baseline: {base['meta'].get('date')} "
-          f"({', '.join(base_tools) or 'no tools'})")
-    for tool, c in sorted(cur_tools.items()):
-        b = base_tools.get(tool)
-        if b is None:
-            print(f"  NOTE  {tool}: not in the baseline (new tool?)")
+class Report:
+    """Gate output: every line is a verdict, and violations are counted."""
+
+    def __init__(self) -> None:
+        self.violations = 0
+        self.legacy_checks = 0
+
+    def ok(self, fmt: str, *a) -> None:
+        print(f"  ok    {fmt.format(*a)}")
+
+    def fail(self, fmt: str, *a) -> None:
+        print(f"  FAIL  {fmt.format(*a)}")
+        self.violations += 1
+
+    def note(self, fmt: str, *a) -> None:
+        print(f"  NOTE  {fmt.format(*a)}")
+
+    def legacy(self, fmt: str, *a) -> None:
+        """A check this data cannot answer because it predates the field.
+
+        Neither a violation (the run was made before the field existed) nor an
+        `ok`: the gate states exactly what it could not verify, so nobody
+        reads the summary as a clean bill of health.
+        """
+        print(f"  LEGACY {fmt.format(*a)}")
+        self.legacy_checks += 1
+
+    def limit(self, value, base, limit: float, fmt: str, *a) -> None:
+        """A threshold verdict: `value` must not exceed `base` by `limit`%."""
+        if value is None or base is None:
+            self.note(fmt + " (incomplete)", *a)
+            return
+        d = pct_change(base, value)
+        if d <= limit:
+            self.ok(fmt + f" ({d:+.1f}%, limit +{limit:.0f}%)", *a)
+        else:
+            self.fail(fmt + f" ({d:+.1f}%, limit +{limit:.0f}%)", *a)
+
+
+def metric_count(test: dict, metric: str) -> int:
+    return sum(1 for r in test.get("series", []) if r.get("metric") == metric)
+
+
+def check_run(cur: dict, rep: Report) -> None:
+    """The run's self-check: completeness, endpoints, absolute SLO.
+
+    This is the part that makes a baseline-less release gate mean something,
+    and it is the mechanical half of §10's "re-check every consumer after
+    reshaping data" rule: a renamed or missing series, or a throughput sample
+    that dialed the backend, must fail the gate rather than plot as a hole.
+    """
+    slo = cur.get("meta", {}).get("slo") or {}
+    slo_p99 = slo.get("rtt_p99_ms")
+    slo_err = slo.get("error_rate")
+    tests = cur.get("tests", [])
+    if not tests:
+        rep.fail("the results file contains no tests")
+        return
+    for t in tests:
+        name = t.get("tool", "?")
+        if t.get("error"):
+            rep.fail(f"{name}: the test failed ({t['error']})")
             continue
-        cm, bm = c["metrics"], b["metrics"]
-        # --- capacity: the sustainable load and its curve ------------------
-        if "max_sustainable_streams" in cm and "max_sustainable_streams" in bm:
-            d = pct_change(bm["max_sustainable_streams"],
-                           cm["max_sustainable_streams"])
-            lim = env_pct("capacity_streams_pct")
-            ok = d is None or d >= -lim
-            print(f"  {'ok  ' if ok else 'FAIL'}  {tool} capacity: "
-                  f"{bm['max_sustainable_streams']} -> "
-                  f"{cm['max_sustainable_streams']} streams "
-                  f"({d:+.1f}%, limit -{lim:.0f}%)" if d is not None else
-                  f"  ok    {tool} capacity: incomplete")
-            violations += 0 if ok else 1
-            bcurve = {p["streams"]: p for p in bm.get("curve", [])}
-            for p in cm.get("curve", []):
-                bp = bcurve.get(p["streams"])
-                if not bp or bp.get("rtt_p99") is None or p.get("rtt_p99") is None:
-                    continue
-                d = pct_change(bp["rtt_p99"], p["rtt_p99"])
-                lim = env_pct("capacity_rtt_p99_pct")
-                ok = d is None or d <= lim
-                print(f"  {'ok  ' if ok else 'FAIL'}  {tool} capacity "
-                      f"p99 @ {p['streams']} streams: "
-                      f"{bp['rtt_p99']} -> {p['rtt_p99']} ms "
-                      f"({d:+.1f}%, limit +{lim:.0f}%)")
-                violations += 0 if ok else 1
-        # --- rrul / soak: the per-stage interactive distribution ------------
-        for stage_c, stage_b in zip(c.get("stages", []), b.get("stages", [])):
-            if stage_c.get("stage") != stage_b.get("stage"):
+        check_completeness(name, t, rep)
+        check_endpoints(name, t, rep)
+        check_slo(name, t, rep, slo_p99, slo_err)
+
+
+def check_completeness(name: str, t: dict, rep: Report) -> None:
+    """Every coverage axis the test claims must have carried samples."""
+    if not t.get("coverage"):
+        rep.fail(f"{name}: no coverage record")
+        return
+    missing = [
+        axis
+        for axis, metric in COVERAGE_SERIES.items()
+        if t["coverage"].get(axis) and metric_count(t, metric) == 0
+    ]
+    if missing:
+        rep.fail(f"{name}: claimed coverage with no series for {', '.join(missing)}")
+    else:
+        rep.ok(
+            f"{name}: complete ({len(t['series'])} samples, "
+            f"{len(t.get('stages', []))} stage(s))"
+        )
+
+
+def check_endpoints(name: str, t: dict, rep: Report) -> None:
+    """The throughput sample must have dialed the tool, not its backend."""
+    ep = (t.get("endpoints") or {}).get("throughput") or {}
+    exposed, backend = ep.get("exposed"), ep.get("backend")
+    if exposed is None:
+        rep.legacy(
+            f"{name}: no throughput endpoint recorded — the run predates the "
+            "provenance record, so the endpoint invariant cannot be checked "
+            "from it (re-run with the current harness, or record the waiver "
+            "in HANDOFF.md)"
+        )
+    elif exposed == backend:
+        rep.fail(
+            f"{name}: throughput dialed the backend ({backend}), not "
+            "the tool's exposed port"
+        )
+    else:
+        rep.ok(
+            f"{name}: throughput endpoint is the exposed port {exposed} "
+            f"(backend {backend})"
+        )
+
+
+def check_slo(name: str, t: dict, rep: Report, slo_p99, slo_err) -> None:
+    """The absolute SLO, applied where the model defines it to apply.
+
+    The SLO is a *clean-path* contract: the compliant path is the unshaped
+    control stage, and a saturated `rrul`/`soak` stage under a shaped class is
+    expected to sit far above it — that degradation is the measurement, not a
+    violation. So the verdict is per **clean** stage, and what the shaped
+    stages did is reported beside it rather than judged by a line that was
+    never meant to hold there.
+    """
+    clean = [s for s in t.get("stages", []) if s.get("stage") == "clean"]
+    if not clean:
+        rep.note(
+            f"{name}: no clean stage in the schedule — the SLO cannot be "
+            "judged for this test"
+        )
+        return
+    subject = name.startswith(SUBJECT)
+    # The SLO gates the tool this repository releases; a peer that misses it is
+    # a finding about the peer (reported, with its number) and not a block.
+    over = rep.fail if subject else rep.note
+    peer_note = "" if subject else " (reference peer — reported, not gated)"
+    for stage in clean:
+        p99, err = stage.get("rtt_p99"), stage.get("rtt_error_rate")
+        if p99 is None:
+            rep.note(f"{name} clean: no interactive p99 to judge")
+        elif slo_p99 is not None and p99 > slo_p99:
+            over(
+                f"{name} clean: interactive p99 {p99} ms is over the SLO "
+                f"({slo_p99} ms){peer_note}"
+            )
+        else:
+            rep.ok(
+                f"{name} clean: interactive p99 {p99} ms is inside the SLO "
+                f"({slo_p99} ms)"
+            )
+        if err is not None and slo_err is not None and err > slo_err:
+            over(
+                f"{name} clean: interactive error rate {err} is over the SLO "
+                f"({slo_err}){peer_note}"
+            )
+    shaped = [
+        s.get("rtt_p99")
+        for s in t.get("stages", [])
+        if s.get("stage") != "clean" and s.get("rtt_p99") is not None
+    ]
+    if shaped:
+        rep.note(
+            f"{name}: {len(shaped)} shaped stage(s) sit above the SLO by "
+            f"design, p99 up to {max(shaped)} ms — that is the degradation "
+            "curve, not a verdict"
+        )
+
+
+def check_capacity(tool: str, rep: Report, c: dict, b: dict) -> None:
+    cm, bm = c["metrics"], b["metrics"]
+    if "max_sustainable_streams" not in cm or "max_sustainable_streams" not in bm:
+        return
+    lim = env_pct("capacity_streams_pct")
+    cur_s, base_s = cm["max_sustainable_streams"], bm["max_sustainable_streams"]
+    if base_s:
+        d = (cur_s - base_s) / base_s * 100.0
+        (rep.ok if d >= -lim else rep.fail)(
+            f"{tool} capacity: {base_s} -> {cur_s} streams "
+            f"({d:+.1f}%, limit -{lim:.0f}%)"
+        )
+    else:
+        rep.note(f"{tool} capacity: baseline measured no sustainable load")
+    lim = env_pct("capacity_rtt_p99_pct")
+    for point in cm.get("curve", []):
+        bp = {p["streams"]: p for p in bm.get("curve", [])}.get(point["streams"])
+        if not bp or bp.get("rtt_p99") is None or point.get("rtt_p99") is None:
+            continue
+        rep.limit(
+            point["rtt_p99"],
+            bp["rtt_p99"],
+            lim,
+            f"{tool} capacity p99 @ {point['streams']} streams: "
+            f"{bp['rtt_p99']} -> {point['rtt_p99']} ms",
+        )
+
+
+def check_stages(tool: str, rep: Report, c: dict, b: dict) -> None:
+    """Per-stage verdicts: the interactive distribution and the worst second."""
+    p99_lim = env_pct("rrul_rtt_p99_pct")
+    worst_lim = env_pct("rrul_worst_1s_pct")
+    for stage_c in c.get("stages", []):
+        stage_b = next(
+            (s for s in b.get("stages", []) if s.get("stage") == stage_c.get("stage")),
+            None,
+        )
+        if stage_b is None:
+            continue
+        rep.limit(
+            stage_c.get("rtt_p99"),
+            stage_b.get("rtt_p99"),
+            p99_lim,
+            f"{tool} {stage_c['stage']} p99: "
+            f"{stage_b.get('rtt_p99')} -> {stage_c.get('rtt_p99')} ms",
+        )
+        # The worst second is the stability axis: a stage may hold its median
+        # while a single second blows up, which is what a queue does.
+        worst_c = stage_c.get("rtt_worst_1s")
+        worst_b = stage_b.get("rtt_worst_1s")
+        if worst_c is not None and worst_b is not None:
+            rep.limit(
+                worst_c,
+                worst_b,
+                worst_lim,
+                f"{tool} {stage_c['stage']} worst 1s: {worst_b} -> {worst_c} ms",
+            )
+        # a stage that wedges only in the current run is a regression even
+        # when the numbers that did land look fine
+        if stage_c.get("flat_segments") and not stage_b.get("flat_segments"):
+            rep.fail(
+                f"{tool} {stage_c['stage']}: wedge appeared "
+                f"({len(stage_c['flat_segments'])} flat segment(s))"
+            )
+
+
+def check_cost_and_drift(tool: str, rep: Report, c: dict, b: dict) -> None:
+    cm, bm = c["metrics"], b["metrics"]
+    cg, bg = cm.get("cost_cpu_per_gbit"), bm.get("cost_cpu_per_gbit")
+    if cg is not None and bg is not None:
+        rep.limit(
+            cg,
+            bg,
+            env_pct("cost_cpu_per_gbit_pct"),
+            f"{tool} cost: {bg} -> {cg} CPU-s/Gbit",
+        )
+    for metric, lim, unit in (
+        ("server_fds_slope_per_min", env_pct("drift_fds_per_min"), "fds/min"),
+        (
+            "server_rss_kb_slope_per_min",
+            env_pct("drift_rss_mb_per_min") * 1024,
+            "KiB/min",
+        ),
+    ):
+        v = cm.get(metric)
+        if v is None:
+            continue
+        label = metric.replace("_slope_per_min", "")
+        (rep.ok if abs(v) <= lim else rep.fail)(
+            f"{tool} drift {label}: {v:+} {unit} (limit ±{lim:.0f})"
+        )
+    d = pct_change(
+        bm.get("interactive_error_rate") or 0, cm.get("interactive_error_rate") or 0
+    )
+    if d is not None and d > ERROR_RATE_RISE_PP:
+        rep.fail(
+            f"{tool} interactive error rate: "
+            f"{bm.get('interactive_error_rate')} -> "
+            f"{cm.get('interactive_error_rate')} ({d:+.1f}pp)"
+        )
+
+
+def gate(cur: dict, base: dict | None) -> int:
+    """The release verdict: self-check, then per-type comparison."""
+    rep = Report()
+    print(
+        f"current : {cur['meta'].get('date')} "
+        f"revision {cur['meta'].get('revision', 'unrecorded')}"
+    )
+    if not cur["meta"].get("revision"):
+        rep.legacy(
+            "the results meta has no revision — the run cannot be tied to a "
+            "checkout (AGENTS.md §10, 'prove provenance')"
+        )
+    print("\n# Run self-check (completeness, endpoints, absolute SLO)")
+    check_run(cur, rep)
+    if base is None:
+        print(
+            "\nno baseline: the first soak run is gated by the absolute SLO "
+            "above (see docs/release.md, 'Benchmarks')"
+        )
+    else:
+        print(
+            f"\nbaseline: {base['meta'].get('date')} "
+            f"revision {base['meta'].get('revision', 'unrecorded')}"
+        )
+        cur_tools = {t["tool"]: t for t in cur["tests"] if not t.get("error")}
+        base_tools = {t["tool"]: t for t in base["tests"] if not t.get("error")}
+        print("\n# Comparison against the baseline")
+        for tool, c in sorted(cur_tools.items()):
+            b = base_tools.get(tool)
+            if b is None:
+                rep.note(f"{tool}: not in the baseline (new tool?)")
                 continue
-            for key, lim_name in (("rtt_p99", "rrul_rtt_p99_pct"),):
-                d = pct_change(stage_b.get(key), stage_c.get(key))
-                lim = env_pct(lim_name)
-                ok = d is None or d <= lim
-                print(f"  {'ok  ' if ok else 'FAIL'}  {tool} {stage_c['stage']} "
-                      f"{key}: {stage_b.get(key)} -> {stage_c.get(key)} ms "
-                      f"({d:+.1f}%, limit +{lim:.0f}%)" if d is not None else
-                      f"  ok    {tool} {stage_c['stage']} {key}: incomplete")
-                violations += 0 if ok else 1
-            # a stage that wedges only in the current run is a regression
-            # even when the numbers that did land look fine
-            if stage_c.get("flat_segments") and not stage_b.get("flat_segments"):
-                print(f"  FAIL  {tool} {stage_c['stage']}: wedge appeared "
-                      f"({len(stage_c['flat_segments'])} flat segment(s))")
-                violations += 1
-        # --- interactive error rate -----------------------------------------
-        d = pct_change(bm.get("interactive_error_rate") or 0,
-                       cm.get("interactive_error_rate") or 0)
-        if d is not None and d > 5.0:
-            print(f"  FAIL  {tool} interactive error rate: "
-                  f"{bm.get('interactive_error_rate')} -> "
-                  f"{cm.get('interactive_error_rate')} ({d:+.1f}pp)")
-            violations += 1
-        # --- cost ------------------------------------------------------------
-        cg = cm.get("cost_cpu_per_gbit")
-        bg = bm.get("cost_cpu_per_gbit")
-        if cg is not None and bg is not None:
-            d = pct_change(bg, cg)
-            lim = env_pct("cost_cpu_per_gbit_pct")
-            ok = d is None or d <= lim
-            print(f"  {'ok  ' if ok else 'FAIL'}  {tool} cost: "
-                  f"{bg} -> {cg} CPU-s/Gbit ({d:+.1f}%, limit +{lim:.0f}%)")
-            violations += 0 if ok else 1
-        # --- drift -----------------------------------------------------------
-        for metric, lim, unit in (
-                ("server_fds_slope_per_min", env_pct("drift_fds_per_min"),
-                 "fds/min"),
-                ("server_rss_kb_slope_per_min",
-                 env_pct("drift_rss_mb_per_min") * 1024, "KiB/min")):
-            v = cm.get(metric)
-            if v is None:
-                continue
-            ok = abs(v) <= lim
-            print(f"  {'ok  ' if ok else 'FAIL'}  {tool} drift "
-                  f"{metric.replace('_slope_per_min', '')}: "
-                  f"{v:+} {unit} (limit ±{lim:.0f})")
-            violations += 0 if ok else 1
+            check_capacity(tool, rep, c, b)
+            check_stages(tool, rep, c, b)
+            check_cost_and_drift(tool, rep, c, b)
     print()
-    if violations:
-        print(f"FAIL: {violations} violation(s) — fix, or waive explicitly "
-              "(HANDOFF.md)")
+    if rep.legacy_checks:
+        print(
+            f"{rep.legacy_checks} check(s) could not be answered by this data "
+            "(LEGACY above): the run predates the provenance record"
+        )
+    if rep.violations:
+        print(
+            f"FAIL: {rep.violations} violation(s) — fix, or waive "
+            "explicitly (HANDOFF.md)"
+        )
         return 1
-    print("OK: no gate violation against the baseline")
+    print("OK: no gate violation")
     return 0
 
 
 def screen(data: dict) -> int:
-    """The A/B verdict for a `--test=screen` run."""
+    """The A/B verdict for a `--test=screen` run.
+
+    Read in one direction only: every delta is `head - base` where A is the
+    first build on the command line. A step that favours B is reported as
+    such, and a run where every step favours B is a claim for B — the
+    sequential decision the runner's interleave exists to support.
+    """
     t = next((t for t in data["tests"] if t["test"] == "screen"), None)
     if t is None:
         sys.exit("no screen test in that results file")
     rounds = t["metrics"].get("rounds") or []
     builds = t["metrics"].get("builds") or {}
-    print(f"screen: A={builds.get('A_version')} B={builds.get('B_version')}")
+    print(
+        f"screen: A={builds.get('A_version')} ({builds.get('A')})\n"
+        f"        B={builds.get('B_version')} ({builds.get('B')})"
+    )
     if not rounds:
         sys.exit("no rounds recorded")
     key = "gbps" if rounds[0]["pair"][0].get("gbps") is not None else "rtt_p99"
-    claims = 0
+    # For throughput a higher A is better; for a response time a lower A is.
+    better = 1.0 if key == "gbps" else -1.0
     print(f"\n{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading")
+    steps = 0
+    a_ahead = b_ahead = 0
     for r in rounds:
-        a = next(p for p in r["pair"] if p["build"] == "A")[key]
-        b = next(p for p in r["pair"] if p["build"] == "B")[key]
+        a = next((p for p in r["pair"] if p["build"] == "A"), {}).get(key)
+        b = next((p for p in r["pair"] if p["build"] == "B"), {}).get(key)
         if a is None or b is None or b == 0:
+            print(f"{r['streams']:>8}{'—':>10}{'—':>10}{'—':>9}   no data")
             continue
+        steps += 1
         d = (a - b) / b * 100.0
-        sign = "A" if d > 0 else "B"
         strong = abs(d) >= SCREEN_CLAIM_PCT
-        claims += 1 if (strong and d > 0) else 0
-        print(f"{r['streams']:>8}{a:>10.3f}{b:>10.3f}{d:>+8.1f}%   "
-              f"{'claim ' + sign if strong else 'directional ' + sign}")
+        a_wins = d * better > 0
+        if strong and a_wins:
+            a_ahead += 1
+        elif strong:
+            b_ahead += 1
+        winner = "A" if a_wins else "B"
+        print(
+            f"{r['streams']:>8}{a:>10.3f}{b:>10.3f}{d:>+8.1f}%   "
+            f"{'claim ' + winner if strong else 'directional ' + winner}"
+        )
     print()
-    steps = len(rounds)
-    if claims == steps and steps >= 2:
-        print(f"CLAIM: A ahead on every step by >= {SCREEN_CLAIM_PCT:.0f}% "
-              f"({steps} steps) — pursue the direction")
+    if steps < SCREEN_MIN_STEPS:
+        print(
+            f"NO CLAIM: {steps} usable step(s) — a verdict needs "
+            f"{SCREEN_MIN_STEPS} at least"
+        )
         return 0
-    print(f"DIRECTIONAL: A ahead on {claims}/{steps} steps; not a claim at "
-          f"the {SCREEN_CLAIM_PCT:.0f}% threshold — the effect is inside "
-          "the noise or the host is noisy today")
+    for label, wins in (("A", a_ahead), ("B", b_ahead)):
+        if wins == steps:
+            other = "B" if label == "A" else "A"
+            print(
+                f"CLAIM: {label} ahead on every step by >= "
+                f"{SCREEN_CLAIM_PCT:.0f}% ({steps} steps) — pursue the "
+                f"direction (the metric favours {label} over {other})"
+            )
+            return 0
+    print(
+        f"DIRECTIONAL: A ahead on {a_ahead}/{steps} steps and B on "
+        f"{b_ahead}/{steps}; not a claim at the "
+        f"{SCREEN_CLAIM_PCT:.0f}% threshold — the effect is inside the "
+        "noise or the host is noisy today"
+    )
     return 0
 
 
-def main() -> None:
-    args = sys.argv[1:]
-    if args and args[0] == "--screen":
-        if len(args) < 2:
-            sys.exit("usage: soak_check.py --screen <results.json>")
-        data = json.loads(Path(args[1]).read_text())
-        sys.exit(screen(data))
+def resolve_paths(args: list) -> tuple:
+    """The (current, baseline) files to compare, from argv or by convention."""
     here = Path(__file__).parent
     found = sorted(here.glob("results-soak-*.json"), key=lambda p: p.name)
     cur = Path(args[0]) if args else (found[-1] if found else None)
     if cur is None:
         sys.exit("no results-soak-*.json found")
-    base = Path(args[1]) if len(args) > 1 else None
-    if base is None:
-        older = [p for p in here.glob("results-soak-*.json")
-                 if p.name < cur.name]
-        if not older:
-            print(f"current : {cur.name}")
-            print("no baseline: the first soak run is gated by the absolute "
-                  "SLO only (see docs/release.md)")
-            sys.exit(0)
-        base = older[-1]
-    print(f"current : {cur.name}\nbaseline: {base.name}")
-    data = json.loads(cur.read_text())
-    base_data = json.loads(base.read_text())
-    sys.exit(gate(data, base_data))
+    if len(args) > 1:
+        return cur, Path(args[1])
+    older = [p for p in found if p.name < cur.name]
+    return cur, (older[-1] if older else None)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if args and args[0] == "--screen":
+        if len(args) < SCREEN_ARGS:
+            sys.exit("usage: soak_check.py --screen <results.json>")
+        sys.exit(screen(json.loads(Path(args[1]).read_text())))
+    cur, base = resolve_paths(args)
+    print(f"current : {cur.name}")
+    if base is not None:
+        print(f"baseline: {base.name}")
+    sys.exit(
+        gate(
+            json.loads(cur.read_text()), json.loads(base.read_text()) if base else None
+        )
+    )
 
 
 if __name__ == "__main__":
