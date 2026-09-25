@@ -151,6 +151,38 @@ safe wrapper exists. Recorded here as the remaining half.
   first two deliverables.
 
 
+## Release blocker: the KCP send path is Linux-only (found by the first CI run)
+
+The branch's first CI run (PR #2) failed four platform builds. Three distinct
+causes, all invisible to local glibc testing:
+
+1. **`nix` was an unconditional dependency** — every non-Unix target failed to
+   compile it. Fixed: declared for `cfg(target_os = "linux")`, probe gated.
+2. **`msg_iovlen` is `size_t` on glibc, `c_int` on musl** — the musl build
+   failed on the assignment, and the two spellings cannot share one expression
+   (a `try_into` is a no-op and a lint error on the wide one). Fixed: the
+   conversion is `cfg`-split by `target_env`.
+3. **The KCP send batching is Linux-only without a fallback** — `Span`,
+   `SendBatch` and `DgramBatch` live behind `#![cfg(target_os = "linux")]`
+   while `DatagramOut` and the pump's send arm use them unconditionally, so
+   macOS and Windows do not compile. **This is pre-existing**: it came in with
+   the send-batching work (`ec9b322`), which was measured on the bench host and
+   never built elsewhere. The *receive* path already has a per-datagram
+   fallback for other platforms (see the `#[cfg(not(target_os = "linux"))]`
+   arm in the ingress task); the send path never got one.
+
+The fix is a bounded port: give the non-Linux build a per-datagram send path
+(the behaviour the code had before batching — one channel message per datagram,
+`send_to` each), keeping `Span`/`SendBatch` Linux-only. It cannot be verified
+locally beyond `cargo check` (macOS and Windows cross-builds stop in `ring`'s
+build script for want of a cross C toolchain), so the honest verification is
+(a) a temporary inverted `cfg` to type-check the fallback on Linux and (b) the
+macOS/Windows CI jobs on the PR.
+
+**No tag until those jobs are green**: `release.yml` builds every platform, and
+shipping a release whose macOS and Windows artifacts cannot compile is not a
+release.
+
 ## Where things stand
 
 **The data-path rework is complete on its own terms; the release is prepared
