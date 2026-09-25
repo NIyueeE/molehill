@@ -28,6 +28,7 @@ Parallelism: each tool in a batch owns its port band and its own shaped
 path (one HTB class + independent netem on `lo`), so tools never share a
 shaper. The pair under comparison always runs in the same batch.
 """
+
 # E402 is waived file-wide: the sys.path insert below is the bench-lib
 # import pattern and must precede the third-party imports.
 import sys
@@ -37,9 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import argparse
 import contextlib
-import itertools
 import json
-import math
 import os
 import signal
 import socket
@@ -47,19 +46,20 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import asdict, dataclass
 
 import lib
 
 WORKLOAD_VERSION = 1
 
-# The SLO is a method constant (versioned into the meta): the interactive
-# stream's p99 must stay under it, with zero errors, for a load level to
-# count as sustainable.
-SLO_RTT_P99_MS = 50.0
 
-# An interactive stream silent for longer than this is a wedge: recorded
-# as a flat segment with its duration, never a bare `None`.
-WEDGE_SILENCE_S = 5.0
+@dataclass(frozen=True)
+class Stage:
+    """One step of the schedule: the path class and how long it holds."""
+
+    path: str
+    secs: float
+
 
 # Path classes: the stage schedule's vocabulary. The args are applied to
 # each tool's own netem class in place; `clean` is the unshaped control.
@@ -76,82 +76,27 @@ PATH_CLASSES = {
 }
 
 DEFAULT_TIMELINE = [
-    ("clean", 150), ("rtt100", 120), ("loss1", 120), ("loss5", 120),
-    ("rate100", 120), ("rate20", 120), ("jitter", 120), ("clean", 150),
+    Stage("clean", 150),
+    Stage("rtt100", 120),
+    Stage("loss1", 120),
+    Stage("loss5", 120),
+    Stage("rate100", 120),
+    Stage("rate20", 120),
+    Stage("jitter", 120),
+    Stage("clean", 150),
 ]
-SOAK_TIMELINE = [("clean", 180), ("loss1", 180), ("rtt100", 180),
-                 ("loss5", 180), ("clean", 180)]
+SOAK_TIMELINE = [
+    Stage("clean", 180),
+    Stage("loss1", 180),
+    Stage("rtt100", 180),
+    Stage("loss5", 180),
+    Stage("clean", 180),
+]
 
 
-# --- series statistics ------------------------------------------------------
-def pct(values: list, q: float):
-    if not values:
-        return None
-    s = sorted(values)
-    return s[min(len(s) - 1, max(0, math.ceil(q * len(s)) - 1))]
-
-
-def series_stats(rows: list, metric: str) -> dict:
-    vals = [r["v"] for r in rows
-            if r.get("metric") == metric and isinstance(r.get("v"), (int, float))]
-    if not vals:
-        return {"n": 0}
-    return {"n": len(vals), "mean": round(sum(vals) / len(vals), 3),
-            "p50": round(pct(vals, 0.5), 3), "p99": round(pct(vals, 0.99), 3),
-            "max": round(max(vals), 3), "min": round(min(vals), 3)}
-
-
-def slope_per_min(rows: list, metric: str):
-    """Least-squares slope in units/minute: the drift axis (handles, RSS,
-    CPU). A leak is a slope, not a level."""
-    pts = [(r["t"], r["v"]) for r in rows
-           if r.get("metric") == metric and isinstance(r.get("v"), (int, float))]
-    if len(pts) < 10:
-        return None
-    t0, t1 = pts[0][0], pts[-1][0]
-    if t1 - t0 < 60:
-        return None
-    n = len(pts)
-    mx = sum(p[0] for p in pts) / n
-    my = sum(p[1] for p in pts) / n
-    num = sum((p[0] - mx) * (p[1] - my) for p in pts)
-    den = sum((p[0] - mx) ** 2 for p in pts)
-    if not den:
-        return None
-    return round(num / den * 60.0, 4)
-
-
-def worst_window(rows: list, metric: str, window_s: float = 1.0):
-    """The worst `window_s` slice's mean: the stability axis. A stage whose
-    worst second sits far above its mean is not a stable configuration."""
-    pts = [(r["t"], r["v"]) for r in rows
-           if r.get("metric") == metric and isinstance(r.get("v"), (int, float))]
-    if len(pts) < 2:
-        return None
-    best = None
-    for i, (t0, _) in enumerate(pts):
-        acc, n = 0.0, 0
-        for t1, v in pts[i:]:
-            if t1 - t0 > window_s:
-                break
-            acc += v
-            n += 1
-        if n:
-            mean = acc / n
-            if best is None or mean > best["mean"]:
-                best = {"mean": round(mean, 3), "n": n}
-    return best
-
-
-def flat_segments(rows: list, metric: str = "rtt_interactive_ms",
-                  gap_s: float = WEDGE_SILENCE_S) -> list:
-    """Gaps in the interactive series beyond the wedge threshold: the
-    shape of a silent stage, recorded instead of a null."""
-    pts = [(r["t"], r["v"]) for r in rows if r.get("metric") == metric]
-    return [{"start": round(t0, 3), "end": round(t1, 3),
-             "duration_s": round(t1 - t0, 1)}
-            for (t0, _), (t1, _) in itertools.pairwise(pts)
-            if t1 - t0 > gap_s]
+def log(*a) -> None:
+    """Print a run-progress line immediately (a run is watched live)."""
+    print(*a, flush=True)
 
 
 # --- per-tool shaping -------------------------------------------------------
@@ -179,8 +124,7 @@ class Shaper:
         self.log = log
 
     def _tc(self, *args) -> None:
-        r = subprocess.run(["tc", *args], capture_output=True, text=True,
-                           check=False)
+        r = subprocess.run(["tc", *args], capture_output=True, text=True, check=False)
         if r.returncode != 0:
             raise RuntimeError(f"tc {' '.join(args)}: {r.stderr.strip()[:400]}")
 
@@ -190,9 +134,18 @@ class Shaper:
         # the control plane kills the tool's heartbeat (measured: 40 s
         # timeout on a 100 mbit cell) and the run becomes a wedge study
         # instead of a capacity study.
-        return [band[k] for k in ("iperf_exposed", "echo_exposed",
-                                  "udp_exposed", "kcp_bind", "iperf_backend",
-                                  "echo_backend", "udp_backend")]
+        return [
+            band[k]
+            for k in (
+                "iperf_exposed",
+                "echo_exposed",
+                "udp_exposed",
+                "kcp_bind",
+                "iperf_backend",
+                "echo_backend",
+                "udp_backend",
+            )
+        ]
 
     def _prio(self, cid: str) -> str:
         return str(10 + int(cid.split(":")[1]))
@@ -208,14 +161,29 @@ class Shaper:
         """
         prio = self._prio(cid)
         with contextlib.suppress(Exception):
-            self._tc("filter", "del", "dev", "lo", "parent", "1:", "prio",
-                     prio)
+            self._tc("filter", "del", "dev", "lo", "parent", "1:", "prio", prio)
         for port in self._ports(band):
             for key in ("dport", "sport"):
-                self._tc("filter", "add", "dev", "lo", "parent", "1:",
-                         "prio", prio, "protocol", "ip", "u32",
-                         "match", "ip", key, str(port), "0xffff",
-                         "flowid", flowid)
+                self._tc(
+                    "filter",
+                    "add",
+                    "dev",
+                    "lo",
+                    "parent",
+                    "1:",
+                    "prio",
+                    prio,
+                    "protocol",
+                    "ip",
+                    "u32",
+                    "match",
+                    "ip",
+                    key,
+                    str(port),
+                    "0xffff",
+                    "flowid",
+                    flowid,
+                )
 
     def build(self) -> None:
         # delete any existing root first: `qdisc replace` cannot CHANGE a
@@ -224,18 +192,41 @@ class Shaper:
         # earlier experiment would abort the whole run.
         with contextlib.suppress(Exception):
             self._tc("qdisc", "delete", "dev", "lo", "root")
-        self._tc("qdisc", "add", "dev", "lo", "root", "handle", "1:",
-                 "htb", "default", "999")
+        self._tc(
+            "qdisc", "add", "dev", "lo", "root", "handle", "1:", "htb", "default", "999"
+        )
         for cid, band in self.classes:
             minor = cid.split(":")[1]
-            self._tc("class", "replace", "dev", "lo", "parent", "1:",
-                     "classid", cid, "htb", "rate", "10gbit")
-            self._tc("qdisc", "replace", "dev", "lo", "parent", cid,
-                     "handle", f"{minor}0:", "netem")
+            self._tc(
+                "class",
+                "replace",
+                "dev",
+                "lo",
+                "parent",
+                "1:",
+                "classid",
+                cid,
+                "htb",
+                "rate",
+                "10gbit",
+            )
+            self._tc(
+                "qdisc",
+                "replace",
+                "dev",
+                "lo",
+                "parent",
+                cid,
+                "handle",
+                f"{minor}0:",
+                "netem",
+            )
             # start unclassified: a clean stage creates no HTB path
             self._filters(cid, band, self.DEFAULT)
-        self.log(f"    shaper: {len(self.classes)} tool class(es) on lo "
-                 f"(clean stages stay in the default class)")
+        self.log(
+            f"    shaper: {len(self.classes)} tool class(es) on lo "
+            f"(clean stages stay in the default class)"
+        )
 
     def apply(self, cid: str, stage: str) -> None:
         band = next(b for c, b in self.classes if c == cid)
@@ -246,8 +237,18 @@ class Shaper:
             self._filters(cid, band, self.DEFAULT)
             self.log(f"    {cid} path={stage} (unshaped, default class)")
             return
-        self._tc("qdisc", "replace", "dev", "lo", "parent", cid,
-                 "handle", f"{minor}0:", "netem", *args)
+        self._tc(
+            "qdisc",
+            "replace",
+            "dev",
+            "lo",
+            "parent",
+            cid,
+            "handle",
+            f"{minor}0:",
+            "netem",
+            *args,
+        )
         self._filters(cid, band, cid)
         self.log(f"    {cid} path={stage} ({' '.join(args)})")
 
@@ -268,23 +269,27 @@ class Tool:
         self.work = work
         self.label = f"{name} ({variant})" if variant else name
         self.procs = lib.ArmProcs(work, f"{name} {variant}".strip())
-        self.coverage = {"tcp_bulk": True, "tcp_interactive": True,
-                         "tcp_churn": True, "udp_session": True}
+        self.coverage = {
+            "tcp_bulk": True,
+            "tcp_interactive": True,
+            "tcp_churn": True,
+            "udp_session": True,
+        }
 
     def start(self, binary: str = "") -> None:
         k, p = self.knobs, self.band
-        setup = {"molehill": lambda: lib.setup_molehill(
-                      self.variant, k, p, self.procs, self.work, binary),
-                 "frp": lambda: lib.setup_frp(k, p, self.procs, self.work),
-                 "rathole": lambda: lib.setup_rathole(k, p, self.procs,
-                                                      self.work),
-                 "nps": lambda: lib.setup_nps(k, p, self.procs, self.work),
-                 }[self.name]
+        setup = {
+            "molehill": lambda: lib.setup_molehill(
+                self.variant, k, p, self.procs, self.work, binary
+            ),
+            "frp": lambda: lib.setup_frp(k, p, self.procs, self.work),
+            "rathole": lambda: lib.setup_rathole(k, p, self.procs, self.work),
+            "nps": lambda: lib.setup_nps(k, p, self.procs, self.work),
+        }[self.name]
         setup()
         for port in (p["iperf_exposed"], p["echo_exposed"]):
             if not lib.wait_port(port, 30):
-                raise TimeoutError(
-                    f"{self.label}: exposed port {port} not ready")
+                raise TimeoutError(f"{self.label}: exposed port {port} not ready")
 
     def restart(self, binary: str = "") -> None:
         """Restart the tool's processes with another build: the screen's
@@ -310,8 +315,10 @@ class Tool:
 
     def version(self, binary: str = "") -> str:
         if self.name == "molehill":
-            k = lib.Knobs(molehill_bin=binary or self.knobs.molehill_bin,
-                          peer_dir=self.knobs.peer_dir)
+            k = lib.Knobs(
+                molehill_bin=binary or self.knobs.molehill_bin,
+                peer_dir=self.knobs.peer_dir,
+            )
             return lib.tool_version(k)
         return lib.peer_version(self.name, self.knobs)
 
@@ -397,6 +404,9 @@ elif mode == "udp":
     cli.settimeout(max(0.5, interval * 4))
     while True:
         t0 = time.perf_counter()
+        # One attempt line per ping: the loss rate needs its denominator
+        # (the outcome line alone cannot tell loss from a slow ping).
+        emit("udp_attempt", 1)
         try:
             cli.sendto(payload, ("127.0.0.1", port))
             data, _ = cli.recvfrom(2048)
@@ -445,46 +455,53 @@ class Pingers:
     lines; the parent reads them into the shared series.
     """
 
-    def __init__(self, band: dict, knobs, out: list, work, log=print):
-        self.band, self.knobs, self.out, self.work, self.log = (
-            band, knobs, out, work, log)
+    def __init__(self, band: dict, knobs: lib.Knobs, out: list, work: Path):
+        self.band, self.knobs, self.out, self.work = band, knobs, out, work
         self.procs: list = []
         self.readers: list = []
         self.stop = threading.Event()
-        self.errors = 0
-        self.attempts = 0
-        self.churn_errors = 0
 
     def log_path(self, mode: str) -> str:
         return str(Path(self.work) / f"probe-{mode}-{self.band['echo_exposed']}.log")
 
-    def _spawn(self, mode: str, port: int, interval: float,
-               backend_port: int = 0, rate: float = 0.0) -> None:
+    def _spawn(
+        self,
+        mode: str,
+        port: int,
+        interval: float,
+        backend_port: int = 0,
+        rate: float = 0.0,
+    ) -> None:
         log_path = self.log_path(mode)
         with open(log_path, "w") as errlog:
             proc = subprocess.Popen(
-                [sys.executable, "-c", PROBE_SRC, mode, str(port),
-                 str(interval), str(backend_port), str(rate)],
-                stdout=subprocess.PIPE, stderr=errlog, text=True, bufsize=1)
+                [
+                    sys.executable,
+                    "-c",
+                    PROBE_SRC,
+                    mode,
+                    str(port),
+                    str(interval),
+                    str(backend_port),
+                    str(rate),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=errlog,
+                text=True,
+                bufsize=1,
+            )
         self.procs.append(proc)
 
         def reader() -> None:
             for line in proc.stdout:
                 parts = line.strip().split("\t")
-                if len(parts) != 3:
+                if len(parts) != lib.PROBE_FIELDS:
                     continue
                 try:
-                    v = float(parts[2])
+                    t, v = float(parts[0]), float(parts[2])
                 except ValueError:
                     continue
-                if parts[1] == "rtt_interactive_error":
-                    self.errors += 1
-                elif parts[1] == "churn_error":
-                    self.churn_errors += 1
-                else:
-                    self.attempts += 1
-                self.out.append({"t": float(parts[0]), "metric": parts[1],
-                                 "v": v})
+                self.out.append({"t": t, "metric": parts[1], "v": v})
 
         th = threading.Thread(target=reader, daemon=True)
         th.start()
@@ -497,16 +514,25 @@ class Pingers:
         (a fresh TCP connection per ping) and of the UDP session, with the
         tool's tunnel in between and the harness out of the measured path.
         """
-        self._spawn("interactive", self.band["echo_exposed"],
-                    self.knobs.ping_interval_ms / 1000.0,
-                    backend_port=self.band["echo_backend"])
-        self._spawn("udp", self.band["udp_exposed"],
-                    self.knobs.udp_interval_ms / 1000.0,
-                    backend_port=self.band["udp_backend"])
-        self._spawn("churn", self.band["echo_exposed"],
-                    1.0 / max(1, self.knobs.churn_connects_s),
-                    backend_port=self.band["echo_backend"],
-                    rate=float(self.knobs.churn_connects_s))
+        self._spawn(
+            "interactive",
+            self.band["echo_exposed"],
+            self.knobs.ping_interval_ms / 1000.0,
+            backend_port=self.band["echo_backend"],
+        )
+        self._spawn(
+            "udp",
+            self.band["udp_exposed"],
+            self.knobs.udp_interval_ms / 1000.0,
+            backend_port=self.band["udp_backend"],
+        )
+        self._spawn(
+            "churn",
+            self.band["echo_exposed"],
+            1.0 / max(1, self.knobs.churn_connects_s),
+            backend_port=self.band["echo_backend"],
+            rate=float(self.knobs.churn_connects_s),
+        )
 
     def stop_and_join(self) -> None:
         self.stop.set()
@@ -538,17 +564,16 @@ class Samplers:
                 v = fn(pid)
                 if v is None:
                     continue
-                self.out.append({"t": round(now, 3),
-                                 "metric": f"{label}_{fn.__name__}",
-                                 "v": v})
+                self.out.append(
+                    {"t": round(now, 3), "metric": f"{label}_{fn.__name__}", "v": v}
+                )
             self.stop.wait(0.5)
 
     @staticmethod
     def rss_kb(pid: int):
         try:
             with open(f"/proc/{pid}/statm") as fh:
-                return int(fh.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE")
-                                                    // 1024)
+                return int(fh.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
         except (OSError, ValueError, IndexError):
             return None
 
@@ -578,16 +603,15 @@ class Samplers:
     def start(self) -> None:
         for fn in (self.rss_kb, self.fds, self.thread_count):
             self.threads.append(
-                threading.Thread(target=self._sampler, args=(fn,), daemon=True))
+                threading.Thread(target=self._sampler, args=(fn,), daemon=True)
+            )
         # CPU as a delta of ticks over the wall interval
-        self.threads.append(threading.Thread(target=self._cpu_loop,
-                                             daemon=True))
+        self.threads.append(threading.Thread(target=self._cpu_loop, daemon=True))
         for t in self.threads:
             t.start()
 
     def _cpu_loop(self) -> None:
-        prev = {p: (self.cpu_ticks(p), time.monotonic())
-                for p in self.pids_of() if p}
+        prev = {p: (self.cpu_ticks(p), time.monotonic()) for p in self.pids_of() if p}
         while not self.stop.is_set():
             self.stop.wait(0.5)
             now = time.monotonic()
@@ -600,9 +624,13 @@ class Samplers:
                 p0, t0 = prev.get(pid, (cur, now))
                 wall = now - t0
                 if wall > 0:
-                    self.out.append({"t": round(time.time(), 3),
-                                     "metric": f"{label}_cpu_pct",
-                                     "v": round((cur - p0) / wall / 100.0, 1)})
+                    self.out.append(
+                        {
+                            "t": round(time.time(), 3),
+                            "metric": f"{label}_cpu_pct",
+                            "v": round((cur - p0) / wall / 100.0, 1),
+                        }
+                    )
                 prev[pid] = (cur, now)
 
     def stop_and_join(self) -> None:
@@ -612,8 +640,51 @@ class Samplers:
 
 
 # --- test types -------------------------------------------------------------
-def stage_spine(tool: Tool, streams: int, secs: float, entry: dict,
-                backends, log) -> dict:
+@dataclass
+class RunContext:
+    """What every test type needs, in one value.
+
+    The runners used to take eight positional arguments, most of them unused
+    by any given test type; a runner that silently ignores a parameter is how
+    the SLO knob and the load fractions drifted out of the measured path.
+
+    `backends` and `load` are filled in per test — the backends once they are
+    up, the load when the test type picks its operating point — so the stage
+    runners take `(tool, ctx, entry)` and nothing else.
+    """
+
+    args: argparse.Namespace
+    knobs: lib.Knobs
+    timeline: list
+    shaper: "Shaper"
+    backends: lib.Backends | None = None
+    load: int = 0
+
+    def with_backends(self, backends: lib.Backends) -> "RunContext":
+        self.backends = backends
+        return self
+
+    @property
+    def ceiling(self) -> int:
+        """The configured maximum load, in bulk streams."""
+        return self.args.streams_max or self.knobs.streams_max
+
+    def load_for(self, test: str) -> int:
+        """The fixed operating point of a staged test, from the knobs.
+
+        Neither `soak` nor `cost` measures capacity first, so the fraction is
+        of the *configured* ceiling and the results meta says so; naming it
+        "fraction of measured capacity" was a claim the runner never checked.
+        """
+        fraction = (
+            self.knobs.cost_operating_point
+            if test == "cost"
+            else self.knobs.soak_load_fraction
+        )
+        return max(1, round(self.ceiling * fraction))
+
+
+def stage_spine(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> dict:
     """Run one stage's bulk load through the tool and record its intervals.
 
     The bulk is per stage ON PURPOSE: a spine that dies (a wedged tunnel, a
@@ -629,18 +700,32 @@ def stage_spine(tool: Tool, streams: int, secs: float, entry: dict,
     next dial ("unable to receive cookie"/exit 1). One restart-and-retry
     per stage keeps one bad sample from becoming a dead axis.
     """
-    cmd = ["iperf3", "-c", "127.0.0.1", "-p", str(tool.band["iperf_exposed"]),
-           "-t", str(int(secs)), "-O", "2", "-P", str(streams), "-i", "1",
-           "--json-stream"]
-    t_end = time.time() + secs
+    target = lib.ThroughputTarget.from_band(tool.band)
+    cmd = [
+        "iperf3",
+        "-c",
+        "127.0.0.1",
+        "-p",
+        str(target.exposed),
+        "-t",
+        str(int(stage.secs)),
+        "-O",
+        "2",
+        "-P",
+        str(ctx.load),
+        "-i",
+        "1",
+        "--json-stream",
+    ]
+    t_end = time.time() + stage.secs
     outcome = {}
     for attempt in (0, 1):
-        outcome = _spine_once(cmd, secs, entry, t_end)
+        outcome = _spine_once(cmd, entry, t_end)
         if outcome["intervals"]:
             return outcome
         if attempt == 0:
             with contextlib.suppress(Exception):
-                backends.restart_iperf()
+                ctx.backends.restart_iperf()
     # the stage's full duration elapses regardless: a dead spine must not
     # cut the probes' and samplers' window short
     while time.time() < t_end:
@@ -648,10 +733,9 @@ def stage_spine(tool: Tool, streams: int, secs: float, entry: dict,
     return outcome
 
 
-def _spine_once(cmd: list, secs: float, entry: dict, t_end: float) -> dict:
+def _spine_once(cmd: list, entry: dict, t_end: float) -> dict:
     """One iperf3 client attempt for a stage's bulk load."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True,
-                            bufsize=1)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     intervals = 0
     try:
         while time.time() < t_end and proc.poll() is None:
@@ -666,12 +750,29 @@ def _spine_once(cmd: list, secs: float, entry: dict, t_end: float) -> dict:
                 if s and not s.get("omitted"):
                     now = round(time.time(), 3)
                     intervals += 1
-                    entry["series"].append({
-                        "t": now, "metric": "throughput_bulk_gbps",
-                        "v": round(s.get("bits_per_second", 0) / 1e9, 4)})
-                    entry["series"].append({
-                        "t": now, "metric": "bulk_retransmits",
-                        "v": s.get("retransmits", 0)})
+                    # `span_s` is the interval's own length. It is recorded
+                    # because a jammed tunnel makes iperf3 emit one wide
+                    # catch-up interval whose average describes a much longer
+                    # window than the nominal 1 s — a reader (and the chart)
+                    # has to be able to tell it apart from a normal sample.
+                    entry["series"].append(
+                        {
+                            "t": now,
+                            "metric": "throughput_bulk_gbps",
+                            "v": round(s.get("bits_per_second", 0) / 1e9, 4),
+                            "span_s": round(
+                                max(0.0, s.get("end", 0.0) - s.get("start", 0.0)),
+                                3,
+                            ),
+                        }
+                    )
+                    entry["series"].append(
+                        {
+                            "t": now,
+                            "metric": "bulk_retransmits",
+                            "v": s.get("retransmits", 0),
+                        }
+                    )
     finally:
         proc.kill()
         with contextlib.suppress(Exception):
@@ -679,118 +780,167 @@ def _spine_once(cmd: list, secs: float, entry: dict, t_end: float) -> dict:
     return {"intervals": intervals, "exit": proc.returncode}
 
 
-def record_stage(entry: dict, mark: int, log) -> None:
+def record_stage(entry: dict, mark: int) -> None:
     """Derive one stage's statistics from the series since `mark`."""
-    st = series_stats(entry["series"][mark:], "rtt_interactive_ms")
-    udp = series_stats(entry["series"][mark:], "rtt_udp_ms")
-    churn = series_stats(entry["series"][mark:], "churn_setup_ms")
+    window = entry["series"][mark:]
+    st = lib.series_stats(window, "rtt_interactive_ms")
+    udp = lib.series_stats(window, "rtt_udp_ms")
+    churn = lib.series_stats(window, "churn_setup_ms")
+    it_err = lib.series_stats(window, "rtt_interactive_error").get("n", 0)
+    attempts = st.get("n", 0) + it_err
+    losses = lib.series_stats(window, "udp_loss").get("n", 0)
+    udp_attempts = lib.series_stats(window, "udp_attempt").get("n", 0)
+    worst = lib.worst_window(window, "rtt_interactive_ms")
     entry["stages"][-1].update(
-        {"rtt_p99": st.get("p99"), "rtt_mean": st.get("mean"),
-         "rtt_max": st.get("max"), "rtt_n": st.get("n"),
-         "udp_p99": udp.get("p99"), "udp_mean": udp.get("mean"),
-         "churn_p99": churn.get("p99"), "churn_per_s": churn.get("n")})
-    flats = flat_segments(entry["series"][mark:])
+        {
+            "rtt_p99": st.get("p99"),
+            "rtt_mean": st.get("mean"),
+            "rtt_max": st.get("max"),
+            "rtt_n": st.get("n"),
+            "rtt_worst_1s": worst.get("mean") if worst else None,
+            "rtt_error_n": it_err,
+            "rtt_error_rate": round(it_err / attempts, 5) if attempts else None,
+            "udp_p99": udp.get("p99"),
+            "udp_mean": udp.get("mean"),
+            "udp_loss_pct": (
+                round(100.0 * losses / udp_attempts, 3) if udp_attempts else None
+            ),
+            "churn_p99": churn.get("p99"),
+            "churn_per_s": churn.get("n"),
+        }
+    )
+    flats = lib.flat_segments(window)
     if flats:
         entry["stages"][-1]["flat_segments"] = flats
-    log(f"    interactive p99={st.get('p99')} mean={st.get('mean')} "
-        f"n={st.get('n', 0)}; udp p99={udp.get('p99')}; "
-        f"churn/s={churn.get('n', 0)} p99={churn.get('p99')}")
+    log(
+        f"    interactive p99={st.get('p99')} mean={st.get('mean')} "
+        f"n={st.get('n', 0)} err={it_err}; udp p99={udp.get('p99')} "
+        f"loss={entry['stages'][-1]['udp_loss_pct']}%; "
+        f"churn/s={churn.get('n', 0)} p99={churn.get('p99')}"
+    )
 
 
-def run_capacity(tool: Tool, args, knobs, timeline, shaper: Shaper,
-                 pingers: Pingers, backends, entry: dict, log) -> None:
-    """Ramp the bulk load until the interactive stream breaks the SLO."""
-    ceiling = args.streams_max or knobs.streams_max
+def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
+    """Ramp the bulk load until the interactive stream breaks the SLO.
+
+    The SLO is the knob's, not a module constant: the meta records the value
+    the verdict was actually taken against, and the interactive error rate is
+    part of it (the documented SLO is "under this p99 AND under this error
+    rate"), not an afterthought.
+    """
+    knobs = ctx.knobs
+    target = lib.ThroughputTarget.from_band(tool.band)
     sustainable = 0
-    for streams in range(1, ceiling + 1):
+    for streams in range(1, ctx.ceiling + 1):
         mark = len(entry["series"])
-        r = backends.iperf_burst(tool.band["iperf_exposed"], streams,
-                                 knobs.settle_s, tag=f"{tool.label} cap",
-                                 backend_port=tool.band["iperf_backend"])
-        st = series_stats(entry["series"][mark:], "rtt_interactive_ms")
+        r = ctx.backends.iperf_burst(
+            target, streams, knobs.settle_s, tag=f"{tool.label} cap"
+        )
+        window = entry["series"][mark:]
+        st = lib.series_stats(window, "rtt_interactive_ms")
         p99 = st.get("p99")
-        broken = (p99 is not None and p99 > SLO_RTT_P99_MS) or not r["ok"]
-        point = {"streams": streams, "gbps": r.get("gbps_headline"),
-                 "rtt_p99": p99, "rtt_mean": st.get("mean"),
-                 "rtt_n": st.get("n"), "slo_broken": bool(broken),
-                 "reason": (r.get("reason") if not r["ok"] else
-                            (f"interactive p99 {p99} > {SLO_RTT_P99_MS}"
-                             if broken else None))}
-        entry["metrics"].setdefault("curve", []).append(point)
-        log(f"    load {streams}: {r.get('gbps_headline', '-')} Gbit/s, "
-            f"interactive p99={p99} (n={st.get('n', 0)}) -> "
-            f"{'BROKEN' if broken else 'ok'}")
+        errors = lib.series_stats(window, "rtt_interactive_error").get("n", 0)
+        err_rate = errors / max(1, st.get("n", 0) + errors)
+        reasons = []
+        if not r["ok"]:
+            reasons.append(str(r.get("reason")))
+        if p99 is not None and p99 > knobs.slo_rtt_p99_ms:
+            reasons.append(f"interactive p99 {p99} > {knobs.slo_rtt_p99_ms}")
+        if errors and err_rate > knobs.slo_error_rate:
+            reasons.append(
+                f"interactive error rate {err_rate:.3f} > {knobs.slo_error_rate}"
+            )
+        broken = bool(reasons)
+        entry["metrics"].setdefault("curve", []).append(
+            {
+                "streams": streams,
+                "gbps": r.get("gbps_headline"),
+                "rtt_p99": p99,
+                "rtt_mean": st.get("mean"),
+                "rtt_n": st.get("n"),
+                "rtt_error_rate": round(err_rate, 5),
+                "slo_broken": broken,
+                "reason": "; ".join(x for x in reasons if x) or None,
+            }
+        )
+        log(
+            f"    load {streams}: {r.get('gbps_headline', '-')} Gbit/s, "
+            f"interactive p99={p99} err={err_rate:.4f} (n={st.get('n', 0)}) -> "
+            f"{'BROKEN' if broken else 'ok'}"
+        )
         if broken:
             break
         sustainable = streams
     entry["metrics"]["max_sustainable_streams"] = sustainable
-    entry["metrics"]["headroom"] = round(1 - sustainable / ceiling, 4)
+    entry["metrics"]["headroom"] = round(1 - sustainable / ctx.ceiling, 4)
 
 
-def run_rrul(tool: Tool, args, knobs, timeline, shaper: Shaper,
-             pingers: Pingers, backends, entry: dict, log) -> None:
+def run_rrul(tool: Tool, ctx: RunContext, entry: dict) -> None:
     """Saturate the path and watch the interactive stream's RTT over time.
 
-    N = cpu count (the canonical saturation), the interactive stream's RTT
-    distribution over time through the stage schedule — the
+    N = cpu count x the factor (the canonical saturation), the interactive
+    stream's RTT distribution over time through the stage schedule — the
     queueing-under-load detector, with the return-to-clean stage as the
     recovery axis.
     """
-    streams = max(1, knobs.rrul_stream_factor * (os.cpu_count() or 1))
-    entry["metrics"]["bulk_streams"] = streams
-    for stage, secs in timeline:
-        run_one_stage(tool, cid=tool.cid, stage=stage, secs=secs,
-                      shaper=shaper, streams=streams, entry=entry,
-                      backends=backends, log=log)
+    ctx.load = max(1, ctx.knobs.rrul_stream_factor * (os.cpu_count() or 1))
+    entry["metrics"]["bulk_streams"] = ctx.load
+    for stage in ctx.timeline:
+        run_one_stage(tool, ctx, entry, stage)
 
 
-def run_staged(tool: Tool, args, knobs, timeline, shaper: Shaper,
-               pingers: Pingers, backends, entry: dict, log) -> None:
+def run_staged(tool: Tool, ctx: RunContext, entry: dict) -> None:
     """soak / cost: drive the timeline under a fixed load, sample every stage.
 
-    `soak` carries half the configured max load (the drift/leak axis is
-    measured under load); `cost` carries the same load and additionally
-    derives CPU-seconds per carried Gbit at that operating point.
+    `soak` carries `soak_load_fraction` of the configured ceiling (the
+    drift/leak axis is measured under load); `cost` carries
+    `cost_operating_point` of it and additionally derives CPU-seconds per
+    carried Gbit at that operating point. Both fractions are knobs, and both
+    are recorded in the meta.
     """
-    streams = max(1, (args.streams_max or knobs.streams_max) // 2)
-    entry["metrics"]["bulk_streams"] = streams
-    for stage, secs in timeline:
-        mark = run_one_stage(tool, cid=tool.cid, stage=stage, secs=secs,
-                             shaper=shaper, streams=streams, entry=entry,
-                             backends=backends, log=log)
-        if args.test == "cost":
-            record_cost(entry, mark, streams, log)
+    ctx.load = ctx.load_for(ctx.args.test)
+    entry["metrics"]["bulk_streams"] = ctx.load
+    for stage in ctx.timeline:
+        mark = run_one_stage(tool, ctx, entry, stage)
+        if ctx.args.test == "cost":
+            record_cost(entry, mark, ctx.load)
 
 
-def run_one_stage(tool: Tool, cid: str, stage: str, secs: float,
-                  shaper: Shaper, streams: int, entry: dict, backends,
-                  log) -> int:
+def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int:
     """Shape one stage, run its bulk spine, record the stage's stats."""
-    shaper.apply(cid, stage)
+    ctx.shaper.apply(tool.cid, stage.path)
     mark = len(entry["series"])
-    entry["stages"].append({"stage": stage, "secs": secs,
-                            "t_start": round(time.time(), 3)})
-    log(f"  stage {stage} ({secs}s)")
-    outcome = stage_spine(tool, streams, secs, entry, backends, log)
+    entry["stages"].append(
+        {"stage": stage.path, "secs": stage.secs, "t_start": round(time.time(), 3)}
+    )
+    log(f"  stage {stage.path} ({stage.secs}s)")
+    outcome = stage_spine(tool, ctx, entry, stage)
     if not outcome["intervals"]:
         entry["stages"][-1]["bulk_error"] = (
-            f"spine produced no intervals (exit {outcome['exit']})")
+            f"spine produced no intervals (exit {outcome['exit']})"
+        )
         log(f"    bulk spine produced nothing (exit {outcome['exit']})")
-    record_stage(entry, mark, log)
+    record_stage(entry, mark)
     return mark
 
 
-def record_cost(entry: dict, mark: int, streams: int, log) -> None:
-    """CPU-seconds per carried Gbit over one stage's burst window."""
+def record_cost(entry: dict, mark: int, streams: int) -> None:
+    """CPU-seconds per carried Gbit over one stage's burst window.
+
+    The denominator is the stage's duration, not the sum of the interval
+    spans: the spine is cut off at the stage boundary, so a shorter sum
+    would inflate the cost. Both the carried mean and the CPU mean come from
+    the same window.
+    """
     stage = entry["stages"][-1]
-    bulk = series_stats(entry["series"][mark:], "throughput_bulk_gbps")
+    bulk = lib.series_stats(entry["series"][mark:], "throughput_bulk_gbps")
     carried = (bulk.get("mean") or 0) * stage["secs"]
     if carried <= 0 or not bulk.get("n"):
         stage["cost_error"] = "no carried bytes in this stage"
         return
-    cpu = (series_stats(entry["series"][mark:], "server_cpu_pct").get("mean")
-           or 0.0) + (series_stats(entry["series"][mark:],
-                                   "client_cpu_pct").get("mean") or 0.0)
+    cpu = (
+        lib.series_stats(entry["series"][mark:], "server_cpu_pct").get("mean") or 0.0
+    ) + (lib.series_stats(entry["series"][mark:], "client_cpu_pct").get("mean") or 0.0)
     cost = (cpu / 100.0 * stage["secs"]) / carried
     stage["bulk_streams"] = streams
     stage["cost_cpu_per_gbit"] = round(cost, 4)
@@ -799,245 +949,437 @@ def record_cost(entry: dict, mark: int, streams: int, log) -> None:
     entry["metrics"]["cost_cpu_per_gbit"] = round(total / stages, 4)
     entry["metrics"]["cost_cpu_per_gbit_sum"] = total
     entry["metrics"]["cost_stages"] = stages
-    log(f"    cost: {cost:.4f} CPU-s per carried Gbit "
-        f"({streams} streams, {bulk.get('mean')} Gbit/s)")
+    log(
+        f"    cost: {cost:.4f} CPU-s per carried Gbit "
+        f"({streams} streams, {bulk.get('mean')} Gbit/s)"
+    )
 
 
-def run_screen(tool: Tool, args, knobs, timeline, shaper: Shaper,
-               pingers: Pingers, backends, entry: dict, log) -> None:
+def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
     """Fast A/B: two builds, interleaved inside every step of one test.
 
-    The pair is spawned in the same batch (same epoch) and the tool's
-    processes are swapped between the two builds at every load step, so
-    both sample the same machine state — sequential before/after runs are
-    defeated by epoch drift, which is the whole reason this exists.
+    The pair runs in the same batch (same epoch) and the tool's processes
+    are swapped between the two builds at every load step, so both sample
+    the same machine state — sequential before/after runs are defeated by
+    epoch drift, which is the whole reason this exists.
+
+    The steps carry no stage shaping (`--path` is recorded but not applied):
+    the verdict is a throughput/response-time comparison at a fixed path, and
+    a shape change between the two builds would be a second variable.
     """
-    build_a, build_b = args.ab
+    build_a, build_b = ctx.args.ab
+    target = lib.ThroughputTarget.from_band(tool.band)
     entry["metrics"]["builds"] = {
-        "A": build_a, "B": build_b,
-        "A_version": tool.version(build_a), "B_version": tool.version(build_b)}
+        "A": build_a,
+        "B": build_b,
+        "A_version": tool.version(build_a),
+        "B_version": tool.version(build_b),
+    }
     rounds = []
-    for step in range(1, (args.streams_max or knobs.streams_max) + 1):
+    for step in range(1, ctx.ceiling + 1):
         pair = []
         for label, binary in (("A", build_a), ("B", build_b)):
             tool.restart(binary)
             mark = len(entry["series"])
-            r = backends.iperf_burst(tool.band["iperf_exposed"], step,
-                                     knobs.settle_s, tag=f"{tool.label} {label}",
-                                     backend_port=tool.band["iperf_backend"])
-            st = series_stats(entry["series"][mark:], "rtt_interactive_ms")
-            pair.append({"build": label, "gbps": r.get("gbps_headline"),
-                         "rtt_p99": st.get("p99"), "rtt_n": st.get("n"),
-                         "rtt_mean": st.get("mean")})
+            r = ctx.backends.iperf_burst(
+                target, step, ctx.knobs.settle_s, tag=f"{tool.label} {label}"
+            )
+            st = lib.series_stats(entry["series"][mark:], "rtt_interactive_ms")
+            pair.append(
+                {
+                    "build": label,
+                    "gbps": r.get("gbps_headline"),
+                    "rtt_p99": st.get("p99"),
+                    "rtt_n": st.get("n"),
+                    "rtt_mean": st.get("mean"),
+                }
+            )
         rounds.append({"streams": step, "pair": pair})
-        log(f"    step {step}: " + " | ".join(
-            f"{p['build']} {p['gbps']} Gbit/s p99={p['rtt_p99']}" for p in pair))
+        log(
+            f"    step {step}: "
+            + " | ".join(
+                f"{p['build']} {p['gbps']} Gbit/s p99={p['rtt_p99']}" for p in pair
+            )
+        )
     entry["metrics"]["rounds"] = rounds
 
 
+TEST_TYPES = {
+    "capacity": run_capacity,
+    "rrul": run_rrul,
+    "soak": run_staged,
+    "cost": run_staged,
+    "screen": run_screen,
+}
+
+
 # --- one tool's pass --------------------------------------------------------
-def run_tool(tool: Tool, cid: str, args, knobs, timeline, shaper: Shaper,
-             log) -> dict:
+def run_tool(tool: Tool, cid: str, ctx: RunContext, entry: dict) -> dict:
+    """Run one test type against one tool pair and derive the test's metrics.
+
+    The entry is filled in place: a failure part-way through leaves the
+    series and the completed stages as the evidence for that failure.
+    """
+    args, knobs = ctx.args, ctx.knobs
     tool.cid = cid
-    entry = {"test": args.test, "path": args.path, "series": [],
-             "stages": [], "metrics": {}}
+    entry.update(
+        {
+            "test": args.test,
+            "path": args.path,
+            # The endpoint record (§10): which port each probe dialed, and which
+            # port the backend listens on. `soak_check` re-checks the pair, so a
+            # sample that measured the backend instead of the tool cannot pass
+            # the gate just because the numbers look plausible.
+            "endpoints": {
+                "throughput": asdict(lib.ThroughputTarget.from_band(tool.band)),
+                "interactive": {
+                    "exposed": tool.band["echo_exposed"],
+                    "backend": tool.band["echo_backend"],
+                },
+                "udp": {
+                    "exposed": tool.band["udp_exposed"],
+                    "backend": tool.band["udp_backend"],
+                },
+            },
+        }
+    )
     out = entry["series"]
     samplers = Samplers(tool.pids_of, out)
-    pingers = Pingers(tool.band, knobs, out, tool.work, log=log)
+    pingers = Pingers(tool.band, knobs, out, tool.work)
     backends = lib.Backends()
     try:
-        backends.start(tool.band["iperf_backend"], tool.band["echo_backend"],
-                       tool.band["udp_backend"], tool.work,
-                       echo_in_probe=True)
-    except Exception as e:
+        backends.start(
+            lib.BackendPorts.from_band(tool.band), tool.work, echo_in_probe=True
+        )
+    except Exception as e:  # noqa: BLE001 — a dead backend is that test's data
         entry["error"] = f"Backends: {e}"
         return entry
+    ctx.with_backends(backends)
     samplers.start()
     pingers.start()
     try:
-        runner = {"capacity": run_capacity, "rrul": run_rrul,
-                  "soak": run_staged, "cost": run_staged,
-                  "screen": run_screen}[args.test]
-        runner(tool, args, knobs, timeline, shaper, pingers, backends,
-               entry, log)
+        TEST_TYPES[args.test](tool, ctx, entry)
     finally:
         pingers.stop_and_join()
         samplers.stop_and_join()
         backends.stop()
     # derived metrics: stability and drift
-    for metric, label in (("rtt_interactive_ms", "interactive_rtt"),
-                          ("rtt_udp_ms", "udp_rtt"),
-                          ("throughput_bulk_gbps", "bulk_throughput")):
-        entry["metrics"][f"{label}_stats"] = series_stats(out, metric)
-        w = worst_window(out, metric)
+    for metric, label in (
+        ("rtt_interactive_ms", "interactive_rtt"),
+        ("rtt_udp_ms", "udp_rtt"),
+        ("throughput_bulk_gbps", "bulk_throughput"),
+    ):
+        entry["metrics"][f"{label}_stats"] = lib.series_stats(out, metric)
+        w = lib.worst_window(out, metric)
         if w:
             entry["metrics"][f"{label}_worst_1s"] = w
-    entry["metrics"]["flat_segments"] = flat_segments(out)
+    entry["metrics"]["flat_segments"] = lib.flat_segments(out)
     # the interactive error rate from the probe's own series: errors over
     # attempts, not over the other probes' samples
-    it_ok = series_stats(out, "rtt_interactive_ms").get("n", 0)
-    it_err = series_stats(out, "rtt_interactive_error").get("n", 0)
+    it_ok = lib.series_stats(out, "rtt_interactive_ms").get("n", 0)
+    it_err = lib.series_stats(out, "rtt_interactive_error").get("n", 0)
     entry["metrics"]["interactive_error_rate"] = round(
-        it_err / max(1, it_ok + it_err), 5)
+        it_err / max(1, it_ok + it_err), 5
+    )
     entry["metrics"]["churn_error_rate"] = round(
-        series_stats(out, "churn_error").get("n", 0)
-        / max(1, series_stats(out, "churn_setup_ms").get("n", 0)
-              + series_stats(out, "churn_error").get("n", 0)), 5)
+        lib.series_stats(out, "churn_error").get("n", 0)
+        / max(
+            1,
+            lib.series_stats(out, "churn_setup_ms").get("n", 0)
+            + lib.series_stats(out, "churn_error").get("n", 0),
+        ),
+        5,
+    )
+    # The derived UDP loss rate is a series of its own (the raw probe stream
+    # only carries 1-per-loss markers, which have no contrast to plot).
+    out.extend(lib.loss_rate_series(out))
     # The drift axis skips the first stage: the connection-setup pool
     # allocation ramps RSS/fds once at startup, and warm-up is not a leak.
-    drift_from = (entry["stages"][1]["t_start"] if len(entry["stages"]) > 1
-                  else out[0]["t"] if out else 0)
-    for metric in ("server_rss_kb", "client_rss_kb", "server_fds",
-                   "client_fds", "server_threads", "client_threads",
-                   "server_cpu_pct", "client_cpu_pct"):
-        slope = slope_per_min([r for r in out if r["t"] >= drift_from], metric)
+    drift_from = (
+        entry["stages"][1]["t_start"]
+        if len(entry["stages"]) > 1
+        else out[0]["t"]
+        if out
+        else 0
+    )
+    for metric in (
+        "server_rss_kb",
+        "client_rss_kb",
+        "server_fds",
+        "client_fds",
+        "server_threads",
+        "client_threads",
+        "server_cpu_pct",
+        "client_cpu_pct",
+    ):
+        slope = lib.slope_per_min([r for r in out if r["t"] >= drift_from], metric)
         if slope is not None:
             entry["metrics"][f"{metric}_slope_per_min"] = slope
     entry["metrics"]["drift_from_t"] = round(drift_from, 3)
     return entry
 
 
-def checkpoint(path: Path, meta: dict, tests: list, log) -> None:
-    """Atomically dump the tests completed so far.
+@dataclass
+class Results:
+    """The run's output file, its method record and the tests so far."""
 
-    A run that is killed (SIGKILL, host wipe, an aborting test type) must
-    still leave the finished tests on disk — the retired matrix's
-    real-time checkpointing, which is what made a 3-hour run resumable.
+    path: Path
+    meta: dict
+    tests: list
+
+    def checkpoint(self) -> None:
+        """Atomically dump the tests completed so far.
+
+        A run that is killed (SIGKILL, host wipe, an aborting test type) must
+        still leave the finished tests on disk — the real-time checkpointing
+        that makes a multi-hour run resumable.
+        """
+        payload = {
+            "meta": self.meta | {"date": time.strftime("%Y-%m-%d %H:%M %z")},
+            "tests": self.tests,
+        }
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with contextlib.suppress(OSError):
+            tmp.write_text(json.dumps(payload))
+            os.replace(tmp, self.path)
+
+
+def parse_args(argv: list | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description='Soak benchmark runner (see docs/release.md, "Benchmarks")'
+    )
+    ap.add_argument(
+        "--tools", default="molehill", help="comma list: molehill,frp,rathole,nps"
+    )
+    ap.add_argument(
+        "--variants",
+        default="mux",
+        help="molehill variants: mux,noise,mux1,kcp4,noise-direct,mux-off",
+    )
+    ap.add_argument("--test", default="capacity", choices=sorted(TEST_TYPES))
+    ap.add_argument(
+        "--path",
+        default="clean",
+        choices=sorted(PATH_CLASSES),
+        help="the stage class for the single-stage test types "
+        "(rrul and soak use their own timelines)",
+    )
+    ap.add_argument(
+        "--timeline", default="", help="stage:secs,... (default: the test type's own)"
+    )
+    ap.add_argument(
+        "--secs",
+        type=float,
+        default=0,
+        help="single-stage timeline of this length on --path",
+    )
+    ap.add_argument(
+        "--streams-max",
+        type=int,
+        default=0,
+        help="the configured maximum bulk load (default: the SOAK_STREAMS_MAX knob)",
+    )
+    ap.add_argument(
+        "--batch",
+        type=int,
+        default=0,
+        help="tools measured concurrently (default: the CPU "
+        "budget from SOAK_CORES_PER_PAIR)",
+    )
+    ap.add_argument(
+        "--ab", metavar="BIN_A,BIN_B", help="screen: the two builds to interleave"
+    )
+    ap.add_argument("--out", default="")
+    args = ap.parse_args(argv)
+    if args.test == "screen" and not args.ab:
+        ap.error("--ab BIN_A,BIN_B is required for the screen test")
+    if args.test != "screen" and args.ab:
+        ap.error("--ab is only meaningful for --test=screen")
+    if args.ab:
+        args.ab = args.ab.split(",")
+        if len(args.ab) != lib.AB_BUILDS:
+            ap.error("--ab takes exactly two binaries: BIN_A,BIN_B")
+    return args
+
+
+def timeline_for(args: argparse.Namespace) -> list[Stage]:
+    """The stage schedule: explicit, or the test type's own default."""
+    if args.timeline:
+        return [
+            Stage(path=s.strip(), secs=float(d))
+            for s, d in (p.split(":") for p in args.timeline.split(",") if p)
+        ]
+    if args.test == "soak":
+        return SOAK_TIMELINE
+    if args.test == "rrul":
+        return DEFAULT_TIMELINE
+    return [Stage(path=args.path, secs=args.secs or 60.0)]
+
+
+def build_meta(
+    args: argparse.Namespace, knobs: lib.Knobs, timeline: list, batch: int, nproc: int
+) -> dict:
+    """The run's method record: every knob that changes a number.
+
+    A reader must be able to tell what was measured and against what, so the
+    SLO the verdict used, the load fractions, the stage schedule and the
+    instrumentation switches all travel with the results (§10).
     """
-    payload = {"meta": meta | {"date": time.strftime("%Y-%m-%d %H:%M %z")},
-               "tests": tests}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with contextlib.suppress(OSError):
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, path)
+    return {
+        "workload_version": WORKLOAD_VERSION,
+        "slo": {"rtt_p99_ms": knobs.slo_rtt_p99_ms, "error_rate": knobs.slo_error_rate},
+        "load_fractions": {
+            "soak": knobs.soak_load_fraction,
+            "cost": knobs.cost_operating_point,
+            "rrul_stream_factor": knobs.rrul_stream_factor,
+        },
+        "path_classes": PATH_CLASSES,
+        "timeline": [asdict(t) for t in timeline],
+        "batch": batch,
+        "nproc": nproc,
+        "cores_per_pair": knobs.cores_per_pair,
+        "streams_max": args.streams_max or knobs.streams_max,
+        "settle_s": knobs.settle_s,
+        "interactive_ping_interval_ms": knobs.ping_interval_ms,
+        "udp_ping_interval_ms": knobs.udp_interval_ms,
+        "churn_connects_s": knobs.churn_connects_s,
+        "wedge_silence_s": lib.WEDGE_SILENCE_S,
+        "loss_window_s": lib.LOSS_WINDOW_S,
+        # The opt-in molehill instrumentation the run inherited (empty for a
+        # default run): an instrumented path is not the same path.
+        "instrumentation": lib.diag_env(),
+        # Provenance (§10): the run must correspond to a known revision of a
+        # known binary. `revision` marks a dirty tree as such, because a
+        # number produced by uncommitted code describes code that does not
+        # exist anywhere else.
+        "revision": lib.git_revision(),
+        "molehill_bin": str(knobs.molehill_bin),
+        "molehill_version": lib.tool_version(knobs),
+        "hostname": socket.gethostname(),
+        "kernel": subprocess.run(
+            ["uname", "-r"], capture_output=True, text=True, check=False
+        ).stdout.strip(),
+    }
+
+
+def run_one_tool(
+    tool: Tool, cid: str, ctx: RunContext, binary: str, entry: dict
+) -> dict:
+    """Start one tool pair, run its test, and never let a failure lose data.
+
+    A failing tool is data: the entry keeps whatever was measured before the
+    failure (its series and completed stages) and gains a typed error.
+    """
+    try:
+        tool.start(binary)
+        return run_tool(tool, cid, ctx, entry)
+    except Exception as e:  # noqa: BLE001 — a failed test is data, not an abort
+        entry["error"] = f"{type(e).__name__}: {e}"
+        log(f"    {tool.label} FAILED: {entry['error']}")
+        return entry
+    finally:
+        tool.stop()
+
+
+def measure_batch(ctx: RunContext, group: list, work: Path, results: Results) -> None:
+    """Shape one batch's paths, measure every tool in it, checkpoint.
+
+    The batch's shaper is torn down on the way out even when a tool raises:
+    a leftover qdisc would shape the next batch's clean stages, which is the
+    one thing the clean stages exist to rule out.
+    """
+    bands = [lib.tool_band(26000 + i * 100, 0) for i in range(len(group))]
+    classes = [(f"1:{20 + i}", bands[i]) for i in range(len(group))]
+    shaper = Shaper(classes, log=log)
+    ctx.shaper = shaper
+    shaper.build()
+    try:
+        log(f"== batch: {[f'{t} {v}'.strip() for t, v in group]}")
+        for (tool_name, variant), (cid, band) in zip(group, classes):
+            # The screen starts on build A and swaps per step; the other
+            # test types start on the default binary.
+            binary = ctx.args.ab[0] if ctx.args.ab and tool_name == "molehill" else ""
+            tool = Tool(tool_name, variant, band, ctx.knobs, work)
+            entry = run_one_tool(tool, cid, ctx, binary, new_entry(ctx.args))
+            results.tests.append(
+                entry
+                | {
+                    "tool": tool.label,
+                    "variant": variant,
+                    "version": tool.version(binary),
+                    "coverage": tool.coverage,
+                }
+            )
+            results.checkpoint()
+    finally:
+        shaper.teardown()
+
+
+def new_entry(args: argparse.Namespace) -> dict:
+    """An empty test record, filled in by the test type as it measures."""
+    return {
+        "test": args.test,
+        "path": args.path,
+        "series": [],
+        "stages": [],
+        "metrics": {},
+    }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="soak benchmark runner")
-    ap.add_argument("--tools", default="molehill",
-                    help="comma list: molehill,frp,rathole,nps")
-    ap.add_argument("--variants", default="mux",
-                    help="molehill variants: mux,noise,mux1,kcp4,mux-off")
-    ap.add_argument("--test", default="capacity",
-                    choices=["capacity", "rrul", "soak", "cost", "screen"])
-    ap.add_argument("--path", default="clean", choices=sorted(PATH_CLASSES))
-    ap.add_argument("--timeline", default="",
-                    help="stage:secs,... (default: the test type's own)")
-    ap.add_argument("--secs", type=float, default=0,
-                    help="single-stage timeline of this length on --path")
-    ap.add_argument("--streams-max", type=int, default=0)
-    ap.add_argument("--batch", type=int, default=0)
-    ap.add_argument("--ab", metavar="BIN_A,BIN_B",
-                    help="screen: the two builds to interleave")
-    ap.add_argument("--fresh", action="store_true")
-    ap.add_argument("--out", default="")
-    args = ap.parse_args()
-
-    if args.test == "screen" and not args.ab:
-        ap.error("--ab BIN_A,BIN_B is required for the screen test")
-
+    args = parse_args()
     knobs = lib.Knobs.from_env()
-    log = lambda *a: print(*a, flush=True)
     lib.acquire_lock()
     # The run's working artifacts (tool logs, iperf-raw evidence, probe
-    # logs) live in a temp dir: they are evidence for the session, not
-    # repository content — and tool logs carry the config's key material.
-    # The `molehill-bench.` prefix keeps one lock/ledger namespace with the
-    # sweep below, which reaps a previously SIGKILLed run's leaked arms.
-    work = Path(tempfile.mkdtemp(prefix="molehill-bench."))
+    # logs) are evidence for the session, not repository content — and tool
+    # logs carry the config's key material. The default results path is NOT
+    # the work dir: `soak-plot` and `soak-check` glob the script's own
+    # directory, so a run whose output they cannot see is a run nobody can
+    # read. Release runs still pass an explicit --out.
+    work = Path(tempfile.mkdtemp(prefix=lib.WORK_PREFIX))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
     reaped = lib.sweep_stale(work)
     if reaped:
         log(f"reaped {reaped} stale process(es) from crashed runs")
 
-    out = Path(args.out) if args.out else (work / "results-soak-dev.json")
+    out = (
+        Path(args.out) if args.out else Path(__file__).parent / "results-soak-dev.json"
+    )
     with contextlib.suppress(OSError):
         out.parent.mkdir(parents=True, exist_ok=True)
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
     variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    timeline = ([(s.strip(), float(d)) for s, d in
-                 (p.split(":") for p in args.timeline.split(",") if p)]
-                if args.timeline else
-                SOAK_TIMELINE if args.test == "soak" else
-                DEFAULT_TIMELINE if args.test == "rrul" else
-                [(args.path, args.secs or 60)])
+    timeline = timeline_for(args)
     nproc = os.cpu_count() or 1
     budget = max(1, int(nproc / knobs.cores_per_pair))
     batch = args.batch or min(knobs.max_batch, budget)
-    slots = [(t, v) for t in tools for v in
-             (variants if t == "molehill" else [""])]
+    slots = [(t, v) for t in tools for v in (variants if t == "molehill" else [""])]
 
-    log(f"soak: test={args.test} path={args.path} slots={slots} "
-        f"timeline={timeline} batch={batch} (nproc={nproc})")
-    args.ab = [b for b in args.ab.split(",")] if args.ab else None
-
-    meta = {
-        "workload_version": WORKLOAD_VERSION,
-        "slo": {"rtt_p99_ms": SLO_RTT_P99_MS},
-        "path_classes": PATH_CLASSES,
-        "timeline": [{"stage": s, "secs": d} for s, d in timeline],
-        "batch": batch, "nproc": nproc,
-        "cores_per_pair": knobs.cores_per_pair,
-        "settle_s": knobs.settle_s,
-        "interactive_ping_interval_ms": knobs.ping_interval_ms,
-        "udp_ping_interval_ms": knobs.udp_interval_ms,
-        "wedge_silence_s": WEDGE_SILENCE_S,
-        "hostname": socket.gethostname(),
-        "kernel": subprocess.run(["uname", "-r"], capture_output=True,
-                                 text=True, check=False).stdout.strip(),
-    }
-    tests: list = []
-    shaper = None
+    log(
+        f"soak: test={args.test} path={args.path} slots={slots} "
+        f"timeline={[(s.path, s.secs) for s in timeline]} batch={batch} "
+        f"(nproc={nproc})"
+    )
+    if args.ab:
+        log(f"      A/B: {args.ab[0]} vs {args.ab[1]}")
+    results = Results(
+        path=out, meta=build_meta(args, knobs, timeline, batch, nproc), tests=[]
+    )
+    ctx = RunContext(args=args, knobs=knobs, timeline=timeline, shaper=None)
     exit_code = 0
     try:
         for start in range(0, len(slots), batch):
-            group = slots[start:start + batch]
-            bands = [lib.tool_band(26000 + i * 100, 0)
-                   for i in range(len(group))]
-            classes = [(f"1:{20 + i}", bands[i]) for i in range(len(group))]
-            shaper = Shaper(classes, log=log)
-            shaper.build()
-            log(f"== batch: {[f'{t} {v}'.strip() for t, v in group]}")
-            for (tool_name, variant), (cid, band) in zip(group, classes):
-                binary = ""
-                if args.ab and tool_name == "molehill":
-                    binary = args.ab[0]  # the screen swaps builds per step
-                t = Tool(tool_name, variant, band, knobs, work)
-                entry = {"test": args.test, "path": args.path, "series": [],
-                         "stages": [], "metrics": {}}
-                try:
-                    t.start(binary)
-                    entry = run_tool(t, cid, args, knobs, timeline, shaper,
-                                     log)
-                except Exception as e:  # a failed test is data
-                    # keep whatever this tool measured: the series and the
-                    # stages it completed are the evidence for the failure,
-                    # and discarding them would lose the run
-                    entry["error"] = f"{type(e).__name__}: {e}"
-                    log(f"    {t.label} FAILED: {entry['error']}")
-                finally:
-                    t.stop()
-                tests.append(entry | {
-                    "tool": t.label, "variant": variant,
-                    "version": t.version(binary),
-                    "coverage": t.coverage})
-                checkpoint(out, meta, tests, log)
-            shaper.teardown()
-            shaper = None
+            measure_batch(ctx, slots[start : start + batch], work, results)
     except KeyboardInterrupt:
         log("interrupted — completed tests are kept")
         exit_code = 130
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — record the failure, keep the tests
         log(f"run failed: {type(e).__name__}: {e}")
         exit_code = 1
     finally:
-        if shaper is not None:
-            shaper.teardown()
         lib.release_lock()
-        out = Path(args.out) if args.out else (
-            work / "results-soak-dev.json")
-        checkpoint(out, meta, tests, log)
-        log(f"soak complete: {len(tests)} test(s) -> {out}")
+        results.checkpoint()
+        log(f"soak complete: {len(results.tests)} test(s) -> {out}")
     sys.exit(exit_code)
 
 
