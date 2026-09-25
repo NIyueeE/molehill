@@ -151,6 +151,26 @@ safe wrapper exists. Recorded here as the remaining half.
   first two deliverables.
 
 
+## Provenance of the published v0.9.0 numbers
+
+The release sweep was measured on `710186c` (`tree_clean: true`, binary
+fingerprint recorded, `soak-check` green). The release commit differs from it by
+the platform-portability work CI forced (`4b2ea0a`, `82a26e2`): `nix` moved to a
+target-scoped dependency, the musl `msg_iovlen` conversion is `cfg`-split, and
+the portable half of a datagram batch moved to `transport::dgram` while the
+Linux module kept the syscall machinery.
+
+**On the measured platform that is a no-op**, and that is checkable rather than
+asserted: every changed line is either `cfg`-gated away from Linux/glibc, or a
+verbatim move of a constant or an enum whose shape and values are unchanged
+(`BATCH = 32`, `Span` with the same two variants), or the same expression
+(`staging.len() - buf.len()`), or a dependency that Linux still resolves
+identically. So the published numbers describe the released code on the host
+they were measured on; they were not re-measured after a refactor that cannot
+move them. A platform-portability change that *did* touch the measured path
+would have needed a fresh sweep, and the gate's provenance fields (`revision`,
+`tree_clean`, `molehill_bin_fingerprint`) are what make the difference visible.
+
 ## Release blocker: the KCP send path is Linux-only (found by the first CI run)
 
 The branch's first CI run (PR #2) failed four platform builds. Three distinct
