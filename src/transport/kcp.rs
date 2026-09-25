@@ -101,6 +101,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
+#[cfg(target_os = "linux")]
 use crate::transport::udp_batch::Span;
 
 /// KCP flush interval in ms (`nodelay` mode; also the pump's timer floor
@@ -1580,17 +1581,30 @@ fn clamp_mtu(current: usize, path_mtu: usize, ipv6: bool) -> Option<usize> {
 /// socket that is closed immediately, which is why this is not worth a
 /// `spawn_blocking` hop.
 fn probe_path_mtu(local: Option<SocketAddr>, peer: SocketAddr) -> Option<usize> {
-    if !peer.is_ipv4() {
-        return None;
+    // Not on this platform: `nix` is a Unix crate and `sockopt::IpMtu` exists
+    // only on Linux/Android/FreeBSD, so the dependency is declared for Linux
+    // and this returns the "no probe" answer everywhere else. The consequence
+    // is the documented one — those platforms keep kernel fragmentation — and
+    // it is visible here rather than as a build failure on four CI targets.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (local, peer);
+        None
     }
-    let bind = match local {
-        Some(addr) if addr.is_ipv4() => SocketAddr::new(addr.ip(), 0),
-        _ => SocketAddr::from(([0, 0, 0, 0], 0)),
-    };
-    let probe = std::net::UdpSocket::bind(bind).ok()?;
-    probe.connect(peer).ok()?;
-    let mtu = nix::sys::socket::getsockopt(&probe, nix::sys::socket::sockopt::IpMtu).ok()?;
-    usize::try_from(mtu).ok()
+    #[cfg(target_os = "linux")]
+    {
+        if !peer.is_ipv4() {
+            return None;
+        }
+        let bind = match local {
+            Some(addr) if addr.is_ipv4() => SocketAddr::new(addr.ip(), 0),
+            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+        };
+        let probe = std::net::UdpSocket::bind(bind).ok()?;
+        probe.connect(peer).ok()?;
+        let mtu = nix::sys::socket::getsockopt(&probe, nix::sys::socket::sockopt::IpMtu).ok()?;
+        usize::try_from(mtu).ok()
+    }
 }
 
 /// Build the channel quartet + configured `Kcp` for one session and spawn

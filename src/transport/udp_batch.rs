@@ -364,7 +364,15 @@ impl SendBatch {
                     });
                 }
             }
+            // `msg_iovlen` is `size_t` on glibc and `c_int` on musl, and the
+            // two spellings cannot share one expression: a `try_into` is a
+            // no-op (and a lint error) on the wide one. A musl build failed on
+            // exactly this — something glibc testing cannot show.
+            #[cfg(not(target_env = "musl"))]
             let msg_iovlen = self.iovs.len() - iov_start;
+            #[cfg(target_env = "musl")]
+            let msg_iovlen = libc::c_int::try_from(self.iovs.len() - iov_start)
+                .expect("an mmsg batch fits a c_int by construction (BATCH = 32)");
             // `iov_start` indexes the iovec this span just pushed, so the
             // bounds-checked lookup cannot miss; the raw pointer it
             // yields is what the message stores.
