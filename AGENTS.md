@@ -58,13 +58,7 @@ code-level.**
     warning once the lint stops firing, preventing stale allows), fall back to
     `#[allow(clippy::lint_name)]`;
   - minimal scope: a single statement or one function; never function groups,
-    module-level `#![allow(...)]`, or crate-level relaxation. One exception is
-    sanctioned: a `#[cfg(test)] mod tests` may carry a module-level
-    `#![expect(clippy::unwrap_used, reason = "...")]` (and `expect_used` /
-    `panic` / `assertions_on_constants` where a test needs them), because a
-    test's failure path *is* a panic — waiving it per call would bury the
-    assertion under `.expect()` noise. Production modules get no such
-    exception;
+    module-level `#![allow(...)]`, or crate-level relaxation;
   - feature-gated dead code: prefer real `#[cfg(feature = "...")]` gating
     over `allow(dead_code)` when the item's only consumer is feature-gated —
     gate the whole item (struct, function, parameter, trait method) when the
@@ -246,13 +240,7 @@ Details: [docs/release.md](docs/release.md).
   release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
   runs the identical chain when the change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
-  docs-alignment check instead — the one gate such a change can break. **The
-  hooks mirror that split** (`githooks/docs-only` classifies the staged paths
-  or the pushed range): pre-commit keeps only the secret scan and the docs
-  check, pre-push keeps only the docs check, and anything ambiguous — an empty
-  change set, a new branch, a tag push, a commit mixing docs with code — falls
-  back to the full chain. Deleting the classifier restores the full chain,
-  which is the safe direction. `main`
+  docs-alignment check instead — the one gate such a change can break. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by
   convention (CI red on main is the top priority; the one sanctioned
@@ -424,13 +412,6 @@ Details that agents need constantly:
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Unsafe is denied crate-wide** (`unsafe_code = "deny"`): the one module
-  that needs it — `src/transport/udp_batch.rs`, the `recvmmsg`/`sendmmsg`
-  batching FFI — opts in per item with `#[expect(unsafe_code, reason = ...)]`
-  and a `// SAFETY:` comment, and `src/mux.rs` forbids it outright. Every other
-  waiver in the tree is an `#[expect]`, so `-D warnings` (which denies
-  `unfulfilled_lint_expectations`) fails the build on a stale one — verified,
-  not assumed.
 - **Bench/test entries are PEP 723 python scripts run via `uv run`** (no
   shell test entries; see docs/release.md). They are linted *and*
   format-checked by ruff (`ruff.toml`) in the pre-commit gate — fix the code,

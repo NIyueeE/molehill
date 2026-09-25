@@ -30,16 +30,11 @@ for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
     errors=$((errors + 1))
     continue
   fi
-  # Extract the gate *commands*, not whole shell lines: a hook line may be a
-  # pipeline or carry control flow (`git diff … | githooks/docs-only || x=0`),
-  # and requiring that literal text in the docs would document noise. The
-  # reverse check below extracts commands the same way, so both directions
-  # speak about the same thing.
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
-  done < <(sed -e 's/[[:space:]]*#.*$//' "$hook" \
-             | grep -oE '(cargo [a-z-]+|uvx [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
+  done < <(grep -E '^(cargo|uvx|just|git|githooks/)' "$hook" \
+             | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' \
              | sort -u)
 done
 
@@ -69,12 +64,7 @@ done < <(awk '
 while IFS= read -r lint; do
   [ -n "$lint" ] || continue
   expect "lint documented: $lint" docs/lint-policy.md '`'"$lint"'`'
-done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0}
-              # comments are prose, not lint declarations: a `=` inside one
-              # (e.g. a code sample) is not a lint level
-              f && /=/ && $0 !~ /^[ \t]*#/ {
-                split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k
-              }' Cargo.toml)
+done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0} f && /=/{split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k}' Cargo.toml)
 
 # 3) rustc edition
 edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)

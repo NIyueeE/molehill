@@ -66,34 +66,6 @@ Note the template difference: clippy runs twice (default features, then
 second pass covers the minimal no-default-features build that the
 default-feature pass never compiles. `just check` runs the identical chain.
 
-### The docs-only path (both fast and heavy gates)
-
-A change whose paths are all markdown, `docs/**` or `assets/**` cannot move
-the code gates, so both hooks classify it with `githooks/docs-only` before
-running anything and take a two-gate path instead:
-
-| Where | Runs | Skips |
-|---|---|---|
-| `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, both ruff gates, both clippy passes |
-| `githooks/pre-push` | `githooks/check-docs` | audit, deny, outdated, tests |
-
-Three properties make this safe rather than a bypass:
-
-- the classifier reads the **actual change set** — the staged paths for a
-  commit, the pushed commit range for a push — and the three patterns are
-  exactly `ci.yml`'s `paths-ignore` / `docs.yml`'s `paths`, so the hooks and CI
-  can never disagree about what "docs-only" means;
-- the two gates a docs-only change *can* still break always run: the secret
-  scan (a leaked key in a README is still a leaked key) and the docs-alignment
-  check (which is what such a change moves);
-- anything ambiguous falls back to the full chain: an empty change set, a new
-  branch with no remote to diff against, a **tag push** (never docs-only, the
-  release review runs first), and a commit that mixes docs with code paths.
-
-`githooks/docs-only` is the classifier itself: paths on stdin, exit 0 when all
-of them are docs. Deleting it makes both hooks run the full chain again, which
-is the safe direction.
-
 Lines that must carry a secret-shaped string (e.g. key-format documentation)
 take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 

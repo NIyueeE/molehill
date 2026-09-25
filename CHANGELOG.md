@@ -414,44 +414,12 @@ opens its own section here.
   the probe's own attempt stream), `-drift.png` (with every fitted slope
   printed) and `-cost.png`. Each figure carries its method constants and
   revision in the footer, and a tool keeps its colour across the whole set.
-- **Unsafe is now denied crate-wide** (`unsafe_code = "deny"`, was `warn`),
-  so an unexpected `unsafe` fails a plain `cargo build` instead of only the
-  `-D warnings` gate. The one module that needs it — the `recvmmsg`/`sendmmsg`
-  batching FFI — keeps its per-item `#[expect(unsafe_code, reason = ...)]`
-  with a `SAFETY` comment; the alternatives were evaluated against their
-  sources and are recorded in docs/lint-policy.md ("Unsafe"): `nix` cannot
-  drop the `Send`/`Sync` proofs (its `MultiHeaders` is itself `!Send`) and
-  `quinn-udp` would change the KCP send path's GSO semantics. Two clippy
-  waivers were removed outright on the way: the KCP stats clock now converts
-  nanoseconds with `Duration::as_secs_f64()` and masks the 32-bit protocol
-  wrap instead of casting, so both cast waivers are gone.
 - The python bench scripts are format-checked as well as lint-checked: the
   pre-commit chain now runs `uvx ruff format --check benches/scripts/`
   beside `uvx ruff check`, `just py-lint` runs both and `just py-fmt`
   auto-fixes. The ruff waiver list shrank to the one entry that is true of
   every script here (they measure PATH binaries), with the rest waived
   inline at their own sites and a named reason each.
-- The docs-only path CI already had (`ci.yml` / `docs.yml`) is now mirrored by
-  the hooks: `githooks/docs-only` classifies the staged paths (commit) or the
-  pushed range (push), and a change limited to markdown, `docs/**` or
-  `assets/**` runs only the two gates it can move — the secret scan and the
-  docs-alignment check — instead of the whole Rust chain. Anything ambiguous
-  (empty change set, new branch, tag push, or a commit mixing docs with code)
-  falls back to the full chain, and deleting the classifier restores it.
-- **HANDOFF.md was restructured and condensed** (1762 → ~770 lines): it now
-  opens with the branch's state and the theme planned for the next update
-  (measure the three unmeasured data-path axes — establishment, fragmentation,
-  reconnect — then fix what they show), keeps the landed-work index, the
-  gated candidate table and the open items, and compresses the historical
-  measurement record to the verdicts, numbers and commits that carry it. An
-  Everything measured before the Soak model is now bannered as **historical
-  context, not evidence** — the matrix harness was proven wrong in ways that
-  were invisible at the time (`--ab` spawned one binary on both sides, a
-  verdict could be read with the sides swapped, the memory axis read a key
-  that never existed, several headline figures never reproduced), so those
-  numbers may not be quoted, compared or gated on. One verdict was corrected
-  in place first (a throughput claim that did not exceed its own ordering
-  floor); the rest was left as written and demoted.
 - **The documentation set was given an ownership contract.** Every page now
   owns one topic and links to the others (the routing table is in AGENTS.md
   §3, the audience-and-scope table in docs/structure.md): the landing pages

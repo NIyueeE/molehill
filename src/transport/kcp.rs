@@ -376,12 +376,13 @@ pub(crate) struct KcpStats {
 /// Snapshot of the KCP path counters, for the periodic stats line.
 pub(crate) fn kcp_stats() -> KcpStats {
     use crate::kcp::kcp_engine_stats;
-    /// Nanosecond accumulators as milliseconds. `Duration` does the
-    /// conversion exactly (the accumulators stay far below 2^53 ns, the
-    /// point where an `f64` stops counting nanoseconds) and without the
-    /// lossy-looking cast the lint is there to catch.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "nanosecond accumulators stay far below 2^53 for any \
+                  process lifetime worth measuring"
+    )]
     fn ms(stat: &AtomicU64) -> f64 {
-        Duration::from_nanos(stat.load(Ordering::Relaxed)).as_secs_f64() * 1.0e3
+        stat.load(Ordering::Relaxed) as f64 / 1e6
     }
     KcpStats {
         datagrams_in: kcp_engine_stats().0,
@@ -620,16 +621,20 @@ fn tune_socket_buffers(socket: &UdpSocket) {
 
 /// Milliseconds since `start`, on KCP's wrapping u32 clock.
 ///
-/// KCP's protocol clock runs in milliseconds modulo 2^32 (~49.7 days) and
-/// its `timediff` arithmetic handles the wraparound by design, so the low
-/// 32 bits are the value — masked here rather than truncated by a cast, so
-/// the wrap is a statement about the protocol clock and not an accident of
-/// integer conversion. The `try_from` cannot fail on a 32-bit value and
-/// the fallback is unreachable; `unwrap_or(0)` is how that is spelled
-/// without a lint waiver.
+/// The `as u32` below is the wrap itself, not a truncation: KCP's
+/// protocol clock runs in milliseconds modulo 2^32 (~49.7 days) and its
+/// `timediff` arithmetic handles the wraparound by design. Masking the
+/// low 32 bits (`u32::try_from(millis & u32::MAX)`) is a lint-free
+/// equivalent, but it reads as a checked conversion with a dead
+/// fallback rather than as the protocol clock this is.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the u32 clock wraps modulo 2^32 by protocol design and \
+              `timediff` handles the 49-day wraparound; the masked \
+              `try_from` equivalent is strictly less clear about it"
+)]
 fn ms_now(start: Instant) -> u32 {
-    let millis = start.elapsed().as_millis();
-    u32::try_from(millis & u128::from(u32::MAX)).unwrap_or(0)
+    start.elapsed().as_millis() as u32
 }
 
 /// Hand one owned write to the engine, sharing it per segment.
