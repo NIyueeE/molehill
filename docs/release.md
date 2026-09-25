@@ -68,74 +68,53 @@ re-enforces the version and changelog invariants remotely.
 
 ## Benchmarks: per-tag ritual
 
-The method — what is measured, how to read the charts, the stage schedule,
-the SLO, the test types, and how to reproduce a run — is owned by
-[benchmarks.md](benchmarks.md); this section owns the ritual a tag depends on.
-The ritual produces three artifacts and one verdict — the results file
-(`benches/scripts/soak/results-soak-vX.Y.Z.json`), the chart set in `assets/`
-and the refreshed README benchmark numbers, then `soak-check`'s verdict on the
-run and its comparison against the previous tag.
-
-The tools live in `benches/scripts/soak/`; peers are frp, rathole (upstream)
-and nps, each fetched as the **latest GitHub release** binary, never built
-from source, with the resolved versions recorded in the results meta. All
-entries are PEP 723 python scripts run via `uv run`; a run refuses to start
-while another one holds the lock, and a killed run (Ctrl-C or SIGTERM) still
-writes the tests it completed.
+Every tag refreshes the Soak benchmark (design and tools live in
+`benches/scripts/soak/`; peers: frp, rathole (upstream), nps — each fetched as
+the **latest GitHub release** binary, never built from source, with the
+resolved versions recorded in the results meta). The model measures a
+**workload under staged network conditions as time series**: one interactive
+stream (the SLO instrument), N bulk TCP streams, C short connections per
+second and one UDP session, while the path changes on a stage schedule
+(clean → rtt100 → loss1 → loss5 → rate100 → rate20 → jitter → clean), applied
+in place so the tool's session is never rebuilt. Everything measured is
+externally observable, so the peers are driven by exactly the same workload
+and appear beside molehill in every chart. All entries are PEP 723 python
+scripts run via `uv run`; a run refuses to start while another one holds the
+lock, and a killed run (Ctrl-C or SIGTERM) still writes the tests it
+completed.
 
 1. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
-2. `just soak --out benches/scripts/soak/results-soak-vX.Y.Z.json` — run
-   the sweep (one tool or a batch of them, per its own shaped path in one HTB
-   class each, so concurrent tools never share a shaper; the batch size comes
-   from the host's CPU budget). The release artifact path is passed
-   explicitly: the default `--out` is `results-soak-dev.json` beside the
-   script, which `soak-plot`/`soak-check` do read but which is never the
-   committed evidence. The run covers the test types the release needs
-   (`--test`; see [benchmarks.md](benchmarks.md#test-types) for what each one
-   answers). Before the run: the tree must be clean and the binary
-   freshly built, and the results meta records the revision and the binary
-   version, because a number has to describe code someone can check out
-   (AGENTS.md §10).
-3. `just soak-plot` — renders the chart set and prints the markdown tables:
-   `assets/soak-vX.Y.Z.png` (the master: per tool, the interactive stream over
-   the stage schedule with its per-stage p50/p99 and the bulk throughput,
-   wedges marked), `-stages.png` (small multiples, one panel per stage),
-   `-capacity.png` (the response-time-vs-load curve, only when the run had a
-   capacity test), `-udp.png` (RTT plus the sliding loss rate), `-drift.png`
-   (the fitted slopes) and `-cost.png` (only for a `cost` run). Update the
-   README Benchmarks section with them and their numbers, then delete the
-   previous tag's charts from `assets/`.
-4. `just soak-check` — the gate, in two steps. First the run is checked
-   against itself: every coverage axis a test claims must have carried
-   samples, every throughput sample must have dialed the tool's exposed port
-   rather than its backend, and the released tool must meet the absolute SLO
-   **on the unshaped clean stages** (a saturated `rrul`/`soak` stage is above
-   the SLO by design — that is the degradation curve, reported as a note, not
-   judged). The SLO gates the tool this repository releases; a peer that
-   misses it is reported with its number and does not block the tag. Without
-   a baseline that self-check *is* the verdict, and that is how the first
-   Soak release (v0.9.0) is gated: the absolute SLO on the clean stages plus
-   the run's own completeness and endpoint checks. With the previous tag's
-   file it then compares per test type: **a tool must not lose capacity, must
-   not break its SLO earlier, must not wedge where it did not and must not
-   drift**; a violation blocks the tag until fixed or explicitly waived
-   (record the waiver in `HANDOFF.md`). Only same-schema, same-host runs are
-   comparable, so a baseline from another host or another `workload_version`
-   is not a gate input. A run that predates a field the gate needs (the
-   endpoint record, the revision) is reported as `LEGACY`: neither a pass nor
-   a violation — the gate names what it could not verify, and the count of
-   those checks is printed in the summary.
+2. `just soak` — run the sweep (one tool or a batch of them, per its own
+   shaped path in one HTB class each, so concurrent tools never share a
+   shaper; the batch size comes from the host's CPU budget). Writes
+   `benches/scripts/soak/results-soak-vX.Y.Z.json` (the default `--out`
+   derives from `Cargo.toml`'s version). Test types: `capacity` (ramp the
+   load until the interactive stream breaks the SLO), `rrul` (saturate and
+   watch the interactive stream's RTT distribution over time), `soak` (a
+   long rotating-path drift/leak run), `cost` (CPU-seconds per carried
+   Gbit/s at a fixed operating point), `screen` (a fast development A/B —
+   see below).
+3. `just soak-plot` — renders the chart set (`assets/soak-vX.Y.Z.png`: the
+   interactive stream over the stage schedule with the SLO line;
+   `soak-*-capacity.png`: the response-time-vs-load curve; `soak-*-udp.png`;
+   `soak-*-drift.png`) and prints the markdown tables; update the README
+   Benchmarks section with them, then delete the previous tag's charts from
+   `assets/`.
+4. `just soak-check` — regression gate against the previous tag's results
+   file. **A tool must not lose capacity, must not break its SLO earlier and
+   must not drift**; a violation blocks the tag until fixed or explicitly
+   waived (record the waiver in `HANDOFF.md`). On the first soak release
+   there is no same-model baseline: the gate is the absolute SLO, and that
+   is stated in the README.
 
 The gate runs locally before tagging, never in CI: shared runners are too
 noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
 (netem); without it the run aborts — there is no userspace fallback, because
 a fallback path is a second measurement method. The gate is only meaningful
-between same-model results: the retired matrix's numbers (v0.8.x and
-earlier, in git history — its runner, charts and result files are no longer
-in the tree) measured cold cells with medians over reps, so they are a
-different instrument and never a regression signal against this model.
-`benches/scripts/soak/soak_check.py` is the companion that applies the
-run's self-check, the per-type threshold rules and the screen verdict.
+between same-model results; the retired matrix model's numbers (v0.8.0 and
+earlier, in git history) are a different instrument and are never a
+regression signal. `benches/scripts/soak/soak_check.py` is the companion
+that applies the per-type claim rules and the screen verdict.
 
 ### Comparing two builds (development screening)
 
@@ -153,19 +132,14 @@ just soak --test=screen --path=loss1 --streams-max=8 \
 just soak-check --screen results-screen.json    # per-step verdict
 ```
 
-The run and the verdict are the fast, development-time form of
-[benchmarks.md](benchmarks.md#reproduce-it-yourself)'s two-build comparison —
-minutes instead of a sweep.
-
-The verdict prints per-step values for both builds, the effect size, and a
-CLAIM only where **every** step favours the same build by more than the
-threshold (in either direction: a claim against the change is as much a
-verdict as one for it); anything else is reported as *directional*. A screen
+The verdict prints per-step medians for both builds, the effect size, and a
+CLAIM only where every step agrees in sign and exceeds the threshold;
+anything else is reported as *directional* with its effect size. A screen
 verdict is **domain-scoped**: it says whether to pursue the direction on
 that path class, never whether the change may ship — the sweep and the gate
-decide that. The retired matrix's `--ab` mode did the same job for the old
-model; the screen is its successor and adds the SLO instrument as the second
-measured axis.
+decide that. `bench.py`'s retired `--ab` mode did the same job for the old
+matrix; the screen is its successor and adds the SLO instrument as the
+second measured axis.
 
 ## What the release workflow does
 

@@ -7,11 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet: v0.9.0 below is the state being prepared, and the next change
-opens its own section here.
-
-## [0.9.0] - 2026-09-25
-
 ### Changed
 
 - **The benchmark model was replaced: the measurement matrix is retired and
@@ -40,6 +35,8 @@ opens its own section here.
   the release review now requires `results-soak-vX.Y.Z.json` and
   `assets/soak-vX.Y.Z.png`.
 
+## [0.9.0] - 2026-09-24
+
 > **Measurement note.** Several A/B figures quoted below were first taken
 > with the benchmark harness's broken `--ab` mode, which spawned the default
 > binary on both sides of an interleave and therefore compared one binary
@@ -51,33 +48,7 @@ opens its own section here.
 > branch-vs-`main` cumulative comparison and the v0.9.0 release matrix were
 > run entirely with the fixed harness.
 
-### Fixed
-
-- **A KCP data channel no longer fragments on a path smaller than its
-  datagram.** UDP does not negotiate a path MTU: Linux fragments an oversized
-  datagram by default, so on a 1280-byte path every 1400-byte KCP datagram
-  became two fragments and one lost fragment cost the whole datagram — enough
-  to take the KCP carrier from 0.37 Gbit/s to **zero** on a 1 %-loss path while
-  the TCP arms were unaffected. Each session now reads the kernel's path MTU
-  and shrinks its datagram to fit (IPv4; shrink-only; re-checked once a second
-  because a session outlives the path it started on). The TCP carriers already
-  had this from the kernel.
-
 ### Added
-
-- **The benchmark can measure cold start** (`--test=reconnect`): how long from
-  a client start until every registered service answers, per service, five
-  repetitions per build, interleaved when two builds are compared. It is the
-  first instrument for a cost every other probe is blind to — they all dial a
-  running tool — and it reports ~154 ms on a clean loopback path on this host.
-
-- **The UDP visitor path has drop counters** (`MOLEHILL_UDP_STATS=1`): the
-  server's datagram reader distinguishes a full worker queue (the loss the
-  design accepts instead of head-of-line blocking every visitor) from "no data
-  channel was ready yet" (the registration/reconnect window), counts each, and
-  logs both once a second under the same opt-in convention as the KCP and mux
-  counters. Routing now returns its outcome instead of only counting, so the
-  decision is testable without racing on process-global statics.
 
 - **Noise session resume** (`[transport.noise] resume = true`, default
   off): a reconnect proves possession of the previous session's
@@ -406,117 +377,6 @@ opens its own section here.
   cell of any matrix (it had only ever been measured on loopback before). Every
   figure in this section quoted from an affected run has been re-taken or
   explicitly withdrawn above.
-
-- **The Soak harness had three defects that made parts of a run wrong or
-  unreadable, all of them silent.** (1) The Noise keypair helper raised
-  `NameError` on first use: the memo it read was never defined, so every
-  `noise` / `kcp4` / `noise-direct` variant died before it measured
-  anything. (2) The single-run lock and the stale-process sweep both
-  identified a live run by the string `bench.py` — the runner the matrix
-  retired — so concurrent runs stopped being refused and the sweep could
-  kill a live run's processes. (3) The SLO, the soak/cost load fractions and
-  the per-stage statistics were partly dead: `SOAK_SLO_RTT_P99_MS` and
-  `SOAK_SOAK_LOAD_FRACTION` were accepted and ignored, the capacity verdict
-  ignored the interactive error rate that its own SLO documents, and the
-  charts computed every per-stage statistic against a time base that
-  selected no samples at all (so no stage percentile was ever drawn). The
-  runner now records the revision, the binary version, the endpoints each
-  probe dialed and every knob it used, and `soak_check.py` re-checks the
-  endpoint invariant, the series completeness and the absolute SLO against
-  that record before it compares anything to a baseline.
-
-
-### Changed
-
-- **The Soak charts were rebuilt around one question per figure.** The first
-  release's set mixed a linear RTT axis (a single 7000 ms outlier flattened
-  every stage below 100 ms), a missing legend entry for the throughput line
-  and a "loss events" panel that plotted a constant `1` for every loss. The
-  set is now: the master (per tool, log RTT with per-stage p50/p99 and the
-  bulk throughput over the shared stage schedule, wedges marked on the
-  bottom edge), `-stages.png` (small multiples — one panel per stage, a
-  lollipop per tool, so tool-vs-tool per condition reads at a glance),
-  `-capacity.png`, `-udp.png` (RTT plus a sliding loss *rate* derived from
-  the probe's own attempt stream), `-drift.png` (with every fitted slope
-  printed) and `-cost.png`. Each figure carries its method constants and
-  revision in the footer, and a tool keeps its colour across the whole set.
-- **Unsafe is now denied crate-wide** (`unsafe_code = "deny"`, was `warn`),
-  so an unexpected `unsafe` fails a plain `cargo build` instead of only the
-  `-D warnings` gate. The one module that needs it — the `recvmmsg`/`sendmmsg`
-  batching FFI — keeps its per-item `#[expect(unsafe_code, reason = ...)]`
-  with a `SAFETY` comment; the alternatives were evaluated against their
-  sources and are recorded in docs/lint-policy.md ("Unsafe"): `nix` cannot
-  drop the `Send`/`Sync` proofs (its `MultiHeaders` is itself `!Send`) and
-  `quinn-udp` would change the KCP send path's GSO semantics. Two clippy
-  waivers were removed outright on the way: the KCP stats clock now converts
-  nanoseconds with `Duration::as_secs_f64()` and masks the 32-bit protocol
-  wrap instead of casting, so both cast waivers are gone.
-- The python bench scripts are format-checked as well as lint-checked: the
-  pre-commit chain now runs `uvx ruff format --check benches/scripts/`
-  beside `uvx ruff check`, `just py-lint` runs both and `just py-fmt`
-  auto-fixes. The ruff waiver list shrank to the one entry that is true of
-  every script here (they measure PATH binaries), with the rest waived
-  inline at their own sites and a named reason each.
-- The docs-only path CI already had (`ci.yml` / `docs.yml`) is now mirrored by
-  the hooks: `githooks/docs-only` classifies the staged paths (commit) or the
-  pushed range (push), and a change limited to markdown, `docs/**` or
-  `assets/**` runs only the two gates it can move — the secret scan and the
-  docs-alignment check — instead of the whole Rust chain. Anything ambiguous
-  (empty change set, new branch, tag push, or a commit mixing docs with code)
-  falls back to the full chain, and deleting the classifier restores it.
-- **HANDOFF.md was restructured and condensed** (1762 → ~770 lines): it now
-  opens with the branch's state and the theme planned for the next update
-  (measure the three unmeasured data-path axes — establishment, fragmentation,
-  reconnect — then fix what they show), keeps the landed-work index, the
-  gated candidate table and the open items, and compresses the historical
-  measurement record to the verdicts, numbers and commits that carry it. An
-  Everything measured before the Soak model is now bannered as **historical
-  context, not evidence** — the matrix harness was proven wrong in ways that
-  were invisible at the time (`--ab` spawned one binary on both sides, a
-  verdict could be read with the sides swapped, the memory axis read a key
-  that never existed, several headline figures never reproduced), so those
-  numbers may not be quoted, compared or gated on. One verdict was corrected
-  in place first (a throughput claim that did not exceed its own ordering
-  floor); the rest was left as written and demoted.
-- **The documentation set was given an ownership contract.** Every page now
-  owns one topic and links to the others (the routing table is in AGENTS.md
-  §3, the audience-and-scope table in docs/structure.md): the landing pages
-  describe what is true now, `docs/benchmarks.md` (+ its Chinese mirror) is
-  the home of the benchmark method — what is measured, how to read the
-  charts, the stage schedule, the SLO, the test types, the per-decision
-  measurements and how to reproduce a run — `docs/configuration.md` owns what
-  each setting does and hands the measured costs to that page, and
-  `docs/release.md` owns the ritual instead of re-explaining the method.
-  Migration and deprecation narrative ("what replaced the old tables") is out
-  of the user-facing pages; it lives in this changelog, the release notes and
-  HANDOFF.md. `githooks/check-docs` now enforces the parts that can be
-  grepped: every page has an owner, user-facing pages have a mirror with the
-  same structure, and the READMEs link each page in their own language.
-- **The configuration, transport and contributor documentation was aligned
-  with the code it describes.** Five documented behaviours were wrong or
-  unenforced and are now stated as they are: privileged ports inside an
-  `allow_ports` range are *not* treated specially (the OS decides), the
-  tunnel-count ceiling is 64 streams per tunnel, `retry_interval` is the
-  backoff cap rather than a fixed interval (after three tries the client
-  falls back to 1 s), `nodelay` only reaches the sockets the client owns,
-  and a `psk` is silently unused unless the configured noise `pattern`
-  carries a PSK modifier. The `x448` keygen promise was dropped (the
-  shipped `snow` backend has no X448). The `count × 64` arithmetic, the
-  `[client.data]` behaviour in a multiplex-less build and the
-  `MOLEHILL_STRIPE_COUNT` override are stated where they belong, and the
-  Chinese configuration page regained the facts it had dropped for
-  `resume`. The landing pages, the release ritual and the contributor docs
-  were re-grouped by audience (users vs contributors) and stripped of the
-  retired measurement matrix's vocabulary.
-- A release now fails fast on a stale ritual: `release.yml` refuses an
-  undated changelog section and a missing `results-soak-vX.Y.Z.json` /
-  `assets/soak-vX.Y.Z.png`, and both it and the test-build workflow take a
-  concurrency group so two runs cannot race on the same release or cache.
-  The `githooks/check-docs` gate now checks every command a hook runs (not
-  only `cargo` ones), checks the reverse direction (a documented gate that
-  no hook runs), and pins the docs index on both READMEs. `--version` now
-  reports the commit SHA it always printed a line for, and marks a dirty
-  tree.
 
 ## [0.8.1] - 2026-09-11
 

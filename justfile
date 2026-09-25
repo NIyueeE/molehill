@@ -4,8 +4,7 @@
 default:
     @just --list
 
-# One-time setup per clone: activate git hooks + install missing check tools
-# (the ruff gate needs uv/uvx; `just powerset` needs cargo-hack).
+# One-time setup per clone: activate git hooks + install missing check tools.
 setup:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -20,17 +19,6 @@ setup:
             cargo install "$tool" --locked
         fi
     done
-    if command -v uvx >/dev/null 2>&1; then
-        echo "ok:      uvx"
-    else
-        echo "install: uvx  (the python bench gate; run:"
-        echo "          curl -LsSf https://astral.sh/uv/install.sh | sh)"
-    fi
-    if command -v cargo-hack >/dev/null 2>&1; then
-        echo "ok:      cargo-hack"
-    else
-        echo "missing: cargo-hack (needed by 'just powerset'; install: cargo install cargo-hack --locked)"
-    fi
     echo "setup complete"
 
 # Auto-fix formatting across the workspace.
@@ -41,7 +29,7 @@ fmt:
 test:
     cargo test -- --test-threads=1
 
-# Run the full check chain (identical to hooks + CI: fmt/secrets/machete/docs/ruff/clippy + audit/deny/outdated/test).
+# Run the full check chain (identical to hooks + CI: fmt/secrets/machete/docs/clippy + audit/deny/outdated/test).
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -106,11 +94,6 @@ test-fast:
 # Lint the python bench/test entries (ruff via uvx; also in the pre-commit gate).
 py-lint:
     uvx ruff check benches/scripts/
-    uvx ruff format --check benches/scripts/
-
-# Auto-fix the python bench/test entries' formatting (ruff format).
-py-fmt:
-    uvx ruff format benches/scripts/
 
 # Build the scratch container image from a release musl binary (see Containerfile).
 container:

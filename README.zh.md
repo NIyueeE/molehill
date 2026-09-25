@@ -26,9 +26,6 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 - [molehill](#molehill)
   - [特性](#特性)
-  - [基准测试](#基准测试)
-    - [如何选配置](#如何选配置)
-    - [molehill vs 明文 TCP 对端](#molehill-vs-明文-tcp-对端)
   - [快速开始](#快速开始)
   - [部署](#部署)
     - [二进制](#二进制)
@@ -51,46 +48,66 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 ## 基准测试
 
-单机对比(`访客 → 服务端 → 客户端 → 后端`,四跳都在同一台机器上)。一切
-**穿过隧道**测量:探针拨的是每个工具的暴露端口,绝不直接连它转发的后端。
-对端工具为最新 GitHub release 构建(frp、rathole 上游、nps,版本随每次运行
-一起记录)。每个工具都被驱以**完全相同的工作负载**,同时网络条件按脚本化的
-阶段表原地切换,因此工具会话从不重建——它如何适应劣化再恢复的路径,本身就是
-测量的一部分。
+单机对比(`访客 → 服务端 → 客户端 → 后端`,四跳都在同一台机器上);一切
+**穿过隧道**测量——探针拨的是每个工具的暴露端口,绝不直接连它转发的后端。
+对端工具为最新 GitHub release 构建(frp、rathole 上游、nps——版本按次运行
+记录在结果 meta 中)。每个工具都被驱以**完全相同的工作负载**,同时网络条
+件按脚本化的阶段表变化(netem 塑造整个 `lo`,每一跳都受影响,且原地切换,工
+具会话从不重建);指标集合与测试类型见[方法论](#方法论)。以下是本主机的
+v0.9.0 数字;只有同模型、同主机的运行之间才可互相比较。
 
 ### 如何选配置
 
-默认值——`mode = "multiplex"`、`count = 4`、`carrier = "tcp"`、明文传输
-——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。怎么落地:全局默认
-在 `[client.data]`,每个服务可在自己的 `[client.services.<name>]` 上单独覆盖
-`mode` / `count` / `carrier`——同一客户端可以混跑 mux 交互服务与 `direct`
-大流量服务,还能用 `remote_addr` 把个别服务指向不同的 molehill 服务端。
-`[transport]` 见[配置](docs/configuration.zh.md),noise 密钥见
-[传输](docs/transport.zh.md)。
+下面的测量为默认值背书,并告诉你在何时偏离:
 
-**怎么选:分步走。** 从默认值出发,回答三个关于你负载的问题;一次只改一项,
-改完在**你自己的路径上**复测:
+| 配置 | 何时使用 | 实测代价 |
+|---|---|---|
+| **`mode = "multiplex"`(默认)** | 一个客户端暴露**多个服务**,或连接高频开合(HTTP/游戏会话);连接资源重要(FD、端口、**NAT 映射**——NAT 后每条物理隧道占一个映射) | 回环单流 10.0 Gbit/s(`direct` 为 19.2——一条 yamux 流受限于单条隧道流),8 流 19.5;yamux 上限把并发连接钉在 `count × 64`(默认 `count = 4` 即 256——64 可用) |
+| **`mode = "direct"`** | 单个服务或少数长连接(SSH);**原始吞吐优先**(大流量传输):回环 19.2/23.3 Gbit/s | 每条流一条物理隧道:FD/端口/NAT 映射随流数增长;每连接建连成本真实存在(churn p99 ~3.5 ms,16 路并发)但在 `pool_size = 8` 下不可见;足迹最小(约 15.5 MiB)、CPU 更低(单隧道 216% 单核) |
+| **`count = 4`(默认)** | 并发流多,或链路有损:独立隧道隔离队头阻塞并**聚合超过单流** | 每服务 4 条物理连接(FD/端口/NAT 映射),CPU 约 494% 单核(单隧道 216%);回环 8 流 19.5 vs `count = 1` 的 9.2 Gbit/s,1% 丢包 12.3 vs 4.5,突发丢包 13.3 vs 4.5;10 ms 的 HoL 最大值更低(80.7 vs 100.1 ms) |
+| **`count = 1`** | 单条长连接、连接预算紧张,或要最小足迹与更低的 CPU(约 16 MiB / 216%) | 单 TCP 流天花板;没有聚合(回环 8 流 9.2 Gbit/s);所有流共享一个重传域 |
+| **`carrier = "kcp"`**(实验性) | TCP 数据隧道被封锁/限速时,或**高延迟下的延迟优先 UDP** | 只要路径不是瓶颈就远落后于 TCP 载体(回环 8 流 1.1 vs 14.9 Gbit/s、rtt10 0.79 vs 5.45、loss1 0.71 vs 7.74),RSS 约 2.5-3 倍(83 vs 26 MiB)、CPU 更低;最明确的优势是 rtt100 会话质量(最大包间隔 20 ms vs TCP 各 arm 的 100+) |
+| **`[server.data] stripe_count = K`**(实验性) | 单条长连接不能被单条隧道流钉死:每个访客连接摊到 `K` 条数据通道上,其天花板与在途窗口成为各通道之和 | 每访客 `K×` 数据通道与任务,接收侧重排缓冲;单流 A/B 及其代价面记录在 HANDOFF.md"Stripe A/B (K=4)" |
+| **noise** | 要加密且**内存与简单性优先**:预共享公钥、无 PKI | 单流约为明文的 58%、8 流约 76%(5.8/14.9 vs 10.0/19.5 Gbit/s),RTT 亚毫秒,RSS 多约 4 MiB;CPU 持平(470% vs 494% 单核) |
 
-1. **需要加密吗?** 需要 → 设 `[client.transport] type = "noise"` 并放置
-   密钥。不需要 → 保持 `"plain"`。
-2. **一个用户还是很多用户,并发连接多少?** 单条长连接(SSH、单个 Minecraft
-   玩家)→ `direct` 与默认 mux 都可行;低并发下 mux 同样省 NAT 映射。当这条
-   流不该被单条隧道流限制住(单会话大流量)时,设 `[server.data]
-   stripe_count`(K=4)——该连接会摊到 K 条并行数据通道上,代价是每访客
-   K× 通道与有界重排缓冲。多用户 / 高连接频率 / 多服务 → 保持或提高
-   `count`(每条隧道在 yamux 上限前约承载 64 条并发连接——`count = 8`
-   ≈ 512)。
-3. **路径什么状况,是否转发 UDP?** 若 TCP 数据隧道被封锁/限速,或需要高延迟
-   下的延迟优先 UDP,值得 A/B 试 `carrier = "kcp"`。否则保持 TCP 载体。
-   有损/wifi 路径保持 `count >= 4`:它能聚合并隔离队头阻塞;`count` 按
-   "每隧道连接上限"选(`count = 1 -> 64` 条连接,`count = 4 -> 256`)。
+如何应用:全局默认在 `[client.data]`,每个服务可在自己的
+`[client.services.<name>]` 上单独覆盖 `mode`/`count`/`carrier`——同一
+客户端可以混跑 mux 交互服务与 `direct` 大流量服务,还能用 `remote_addr`
+把个别服务指向不同的 molehill 服务端(服务端按连接自适应,无需改配置)。
+`[transport]` 见[配置](docs/configuration.md);noise 密钥见
+[传输](docs/transport.md);可运行的配置见[快速开始](#快速开始)与
+[完整示例](./docs/configuration.zh.md#完整示例)。
 
-在这两个数之间做取舍,最好在**你自己的路径上**测,而不是从表里读:
-**可持续负载**(交互流仍满足 50 ms SLO 时,工具能扛多少条 bulk 流)与
-**工作点成本**(每承载 1 Gbit/s 的 CPU 秒)。已发布的运行测到了什么、各项配置
-选择的实测代价、以及如何在自己的机器上跑同一套对比,见
-[基准测试](docs/benchmarks.zh.md);各设置本身见
-[配置文档](docs/configuration.zh.md#选择配置决策树)。
+**怎么选:分步走。** 从默认值(`multiplex`、`count = 4`、
+`carrier = "tcp"`、明文)出发,回答三个关于你负载的问题;一次只改一项,
+改完复测:
+
+1. **需要加密吗?** 需要 → `[client.transport] type = "noise"` 并放置密钥
+   (代价:单流约 -42%,5.8 vs 10.0 Gbit/s,8 流约 -24%;需求低于
+   ~2 Gbit/s 时无感;RTT 亚毫秒、RSS 多约 4 MiB)。不需要 → 保持
+   `"plain"`。
+2. **单人还是多人?并发连接多少?** 单条长连接(SSH、单玩家 Minecraft)→
+   `direct` 或默认 mux 都行;低并发下 mux 还省 NAT 映射。多人/高频开合/
+   多服务 → 保持或加大 `count`(每条隧道约承载 64 条并发连接,yamux
+   上限——`count = 8` ≈ 512)。若这一条流不能被单条隧道流钉死(单会话
+   大流量),设置 `[server.data] stripe_count`(K=4)——连接随即跑在 K
+   条并行数据通道上,代价是每访客 K× 通道与有界的重排缓冲。
+3. **路径什么状况,是否转发 UDP?** 若 TCP 数据隧道被封锁/限速,或需要
+   高延迟下的延迟优先 UDP,值得 A/B 试 `carrier = "kcp"`(rtt100 会话最大
+   间隔 20 ms vs TCP 各 arm 的 100+)。否则保持 TCP 载体:UDP 阶梯与队头
+   探针都没有显示默认配置存在可复现的"负载下 UDP 惩罚"(两轮里出现的
+   100% pinger 丢包在第三轮回到 2%)。有损/wifi 路径 → 保持
+   `count >= 4`:它能聚合(1% 丢包 8 流 12.3 vs 4.5 Gbit/s)并让 10 ms 的
+   HoL 最大值更低;`count` 按"每隧道连接上限"选
+   (`count = 1 → 64` 条连接,`count = 4 → 256`)。
+
+
+**为自己的场景测一遍。** v0.9.0 模型对每个配置给两个数,而不是一个吞吐
+数字:**可持续负载**(交互流仍满足 50 ms SLO 时,工具能扛多少条 bulk 流)和
+**工作点成本**(每承载 1 Gbit/s 的 CPU 秒)。`just soak --test=screen --ab
+<parent>,<head>` 可在分钟级对*你自己的*负载做 A/B,并打印该差异是 claim
+还是 directional。退役矩阵在这里引用逐格平均值;它们已删除,因为“每格冷启
+动的一个平均値”回答不了“路径变化时会发生什么”。
 
 ### molehill vs 明文 TCP 对端
 
@@ -102,12 +119,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 ![Soak: molehill 与对端在阶段日程上的形态](assets/soak-v0.9.0.png)
 
-同一轮数据的小倍数图——每个阶段一个面板,每个工具一根棒棒糖(圆点 = p50,
-横杠 = p99,竖线 = 最差一秒),"哪个工具在哪个条件下更好"不用查表就能看出来:
-
-![逐阶段、逐工具的交互流 RTT](assets/soak-v0.9.0-stages.png)
-
-**交互流 RTT p99,逐阶段**(ms;"wedge" = 该流超过 5 秒没有任何响应):
+**交互流 RTT p99,逐阶段**(ms;"wedge" = 该流静默超过 5 秒后恢复):
 
 | 工具 | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean(回归) |
 |---|---|---|---|---|---|---|---|---|
@@ -121,19 +133,66 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 nps 全程 0.14。
 
 **这些形状说明什么。** 每个工具在劣化档上都退化、在回归 clean 档上都恢复
-——最后一段测的就是这个恢复;一个保持 wedge 的工具就是一个发现。交互流的 p99 才是新
+——最后一段的意义就在恢复;一个保持 wedge 的工具就是一个发现(确有一个:
+本 harness 的第一个版本把控制通道也整形了,rate100 档的心跳超时直接把工具
+打楔;现在 harness 让控制面保持不整形,方法里已写明)。交互流的 p99 才是新
 访客真正感受到的东西:饱和状态下它是区分工具的那个数,也正是吞吐轴的盲区
 ——molehill 与 rathole 在 clean 档上 bulk 几乎相同(17.0 对 16.9 Gbit/s),
 而一次全新交互连接的代价是 7.6 ms 对 81 ms;在 1% 丢包档两者 bulk 都约 4.9
 Gbit/s,交互流则是 1334 ms 对 1311 ms。对端由同一份工作负载驱动,画在同一批
 面板里;漂移轴(全程的打开 fd、RSS 与 CPU 斜率)见
-`soak-v0.9.0-drift.png`,UDP 会话的 RTT/丢包见 `soak-v0.9.0-udp.png`(画的是
-滑动丢包**率**,不是丢包事件的计数)。
+`soak-v0.9.0-drift.png`,UDP 会话的 RTT/丢包见 `soak-v0.9.0-udp.png`。
 
-以上是本主机上的 v0.9.0 数字,只有同模型、同主机的运行之间才可直接比较。
-怎么细读一张图(对数轴、阶梯线、wedge 红条、每个色带代表什么)、阶段日程、
-测试类型,以及如何在自己的硬件上复现一轮:
-[基准测试方法](docs/benchmarks.zh.md)。
+### 怎么读这些数(以及旧表格被什么取代)
+
+v0.9.0 替换了测量模型:退役的矩阵测的是**格**(每工具每网络条件一个平均
+值,每格冷启动),现在测的是**时间上的工作负载**。旧的逐格表格及其图表
+(逐格吞吐、count/carrier/transport 各自为图)随之删除;v0.8.x 的发布说明
+保留其历史数字,模型方法见[方法论](#方法论)与
+[docs/release.md](docs/release.md)。退役模型的数字永远不是对本模型的回归
+信号。
+
+### 方法论
+
+- **测量的单位是工作负载,不是格。** 每个工具都被驱以同一份客户端侧的工作
+  负载——1 条交互流(每 ping 一次到 echo 服务的新 TCP 连接,即 SLO 仪器)、
+  N 条 bulk TCP 流(iperf3)、每秒 C 次短连接(churn 连接器)、1 条 UDP 会
+  话——同时路径按脚本化的阶段表推进。工具进程只启动一次,整形原地切换
+  (每工具 class 一次 `tc qdisc change`),因此会话从不重建,**适应过程本身
+  就是测量的一部分**。
+- **阶段**:`clean`(150 s——冷启动加基线)、`rtt100`、`loss1`、`loss5`、
+  `rate100`、`rate20`、`jitter`(各 120 s),然后再 `clean`(150 s——恢复
+  轴)。顺序、时长、保护带与每个采样率都记入结果 meta,因为它们是方法参数
+  (AGENTS.md §10)。
+- **SLO 是方法常量**:交互流 RTT p99 = 50 ms 且零错误——它是每张图上的那
+  根线,也是容量测试的中止条件。
+- **测试类型**:`capacity`(ramp bulk 负载直到交互流破 SLO——可持续负载加
+  完整响应时间曲线)、`rrul`(N = CPU 核数,看交互流 RTT 分布**随时间**——
+  饱和排队检测器)、`soak`(长时间轮换路径:漂移/泄漏轴)、`cost`(固定工作
+  点上每承载 Gbit 的 CPU 秒)、`screen`(快速开发 A/B,在每个负载档内交替
+  两个构建)。
+- **隔离**:每个工具拥有自己的端口带;并发运行时还各有一个 HTB class 与独立
+  netem——同一批里的两个工具绝不共享速率桶、丢包过程或队列。批大小来自
+  主机 CPU 预算(核数 ÷ 每对 CPU,记入 meta)。交互与 UDP 探针跑在各自独立
+  的进程里,harness 永远不在被测路径上。
+- **一切外部可测**:吞吐与重传来自 iperf3 的每区间流,RTT/丢包/抖动来自探
+  针,RSS/CPU/打开 fd/线程数来自 `/proc`。这正是对端能用同一份工作负载被
+  测量的原因——也正是 molehill 自己的内部计数器(mux/KCP)被排除在比较之
+  外的原因。
+- **派生数字**:每阶段每条序列的 p50/p99/max、最差 1 秒窗口(稳定性轴)、
+  漂移斜率(泄漏是斜率不是水位)与压平段——交互流静默超过 5 s 记为一次
+  wedge 及其时长,绝不是一个裸 null。
+- **并行是被验证的,不是被假设的**:同一工具单独跑一次、再放进满批里跑一
+  次;若逐阶段数字在 claim 规则之外不一致,那么本主机的批大小就是实测出
+  来的那个数,并记入 meta。
+- **纪律**:热身保护带不计入派生统计,每次失败都留下其类型化原因,任何判据
+  工具都不会在分布之外单独发布一个平均值。退役的矩阵(v0.8.x 及更早)测的
+  是冷启动格与 rep 中位数——那是另一套仪器;它的数字留在 git 历史与发布
+  说明里,永远不是对本模型的回归信号。
+- **复现**:`just soak-peers` → `just soak` → `just soak-plot` →
+  `just soak-check`(原始数据在
+  `benches/scripts/soak/results-soak-v0.9.0.json`;仪式与门见
+  docs/release.md)。
 
 ## 快速开始
 
@@ -238,17 +297,15 @@ Quadlet（`molehill-server.container` / `molehill-client.container`）。
 
 ## 文档
 
-给部署和使用 molehill 的人：
+使用 molehill：
 
 - [配置文档](./docs/configuration.zh.md) — 完整的配置规范、日志和调优
 - [传输层](./docs/transport.zh.md) — Noise Protocol 配置
-- [基准测试](./docs/benchmarks.zh.md) — 已发布数字是怎么测出来的、怎么读、怎么复现
 - [构建指南](./docs/build-guide.md) — 构建定制、最小化二进制
 - [内部原理](./docs/internals.md) — 控制通道和数据通道的工作原理
 - [配置示例](./docs/configuration.zh.md#完整示例) — 常见场景的配置(含 systemd 与容器部署)
 
-给改动这个仓库的人(贡献与治理类文档按决定只保留英文,见
-[AGENTS.md](./AGENTS.md) §3):
+贡献与工程：
 
 - [检查门](./docs/checks.md) — 每个门运行什么、被拦住时怎么办
 - [Lint 策略](./docs/lint-policy.md) — lint 级别与豁免规则
@@ -267,7 +324,7 @@ git hooks 守护每次 commit、push 与发布 tag，CI 对**涉及代码**的�
 
 ```bash
 just setup   # 激活 git hooks（core.hooksPath githooks）并安装检查工具
-just check   # fmt / secrets / machete / docs / ruff(check + format) / clippy + audit / deny / outdated / test
+just check   # fmt / secrets / machete / docs / clippy + audit / deny / outdated / test
 just tag     # 发布审查（githooks/pre-tag）+ 创建本地 v* tag
 ```
 

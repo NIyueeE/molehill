@@ -27,8 +27,8 @@ pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不�
 
 ### 生成密钥对
 
-运行 `molehill --genkey`,生成一对 X25519 密钥(这是随包发布的 `snow`
-后端唯一提供的曲线):
+运行 `molehill --genkey`,用默认的 X25519 算法生成密钥对(传 `x448` 可用
+X448):
 
 ```sh
 $ molehill --genkey
@@ -115,11 +115,9 @@ remote_public_key = "server-pub-key-here"
 
 ### 预共享密钥
 
-`psk` 与 `psk_location` 为握手增加预共享密钥。只有配置的 `pattern` 在
-`psk_location` 处带有 PSK 修饰符(如 `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`)
-时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝。密钥 base64
-解码后必须恰好是 32 字节(在建立握手时检查),且两端使用相同的 `psk` 与
-`psk_location`:
+`psk` 与 `psk_location` 为握手增加预共享密钥。pattern 必须包含 PSK
+修饰符(如 `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`),密钥必须是 32 字节
+base64 编码,且两端使用相同的 `psk` 与 `psk_location`:
 
 ```toml
 [server.transport.noise]

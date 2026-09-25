@@ -1,23 +1,10 @@
 #!/usr/bin/env bash
-# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + python lint/format (ruff) + strict clippy.
-# A change limited to markdown, docs/ or assets/ cannot move the code gates, so
-# it runs only the two gates it CAN break (the secret scan and the
-# docs-alignment check) — the same split CI makes with ci.yml / docs.yml.
+# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + python lint (ruff) + strict clippy.
 # Heavyweight gates (audit / deny / outdated / test) live in githooks/pre-push.
 # Activate via: git config core.hooksPath githooks   (or: just setup)
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
-
-if git diff --cached --name-only --diff-filter=ACMRD | githooks/docs-only; then
-  echo "==> docs-only change: skipping the code gates (fmt / machete / ruff / clippy)"
-  echo "==> secret scan (githooks/check-secrets)"
-  githooks/check-secrets
-  echo "==> docs alignment (githooks/check-docs)"
-  githooks/check-docs
-  echo "pre-commit checks passed (docs-only)"
-  exit 0
-fi
 
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
@@ -31,11 +18,8 @@ cargo machete
 echo "==> docs alignment (githooks/check-docs)"
 githooks/check-docs
 
-echo "==> ruff check (python bench/test entries, see ruff.toml)"
+echo "==> ruff (python bench/test entries, see ruff.toml)"
 uvx ruff check benches/scripts/
-
-echo "==> ruff format --check (same scope; auto-fix with: just py-fmt)"
-uvx ruff format --check benches/scripts/
 
 echo "==> cargo clippy (strict lints from Cargo.toml, default features)"
 cargo clippy --all-targets -- -D warnings

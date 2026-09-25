@@ -23,7 +23,7 @@ use rand::TryRng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
@@ -1084,7 +1084,6 @@ impl ControlChannelHandle {
                 info!(service = %service.name, "Listening at {}", service.bind_addr);
                 let buffer_size = service.udp_buffer_size;
                 let data_ch_req_tx = data_ch_req_tx.clone();
-                spawn_udp_stats();
                 tokio::spawn(
                     async move {
                         if let Err(e) = run_udp_connection_pool::<DataChannel>(
@@ -1509,21 +1508,13 @@ where
             }
             recv = l.recv_from(&mut buf) => match recv {
                 Ok((n, from)) => {
-                    match route_udp_datagram(
+                    route_udp_datagram(
                         &workers,
                         &routes,
                         &mut next_worker,
                         from,
                         Bytes::copy_from_slice(&buf[..n]),
-                    ) {
-                        UdpRouteOutcome::Enqueued => {}
-                        UdpRouteOutcome::DroppedQueueFull => {
-                            UDP_DROPS_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
-                        }
-                        UdpRouteOutcome::DroppedNoWorker => {
-                            UDP_DROPS_NO_WORKER.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    );
                 }
                 // Linux surfaces a stale ICMP error (the recipient of an
                 // earlier datagram has gone) as ECONNREFUSED on the next
@@ -1560,78 +1551,6 @@ where
     Ok(())
 }
 
-// --- visitor-datagram drop counters (opt-in line, MOLEHILL_UDP_STATS) -------
-//
-// The single socket reader never blocks: a full worker queue drops the
-// datagram, exactly what UDP peers tolerate, instead of head-of-line blocking
-// every other visitor. That design choice had no number attached to it — the
-// drop was visible only as a `debug!` line — so "is the queue depth right?"
-// could not be answered with evidence. These counters are that number.
-//
-// They count *datagrams the server refused to enqueue*, not datagrams lost in
-// the network or by the peer: `queue_full` is the drop the design accepts,
-// `no_worker` is a datagram that arrived while no data channel was ready (the
-// registration/reconnect window), which is a different failure and is
-// separated for that reason.
-
-/// Drops because the assigned worker's queue was full.
-static UDP_DROPS_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
-/// Drops because no data channel was ready at all (registration window).
-static UDP_DROPS_NO_WORKER: AtomicU64 = AtomicU64::new(0);
-/// Guards the one-time spawn of the periodic line.
-static UDP_STATS_SPAWNED: std::sync::Once = std::sync::Once::new();
-
-/// The two drop counters, for the periodic line and for tests.
-pub(crate) fn udp_drop_stats() -> (u64, u64) {
-    (
-        UDP_DROPS_QUEUE_FULL.load(Ordering::Relaxed),
-        UDP_DROPS_NO_WORKER.load(Ordering::Relaxed),
-    )
-}
-
-/// Spawn the periodic drop line, once per process, when
-/// `MOLEHILL_UDP_STATS` is set. Cumulative counters, like the KCP ones: a
-/// reader that knows the window (or takes the first and last line of a run)
-/// gets a drop *rate*, which is the number a queue-depth decision needs.
-///
-/// Deliberately independent of the KCP stats task: the default carrier is
-/// TCP, so a run can exercise the UDP path without any KCP session existing.
-fn spawn_udp_stats() {
-    if std::env::var_os("MOLEHILL_UDP_STATS").is_none() {
-        return;
-    }
-    UDP_STATS_SPAWNED.call_once(|| {
-        tokio::spawn(async {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                let (queue_full, no_worker) = udp_drop_stats();
-                info!(
-                    queue_full,
-                    no_worker, "udp-stats: cumulative visitor-datagram drops"
-                );
-            }
-        });
-    });
-}
-
-/// What routing one visitor datagram did.
-///
-/// Returned rather than only counted, so the decision is testable without
-/// touching the process-global counters: a counter that can only be asserted
-/// on racily (several tests routing through the same statics in parallel) is a
-/// counter nobody can prove works. The caller counts the outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UdpRouteOutcome {
-    /// Handed to the peer's data channel (sticky or freshly assigned).
-    Enqueued,
-    /// The assigned channel's queue was full — the loss this design accepts.
-    DroppedQueueFull,
-    /// No data channel was ready (the registration/reconnect window).
-    DroppedNoWorker,
-}
-
 /// Send one visitor datagram to the data channel assigned to its source
 /// address, assigning (or re-assigning after a worker died) on the fly.
 ///
@@ -1644,7 +1563,7 @@ fn route_udp_datagram(
     next_worker: &mut usize,
     from: SocketAddr,
     mut data: Bytes,
-) -> UdpRouteOutcome {
+) {
     let now = Instant::now();
     let mut routes = routes.lock().unwrap_or_else(PoisonError::into_inner);
     let workers = workers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1656,11 +1575,11 @@ fn route_udp_datagram(
         match tx.try_send((from, data)) {
             Ok(()) => {
                 route.last_seen = now;
-                return UdpRouteOutcome::Enqueued;
+                return;
             }
             Err(TrySendError::Full(_)) => {
                 debug!("UDP worker queue full, dropping a datagram from {from}");
-                return UdpRouteOutcome::DroppedQueueFull;
+                return;
             }
             Err(TrySendError::Closed((_, back))) => {
                 // The assigned worker died; re-assign below.
@@ -1672,12 +1591,12 @@ fn route_udp_datagram(
     // (Re-)assign the peer to a worker, round-robin over the live ones.
     if workers.is_empty() {
         debug!("No UDP data channel is ready, dropping a datagram from {from}");
-        return UdpRouteOutcome::DroppedNoWorker;
+        return;
     }
     let idx = *next_worker % workers.len();
     *next_worker = next_worker.wrapping_add(1);
     let Some((id, tx)) = workers.iter().nth(idx).map(|(id, tx)| (*id, tx.clone())) else {
-        return UdpRouteOutcome::DroppedNoWorker; // Unreachable: the map is non-empty.
+        return; // Unreachable: the map is non-empty.
     };
     debug!("UDP peer {from} assigned to data channel {id}");
     routes.insert(
@@ -1687,14 +1606,8 @@ fn route_udp_datagram(
             last_seen: now,
         },
     );
-    match tx.try_send((from, data)) {
-        Ok(()) => UdpRouteOutcome::Enqueued,
-        Err(e) => {
-            // The freshly assigned channel refused it: same class as a full
-            // queue (a closed one loses the race with the worker's death).
-            debug!("Dropped a datagram from {from}: {e}");
-            UdpRouteOutcome::DroppedQueueFull
-        }
+    if let Err(e) = tx.try_send((from, data)) {
+        debug!("Dropped a datagram from {from}: {e}");
     }
 }
 
@@ -1840,71 +1753,6 @@ mod tests {
         let table = routes.lock().unwrap();
         assert_eq!(table.len(), 1);
         assert!(table.contains_key(&peer(1000)));
-    }
-
-    /// Routing reports *what it did*; the caller counts it. Asserting the
-    /// outcome keeps this deterministic — the counters are process-global and
-    /// several tests route through them in parallel, so the outcome, not the
-    /// static, is what a unit test can prove.
-    #[test]
-    fn routing_reports_each_drop_reason() {
-        // A worker with capacity 1: the second datagram for the same peer is
-        // refused by the queue.
-        let workers = Arc::new(Mutex::new(HashMap::new()));
-        let routes = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, mut rx) = mpsc::channel(1);
-        workers.lock().unwrap().insert(0, tx);
-        let mut next = 0;
-
-        assert_eq!(
-            route_udp_datagram(
-                &workers,
-                &routes,
-                &mut next,
-                peer(4000),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::Enqueued
-        );
-        assert_eq!(
-            route_udp_datagram(
-                &workers,
-                &routes,
-                &mut next,
-                peer(4000),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::DroppedQueueFull,
-            "a full queue must say so"
-        );
-        // The queued datagram is still there: the drop decision lost nothing.
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err());
-
-        // No live channel at all is a different reason, and says so.
-        let empty: Arc<UdpWorkerMap> = Arc::new(Mutex::new(HashMap::new()));
-        assert_eq!(
-            route_udp_datagram(
-                &empty,
-                &routes,
-                &mut next,
-                peer(4100),
-                Bytes::from_static(b"x")
-            ),
-            UdpRouteOutcome::DroppedNoWorker
-        );
-    }
-
-    /// The opt-in line exists so the design's accepted loss has a number; the
-    /// counters it reads must therefore be wired to the outcomes above.
-    #[test]
-    fn drop_counters_track_their_reason() {
-        let (full0, none0) = udp_drop_stats();
-        UDP_DROPS_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(udp_drop_stats().0, full0 + 1);
-        assert_eq!(udp_drop_stats().1, none0);
-        UDP_DROPS_NO_WORKER.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(udp_drop_stats().1, none0 + 1);
     }
 
     #[test]
