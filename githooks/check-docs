@@ -30,11 +30,16 @@ for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
     errors=$((errors + 1))
     continue
   fi
+  # Extract the gate *commands*, not whole shell lines: a hook line may be a
+  # pipeline or carry control flow (`git diff … | githooks/docs-only || x=0`),
+  # and requiring that literal text in the docs would document noise. The
+  # reverse check below extracts commands the same way, so both directions
+  # speak about the same thing.
   while IFS= read -r cmd; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
-  done < <(grep -E '^(cargo|uvx|just|git|githooks/)' "$hook" \
-             | sed -e 's/[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' \
+  done < <(sed -e 's/[[:space:]]*#.*$//' "$hook" \
+             | grep -oE '(cargo [a-z-]+|uvx [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
              | sort -u)
 done
 

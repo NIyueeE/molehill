@@ -55,6 +55,24 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 
 UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. Idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
 
+### UDP drop counters (`MOLEHILL_UDP_STATS`)
+
+The visitor-datagram reader never blocks: a full worker queue drops the
+datagram (what UDP peers already tolerate) rather than head-of-line blocking
+every other visitor, and the reader separates "no data channel is ready yet" —
+the registration/reconnect window — from queue pressure. Both drops were
+previously visible only as `debug!` lines, so "is the queue depth right?" could
+not be answered with evidence.
+
+With `MOLEHILL_UDP_STATS=1` the server logs a cumulative
+`udp-stats: cumulative visitor-datagram drops` line once a second carrying
+`queue_full` and `no_worker` separately; being cumulative, per-second rates
+come from consecutive lines. The switch is independent of
+`MOLEHILL_KCP_STATS` because the default carrier is TCP — a run can exercise
+the UDP path with no KCP session in existence. The runner records whichever
+`MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
+so an instrumented run is never mistaken for a clean one.
+
 ## Heartbeat
 
 The server sends application-layer heartbeats on each control channel every `[server.control].heartbeat_interval` seconds (`0` disables sending). The client expects some control command within `[client.control].default_heartbeat_timeout` seconds (overridable per service); otherwise it treats the channel as dead and reconnects. The timeout must be greater than the server's `heartbeat_interval`.
