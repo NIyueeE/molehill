@@ -214,8 +214,13 @@ release.
 
 ## Where things stand
 
-**The data-path rework is complete on its own terms; the release is prepared
-and waiting on a benchmark run.**
+**v0.9.0 is released** (2026-09-25). Tag `v0.9.0` on `112372e`; the release
+workflow built nine targets, published the GHCR image and the crates.io crate,
+and created the GitHub Release with its archives and `SHA256SUMS`. The branch
+`perf/data-path-optimizations` is merged into `main` (`c6e8c1f`) and its 34 topic
+commits are the release's history.
+
+**The data-path rework is complete on its own terms.**
 
 This session added two measured improvements on top of it — the KCP path-MTU
 fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no cost
