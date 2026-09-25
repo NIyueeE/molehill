@@ -29,7 +29,6 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
   - [Benchmarks](#benchmarks)
     - [Choosing a configuration](#choosing-a-configuration)
     - [molehill vs the plain-TCP peers](#molehill-vs-the-plain-tcp-peers)
-    - [How to read these charts](#how-to-read-these-charts)
   - [Quickstart](#quickstart)
   - [Deployment](#deployment)
     - [Binary](#binary)
@@ -150,25 +149,11 @@ RSS and CPU slopes over the run) is in `soak-v0.9.0-drift.png` and the UDP
 session's RTT/loss in `soak-v0.9.0-udp.png` (a sliding loss *rate*, not a
 count of loss events).
 
-### How to read these charts
-
-- The dashed red line is the **SLO**: an interactive stream should keep p99 at
-  or under 50 ms. Green bands are the healthy control stages, grey ones are
-  deliberately degraded, and the last band repeats the clean condition to show
-  recovery.
-- Response times are on a **logarithmic** axis — a bad path costs three orders
-  of magnitude, and on a linear axis the healthy stages would be invisible. The
-  solid step line is each stage's median, the dashed one its p99, and a red bar
-  on the bottom edge marks a **wedge**: the stream produced no response at all
-  for more than five seconds. A wedge that never ends is a finding, not a
-  missing number.
-- The second figure shows the same run as one panel per stage (dot = median,
-  bar = p99, tick = worst single second), which is the comparison to read when
-  you care about one condition rather than the whole schedule.
-
 These are v0.9.0 numbers from one host, and only runs of the same model on the
-same host compare directly. The method, the stage schedule, the test types and
-how to reproduce it all: [Benchmarks](docs/benchmarks.md).
+same host compare directly. How to read a chart in detail (the log axis, the
+step lines, the wedge bars, what each band means), the stage schedule, the test
+types and how to reproduce a run on your own hardware:
+[Benchmarks](docs/benchmarks.md).
 
 ## Quickstart
 
