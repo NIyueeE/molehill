@@ -4,15 +4,16 @@
 # ///
 """End-to-end smoke test for the multiplexed data path (0.7.0+).
 
-Requires target/release/molehill built with the default features (which
-include `multiplex`). Starts a local echo backend plus a molehill
-server+client pair using the default `mode = "multiplex"`, registers the service,
-then requires three visitor echo round-trips through the yamux tunnel. This
-used to be the reproduction script for the 0.7.0 stall; the same flow now
-asserts the fixed behavior.
+Not part of the Soak model: this is the scenario check that the tunnel still
+carries a visitor round trip at all (it began as the reproduction script for
+the 0.7.0 stall). Requires target/release/molehill built with the default
+features (which include `multiplex`). Starts a local echo backend plus a
+molehill server+client pair using the default `mode = "multiplex"`, waits for
+the registration, then requires three visitor echo round-trips.
 
 Usage: uv run repro_e2e.py
 """
+
 import atexit
 import contextlib
 import os
@@ -25,9 +26,15 @@ import threading
 import time
 from pathlib import Path
 
-BIN = os.environ.get("MOLEHILL_BIN",
-                     str(Path(__file__).parents[3] / "target/release/molehill"))
+BIN = os.environ.get(
+    "MOLEHILL_BIN", str(Path(__file__).parents[3] / "target/release/molehill")
+)
 WORK = Path(tempfile.mkdtemp(prefix="molehill-mux."))
+PING = b"ping"
+CONTROL_PORT = 23332
+VISITOR_PORT = 52021
+ECHO_BACKEND_PORT = 60002
+VISITS = 3
 
 
 def wait_registration(log: Path, timeout_s: float = 10.0) -> bool:
@@ -40,56 +47,66 @@ def wait_registration(log: Path, timeout_s: float = 10.0) -> bool:
 
 
 def visitor_ping(i: int) -> None:
-    s = socket.create_connection(("127.0.0.1", 52021))
+    """One visitor round trip; raises when the echo does not come back."""
+    s = socket.create_connection(("127.0.0.1", VISITOR_PORT), timeout=3)
     s.settimeout(3)
     try:
-        s.sendall(b"ping")
-        d = b""
-        while len(d) < 4:  # echo may arrive in several segments
-            chunk = s.recv(4 - len(d))
+        s.sendall(PING)
+        got = b""
+        while len(got) < len(PING):  # the echo may arrive in several segments
+            chunk = s.recv(len(PING) - len(got))
             if not chunk:
                 break
-            d += chunk
-        assert d == b"ping", d
-        print(f"echo{i}={d!r}")
+            got += chunk
+        if got != PING:
+            raise AssertionError(f"echo mismatch: sent {PING!r}, got {got!r}")
+        print(f"echo{i}={got!r}")
     finally:
         s.close()
 
 
-def main() -> None:
-    if not os.access(BIN, os.X_OK):
-        sys.exit(f"missing {BIN} (build with: cargo build --release)")
-    # only reap molehill leftovers of THIS scenario (configs under a
-    # molehill-mux.* workdir) — never a running benchmark matrix
-    subprocess.run(["pkill", "-9", "-f", r"molehill.*molehill-mux\."],
-                   capture_output=True, check=False)
-    time.sleep(0.3)
-
-    (WORK / "server.toml").write_text("""[server]
+def write_configs() -> None:
+    """The scenario's configs: the multiplex default, one echo service."""
+    (WORK / "server.toml").write_text(f"""[server]
 default_token = "bench"
-allow_ports = ["52021"]
+allow_ports = ["{VISITOR_PORT}"]
 [server.control]
-bind_addr = "0.0.0.0:23332"
+bind_addr = "0.0.0.0:{CONTROL_PORT}"
 """)
     # `[client.data]` is omitted on purpose: the multiplex default applies.
-    (WORK / "client.toml").write_text("""[client]
+    (WORK / "client.toml").write_text(f"""[client]
 default_token = "bench"
 [client.control]
-default_remote_addr = "127.0.0.1:23332"
+default_remote_addr = "127.0.0.1:{CONTROL_PORT}"
 [client.transport]
 type = "plain"
 [client.services.echo]
-local_addr = "127.0.0.1:60002"
-remote_bind_addr = "0.0.0.0:52021"
+local_addr = "127.0.0.1:{ECHO_BACKEND_PORT}"
+remote_bind_addr = "0.0.0.0:{VISITOR_PORT}"
 pool_size = 8
 """)
 
+
+def start_echo_backend() -> socket.socket:
+    """The local echo server the tunnel forwards to (one thread per conn)."""
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", 60002))
+    srv.bind(("127.0.0.1", ECHO_BACKEND_PORT))
     srv.listen(64)
 
-    def echo():
+    def serve(conn: socket.socket) -> None:
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                conn.sendall(data)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def accept_loop() -> None:
         srv.settimeout(0.5)
         while True:
             try:
@@ -97,53 +114,71 @@ pool_size = 8
             except TimeoutError:
                 continue
             except OSError:
-                break
-
-            def serve(c):
-                try:
-                    while True:
-                        d = c.recv(65536)
-                        if not d:
-                            break
-                        c.sendall(d)
-                except OSError:
-                    pass
-                finally:
-                    c.close()
-
+                break  # the socket was closed; the scenario is over
             threading.Thread(target=serve, args=(conn,), daemon=True).start()
 
-    threading.Thread(target=echo, daemon=True).start()
+    threading.Thread(target=accept_loop, daemon=True).start()
+    return srv
 
-    procs = [
-        subprocess.Popen([BIN, "--server", str(WORK / "server.toml")],
-                         stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL),
-        subprocess.Popen([BIN, "--client", str(WORK / "client.toml")],
-                         stdout=(WORK / "client.log").open("w"),
-                         stderr=subprocess.STDOUT),
-    ]
 
-    def cleanup():
+def start_pair() -> list:
+    """Start the molehill server/client pair; the client logs where we read."""
+    with (WORK / "client.log").open("w") as client_log:
+        procs = [
+            subprocess.Popen(
+                [BIN, "--server", str(WORK / "server.toml")],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ),
+            subprocess.Popen(
+                [BIN, "--client", str(WORK / "client.toml")],
+                stdout=client_log,
+                stderr=subprocess.STDOUT,
+            ),
+        ]
+
+    def cleanup() -> None:
         for p in procs:
             with contextlib.suppress(OSError):
                 p.send_signal(signal.SIGKILL)
 
     atexit.register(cleanup)
+    return procs
+
+
+def tail_client_log() -> str:
+    return (WORK / "client.log").read_text(errors="ignore")[-500:]
+
+
+def main() -> None:
+    if not os.access(BIN, os.X_OK):
+        sys.exit(f"missing {BIN} (build with: cargo build --release)")
+    # Only reap molehill leftovers of THIS scenario (configs under a
+    # molehill-mux.* workdir) — never a bench run in progress.
+    subprocess.run(
+        ["pkill", "-9", "-f", r"molehill.*molehill-mux\."],
+        capture_output=True,
+        check=False,
+    )
+    time.sleep(0.3)
+
+    write_configs()
+    start_echo_backend()
+    start_pair()
 
     if not wait_registration(WORK / "client.log"):
         print("REG FAILED")
-        print((WORK / "client.log").read_text(errors="ignore")[-500:])
+        print(tail_client_log())
         sys.exit(1)
     time.sleep(0.5)
 
-    for i in range(1, 4):
+    for i in range(1, VISITS + 1):
         try:
             visitor_ping(i)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — report any failure, not a few
             print(f"visitor{i} failed: {e!r}")
             print("MUX E2E FAILED")
-            print((WORK / "client.log").read_text(errors="ignore")[-500:])
+            print(tail_client_log())
             sys.exit(1)
 
     print("MUX E2E OK")

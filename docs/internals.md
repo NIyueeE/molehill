@@ -49,11 +49,54 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 - The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 
-`mode = "direct"` restores the one-connection-per-channel behavior, which measures slightly higher raw throughput on fast reliable links at the cost of handshakes.
+`mode = "direct"` restores the one-connection-per-channel behavior: every data channel is its own transport connection, so nothing is multiplexed and each visitor connection pays the full connection setup (TCP connect plus, with `noise`, the Noise handshake). That is a design trade-off, not a performance claim — the measured comparison lives in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements), and the choice between the two is the decision tree in [Configuration](configuration.md).
 
 ## UDP
 
 UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. Idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
+
+### UDP drop counters (`MOLEHILL_UDP_STATS`)
+
+The visitor-datagram reader never blocks: a full worker queue drops the
+datagram (what UDP peers already tolerate) rather than head-of-line blocking
+every other visitor, and the reader separates "no data channel is ready yet" —
+the registration/reconnect window — from queue pressure. Both drops were
+previously visible only as `debug!` lines, so "is the queue depth right?" could
+not be answered with evidence.
+
+With `MOLEHILL_UDP_STATS=1` the server logs a cumulative
+`udp-stats: cumulative visitor-datagram drops` line once a second carrying
+`queue_full` and `no_worker` separately; being cumulative, per-second rates
+come from consecutive lines. The switch is independent of
+`MOLEHILL_KCP_STATS` because the default carrier is TCP — a run can exercise
+the UDP path with no KCP session in existence. The runner records whichever
+`MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
+so an instrumented run is never mistaken for a clean one.
+
+### KCP datagram size follows the path MTU
+
+A KCP datagram is one UDP packet, and UDP does not negotiate a path MTU the way
+TCP does: Linux's default `IP_MTU_DISCOVER` for UDP fragments an oversized
+datagram instead of reporting an error, so a 1400-byte KCP datagram on a
+1280-byte path becomes two fragments and **one lost fragment costs the whole
+datagram** — a 1 % fragment loss becomes ~2 % datagram loss, which at the
+carrier's ARQ cost is the difference between working and not (measured on
+`loss1_mtu1280`: the KCP arm goes from 0.37 Gbit/s to zero while the TCP arm is
+unaffected, because the kernel does this arithmetic for TCP).
+
+Each session therefore reads the kernel's path MTU (`getsockopt(IP_MTU)` on a
+throwaway socket connected to the peer) and shrinks its datagram size to fit,
+before the pump drains any application data and again once a second, because a
+session outlives the path it started on. The size is **shrink-only**: a later
+probe reporting a larger path is ignored, so a route change cannot oscillate the
+segment size, and a session that needs a bigger datagram starts a new session.
+
+Two limits worth knowing: the probe is **IPv4-only** (the IPv6 equivalent,
+`IPV6_MTU`, has no safe wrapper in this crate's dependencies and reading it would
+need `unsafe`, which the crate denies) — an IPv6 session keeps the previous
+behaviour and relies on kernel fragmentation; and the size is never *grown*, so
+`mtu` in the config's sense does not exist: the engine's 1400-byte default is the
+ceiling.
 
 ## Heartbeat
 

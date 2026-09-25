@@ -25,7 +25,10 @@ pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V3;
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
-/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake.
+/// the postcard hello, `NOISE_SELECTOR` by the Noise handshake. The
+/// opt-in session-resume selector (`0x02`, `noise_resume.rs`) is a
+/// third value on the same byte, and an old peer rejects it the same way
+/// it rejects an unknown protocol version.
 pub const PLAIN_SELECTOR: u8 = 0x00;
 pub const NOISE_SELECTOR: u8 = 0x01;
 

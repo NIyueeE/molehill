@@ -1,3 +1,5 @@
+# expect: remote_addr
+
 [client]
 default_token = "123"
 
@@ -6,3 +8,4 @@ default_remote_addr = "example.com"
 
 [client.services.foo]
 local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"

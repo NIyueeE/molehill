@@ -75,11 +75,9 @@ A typical setup:
 
 The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
 transport — are the right starting point for almost everyone. Deviate only
-when the tree says so. The numbers below are the measured basis of the
-v0.8.0 benchmark, carried forward unchanged into v0.8.1 (same-host loopback
-and weak-network cells; raw data in
-`benches/scripts/bench/results-v0.8.1.json`, charts and tables in the
-README's Benchmarks chapter):
+when the tree says so, change one thing at a time, and measure the result on
+your own path: the published runs, their numbers and how to reproduce them are
+in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
@@ -90,7 +88,7 @@ flowchart TD
     D -- "Yes, raw throughput first" --> E["mode = direct"]
     D -- "No: many services,<br/>many users, churn" --> F{"Many concurrent<br/>connections?"}
     E --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
-    F -- "> ~100 concurrent" --> G["count = 8 or higher"]
+    F -- "> ~256 concurrent" --> G["count = 8 or higher"]
     F -- Typical --> H["keep count = 4"]
     G --> I{"Path quality?"}
     H --> I
@@ -99,25 +97,29 @@ flowchart TD
     J --> Z
 ```
 
-### What each choice costs (measured)
+### What each choice costs (what you trade)
 
-| Decision | Option | Measured basis |
+| Decision | Option | What you give up / gain |
 |---|---|---|
-| `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
-| `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | single-flow ceiling (loopback 8-str 9.2 Gbit/s); every stream shares one retransmit domain (loss5 HoL max 2.5 s vs 1.6 s at count=4) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 HoL max 80.6 vs 100.1 ms at count=1); yamux ceiling `count × 64` concurrent connections |
-| `count` | `8+` | ~256 concurrent connections; 8 physical tunnels per service (NAT mappings ×8) |
-| `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-str 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport; 8-str 14.9 vs 1.1 — the kcp4 8-stream cell is the documented cold-start bimodal one, see HANDOFF.md); RSS 26 vs 85 MiB |
-| `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or A/B for a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0% loss, 20 ms max inter-packet gap vs 100+ ms for the TCP arms) |
-| transport | `"plain"` | 10.0 / 19.5 Gbit/s (1/8 streams) on loopback |
-| transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
-| `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels, never splits one session (session affinity) |
+| `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
+| `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
+| `count` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain |
+| `count` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `count × 64` concurrent connections |
+| `count` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
+| `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
+| `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + `count` for the ceiling |
+| transport | `"plain"` | no encryption; lowest per-byte cost |
+| transport | `"noise"` | encrypted wire with a single pre-shared keypair; a sub-millisecond RTT cost and no CPU penalty under full load |
+| `pool_size` | 8 TCP / 2 UDP (defaults) | enough warm data channels to absorb churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
+
+The measured cost of each option — including the figures these trade-offs come
+from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
 **Validate the choice** with the exposure you care about: `ping` / in-game
 feel for latency, `iperf3` on the exposed port for raw throughput, and the
-real traffic of your service. For local A/B of configurations,
-`just bench-fast` runs a ~2-minute molehill-only benchmark matrix.
+real traffic of your service. To compare two configurations or two builds on
+your own hardware, [Benchmarks](benchmarks.md#reproduce-it-yourself) has the
+commands.
 
 Here is the full configuration specification:
 
@@ -128,7 +130,7 @@ default_token = "change-me" # Necessary. Must match `[server].default_token`
 [client.control] # Necessary. Control-channel defaults: authentication, registration, heartbeat
 default_remote_addr = "example.com:2333" # Necessary. The address of the server
 default_heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
-default_retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
+default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
 [client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_mode/default_count/default_carrier individually — see the per-service keys in `[client.services.*]` below
 # default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). With `default_carrier = "kcp"` the KCP sessions dial the control address over UDP — TCP control and UDP KCP can share one port (distinct protocols)
@@ -144,7 +146,7 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Client only. Connect t
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
@@ -153,13 +155,13 @@ protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values
 local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
 remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
 nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
-retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits `client.control.default_retry_interval`
+retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
 heartbeat_timeout = 60 # Optional. Override `client.control.default_heartbeat_timeout` for this service only — e.g. when the service runs against a server with a different heartbeat interval
 udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only). Default: false
 mode = "multiplex" # Optional. Override `client.data.default_mode` for this service only. "multiplex" (default) or "direct"
-count = 4 # Optional. Override `client.data.default_count` for this service only; valid only with `mode = "multiplex"`. Inherits the default when unset
+count = 4 # Optional. Override `client.data.default_count` for this service only; valid only with `mode = "multiplex"`, clamped to 1..=64. Inherits the default when unset
 carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only; valid only with `mode = "multiplex"`. Inherits the default when unset
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
 pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`. For UDP this shards distinct visitors across channels; each visitor is pinned to one channel (session affinity)
@@ -175,7 +177,7 @@ udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per dat
 
 [server]
 default_token = "change-me" # Necessary. Must match `[client].default_token`
-allow_ports = ["6000-6999", "8080"] # Necessary to enable dynamic registration. Empty or missing: ALL registrations are rejected. Privileged ports (<1024) must be listed explicitly
+allow_ports = ["6000-6999", "8080"] # Necessary to enable dynamic registration. Empty or missing: ALL registrations are rejected. A requested port is admitted when one of these entries contains it — a literal port, or a range covering it, privileged ports (<1024) included
 max_pool_size = 16 # Optional. Upper bound applied to every service's requested pool_size. Default: no limit
 
 [server.control] # Necessary. Control-channel listener
@@ -184,13 +186,13 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
-# stripe_count = 4 # Optional. Data channels per visitor connection. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping")
+# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"). Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a v3 transport selector byte); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded). The pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
@@ -208,7 +210,12 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
    - **whitelist**: the requested port must be covered by `allow_ports`;
      an empty/missing `allow_ports` rejects *every* registration (this is
      how you disable the feature entirely);
-   - **privileged ports**: ports below 1024 must be listed explicitly;
+   - **privileged ports**: there is no separate rule — a whitelist entry
+     (literal or range) admits the ports below 1024 inside it like any
+     other port. Binding one still fails unless the server has the OS
+     privilege (root, or a lowered
+     `net.ipv4.ip_unprivileged_port_start`), so when the server is
+     privileged, list the privileged ports it should expose literally;
    - **conflicts**: if the port is already bound, the registration fails
      with `Port already in use`.
 4. On success the server binds the port immediately and starts forwarding.
@@ -266,8 +273,11 @@ handshake) and cuts FD usage under many concurrent visitors.
   keeps idle tunnels warm (NAT mappings) and probes the path RTT; a
   vanished peer is only confirmed on the next write (dead-link after ~20
   RTOs).
-- Building without the feature removes the option entirely and always uses
-  the one-connection-per-channel path.
+- Building without the feature removes the option entirely, and such a
+  build must not see the corresponding tables at all: a config that
+  contains `[client.data]` or `[server.data]` is rejected there (unknown
+  keys — `deny_unknown_fields`). Delete those tables and the data plane
+  always uses the one-connection-per-channel path.
 
 **Per-service overrides.** `[client.data]` holds the defaults; each service
 can override `mode`, `count` and `carrier` individually on its own
@@ -333,9 +343,11 @@ the per-connection knobs.
 
 From v0.4.7, molehill enables TCP_NODELAY by default on every TCP connection: the control channel, the data-plane tunnels, both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
+Only the client honours `nodelay`, and only on the two socket kinds the client creates for a service: its data-channel connections on the one-connection-per-channel path, and its TCP connection towards the local service. Every other socket stays nodelay regardless: the control channel is always set up with TCP_NODELAY at both ends, the client's multiplexed tunnels use those same control-channel options, and the server always applies its fixed latency-friendly defaults (nodelay + keepalive) to its end of every data channel and to the visitor-facing sockets. `nodelay = false` therefore cannot turn Nagle back on there.
+
 TCP keepalive is also enabled by default on these sockets (20s idle time, 8s probe interval), so pooled data channels that were silently dropped by NATs or middleboxes are detected instead of being handed out to visitors.
 
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service.
+If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service — on the client-side sockets above.
 
 ## Complete examples
 
@@ -383,7 +395,7 @@ default_token = "default_token_if_not_specify" # security-scan:allow documentati
 [client.control]
 default_remote_addr = "myserver.com:2333" # Necessary. The address of the server
 default_heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. Must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
-default_retry_interval = 1 # Optional. The interval between retries to connect to the server. Default: 1 second
+default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
 # Data-plane options (`[client.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
@@ -397,7 +409,7 @@ proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect to the server 
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
@@ -437,7 +449,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
 remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier (e.g. Noise_KKpsk0_...)
+psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 ```
@@ -743,7 +755,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 
 The image carries the full default feature set (`server`, `client`, `noise`,
 `hot-reload`, `multiplex`, `kcp`), so `default_carrier = "kcp"` needs no
-different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.8.1`)
+different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
 instead of `:latest` when you want reproducible upgrades.
 
 Two consequences of running as UID 1000:
@@ -932,6 +944,7 @@ above and follow that guide.
 | `Protocol version mismatched ... Please update` | One side runs an older molehill. Upgrade both ends together (protocol v3 since 0.8; v2 since 0.7.0). |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
+| Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |
 | Repeated `Heartbeat timed out` | `client.control.default_heartbeat_timeout <= server.control.heartbeat_interval`, or the network path drops the connection. |
 | Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
 | `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |

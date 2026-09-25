@@ -6,6 +6,21 @@ perf.data.old
 __pycache__/
 *.pyc
 
-# bench-fast smoke output (never version-picked; local scratch)
-benches/scripts/bench/results-dev.json*
-benches/scripts/assets/
+# ruff's own cache (it self-ignores, but a repo entry documents the intent)
+.ruff_cache/
+
+# The Soak runner's default output and working artifacts. The release run
+# passes an explicit `--out benches/scripts/soak/results-soak-vX.Y.Z.json`,
+# so only the dev-named file belongs here; the raw evidence (tool logs,
+# iperf-raw, probe logs) lives in a temp dir, and the entries below are the
+# defensive legacy pattern for a stray run.
+benches/scripts/soak/results-soak-dev.json*
+benches/scripts/soak/results-screen*.json
+benches/scripts/soak/frp/
+benches/scripts/soak/nps/
+benches/scripts/soak/rathole/
+benches/scripts/soak/molehill/
+benches/scripts/soak/iperf-raw/
+benches/scripts/soak/*.log
+benches/scripts/soak/pids.json
+benches/scripts/soak/probe-*.log
