@@ -56,6 +56,16 @@ SLO behaviour are what travel.
 
 ## The stage schedule
 
+This is the default schedule — what the `capacity` and `rrul` runs walk
+through. Three other schedules exist, and which one a run uses is recorded in
+its results file (`meta.timeline`, beside the path classes):
+
+- **`soak`** rotates a shorter one for a longer time: `clean` → `loss1` →
+  `rtt100` → `loss5` → `clean`, 180 s each;
+- **`cost`** and **`screen`** run a single stage — `--path` at `--secs`
+  (60 s by default);
+- **any test** accepts an explicit `--timeline clean:60,loss1:120,...`.
+
 | Stage | What it emulates | Applied to the path | Duration |
 |---|---|---|---|
 | `clean` | a healthy network (the control) | nothing | 150 s |
@@ -69,7 +79,9 @@ SLO behaviour are what travel.
 
 The schedule, the durations, the sample rates and the SLO are recorded in every
 results file (`meta`), so a chart can always be traced back to the method that
-produced it.
+produced it. So is the shaping applied to each class — including the rate
+stages' queue depth (`rate`/`limit 2000`), which bounds how much traffic the
+shaper may hold and therefore what a burst through it can do.
 
 Only the data plane is shaped. The tool's control channel stays on the
 unshaped path: shaping it kills the heartbeat and turns a capacity measurement
@@ -105,10 +117,10 @@ configuration only. Treat them as directional, and re-measure your own case.
 |---|---|---|
 | `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | single-flow ceiling (loopback 8-str 9.2 Gbit/s); every stream shares one retransmit domain (loss5 head-of-line max 2.5 s vs 1.6 s at count = 4) |
+| `count` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at count = 4; loss5 head-of-line max 2.5 s vs 1.6 s) |
 | `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at count = 1); yamux ceiling `count × 64` concurrent connections |
 | `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
-| `carrier` | `"tcp"` (default) | faster in every measured cell (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport; 8-stream 14.9 vs 1.1 — the kcp4 8-stream cell is the documented cold-start bimodal one); RSS 26 vs 85 MiB |
+| `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
 | `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |

@@ -103,7 +103,7 @@ flowchart TD
 |---|---|---|
 | `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
 | `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
-| `count` | `1` | single-flow throughput ceiling; every stream shares one retransmit domain, so one loss event stalls them together |
+| `count` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain |
 | `count` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `count × 64` concurrent connections |
 | `count` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
