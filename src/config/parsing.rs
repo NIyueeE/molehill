@@ -577,7 +577,9 @@ pub struct ServerConfig {
     /// Port ranges a client may claim for its services, e.g.
     /// `["6000-6999", "8080"]`. This is the master switch for dynamic
     /// registration: when empty or missing, **all** registrations are
-    /// rejected. Privileged ports (<1024) must be listed explicitly.
+    /// rejected. An entry admits every port it contains, privileged ports
+    /// (<1024) included — binding one still needs the server's own OS
+    /// privilege, so list those literally when the server has it.
     #[serde(default)]
     pub allow_ports: Vec<PortRange>,
     /// Upper bound applied to every service's requested `pool_size`.
@@ -911,6 +913,12 @@ mod tests {
         reason = "tests unwrap values they just constructed"
     )]
     use super::*;
+    // Only the defaults-pinning test needs these (and the tunnels/streams
+    // group exists only with the multiplex feature); at file scope the
+    // feature-minimal build warns about unused imports.
+    #[cfg(feature = "multiplex")]
+    use crate::common::constants::{DEFAULT_MUX_MAX_STREAMS, DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS};
+    use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
     use std::{fs, path::PathBuf};
 
     use anyhow::Result;
@@ -1001,12 +1009,76 @@ mod tests {
         Ok(())
     }
 
+    /// Every fixture under `tests/config_test/invalid_config` must fail for
+    /// the reason it names. A fixture that only asserts `is_err()` passes for
+    /// the wrong reason the moment one of its fields becomes required — two
+    /// of them did exactly that (both failed on a missing `remote_bind_addr`
+    /// instead of the proxy/host-port defect they document). The fixture
+    /// declares its expectation on its first line as `# expect: <substring>`,
+    /// and the error has to contain it.
+    /// The documented defaults are part of the user-facing contract: a change
+    /// to one of these constants silently changes what every existing config
+    /// means, so each is pinned here against the value the documentation
+    /// states. If a default has to move, this test moves with it and the
+    /// configuration pages change in the same commit (AGENTS.md §3).
+    #[test]
+    // The whole point of this test is to assert on the constant values
+    // themselves, which is exactly what `assertions_on_constants` flags.
+    #[expect(
+        clippy::assertions_on_constants,
+        reason = "pinning documented defaults means asserting on constants"
+    )]
+    fn test_documented_defaults_are_pinned() {
+        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL_SECS, 30, "server heartbeats");
+        assert_eq!(DEFAULT_HEARTBEAT_TIMEOUT_SECS, 40, "client heartbeat");
+        assert_eq!(DEFAULT_CLIENT_RETRY_INTERVAL_SECS, 1, "retry interval");
+        assert_eq!(DEFAULT_TCP_POOL_SIZE, 8, "TCP pool_size");
+        assert_eq!(DEFAULT_UDP_POOL_SIZE, 2, "UDP pool_size");
+        assert_eq!(DEFAULT_UDP_BUFFER_SIZE, 2048, "udp_buffer_size");
+        assert_eq!(DEFAULT_UDP_IDLE_TIMEOUT_SECS, 60, "udp_idle_timeout");
+        assert_eq!(DEFAULT_UDP_SENDQ_SIZE, 1024, "udp_send_queue_size");
+        assert_eq!(
+            DEFAULT_HEALTH_CHECK_INTERVAL_SECS, 10,
+            "health_check.interval"
+        );
+        assert_eq!(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, 3, "health_check.timeout");
+        assert_eq!(
+            DEFAULT_HEALTH_CHECK_MAX_FAILED, 1,
+            "health_check.max_failed"
+        );
+        assert_eq!(
+            DEFAULT_HEALTH_CHECK_HTTP_PATH, "/",
+            "health_check.http_path"
+        );
+        assert!(DEFAULT_NODELAY, "nodelay");
+        assert_eq!(DEFAULT_KEEPALIVE_SECS, 20, "tcp keepalive");
+        assert_eq!(DEFAULT_KEEPALIVE_INTERVAL, 8, "tcp keepalive interval");
+        #[cfg(feature = "multiplex")]
+        {
+            assert_eq!(DEFAULT_MUX_TUNNELS, 4, "data-plane tunnel count");
+            assert_eq!(MAX_MUX_TUNNELS, 64, "tunnel count clamp");
+            assert_eq!(DEFAULT_MUX_MAX_STREAMS, 64, "streams per tunnel");
+        }
+    }
+
     #[test]
     fn test_invalid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/invalid_config")?;
+        assert!(!paths.is_empty(), "no invalid-config fixtures found");
         for p in paths {
-            let s = fs::read_to_string(p)?;
-            assert!(Config::from_str(&s).is_err());
+            let name = p.display();
+            let s = fs::read_to_string(&p)?;
+            let expected = s.lines().find_map(|l| l.strip_prefix("# expect: "));
+            let Err(err) = Config::from_str(&s) else {
+                anyhow::bail!("{name} parsed, but it is an invalid fixture");
+            };
+            if let Some(needle) = expected {
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains(needle),
+                    "{name}: expected an error containing {needle:?}, got: {msg}"
+                );
+            }
         }
         Ok(())
     }
@@ -1321,12 +1393,18 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [client.services.test]
-type = "udp"
+protocol = "udp"
 local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:6053"
 health_check = { interval = 5 }
 "#;
-        assert!(Config::from_str(config).is_err());
+        // The reason matters: with the pre-0.8 `type` key this failed as an
+        // unknown field and never reached the health-check rule it tests.
+        let err = Config::from_str(config).unwrap_err().to_string();
+        assert!(
+            err.contains("health_check"),
+            "expected the health_check rule to reject this, got: {err}"
+        );
     }
 
     #[test]

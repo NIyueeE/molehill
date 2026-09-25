@@ -257,10 +257,7 @@ pub(crate) enum Action {
 
 // The socket field is skipped because its type parameter `T` does not
 // implement `Debug` — that is why this impl is manual in the first place.
-#[expect(
-    clippy::missing_fields_in_debug,
-    reason = "the socket's type parameter is not Debug"
-)]
+// `finish_non_exhaustive` marks the omission as intentional.
 impl<T> fmt::Debug for Active<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Connection")
@@ -272,7 +269,7 @@ impl<T> fmt::Debug for Active<T> {
             .field("pending_read_frame", &self.pending_read_frame)
             .field("pending_frames", &self.pending_frames)
             .field("rtt", &self.rtt)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -490,12 +487,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     }
 
     fn on_drop_stream(&mut self, stream_id: StreamId) -> Option<Frame<()>> {
-        // on_drop_stream is only called for streams still in the map.
-        #[expect(
-            clippy::expect_used,
-            reason = "the stream is in the map by construction"
-        )]
-        let s = self.streams.remove(&stream_id).expect("stream not found");
+        // on_drop_stream is normally called for streams still in the map;
+        // one already removed (a reset handled concurrently) has nothing
+        // left to inform the remote about.
+        let Some(s) = self.streams.remove(&stream_id) else {
+            tracing::trace!("{}: dropping unknown stream {}", self.id, stream_id);
+            return None;
+        };
 
         tracing::trace!("{}: removing dropped stream {}", self.id, stream_id);
         let frame;
