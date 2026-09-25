@@ -414,6 +414,17 @@ opens its own section here.
   the probe's own attempt stream), `-drift.png` (with every fitted slope
   printed) and `-cost.png`. Each figure carries its method constants and
   revision in the footer, and a tool keeps its colour across the whole set.
+- **Unsafe is now denied crate-wide** (`unsafe_code = "deny"`, was `warn`),
+  so an unexpected `unsafe` fails a plain `cargo build` instead of only the
+  `-D warnings` gate. The one module that needs it — the `recvmmsg`/`sendmmsg`
+  batching FFI — keeps its per-item `#[expect(unsafe_code, reason = ...)]`
+  with a `SAFETY` comment; the alternatives were evaluated against their
+  sources and are recorded in docs/lint-policy.md ("Unsafe"): `nix` cannot
+  drop the `Send`/`Sync` proofs (its `MultiHeaders` is itself `!Send`) and
+  `quinn-udp` would change the KCP send path's GSO semantics. Two clippy
+  waivers were removed outright on the way: the KCP stats clock now converts
+  nanoseconds with `Duration::as_secs_f64()` and masks the 32-bit protocol
+  wrap instead of casting, so both cast waivers are gone.
 - The python bench scripts are format-checked as well as lint-checked: the
   pre-commit chain now runs `uvx ruff format --check benches/scripts/`
   beside `uvx ruff check`, `just py-lint` runs both and `just py-fmt`

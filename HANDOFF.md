@@ -1343,6 +1343,22 @@ heading structure, or a README that does not link its own language's page.
 
 ### Open items this session recorded but did not close
 
+0. **The FFI batching module is the last `unsafe` (evaluated 2026-09-25, not
+   changed).** `src/transport/udp_batch.rs` carries 8 `unsafe_code`
+   expectations; the rest of the tree has none and `unsafe_code` is now
+   `deny`, so an unexpected `unsafe` fails a plain `cargo build`. Before the
+   v0.9.0 benchmark run the alternatives were checked against their sources
+   rather than assumed: `nix` 0.31.3's `MultiHeaders<S>` is
+   `Box<[libc::mmsghdr]>` and therefore `!Send`/`!Sync`, so adopting it would
+   keep the three `unsafe impl Send`/`Sync` proofs (the part with the real
+   soundness argument) and add a per-call `Vec<IoSliceMut>` allocation in the
+   hot path — not worth a dependency. `quinn-udp` *could* remove all eight
+   (`UdpSocketState` is plain `Send + Sync` and takes caller-owned slice
+   buffers), but it also brings GSO/GRO segmentation, i.e. it changes the send
+   path's syscall shape on the KCP carrier. That is a data-path change and
+   belongs in its own `screen` A/B, not in a lint cleanup. The reasoning lives
+   in docs/lint-policy.md ("Unsafe") and at the top of the module.
+
 1. **The configuration test gaps** (audit of the docs against `tests/`, ranked
    by user impact). Fixed in this session: the three vacuous tests
    (`type = "udp"` had been renamed to `protocol`, and two invalid fixtures

@@ -64,7 +64,12 @@ done < <(awk '
 while IFS= read -r lint; do
   [ -n "$lint" ] || continue
   expect "lint documented: $lint" docs/lint-policy.md '`'"$lint"'`'
-done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0} f && /=/{split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k}' Cargo.toml)
+done < <(awk '/^\[lints\./{f=1;next} /^\[/{f=0}
+              # comments are prose, not lint declarations: a `=` inside one
+              # (e.g. a code sample) is not a lint level
+              f && /=/ && $0 !~ /^[ \t]*#/ {
+                split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "") print k
+              }' Cargo.toml)
 
 # 3) rustc edition
 edition=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml)
