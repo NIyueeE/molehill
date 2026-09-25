@@ -43,317 +43,176 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Client-Authoritative Services** Since v0.7 the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
 - **Multiplexing** Every data channel rides as a yamux stream over one of N parallel tunnel connections by default (`[client.data].default_count = 4`) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The optional `default_carrier = "kcp"` (feature `kcp`) moves the data plane onto KCP-over-UDP sessions. The `[client.data]` default knobs and the `mode = "direct"` fallback are covered in [Configuration](./docs/configuration.md).
-- **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The optional Noise Protocol encrypts the wire with a single pre-shared X25519 keypair — no PKI, no CA. `plain` forwards unencrypted.
+- **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The optional Noise Protocol encrypts the wire with a single pre-shared X25519 keypair — no PKI, no CA — and, with `resume = true`, proves a reconnect with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 -> 38.5 us per pair). `plain` forwards unencrypted.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
 
 ## Benchmarks
 
-Single-machine comparison (all on loopback, `visitor -> server -> client ->
-backend`); everything is measured **through the tunnel** — iperf3 and the
-probes dial each tool's exposed port, never the backend. Peers are the
-latest GitHub release builds (frp 0.71.0, rathole 0.5.0 upstream, bore
-0.6.0). Network cells (netem on `lo`, every leg affected) and the metric
-set are described in [Methodology](#methodology). These are the v0.8.0
-matrix carried forward into v0.8.1 (the patch changes no forwarding path;
-see `CHANGELOG.md`), and the v0.7.2 baseline ran a single-tunnel default on
-a different container — cross-version values are indicative, same-matrix
-comparisons are precise.
+Single-machine comparison (`visitor -> server -> client -> backend`, all four
+hops on one machine); everything is measured **through the tunnel** — the
+probes dial each tool's exposed port, never the backend it forwards to.
+Peers are the latest GitHub release builds (frp, rathole upstream, nps —
+versions recorded per run in the results meta). Each tool is driven through
+one identical workload while the network condition follows a stage schedule
+(netem on `lo`, every leg affected, changed in place so the tool's session
+is never rebuilt); the metric set and the test types are described in
+[Methodology](#methodology). These are v0.9.0 numbers from this host; only
+same-model, same-host runs are comparable with each other.
 
 ### Choosing a configuration
 
-The measurements below justify the defaults and tell you when to deviate.
+The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
+transport — are the right starting point for almost everyone. Deviate only
+when the tree says so. How to apply each choice: the `[client.data]` block
+holds the per-client defaults, and every service can override `mode` /
+`count` / `carrier` on its own `[client.services.<name>]` block — one client
+can mix a multiplexed interactive service with a `direct` bulk service, and
+can even point individual services at different molehill servers via
+`remote_addr`. The `[transport]` block is in
+[Configuration](docs/configuration.md); Noise keypairs in
+[Transport](docs/transport.md).
 
-| Config | Use it when | Cost measured |
-|---|---|---|
-| **`mode = "multiplex"` (default)** | one client exposes **multiple services**, or connections churn (HTTP/game sessions); connection resources matter (FDs, ports, **NAT mappings** — every physical tunnel behind a NAT costs one mapping) | 10.0 Gbit/s single-stream on loopback (19.2 with `mode = "direct"` — one yamux stream is bounded by one tunnel flow), 19.5 at 8 streams; the yamux ceiling caps concurrent connections at `count × 64` (256 at the default `count = 4`) |
-| **`mode = "direct"`** | one service or a few long-lived streams (SSH); **raw throughput first** (bulk transfers): 19.2/23.3 Gbit/s on loopback | one physical tunnel per stream: FDs/ports/NAT mappings scale with stream count; per-connection setup is real (churn p99 ~3.5 ms at 16-way concurrency) but invisible at `pool_size = 8`; smallest footprint (~15.5 MiB) and lower CPU (~515% vs ~494% at four tunnels, but 216% at one) |
-| **`count = 4` (default)** | many concurrent streams, or a lossy path: independent tunnels isolate head-of-line blocking and **aggregate beyond a single flow** | 4 physical connections per service (FDs/ports/NAT mappings) and ~494% CPU against 216% for one tunnel; loopback 8-stream 19.5 vs 9.2 Gbit/s at `count = 1`, 1% loss 12.3 vs 4.5, burst loss 13.3 vs 4.5; the 10 ms HoL max is lower (80.7 vs 100.1 ms) |
-| **`count = 1`** | one long-lived stream, a tight connection budget, or the smallest footprint (~16 MiB with half the CPU) | one TCP-flow ceiling; no aggregation (loopback 8-stream 9.2 Gbit/s); every stream shares one retransmit domain |
-| **`carrier = "kcp"`** (experimental) | when TCP data tunnels are blocked or throttled, or for **latency-first UDP at high delay** | far behind the TCP carrier wherever the path is not the bottleneck (loopback 8-stream 1.1 vs 14.9 Gbit/s, rtt10 0.79 vs 5.45, loss1 0.71 vs 7.74) at ~2.5-3x RSS (83 vs 26 MiB) and lower CPU; its clearest win is rtt100 session quality (max gap 20 ms vs the TCP arms' 100+) |
-| **noise** | encrypted transport wanted with **memory and simplicity first**: a pre-shared public key and no PKI | ~58% of single-stream and ~76% of 8-stream plain throughput (5.8/14.9 vs 10.0/19.5 Gbit/s), sub-millisecond RTT, ~4 MiB more RSS; CPU a wash (470% vs 494% of one core) |
-
-How to apply each choice: the `[client.data]` block holds the per-client
-defaults, and every service can override `mode`/`count`/`carrier` on its
-own `[client.services.<name>]` block — one client can mix a multiplexed
-interactive service with a `direct` bulk service, and can even point
-individual services at different molehill servers via `remote_addr` (the
-server adapts per connection, no server-side change). The `[transport]`
-block is in [Configuration](docs/configuration.md); Noise keypairs in
-[Transport](docs/transport.md); ready-to-run configs in
-[Quickstart](#quickstart) and [Complete examples](./docs/configuration.md#complete-examples).
-
-**How to choose, step by step.** Start from the defaults
-(`multiplex`, `count = 4`, `carrier = "tcp"`, plain transport) and answer
-three questions about your workload; change one thing at a time and
-re-test:
+**How to choose, step by step.** Start from the defaults and answer three
+questions about your workload; change one thing at a time and re-test:
 
 1. **Do you need encryption?** Yes → set `[client.transport] type =
-   "noise"` and place the keys (cost: ~42% of single-stream throughput,
-   5.8 vs 10.0 Gbit/s, and ~24% at 8 streams; irrelevant below ~2 Gbit/s
-   needs; sub-millisecond RTT, ~4 MiB RSS). No → keep `"plain"`.
+   "noise"` and place the keys. No → keep `"plain"`.
 2. **One user or many, and how many concurrent connections?** A single
-   long-lived session (SSH, one Minecraft player) → `direct` or the
-   default mux both work; mux saves NAT mappings at low concurrency too.
-   Many users / churn / multiple services → keep or raise `count`
-   (each tunnel carries ~64 concurrent connections before the yamux
+   long-lived session (SSH, one Minecraft player) → `direct` or the default
+   mux both work; mux saves NAT mappings at low concurrency too. When that
+   one stream must not be bounded by a single tunnel flow (bulk over one
+   session), set `[server.data] stripe_count` (K=4) — the connection then
+   rides K parallel data channels, at K× channels per visitor and a bounded
+   reorder buffer. Many users / churn / multiple services → keep or raise
+   `count` (each tunnel carries ~64 concurrent connections before the yamux
    ceiling — `count = 8` ≈ 512).
 3. **What does the path look like, and do you forward UDP?** If TCP data
    tunnels are blocked or throttled, or you need latency-first UDP at high
-   delay, A/B `carrier = "kcp"` (its rtt100 session max gap is 20 ms against
-   the TCP arms' 100+). Otherwise keep the TCP carrier: the UDP ladder and
-   head-of-line probes show no reproducible UDP-under-load penalty for the
-   default in our cells (a 100% paced-pinger loss seen in two runs came back
-   as 2% in a third). For lossy/wifi paths keep `count >= 4` — it aggregates
-   (1% loss 8-stream 12.3 vs 4.5 Gbit/s) and keeps the 10 ms HoL max
-   lower — and pick `count` for the per-tunnel connection ceiling
-   (`count = 1 -> 32` connections, `count = 4 -> 128`).
+   delay, A/B `carrier = "kcp"`. Otherwise keep the TCP carrier. For
+   lossy/wifi paths keep `count >= 4` — it aggregates and isolates
+   head-of-line blocking — and pick `count` for the per-tunnel connection
+   ceiling (`count = 1 -> 64` connections, `count = 4 -> 256`).
 
-Validate with the exposure you care about: `ping`/in-game feel for
-latency, `iperf3` on the exposed port for raw throughput, and the
-exposed-service behavior under your real traffic. For development,
-`just bench-fast` runs a ~2-minute molehill-only matrix for A/B-ing
-configurations on this machine.
+**Measuring the choice for yourself.** The v0.9.0 model answers these with
+two numbers per configuration instead of one throughput figure: the
+**sustainable load** (how many bulk streams the tool carries while a fresh
+interactive connection still meets the 50 ms SLO) and the **cost at the
+operating point** (CPU-seconds per carried Gbit/s). `just soak --test=screen
+--ab <parent>,<head>` A/Bs two builds of *your* workload in minutes and
+prints whether the difference is a claim or directional. The retired matrix
+quoted per-cell averages here; they are gone, because an average per cold
+cell cannot answer "what happens while the path changes".
 
-### molehill vs plain-TCP peers
+### molehill vs the plain-TCP peers
 
-Plain-TCP axis only (mux on, no encryption): encrypted competitors such as
-chisel's SSH tunnel are not comparable here — molehill's own encrypted rows
-are isolated below.
+Every tool is driven through the identical workload — one interactive stream
+(the SLO instrument), N = 20 bulk TCP streams, 16 short connections per
+second and one UDP session — while the path follows the stage schedule
+(netem on `lo`, the control plane left unshaped). The chart below is the
+v0.9.0 run on one host (molehill's default `multiplex`, `count = 4`, plain
+transport): the orange line is the bulk throughput, the blue points the
+interactive stream's RTT, the shaded bands the path classes, the dashed
+line the SLO (p99 <= 50 ms).
 
-![Benchmark: molehill 0.8.0 vs plain-TCP peers](assets/benchmark-v0.8.1.png)
+![Soak: molehill and the peers over the stage schedule](assets/soak-v0.9.0.png)
 
-| Tool | 1-stream | 8-stream | echo RTT p50 | Memory |
-|---|---|---|---|---|
-| **molehill (mux)** | 10.0 | 19.5 | 0.266 ms | 21.8 MiB |
-| rathole 0.5.0 | 12.2 | **21.4** | 0.240 ms | 21.1 MiB |
-| bore 0.6.0 | **13.8** | 20.5 | 0.482 ms | **10.6 MiB** |
-| frp 0.71.0 | 4.6 | 6.2 | 0.391 ms | 68.9 MiB |
+**Interactive stream RTT p99, per stage** (ms; "wedge" = the stream went
+silent for > 5 s and recovered):
 
-The multiplexed client sits mid-pack single-stream (10.0 Gbit/s against
-rathole's 12.2 and bore's 13.8) and within ~10% of rathole at 8 streams
-(19.5 vs 21.4) while beating frp (6.2); memory is second-lightest (bore
-10.6 MiB, frp 68.9). At the 10 ms cell every tool tracks ~101 ms echo RTT
-(bore pays 142 ms — extra round trips per connect) and the molehill-only
-100 ms cell holds ~1001 ms. In the 1%-loss cell the group lands at
-3.8-4.2 Gbit/s (frp 0.8). The shaped cells converge on the configured link
-rate (see Methodology).
-
-### molehill: multiplexing cost (mux vs mux-off)
-
-One variable (multiplexing on/off), loopback:
-
-![Multiplexing cost](assets/benchmark-mux-v0.8.1.png)
-
-| Cell | mux 1-str | mux-off 1-str | mux 8-str | mux-off 8-str |
-|---|---|---|---|---|
-| loopback | 10.0 | 19.2 | 19.5 | 23.3 |
-
-Single-stream shows the mux cost (10.0 vs 19.2 Gbit/s): one yamux stream is
-bounded by one tunnel flow. At 8 streams the per-connection architecture
-stays ahead here (23.3 vs 19.5) — the default tunnels' value is connection
-resources and head-of-line isolation under loss, not raw aggregation
-against direct mode (count axis below); mux-off only runs loopback by
-design.
-
-### molehill: transport cost (mux vs noise)
-
-One variable (encryption), mux on for both:
-
-![Transport cost](assets/benchmark-transport-v0.8.1.png)
-
-| Configuration | 1-stream | 8-stream | echo RTT p50 | Memory |
-|---|---|---|---|---|
-| **mux (plain)** | 10.0 | 19.5 | 0.266 ms | 21.8 MiB |
-| noise | 5.8 | 14.9 | 0.281 ms | 25.9 MiB |
-
-Noise retains ~58% of single-stream and ~76% of 8-stream throughput with a
-sub-millisecond RTT cost and ~4 MiB of extra RSS; in the weak cells the
-encrypted row tracks the plain row. The in-repo cipher work (ring-accelerated
-ChaChaPoly, batched datagram IO for the KCP carrier) narrowed but did not
-remove this cost.
-
-### molehill: tunnel count (`count = 4` vs `count = 1`)
-
-One variable (the number of parallel tunnel connections), plain transport,
-everything else at the default:
-
-![Tunnel count](assets/benchmark-count-v0.8.1.png)
-
-| Cell | c4 1-str | c1 1-str | c4 8-str | c1 8-str | c4 HoL max | c1 HoL max |
-|---|---|---|---|---|---|---|
-| loopback | 10.0 | 9.6 | 19.5 | 9.2 | 33.4 | 33.4 |
-| rtt10 | 6.4 | 6.2 | 7.2 | 5.7 | 80.7 | 100.1 |
-| rtt100 | 0.569 | 0.611 | 1.3 | 1.4 | 801.0 | 807.9 |
-| loss1_rtt10 | 4.2 | 4.3 | 12.3 | 4.5 | 287.7 | 289.6 |
-| loss5_rtt100 | 0.217 | 0.232 | 0.826 | 0.330 | 1627.3 | 2456.2 |
-| loss2b25_rtt10 | 3.9 | 4.0 | 13.3 | 4.5 | 320.9 | 317.6 |
-| rate100_rtt20 | 0.0356 | 0.0395 | 0.0381 | 0.0355 | 201.7 | 746.4 |
-| rate20_rtt40 | 0.0089 | 0.0078 | - | - | 2673.8 | 3015.3 |
-| jitter20_10 | 2.4 | 2.5 | 4.1 | 4.0 | 162.2 | 159.0 |
-
-Independent tunnels aggregate concurrent streams where one flow cannot
-(loopback 8-stream 19.5 vs 9.2 Gbit/s; 1% loss 12.3 vs 4.5; burst loss 13.3
-vs 4.5) and keep the 10 ms HoL max lower (80.7 vs 100.1 ms). Under
-sustained loss the shared retransmit domain shows (loss5 HoL 1627 vs 2456 ms
-in `count = 4`'s favour here, but rate100 202 vs 746 ms against it) — the
-HoL maxima are noisy, the aggregation is the stable effect.
-`rate20_rtt40` reports 1-stream only: its 8-stream slot times out with the
-reason recorded in `partial_metrics` (see Methodology).
-
-### molehill: data-plane carrier (`carrier = "tcp"` vs `"kcp"`)
-
-One variable (what carries the data channels), noise control channel,
-`count = 4` for both:
-
-![Data-plane carrier](assets/benchmark-carrier-v0.8.1.png)
-
-| Cell | tcp 1-str | kcp 1-str | tcp 8-str | kcp 8-str | tcp HoL max | kcp HoL max | tcp RSS | kcp RSS |
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| loopback | 5.8 | 3.7 | 14.9 | 1.1 | 33.4 | 33.4 | 25.9 | 83.0 |
-| rtt10 | 4.14 | 0.407 | 5.45 | 0.785 | 80.7 | 81.1 | 18.8 | 64.3 |
-| rtt100 | 0.656 | 0.080 | 1.17 | - | 801.4 | 801.1 | 18.5 | 43.4 |
-| loss1_rtt10 | 3.76 | 0.456 | 7.74 | 0.710 | 285.1 | 289.0 | 23.6 | 68.4 |
-| loss5_rtt100 | 0.247 | 0.059 | 1.06 | 0.078 | 1210.5 | 1074.8 | 19.5 | 45.4 |
-| loss2b25_rtt10 | 3.49 | 0.408 | 8.71 | 0.794 | 288.5 | 509.4 | 29.8 | 60.5 |
-| rate100_rtt20 | 0.0358 | 0.0366 | 0.0178 | - | 265.1 | 234.5 | 20.0 | 42.0 |
-| rate20_rtt40 | 0.0097 | 0.0068 | - | - | 3015.2 | 1297.3 | 19.1 | 24.8 |
-| jitter20_10 | 2.13 | 0.155 | 3.15 | 0.273 | 145.3 | 151.8 | 22.9 | 60.2 |
+| **molehill (mux)** | **7.6** | wedge | 1334 | 3494 | wedge | 3123 | 4354 | **4.9** |
+| frp 0.71.0 | **2.9** | wedge | 3900 | wedge | 162 | 3919 | 5007 | **2.9** |
+| rathole 0.5.0 | 81 | wedge | 1311 | wedge | wedge | 2600 | 4675 | 78 |
+| nps 0.26.10 | 74 | 856 | 1139 | 4270 | wedge | 3265 | 1785 | 82 |
 
-KCP-over-UDP stays far behind the TCP carrier wherever the path is not the
-bottleneck (loopback 1.1 vs 14.9 Gbit/s at 8 streams; rtt10 0.79 vs 5.45;
-loss1 0.71 vs 7.74) at ~2.5-3x the RSS (83 vs 26 MiB on loopback) — the
-2048/4096-segment ARQ windows — while at the shaped rate cells both
-carriers sit on the ceiling. Its defensible uses are a **UDP-only path**
-(TCP blocked or throttled) and latency-first UDP at high delay (rtt100
-session max gap 20 ms against the TCP arms' 100+).
+**Bulk throughput per stage** (Gbit/s): molehill 17.0 on clean -> 2.4 at
+rtt100 -> 0.02 at rate100 -> **20.1 on the return to clean**; frp 5.9 ->
+2.2 -> 5.9; rathole 16.9 -> 2.5 -> 17.0; nps 0.14 throughout.
 
-### Configuration tradeoffs (loopback)
+**What these shapes say.** Every tool degrades under a bad path and every
+tool recovers on the return to clean — that recovery is the point of the
+last band, and a tool that stayed wedged would be a finding (one was: the
+first version of this harness shaped the control channel too, and the
+heartbeat timeout wedged the tools at rate100; the harness now leaves the
+control plane unshaped, which is stated in the method). The interactive
+stream's p99 is what a new visitor actually feels: under saturation it is
+the number that separates tools, and it is where the throughput axis is
+blind — molehill and rathole carry nearly the same bulk on the clean stage
+(17.0 vs 16.9 Gbit/s) while a fresh interactive connection costs 7.6 ms
+versus 81 ms, and on the 1%-loss cell both carry ~4.9 Gbit/s but the
+interactive stream sits at 1334 ms versus 1311 ms. The peers are driven by
+the same workload and charted in the same panels; the drift axis (open fds,
+RSS and CPU slopes over the run) is in `soak-v0.9.0-drift.png` and the UDP
+session's RTT/loss in `soak-v0.9.0-udp.png`.
 
-![Configuration tradeoffs](assets/benchmark-cost-v0.8.1.png)
+### How to read the numbers (and what replaced the old tables)
 
-| Tool | CPU% | churn/s | churn p99 ms | RSS MiB | thr64 | mixed bulk |
-|---|---|---|---|---|---|---|
-| **mux** | 494.1 | 4987.0 | 3.56 | 21.8 | 14.91 | 11.52 |
-| mux-off | 514.8 | 5022.7 | 3.50 | 15.5 | 18.04 | 21.08 |
-| noise | 470.7 | 5005.0 | 3.53 | 25.9 | 12.97 | 5.80 |
-| mux1 | 216.0 | 5030.0 | 3.52 | 16.0 | - | 8.81 |
-| kcp4 | 299.2 | 4823.0 | 3.73 | 83.0 | 6.99 | 1.30 |
-
-Every mode sustains ~4.8-5.0k connections/s under churn (setup-to-first-byte
-p99 ~3.5-3.7 ms — the pool absorbs per-connection setup). CPU tracks the
-tunnel count (one tunnel 216% of one core, four ~471-515%) and memory
-separates mux-off/mux1 (~16 MiB) from mux (22) and KCP (83). The 64-stream
-point is a working-point reference (14.9 Gbit/s at the default, 18.0
-direct); `mux1` has no point by design (64 streams exceed its single
-tunnel's usable ceiling of 45 — the cap minus the bench's pooled channels
-and the client's control stream). The
-mixed workload keeps 11.5 Gbit/s while sharing the client with an
-interactive service (21.1 direct, 1.3 on KCP).
+The v0.9.0 release replaced the measurement model: the retired matrix
+measured *cells* (one average per tool per network condition, cold-started
+per cell, reported as a median over reps) and this one measures *workloads
+over time*. The old per-cell tables and their charts (throughput-per-cell,
+the count/carrier/transport comparisons as separate charts) are gone with
+it; the release notes of v0.8.x keep their historical numbers, and the
+model's method is documented in [Methodology](#methodology) and
+[docs/release.md](docs/release.md). A number from the retired model is never
+a regression signal against a new one — a cell average cannot see a wedge,
+and this run found several.
 
 ### Methodology
 
-- **Setup**: everything on one machine's loopback; the four hops
-  (visitor, server, client, backend) are processes on the same host, so
-  absolute numbers are host-dependent — comparisons are same-host and
-  same-methodology only.
-- **Cells**: loopback, rtt10, rtt100, loss1%, loss5%, loss2%-burst, and
-  rate-limited (r100/20, r20/40 — a bottleneck uplink) and jittery
-  (j20/10) cells — netem shapes the whole `lo`, so every hop is
-  delayed/lossy; a "10 ms" cell shows ~100 ms echo RTT because the path is
-  multi-leg. Without `CAP_NET_ADMIN`, rtt cells fall back to a userspace
-  delay proxy and loss cells are skipped. A rate cell shapes `lo` at the
-  configured rate with a `limit 2000`-packet queue (`netem_rate_limit` in
-  the meta), so the cell is a floor test rather than a tool ranking: the
-  100 Mbit/s cell measures both stream counts (0.036 / 0.040 Gbit/s) and the
-  20 Mbit/s cell measures 1-stream (0.008); its 8-stream slot is `null`
-  because eight parallel streams cannot finish through that bottleneck
-  inside the harness bound — the timeout reason is in `partial_metrics`.
-  The plain-TCP peers run a lean subset (loopback, rtt10, 1% loss and the
-  two rate cells); the molehill-vs-peers chart therefore plots only those
-  cells, while the pure-delay, 5%-loss, burst-loss and jitter cells are
-  molehill-only stories told by the count and carrier charts.
-- **Metrics**: TCP throughput (1/8/64 streams — 64 is the working point
-  below the yamux ceiling of `count × 64` concurrent connections; the
-  headline is the sender's bytes over the **measured window** (falling back
-  to the receiver's count when a fast sender's writes were all absorbed by
-  the `-O` warm-up and backpressure blocked the measured window — recorded
-  with the raw numbers), with the receiver's own drain-inclusive window
-  next to it, plus the median rep's retransmits, the min/max spread and
-  per-stream bytes),
-  connection-path RTT (fresh connects, up to 300 samples bounded at 20 s
-  wall), steady data-path RTT (pings on one connection, likewise bounded
-  at 20 s), **connection churn** (short-connection storm at 16 concurrent
-  connectors: connects/sec and setup-to-first-byte p50/p99 — the
-  mux-vs-direct and pool guidance data), UDP session quality
-  (RTT/loss/jitter/max gap over one session) and a two-point UDP
-  pacing probe whose raw `offered`/`delivered`/loss numbers are recorded
-  but deliberately not charted or claimed (the probe is being redesigned —
-  see Known limits), a head-of-line probe (saturating bulk + game-like pinger through one service), a
-  **mixed workload** (iperf bulk + interactive latency through two
-  services of the same client simultaneously — per-service override
-  guidance), **CPU%** of server+client (the noise/KCP tradeoff cost) and
-  RSS (0.5 s sampling).
-- **Discipline**: every comparison varies **one variable** (plain-TCP axis,
-  multiplexing on/off, transport) with a shared control; arms run
-  **serially** in isolated port bands with fresh processes (parallel runs
-  would compete for CPU and invalidate the numbers); molehill arms run 3
-  reps, peers 1; the matrix self-throttles (nice 10, and every arm waits
-  for the load average to fall below 70% of the core count before
-  starting) so each arm begins on a quiet machine and a long run cannot
-  freeze the host.
-- **Known limits**: loopback is not a real network (idealized loss/delay,
-  no real congestion); the shared qdisc dilutes drops — the UDP loss column
-  is the residual share a light session sees, not the configured rate; the
-  `pool_size=8` connection pool hides per-connect handshake costs
-  (the churn metric now shows the residual cost); connection-resource
-  metrics (FDs, NAT mappings, TIME_WAIT) — mux's main benefit — are not
-  measured; rate cells need netem with `rate` support (modern iproute2).
-  A rate cell shapes `lo` with a `limit 2000`-packet queue (recorded in the
-  meta as `netem_rate_limit`): the depth is a measurement parameter, and a
-  shallow queue tail-drops whole GSO segments, which costs ~80% of the
-  shaped rate for reasons that belong to the shaper rather than the tool.
-  Each throughput sample bounds its iperf3 client at least as loosely as the
-  historical `secs + 20` and replaces the single-test iperf3 server after a
-  stalled repetition, so one wedge cannot starve the rest of the repetition
-  budget. Every `null` in the results file carries the typed reason that
-  produced it in `partial_metrics`, and `audit_results.py` refuses a `null`
-  without one. **Method and host bound comparability:** these rows are one
-  same-host run of the revised method (schema v3), so older rows and the
-  v0.7.2 gate are informational only (docs/release.md).
-  **A throughput number is only valid for the endpoint it dialed.** The
-  harness samples the tool's exposed port; an earlier revision of this
-  revision dialed the iperf3 backend by mistake and reported the loopback
-  ceiling (~46 Gbit/s) for every tool with the tunnel bypassed. The entries
-  now record `_throughput_exposed_port`/`_bench_backend_port`, the sampler
-  raises when they are equal, and the audit fails such a run (AGENTS.md
-  §10).
-  **UDP characterisation.** The UDP probe walks a ladder of paced short
-  bursts (500 pps to the configured burst rate, 2000-datagram bursts, a
-  1.5 s drain) and reports the highest step delivered within
-  `max(2%, cell loss + 2pp)`. On unshaped loopback every step arrives, so
-  the figure is a lower bound (27.2 Mbit/s, the ladder's top); the 10 ms
-  cell bends at 12 000 pps (10.9 Mbit/s delivered) and the 100 ms cell at
-  1 000-2 000 pps (0.7-1.4 Mbit/s); in the loss cells no step is within
-  tolerance, so the knee plus its delivered rate is the informative pair.
-  An earlier two-point version reported its own pace back and was not
-  charted; this ladder is what the results file records now. The head-of-line
-  probe's pinger loss was 100% for the default arms in two runs and 2% in a
-  third, so **a UDP-under-load weakness is NOT claimed**: it does not
-  reproduce (variance, not a path property).
-  An arm whose usable yamux ceiling (the cap `count × 64` minus the
-  bench's own pooled channels and the client's control stream) is below
-  the 64-stream scale point skips that probe by design (reason in
-  `partial_metrics`). Charts plot only the
-  rows and cells that take part in a comparison (a peer-less cell or a
-  structurally skipped probe is not drawn at all); a value missing inside a
-  compared panel is a grey `x`, while a measured zero is labelled `0` so
-  zero and absent stay distinct. A HoL pinger that gets zero or one reply
-  records a stall (the elapsed wait) rather than `null`. Raw per-rep iperf3
-  JSON for every throughput sample is kept under the run's work directory
-  (`iperf-raw/`), so a surprising number can be re-diagnosed.
-- **Reproduce**: `just bench-peers` → `just bench` → `just bench-plot` →
-  `just bench-check` (raw data in `benches/scripts/bench/results-v0.8.1.json`;
-  ritual and regression gate in docs/release.md).
+- **The unit of measurement is a workload, not a cell.** Every tool is
+  driven through the same client-side workload — one interactive stream (a
+  fresh TCP connection to the echo service per ping, the SLO instrument), N
+  bulk TCP streams (iperf3), C short connections per second (the churn
+  connector) and one UDP session — while the path follows a scripted stage
+  schedule. The tool's processes start once and the shaping changes in place
+  (`tc qdisc change` per tool class), so the session is never rebuilt and
+  the *adaptation* is part of the measurement.
+- **Stages**: `clean` (150 s — cold start plus baseline), `rtt100`, `loss1`,
+  `loss5`, `rate100`, `rate20`, `jitter` (120 s each), then `clean` again
+  (150 s — the recovery axis). The order, the durations, the guard band and
+  every sample rate are recorded in the results meta, because they are
+  method parameters (AGENTS.md §10).
+- **The SLO is a method constant**: an interactive-stream RTT p99 of 50 ms
+  with zero errors — the line on every chart and the break condition of the
+  capacity test.
+- **Test types**: `capacity` (ramp the bulk load until the interactive
+  stream breaks the SLO — the sustainable load plus the full response-time
+  curve), `rrul` (N = cpu count, and the interactive stream's RTT
+  distribution *over time* — the queueing-under-load detector), `soak` (a
+  long rotating-path run: the drift/leak axis), `cost` (CPU-seconds per
+  carried Gbit/s at a fixed operating point), `screen` (a fast development
+  A/B, interleaved inside every load step).
+- **Isolation**: each tool owns its port band and, when tools run
+  concurrently, its own HTB class with an independent netem — two tools in a
+  batch never share a rate bucket, a loss process or a queue. The batch size
+  comes from the host's CPU budget (cores ÷ CPU-per-pair, recorded in the
+  meta). The interactive and UDP probes run in their own processes, so the
+  harness is never inside the measured path.
+- **Everything is externally observable**: throughput and retransmits from
+  iperf3's per-interval stream, RTT/loss/jitter from the probes, RSS / CPU
+  / open-fd / thread counts from `/proc`. That is what makes the peers
+  measurable with the same workload — and what keeps molehill's internal
+  instrumentation (the mux/KCP counters) out of the comparison.
+- **Derived numbers**: per stage the p50/p99/max of each series, the worst
+  1-second window (the stability axis), the drift slope (a leak is a slope,
+  not a level) and flat segments — an interactive stream silent for more
+  than 5 s is recorded as a wedge with its duration, never as a bare null.
+- **Parallelism is validated, not assumed**: the same tool is run alone and
+  inside a full batch; if the per-stage numbers disagree outside the claim
+  rule, the batch size is what it actually is on this host, and that number
+  is recorded.
+- **Discipline**: the warm-up guard band is excluded from the derived
+  statistics, every failure leaves its typed reason, and no verdict tool
+  publishes a single averaged number without the distribution beside it. The
+  retired matrix (v0.8.x and earlier) measured cold cells with medians over
+  reps — a different instrument; its numbers live in git history and the
+  release notes and are never a regression signal against this model.
+- **Reproduce**: `just soak-peers` → `just soak` → `just soak-plot` →
+  `just soak-check` (raw data in
+  `benches/scripts/soak/results-soak-v0.9.0.json`; ritual and gate in
+  docs/release.md).
 
 ## Quickstart
 

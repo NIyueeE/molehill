@@ -20,8 +20,9 @@ extend-select = [
 ]
 
 # Waivers — all deliberate, code-level only (AGENTS.md §2):
-# - BLE001: the bench matrix is continue-on-error by design; every arm and
-#   metric is guarded by a blind except that records the failure and moves on
+# - BLE001: the soak runner is continue-on-error by design; every test and
+#   every probe is guarded by a blind except that records the failure and
+#   moves on
 # - S110/S112: silent fallbacks in probes and reaping loops are intentional
 #   (a dead process or a refused probe must not spam the run)
 # - S101: `assert` is used for scenario assertions in repro_e2e.py
@@ -33,8 +34,8 @@ extend-select = [
 # - S311: `random` drives the loss simulation, not security
 # - S202: zipfile extractall of trusted release assets (rathole)
 # - PLW0603: the noise-keypair cache global is a per-run memo
-# - PLR091x/PLR2004: config-like scripts legitimately carry many ports,
-#   knobs and long arm sequences; not library code
+# - PLR091x/PLR2004: config-like scripts legitimately carry many ports and
+#   knobs; not library code
 ignore = [
     "BLE001", "S101", "S110", "S112", "S602", "S603", "S607",
     "S108", "S310", "S311", "S202", "PLW0603",

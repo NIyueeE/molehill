@@ -64,28 +64,26 @@ bench-deps:
     sudo apt-get install -y iperf3 iproute2
 
 # Fetch the latest GitHub release binaries of the peer tools (frp, rathole,
-# bore) into ~/tmp/bench-peers — nothing is built from source.
-bench-peers:
-    uv run benches/scripts/bench/fetch_peers.py
+# nps) into ~/tmp/bench-peers — nothing is built from source.
+soak-peers:
+    uv run benches/scripts/soak/fetch_peers.py
 
-# Run the full benchmark matrix (molehill arms at full rigor; loss cells need netem).
-bench:
-    uv run benches/scripts/bench/bench.py
+# Run the soak benchmark: a tool (or a batch of them) through the scripted
+# workload under the stage schedule. Test types: capacity / rrul / soak /
+# cost / screen — see docs/release.md, "Benchmarks".
+# Example (fast development A/B between two builds):
+#   just soak --test=screen --path=clean --streams-max=8 --ab bin-a,bin-b
+soak *ARGS:
+    uv run benches/scripts/soak/soak.py {{ARGS}}
 
-# Quick perf sanity for the dev loop: molehill only, loopback + loss1 cells,
-# one rep, short durations. Writes results-dev.json — excluded from the
-# version-picked files plot/regression use, so it can never pollute a
-# release baseline.
-bench-fast:
-    MOLEHILL_REPS=1 MOLEHILL_SECS=4 MOLEHILL_SECS_WEAK=6 uv run benches/scripts/bench/bench.py --tools=molehill --cells=0/0,1%/10 --variants=mux,noise,kcp4 --fresh --out benches/scripts/bench/results-dev.json
+# Render the charts + markdown tables from the latest results file.
+soak-plot:
+    uv run benches/scripts/soak/soak_plot.py
 
-# Render the README chart + markdown tables from the latest results file.
-bench-plot:
-    uv run benches/scripts/bench/plot_bench.py
-
-# Regression gate: latest results vs the previous tag's file (pre-tag ritual).
-bench-check:
-    uv run benches/scripts/bench/check_regression.py
+# The gate: latest results vs the previous release's file (pre-tag ritual).
+# With --screen <file>: the verdict of a development A/B run.
+soak-check *ARGS:
+    uv run benches/scripts/soak/soak_check.py {{ARGS}}
 
 # Fast dev loop: lib tests + the core integration subset (~1 min; the full
 # suite is ~72 s and runs on every push/CI — see docs/checks.md).

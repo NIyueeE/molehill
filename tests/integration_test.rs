@@ -296,6 +296,60 @@ async fn multiplex_tunnel_pool() -> Result<()> {
     Ok(())
 }
 
+/// Noise session resume: the client caches the server's ticket on the
+/// first full handshake and the next control connection (after the
+/// client restarts) resumes the session instead of repeating the key
+/// exchanges (transport selector 0x02). The service must behave
+/// identically across the restart — same replies, same payloads.
+#[cfg(feature = "noise")]
+#[tokio::test]
+async fn noise_session_resume() -> Result<()> {
+    init();
+
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/noise_resume.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    echo_hitter(exposed_addrs(Type::Tcp).0, Type::Tcp)
+        .await
+        .unwrap();
+
+    // Restart the client: the control channel reconnects and the resume
+    // path engages (the server's ticket from the first connection is
+    // cached client-side).
+    info!("restart the client onto the resumed session");
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client);
+    let client_shutdown_rx = client_shutdown_tx.subscribe();
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    echo_hitter(exposed_addrs(Type::Tcp).0, Type::Tcp)
+        .await
+        .unwrap();
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
 /// Per-service data-plane overrides: the fixture keeps
 /// `mode = "multiplex"` (count 1) as the client-wide default while one
 /// service forces `mode = "direct"` — both data paths must work side by
@@ -308,6 +362,111 @@ async fn per_service_data_modes() -> Result<()> {
     spawn_tcp_backends();
 
     test("tests/for_tcp/per_service_modes.toml", Type::Tcp, None).await?;
+
+    Ok(())
+}
+
+/// Bytes pushed through the echo service in the striped-data-channel test:
+/// far more than one stripe frame (32 KiB), so the group's chunking and
+/// reassembly run for real, and a pattern that makes any reordering or
+/// duplication visible byte-for-byte.
+#[cfg(feature = "multiplex")]
+const STRIPE_BULK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Push a deterministic pattern through the echo service and verify the
+/// reply is the same bytes in the same order: the striped group's
+/// reassembly contract, in both directions at once (the echo service
+/// mirrors the stream).
+#[cfg(feature = "multiplex")]
+async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
+    let conn = TcpStream::connect(addr).await?;
+    let (mut rd, mut wr) = conn.into_split();
+
+    let mut expected = vec![0u8; len];
+    for (i, b) in expected.iter_mut().enumerate() {
+        *b = u8::try_from((i.wrapping_mul(0x9E37_79B1) >> 24) & 0xff).unwrap();
+    }
+
+    let write_pattern = expected.clone();
+    let writer = tokio::spawn(async move {
+        for chunk in write_pattern.chunks(64 * 1024) {
+            wr.write_all(chunk).await?;
+        }
+        wr.flush().await?;
+        Ok(())
+    });
+
+    let mut got = vec![0u8; len];
+    let mut read = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while read < len {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "striped bulk echo timed out at {read}/{len} bytes"
+        );
+        let n = time::timeout(Duration::from_secs(30), rd.read(&mut got[read..]))
+            .await
+            .context("striped bulk echo read timed out")??;
+        anyhow::ensure!(n > 0, "echo service closed after {read}/{len} bytes");
+        read += n;
+    }
+    assert_eq!(got, expected, "the striped path corrupted the byte stream");
+    writer
+        .await
+        .context("bulk writer task failed")?
+        .context("bulk writer returned an error")?;
+    Ok(())
+}
+
+/// Data-channel striping: `[server.data] stripe_count = 4` spreads every
+/// visitor connection over 4 parallel data channels (a stripe group, see
+/// `src/stripe.rs`). A multi-megabyte transfer must come back
+/// byte-identical and in order through the group, back-to-back visitors
+/// must each get their own group, and the unstriped request path must keep
+/// working beside it.
+#[cfg(feature = "multiplex")]
+#[tokio::test]
+async fn striped_data_channels() -> Result<()> {
+    init();
+
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client(
+            "tests/for_tcp/striped_data_channels.toml",
+            client_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server(
+            "tests/for_tcp/striped_data_channels.toml",
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+
+    info!("bulk round trip through a striped visitor connection");
+    bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
+
+    info!("a second visitor gets its own stripe group");
+    bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
+
+    info!("small interactive request after the bulk transfers");
+    echo_hitter(exposed_addrs(Type::Tcp).0, Type::Tcp)
+        .await
+        .unwrap();
+
+    server_shutdown_tx.send(true)?;
+    client_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
 
     Ok(())
 }

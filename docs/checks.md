@@ -93,7 +93,7 @@ commit; nothing here is a heavy gate.
 |---|-------|---------|
 | 12 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
 | 13 | dated, non-empty `## [x.y.z] - YYYY-MM-DD` in `CHANGELOG.md` | release notes single source |
-| 14 | `results-vX.Y.Z.json` + `assets/benchmark-vX.Y.Z.png` committed | benchmark ritual deliverables |
+| 14 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed | benchmark ritual deliverables |
 | 15 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
 | 16 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 

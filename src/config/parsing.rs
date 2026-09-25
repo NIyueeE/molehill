@@ -371,6 +371,13 @@ pub struct NoiseConfig {
     pub psk: Option<MaskedString>,
     #[serde(default)]
     pub psk_location: Option<u8>,
+    /// Noise session resume: a reconnect that proves possession of the
+    /// previous session's handshake hash with a MAC instead of repeating
+    /// the handshake's key exchanges. Opt-in (default off) because a
+    /// resumed session's keys derive without a fresh DH — see
+    /// docs/transport.md, "Noise session resume".
+    #[serde(default)]
+    pub resume: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
@@ -548,6 +555,16 @@ pub struct ServerControlConfig {
 pub struct ServerDataConfig {
     /// Data-plane listener; defaults to `[server.control].bind_addr`.
     pub bind_addr: Option<String>,
+    /// Data channels per visitor connection.
+    ///
+    /// `1` (the default) is the classic shape: one data channel per
+    /// visitor. A higher count spreads every visitor connection over that
+    /// many parallel data channels ("stripes"), which multiplies its
+    /// throughput ceiling and in-flight window; both ends must be able to
+    /// speak the striped data-channel framing (a molehill new enough to
+    /// know the `StartForwardStripedTcp` command on both sides). See
+    /// `docs/internals.md` ("Data-channel striping").
+    pub stripe_count: Option<u16>,
 }
 
 /// The server owns no per-service configuration. Services are registered at
@@ -598,6 +615,15 @@ impl ServerConfig {
             .bind_addr
             .as_deref()
             .unwrap_or(self.control.bind_addr.as_str())
+    }
+
+    /// Effective data channels per visitor connection: the configured
+    /// `[server.data].stripe_count` clamped to `1..=MAX_STRIPES` (an
+    /// environment override for measurements wins when set — see
+    /// `crate::stripe::stripe_count`).
+    #[cfg(feature = "multiplex")]
+    pub fn stripe_count(&self) -> usize {
+        crate::stripe::stripe_count(self.data.stripe_count)
     }
 
     /// Without the multiplex feature the data plane follows the control
@@ -904,9 +930,10 @@ mod tests {
     }
 
     /// Extract every fenced `toml` code block from a markdown file: the
-    /// configuration examples live as code blocks in docs/configuration.md
-    /// since the examples/ directory was folded into the documentation, and
-    /// the test keeps validating that every shipped example parses.
+    /// configuration examples live as code blocks in the docs and the
+    /// READMEs since the examples/ directory was folded into the
+    /// documentation, and the test keeps validating that every shipped
+    /// example parses.
     /// Only used by the `multiplex`-gated doc-example test, so it shares
     /// that gate (a cfg-gated consumer must not leave it as dead code).
     #[cfg(feature = "multiplex")]
@@ -936,17 +963,31 @@ mod tests {
     // `[client.data]` / `[server.data]` blocks exist only behind the
     // `multiplex` feature, so this gate runs in the default and
     // multiplex legs and is skipped in feature-minimal legs.
+    //
+    // Every markdown file that ships a config example is checked — the
+    // two READMEs and both configuration pages. Covering only the English
+    // page let the Chinese mirror and the quick-start examples drift
+    // silently (a renamed key would ship unparsed); the zh mirrors are
+    // translated copies, so the same parse contract applies to them.
     #[test]
     #[cfg(feature = "multiplex")]
     fn test_doc_example_config() -> Result<()> {
-        let blocks = doc_toml_blocks("docs/configuration.md")?;
-        assert!(
-            !blocks.is_empty(),
-            "no toml code blocks found in docs/configuration.md"
-        );
-        for b in &blocks {
-            Config::from_str(b)?;
+        const DOC_FILES: [&str; 4] = [
+            "docs/configuration.md",
+            "docs/configuration.zh.md",
+            "README.md",
+            "README.zh.md",
+        ];
+        let mut total = 0;
+        for path in DOC_FILES {
+            let blocks = doc_toml_blocks(path)?;
+            assert!(!blocks.is_empty(), "no toml code blocks found in {path}");
+            for b in &blocks {
+                Config::from_str(b).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+                total += 1;
+            }
         }
+        assert!(total >= DOC_FILES.len(), "expected several examples");
         Ok(())
     }
 

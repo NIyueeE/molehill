@@ -9,68 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The per-tunnel mux stream cap is raised from 32 to 64
-  (`DEFAULT_MUX_MAX_STREAMS`), doubling the per-client concurrent
-  data-channel ceiling at the default `count = 4` (128 -> 256). The
-  yamux credit reservation grows from 8 MiB to 16 MiB of the 64 MiB
-  connection receive window, leaving 48 MiB (75%) for the window
-  auto-tuner; the pairing is guarded by a unit test that fails if the
-  reservation ever swallows half the window (the configuration that
-  measured a ~30x throughput drop). The per-tunnel data-channel ceiling
-  was probed directly on one host with `count = 1`: 15 concurrent
-  streams before (the cap minus the service's 16-stream pool and
-  iperf3's control stream) versus 47 after, with the 16th and 48th
-  opening failing in the respective runs. See HANDOFF.md, "Phase 4:
-  L2 landed".
+- **The benchmark model was replaced: the measurement matrix is retired and
+  the Soak model ships in its place** (`benches/scripts/soak/`). A *cell* —
+  one average per tool per network condition, cold-started per cell and
+  reported as a median over reps — is replaced by a *workload over time*:
+  every tool is driven through one identical workload (an interactive
+  stream, N bulk streams, C short connections per second, a UDP session)
+  while the path follows a scripted stage schedule that is changed in place,
+  so the tool's session is never rebuilt and adaptation/recovery is part of
+  the measurement. Test types: `capacity` (ramp the load until the
+  interactive stream breaks the SLO), `rrul` (saturate and watch the
+  interactive stream's RTT distribution over time), `soak` (the drift/leak
+  axis), `cost` (CPU-seconds per carried Gbit at a fixed operating point)
+  and `screen` (a fast development A/B, the two builds interleaved inside
+  every load step with a sequential decision). Everything measured is
+  externally observable, so the peers (frp, rathole, nps) are driven by the
+  same workload and charted in the same panels; tools in a batch never share
+  a shaper (one HTB class plus independent netem each) and the interactive
+  probes run in their own processes so the harness is never inside the
+  measured path. The retired matrix's runner, charts, gate and results
+  (`benches/scripts/bench/`, `assets/benchmark-*.png`,
+  `results-v*.json`) are removed; its numbers remain in git history and in
+  the v0.8.x release notes and are never a regression signal against this
+  model. Recipes: `just soak` / `soak-plot` / `soak-check` / `soak-peers`;
+  the release review now requires `results-soak-vX.Y.Z.json` and
+  `assets/soak-vX.Y.Z.png`.
 
-### Performance
+## [0.9.0] - 2026-09-24
 
-- Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
-  now staged into one buffer with their 12-byte header and written in a
-  single call instead of two. Larger frame bodies keep the two-phase write
-  so a 16 KiB payload is never copied twice.
-- The Noise record stream (the `noise` transport) is leaner: reads
-  accumulate the two-byte length header together with the ciphertext in one
-  buffer — one `poll_read` sweep per record instead of a separate header
-  read first — and a record that coalesces with its successor in a single
-  wake is decrypted from the same buffer without an extra copy. The
-  per-record `set_len` dance is gone, and with it the wrapper's `unsafe`
-  code. Covered by new unit tests in `src/transport/noise_stream.rs`. An
-  A/B against the parent revision on one host (3 reps, 8 s tests) measures
-  **+9.0%** on the loopback 1-stream cell and **+8.0%** on the
-  loss1_rtt10 8-stream cell — both with non-overlapping rep ranges; the
-  remaining cells sit inside the run spread and claim nothing. Details and
-  the full table: HANDOFF.md, "Leaner noise stream A/B".
+> **Measurement note.** Several A/B figures quoted below were first taken
+> with the benchmark harness's broken `--ab` mode, which spawned the default
+> binary on both sides of an interleave and therefore compared one binary
+> against itself (fixed in `064c55a`; post-mortem in HANDOFF.md, "The `--ab`
+> harness bug"). Those figures are withdrawn; the ones that stand were
+> re-taken with the fixed harness and say so in their entry. A/Bs taken as
+> two separate runs (the noise-stream pairs, the KCP experiments) and the
+> in-process probes (µs, allocations, faults) were never affected. The
+> branch-vs-`main` cumulative comparison and the v0.9.0 release matrix were
+> run entirely with the fixed harness.
 
-- A record whose plaintext fits the caller's read buffer is now decrypted
-  **straight into that buffer** instead of being staged in the wrapper and
-  copied out: the plaintext length is known from the ciphertext length, so
-  tokio's `ReadBuf::initialize_unfilled_to` can size the output region
-  exactly (a free slice view for the standard caller, a memset of just
-  that region for uninit callers). No unsafe is added. Measured on the
-  default `count=4` + noise arm: **+12.3%** on the loopback 8-stream cell
-  with non-overlapping rep ranges, while the plain-path control moved the
-  other way; the 1-stream cells sit at the ring cipher's ceiling and claim
-  nothing, and the `noise-direct` arm — already at the plain-path ceiling
-  — is unchanged. The mux path benefits too, because yamux's writer splits
-  a frame into a header write and a body write, so the body record aligns
-  1:1 with the frame reader's body ask. Details: HANDOFF.md, "Direct
-  decrypt A/B".
+### Added
 
-- Connection setup allocates almost nothing now. The handshake runs on
-  stack buffers (its messages are bounded by the pattern's tokens, well
-  under 300 bytes — the snowstorm original allocated two 64 KiB buffers
-  per handshake turn), and the three 64 KiB record buffers come from a
-  bounded pool (64 sets, ~12 MiB high-water): freed in one piece they
-  exceed the allocator's trim threshold, so without a pool every
-  connection re-faults and re-zeroes 48 pages. A counting-allocator +
-  getrusage probe (release build) measures pair setup at **232 us, 28
-  allocations and 4 KiB, zero minor faults — down from 312 us, 42
-  allocations and 900 KiB**. System level (same host, same method, 3
-  reps): the direct-mode noise arm's churn improves **+11.7% connects/s
-  and -10.7% first-byte p50**, with RSS **-24%**; the mux arm is unchanged
-  inside the spread (its tunnels are set up once per client). Details:
-  HANDOFF.md, "Connection-setup allocation measurement".
+- **Noise session resume** (`[transport.noise] resume = true`, default
+  off): a reconnect proves possession of the previous session's
+  handshake hash with a MAC instead of repeating the handshake's key
+  exchanges. The server issues a ticket (sealed with a key derived from
+  its Noise static private key) after a full handshake; the client caches
+  it and, on the next connect, sends it with a fresh nonce and MAC
+  (transport selector `0x02`). Both sides then derive fresh record keys
+  from the cached hash plus two nonces (HKDF-SHA256 over
+  ChaCha20-Poly1305). Tickets expire after 24 h, a repeated
+  `(ticket, nonce)` pair is rejected, and any failure declines cleanly so
+  the client falls back to a full handshake. Measured on this host
+  (release build, in-process pair over a duplex, the default pattern):
+  **442.7 -> 38.5 us per connection pair** — the handshake's key
+  exchanges are ~97% of the setup CPU and resume removes them. The
+  tradeoff is forward secrecy on resumed sessions (their keys derive
+  without a fresh DH), which is why it is opt-in. See docs/transport.md,
+  "Noise session resume".
+- **Data-channel striping** (`[server.data] stripe_count = K`): a visitor
+  connection can be spread over `K` parallel data channels — a *stripe
+  group* — instead of one. Each direction numbers its 32 KiB chunks and
+  spreads them round-robin over the group; the receiver reassembles by
+  sequence number, so the connection behaves like one stream whose ceiling
+  and in-flight window are the sum of its channels'. The framing lives on
+  the data channel (`StartForwardStripedTcp` command, `[seq][len]` frames,
+  `src/stripe.rs`), not on yamux, so the engine's wire format — and 0.8.x
+  peer interoperability — is untouched, and channels that do not carry the
+  new command are byte-identical to before. Default `1` (off); TCP services
+  only. An interleaved A/B against the parent revision with the fixed
+  harness (loopback cell, 3 rounds, 8 s tests, both binaries' commit SHAs
+  verified) measures **+48.7%** on 1-stream with non-overlapping rep ranges
+  (10.73 -> 15.96 Gbit/s), 8-stream inside its spread (+5.1%), and a
+  median-only cost side (churn -7.7%, CPU +40.8%, RSS +8.7%, sub-ms
+  latency +5%); cpu-per-frame halves. Details and the inertness check at
+  K=1: HANDOFF.md, "Stripe A/B (K=4)". See docs/internals.md,
+  "Data-channel striping".
+- The KCP data path (carrier `kcp`, `kcp` feature) carries opt-in
+  attribution counters — the same instrument the mux engine's framing
+  counters are for that engine. With `MOLEHILL_KCP_STATS=1` every
+  molehill process logs a per-second `kcp-stats` line: datagrams
+  in/out, retransmissions, acks and SACK gap notifications sent, pump
+  rounds, and coarse per-phase milliseconds split across input, delivery,
+  writer drain, wire drain and the ARQ update. Relaxed atomics at the
+  existing sites; no wire-format or behaviour effect, default off.
 
 ### Changed
 
@@ -82,8 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of `web-time`/`static_assertions`, upstream property tests
   dropped, the unused graceful-close subsystem removed). It puts the
   framing path under molehill's own rules and unlocks changes that
-  call-site tuning cannot reach. Design and phased plan: HANDOFF.md,
-  "Direction ① design document".
+  call-site tuning cannot reach. The per-change record of the migration
+  (what landed, what was measured and closed) is HANDOFF.md, "What
+  landed".
 - The mux engine is now tokio-native: it speaks tokio's `AsyncRead` /
   `AsyncWrite` directly instead of the futures-io traits behind a
   tokio-util `Compat` shim, so the `futures` and `tokio-util`
@@ -106,20 +129,254 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ahead, the receiver's buffer grows with them, and the window update
   shrinks with the buffer, throttling the very sender it is meant to
   supply.
-
 - `MultiMap` — the two-key map behind the server's control-channel
   registry — is now plain safe Rust: the second key is stored in both maps
   instead of sharing one heap item between them through raw pointers.
-  `src/common/multi_map.rs` no longer contains `unsafe`, which leaves
-  `src/transport/udp_batch.rs` as the single audited unsafe site.
+- The per-tunnel mux stream cap is raised from 32 to 64
+  (`DEFAULT_MUX_MAX_STREAMS`), doubling the per-client concurrent
+  data-channel ceiling at the default `count = 4` (128 -> 256). The
+  yamux credit reservation grows from 8 MiB to 16 MiB of the 64 MiB
+  connection receive window, leaving 48 MiB (75%) for the window
+  auto-tuner; the pairing is guarded by a unit test that fails if the
+  reservation ever swallows half the window (the configuration that
+  measured a ~30x throughput drop). The per-tunnel data-channel ceiling
+  was probed directly on one host with `count = 1`: 15 concurrent
+  streams before (the cap minus the service's 16-stream pool and
+  iperf3's control stream) versus 47 after, with the 16th and 48th
+  opening failing in the respective runs. See HANDOFF.md, "What
+  landed".
+- `default_split_send_size` is now 32 KiB (the vendored yamux default was
+  16 KiB). Re-measured on the fixed engine — the earlier 16 KiB preference
+  came from a run polluted by the dead-receiver leak below and its numbers
+  are not comparable: the 32 KiB split now measures +45.7% with
+  non-overlapping reps on the single-tunnel 8-stream loopback cell and
+  +5..9% on the shaped cells, everything else inside the spread.
+  Re-measured again 2026-09-22 in the cumulative A/B against `main`
+  (fixed-harness `--ab`, 3 rounds): the single-tunnel 8-stream loopback
+  cell sits at **+0.3%** with the rounds alternating direction, so the
+  +45.7% figure did not reproduce; the default stands on no-regression
+  grounds, not as a proven throughput win.
+- The Noise record stream (the `noise` transport) is leaner: reads
+  accumulate the two-byte length header together with the ciphertext in one
+  buffer — one `poll_read` sweep per record instead of a separate header
+  read first — and a record that coalesces with its successor in a single
+  wake is decrypted from the same buffer without an extra copy. The
+  per-record `set_len` dance is gone, and with it the wrapper's `unsafe`
+  code. Covered by new unit tests in `src/transport/noise_stream.rs`. An
+  A/B against the parent revision on one host (3 reps, 8 s tests) measures
+  **+9.0%** on the loopback 1-stream cell and **+8.0%** on the
+  loss1_rtt10 8-stream cell — both with non-overlapping rep ranges; the
+  remaining cells sit inside the run spread and claim nothing. Details and
+  the full table: HANDOFF.md, "Leaner Noise record stream".
+- A record whose plaintext fits the caller's read buffer is now decrypted
+  **straight into that buffer** instead of being staged in the wrapper and
+  copied out: the plaintext length is known from the ciphertext length, so
+  tokio's `ReadBuf::initialize_unfilled_to` can size the output region
+  exactly (a free slice view for the standard caller, a memset of just
+  that region for uninit callers). No unsafe is added. The mux path
+  benefits too, because yamux's writer splits a frame into a header write
+  and a body write, so the body record aligns 1:1 with the frame reader's
+  body ask. The +12.3% first measured on the noise loopback 8-stream cell
+  did not reproduce under the fixed harness (that cell reads -7.5% in the
+  cumulative A/B, `main` ahead in all three rounds), so no gain is claimed
+  for it; the change stands on its mechanism. Details: HANDOFF.md,
+  "Direct decrypt into the caller's buffer" and "Final cumulative A/B".
+- Connection setup allocates almost nothing now. The handshake runs on
+  stack buffers (its messages are bounded by the pattern's tokens, well
+  under 300 bytes — the snowstorm original allocated two 64 KiB buffers
+  per handshake turn), and the three 64 KiB record buffers come from a
+  bounded pool (64 sets, ~12 MiB high-water): freed in one piece they
+  exceed the allocator's trim threshold, so without a pool every
+  connection re-faults and re-zeroes 48 pages. A counting-allocator +
+  getrusage probe (release build) measures pair setup at **232 us, 28
+  allocations and 4 KiB, zero minor faults — down from 312 us, 42
+  allocations and 900 KiB**. The system-level churn gain first reported
+  alongside it (+11.7% connects/s) did not reproduce under the fixed
+  harness — the direct-mode loopback churn arm sits at parity in the
+  cumulative A/B — so only the in-process setup probes are claimed.
+  Details: HANDOFF.md, "Connection-setup allocation".
+- Control frames on the mux data path (SYN/ACK/FIN/window update/ping) are
+  now staged into one buffer with their 12-byte header and written in a
+  single call instead of two. Larger frame bodies keep the two-phase write
+  so a 16 KiB payload is never copied twice.
+- The KCP data path amortizes its per-segment bookkeeping: the engine's
+  outbound datagrams stage in a reusable ~46 KiB buffer and cross the pump
+  channel as ONE message per batch (closed at 32 datagrams, the staging
+  cap, or the engine's flush boundary — `Kcp::flush` now calls
+  `Output::flush`), and the reader side coalesces consecutive segments
+  into one channel message per ~16 KiB while the reader keeps up
+  (per-segment granularity returns under reader backpressure). Channel
+  messages and `Bytes` allocations per segment fall ~32x on the send side
+  and ~8-11x on the receive side (measured by the new `blobs_out`
+  counter); the wire datagrams, the byte stream and the ARQ semantics are
+  unchanged — a pacer denial still drops only the denied datagram. An
+  interleaved A/B against the parent revision with the fixed harness
+  (3 rounds x 3 reps x 8 s, cells loopback / loss1_rtt10 / rtt100, kcp4
+  arm + the loopback mux-off control, both binaries' SHAs verified)
+  measures **+6.6%** on loopback 1-stream and **+7.6%** on loopback
+  64-stream (both non-overlapping), **+9.3%** on loss1_rtt10 8-stream
+  (non-overlapping), CPU -7.2% and cpu/kframe -20.7% (median-only); the
+  loopback 8-stream cell's -39% is that cell's documented cold-start
+  bimodality (0.4-3.2 Gbit/s modes), not a claim. One open cost: loopback
+  RSS +73% median-only against its own parent (the coalesced-blob channel
+  residency, bounded at ~32 MiB per session under a full reader stall);
+  the cumulative figure against `main` — from the first valid
+  branch-vs-main A/B — is **+194%** on that cell, the per-session staging
+  and coalescing residency times the 64 concurrent sessions the cell
+  holds. Details: HANDOFF.md, "Phase 1 A/B" and "Final cumulative A/B".
+- Zero-copy receive on the KCP read path (link L1): the engine's own
+  segment buffers cross to the reader channel **by ownership**
+  (`Kcp::recv_owned` freezes each segment in place; the reader-channel
+  message is a `ReadBatch` of parts), so both per-byte copies the receive
+  path paid are gone — the Phase-1 receive batching is now free
+  (reference-count moves, not memcpys). The engine's buffer-API `recv`
+  became a thin wrapper over the same core and is test-gated; new engine
+  tests lock the two read APIs byte-for-byte identical. Measured per
+  delivered segment (interleaved A/B, 3 rounds x 3 reps, cells loopback /
+  loss1_rtt10 / rtt100, kcp4 arm + the loopback mux-off control, both
+  binaries' SHAs verified): the recv loop fell **0.72-0.79 -> 0.042-0.046
+  us on loss1_rtt10 (-94%)** and 0.30-58 -> 0.045-0.051 us on loopback,
+  with the segments-per-reader-message ratio held and the input/output
+  phases unchanged; CPU / RSS / cpu-per-kframe moved favourably on every
+  cell (median-only) and no attributable throughput regression. Details
+  and the full table: HANDOFF.md, "Link L1 A/B".
+- Zero-copy send for stream-mode PUSH datagrams (link L2): the engine
+  emits a 24-byte header plus the segment's own payload buffer by
+  reference (`DatagramSink::write_datagram`; the segment payload type
+  moved from `BytesMut` to `Bytes`), and the adapter's batch carries the
+  payload as a second iovec (`Span::Split`) that `sendmmsg` writes
+  directly — the engine's staging buffer and the adapter's batch copy
+  both disappear on the send path, so a sent byte is copied zero times
+  between the app write and the syscall. The wire bytes are identical to
+  the packed form (engine test locks them byte-for-byte, and the
+  retransmit re-emits the same allocation); ack/probe datagrams keep the
+  packed path. Measured (interleaved A/B, fixed harness, 3 rounds x 3
+  reps, cells loopback / loss1_rtt10 / rtt100, kcp4 arm + the loopback
+  mux-off control, both binaries' SHAs verified): no attributable
+  throughput change — loopback 1-stream -0.2% and 64-stream -1.0%
+  non-overlapping (the control arm's own noise on those cells is +/-9%),
+  the 8-stream cells inside their spreads, and the rtt100 1-stream -40%
+  tool claim is not attributable (that cell is bimodal on both binaries
+  and the medians differ by rep count, inside its documented 7x spread).
+  CPU moved favourably on loopback (-4.6%) and rtt100 (-11.3%),
+  median-only; RSS +12.4%/+16.7% median-only on loopback/loss1 (a
+  pacer-denied span now holds its payload `Bytes` instead of a staged
+  copy, bounded by the 32-datagram batch). Details: HANDOFF.md,
+  "Link L2 A/B".
+- Zero-copy write on the kcp4+noise path (link L3): the Noise record is
+  handed to the writer channel **by ownership** — the record buffer the
+  AEAD encrypted into *is* the transport's buffer, gated by the
+  `TAKES_OWNED` const so a plain-TCP transport keeps the pooled path —
+  and the engine's `send_owned` shares it per segment with O(1) `Bytes`
+  splits, so both remaining per-byte copies on that path are gone and a
+  sent byte is copied zero times between the app write and the syscall,
+  AEAD aside. The engine's slice `send` is now only the owned path's test
+  oracle (byte-for-byte lock). Measured (interleaved A/B, fixed harness,
+  3 rounds x 3 reps, cells loopback / loss1_rtt10, kcp4 arm + the mux-off
+  control, both binaries' SHAs verified; the run was interrupted at the
+  start of the rtt100 cell, so that cell is not part of the comparison):
+  **+5.7%** on loopback 1-stream and **+24.4%** on loopback 64-stream
+  (both non-overlapping, the latter exceeding the control arm's own
+  +11.3% bias on that cell); the loss1_rtt10 -0.3%/-0.4% tool claims sit
+  inside the cell's own ±7% rep spread with comparable retransmits, and
+  the mux-off control's -10.3% on loopback 1-stream is that cell's
+  ordering bias. CPU / RSS / cpu-per-kframe all median-only favourable or
+  flat. Details: HANDOFF.md, "Link L3 A/B".
+- Zero-copy send on the stripe path (link S1): the stripe send direction
+  reads each chunk **directly into the payload region of its frame
+  buffer** — behind the 10-byte header, written in front once the read
+  length is known — and hands the whole frame to the stripe by ownership,
+  so the send direction's staging copy is gone (the read buffer becomes
+  the frame). The stripe write itself keeps the borrowed boundary, and the
+  wire format and the round-robin/commit semantics are unchanged. An
+  interleaved A/B against the parent revision with the fixed harness
+  (3 rounds, 3 reps, 8 s tests, loopback cell, mux-stripe arm + the
+  unstriped `mux` inertness control + the mux-off control, both binaries'
+  commit SHAs verified) measures **+9.7%** on the stripe arm's 1-stream
+  (17.098 -> 18.758 Gbit/s, the head ahead in all 3 rounds) — inside the
+  cell's spread, so recorded as directional, not claimed — with 8-stream
+  at parity and the unstriped control unchanged. The cost is the per-chunk
+  frame buffer allocated per read instead of reused: RSS +10.7% and CPU
+  +3.3% on the opt-in stripe arm (median-only). The same link's sibling
+  on the default arms, M1 (owned mux frame bodies), was reverted after its
+  A/B — it failed the gate on four cells (including both single-rep
+  64-stream points) with RSS +25% on the default arms; the evidence and
+  the identified cost mechanism are in HANDOFF.md, "Link M1 A/B".
+  Details: HANDOFF.md, "Link S1 A/B".
+- The KCP attribution instrument's delivery phase is split and a
+  timer-scope bug fixed: the "deliver" timer's binding outlived its
+  statement, so it booked the rest of the pump round (the SACK check, the
+  ack flush, the wire drain, the liveness tail) into the delivery phase —
+  the first per-segment table's "delivery 2.46 us" was mostly the wire
+  drain. The phase is now block-scoped, `kcp-stats` gains
+  `segments_delivered`, `recv_empty`, `ms_deliver_spill` and
+  `ms_deliver_recv`, and the re-based loopback kcp4 table (1 rep x 8 s,
+  both processes) reads: sender per segment — writer 0.60 us, wire drain
+  2.55 us, input 0.09, update 0.01 (pump body ~3.26 us, pump rounds
+  3002/s against 4842/s before send batching landed); receiver per
+  segment — input 0.42, deliver 0.41 (recv loop 0.40, spill 0.01),
+  output 0.42, with 8.0 segments per reader message. The original "sender
+  delivery anomaly" is retired as an artifact; the re-aimed targets (the
+  wire drain on the send side, the recv-loop copies on the receive side)
+  are exactly what the zero-copy links above remove. Also recorded: the
+  full-path copy map and the L1-L3/M1/N1/S1 link sequence in HANDOFF.md,
+  "Zero-copy route".
+- Lint-hygiene pass over the data path: in-code lint waivers fell from 49
+  to 14 in production code (70 -> 25 including test modules) and the
+  `unsafe` surface from 19 items to 8. No wire-format, protocol or
+  scheduling change; the full suite and both clippy passes are green. The
+  waivers were removed by fixing the code rather than by relaxing a level:
+  `expect_used`/`unwrap_used` sites became real error paths, `cast_*`
+  sites became `try_from` conversions whose unreachable fallbacks are
+  benign, the vendored KCP engine's `input`/`flush` were split into the
+  helpers their own `too_many_lines` reasons described, and `pump_tail`'s
+  per-round state became one `PumpTailCtx` instead of twelve parameters.
+  The dead `Config::set_split_send_size` setter was deleted.
+- `src/transport/udp_batch.rs` — still the single audited unsafe site —
+  now keeps `unsafe` only at the FFI boundary: the two zeroed `msghdr` /
+  `sockaddr_storage` templates (musl's private padding fields rule out a
+  struct literal), the kernel-ABI cast that reads a received address back,
+  the `recvmmsg`/`sendmmsg` calls, and the `Send`/`Sync` impls the
+  reusable descriptor arrays need. Everything else is safe: iovec pointers
+  come from `ptr::from_mut` on bounds-checked indices, staged spans from
+  range-sliced `Bytes`, and the send address from
+  `socket2::SockAddr::from(peer)` instead of a hand-built storage — which
+  also means a **scoped IPv6 peer now carries its flowinfo and scope id**
+  onto the wire, where the hand-built storage dropped both.
 
 ### Fixed
 
+- Multiplexed connections no longer accumulate dead stream receivers.
+  The engine used futures' `SelectAll` for the per-stream command
+  receivers, which drops a sub-stream once it reports its end; the
+  tokio-native conversion replaced it with a `Vec` and never removed the
+  finished receivers. Every stream ever opened stayed in the vector, and
+  the connection's poll loop is O(receivers) — a client serving many
+  short-lived connections (connection churn) ended up polling thousands
+  of dead receivers on every poll: the single-tunnel churn rate measured
+  -29% and the first-byte p50 3.1 -> 7.1 ms against the pre-conversion
+  engine. Fixed by retaining only the live receivers.
 - `molehill --genkey` on a binary built without the `noise` feature names
   the feature correctly now ("noise", previously "nosie"). The
   `feature_not_compile` helper is cfg-gated to exist exactly when one of
   its `#[cfg(not(feature = ...))]` callers does, instead of being
   `allow(dead_code)`d away in full-feature builds.
+- The benchmark harness's `--ab` mode spawned the default binary on both
+  sides of an interleave (every spawn site read a frozen global instead of
+  the per-arm knob), so every interleaved A/B taken with it compared one
+  binary against itself. The global is gone — the binary path lives only
+  in `knobs`, which the interleave swaps — and a label collision between
+  same-named worktree binaries (the sides silently overwrote each other)
+  plus the unrecorded label-to-path mapping that let one verdict be read
+  backwards are fixed too. Two more bench bugs found while running the v0.9.0
+  matrix are fixed with it: the `--ab` work had wrapped the arm set in a
+  per-round loop, so a plain `just bench` ran every arm — molehill's and every
+  peer's — three times over (the matrix took 3x its documented wall time and
+  the extra passes bought nothing), and `setup_nps`'s `web` symlink was the one
+  non-idempotent step of the peer's tree, so the nps arm failed on the second
+  cell of any matrix (it had only ever been measured on loopback before). Every
+  figure in this section quoted from an affected run has been re-taken or
+  explicitly withdrawn above.
 
 ## [0.8.1] - 2026-09-11
 

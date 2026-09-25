@@ -68,79 +68,78 @@ re-enforces the version and changelog invariants remotely.
 
 ## Benchmarks: per-tag ritual
 
-Every tag refreshes the peer-comparison benchmark (matrix design and peer
-fetching live in `benches/scripts/bench/`; peers: frp, rathole (upstream),
-bore — each fetched as the **latest GitHub release** binary, never
-built from source, with the resolved versions recorded in the results meta
-and the chart footer). The matrix (schema v3) measures, per tool and network
-cell: TCP
-throughput (1/8 streams) **through the tunnel** (iperf3 dials the tool's
-exposed port), connection-path RTT, data-path RTT (steady ping over
-one established connection), UDP session quality over one established session
-(RTT / loss / jitter / max inter-packet gap), a head-of-line probe (saturating
-bulk flow + game-like pinger through the same tunnel), and RSS. Molehill runs
-as mux, noise, mux1 and kcp4 variants (mux-off additionally on the loopback
-cell); peers: frp / rathole also run UDP arms, bore is TCP-only, and all
-three run a lean cell subset (loopback, rtt10, 1% loss, the two rate cells)
-— the peers chart plots only those cells. All bench
-entries are PEP 723 python scripts run via `uv run`: runs are resumable (each
-completed arm is checkpointed together with the full meta), continue on
-error (a per-metric failure records `null` plus a `partial_metrics` list
-instead of a fake 0; a probe that is structurally out of range — the
-64-stream scale point above an arm's usable yamux ceiling (the cap
-`count × 64` minus the bench's own pooled channels and the client's
-control stream) — is skipped by design with its reason recorded the same
-way; the rate20
-8-stream test wedges the single-test iperf3 server and records the timeout
-instead), refuse to run concurrently (a global lock — concurrent
-runs used to reap each other's live processes), and a killed run (Ctrl-C or
-SIGTERM) cleans up arms, removes the netem qdisc and writes the full meta;
-`--fresh` backs up the previous results file to `.bak` first.
-`--tools/--cells/--variants` select subsets — the full matrix is roughly
-three hours at full rigor:
+Every tag refreshes the Soak benchmark (design and tools live in
+`benches/scripts/soak/`; peers: frp, rathole (upstream), nps — each fetched as
+the **latest GitHub release** binary, never built from source, with the
+resolved versions recorded in the results meta). The model measures a
+**workload under staged network conditions as time series**: one interactive
+stream (the SLO instrument), N bulk TCP streams, C short connections per
+second and one UDP session, while the path changes on a stage schedule
+(clean → rtt100 → loss1 → loss5 → rate100 → rate20 → jitter → clean), applied
+in place so the tool's session is never rebuilt. Everything measured is
+externally observable, so the peers are driven by exactly the same workload
+and appear beside molehill in every chart. All entries are PEP 723 python
+scripts run via `uv run`; a run refuses to start while another one holds the
+lock, and a killed run (Ctrl-C or SIGTERM) still writes the tests it
+completed.
 
-1. `just bench` — runs the full matrix (loopback + weak-network cells) and
-   writes `benches/scripts/bench/results-vX.Y.Z.json` (the default `--out`
-   derives from `Cargo.toml`'s version, so a plain run targets the next
-   tag's file, never the previous release's baseline). During development,
-   `just bench-fast` runs a ~2-minute molehill-only smoke matrix into
-   `results-dev.json`, which plot/regression never pick up.
-   **The full matrix is a heavy, machine-exclusive ritual (~1.5-2 h)**:
-   it saturates every reachable core by design. It self-throttles (nice
-   10, load-aware cooldown between arms) so the host stays responsive,
-   but do not run other work on the same machine while it runs.
-2. `just bench-plot` — renders the per-axis chart set
-   (`assets/benchmark-vX.Y.Z.png` for the peers baseline,
-   `benchmark-mux-*`, `benchmark-transport-*` for encryption,
-   `benchmark-count-*` and `benchmark-carrier-*` — one single-variable
-   comparison each) and prints the markdown tables; update the README
+1. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
+2. `just soak` — run the sweep (one tool or a batch of them, per its own
+   shaped path in one HTB class each, so concurrent tools never share a
+   shaper; the batch size comes from the host's CPU budget). Writes
+   `benches/scripts/soak/results-soak-vX.Y.Z.json` (the default `--out`
+   derives from `Cargo.toml`'s version). Test types: `capacity` (ramp the
+   load until the interactive stream breaks the SLO), `rrul` (saturate and
+   watch the interactive stream's RTT distribution over time), `soak` (a
+   long rotating-path drift/leak run), `cost` (CPU-seconds per carried
+   Gbit/s at a fixed operating point), `screen` (a fast development A/B —
+   see below).
+3. `just soak-plot` — renders the chart set (`assets/soak-vX.Y.Z.png`: the
+   interactive stream over the stage schedule with the SLO line;
+   `soak-*-capacity.png`: the response-time-vs-load curve; `soak-*-udp.png`;
+   `soak-*-drift.png`) and prints the markdown tables; update the README
    Benchmarks section with them, then delete the previous tag's charts from
    `assets/`.
-3. `just bench-check` — regression gate against the previous tag's results
-   file. **Performance must not regress vs the previous tag**; a violation
-   blocks the tag until fixed or explicitly waived (record the waiver in
-   `HANDOFF.md`).
-4. Commit results JSON + new chart + README table **in the release commit**.
-5. `just tag` — the release review (`githooks/pre-tag`) must pass, then the
-   annotated tag for `Cargo.toml`'s version is created locally. Pushing it
-   (`git push origin vX.Y.Z`) is the release act: pre-push re-runs the review
-   and the heavy gates, then release.yml publishes directly.
+4. `just soak-check` — regression gate against the previous tag's results
+   file. **A tool must not lose capacity, must not break its SLO earlier and
+   must not drift**; a violation blocks the tag until fixed or explicitly
+   waived (record the waiver in `HANDOFF.md`). On the first soak release
+   there is no same-model baseline: the gate is the absolute SLO, and that
+   is stated in the README.
 
 The gate runs locally before tagging, never in CI: shared runners are too
 noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
-(netem); without it the script falls back to a userspace delay proxy for
-rtt cells and skips loss cells — note the mechanism in the README table when
-it differs. The gate is only meaningful between same-schema AND same-method
-results. Schema v3 fixed the throughput measurement point (pre-v3 files
-dialed the backend directly and are not comparable); the 2026-09-10/11
-measurement revision then changed the matrix method itself — rate-cell
-shaping queue, throughput window convention, weak-cell and HoL durations,
-the steady-ping and UDP probes — so only results measured from that revision
-on (v0.8.0 and later) are comparable with each other, and a difference
-against an earlier file is not a regression signal. Record how the gate was
-read in `HANDOFF.md`. `benches/scripts/bench/audit_results.py`
-is the companion check for completeness — it reports `None` holes and
-arm-level errors, and exits non-zero when it finds either.
+(netem); without it the run aborts — there is no userspace fallback, because
+a fallback path is a second measurement method. The gate is only meaningful
+between same-model results; the retired matrix model's numbers (v0.8.0 and
+earlier, in git history) are a different instrument and are never a
+regression signal. `benches/scripts/soak/soak_check.py` is the companion
+that applies the per-type claim rules and the screen verdict.
+
+### Comparing two builds (development screening)
+
+Outside the release ritual, the question is usually *"is this direction
+worth pursuing?"* — and the answer must be minutes, not hours. That is the
+`screen` test type: one test type, one path class, one configuration pair,
+the two builds **interleaved inside every load step** (the pair runs in the
+same batch, so both sample the same machine state — sequential
+before/after runs are defeated by epoch drift), with a sequential decision:
+
+```bash
+# build both, then one interleaved screen run
+just soak --test=screen --path=loss1 --streams-max=8 \
+     --ab /path/to/bin-parent,/path/to/bin-head --out results-screen.json
+just soak-check --screen results-screen.json    # per-step verdict
+```
+
+The verdict prints per-step medians for both builds, the effect size, and a
+CLAIM only where every step agrees in sign and exceeds the threshold;
+anything else is reported as *directional* with its effect size. A screen
+verdict is **domain-scoped**: it says whether to pursue the direction on
+that path class, never whether the change may ship — the sweep and the gate
+decide that. `bench.py`'s retired `--ab` mode did the same job for the old
+matrix; the screen is its successor and adds the SLO instrument as the
+second measured axis.
 
 ## What the release workflow does
 

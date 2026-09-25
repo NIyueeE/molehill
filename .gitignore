@@ -9,3 +9,15 @@ __pycache__/
 # bench-fast smoke output (never version-picked; local scratch)
 benches/scripts/bench/results-dev.json*
 benches/scripts/assets/
+# The Soak runner's working artifacts (tool logs, iperf-raw evidence, probe
+# logs) live in a temp dir; a stray run that predates that fix may leave
+# them here.
+benches/scripts/soak/frp/
+benches/scripts/soak/nps/
+benches/scripts/soak/rathole/
+benches/scripts/soak/molehill/
+benches/scripts/soak/iperf-raw/
+benches/scripts/soak/*.log
+benches/scripts/soak/pids.json
+benches/scripts/soak/probe-*.log
+benches/scripts/soak/__pycache__/
