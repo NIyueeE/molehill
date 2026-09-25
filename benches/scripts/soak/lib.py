@@ -23,6 +23,7 @@ Design principles:
 
 import contextlib
 import functools
+import hashlib
 import itertools
 import json
 import math
@@ -578,6 +579,15 @@ class ThroughputTarget:
 
 
 # --- wait for a TCP port -----------------------------------------------------
+def port_open(port: int) -> bool:
+    """Is something listening on `port` right now? One attempt, no waiting."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def wait_port(port: int, timeout_s: float = 25.0) -> bool:
     end = time.time() + timeout_s
     while time.time() < end:
@@ -1207,7 +1217,15 @@ def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     # shipped file that is not the config itself.
     for shipped in (peer / "conf").iterdir():
         if shipped.name != "nps.conf" and not (conf / shipped.name).exists():
-            os.link(shipped, conf / shipped.name)
+            target = conf / shipped.name
+            try:
+                os.link(shipped, target)
+            except OSError:
+                # Different filesystem — the peer cache is not required to
+                # live on the same mount as the work dir (measured: EXDEV
+                # from /home to /tmp, which failed the whole nps test while
+                # the binaries' own link had a fallback and quietly worked).
+                shutil.copy2(shipped, target)
     # The web UI is mandatory in nps.conf; it takes a free slot in the
     # test's port band, and the http/https proxy ports stay empty so
     # nothing privileged is opened.
@@ -1359,22 +1377,103 @@ def peer_version(tool: str, knobs: Knobs) -> str:
         return "0.5.0"
 
 
-def git_revision() -> str:
-    """The repository revision this run's harness came from (`--dirty` marked).
+#: Tool name → its setup function, all sharing `setup(s: ToolSetup, knobs)`.
+#: Defined once, after the four functions, so the runner's dispatch is a dict
+#: lookup instead of four lambdas that can drift from the signatures they call
+#: (they did: every molehill test failed with a TypeError until a smoke run
+#: caught it).
+TOOL_SETUPS = {
+    "molehill": setup_molehill,
+    "frp": setup_frp,
+    "rathole": setup_rathole,
+    "nps": setup_nps,
+}
 
-    §10's provenance rule: a number must describe a revision someone can
-    check out. The harness's own revision is recorded beside the tool's
-    version because a harness change moves numbers too.
+
+def binary_fingerprint(path) -> dict:
+    """Identify the binary a run measured, and whether it is stale.
+
+    §10 spent two incidents on this: a run whose binary was two commits behind
+    HEAD described code that no longer existed, and a `--profile bench` build
+    that survived a revert did the same thing here. A version string cannot
+    tell two builds of the same release apart, so the fingerprint is the
+    binary's own bytes; `stale` compares its mtime against the newest source
+    file, which is what catches "I edited, rebuilt nothing, and measured the
+    old binary".
+
+    Returns `{}` when the file cannot be read (a peer binary may not exist for
+    a tool that is not in the run), and never raises.
     """
+    path = Path(path)
     try:
+        data = path.read_bytes()
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+    newest_src = 0.0
+    root = Path(__file__).resolve().parents[3]
+    for rel in ("src", "build.rs"):
+        target = root / rel
+        if target.is_file():
+            newest_src = max(newest_src, target.stat().st_mtime)
+            continue
+        for f in target.rglob("*.rs"):
+            with contextlib.suppress(OSError):
+                newest_src = max(newest_src, f.stat().st_mtime)
+    for rel in ("Cargo.toml", "Cargo.lock"):
+        with contextlib.suppress(OSError):
+            newest_src = max(newest_src, (root / rel).stat().st_mtime)
+    return {
+        "sha256": hashlib.sha256(data).hexdigest()[:16],
+        "bytes": len(data),
+        "mtime": round(mtime, 3),
+        "stale": bool(newest_src and mtime < newest_src),
+    }
+
+
+def git_revision(exclude: Path | None = None) -> tuple:
+    """The commit this run's harness came from, and whether the tree is clean.
+
+    §10's provenance rule: a number must describe a revision someone can check
+    out. Two facts, deliberately separate:
+
+    * `git describe --always --broken` names the commit — without `--dirty`,
+      whose suffix conflates two very different situations;
+    * the clean/dirty verdict comes from `git status --porcelain` **minus the
+      results file this run is writing**. A run always makes its own tracked
+      output dirty, so a naive `--dirty` marks every release artifact dirty and
+      the mark stops carrying information. An uncommitted *source* change still
+      shows up, which is the case the rule exists for.
+
+    Returns `(revision, tree_clean)`; `tree_clean` is `None` when git cannot
+    answer (a tarball checkout), which is honest rather than assumed-clean.
+    """
+    here = Path(__file__).parent
+    rev = "unknown"
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
         r = subprocess.run(
-            ["git", "describe", "--always", "--dirty", "--broken"],
+            # No `--broken`: in git 2.47 it appends `-dirty` to the *name*,
+            # which is the conflation this function exists to undo (the
+            # clean/dirty verdict is the second return value, and it excludes
+            # the results file this run is writing).
+            ["git", "describe", "--always"],
             capture_output=True,
             text=True,
             check=False,
             timeout=10,
-            cwd=Path(__file__).parent,
+            cwd=here,
         )
-        return r.stdout.strip() or "unknown"
-    except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
+        if r.returncode == 0 and r.stdout.strip():
+            rev = r.stdout.strip()
+    clean = None
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        args = ["git", "status", "--porcelain"]
+        if exclude is not None:
+            # `:(exclude)` pathspec: everything except the run's own output.
+            args += ["--", ".", f":(exclude){exclude}"]
+        r = subprocess.run(
+            args, capture_output=True, text=True, check=False, timeout=20, cwd=here
+        )
+        if r.returncode == 0:
+            clean = not r.stdout.strip()
+    return rev, clean

@@ -73,6 +73,31 @@ the UDP path with no KCP session in existence. The runner records whichever
 `MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
 so an instrumented run is never mistaken for a clean one.
 
+### KCP datagram size follows the path MTU
+
+A KCP datagram is one UDP packet, and UDP does not negotiate a path MTU the way
+TCP does: Linux's default `IP_MTU_DISCOVER` for UDP fragments an oversized
+datagram instead of reporting an error, so a 1400-byte KCP datagram on a
+1280-byte path becomes two fragments and **one lost fragment costs the whole
+datagram** — a 1 % fragment loss becomes ~2 % datagram loss, which at the
+carrier's ARQ cost is the difference between working and not (measured on
+`loss1_mtu1280`: the KCP arm goes from 0.37 Gbit/s to zero while the TCP arm is
+unaffected, because the kernel does this arithmetic for TCP).
+
+Each session therefore reads the kernel's path MTU (`getsockopt(IP_MTU)` on a
+throwaway socket connected to the peer) and shrinks its datagram size to fit,
+before the pump drains any application data and again once a second, because a
+session outlives the path it started on. The size is **shrink-only**: a later
+probe reporting a larger path is ignored, so a route change cannot oscillate the
+segment size, and a session that needs a bigger datagram starts a new session.
+
+Two limits worth knowing: the probe is **IPv4-only** (the IPv6 equivalent,
+`IPV6_MTU`, has no safe wrapper in this crate's dependencies and reading it would
+need `unsafe`, which the crate denies) — an IPv6 session keeps the previous
+behaviour and relies on kernel fragmentation; and the size is never *grown*, so
+`mtu` in the config's sense does not exist: the engine's 1400-byte default is the
+ceiling.
+
 ## Heartbeat
 
 The server sends application-layer heartbeats on each control channel every `[server.control].heartbeat_interval` seconds (`0` disables sending). The client expects some control command within `[client.control].default_heartbeat_timeout` seconds (overridable per service); otherwise it treats the channel as dead and reconnects. The timeout must be greater than the server's `heartbeat_interval`.

@@ -84,10 +84,13 @@ while another one holds the lock, and a killed run (Ctrl-C or SIGTERM) still
 writes the tests it completed.
 
 1. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
-2. `just soak --out benches/scripts/soak/results-soak-vX.Y.Z.json` — run
-   the sweep (one tool or a batch of them, per its own shaped path in one HTB
-   class each, so concurrent tools never share a shaper; the batch size comes
-   from the host's CPU budget). The release artifact path is passed
+2. `just soak --test=rrul --out benches/scripts/soak/results-soak-vX.Y.Z.json`
+   — run the sweep (one tool or a batch of them, per its own shaped path in
+   one HTB class each, so concurrent tools never share a shaper; the batch
+   size comes from the host's CPU budget). **`--test=rrul` is required**: the
+   default test type is `capacity`, which produces a ceiling probe rather than
+   the staged release sweep, and the file it writes looks like a release
+   artifact. The release artifact path is passed
    explicitly: the default `--out` is `results-soak-dev.json` beside the
    script, which `soak-plot`/`soak-check` do read but which is never the
    committed evidence. The run covers the test types the release needs
@@ -96,6 +99,10 @@ writes the tests it completed.
    freshly built, and the results meta records the revision and the binary
    version, because a number has to describe code someone can check out
    (AGENTS.md §10).
+   The meta records `revision` and `tree_clean` separately: the revision names
+   the commit, and `tree_clean` excludes the results file the run is writing
+   (producing an artifact must not be what marks it dirty), so an uncommitted
+   *source* change is the only thing that makes it false.
 3. `just soak-plot` — renders the chart set and prints the markdown tables:
    `assets/soak-vX.Y.Z.png` (the master: per tool, the interactive stream over
    the stage schedule with its per-stage p50/p99 and the bulk throughput,

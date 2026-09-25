@@ -51,7 +51,25 @@ opens its own section here.
 > branch-vs-`main` cumulative comparison and the v0.9.0 release matrix were
 > run entirely with the fixed harness.
 
+### Fixed
+
+- **A KCP data channel no longer fragments on a path smaller than its
+  datagram.** UDP does not negotiate a path MTU: Linux fragments an oversized
+  datagram by default, so on a 1280-byte path every 1400-byte KCP datagram
+  became two fragments and one lost fragment cost the whole datagram — enough
+  to take the KCP carrier from 0.37 Gbit/s to **zero** on a 1 %-loss path while
+  the TCP arms were unaffected. Each session now reads the kernel's path MTU
+  and shrinks its datagram to fit (IPv4; shrink-only; re-checked once a second
+  because a session outlives the path it started on). The TCP carriers already
+  had this from the kernel.
+
 ### Added
+
+- **The benchmark can measure cold start** (`--test=reconnect`): how long from
+  a client start until every registered service answers, per service, five
+  repetitions per build, interleaved when two builds are compared. It is the
+  first instrument for a cost every other probe is blind to — they all dial a
+  running tool — and it reports ~154 ms on a clean loopback path on this host.
 
 - **The UDP visitor path has drop counters** (`MOLEHILL_UDP_STATS=1`): the
   server's datagram reader distinguishes a full worker queue (the loss the
