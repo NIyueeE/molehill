@@ -98,7 +98,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 每秒 16 次短连接、1 条 UDP 会话——同时路径按阶段表推进(netem 塑造整个
 `lo`,控制面保持不整形)。下图是本主机上的 v0.9.0 一次运行(molehill 默认
 `multiplex`、`count = 4`、明文):橙色线是 bulk 吞吐,蓝色点是交互流 RTT,
-阴影带是路径档,虚线是 SLO(p99 ≤ 50 ms)。
+阴影带是路径档,虚线是 SLO(p99 ≤ 50 ms,错误率 ≤ 0.5%)。
 
 ![Soak: molehill 与对端在阶段日程上的形态](assets/soak-v0.9.0.png)
 

@@ -97,7 +97,7 @@ questions about your workload; change one thing at a time and re-test:
 Two numbers decide between these options, and they are best measured on your
 own path rather than read off a table: the **sustainable load** (how many bulk
 streams the tool carries while a fresh interactive connection still meets the
-50 ms SLO) and the **cost at the operating point** (CPU-seconds per carried
+50 ms and 0.5 % errors) and the **cost at the operating point** (CPU-seconds per carried
 Gbit/s). What the published runs measured, and how to run the same comparison
 on your own hardware, is in [Benchmarks](docs/benchmarks.md); the settings
 themselves are in [Configuration](docs/configuration.md#choosing-your-configuration-decision-tree).
@@ -126,14 +126,14 @@ no response for > 5 s):
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | **7.6** | wedge | 1334 | 3494 | wedge | 3123 | 4354 | **4.9** |
-| frp 0.71.0 | **2.9** | wedge | 3900 | wedge | 162 | 3919 | 5007 | **2.9** |
-| rathole 0.5.0 | 81 | wedge | 1311 | wedge | wedge | 2600 | 4675 | 78 |
-| nps 0.26.10 | 74 | 856 | 1139 | 4270 | wedge | 3265 | 1785 | 82 |
+| **molehill (mux)** | **6.8** | wedge | 1338 | 2873 | 641 | 4969 | 4029 | **4.9** |
+| frp 0.71.0 | **2.8** | wedge | 3955 | wedge | wedge | 2139 | 2535 | **3.0** |
+| rathole 0.5.0 | 80 | wedge | 1335 | wedge | 162 | 2397 | 218 | 77 |
+| nps 0.26.10 | 68 | 855 | 1137 | 2879 | wedge | 709 | 3616 | 69 |
 
-**Bulk throughput per stage** (Gbit/s): molehill 17.0 on clean -> 2.4 at
-rtt100 -> 0.02 at rate100 -> **20.1 on the return to clean**; frp 5.9 ->
-2.2 -> 5.9; rathole 16.9 -> 2.5 -> 17.0; nps 0.14 throughout.
+**Bulk throughput per stage** (Gbit/s): molehill 18.9 on clean -> 2.4 at
+rtt100 -> 0.03 at rate100 -> **20.6 on the return to clean**; frp 5.9 -> 2.2 ->
+5.9; rathole 18.4 -> 2.5 -> 18.5; nps 0.1 throughout.
 
 **What these shapes say.** Every tool degrades under a bad path and every
 tool recovers on the return to clean — that recovery is what the last band

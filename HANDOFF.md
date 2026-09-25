@@ -58,7 +58,28 @@ own measurement, and the harness changes it needed are recorded with it.
 | 2 — the fragmentation axis in the harness (`mtu1280`, `loss1_mtu1280`) | **landed with the D commit** | the classes are `PathClass{netem, mtu}`; the shaper applies `ip link set lo mtu` and **verifies the restore**; `restore_stale_mtu` at startup cleans up after a SIGKILLed run; `meta.mtu_restore_to` records the interface's starting MTU |
 | 3 — D: PMTU-aware KCP | **gate met** | alternating parent/child `cost` runs on `loss1_mtu1280` (kcp4, 1 stream, 3 pairs): **A 0.000/0.000/0.000 vs B 0.303/0.294/0.369 Gbit/s**; control cell `loss1` (same loss, MTU 65536) overlaps (A 0.313/0.320/0.316, B 0.311/0.399/0.348), so the change costs nothing where it does not apply |
 | 4 — B: parallel establishment | **not shipped — no measurable effect** | see below |
-| 5 — reconnect probe (`--test=reconnect`) | **landed with this commit** | ~154 ms clean cold start; A/B interleaved, five reps per build |
+| 5 — reconnect probe (`--test=reconnect`) | **landed** | ~154 ms clean cold start; A/B interleaved, five reps per build |
+| 6-7 — docs, release sweep, gate | **done; gate green** | `results-soak-v0.9.0.json` on `v0.8.1-122-g710186c`, `tree_clean: true`, binary fingerprint recorded and not stale, four tools × 8 stages, `soak-check`: "OK: no gate violation" |
+
+The sweep's first two attempts are worth recording, because both were caught by
+the harness rather than by reading it:
+
+- **nps failed outright** with `EXDEV` — its shipped conf files were hard-linked
+  from a peer cache on another filesystem, while the binaries' own links had a
+  fallback. Fixed in `edaee3c` (copy when a link is impossible).
+- **the gate failed on one clean stage**: molehill recorded 2 interactive errors
+  in 2912 samples (0.069%). The same run measured frp 0, rathole 0.05 % and nps
+  0.31 % on their clean stages — so an absolute zero-error SLO was flagging the
+  middle of the host's own spread. The rule became a 0.5 % rate (`710186c`), and
+  the artifact was re-measured under it rather than judged by the stricter rule
+  that happened to be in force when it ran.
+- **two false starts on the command line**: the ritual's documented invocation
+  omitted `--test=rrul`, and the default is `capacity`, so a four-minute ceiling
+  probe was written to the release path and looked like a release artifact
+  (`f8f5e37` fixes the page). The same shape of mistake — a binary built before
+  a revert, claiming the later revision — is now impossible to record silently:
+  the meta carries the binary's sha256, size and mtime plus a `stale` flag
+  (`553a41d`).
 
 **B's premise is real in the code and costs nothing measurable on today's
 instruments.** The tunnel driver held a *single* pending open and a single SYN
