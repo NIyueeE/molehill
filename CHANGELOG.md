@@ -51,7 +51,33 @@ opens its own section here.
 > branch-vs-`main` cumulative comparison and the v0.9.0 release matrix were
 > run entirely with the fixed harness.
 
+### Fixed
+
+- **A KCP data channel no longer fragments on a path smaller than its
+  datagram.** UDP does not negotiate a path MTU: Linux fragments an oversized
+  datagram by default, so on a 1280-byte path every 1400-byte KCP datagram
+  became two fragments and one lost fragment cost the whole datagram — enough
+  to take the KCP carrier from 0.37 Gbit/s to **zero** on a 1 %-loss path while
+  the TCP arms were unaffected. Each session now reads the kernel's path MTU
+  and shrinks its datagram to fit (IPv4; shrink-only; re-checked once a second
+  because a session outlives the path it started on). The TCP carriers already
+  had this from the kernel.
+
 ### Added
+
+- **The benchmark can measure cold start** (`--test=reconnect`): how long from
+  a client start until every registered service answers, per service, five
+  repetitions per build, interleaved when two builds are compared. It is the
+  first instrument for a cost every other probe is blind to — they all dial a
+  running tool — and it reports ~154 ms on a clean loopback path on this host.
+
+- **The UDP visitor path has drop counters** (`MOLEHILL_UDP_STATS=1`): the
+  server's datagram reader distinguishes a full worker queue (the loss the
+  design accepts instead of head-of-line blocking every visitor) from "no data
+  channel was ready yet" (the registration/reconnect window), counts each, and
+  logs both once a second under the same opt-in convention as the KCP and mux
+  counters. Routing now returns its outcome instead of only counting, so the
+  decision is testable without racing on process-global statics.
 
 - **Noise session resume** (`[transport.noise] resume = true`, default
   off): a reconnect proves possession of the previous session's
@@ -431,6 +457,13 @@ opens its own section here.
   auto-fixes. The ruff waiver list shrank to the one entry that is true of
   every script here (they measure PATH binaries), with the rest waived
   inline at their own sites and a named reason each.
+- The docs-only path CI already had (`ci.yml` / `docs.yml`) is now mirrored by
+  the hooks: `githooks/docs-only` classifies the staged paths (commit) or the
+  pushed range (push), and a change limited to markdown, `docs/**` or
+  `assets/**` runs only the two gates it can move — the secret scan and the
+  docs-alignment check — instead of the whole Rust chain. Anything ambiguous
+  (empty change set, new branch, tag push, or a commit mixing docs with code)
+  falls back to the full chain, and deleting the classifier restores it.
 - **HANDOFF.md was restructured and condensed** (1762 → ~770 lines): it now
   opens with the branch's state and the theme planned for the next update
   (measure the three unmeasured data-path axes — establishment, fragmentation,

@@ -409,10 +409,24 @@ def screen(data: dict) -> int:
     )
     if not rounds:
         sys.exit("no rounds recorded")
-    key = "gbps" if rounds[0]["pair"][0].get("gbps") is not None else "rtt_p99"
+    # Which metric the table shows, decided by what the run actually produced —
+    # not by its first step. A cell hostile enough to kill the bulk probe on
+    # step 1 (the MTU/fragmentation cell does exactly that) used to flip the
+    # whole verdict to response time while the columns still read like
+    # throughput, so a "claim B" could be about milliseconds and look like
+    # Gbit/s. Throughput is the primary metric: use it whenever any step has
+    # it, and label the table so the units are never in doubt.
+    have_gbps = any(p.get("gbps") is not None for r in rounds for p in r["pair"])
+    key = "gbps" if have_gbps else "rtt_p99"
+    unit = "Gbit/s" if key == "gbps" else "ms (p99)"
+    if not have_gbps:
+        print(
+            "\nnote: no step produced a throughput sample (the bulk probe "
+            "failed on every step); comparing response time instead"
+        )
     # For throughput a higher A is better; for a response time a lower A is.
     better = 1.0 if key == "gbps" else -1.0
-    print(f"\n{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading")
+    print(f"\n{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading  [{unit}]")
     steps = 0
     a_ahead = b_ahead = 0
     for r in rounds:

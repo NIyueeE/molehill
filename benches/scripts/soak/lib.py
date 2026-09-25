@@ -578,6 +578,15 @@ class ThroughputTarget:
 
 
 # --- wait for a TCP port -----------------------------------------------------
+def port_open(port: int) -> bool:
+    """Is something listening on `port` right now? One attempt, no waiting."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 def wait_port(port: int, timeout_s: float = 25.0) -> bool:
     end = time.time() + timeout_s
     while time.time() < end:
@@ -1357,6 +1366,19 @@ def peer_version(tool: str, knobs: Knobs) -> str:
         return marker.read_text().strip() or "0.5.0"
     except OSError:
         return "0.5.0"
+
+
+#: Tool name → its setup function, all sharing `setup(s: ToolSetup, knobs)`.
+#: Defined once, after the four functions, so the runner's dispatch is a dict
+#: lookup instead of four lambdas that can drift from the signatures they call
+#: (they did: every molehill test failed with a TypeError until a smoke run
+#: caught it).
+TOOL_SETUPS = {
+    "molehill": setup_molehill,
+    "frp": setup_frp,
+    "rathole": setup_rathole,
+    "nps": setup_nps,
+}
 
 
 def git_revision() -> str:

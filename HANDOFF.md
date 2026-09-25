@@ -47,6 +47,66 @@ until the three above have their numbers. The single-control-channel
 consolidation is a *later* theme: its design is scoped below, and deliverable 3
 is what gates it.
 
+### Phase log (this session)
+
+The theme above is being executed in phases; each lands as one commit with its
+own measurement, and the harness changes it needed are recorded with it.
+
+| Phase | State | Evidence |
+|---|---|---|
+| 1 — UDP drop counters (`MOLEHILL_UDP_STATS=1`) | **landed** (`38b7acd`) | routing returns `UdpRouteOutcome`; unit-tested without racing on the globals |
+| 2 — the fragmentation axis in the harness (`mtu1280`, `loss1_mtu1280`) | **landed with the D commit** | the classes are `PathClass{netem, mtu}`; the shaper applies `ip link set lo mtu` and **verifies the restore**; `restore_stale_mtu` at startup cleans up after a SIGKILLed run; `meta.mtu_restore_to` records the interface's starting MTU |
+| 3 — D: PMTU-aware KCP | **gate met** | alternating parent/child `cost` runs on `loss1_mtu1280` (kcp4, 1 stream, 3 pairs): **A 0.000/0.000/0.000 vs B 0.303/0.294/0.369 Gbit/s**; control cell `loss1` (same loss, MTU 65536) overlaps (A 0.313/0.320/0.316, B 0.311/0.399/0.348), so the change costs nothing where it does not apply |
+| 4 — B: parallel establishment | **not shipped — no measurable effect** | see below |
+| 5 — reconnect probe (`--test=reconnect`) | **landed with this commit** | ~154 ms clean cold start; A/B interleaved, five reps per build |
+
+**B's premise is real in the code and costs nothing measurable on today's
+instruments.** The tunnel driver held a *single* pending open and a single SYN
+announcement, so N concurrent callers were served one SYN round trip at a time —
+the serialization the rtt100 wedge was attributed to. Opening them concurrently
+(a queue of pending opens, `MAX_OPENS_IN_FLIGHT`) was implemented and measured:
+
+| Metric | Parent | Concurrent opens | Reading |
+|---|---|---|---|
+| rtt100, 8-stream `cost` bulk | 1.039 / 1.160 Gbit/s | 1.130 / 1.105 Gbit/s | overlapping — and the cell **no longer wedges on either build** |
+| rtt100, 26-stream `cost` bulk | 1.512 Gbit/s | 1.336 Gbit/s | no win; steady-state rate does not depend on setup order |
+| clean cold start (`reconnect`, 5 reps) | median 0.1540 s | median 0.1532 s | identical |
+
+The reason is structural: streams start flowing as soon as *their own* setup
+completes, so serialized setup delays **when stream N starts**, not the rate
+once it is running — and cold start never opens data channels at all (they are
+opened per visitor connection). So the change was reverted rather than shipped
+on a premise, and the patch is parked at `/tmp/b-parallel-opens.patch` (and in
+this session's transcript) with its unit-test-free diff.
+
+**What B actually needs is a different instrument**: N visitors connecting
+*simultaneously*, timed until all N are established. That is the honest gate for
+"parallel establishment", it does not exist yet, and it belongs with the next
+theme — the `reconnect` probe landed here measures registration cold start, not
+concurrent establishment, so the two are deliberately separate numbers.
+
+Two harness defects were found and fixed on the way, both by running the tool
+rather than reading it:
+
+- **`screen` recorded `--path` without applying it**, so a screen run labelled
+  `loss1` was clean traffic and its results meta described a path the run never
+  had. It now applies the path once, before the interleave (constant for both
+  builds — a shape differing between them would be the second variable).
+- **The screen verdict chose its metric from step 1**: a cell hostile enough to
+  kill the bulk probe on the first step flipped the whole verdict to response
+  time while the columns still read like throughput. It now uses throughput
+  whenever any step has it, labels the unit, and says so when it falls back.
+  On the fragmentation cell this correctly reports "0 usable steps" — the
+  interleaved `iperf_burst` probe cannot survive that cell, which is why D's
+  gate uses the stage sampler (`--test=cost`) instead.
+
+Known limit of D: the probe is **IPv4-only**. `IPV6_MTU` has no safe wrapper in
+this crate's dependencies, and the alternatives were both rejected — `unsafe`
+for one `getsockopt` in a crate that denies it, or a blanket clamp to the IPv6
+minimum (1280), which would cost throughput on every IPv6 path including the
+65536-byte ones. An IPv6 session therefore keeps kernel fragmentation until a
+safe wrapper exists. Recorded here as the remaining half.
+
 ### Scoping notes carried forward
 
 - **Single control channel per client** (later theme, design already
@@ -73,7 +133,13 @@ is what gates it.
 ## Where things stand
 
 **The data-path rework is complete on its own terms; the release is prepared
-and waiting on a benchmark run and a human tag.**
+and waiting on a benchmark run.**
+
+This session added two measured improvements on top of it — the KCP path-MTU
+fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no cost
+where it does not apply) and the UDP drop counters — plus the fragmentation
+axis and the cold-start probe in the harness, and the docs-only path in the
+hooks. See "Phase log" below.
 
 - **Cumulative branch-vs-`main` A/B (2026-09-24, the fixed harness):** latency
   at parity or better on every arm and cell; throughput net favourable (15

@@ -77,6 +77,26 @@ its results file (`meta.timeline`, beside the path classes):
 | `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms | 120 s |
 | `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
 
+Two further classes carry the **fragmentation** axis and are deliberately not in
+any default timeline:
+
+| Class | What it emulates | Applied to the path |
+|---|---|---|
+| `mtu1280` | a tunnel or an IPv6-minimum path | interface MTU 1280 |
+| `loss1_mtu1280` | a lossy link that also fragments | 10 ms delay, 1 % loss, interface MTU 1280 |
+
+MTU is an *interface* property, not a qdisc: a stage that uses one of these
+classes changes the path for **every packet on `lo`** during that stage — the
+peers', the harness's and the tool's control plane included — which is why they
+stay out of the default schedules and are run as focused single-stage cells
+(`--test=cost --path=loss1_mtu1280`, or `--test=screen --path=…` to A/B two
+builds on it). `meta.mtu_restore_to` records the interface's MTU at the start of
+the run and the harness restores it on teardown, failing loudly if it cannot —
+a leftover 1280 would poison every later run on the host. The reason the axis
+exists at all: `lo` is MTU 65536, so without it every datagram fits in one
+fragment and the cost of a lost fragment is unmeasurable. Read the two classes
+together with the `carrier = "kcp"` row below.
+
 The schedule, the durations, the sample rates and the SLO are recorded in every
 results file (`meta`), so a chart can always be traced back to the method that
 produced it. So is the shaping applied to each class — including the rate
@@ -118,6 +138,15 @@ configuration only. Treat them as directional, and re-measure your own case.
 | `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
 | `count` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at count = 4; loss5 head-of-line max 2.5 s vs 1.6 s) |
+| test type | what it answers |
+|---|---|
+| `rrul` | the mixed workload over the full stage schedule (the release run) |
+| `soak` | the same workload, longer, for drift |
+| `cost` | one stage, one path: what a configuration choice costs |
+| `capacity` | the ceiling probe: how many streams until it stops scaling |
+| `screen` | interleaved A/B of two builds on one path |
+| `reconnect` | cold start: client start → every registered service answering, five repetitions per build (interleaved when `--ab` is given) |
+
 | `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at count = 1); yamux ceiling `count × 64` concurrent connections |
 | `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
 | `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |

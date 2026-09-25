@@ -944,6 +944,9 @@ struct PaceState {
     last_ping_us: u64,
     ping_outstanding: bool,
     clean_pongs: u32,
+    /// When this session last re-read the kernel's path MTU; `None` until the
+    /// first check (see `maybe_path_mtu`).
+    last_mtu_check: Option<Instant>,
 }
 
 impl PaceState {
@@ -959,6 +962,7 @@ impl PaceState {
             last_ping_us: 0,
             ping_outstanding: false,
             clean_pongs: 0,
+            last_mtu_check: None,
         }
     }
 
@@ -1212,7 +1216,49 @@ async fn pump_head(
 ) -> Option<u32> {
     let delay = update_due(kcp, start)?;
     maybe_ping(kcp, net, pace, start).await;
+    maybe_path_mtu(kcp, net, pace);
     Some(delay)
+}
+
+/// How often a session re-reads the kernel's path MTU.
+///
+/// A session outlives the path it started on: a route or interface change
+/// moves the MTU underneath it, and — measurably — the bench does exactly
+/// that, since a session opened while the tool's ports are probed can still
+/// be alive when the stage shrinks the interface. A datagram size fixed once
+/// at session start describes the path that existed then, and a session that
+/// keeps sending 1400-byte datagrams down a 1280-byte path pays a lost
+/// *datagram* for every lost fragment. One second is the cadence at which a
+/// path change costs a bounded amount of traffic; the check is one
+/// `getsockopt` on a throwaway socket, and `shrink_mtu` is one-way, so
+/// re-reading cannot oscillate.
+const PATH_MTU_RECHECK: Duration = Duration::from_secs(1);
+
+/// Re-read the path MTU and shrink the datagram size if the path got smaller.
+/// Shrink-only, so a probe that reports a larger path (a stale cache, a route
+/// that came back) is ignored rather than oscillating.
+fn maybe_path_mtu(kcp: &mut Kcp<DatagramOut>, net: &SessionNet, pace: &mut PaceState) {
+    if let Some(last) = pace.last_mtu_check
+        && last.elapsed() < PATH_MTU_RECHECK
+    {
+        return;
+    }
+    pace.last_mtu_check = Some(Instant::now());
+    let local = net.socket.local_addr().ok();
+    let Some(path_mtu) = probe_path_mtu(local, net.peer) else {
+        return;
+    };
+    if let Some(fits) = clamp_mtu(kcp.mtu(), path_mtu, net.peer.is_ipv6()) {
+        let before = kcp.mtu();
+        kcp.shrink_mtu(fits);
+        info!(
+            peer = %net.peer,
+            path_mtu,
+            datagram_before = before,
+            datagram_after = kcp.mtu(),
+            "KCP datagram size adapted to the path MTU (shrink-only)"
+        );
+    }
 }
 
 /// Flush acks for a consumed input batch, then fill the newly-opened
@@ -1493,6 +1539,60 @@ async fn run_session(
     debug!("KCP session pump exited (peer {peer})");
 }
 
+/// IPv4 and IPv6 header + UDP header, the bytes a KCP datagram's IP packet
+/// adds on top of it.
+const IPV4_UDP_HEADERS: usize = 20 + 8;
+const IPV6_UDP_HEADERS: usize = 40 + 8;
+
+/// The datagram size that fits a path of `path_mtu`, or `None` when the
+/// current size already fits (nothing to do).
+///
+/// Pure, so the arithmetic is testable without a shaped interface: a KCP
+/// datagram of size `m` becomes an IP packet of `m + headers`, and the
+/// kernel fragments it when that exceeds the path MTU. Fragmentation is the
+/// failure this exists to avoid — one lost fragment costs the whole
+/// datagram, so a 1% fragment loss becomes ~2% datagram loss on a path that
+/// needs two fragments (measured on the `loss1_mtu1280` cell: the KCP arm
+/// drops from 0.3 Gbit/s to zero, while the TCP arm is unaffected because
+/// the kernel does this arithmetic for TCP).
+fn clamp_mtu(current: usize, path_mtu: usize, ipv6: bool) -> Option<usize> {
+    let overhead = if ipv6 {
+        IPV6_UDP_HEADERS
+    } else {
+        IPV4_UDP_HEADERS
+    };
+    let fits = path_mtu.saturating_sub(overhead);
+    (fits > KCP_OVERHEAD && fits < current).then_some(fits)
+}
+
+/// The kernel's current path MTU towards `peer`, as it knows it today.
+///
+/// **IPv4 only.** The equivalent IPv6 option (`IPV6_MTU`) has no safe wrapper
+/// in this crate's dependencies, and reading it would mean `unsafe`, which the
+/// crate denies — so an IPv6 session keeps the previous behaviour (the kernel
+/// fragments an oversized datagram) rather than gaining a second unsafe site
+/// for a guess. Documented in HANDOFF.md as the remaining half of this work.
+///
+/// A throwaway socket is connected to the peer and the option read off it:
+/// `IP_MTU` answers per *path*, so it needs a peer, and the session's own
+/// socket is deliberately unconnected (the server accepts any source and the
+/// conv-adoption hook may switch peers). Three non-blocking syscalls on a
+/// socket that is closed immediately, which is why this is not worth a
+/// `spawn_blocking` hop.
+fn probe_path_mtu(local: Option<SocketAddr>, peer: SocketAddr) -> Option<usize> {
+    if !peer.is_ipv4() {
+        return None;
+    }
+    let bind = match local {
+        Some(addr) if addr.is_ipv4() => SocketAddr::new(addr.ip(), 0),
+        _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+    };
+    let probe = std::net::UdpSocket::bind(bind).ok()?;
+    probe.connect(peer).ok()?;
+    let mtu = nix::sys::socket::getsockopt(&probe, nix::sys::socket::sockopt::IpMtu).ok()?;
+    usize::try_from(mtu).ok()
+}
+
 /// Build the channel quartet + configured `Kcp` for one session and spawn
 /// its pump. Returns the user-facing stream and the datagram-in sender the
 /// ingress side must hold (dropping it ends the session).
@@ -1500,6 +1600,9 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     let (dgram_tx, dgram_rx) = mpsc::unbounded_channel();
     let mut kcp = Kcp::new_stream(conv, DatagramOut::new(dgram_tx));
     configure(&mut kcp);
+    // The datagram size is adapted to the path by the pump's first round
+    // (`maybe_path_mtu`), which runs before it drains any application data —
+    // one mechanism, so a session cannot be adapted in two places that drift.
 
     let (pkt_tx, pkt_rx) = mpsc::channel(DATAGRAM_CHANNEL_DEPTH);
     // Writer → pump: an unbounded channel gated by a semaphore (the pump
@@ -2169,6 +2272,51 @@ async fn dispatch(
     // Shutdown: dropping the senders ends every session pump.
     sessions.clear();
     debug!("KCP listener dispatcher exited");
+}
+
+#[cfg(test)]
+mod path_mtu_tests {
+    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, clamp_mtu};
+    use crate::kcp::KCP_OVERHEAD;
+
+    /// The engine's default datagram size, mirrored here because the constant
+    /// itself is private to the engine module (this test pins the arithmetic
+    /// against the value the adapter actually ships with).
+    const KCP_MTU_DEF: usize = 1400;
+
+    /// The arithmetic that decides whether a datagram fits, per family. Every
+    /// case here is a boundary a wrong constant would move: the default
+    /// datagram on a clean path, the same datagram on a 1280 path (the cell
+    /// this exists for), a jumbo path, and a path too small to carry a KCP
+    /// header at all.
+    #[test]
+    fn clamp_mtu_fits_the_path_per_family() {
+        // A clean path: the default datagram fits (1400 + 28 <= 65536).
+        assert_eq!(clamp_mtu(KCP_MTU_DEF, 65536, false), None);
+        assert_eq!(clamp_mtu(KCP_MTU_DEF, 65536, true), None);
+
+        // 1280: the IPv6 minimum every real path must carry. The datagram has
+        // to shed the header the path adds, per family.
+        assert_eq!(
+            clamp_mtu(KCP_MTU_DEF, 1280, false),
+            Some(1280 - IPV4_UDP_HEADERS)
+        );
+        assert_eq!(
+            clamp_mtu(KCP_MTU_DEF, 1280, true),
+            Some(1280 - IPV6_UDP_HEADERS)
+        );
+
+        // A path exactly the size of the current datagram still fragments
+        // once the IP header is added, so it must shrink.
+        assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_MTU_DEF, false), Some(1400 - 28));
+
+        // Smaller than a KCP header can be: not our call to make, leave the
+        // engine alone rather than produce an unsendable size.
+        assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_OVERHEAD + 10, false), None);
+
+        // Never grows: a jumbo path leaves a session that already shrank.
+        assert_eq!(clamp_mtu(1252, 9000, false), None);
+    }
 }
 
 #[cfg(test)]

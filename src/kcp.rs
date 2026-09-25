@@ -30,7 +30,9 @@
 //! - `check()` returns a relative duration instead of the reference's
 //!   absolute timestamp (the adapter adds it to its own clock);
 //! - the `tokio`-feature code and the unused accessor methods are trimmed
-//!   (datagram mode, `set_mtu`, `set_interval`, the conv-adoption hook);
+//!   (datagram mode, `set_interval`, the conv-adoption hook); `mtu` is the
+//!   one accessor kept back, because the adapter shrinks the datagram size to
+//!   the path MTU the kernel reports (`shrink_mtu`, see `transport::kcp`);
 //! - buffers are grown through the safe `BytesMut::zeroed` instead of
 //!   `unsafe` length manipulation;
 //! - errors are molehill's own `Error` type.
@@ -428,6 +430,30 @@ impl<Output> Kcp<Output> {
     /// `conv` represents conversation.
     pub fn new_stream(conv: u32, output: Output) -> Self {
         Kcp::construct(conv, output, true)
+    }
+
+    /// The current maximum datagram size (header included).
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    /// Lower the maximum datagram size, and the payload capacity that follows
+    /// from it. Returns the size now in force.
+    ///
+    /// **Shrink-only by contract.** The caller learns the path MTU from the
+    /// kernel, which can report a *larger* value than the current size (a
+    /// route change, a different peer, a cached PMTU that expired). Growing
+    /// back mid-session would re-fragment exactly what this call exists to
+    /// stop, on a path whose segment statistics KCP has already tuned; a
+    /// session that needs a bigger datagram starts a new session. The floor
+    /// keeps a payload of at least one byte, so the `mss > 0` invariant the
+    /// send path asserts cannot be broken by a nonsensical probe result.
+    pub fn shrink_mtu(&mut self, mtu: usize) -> usize {
+        if mtu < self.mtu {
+            self.mtu = mtu.max(KCP_OVERHEAD + 1);
+            self.mss = self.mtu - KCP_OVERHEAD;
+        }
+        self.mtu
     }
 
     fn construct(conv: u32, output: Output, stream: bool) -> Self {
@@ -1594,6 +1620,27 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The shrink is one-way: a later, larger probe result must not undo it.
+    /// Nothing else in the engine may write `mtu`/`mss`, so this is the whole
+    /// contract of the path-MTU adaptation.
+    #[test]
+    fn shrink_mtu_is_one_way_and_keeps_a_payload() {
+        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
+        assert_eq!(kcp.mtu(), KCP_MTU_DEF);
+        assert_eq!(kcp.mss, KCP_MTU_DEF - KCP_OVERHEAD);
+
+        assert_eq!(kcp.shrink_mtu(1252), 1252);
+        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
+
+        // A bigger path (or a stale cache) must not grow it back.
+        assert_eq!(kcp.shrink_mtu(9000), 1252);
+        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
+
+        // Nonsense cannot produce an empty payload: `send` asserts `mss > 0`.
+        assert_eq!(kcp.shrink_mtu(0), KCP_OVERHEAD + 1);
+        assert_eq!(kcp.mss, 1);
     }
 
     impl DatagramSink for SharedBuf {

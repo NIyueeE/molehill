@@ -61,18 +61,49 @@ class Stage:
     secs: float
 
 
-# Path classes: the stage schedule's vocabulary. The args are applied to
-# each tool's own netem class in place; `clean` is the unshaped control.
-# Positional argument lists for `tc qdisc ... netem`: this iproute2 spells
-# jitter as the second positional after `delay` and has no `jitter` keyword.
+@dataclass(frozen=True)
+class PathClass:
+    """One condition a stage can impose on the path.
+
+    `netem` holds positional arguments for `tc qdisc ... netem` (this iproute2
+    spells jitter as the second positional after `delay` and has no `jitter`
+    keyword); an empty list means "no netem": the stage is either the unshaped
+    control or limited only by `mtu`.
+
+    `mtu` is a different axis and a different mechanism: it is an *interface*
+    property (`ip link set dev lo mtu`), not a qdisc, so it cannot be per-tool
+    or per-port the way the netem classes are. A stage that sets it changes the
+    path for every packet on `lo` during that stage — the peers', the harness's
+    and the control plane's included — which is why it is a first-class field
+    the results meta records rather than a hidden side effect, and why the
+    shaper verifies the restore on teardown. It exists because IPv4
+    fragmentation is the one real-network failure mode the netem classes
+    cannot produce: `lo` is MTU 65536, so without it every datagram KCP emits
+    fits in one fragment and the amplification a lost fragment causes is
+    unmeasurable.
+    """
+
+    netem: list
+    mtu: int | None = None
+
+
+# The stage schedule's vocabulary. `clean` is the unshaped control; the two
+# MTU classes carry the fragmentation axis (see `PathClass.mtu`).
 PATH_CLASSES = {
-    "clean": [],
-    "rtt100": ["delay", "100ms"],
-    "loss1": ["delay", "10ms", "loss", "1%"],
-    "loss5": ["delay", "100ms", "loss", "5%"],
-    "rate100": ["rate", "100mbit", "delay", "20ms", "limit", "2000"],
-    "rate20": ["rate", "20mbit", "delay", "40ms", "limit", "2000"],
-    "jitter": ["delay", "20ms", "10ms"],
+    "clean": PathClass([]),
+    "rtt100": PathClass(["delay", "100ms"]),
+    "loss1": PathClass(["delay", "10ms", "loss", "1%"]),
+    "loss5": PathClass(["delay", "100ms", "loss", "5%"]),
+    "rate100": PathClass(["rate", "100mbit", "delay", "20ms", "limit", "2000"]),
+    "rate20": PathClass(["rate", "20mbit", "delay", "40ms", "limit", "2000"]),
+    "jitter": PathClass(["delay", "20ms", "10ms"]),
+    # --- the fragmentation axis (interface-wide; see PathClass) -------------
+    # Shrink the path MTU to the IPv6 minimum every real deployment tolerates.
+    # `loss1_mtu1280` is the cell that matters: the same 1% *fragment* loss as
+    # `loss1`, on a path where KCP's 1400-byte datagrams become two fragments,
+    # so one lost fragment costs the whole datagram.
+    "mtu1280": PathClass([], mtu=1280),
+    "loss1_mtu1280": PathClass(["delay", "10ms", "loss", "1%"], mtu=1280),
 }
 
 DEFAULT_TIMELINE = [
@@ -118,10 +149,43 @@ class Shaper:
     """
 
     DEFAULT = "1:999"
+    MTU_PATH = "/sys/class/net/lo/mtu"
 
     def __init__(self, classes: list, log=print):
         self.classes = classes  # [(classid, band)]
         self.log = log
+        self.orig_mtu = self._read_mtu()
+        self.mtu_now = self.orig_mtu
+
+    def _read_mtu(self) -> int:
+        try:
+            return int(Path(self.MTU_PATH).read_text().strip())
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"cannot read {self.MTU_PATH}: {e}") from e
+
+    def _set_mtu(self, mtu: int) -> None:
+        """Set the interface MTU, loudly.
+
+        `ip` ships with `tc`, so a missing binary means the harness is
+        incomplete, not that the stage silently runs unshaped — which would
+        measure the wrong path and record it as if it were the right one.
+        """
+        r = subprocess.run(
+            ["ip", "link", "set", "dev", "lo", "mtu", str(mtu)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(f"ip link set lo mtu {mtu}: {r.stderr.strip()[:200]}")
+        self.mtu_now = mtu
+
+    def _apply_mtu(self, want: int | None) -> None:
+        """Move the interface to `want`, restoring the original when None."""
+        target = self.orig_mtu if want is None else want
+        if target != self.mtu_now:
+            self._set_mtu(target)
+            self.log(f"    lo mtu -> {target} (interface-wide for this stage)")
 
     def _tc(self, *args) -> None:
         r = subprocess.run(["tc", *args], capture_output=True, text=True, check=False)
@@ -230,7 +294,11 @@ class Shaper:
 
     def apply(self, cid: str, stage: str) -> None:
         band = next(b for c, b in self.classes if c == cid)
-        args = PATH_CLASSES.get(stage, [])
+        path = PATH_CLASSES.get(stage, PathClass([]))
+        # MTU first: it is an interface property, so it applies to whatever the
+        # qdisc does below, and a stage without it must restore the original.
+        self._apply_mtu(path.mtu)
+        args = path.netem
         minor = cid.split(":")[1]
         if not args:
             # an unshaped stage: no HTB path, no netem tax
@@ -255,6 +323,18 @@ class Shaper:
     def teardown(self) -> None:
         with contextlib.suppress(Exception):
             self._tc("qdisc", "delete", "dev", "lo", "root")
+        # A run that leaves `lo` at 1280 poisons every later run on this host
+        # (and every other tenant of it), so the restore is verified rather
+        # than assumed: a mismatch is a hard failure with the fix in the
+        # message.
+        if self.mtu_now != self.orig_mtu:
+            self._set_mtu(self.orig_mtu)
+        got = self._read_mtu()
+        if got != self.orig_mtu:
+            raise RuntimeError(
+                f"lo mtu is {got} after teardown, expected {self.orig_mtu} — "
+                f"restore it with: ip link set dev lo mtu {self.orig_mtu}"
+            )
 
 
 # --- one tool's process pair ------------------------------------------------
@@ -277,16 +357,20 @@ class Tool:
         }
 
     def start(self, binary: str = "") -> None:
-        k, p = self.knobs, self.band
-        setup = {
-            "molehill": lambda: lib.setup_molehill(
-                self.variant, k, p, self.procs, self.work, binary
-            ),
-            "frp": lambda: lib.setup_frp(k, p, self.procs, self.work),
-            "rathole": lambda: lib.setup_rathole(k, p, self.procs, self.work),
-            "nps": lambda: lib.setup_nps(k, p, self.procs, self.work),
-        }[self.name]
-        setup()
+        p = self.band
+        # One setup value and one signature for every tool (lib.ToolSetup →
+        # `setup(s, knobs)`), so the dispatch is a dict lookup rather than four
+        # lambdas that can drift from the functions they call — they did, and
+        # every molehill arm failed with a TypeError until a smoke run caught
+        # it.
+        s = lib.ToolSetup(
+            band=p,
+            procs=self.procs,
+            work=self.work,
+            variant=self.variant,
+            binary=binary,
+        )
+        lib.TOOL_SETUPS[self.name](s, self.knobs)
         for port in (p["iperf_exposed"], p["echo_exposed"]):
             if not lib.wait_port(port, 30):
                 raise TimeoutError(f"{self.label}: exposed port {port} not ready")
@@ -963,9 +1047,14 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
     the same machine state — sequential before/after runs are defeated by
     epoch drift, which is the whole reason this exists.
 
-    The steps carry no stage shaping (`--path` is recorded but not applied):
-    the verdict is a throughput/response-time comparison at a fixed path, and
-    a shape change between the two builds would be a second variable.
+    The path is constant for the whole comparison: `--path` is applied once,
+    before the interleave, and never changes between the two builds — a shape
+    differing between them would be a second variable, which is what makes
+    this a single-variable test rather than two measurements. It used to be
+    recorded without being applied at all, which made the results meta
+    describe a path the run never had (a `screen` run labelled `loss1` was
+    clean traffic); applying it once is also what lets a shaped cell — the
+    MTU/fragmentation cell, for instance — be A/B-ed at all.
     """
     build_a, build_b = ctx.args.ab
     target = lib.ThroughputTarget.from_band(tool.band)
@@ -975,6 +1064,8 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
         "A_version": tool.version(build_a),
         "B_version": tool.version(build_b),
     }
+    if ctx.args.path:
+        ctx.shaper.apply(tool.cid, ctx.args.path)
     rounds = []
     for step in range(1, ctx.ceiling + 1):
         pair = []
@@ -1004,12 +1095,93 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
     entry["metrics"]["rounds"] = rounds
 
 
+#: Cold-start repetitions per build. Five is the smallest count that gives a
+#: median and a spread worth quoting; the probe is cheap enough to afford it.
+RECONNECT_REPS = 5
+
+
+def run_reconnect(tool: Tool, ctx: RunContext, entry: dict) -> None:
+    """Cold start: how long from a client start until every service answers?
+
+    The measurement no other test type can make. Every probe in this harness
+    dials a *running* tool, so the setup cost a client pays — registering its
+    services, opening the control channel, authenticating — is invisible to
+    all of them, and a change that only moves that cost (opening the data
+    channels concurrently, a resumable handshake) had no metric to win on. The
+    unit is seconds from `start` to the last service answering; per service, so
+    a regression in one registration is visible, and repeated, because the
+    number is a tail as much as a mean.
+
+    Both builds are restarted in turn inside one run, like the screen: the
+    comparison is against the same machine state, not against yesterday.
+    """
+    # `--ab` is a pair of paths, not labelled pairs: label them here.
+    builds = (
+        (("A", ctx.args.ab[0]), ("B", ctx.args.ab[1]))
+        if ctx.args.ab
+        else (("A", ctx.knobs.molehill_bin),)
+    )
+    if ctx.args.ab:
+        entry["metrics"]["builds"] = {
+            "A": ctx.args.ab[0],
+            "B": ctx.args.ab[1],
+            "A_version": tool.version(ctx.args.ab[0]),
+            "B_version": tool.version(ctx.args.ab[1]),
+        }
+    if ctx.args.path:
+        ctx.shaper.apply(tool.cid, ctx.args.path)
+
+    # Every registered service is a port the client has to get answering; the
+    # slowest one is the cold-start time a user experiences.
+    services = [
+        ("iperf", tool.band["iperf_exposed"]),
+        ("echo", tool.band["echo_exposed"]),
+    ]
+    samples = []
+    for rep in range(RECONNECT_REPS):
+        for label, binary in builds:
+            # The old listener must be gone before the clock starts: `stop`
+            # kills the processes, but a socket that outlives its process (or a
+            # port still in TIME_WAIT) would answer the first poll and report a
+            # 0.0001 s cold start that measured the previous tool.
+            tool.stop()
+            for _ in range(200):
+                if not any(lib.port_open(port) for _, port in services):
+                    break
+                time.sleep(0.05)
+            tool.procs = lib.ArmProcs(tool.work, f"{tool.name} {tool.variant}".strip())
+            t0 = time.monotonic()
+            tool.start(binary)
+            firsts = {}
+            for name, port in services:
+                if not lib.wait_port(port, RECONNECT_TIMEOUT_S):
+                    firsts[name] = None
+                else:
+                    firsts[name] = round(time.monotonic() - t0, 4)
+            total = max((v for v in firsts.values() if v is not None), default=None)
+            samples.append(
+                {"build": label, "rep": rep, "per_service": firsts, "total_s": total}
+            )
+            log(
+                f"    {label} rep {rep}: "
+                + " ".join(f"{k}={v}s" for k, v in firsts.items())
+                + f" total={total}s"
+            )
+    entry["metrics"]["samples"] = samples
+
+
+#: A cold start that has not answered in this long is a failure, not a slow
+#: start: the client's own registration timeout is shorter.
+RECONNECT_TIMEOUT_S = 30.0
+
+
 TEST_TYPES = {
     "capacity": run_capacity,
     "rrul": run_rrul,
     "soak": run_staged,
     "cost": run_staged,
     "screen": run_screen,
+    "reconnect": run_reconnect,
 }
 
 
@@ -1191,10 +1363,10 @@ def parse_args(argv: list | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
-    if args.test == "screen" and not args.ab:
-        ap.error("--ab BIN_A,BIN_B is required for the screen test")
-    if args.test != "screen" and args.ab:
-        ap.error("--ab is only meaningful for --test=screen")
+    if args.test in ("screen", "reconnect") and not args.ab:
+        ap.error(f"--ab BIN_A,BIN_B is required for the {args.test} test")
+    if args.test not in ("screen", "reconnect") and args.ab:
+        ap.error("--ab is only meaningful for the interleaved test types")
     if args.ab:
         args.ab = args.ab.split(",")
         if len(args.ab) != lib.AB_BUILDS:
@@ -1216,6 +1388,49 @@ def timeline_for(args: argparse.Namespace) -> list[Stage]:
     return [Stage(path=args.path, secs=args.secs or 60.0)]
 
 
+# `lo`'s MTU is 65536 on every Linux host; the only thing that ever changes it
+# is this harness's `mtu` path classes. That makes it safe to assert at startup
+# rather than track: a run that was SIGKILLed between "shrink" and "restore"
+# cannot clean up after itself, so the *next* run does it here.
+LO_MTU_DEFAULT = 65536
+
+
+def restore_stale_mtu(log) -> None:
+    """Put `lo` back to 65536 if a previous run died holding it shrunk.
+
+    A leftover 1280 poisons every later run on this host — including other
+    tenants' — and would show up as a mysterious throughput loss rather than
+    as a harness state. Cheap to check, so it is checked.
+    """
+    mtu = shaper_mtu()
+    if mtu is None or mtu == LO_MTU_DEFAULT:
+        return
+    r = subprocess.run(
+        ["ip", "link", "set", "dev", "lo", "mtu", str(LO_MTU_DEFAULT)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode == 0:
+        log(f"restored lo mtu {mtu} -> {LO_MTU_DEFAULT} (a run died holding it)")
+    else:
+        raise RuntimeError(
+            f"lo mtu is {mtu} and could not be restored: {r.stderr.strip()[:200]}"
+        )
+
+
+def shaper_mtu() -> int | None:
+    """The interface MTU the run starts from (None when unreadable).
+
+    Recorded so a stage that changes it is auditable against the value the
+    host actually had, not against an assumption about the default.
+    """
+    try:
+        return int(Path("/sys/class/net/lo/mtu").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def build_meta(
     args: argparse.Namespace, knobs: lib.Knobs, timeline: list, batch: int, nproc: int
 ) -> dict:
@@ -1233,7 +1448,11 @@ def build_meta(
             "cost": knobs.cost_operating_point,
             "rrul_stream_factor": knobs.rrul_stream_factor,
         },
-        "path_classes": PATH_CLASSES,
+        "path_classes": {name: asdict(pc) for name, pc in PATH_CLASSES.items()},
+        # The MTU axis changes the whole interface, not one tool's class, and
+        # the original value is what teardown restores — both belong in the
+        # method record (§10).
+        "mtu_restore_to": shaper_mtu(),
         "timeline": [asdict(t) for t in timeline],
         "batch": batch,
         "nproc": nproc,
@@ -1336,7 +1555,19 @@ def main() -> None:
     # the work dir: `soak-plot` and `soak-check` glob the script's own
     # directory, so a run whose output they cannot see is a run nobody can
     # read. Release runs still pass an explicit --out.
-    work = Path(tempfile.mkdtemp(prefix=lib.WORK_PREFIX))
+    # `SOAK_KEEP=1` keeps the working directory and prints its path: diagnosing
+    # a cell (why did this arm carry nothing?) needs the tool logs, the
+    # kcp-stats lines and the raw iperf3 output, and a run that deletes its own
+    # evidence turns every such question into a re-run.
+    keep_work = bool(os.environ.get("SOAK_KEEP"))
+    if keep_work and os.environ.get("SOAK_WORK"):
+        work = Path(os.environ["SOAK_WORK"])
+        work.mkdir(parents=True, exist_ok=True)
+    else:
+        work = Path(tempfile.mkdtemp(prefix=lib.WORK_PREFIX))
+    if keep_work:
+        log(f"work dir kept: {work}")
+    restore_stale_mtu(log)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
     reaped = lib.sweep_stale(work)
     if reaped:

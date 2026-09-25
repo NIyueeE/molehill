@@ -13,18 +13,41 @@ cd "$(git rev-parse --show-toplevel)"
 # Consume the pushed refs from stdin before running anything; `v*` tag pushes
 # get the release review ahead of the heavy gates. Deletions are skipped.
 # (A manual run from a terminal reads nothing, like the hook always did.)
+pushed_any=0
+tag_pushed=0
+docs_only=1
 if [ ! -t 0 ]; then
   zeros="0000000000000000000000000000000000000000"
   while read -r local_ref local_sha remote_ref remote_sha; do
     case "$local_ref" in
       refs/tags/v*)
         if [ "$local_sha" != "$zeros" ]; then
+          tag_pushed=1
           echo "==> release tag pushed: $local_ref"
           githooks/pre-tag --tag "${local_ref#refs/tags/}" --commit "$(git rev-parse --verify "$local_sha^{commit}")"
         fi
         ;;
     esac
+    # Classify the commits this push carries: a branch push whose commits only
+    # touch markdown/docs/assets cannot move audit/deny/outdated/test, so it
+    # runs the doc gate instead (the same split CI makes). A tag push never
+    # takes the shortcut.
+    if [ "$local_sha" != "$zeros" ] && [ "$remote_sha" != "$zeros" ]; then
+      pushed_any=1
+      git diff --name-only "$remote_sha" "$local_sha" | githooks/docs-only || docs_only=0
+    elif [ "$local_sha" != "$zeros" ]; then
+      pushed_any=1
+      docs_only=0   # a new branch: nothing to compare against, run everything
+    fi
   done
+fi
+
+if [ "$pushed_any" -eq 1 ] && [ "$docs_only" -eq 1 ] && [ "$tag_pushed" -eq 0 ]; then
+  echo "==> docs-only push: skipping audit / deny / outdated / test"
+  echo "==> docs alignment (githooks/check-docs)"
+  githooks/check-docs
+  echo "pre-push checks passed (docs-only)"
+  exit 0
 fi
 
 echo "==> cargo audit (security advisories)"
