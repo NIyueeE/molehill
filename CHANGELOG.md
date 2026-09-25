@@ -53,6 +53,15 @@ opens its own section here.
 
 ### Fixed
 
+- **The KCP carrier builds on macOS and Windows again.** Its send batching
+  (a reusable staging buffer plus one span per datagram) lived entirely inside
+  the Linux-only `recvmmsg`/`sendmmsg` module, while the batch *shape* is what
+  both the Linux and the non-Linux send arms consume — so the non-Linux arm
+  referred to types that did not exist there and four CI targets failed to
+  compile. The portable half now lives in `transport::dgram`, the Linux module
+  keeps only the syscall machinery, and the non-Linux path (reassemble a split
+  datagram, one `send_to` each) is what it always was.
+
 - **A KCP data channel no longer fragments on a path smaller than its
   datagram.** UDP does not negotiate a path MTU: Linux fragments an oversized
   datagram by default, so on a 1280-byte path every 1400-byte KCP datagram

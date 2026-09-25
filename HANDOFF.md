@@ -179,6 +179,15 @@ build script for want of a cross C toolchain), so the honest verification is
 (a) a temporary inverted `cfg` to type-check the fallback on Linux and (b) the
 macOS/Windows CI jobs on the PR.
 
+**Resolution (same session):** the portable half of a datagram batch — the
+[`Span`] vocabulary and `BATCH` — moved to `transport::dgram`, which the
+non-Linux send arm can see; `udp_batch` keeps only the `recvmmsg`/`sendmmsg`
+machinery behind its own `cfg`. Verified three ways: `cargo clippy --all-targets
+-- -D warnings` on glibc, `cargo check --target x86_64-unknown-linux-musl`, and
+a **scratch copy with `target_os = "linux"` flipped** so the non-Linux branches
+(the fallback included) type-check locally — plus the macOS and Windows CI jobs,
+which are the only real proof.
+
 **No tag until those jobs are green**: `release.yml` builds every platform, and
 shipping a release whose macOS and Windows artifacts cannot compile is not a
 release.

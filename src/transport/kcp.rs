@@ -101,8 +101,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
-#[cfg(target_os = "linux")]
-use crate::transport::udp_batch::Span;
+use crate::transport::dgram::{BATCH, Span};
 
 /// KCP flush interval in ms (`nodelay` mode; also the pump's timer floor
 /// and the retransmit RTO base). 10 ms is the measured sweet spot:
@@ -187,8 +186,7 @@ const KCP_MTU: usize = 1400;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
 /// appending never reallocates inside a batch (≈46 KiB).
-const BATCH_STAGE_BYTES: usize =
-    crate::transport::udp_batch::BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
+const BATCH_STAGE_BYTES: usize = BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
 /// Reader-side coalescing target: consecutive segments are batched into
 /// one channel message up to this many bytes (the mux/yamux/Noise reader
 /// above asks for ~24 such segments per frame, so this cuts the
@@ -504,7 +502,7 @@ impl DatagramOut {
         DatagramOut {
             tx,
             staging: BytesMut::with_capacity(BATCH_STAGE_BYTES),
-            spans: Vec::with_capacity(crate::transport::udp_batch::BATCH),
+            spans: Vec::with_capacity(BATCH),
         }
     }
 
@@ -523,10 +521,7 @@ impl DatagramOut {
                 BytesMut::with_capacity(BATCH_STAGE_BYTES),
             )
             .freeze(),
-            spans: std::mem::replace(
-                &mut self.spans,
-                Vec::with_capacity(crate::transport::udp_batch::BATCH),
-            ),
+            spans: std::mem::replace(&mut self.spans, Vec::with_capacity(BATCH)),
         });
     }
 }
@@ -545,9 +540,7 @@ impl io::Write for DatagramOut {
             len: buf.len(),
         });
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
-        if self.spans.len() >= crate::transport::udp_batch::BATCH
-            || self.staging.len() >= BATCH_STAGE_BYTES
-        {
+        if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
         }
         Ok(buf.len())
@@ -589,9 +582,7 @@ impl DatagramSink for DatagramOut {
             });
         }
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
-        if self.spans.len() >= crate::transport::udp_batch::BATCH
-            || self.staging.len() >= BATCH_STAGE_BYTES
-        {
+        if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
         }
         Ok(header.len() + payload.len())
@@ -1094,7 +1085,7 @@ async fn drain_dgrams(
         // unless the rate is currently cut). A `Span::Split` clones the
         // payload's `Bytes` handle (an O(1) refcount share), never the
         // payload itself.
-        let mut allowed: Vec<Span> = Vec::with_capacity(crate::transport::udp_batch::BATCH);
+        let mut allowed: Vec<Span> = Vec::with_capacity(BATCH);
         loop {
             let Ok(batch) = dgram_rx.try_recv() else {
                 return;
@@ -1954,10 +1945,7 @@ pub async fn connect(remote: SocketAddr, conv: u32) -> Result<KcpStream> {
     // Ingress task: socket → session pump, filtered to the fixed peer.
     tokio::spawn(async move {
         #[cfg(target_os = "linux")]
-        let mut batch = crate::transport::udp_batch::RecvBatch::new(
-            crate::transport::udp_batch::BATCH,
-            DGRAM_BUF,
-        );
+        let mut batch = crate::transport::udp_batch::RecvBatch::new(BATCH, DGRAM_BUF);
         #[cfg(not(target_os = "linux"))]
         let mut buf = [0u8; DGRAM_BUF];
         loop {
@@ -2257,8 +2245,7 @@ async fn dispatch(
     let mut sessions: HashMap<SessionKey, mpsc::Sender<Bytes>> = HashMap::new();
     let (gone_tx, mut gone_rx) = mpsc::channel::<SessionKey>(64);
     #[cfg(target_os = "linux")]
-    let mut batch =
-        crate::transport::udp_batch::RecvBatch::new(crate::transport::udp_batch::BATCH, DGRAM_BUF);
+    let mut batch = crate::transport::udp_batch::RecvBatch::new(BATCH, DGRAM_BUF);
     #[cfg(not(target_os = "linux"))]
     let mut buf = [0u8; DGRAM_BUF];
 
@@ -2368,7 +2355,7 @@ mod tests {
         let dgram = [0x5Au8; 24];
 
         // A partial batch stays staged: nothing crosses the channel yet.
-        for _ in 0..crate::transport::udp_batch::BATCH - 1 {
+        for _ in 0..BATCH - 1 {
             std::io::Write::write_all(&mut out, &dgram[..]).unwrap();
         }
         assert!(rx.try_recv().is_err(), "a partial batch must stay staged");
@@ -2376,7 +2363,7 @@ mod tests {
         // The 32nd datagram closes the batch.
         std::io::Write::write_all(&mut out, &dgram[..]).unwrap();
         let batch = rx.try_recv().expect("the full batch must cross at once");
-        assert_eq!(batch.spans.len(), crate::transport::udp_batch::BATCH);
+        assert_eq!(batch.spans.len(), BATCH);
         // Spans tile the buffer: contiguous, in order, no gaps.
         let mut off = 0;
         for span in &batch.spans {

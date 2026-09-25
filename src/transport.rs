@@ -100,6 +100,12 @@ pub(crate) use noise::NoiseKeys;
 #[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
 pub(crate) mod kcp;
 
+/// The portable half of an outbound datagram batch: the batch's shape, which
+/// every platform shares, as opposed to the syscall that sends it. Gated with
+/// `kcp` and not with the platform, because the non-Linux send path uses it.
+#[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
+pub(crate) mod dgram;
+
 // Batch UDP datagram IO (recvmmsg/sendmmsg) for the KCP carrier on Linux.
 #[cfg(all(
     target_os = "linux",
