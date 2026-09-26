@@ -85,18 +85,21 @@ carrier's ARQ cost is the difference between working and not (measured on
 unaffected, because the kernel does this arithmetic for TCP).
 
 Each session therefore reads the kernel's path MTU (`getsockopt(IP_MTU)` on a
-throwaway socket connected to the peer) and shrinks its datagram size to fit,
-before the pump drains any application data and again once a second, because a
-session outlives the path it started on. The size is **shrink-only**: a later
-probe reporting a larger path is ignored, so a route change cannot oscillate the
-segment size, and a session that needs a bigger datagram starts a new session.
+throwaway socket connected to the peer, or `getsockopt(IPV6_MTU)` for an IPv6
+one — an option `nix` does not name, so the crate declares `Ipv6Mtu` itself with
+that crate's `sockopt_impl!` macro and no `unsafe`) and shrinks its datagram
+size to fit, before the pump drains any application data and again once a second,
+because a session outlives the path it started on. The size is **shrink-only**: a
+later probe reporting a larger path is ignored, so a route change cannot
+oscillate the segment size, and a session that needs a bigger datagram starts a
+new session.
 
-Two limits worth knowing: the probe is **IPv4-only** (the IPv6 equivalent,
-`IPV6_MTU`, has no safe wrapper in this crate's dependencies and reading it would
-need `unsafe`, which the crate denies) — an IPv6 session keeps the previous
-behaviour and relies on kernel fragmentation; and the size is never *grown*, so
-`mtu` in the config's sense does not exist: the engine's 1400-byte default is the
-ceiling.
+Two limits worth knowing: the probe answers only on Linux, the one platform
+where the dependency it needs is declared — elsewhere a session keeps the
+previous behaviour and relies on kernel fragmentation, which is also what an
+oversized datagram does on any path whose MTU cannot be read; and the size is
+never *grown*, so `mtu` in the config's sense does not exist: the engine's
+1400-byte default is the ceiling.
 
 ## Heartbeat
 

@@ -40,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an error in the next release. See `docs/configuration.md`, "A local service
   that is down".
 
+### Fixed
+
+- **A KCP data channel on an IPv6 path no longer fragments either.** The
+  path-MTU clamp shipped in v0.9.0 read the kernel's MTU through `IP_MTU`, which
+  answers for IPv4 only, so an IPv6 KCP session kept its 1400-byte datagram and
+  the kernel split it on any smaller path — the same failure the v4 fix removed,
+  where one lost fragment costs the whole datagram. The probe now asks
+  `IPV6_MTU` for an IPv6 peer too (declared in-crate on top of `nix`'s socket
+  option macros, so the crate still adds no `unsafe`), and the session shrinks to
+  the path minus the 40-byte IPv6 header and the UDP header. The arithmetic and
+  the shrink-only contract are unchanged.
+
 ## [0.9.0] - 2026-09-25
 
 > The published benchmark numbers were measured on `710186c`. This release

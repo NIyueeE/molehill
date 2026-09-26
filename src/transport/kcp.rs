@@ -87,7 +87,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -1205,10 +1205,11 @@ async fn pump_head(
     net: &SessionNet,
     pace: &mut PaceState,
     start: Instant,
+    datagram_bytes: &AtomicUsize,
 ) -> Option<u32> {
     let delay = update_due(kcp, start)?;
     maybe_ping(kcp, net, pace, start).await;
-    maybe_path_mtu(kcp, net, pace);
+    maybe_path_mtu(kcp, net, pace, datagram_bytes);
     Some(delay)
 }
 
@@ -1229,7 +1230,12 @@ const PATH_MTU_RECHECK: Duration = Duration::from_secs(1);
 /// Re-read the path MTU and shrink the datagram size if the path got smaller.
 /// Shrink-only, so a probe that reports a larger path (a stale cache, a route
 /// that came back) is ignored rather than oscillating.
-fn maybe_path_mtu(kcp: &mut Kcp<DatagramOut>, net: &SessionNet, pace: &mut PaceState) {
+fn maybe_path_mtu(
+    kcp: &mut Kcp<DatagramOut>,
+    net: &SessionNet,
+    pace: &mut PaceState,
+    datagram_bytes: &AtomicUsize,
+) {
     if let Some(last) = pace.last_mtu_check
         && last.elapsed() < PATH_MTU_RECHECK
     {
@@ -1243,6 +1249,7 @@ fn maybe_path_mtu(kcp: &mut Kcp<DatagramOut>, net: &SessionNet, pace: &mut PaceS
     if let Some(fits) = clamp_mtu(kcp.mtu(), path_mtu, net.peer.is_ipv6()) {
         let before = kcp.mtu();
         kcp.shrink_mtu(fits);
+        datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
         info!(
             peer = %net.peer,
             path_mtu,
@@ -1401,6 +1408,11 @@ async fn pump_tail(
 
 /// The per-session pump: owns the `Kcp` state machine and drives it between
 /// the writer channel, the inbound-datagram channel and the update timer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pump owns eight independent pieces of one session's state; \
+              bundling them into a struct would only move the list"
+)]
 async fn run_session(
     mut kcp: Kcp<DatagramOut>,
     net: SessionNet,
@@ -1409,6 +1421,7 @@ async fn run_session(
     mut out_rx: mpsc::UnboundedReceiver<Bytes>,
     out_sem: Arc<Semaphore>,
     in_tx: mpsc::Sender<ReadBatch>,
+    datagram_bytes: Arc<AtomicUsize>,
 ) {
     let start = Instant::now();
     // Prime the clock: `flush`/`check` require one `update` call first.
@@ -1434,7 +1447,7 @@ async fn run_session(
     let mut last_sack_sent = Instant::now();
     while let Some(delay) = {
         let _t = PhaseTimer::new(&KCP_NS_UPDATE); // pump_head = update + keepalive
-        pump_head(&mut kcp, &net, &mut pace, start).await
+        pump_head(&mut kcp, &net, &mut pace, start, &datagram_bytes).await
     } {
         KCP_PUMP_ROUNDS.fetch_add(1, Ordering::Relaxed);
         let mut sent_any = false;
@@ -1536,6 +1549,40 @@ async fn run_session(
 const IPV4_UDP_HEADERS: usize = 20 + 8;
 const IPV6_UDP_HEADERS: usize = 40 + 8;
 
+/// The `IPV6_MTU` socket option, declared in-crate because `nix` ships no
+/// type for it (its `sockopt::IpMtu` is the IPv4 `IP_MTU`).
+///
+/// `nix`'s two exported macros supply the whole implementation without a
+/// single `unsafe` line here (the crate denies `unsafe_code`, and the one
+/// sanctioned FFI site is `transport::udp_batch`):
+///
+/// * [`sockopt_impl!`](nix::sockopt_impl) declares this marker type (derive,
+///   docs and all) and implements [`GetSockOpt`](nix::sys::socket::GetSockOpt)
+///   for it, pairing `libc::IPV6_MTU` with `nix`'s own audited `getsockopt`
+///   call;
+/// * [`getsockopt_impl!`](nix::getsockopt_impl) is the half that macro
+///   expands into; it must be in scope too, because a declarative macro
+///   resolves the names it calls at the *expansion* site.
+///
+/// Linux-only, like the option and like the `nix` dependency itself, which
+/// `Cargo.toml` declares for that target alone.
+#[cfg(target_os = "linux")]
+use nix::{getsockopt_impl, sockopt_impl};
+#[cfg(target_os = "linux")]
+sockopt_impl!(Ipv6Mtu, GetOnly, libc::IPPROTO_IPV6, libc::IPV6_MTU, u32);
+
+/// Read `IPV6_MTU` off `probe`: the kernel's current path MTU towards the
+/// address that socket is connected to.
+///
+/// The value is a `u32` in host byte order (the kernel's `int` length).
+/// Any real IPv6 path carries at least the IPv6 minimum link MTU of 1280,
+/// so a smaller answer would mean the interface itself is misconfigured.
+#[cfg(target_os = "linux")]
+fn ipv6_mtu_of(probe: &std::net::UdpSocket) -> Option<usize> {
+    let mtu = nix::sys::socket::getsockopt(probe, Ipv6Mtu).ok()?;
+    usize::try_from(mtu).ok()
+}
+
 /// The datagram size that fits a path of `path_mtu`, or `None` when the
 /// current size already fits (nothing to do).
 ///
@@ -1559,14 +1606,12 @@ fn clamp_mtu(current: usize, path_mtu: usize, ipv6: bool) -> Option<usize> {
 
 /// The kernel's current path MTU towards `peer`, as it knows it today.
 ///
-/// **IPv4 only.** The equivalent IPv6 option (`IPV6_MTU`) has no safe wrapper
-/// in this crate's dependencies, and reading it would mean `unsafe`, which the
-/// crate denies — so an IPv6 session keeps the previous behaviour (the kernel
-/// fragments an oversized datagram) rather than gaining a second unsafe site
-/// for a guess. Documented in HANDOFF.md as the remaining half of this work.
+/// Per family: `getsockopt(IP_MTU)` for an IPv4 peer, `getsockopt(IPV6_MTU)`
+/// for an IPv6 one — the latter through [`Ipv6Mtu`], this crate's safe
+/// wrapper around an option `nix` does not name.
 ///
 /// A throwaway socket is connected to the peer and the option read off it:
-/// `IP_MTU` answers per *path*, so it needs a peer, and the session's own
+/// the MTU answers per *path*, so it needs a peer, and the session's own
 /// socket is deliberately unconnected (the server accepts any source and the
 /// conv-adoption hook may switch peers). Three non-blocking syscalls on a
 /// socket that is closed immediately, which is why this is not worth a
@@ -1584,17 +1629,26 @@ fn probe_path_mtu(local: Option<SocketAddr>, peer: SocketAddr) -> Option<usize> 
     }
     #[cfg(target_os = "linux")]
     {
-        if !peer.is_ipv4() {
-            return None;
-        }
-        let bind = match local {
-            Some(addr) if addr.is_ipv4() => SocketAddr::new(addr.ip(), 0),
-            _ => SocketAddr::from(([0, 0, 0, 0], 0)),
+        // Bind the probe to the session's own local address when it names
+        // one, so the option is read on the path the session actually uses;
+        // otherwise the wildcard of the peer's family (the client binds
+        // `0.0.0.0:0` / `[::]:0`, and the probe's port is irrelevant — it
+        // never sends a datagram).
+        let bind = match (local, peer) {
+            (Some(addr), _) if addr.is_ipv4() == peer.is_ipv4() => SocketAddr::new(addr.ip(), 0),
+            (_, SocketAddr::V4(_)) => SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0),
+            (_, SocketAddr::V6(_)) => SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0),
         };
         let probe = std::net::UdpSocket::bind(bind).ok()?;
         probe.connect(peer).ok()?;
-        let mtu = nix::sys::socket::getsockopt(&probe, nix::sys::socket::sockopt::IpMtu).ok()?;
-        usize::try_from(mtu).ok()
+        match peer {
+            SocketAddr::V4(_) => {
+                let mtu =
+                    nix::sys::socket::getsockopt(&probe, nix::sys::socket::sockopt::IpMtu).ok()?;
+                usize::try_from(mtu).ok()
+            }
+            SocketAddr::V6(_) => ipv6_mtu_of(&probe),
+        }
     }
 }
 
@@ -1605,6 +1659,10 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     let (dgram_tx, dgram_rx) = mpsc::unbounded_channel();
     let mut kcp = Kcp::new_stream(conv, DatagramOut::new(dgram_tx));
     configure(&mut kcp);
+    // The engine's datagram size, published here so it has exactly one
+    // writer: the pump (below) lowers it when the path asks for it. The
+    // constructed value is what the session starts with (1400).
+    let datagram_bytes = Arc::new(AtomicUsize::new(kcp.mtu()));
     // The datagram size is adapted to the path by the pump's first round
     // (`maybe_path_mtu`), which runs before it drains any application data —
     // one mechanism, so a session cannot be adapted in two places that drift.
@@ -1626,8 +1684,12 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
         out_rx,
         Arc::clone(&out_sem),
         in_tx,
+        Arc::clone(&datagram_bytes),
     ));
-    (KcpStream::new(out_tx, out_sem, in_rx), pkt_tx)
+    (
+        KcpStream::new(out_tx, out_sem, in_rx, datagram_bytes),
+        pkt_tx,
+    )
 }
 
 /// A KCP session presented as a reliable byte stream (tokio IO traits), so
@@ -1640,6 +1702,8 @@ pub struct KcpStream {
     /// Capacity gate for `out_tx`: one permit per in-flight write, returned
     /// by the pump as it feeds each write to KCP.
     out_sem: Arc<Semaphore>,
+    /// The pump's current datagram size in bytes (see `datagram_bytes`).
+    datagram_bytes: Arc<AtomicUsize>,
     /// Parked permit acquisition, kept across `poll_write` calls. Tokio
     /// does not export the future type, so it is type-erased here.
     out_acquire: Option<Pin<Box<AcquirePermitFuture>>>,
@@ -1666,14 +1730,38 @@ impl KcpStream {
         out_tx: mpsc::UnboundedSender<Bytes>,
         out_sem: Arc<Semaphore>,
         in_rx: mpsc::Receiver<ReadBatch>,
+        datagram_bytes: Arc<AtomicUsize>,
     ) -> KcpStream {
         KcpStream {
             out_tx: Some(out_tx),
             out_sem,
+            datagram_bytes,
             out_acquire: None,
             in_rx: Some(in_rx),
             read_queue: std::collections::VecDeque::new(),
         }
+    }
+
+    /// The datagram size this session currently sends, in bytes.
+    ///
+    /// Read-only observability for the path-MTU clamp: the session starts at
+    /// the engine's default and the pump lowers it to fit the path, never
+    /// raising it again. Nothing in the data path reads it — the clamp works
+    /// on the engine the sender already goes through — so its one consumer is
+    /// the test below, which asserts the *live* session instead of
+    /// re-deriving the arithmetic.
+    ///
+    /// This is the narrow case AGENTS.md §2 keeps `allow(dead_code)` for: a
+    /// `#[cfg(test)]` gate cascades, because the value read here is an
+    /// `Arc<AtomicUsize>` the pump carries as a parameter, and `#[expect]`
+    /// cannot hold since the test build *does* call it.
+    #[allow(
+        dead_code,
+        reason = "only the test build reads it; a cfg(test) gate would cascade \
+                  into the field and the pump's parameter"
+    )]
+    pub fn datagram_bytes(&self) -> usize {
+        self.datagram_bytes.load(Ordering::Relaxed)
     }
 
     /// Capacity gate shared by both write paths: acquire one permit
@@ -2277,8 +2365,17 @@ async fn dispatch(
 
 #[cfg(test)]
 mod path_mtu_tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "a test's failure path is a panic; the module-level allow keeps \
+                  the assertions readable"
+    )]
     use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, clamp_mtu};
     use crate::kcp::KCP_OVERHEAD;
+    #[cfg(target_os = "linux")]
+    use crate::transport::kcp::ipv6_mtu_of;
+    #[cfg(target_os = "linux")]
+    use std::net::SocketAddr;
 
     /// The engine's default datagram size, mirrored here because the constant
     /// itself is private to the engine module (this test pins the arithmetic
@@ -2288,35 +2385,80 @@ mod path_mtu_tests {
     /// The arithmetic that decides whether a datagram fits, per family. Every
     /// case here is a boundary a wrong constant would move: the default
     /// datagram on a clean path, the same datagram on a 1280 path (the cell
-    /// this exists for), a jumbo path, and a path too small to carry a KCP
-    /// header at all.
+    /// this exists for), a path exactly the size of the datagram, a jumbo
+    /// path, and a path too small to carry a KCP header at all.
+    ///
+    /// The IPv6 column is what the `IPV6_MTU` probe feeds: its overhead is
+    /// the 40-byte IPv6 header plus UDP, not the IPv4 pair.
     #[test]
     fn clamp_mtu_fits_the_path_per_family() {
-        // A clean path: the default datagram fits (1400 + 28 <= 65536).
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, 65536, false), None);
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, 65536, true), None);
+        /// One row: the datagram size the kernel's answer must produce for
+        /// each family, or `None` when there is nothing to do.
+        fn row(current: usize, path_mtu: usize, v4: Option<usize>, v6: Option<usize>) {
+            assert_eq!(
+                clamp_mtu(current, path_mtu, false),
+                v4,
+                "IPv4: {current} on a {path_mtu} path"
+            );
+            assert_eq!(
+                clamp_mtu(current, path_mtu, true),
+                v6,
+                "IPv6: {current} on a {path_mtu} path"
+            );
+        }
+
+        // A clean path: the default datagram fits (1400 + 28 / + 48 <= 65536).
+        row(KCP_MTU_DEF, 65536, None, None);
 
         // 1280: the IPv6 minimum every real path must carry. The datagram has
         // to shed the header the path adds, per family.
-        assert_eq!(
-            clamp_mtu(KCP_MTU_DEF, 1280, false),
-            Some(1280 - IPV4_UDP_HEADERS)
-        );
-        assert_eq!(
-            clamp_mtu(KCP_MTU_DEF, 1280, true),
-            Some(1280 - IPV6_UDP_HEADERS)
+        row(
+            KCP_MTU_DEF,
+            1280,
+            Some(1280 - IPV4_UDP_HEADERS),
+            Some(1280 - IPV6_UDP_HEADERS),
         );
 
         // A path exactly the size of the current datagram still fragments
         // once the IP header is added, so it must shrink.
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_MTU_DEF, false), Some(1400 - 28));
+        row(KCP_MTU_DEF, KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
 
         // Smaller than a KCP header can be: not our call to make, leave the
         // engine alone rather than produce an unsendable size.
         assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_OVERHEAD + 10, false), None);
 
         // Never grows: a jumbo path leaves a session that already shrank.
-        assert_eq!(clamp_mtu(1252, 9000, false), None);
+        row(1252, 9000, None, None);
+
+        // Both families' 1280 arithmetic against the shipped engine default:
+        // the datagram below the IPv6 minimum a v6 session must not exceed.
+        assert_eq!(clamp_mtu(KCP_MTU_DEF, 1280, true), Some(1232));
+    }
+
+    /// The IPv6 probe must answer off the **kernel**, not off a constant: a
+    /// connected UDP socket on the v6 loopback reports the loopback's MTU
+    /// through `IPV6_MTU`. The value itself is host-dependent (a netns `lo` at
+    /// 1280, a stock one often at 65536) and is deliberately not asserted;
+    /// what is asserted is that an answer exists and that it is at least the
+    /// IPv6 minimum link MTU of 1280, which every real path carries and which
+    /// is exactly the clamp's trigger on the bench cell.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_probe_reads_the_kernel_path_mtu() {
+        use std::net::{Ipv6Addr, UdpSocket};
+
+        let probe = UdpSocket::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
+            .expect("binding the v6 loopback is a prerequisite of this test");
+        probe
+            .connect(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9))
+            .expect("connecting a v6 UDP socket to the loopback");
+
+        let mtu = ipv6_mtu_of(&probe).expect("the kernel must answer IPV6_MTU on a v6 path");
+        assert!(
+            mtu >= 1280,
+            "IPV6_MTU answered {mtu}, below the IPv6 minimum link MTU of 1280 — \
+             the option is not reading a real path MTU"
+        );
     }
 }
 
@@ -2330,6 +2472,7 @@ mod tests {
         reason = "tests unwrap values they just constructed; test windows are far below usize::MAX"
     )]
     use super::*;
+    use std::net::Ipv6Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Read exactly `n` bytes with a generous timeout (KCP is userspace ARQ
@@ -2592,6 +2735,85 @@ mod tests {
         server.write_all(b"hello back").await.unwrap();
         let got = read_exact_timeout(&mut client, "hello back".len()).await;
         assert_eq!(&got, b"hello back");
+    }
+
+    /// **End-to-end proof that the IPv6 path-MTU clamp fires on a shrunken
+    /// path.** The unit test above proves the probe reads the kernel; this one
+    /// proves the *session* acts on it: a real client/server KCP pair over
+    /// `::1` must report a datagram size of `loopback_mtu − 48` — the IPv6
+    /// header plus the UDP header, the bytes the kernel adds on top of a KCP
+    /// datagram — instead of the engine's 1400-byte default. Before the IPv6
+    /// probe existed the session kept 1400, and on a 1280-byte path every
+    /// datagram became two IP fragments, one lost fragment costing the whole
+    /// datagram.
+    ///
+    /// The assertion is on the live sessions (`KcpStream::datagram_bytes`), not
+    /// on the clamp function, so it fails if the pump never runs the probe —
+    /// and it covers both ends, the client that dials and the server that
+    /// accepts. It lives with the adapter rather than in `tests/` because the
+    /// sessions it must inspect are private to this module; a visitor-level
+    /// integration test can only see the reassembled 1800-byte datagram.
+    ///
+    /// `lo` has a 65536-byte MTU by default, where the default datagram already
+    /// fits and the expectation would be vacuous — so the test **fails
+    /// loudly** instead of passing vacuously, telling the reader to run it
+    /// inside a network namespace:
+    ///
+    /// ```text
+    /// sudo unshare -n bash -c 'ip link set lo up; ip link set lo mtu 1280; \
+    ///   ip -6 addr add ::1/128 dev lo 2>/dev/null; \
+    ///   cargo test --lib ipv6_path_mtu_clamps_on_a_shrunk_loopback -- --ignored --nocapture'
+    /// ```
+    ///
+    /// The `unshare -n` is deliberate: the host's own `lo` (which carries the
+    /// agent harness's connection) must never be reshaped.
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs a small-MTU v6 loopback: run it via sudo unshare -n (see the doc comment)"]
+    #[tokio::test]
+    async fn ipv6_path_mtu_clamps_on_a_shrunk_loopback() {
+        let loopback_mtu = probe_path_mtu(None, SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9))
+            .expect("the v6 loopback must answer the path-MTU probe");
+        let expected = loopback_mtu - IPV6_UDP_HEADERS;
+        assert!(
+            expected < KCP_MTU,
+            "this test needs a shrunken v6 loopback to mean anything: lo reports an MTU of \
+             {loopback_mtu}, so the engine's {KCP_MTU}-byte default already fits. Run it \
+             inside a network namespace:\n  \
+             sudo unshare -n bash -c 'ip link set lo up; ip link set lo mtu 1280; \
+             ip -6 addr add ::1/128 dev lo 2>/dev/null; \
+             cargo test --lib ipv6_path_mtu_clamps_on_a_shrunk_loopback -- --ignored --nocapture'"
+        );
+
+        let acceptor = KcpAcceptor::bind("[::1]:0").await.unwrap();
+        let addr = acceptor.local_addr().unwrap();
+        assert!(addr.is_ipv6(), "the acceptor must be on the v6 loopback");
+
+        let mut client = connect(addr, 0x0BAD_C0DE).await.unwrap();
+        // Session start: the client's first pump round probes before it drains
+        // any application data, so the clamp is in place before this write.
+        client.write_all(b"shrink me").await.unwrap();
+
+        let session = tokio::time::timeout(Duration::from_secs(10), acceptor.accept())
+            .await
+            .expect("accept timed out")
+            .expect("acceptor closed");
+        let mut server = session.stream;
+        let got = read_exact_timeout(&mut server, "shrink me".len()).await;
+        assert_eq!(&got, b"shrink me");
+
+        assert_eq!(
+            client.datagram_bytes(),
+            expected,
+            "the client session's datagram must shrink to the v6 path (loopback MTU \
+             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected}); {KCP_MTU} means \
+             the IPv6 probe did not run"
+        );
+        assert_eq!(
+            server.datagram_bytes(),
+            expected,
+            "the server session's datagram must shrink to the v6 path (loopback MTU \
+             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected})"
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,11 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-25.** Branch `perf/data-path-optimizations` (106
-> commits ahead of `main` at `8584945`, pushed, **not merged**). It contains
-> the data-path rework — the in-repo tokio-native mux engine, the zero-copy
-> route, KCP batching, data-channel striping, opt-in Noise session resume —
-> plus the Soak benchmark model that replaced the measurement matrix. Shipped
-> work: [CHANGELOG.md](CHANGELOG.md). Design: [docs/internals.md](docs/internals.md)
+> **State as of 2026-09-26.** `main` is at `cccffcd` (v0.9.0 released, and the
+> v0.9.1 plan of record committed on it). `feat/ipv6-path-mtu`, cut from that
+> `main` and 4 commits ahead, carries the first two milestones of the v0.9.1
+> theme below: M0 (the interop matrix) and M4 (the IPv6 half of the KCP
+> path-MTU fix). **Nothing here is merged.** Shipped work:
+> [CHANGELOG.md](CHANGELOG.md). Design: [docs/internals.md](docs/internals.md)
 > and [docs/structure.md](docs/structure.md). Method and how to read the
 > numbers: [docs/benchmarks.md](docs/benchmarks.md).
 >
@@ -14,20 +14,20 @@
 > number. Per AGENTS.md §3 it is a contributor page — user-facing facts belong
 > in the docs pages, and anything released belongs in CHANGELOG.md.
 >
-> **Not this branch's business:** the configuration model. That landed on
-> `main` (`ee8e1a2`, "0.8 configuration model"), before this branch was cut;
-> here the config surface only gained the two options this branch's features
-> need (`[transport.noise] resume`, `[server.data] stripe_count`) plus tests
-> and documentation fixes.
+> **Not this theme's business:** the configuration model. The 0.8 model landed
+> on `main` (`ee8e1a2`) before any of these branches were cut; the config
+> surface only gains what a committed milestone's feature needs.
 
 ## Plan of record: v0.9.1 — one control session per endpoint, shared elastic pool, transparent visibility, quiet logs
 
-Branch `feat/single-control-session` (cut from `main` after v0.9.0). The previous
-theme is closed: the fragmentation fix and the cold-start probe landed, and
-parallel establishment was measured and **not** shipped (three instruments, no
-effect) — the numbers are in CHANGELOG.md and in the historical records below.
-This is the plan the work follows; it is the record of the decisions taken while
-designing it, including the ones that were rejected.
+Planned on `feat/single-control-session` (cut from `main` after v0.9.0); its
+milestones are being landed one commit at a time, M4 here on
+`feat/ipv6-path-mtu`. The previous theme is closed: the fragmentation fix and the
+cold-start probe landed, and parallel establishment was measured and **not**
+shipped (three instruments, no effect) — the numbers are in CHANGELOG.md and in
+the historical records below. This is the plan the work follows; it is the record
+of the decisions taken while designing it, including the ones that were
+rejected.
 
 **Model.** One authenticated control session per `(client, remote_addr)` — direct,
 its own connection, never multiplexed into the pool — carrying N service
@@ -59,7 +59,7 @@ semantics) and its precise cause goes to logs, not to a state machine.
 | D14 | Over-cap ⇒ typed, non-fatal refusal; cap below the UDP requirement ⇒ degrade and log once |
 | D15 | Growth thresholds and hysteresis stay internal constants until measured |
 | D16 | `direct` mode kept (sparse visitors + measurement control arm); its final role is decided by M7 |
-| D17 | IPv6 path MTU is unblocked: define `Ipv6Mtu` in-crate with nix's exported `sockopt_impl!`/`getsockopt_impl!` — no `unsafe` |
+| D17 | IPv6 path MTU is covered by an in-crate `Ipv6Mtu` declared with nix's exported `sockopt_impl!`/`getsockopt_impl!` — no `unsafe` |
 | D18 | Log model: level contract + aggregation + a log-budget test |
 | D19 | Config shape: client-level policy, service-level intent; no knob without evidence |
 | D20 | One commit per milestone with its own verification; docs in the same commit; upgrade instructions on user pages |
@@ -113,13 +113,23 @@ removed keys warn for one release, then error.
 | M2b | S2 placement + D28 spare selection (**conditional**) | M2a data | Only if the spread is significant: no hysteresis flapping; stripe groups still distinct; no regression |
 | M2c | UDP shortest-queue assignment (**conditional**) | drop counter | Lower drop rate under mixed UDP load, no regression |
 | M3 | Transparent visibility: delete health check | — | No deregistration on backend death; per-visitor failure reproducible; both languages updated |
-| M4 | E: IPv6 path MTU | — | Clamp fires on a shrunk-MTU IPv6 loopback; clippy clean under `unsafe_code = deny` |
+| M4 | E: IPv6 path MTU — **landed** | — | Clamp fires on a shrunk-MTU IPv6 loopback; clippy clean under `unsafe_code = deny` |
 | M5 | Log model | — | Log-budget: zero WARN/ERROR on the happy path, bounded INFO, aggregation replaces repeats |
 | M6 | Config consolidation | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
 | M7 | `direct` mode's role | M2a | Isolation experiment: the shared pool matches direct on interactive p99, or direct keeps its documented role |
 
 Order: M0 → M1 → M2a → (M2b/M2c if the data asks) → M6; M3/M4/M5 independent
 and may land first; M7 after M2a.
+
+**Landed on this branch so far** (in order): M0, the interop matrix —
+`interop_test.rs` and `just interop`; its three cases stay `#[ignore]`d until
+`MOLEHILL_OLD_BIN` is fetched, so a plain green run never claims the matrix ran.
+Then M4, IPv6 path MTU: the probe now answers for both families
+(`transport::kcp::probe_path_mtu`), so an IPv6 KCP session sheds the 40-byte
+IPv6 header plus UDP the way the IPv4 one always has; the end-to-end proof is
+the `#[ignore]`d `ipv6_path_mtu_clamps_on_a_shrunk_loopback`, which asserts the
+live session's datagram size under `sudo unshare -n` (a netns `lo` at MTU 1280
+gives 1232 bytes). The other milestones have not started.
 
 ### Rejected, with the reason (so it is not re-litigated)
 
@@ -255,13 +265,17 @@ and created the GitHub Release with its archives and `SHA256SUMS`. The branch
 `perf/data-path-optimizations` is merged into `main` (`c6e8c1f`) and its 34 topic
 commits are the release's history.
 
-**The data-path rework is complete on its own terms.**
+**The data-path rework is complete on its own terms.** One release theme is
+being landed after it: the v0.9.1 plan above, where M4 (IPv6 path MTU) is the
+first milestone in.
 
-This session added two measured improvements on top of it — the KCP path-MTU
-fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no cost
-where it does not apply) and the UDP drop counters — plus the fragmentation
-axis and the cold-start probe in the harness, and the docs-only path in the
-hooks. See "Phase log" below.
+The release session added two measured improvements on top of that rework — the
+KCP path-MTU fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no
+cost where it does not apply, **IPv4 only at the time**) and the UDP drop
+counters — plus the fragmentation axis and the cold-start probe in the harness,
+and the docs-only path in the hooks. The IPv6 half of that fix is what M4
+closed; the numbers above were taken on a v4 path and are not re-measured for
+it. See "Phase log" below.
 
 - **Cumulative branch-vs-`main` A/B (2026-09-24, the fixed harness):** latency
   at parity or better on every arm and cell; throughput net favourable (15
