@@ -26,6 +26,17 @@ Nothing yet.
   more than three times — the guarantee is measured, not intended. Details and
   the per-level table: `docs/configuration.md`, "What each level means".
 
+- **The benchmark gate now judges what it says it judges.** `just soak-check`
+  compares a run against the previous release only when the two are comparable
+  (the runs record their host, and a number from another host is context, not a
+  baseline — the rule was documented but not enforced); the fd/RSS drift limits
+  are applied to the `soak` leak axis they are calibrated for instead of to
+  every test type; the interactive error-rate limit compares percentage points
+  rather than a ratio, which had turned a 0.03pp wobble into a "+13%" failure;
+  and a reference peer's swing is reported with its numbers instead of blocking
+  this release. Anyone reading a `soak-check` verdict, or reproducing one, is
+  affected; the reasoning each fix rests on is in HANDOFF.md.
+
 ### Removed
 
 - **`health_check` (the per-service health probe) is gone, and a service is no
