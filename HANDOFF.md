@@ -1,10 +1,13 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-26.** `main` is at `cccffcd` (v0.9.0 released, and the
-> v0.9.1 plan of record committed on it). `feat/ipv6-path-mtu`, cut from that
-> `main` and 4 commits ahead, carries the first two milestones of the v0.9.1
-> theme below: M0 (the interop matrix) and M4 (the IPv6 half of the KCP
-> path-MTU fix). **Nothing here is merged.** Shipped work:
+> **State as of 2026-09-26.** `main` is at `cccffcd` (v0.9.0 released, with the
+> v0.9.1 plan of record committed on it). `feat/single-control-session`, cut
+> from that `main`, carries the independent half of the v0.9.1 theme: M0 (the
+> interop matrix), M3 (transparent visibility — the health check is gone), M4
+> (the IPv6 half of the KCP path-MTU fix) and M5 (the log level contract and
+> the log budget). The session/pool merge itself (M1, M2a) is **not** in it:
+> "M1's shape" below records why it became opt-in and what the next cycle does
+> first. **Nothing here is merged yet.** Shipped work:
 > [CHANGELOG.md](CHANGELOG.md). Design: [docs/internals.md](docs/internals.md)
 > and [docs/structure.md](docs/structure.md). Method and how to read the
 > numbers: [docs/benchmarks.md](docs/benchmarks.md).
@@ -20,9 +23,9 @@
 
 ## Plan of record: v0.9.1 — one control session per endpoint, shared elastic pool, transparent visibility, quiet logs
 
-Planned on `feat/single-control-session` (cut from `main` after v0.9.0); its
-milestones are being landed one commit at a time, M4 here on
-`feat/ipv6-path-mtu`. The previous theme is closed: the fragmentation fix and the
+Planned on `feat/single-control-session` (cut from `main` after v0.9.0), and
+landed one milestone per commit — M4 first on its own branch, `feat/ipv6-path-mtu`,
+then folded in. The previous theme is closed: the fragmentation fix and the
 cold-start probe landed, and parallel establishment was measured and **not**
 shipped (three instruments, no effect) — the numbers are in CHANGELOG.md and in
 the historical records below. This is the plan the work follows; it is the record
@@ -108,28 +111,110 @@ removed keys warn for one release, then error.
 | # | Milestone | Depends on | Gate |
 |---|---|---|---|
 | M0 | Interop matrix (new) | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
-| M1 | A: one control session per endpoint | M0 | Matrix cases; FD/handshake counts; `--test=reconnect` no regression; heartbeat mismatch refused or corrected at startup |
-| M2a | Shared elastic pool + S1 observation | M1 | Pool telemetry; first-visitor-after-idle latency; placement state-spread data; no mixed-workload regression; UDP stickiness held (`pinned_peers`) |
+| M0 | Interop matrix (new) — **landed** | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
+| M1 | A: one control session per endpoint (**next cycle** — see "M1's shape" below) | M0 | Matrix cases; FD/handshake counts; `--test=reconnect` no regression; heartbeat mismatch refused or corrected at startup |
+| M2a | Shared elastic pool + S1 observation (**next cycle, with M1**) | M1 | Pool telemetry; first-visitor-after-idle latency; placement state-spread data; no mixed-workload regression; UDP stickiness held (`pinned_peers`) |
 | M2b | S2 placement + D28 spare selection (**conditional**) | M2a data | Only if the spread is significant: no hysteresis flapping; stripe groups still distinct; no regression |
 | M2c | UDP shortest-queue assignment (**conditional**) | drop counter | Lower drop rate under mixed UDP load, no regression |
-| M3 | Transparent visibility: delete health check | — | No deregistration on backend death; per-visitor failure reproducible; both languages updated |
+| M3 | Transparent visibility: delete health check — **landed** | — | No deregistration on backend death; per-visitor failure reproducible; both languages updated |
 | M4 | E: IPv6 path MTU — **landed** | — | Clamp fires on a shrunk-MTU IPv6 loopback; clippy clean under `unsafe_code = deny` |
-| M5 | Log model | — | Log-budget: zero WARN/ERROR on the happy path, bounded INFO, aggregation replaces repeats |
-| M6 | Config consolidation | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
+| M5 | Log model — **landed** | — | Log-budget: zero WARN/ERROR on the happy path, bounded INFO, no shape repeated more than three times |
+| M6 | Config consolidation (**split** — see below) | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
 | M7 | `direct` mode's role | M2a | Isolation experiment: the shared pool matches direct on interactive p99, or direct keeps its documented role |
 
 Order: M0 → M1 → M2a → (M2b/M2c if the data asks) → M6; M3/M4/M5 independent
 and may land first; M7 after M2a.
 
-**Landed on this branch so far** (in order): M0, the interop matrix —
-`interop_test.rs` and `just interop`; its three cases stay `#[ignore]`d until
-`MOLEHILL_OLD_BIN` is fetched, so a plain green run never claims the matrix ran.
-Then M4, IPv6 path MTU: the probe now answers for both families
-(`transport::kcp::probe_path_mtu`), so an IPv6 KCP session sheds the 40-byte
-IPv6 header plus UDP the way the IPv4 one always has; the end-to-end proof is
-the `#[ignore]`d `ipv6_path_mtu_clamps_on_a_shrunk_loopback`, which asserts the
-live session's datagram size under `sudo unshare -n` (a netns `lo` at MTU 1280
-gives 1232 bytes). The other milestones have not started.
+**Landed on this branch** (in order), with the evidence each one rests on:
+
+- **M0, the interop matrix** — `tests/interop_test.rs` and `just interop`:
+  this build against the previous release's *asset*, never a local build (a
+  binary compiled from today's tree cannot test yesterday's protocol). Three
+  cases: old server + new client forwards, new server + old client forwards, and
+  an old server refuses an unknown dialect on that one connection yet keeps
+  serving. They are `#[ignore]`d until `MOLEHILL_OLD_BIN` is set, so a plain
+  green run reports `3 ignored` instead of claiming the matrix ran. It was
+  falsified before it was trusted: with the "unknown" version byte set to one
+  v0.9.0 knows, the old server answers 34 bytes instead of closing and the case
+  fails with that payload. Re-run green after M3, M4 and M5.
+- **M3, transparent visibility** — the health check is gone: code, config key
+  and both language pages. `dead_backend_fails_one_visitor_and_stays_registered`
+  asserts the contract in order — a visitor to a dead-backend service *ends*
+  instead of hanging; the service is still registered (its exposed port is held
+  by the server, observed by a failed bind, so the check creates no visitor
+  traffic of its own); and the same port forwards the moment a backend binds,
+  with no client restart. The removed key is stripped from the parsed document
+  with a warning naming the new contract (verified against the real binary, not
+  only in a unit test); `deny_unknown_fields` is what turns it into an error
+  once the entry is deleted.
+- **M4, IPv6 path MTU** — the probe now answers for both families
+  (`transport::kcp::probe_path_mtu`), so an IPv6 KCP session sheds the 40-byte
+  IPv6 header plus UDP the way the IPv4 one always has; the end-to-end proof is
+  the `#[ignore]`d `ipv6_path_mtu_clamps_on_a_shrunk_loopback`, which asserts the
+  live session's datagram size under `sudo unshare -n` (a netns `lo` at MTU 1280
+  gives 1232 bytes) and fails loudly on a normal host instead of passing
+  vacuously.
+- **M5, the log model** — a level contract (docs/configuration.md, "What each
+  level means"), the per-connection reclassifications that follow from it, and
+  `logging::RepeatNotice` for conditions that repeat. The measurement that
+  justifies it: one integration test emitted 19 WARN/ERROR lines on a run in
+  which nothing failed, and the whole 15-test suite now emits **zero**.
+  `tests/log_budget_test.rs` drives the real binary, with the production
+  formatter, and fails on one WARN, one ERROR, an INFO count over the ceiling,
+  or any message shape repeated more than three times — it found its first
+  violation itself (an ERROR for a port probe that connected and hung up).
+
+### M1's shape, revised now that M0–M5 have landed
+
+D1–D31 stand: the model is the model. The *staging* did not survive contact with
+the interop matrix, and this is the revision the next cycle follows.
+
+- **The new dialect is opt-in for one release, not the default.** M0 exists to
+  make a wire change safe, and its value collapses the moment the client
+  switches dialect silently: a new client against a v0.9.0 server would stop
+  working with nothing to catch it but a user's bug report. The shape that keeps
+  both directions testable: the **server accepts both** dialects (v3, today's
+  one-session-per-service grammar, unchanged) so operators upgrade servers
+  first; the **client picks** the new one only when the config asks for it (the
+  `shared_pool` switch already in the config shape), and otherwise speaks v3;
+  an **old server refuses the new dialect cleanly** — that is M0's third case —
+  and the new client reports it as a protocol mismatch instead of retrying.
+  This is also what §8 of the plan said ("opt-in for one release"); it is the
+  difference between a rollout and a flag day.
+- **The dialect is a version byte, not a new hello variant.** The existing
+  `Hello::ControlChannelHello(version, digest)` already carries a `u8` version
+  that the server validates and M0's third case already exercises; the new
+  session dialect is version 4 on that same message, so the *framing* stays
+  byte-identical (34 bytes) and an old server rejects it with the error path
+  that is tested today. A new `Hello` variant cannot work: the variant tag lives
+  inside the postcard payload, so a peer cannot see it before parsing, and the
+  length it must read is not yet known. What follows the handshake is where the
+  new grammar lives — a session hello acknowledgment carrying the capability
+  block (protocol version, heartbeat interval, flags), registrations and
+  commands that carry a service id, and self-describing tags for the new
+  variants, the pattern `StartForwardStripedTcp` established.
+- **M1 and M2a are one change, not two.** A merged session is only worth its
+  plumbing if the data plane is shared too: the shared pool is what routes an
+  inbound stream to a service (a stream prologue), and it is what gives
+  `pool_size`/`count` a different meaning. Merging control channels while
+  leaving N per-service pools would be a lot of risk for a partial win, so the
+  next cycle does "session + pool" as one milestone with the S1 instrumentation
+  inside it.
+- **M6 cannot delete the old keys until the client default flips.**
+  `default_count`, per-service `count` and `pool_size` are what the v3 path
+  uses; deleting them while v3 is the default would break the default
+  configuration. M6 therefore splits: the *additions*, renames and removed-key
+  warnings land with M1/M2a, and the *deletions* land with the release that
+  makes the new dialect the default and removes the v3 client path (which is
+  also when `[server].max_pool_size` goes — it is the server's arbiter for the
+  v3 pool).
+- **Aggregation is smaller than planned, deliberately.** With per-connection
+  failures at `DEBUG` (M5), no `WARN`/`ERROR` site fires per connection in a
+  healthy run, so a windowed counter would have had no user.
+  `logging::RepeatNotice` — loud once, then `DEBUG`, loud again after recovery —
+  is what landed, and `tests/log_budget_test.rs` keeps the premise true. If a
+  future change reintroduces a repeating `WARN`, the notice is the tool; a
+  counter is not justified until one exists.
 
 ### Rejected, with the reason (so it is not re-litigated)
 
@@ -175,21 +260,12 @@ land.
 
 ### Scoping notes carried forward
 
-- **Single control channel per client** (later theme, design already
-  reviewed). The client currently keeps one control connection *and* one mux
-  tunnel per service; consolidating is mostly plumbing now that the engine is
-  stable and gives another order-of-magnitude FD/handshake reduction for
-  many-service clients. Two constraints: (a) the control channel stays
-  0.8.x-interoperable, so the consolidated form is a **new hello variant**
-  (`ControlChannelHelloMulti`) announced per connection — never a silent change
-  to the v3 grammar — with a service id added to the commands that need one
-  (`CreateDataChannel`, `HeartBeat`) and per-service server state keyed under
-  one client session; the auth handshake stays per connection. (b) The bench
-  probes all dial the exposed port, so the change is invisible to them — it
-  ships with deliverable 3 or not at all. Its crypto half already landed
-  separately: the Noise session resume (`resume = true`) removes the
-  handshake's DH turns on reconnect, opt-in, with replay and forward-secrecy
-  trade-offs documented in docs/transport.md.
+- **Single control channel per client** — the design is above ("M1's shape"),
+  and its crypto half already landed separately: the Noise session resume
+  (`resume = true`) removes the handshake's DH turns on reconnect, opt-in, with
+  replay and forward-secrecy trade-offs documented in docs/transport.md. The
+  bench probes all dial the exposed port, so the merge is invisible to the
+  published numbers — it ships with the pool, or not at all.
 - **Scheduling-review candidates** (A, B, C, D) keep the full statement of
   what is static today, why it is believed true and the gate each must pass —
   that table stays in the backlog below, and its B/D rows are this theme's
