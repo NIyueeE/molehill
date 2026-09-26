@@ -277,7 +277,15 @@ land.
 **The run.** `just soak --test=rrul --tools molehill,frp,rathole,nps` on
 `ac42490` (`tree_clean: true`, binary fingerprint recorded, `stale: false`,
 version 0.9.1), host `16b4dc8db68b`, 4 tools, the default eight-stage timeline,
-~80 minutes. The results file and the chart set are the release artifacts:
+~80 minutes.
+
+The pre-merge history cleanup renumbered that commit (it is `0072098` now:
+`ac42490` itself is unreachable). The provenance survives exactly, because a
+tree is content-addressed: `0072098^{tree}` is
+`6a46fa14b083f7d3fe9e3ad4c3c7fa77f9569dd0`, byte-identical to
+`ac42490^{tree}` — the cleanup moved one hunk between two commits *before* it
+and changed no tree at or after it (verified: the branch's final tree is
+unchanged too). Anyone checking the sweep out checks out that tree. The results file and the chart set are the release artifacts:
 `benches/scripts/soak/results-soak-v0.9.1.json`, `assets/soak-v0.9.1*.png`.
 
 **The self-check passes**: every coverage axis carried samples (106 568 for
