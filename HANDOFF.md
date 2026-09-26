@@ -272,6 +272,72 @@ land.
   first two deliverables.
 
 
+## The v0.9.1 sweep: what it measured, and what the gate said
+
+**The run.** `just soak --test=rrul --tools molehill,frp,rathole,nps` on
+`ac42490` (`tree_clean: true`, binary fingerprint recorded, `stale: false`,
+version 0.9.1), host `16b4dc8db68b`, 4 tools, the default eight-stage timeline,
+~80 minutes. The results file and the chart set are the release artifacts:
+`benches/scripts/soak/results-soak-v0.9.1.json`, `assets/soak-v0.9.1*.png`.
+
+**The self-check passes**: every coverage axis carried samples (106 568 for
+molehill), every throughput sample dialled the exposed port rather than the
+backend, and the absolute SLO holds on both unshaped clean stages — interactive
+p99 9.334 ms and 5.389 ms against a 50 ms SLO, error rate 0 on both. The shaped
+stages sit above the SLO by design; that is the degradation curve, reported as a
+note.
+
+**The comparison against v0.9.0 is not a gate input**, and that is now enforced
+rather than assumed (`soak_check.comparability`): the two runs were made on
+different hosts (`98c48ea3fa68` vs `16b4dc8db68b` — the bench container is
+recreated between sessions, so its hostname changes), and `docs/release.md`
+already says a number from another host is not a baseline. The evidence that
+this is a statement about the environment and not a way past a regression:
+
+- the peer signature is an environment change: molehill and **rathole** both
+  lost ~33% of clean-stage bulk (18.9/20.6 -> 12.7/16.2 and 18.4/18.5 ->
+  12.4/12.4 Gbit/s) while frp (5.9 -> 6.0) and nps (0.13 -> 0.13), which never
+  reach that ceiling, did not move at all;
+- an interleaved A/B of the two **binaries** (`--test=screen --path=clean
+  --streams-max=8 --ab <v0.9.0 release>,<v0.9.1 build>`) refuses to claim a
+  difference in either direction at the 15% threshold: B ahead on 4 of 8 steps
+  and A on 3, and the same v0.9.0 binary measures 7.6-24.5 Gbit/s across the
+  steps of that one run.
+
+So v0.9.1 is gated the way v0.9.0 was — the absolute SLO plus the run's own
+completeness and endpoint checks — with the comparison *recorded* rather than
+judged.
+
+**Four gate defects were found by running the ritual, and fixed in this
+release** (the fixes are part of the release commit; each is falsified, not just
+asserted):
+
+1. **The leak axis was applied to a test type it is not calibrated for.** The
+   absolute ±1 fd/min limit is the *soak* axis; an `rrul` run grows server fds
+   by warm-up — identically in both runs (31 -> 165 at v0.9.0, 31 -> 169 here),
+   which the gate reported as drift. Non-`soak` runs now compare the slope
+   against their baseline (a doubled slope still fails; `soak` keeps the
+   absolute limit).
+2. **The error-rate limit compared units.** Rates are stored as fractions and
+   the limit is documented in percentage points, but the check took a *ratio*:
+   a 0.248% -> 0.281% wobble (0.03pp) printed as "+13.3pp" and failed. It now
+   takes the difference; 0.2% -> 6% still fails.
+3. **A peer's violation counted as a release blocker.** Third-party behaviour
+   swings between runs (rathole's `rate100` p99 moved 161 ms -> 7064 ms here)
+   while the docs say the SLO gates the tool this repository releases. Peers are
+   now reported with their numbers and do not block.
+4. **The comparability rule was documented but not enforced.** See above.
+
+**For the next method revision** (recorded here, not fixed at release time):
+the host key is the container hostname, which changes under the bench — it fails
+safe (refuses to compare) but it also means two runs on the same hardware will
+never compare. A stable host identity is a calibration measurement (kernel +
+CPU model + a fixed-workload throughput probe), not a name. And a single sample
+per stage cannot resolve a 25% change when the model's own within-run spread on
+clean stages is 40-70% (9.334 vs 5.389 ms p99; 12.7 vs 16.2 Gbit/s in one run):
+either repeat the stage or state the interval the comparison can actually
+resolve.
+
 ## Provenance of the published v0.9.0 numbers
 
 The release sweep was measured on `710186c` (`tree_clean: true`, binary
