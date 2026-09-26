@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet: v0.9.0 below is the state being prepared, and the next change
-opens its own section here.
+### Removed
+
+- **`health_check` (the per-service health probe) is gone, and a service is no
+  longer withdrawn from the server when its local backend goes down.** This is
+  the transparent-visibility model: registration is the only thing that decides
+  whether a service is visible, so a dead backend is a failed request for the
+  one visitor who asked (connection closed or reset, like any reverse proxy in
+  front of a dead upstream) instead of a service that silently disappears for
+  everyone. The old behaviour could not tell "the backend is down" from "the
+  process that accepts connections is up but broken", and its deregister/
+  re-register cycle was itself a source of control-plane churn; the cause of a
+  failed request now goes to the client's log, where an operator can see it.
+  Operationally nothing needs to be done to recover a backend: it is enough to
+  start it, and the service that was never deregistered forwards again. A config
+  that still carries `health_check` starts and logs a warning; the key becomes
+  an error in the next release. See `docs/configuration.md`, "A local service
+  that is down".
 
 ## [0.9.0] - 2026-09-25
 

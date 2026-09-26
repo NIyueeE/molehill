@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::broadcast,
     time,
 };
@@ -44,6 +44,13 @@ const HITTER_NUM: usize = 4;
 const AFFINITY_LOCAL_SERVICE: &str = "127.0.0.1:8082";
 const AFFINITY_EXPOSED_ADDR: &str = "127.0.0.1:2340";
 const AFFINITY_PACKETS: usize = 64;
+
+// Ports for the transparent-visibility regression
+// (`dead_backend_fails_one_visitor_and_stays_registered`): one service whose
+// backend is not running, and one healthy service on the same client.
+const DEAD_BACKEND: &str = "127.0.0.1:8099";
+const DEAD_EXPOSED: &str = "127.0.0.1:2350";
+const DEAD_NEIGHBOUR_EXPOSED: &str = "127.0.0.1:2351";
 
 #[cfg(feature = "multiplex")]
 static MUX_CONFIG_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -1115,6 +1122,90 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
 /// stayed bound after the client was gone, and the next registration of the
 /// same service was rejected with "Port N is already in use" while nothing
 /// was serving it any more.
+/// A dead local service must fail one visitor — not withdraw the service.
+///
+/// v0.9.1 removed the health check: visibility follows registration alone, so
+/// the client never probes `local_addr` and never deregisters a service whose
+/// backend is down. A visitor gets what a reverse proxy without a health check
+/// gives: the request fails for that connection (nginx-502 semantics), and the
+/// cause goes to the log instead of into a state machine.
+///
+/// Three observable consequences, in order: a visitor to the dead service
+/// fails instead of hanging; the service is *still registered*, so it forwards
+/// the moment the backend appears, with no client restart and no
+/// re-registration; and a healthy service on the same client never noticed.
+#[tokio::test]
+async fn dead_backend_fails_one_visitor_and_stays_registered() -> Result<()> {
+    if cfg!(not(all(feature = "client", feature = "server"))) {
+        return Ok(());
+    }
+    init();
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/dead_backend.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/dead_backend.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    // The dead service is registered as soon as the server holds its exposed
+    // port (a port this process can no longer bind). This is the registration
+    // proof, and it creates no visitor traffic to explain away.
+    wait_for_port_bound(DEAD_EXPOSED).await?;
+    // The healthy neighbour doubles as the control: the client itself is fine.
+    wait_for_echo(DEAD_NEIGHBOUR_EXPOSED, Type::Tcp).await?;
+
+    // 1. One visitor, one failure — and it must not hang.
+    visitor_gets_a_failed_request(DEAD_EXPOSED).await?;
+
+    // 2. The backend appears. Nothing is restarted: the registration was never
+    //    withdrawn, so the same exposed port starts forwarding.
+    let backend = tokio::spawn(async move {
+        let _ = common::tcp::echo_server(DEAD_BACKEND).await;
+    });
+    wait_for_echo(DEAD_EXPOSED, Type::Tcp).await?;
+
+    // 3. The failure was local to one service; the neighbour never noticed.
+    wait_for_echo(DEAD_NEIGHBOUR_EXPOSED, Type::Tcp).await?;
+
+    backend.abort();
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+
+    Ok(())
+}
+
+/// Connect to `addr` and require the connection to *end*: EOF or a reset.
+///
+/// A forwarded request to a backend nobody listens on has nothing to send
+/// back, so those are the only acceptable outcomes. Silence for ten seconds is
+/// the bug being guarded against — a visitor waiting on a request that will
+/// never be answered.
+async fn visitor_gets_a_failed_request(addr: &str) -> Result<()> {
+    let mut conn = TcpStream::connect(addr).await?;
+    conn.write_all(PING.as_bytes()).await?;
+    let mut buf = [0u8; 64];
+    let read = time::timeout(Duration::from_secs(10), conn.read(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("the visitor to {addr} hung for 10 s instead of failing"))?;
+    match read {
+        // Closed or reset: both are "the request failed", and neither is a
+        // hang.
+        std::result::Result::Ok(0) | std::result::Result::Err(_) => Ok(()),
+        std::result::Result::Ok(n) => anyhow::bail!("a dead backend answered with {n} bytes"),
+    }
+}
+
 #[tokio::test]
 async fn finished_control_channel_releases_its_ports() -> Result<()> {
     if cfg!(not(all(feature = "client", feature = "server"))) {
@@ -1157,6 +1248,28 @@ async fn finished_control_channel_releases_its_ports() -> Result<()> {
     let _ = tokio::join!(server);
 
     Ok(())
+}
+
+/// Wait until `addr` is *held* by someone else, i.e. binding it fails.
+///
+/// The inverse of `wait_for_port_release`, and the way to observe a listener
+/// without making a visitor: a bind that succeeds means nothing is listening
+/// yet, and the listener is dropped immediately so the observation cannot
+/// itself hold the port.
+async fn wait_for_port_bound(addr: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match TcpListener::bind(addr).await {
+            std::result::Result::Err(_) => return Ok(()),
+            std::result::Result::Ok(listener) => {
+                drop(listener);
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("nothing bound {addr} within 15 s");
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 /// Wait until `addr` can be bound again, failing the test after a generous

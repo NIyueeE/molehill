@@ -1,0 +1,36 @@
+# Fixture for `dead_backend_fails_one_visitor_and_stays_registered`.
+#
+# Two services on one client, to separate "this service's backend is dead"
+# from "this client is broken":
+#
+# - `dead` has nothing listening on its `local_addr`;
+# - `echo` is served by the shared echo backend the suite spawns.
+#
+# Nothing here configures health checking — there is no such key any more —
+# and that is the point: the dead service must stay registered, so a visitor
+# gets one failed request instead of a service that silently disappears.
+[client]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.control]
+default_remote_addr = "127.0.0.1:2333"
+
+[client.transport]
+type = "plain"
+
+[client.services.dead]
+local_addr = "127.0.0.1:8099"
+remote_bind_addr = "0.0.0.0:2350"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2351"
+
+[server]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+allow_ports = ["2350-2351"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"

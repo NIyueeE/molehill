@@ -2,7 +2,7 @@ pub mod parsing;
 pub mod watcher;
 
 #[cfg(any(feature = "client", feature = "notify"))]
-pub use parsing::{ClientConfig, ClientServiceConfig, HealthCheckConfig, HealthCheckType};
+pub use parsing::{ClientConfig, ClientServiceConfig};
 // Server-side names are only consumed by the server run mode
 // (ServerControlConfig/ServerTransportConfig stay internal to parsing).
 #[cfg(feature = "server")]

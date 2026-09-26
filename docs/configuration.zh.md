@@ -167,7 +167,6 @@ count = 4 # 可选。仅对本服务覆盖 `client.data.default_count`;仅在 `m
 carrier = "tcp" # 可选。仅对本服务覆盖 `client.data.default_carrier`;仅在 `mode = "multiplex"` 时有效。不设则继承默认值
 transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" = 加密,"plain" = 明文;不设 = 跟随 `client.transport.type`)与 `noise` 密钥(本服务加密时使用;不设 = 用 `client.transport.noise`)。让同一个客户端明文与加密服务并存——例如拨向不同服务端、带自己公钥的服务
 pool_size = 8 # 可选。预建立的数据通道数。默认:TCP 为 8,UDP 为 2。受服务端 `max_pool_size` 限制。对 UDP 而言,这会把不同的访客分片到不同通道;每个访客固定钉在一个通道上(会话亲和)
-health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # 可选。仅 TCP 服务。探测本地服务,在其宕机期间从服务端移除(见下方"健康检查")
 
 [client.services.service2] # 可以定义多个服务
 protocol = "udp"
@@ -404,7 +403,6 @@ local_addr = "127.0.0.1:22" # Necessary. The address of the local service
 nodelay = true # Optional. Per-service TCP_NODELAY override. Default: true
 retry_interval = 1 # Optional. Override the global `client.control.default_retry_interval` per service
 udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only)
-health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Remove the service from the server while the local service is down (see "Health check")
 remote_bind_addr = "0.0.0.0:5202"
 
 [client.services.dns] # A UDP service example
@@ -892,17 +890,20 @@ WantedBy=multi-user.target
 - 设置 `server.control.heartbeat_interval = 0` 可禁用心跳(同时也要设置
   `client.control.default_heartbeat_timeout = 0`)。
 
-### 健康检查
+### 本地服务未运行
 
-- `health_check` 可选,仅支持 TCP 服务。它让客户端每 `interval` 秒
-  (默认 10)探测 `local_addr` 一次,探测 `timeout` 秒(默认 3)。连续
-  `max_failed` 次(默认 1)失败后服务被判定为不健康:其控制通道被丢弃,
-  服务端停止提供服务,访客快速失败而不是被转发到已死的本地服务。一旦探测
-  再次成功,客户端会自动重新注册该服务。
-- 两种探测类型:`type = "tcp"`(默认)向服务打开一条 TCP 连接;
-  `type = "http"` 向 `http_path`(默认 `/`)发送 HTTP GET,接受任何
-  2xx/3xx 响应。
-- 示例:`health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }`。
+- **服务在其客户端运行期间始终处于注册状态。** 没有健康检查,也没有由健康
+  状态驱动的注销:`local_addr` 不必在客户端启动时就绪,它宕机时也不会从
+  服务端撤下任何东西。
+- 请求无法转发到 `local_addr`(连接被拒、超时……)的访客,**只有该连接**
+  得到一次失败的请求——这与任何反向代理面对死掉的后端时一样。访客侧看到的
+  是连接被关闭或重置;原因记录在客户端日志里(`service=<name>`)。其他访客
+  以及该客户端的其他服务都不受影响。
+- 对运维的含义:恢复后端不需要对 molehill 做任何操作。随时启动即可,已经
+  注册的服务会重新开始转发;后端反复重启也不会让客户端付出重新注册的代价。
+- **从 0.9.0 及更早版本升级:** `health_check` 键已被移除,请从
+  `[client.services.<name>]` 中删除。仍带该键的配置在本版本中会正常启动并
+  输出一条警告;从下一个版本起该键会成为错误。
 
 ### UDP 服务
 
@@ -917,7 +918,6 @@ WantedBy=multi-user.target
 - 映射(及其本地 socket)在 `udp_idle_timeout` 秒(默认 60)内双向无流量后
   被清理;下一个数据报会重新绑定新 socket,这改变了本地服务看到的源端口。
   保持默认值,或对长生命周期的有状态会话调大它。
-- `health_check` 不适用于 UDP 服务。
 
 ### 传输层
 
