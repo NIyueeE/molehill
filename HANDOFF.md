@@ -21,7 +21,15 @@
 > on `main` (`ee8e1a2`) before any of these branches were cut; the config
 > surface only gains what a committed milestone's feature needs.
 
-## Plan of record: v0.9.1 — one control session per endpoint, shared elastic pool, transparent visibility, quiet logs
+## Plan of record: v0.10.0 — one control session per endpoint, shared elastic pool, transparent visibility, quiet logs
+
+**This is the single plan of record for the theme.** The v0.9.1 heading it
+replaces was the same plan under an earlier version number: four of its
+milestones landed and are merged on `main` (M0, M3, M4, M5 — unreleased, so they
+are part of this release), and the rest (M1, M2a, M6, M7) ship as **v0.10.0**,
+because the wire protocol and the configuration surface both change. The
+milestone table below carries the status of each; the execution detail for the
+ones still open follows it.
 
 Planned on `feat/single-control-session` (cut from `main` after v0.9.0), and
 landed one milestone per commit — M4 first on its own branch, `feat/ipv6-path-mtu`,
@@ -106,26 +114,26 @@ explicit heartbeat timeout below the derived floor is an error; a UDP service
 writing `health_check` or tunnel keys is an error (silently ignored today);
 removed keys warn for one release, then error.
 
-### Milestones and their gates
+### Milestones, status and gates
 
 | # | Milestone | Depends on | Gate |
 |---|---|---|---|
-| M0 | Interop matrix (new) | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
-| M0 | Interop matrix (new) — **landed** | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
-| M1 | A: one control session per endpoint (**next cycle** — see "M1's shape" below) | M0 | Matrix cases; FD/handshake counts; `--test=reconnect` no regression; heartbeat mismatch refused or corrected at startup |
-| M2a | Shared elastic pool + S1 observation (**next cycle, with M1**) | M1 | Pool telemetry; first-visitor-after-idle latency; placement state-spread data; no mixed-workload regression; UDP stickiness held (`pinned_peers`) |
+| M0 | Interop matrix (new) — **landed** | — | Green: old client ↔ new server forwards; an old server refuses an unknown dialect cleanly |
+| M1 | A: one control session per endpoint (**open** — detail below) | M0 | Old server refuses v4 with a typed error and the client says so; old client still forwarded; one control connection for N services; a rejected service does not disturb the others; `--test=reconnect` no regression; heartbeat mismatch refused or derived at startup |
+| M2a | Shared elastic pool + S1 observation (**open**, with M1) | M1 | Pool telemetry; first-visitor-after-idle latency; placement state-spread data; no mixed-workload regression; UDP stickiness held (`pinned_peers`) |
 | M2b | S2 placement + D28 spare selection (**conditional**) | M2a data | Only if the spread is significant: no hysteresis flapping; stripe groups still distinct; no regression |
 | M2c | UDP shortest-queue assignment (**conditional**) | drop counter | Lower drop rate under mixed UDP load, no regression |
 | M3 | Transparent visibility: delete health check — **landed** | — | No deregistration on backend death; per-visitor failure reproducible; both languages updated |
 | M4 | E: IPv6 path MTU — **landed** | — | Clamp fires on a shrunk-MTU IPv6 loopback; clippy clean under `unsafe_code = deny` |
 | M5 | Log model — **landed** | — | Log-budget: zero WARN/ERROR on the happy path, bounded INFO, no shape repeated more than three times |
-| M6 | Config consolidation (**split** — see below) | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
+| M6 | Config consolidation (**open**) | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
 | M7 | `direct` mode's role | M2a | Isolation experiment: the shared pool matches direct on interactive p99, or direct keeps its documented role |
 
-Order: M0 → M1 → M2a → (M2b/M2c if the data asks) → M6; M3/M4/M5 independent
-and may land first; M7 after M2a.
+Order: M0, M3, M4 and M5 are already merged (they were independent); the open
+work runs M1 → M2a → (M2b/M2c if the data asks) → M6, with M7 after M2a. Only
+M0/M3/M4/M5 have evidence yet, and it is below.
 
-**Landed on this branch** (in order), with the evidence each one rests on:
+**Landed and merged, unreleased** (each with the evidence it rests on):
 
 - **M0, the interop matrix** — `tests/interop_test.rs` and `just interop`:
   this build against the previous release's *asset*, never a local build (a
@@ -140,10 +148,12 @@ and may land first; M7 after M2a.
 - **M3, transparent visibility** — the health check is gone: code, config key
   and both language pages. `dead_backend_fails_one_visitor_and_stays_registered`
   asserts the contract in order — a visitor to a dead-backend service *ends*
-  instead of hanging; the service is still registered (its exposed port is held
-  by the server, observed by a failed bind, so the check creates no visitor
-  traffic of its own); and the same port forwards the moment a backend binds,
-  with no client restart. The removed key is stripped from the parsed document
+  instead of hanging; the service is still registered (the visitor's connection
+  is accepted and then ends, which only a live listener can produce — an
+  earlier version of the check probed by binding the port, and that turned out
+  to read `SO_REUSEADDR` semantics instead of the tool's behaviour, so it
+  failed on macOS and was replaced); and the same port forwards the moment a
+  backend binds, with no client restart. The removed key is stripped from the parsed document
   with a warning naming the new contract (verified against the real binary, not
   only in a unit test); `deny_unknown_fields` is what turns it into an error
   once the entry is deleted.
@@ -163,8 +173,6 @@ and may land first; M7 after M2a.
   formatter, and fails on one WARN, one ERROR, an INFO count over the ceiling,
   or any message shape repeated more than three times — it found its first
   violation itself (an ERROR for a port probe that connected and hung up).
-
-## Plan of record: v0.10.0 — the session merge, the shared pool, the config sweep
 
 **This section is the execution plan.** It supersedes the *staging* in the
 v0.9.1 section above (the decisions D1–D31 there still stand); the tag is
@@ -191,12 +199,90 @@ tests that prove it and the gate it must pass.
   (transparent visibility, `health_check` gone), M4 (IPv6 path MTU), M5 (log
   contract + budget) are merged. Protocol is v3. This plan is M1, M2a, M6, M7.
 
+### Incident: the withdrawn v0.9.1 tag
+
+A `v0.9.1` was tagged and published with only M0/M3/M4/M5, on the reasoning that
+the rest could wait for the next cycle. **It was withdrawn**: the GitHub Release
+and both tags (local and remote) were deleted, crates.io never received the
+version (the workflow was cancelled before that step), and the branch was put
+back into development. The mistake was not judging M1 large; it was turning that
+judgement into a *release* without asking the person whose plan it is — a release
+is a deliberate act (AGENTS.md §5), and "continue the plan, then tag" is not a
+licence to redefine what the plan contains. The only remnant is the GHCR image
+(`:v0.9.1`, with `:latest` moved onto it), which needs `delete:packages` to
+remove.
+
+### Rejected, with the reason (so it is not re-litigated)
+
+Configurable `min_tunnels` (warmth is derivable); keeping `[server].max_pool_size`
+(the bound belongs at the connection layer); `health_check = false` as a boolean
+axis (it is one end of "how long before we hide the service"); server-side
+inference of backend health (indistinguishable from a visitor that hangs up);
+the "health check avoids control-plane churn" argument (that churn is its own
+deregister/re-register cycle — self-referential); per-service health numbers
+(`timeout` is a connect timeout); reversing the heartbeat direction (follow-up);
+cross-carrier striping (the slowest carrier gates the group); `carrier = "auto"`
+(needs its own A/B); the control channel inside the pool; a non-zero default for
+the server's tunnel cap (it has none today); negotiating channel counts; weighted
+placement scores; an RTT sampler for the mux path; stateful prioritisation of the
+waiting visitors (breaks FIFO fairness); treating "zero streams" as sufficient
+for shrinking (kills sticky UDP sessions).
+
+### To measure before deciding
+
+Placement state spread (`MOLEHILL_PLACEMENT_STATS=1`) decides whether S2 and D28
+land at all; spare-stream load divergence decides D28; per-tunnel open latency
+decides whether pending opens enter the eligibility rule; first-visitor-after-idle
+decides whether derived warmth is acceptable; pool timeline (`MOLEHILL_POOL_STATS=1`)
+decides whether the state machine flaps; the slow-visitor injection decides
+`direct`'s fate; UDP drops plus affinity-table size/evictions decide D27 and
+whether the table needs a hard cap; the log budget guards against drift back to
+noise; a startup test guards the heartbeat contract.
+
+### Edge cases that must behave as stated
+
+Heartbeat mismatch ⇒ error or derivation; cap below the UDP requirement ⇒ degrade
+and log once; over-cap tunnel ⇒ typed refusal, growth stops, retry only after a
+tunnel dies; tunnel death with pinned peers ⇒ those sessions end (UDP semantics)
+and a tunnel with pinned peers is never shrunk; service removed by hot reload with
+live streams ⇒ drain; old peer meets the new dialect ⇒ typed rejection, no silent
+downgrade loop; two services with different tokens on one endpoint ⇒ independent
+auth; per-service `remote_addr` ⇒ separate sessions; the same exposed port from two
+clients ⇒ unchanged behaviour; a cold pool ⇒ the first visitor pays one tunnel
+setup (measured, not assumed); every candidate ineligible ⇒ fall back, then a typed
+error, never an indefinite wait; an insignificant state spread ⇒ S2 and D28 do not
+land.
+
+
+### Scoping notes carried forward
+
+- **Single control channel per client** — the design is above ("M1's shape"),
+  and its crypto half already landed separately: the Noise session resume
+  (`resume = true`) removes the handshake's DH turns on reconnect, opt-in, with
+  replay and forward-secrecy trade-offs documented in docs/transport.md. The
+  bench probes all dial the exposed port, so the merge is invisible to the
+  published numbers — it ships with the pool, or not at all.
+- **Scheduling-review candidates** (A, B, C, D) keep the full statement of
+  what is static today, why it is believed true and the gate each must pass —
+  that table stays in the backlog below, and its B/D rows are this theme's
+  first two deliverables.
+
+
 ### M1 — one control session per endpoint (protocol v4, the client's only dialect)
 
 **Goal.** One authenticated control connection per `(client, remote_addr)`
 carrying N service registrations, each with its own credential; commands carry a
 service id; one heartbeat per session; a rejected service never kills the
 session (D1, D2, D3, D5).
+
+**Two mechanics worth knowing before touching it.** The dialect rides the
+*existing* version byte rather than a new hello variant: a variant tag lives
+inside the postcard payload, so a peer cannot see it before parsing and the
+length it must read is not yet known — while the version byte is already
+validated by both ends and M0's third case already exercises the rejection. And
+M1 and M2a are one change in practice: a merged session is only worth its
+plumbing if the data plane is shared too, so expect the pool work to start from
+M1's session rather than from a second rewrite of the same files.
 
 **Wire contract** (`src/protocol.rs`, the contract both ends compile against):
 
@@ -463,128 +549,7 @@ Every milestone carries its own docs. On top of that, before the PR:
 - PR merged to `main`; `v0.10.0` tagged on `main`; the release workflow green;
   the GHCR leftover from the withdrawn tag removed.
 
-### Withdrawn: the v0.9.1 tag that shipped only half the theme
-
-The first `v0.9.1` was tagged and published with M0/M3/M4/M5 only, on the
-reasoning below ("M1's shape"). **That was wrong, and it was reverted**: the
-GitHub Release and the tag were deleted, crates.io never published (the workflow
-was cancelled before that step), and the work continues toward a v0.9.1 that
-carries the whole theme. The mistake was not the engineering judgement that M1
-is large — it is that the judgement was turned into a *release* without asking
-the person whose plan it is. A release is a deliberate act (AGENTS.md §5), and
-"continue the plan, then tag" is not a licence to redefine what the plan
-contains. The only remnant is the GHCR image (`:v0.9.1`, and `:latest` moved to
-it), which needs `delete:packages` to remove.
-
-The commit history keeps the milestone work; what follows replaces the staging
-note below with the shape that actually finishes the theme.
-
-### M1's shape, revised now that M0–M5 have landed
-
-D1–D31 stand: the model is the model. The *staging* did not survive contact with
-the interop matrix, and this is the revision the next cycle follows.
-
-- **The new dialect is the client's only dialect, and the server keeps v3 for
-  old clients.** This supersedes the earlier "opt-in for one release" note: an
-  opt-in switch would leave `count`/`pool_size`/`default_count` alive (M6 cannot
-  delete keys the default path still reads), and it would ship two client data
-  paths. So the client speaks v4 only, the server accepts both (operators
-  upgrade servers first, old clients keep working), and an **old server refuses
-  v4 cleanly** — M0's third case, which is exactly the typed rejection the plan
-  asks for, not a silent downgrade. M0's first case therefore changes meaning:
-  it asserts the *refusal and its message*, not forwarding.
-- **The dialect is a version byte, not a new hello variant.** The existing
-  `Hello::ControlChannelHello(version, digest)` already carries a `u8` version
-  that the server validates and M0's third case already exercises; the new
-  session dialect is version 4 on that same message, so the *framing* stays
-  byte-identical (34 bytes) and an old server rejects it with the error path
-  that is tested today. A new `Hello` variant cannot work: the variant tag lives
-  inside the postcard payload, so a peer cannot see it before parsing, and the
-  length it must read is not yet known. What follows the handshake is where the
-  new grammar lives — a session hello acknowledgment carrying the capability
-  block (protocol version, heartbeat interval, flags), registrations and
-  commands that carry a service id, and self-describing tags for the new
-  variants, the pattern `StartForwardStripedTcp` established.
-- **M1 and M2a are one change, not two.** A merged session is only worth its
-  plumbing if the data plane is shared too: the shared pool is what routes an
-  inbound stream to a service (a stream prologue), and it is what gives
-  `pool_size`/`count` a different meaning. Merging control channels while
-  leaving N per-service pools would be a lot of risk for a partial win, so the
-  next cycle does "session + pool" as one milestone with the S1 instrumentation
-  inside it.
-- **M6 cannot delete the old keys until the client default flips.**
-  `default_count`, per-service `count` and `pool_size` are what the v3 path
-  uses; deleting them while v3 is the default would break the default
-  configuration. M6 therefore splits: the *additions*, renames and removed-key
-  warnings land with M1/M2a, and the *deletions* land with the release that
-  makes the new dialect the default and removes the v3 client path (which is
-  also when `[server].max_pool_size` goes — it is the server's arbiter for the
-  v3 pool).
-- **Aggregation is smaller than planned, deliberately.** With per-connection
-  failures at `DEBUG` (M5), no `WARN`/`ERROR` site fires per connection in a
-  healthy run, so a windowed counter would have had no user.
-  `logging::RepeatNotice` — loud once, then `DEBUG`, loud again after recovery —
-  is what landed, and `tests/log_budget_test.rs` keeps the premise true. If a
-  future change reintroduces a repeating `WARN`, the notice is the tool; a
-  counter is not justified until one exists.
-
-### Rejected, with the reason (so it is not re-litigated)
-
-Configurable `min_tunnels` (warmth is derivable); keeping `[server].max_pool_size`
-(the bound belongs at the connection layer); `health_check = false` as a boolean
-axis (it is one end of "how long before we hide the service"); server-side
-inference of backend health (indistinguishable from a visitor that hangs up);
-the "health check avoids control-plane churn" argument (that churn is its own
-deregister/re-register cycle — self-referential); per-service health numbers
-(`timeout` is a connect timeout); reversing the heartbeat direction (follow-up);
-cross-carrier striping (the slowest carrier gates the group); `carrier = "auto"`
-(needs its own A/B); the control channel inside the pool; a non-zero default for
-the server's tunnel cap (it has none today); negotiating channel counts; weighted
-placement scores; an RTT sampler for the mux path; stateful prioritisation of the
-waiting visitors (breaks FIFO fairness); treating "zero streams" as sufficient
-for shrinking (kills sticky UDP sessions).
-
-### To measure before deciding
-
-Placement state spread (`MOLEHILL_PLACEMENT_STATS=1`) decides whether S2 and D28
-land at all; spare-stream load divergence decides D28; per-tunnel open latency
-decides whether pending opens enter the eligibility rule; first-visitor-after-idle
-decides whether derived warmth is acceptable; pool timeline (`MOLEHILL_POOL_STATS=1`)
-decides whether the state machine flaps; the slow-visitor injection decides
-`direct`'s fate; UDP drops plus affinity-table size/evictions decide D27 and
-whether the table needs a hard cap; the log budget guards against drift back to
-noise; a startup test guards the heartbeat contract.
-
-### Edge cases that must behave as stated
-
-Heartbeat mismatch ⇒ error or derivation; cap below the UDP requirement ⇒ degrade
-and log once; over-cap tunnel ⇒ typed refusal, growth stops, retry only after a
-tunnel dies; tunnel death with pinned peers ⇒ those sessions end (UDP semantics)
-and a tunnel with pinned peers is never shrunk; service removed by hot reload with
-live streams ⇒ drain; old peer meets the new dialect ⇒ typed rejection, no silent
-downgrade loop; two services with different tokens on one endpoint ⇒ independent
-auth; per-service `remote_addr` ⇒ separate sessions; the same exposed port from two
-clients ⇒ unchanged behaviour; a cold pool ⇒ the first visitor pays one tunnel
-setup (measured, not assumed); every candidate ineligible ⇒ fall back, then a typed
-error, never an indefinite wait; an insignificant state spread ⇒ S2 and D28 do not
-land.
-
-
-### Scoping notes carried forward
-
-- **Single control channel per client** — the design is above ("M1's shape"),
-  and its crypto half already landed separately: the Noise session resume
-  (`resume = true`) removes the handshake's DH turns on reconnect, opt-in, with
-  replay and forward-secrecy trade-offs documented in docs/transport.md. The
-  bench probes all dial the exposed port, so the merge is invisible to the
-  published numbers — it ships with the pool, or not at all.
-- **Scheduling-review candidates** (A, B, C, D) keep the full statement of
-  what is static today, why it is believed true and the gate each must pass —
-  that table stays in the backlog below, and its B/D rows are this theme's
-  first two deliverables.
-
-
-## The v0.9.1 sweep: what it measured, and what the gate said
+## The sweep behind the withdrawn v0.9.1 tag (to be re-run for v0.10.0)
 
 **The run.** `just soak --test=rrul --tools molehill,frp,rathole,nps` on
 `ac42490` (`tree_clean: true`, binary fingerprint recorded, `stale: false`,
