@@ -83,8 +83,12 @@ entries are PEP 723 python scripts run via `uv run`; a run refuses to start
 while another one holds the lock, and a killed run (Ctrl-C or SIGTERM) still
 writes the tests it completed.
 
-1. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
-2. `just soak --test=rrul --out benches/scripts/soak/results-soak-vX.Y.Z.json`
+1. `just interop` — the interop matrix ([checks.md](checks.md#outside-the-chain-the-interop-matrix-just-interop)):
+   this build against the previous release's binary. A wire-format change first
+   meets a real old peer here, and nowhere else, so run it **before** the sweep
+   — it is seconds, and a rejection means the release is not ready.
+2. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
+3. `just soak --test=rrul --out benches/scripts/soak/results-soak-vX.Y.Z.json`
    — run the sweep (one tool or a batch of them, per its own shaped path in
    one HTB class each, so concurrent tools never share a shaper; the batch
    size comes from the host's CPU budget). **`--test=rrul` is required**: the
@@ -103,7 +107,7 @@ writes the tests it completed.
    the commit, and `tree_clean` excludes the results file the run is writing
    (producing an artifact must not be what marks it dirty), so an uncommitted
    *source* change is the only thing that makes it false.
-3. `just soak-plot` — renders the chart set and prints the markdown tables:
+4. `just soak-plot` — renders the chart set and prints the markdown tables:
    `assets/soak-vX.Y.Z.png` (the master: per tool, the interactive stream over
    the stage schedule with its per-stage p50/p99 and the bulk throughput,
    wedges marked), `-stages.png` (small multiples, one panel per stage),
@@ -112,7 +116,7 @@ writes the tests it completed.
    (the fitted slopes) and `-cost.png` (only for a `cost` run). Update the
    README Benchmarks section with them and their numbers, then delete the
    previous tag's charts from `assets/`.
-4. `just soak-check` — the gate, in two steps. First the run is checked
+5. `just soak-check` — the gate, in two steps. First the run is checked
    against itself: every coverage axis a test claims must have carried
    samples, every throughput sample must have dialed the tool's exposed port
    rather than its backend, and the released tool must meet the absolute SLO

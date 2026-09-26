@@ -80,6 +80,22 @@ bench-deps:
 soak-peers:
     uv run benches/scripts/soak/fetch_peers.py
 
+# Interop matrix: this build against the previous release's binary, both
+# directions (needs network on the first run; the fetched binary is cached
+# under ~/tmp/interop). Override the peer with MOLEHILL_OLD_TAG=vX.Y.Z.
+# See docs/checks.md, "Outside the chain".
+interop:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+    export MOLEHILL_OLD_BIN="$(
+        uv run benches/scripts/interop/fetch_old.py | sed -n 's/^MOLEHILL_OLD_BIN=//p'
+    )"
+    test -x "$MOLEHILL_OLD_BIN" || { echo "fetch did not yield a binary" >&2; exit 1; }
+    # The cases are #[ignore]d so a plain `cargo test` reports them as not run
+    # (libtest captures a passing test's output); this is the run that does them.
+    cargo test --test interop_test -- --test-threads=1 --include-ignored
+
 # Run the soak benchmark: a tool (or a batch of them) through the scripted
 # workload under the stage schedule. Test types: capacity / rrul / soak /
 # cost / screen — see docs/release.md, "Benchmarks".
