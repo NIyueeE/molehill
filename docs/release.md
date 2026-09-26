@@ -88,10 +88,14 @@ writes the tests it completed.
    meets a real old peer here, and nowhere else, so run it **before** the sweep
    — it is seconds, and a rejection means the release is not ready.
 2. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
-3. `just soak --test=rrul --out benches/scripts/soak/results-soak-vX.Y.Z.json`
+3. `just soak --test=rrul --tools molehill,frp,rathole,nps
+   --out benches/scripts/soak/results-soak-vX.Y.Z.json`
    — run the sweep (one tool or a batch of them, per its own shaped path in
    one HTB class each, so concurrent tools never share a shaper; the batch
-   size comes from the host's CPU budget). **`--test=rrul` is required**: the
+   size comes from the host's CPU budget). **`--tools` is required**: its
+   default is `molehill` alone, which produces a file that looks exactly like
+   a release artifact but has an empty peer comparison in it — every tool the
+   README's table names has to be in the run. **`--test=rrul` is required**: the
    default test type is `capacity`, which produces a ceiling probe rather than
    the staged release sweep, and the file it writes looks like a release
    artifact. The release artifact path is passed
