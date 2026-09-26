@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The log has a level contract, and a healthy run is quiet.** `ERROR` now
+  means a human has to act, `WARN` something the tool handled and is worth one
+  line, `INFO` lifecycle, and `DEBUG` one connection's business — so a visitor
+  whose local service refused the connection is a `DEBUG` line, not the `WARN`
+  it used to be, and a client retrying (started before its server, wrong token)
+  is reported once and then at `DEBUG`. Sixteen `Failed to run the data
+  channel: early eof` lines from a shutdown that went perfectly are gone; a
+  client that starts before its server no longer prints a page of connection
+  refusals. `tests/log_budget_test.rs` drives the real binary and fails if a
+  healthy run emits a single `WARN` or `ERROR`, or repeats one message shape
+  more than three times — the guarantee is measured, not intended. Details and
+  the per-level table: `docs/configuration.md`, "What each level means".
+
 ### Removed
 
 - **`health_check` (the per-service health probe) is gone, and a service is no

@@ -9,6 +9,7 @@ use crate::config::{
 };
 #[cfg(feature = "multiplex")]
 use crate::config::{DataCarrier, DataMode};
+use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, MAX_UDP_HEADER_LEN,
@@ -470,7 +471,9 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Clie
     })
     .retry(backoff)
     .notify(|e: &anyhow::Error, duration| {
-        warn!("{:#}. Retry in {:?}", e, duration);
+        // Per data channel: a visitor arrived while the server was briefly
+        // unreachable. The control channel reports the outage that matters.
+        debug!("{:#}. Retry in {:?}", e, duration);
     })
     .await?;
 
@@ -1010,7 +1013,7 @@ impl UdpHub {
         let socket = match udp_connect(&me.params.local_addr, me.params.udp_forwarder_ipv6).await {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to connect to the local UDP service: {e:#}");
+                debug!("Failed to connect to the local UDP service: {e:#}");
                 return;
             }
         };
@@ -1280,7 +1283,11 @@ fn spawn_data_channel(
                 run_data_channel(args).await
             };
             if let Err(e) = res.with_context(|| "Failed to run the data channel") {
-                warn!("{:#}", e);
+                // One visitor connection's life, and its end: the log line for
+                // a dead local service is this one, so the level has to be the
+                // per-connection one. A *failed request* is visible to the
+                // visitor; the operator needs the cause only when debugging.
+                debug!("{:#}", e);
             }
         }
         .instrument(Span::current()),
@@ -1517,6 +1524,10 @@ impl ControlChannelHandle {
             async move {
                 let mut start = Instant::now();
                 let mut retry_backoff = backoff_builder.build();
+                // A client that starts before its server retries every second.
+                // The first line tells the operator what is happening; the
+                // hundredth only fills the log, so it is a `debug`.
+                let retry_notice = RepeatNotice::new();
 
                 loop {
                     match s
@@ -1550,10 +1561,15 @@ impl ControlChannelHandle {
                             if start.elapsed() > Duration::from_secs(3) {
                                 // The client runs for at least 3 secs and then disconnects
                                 retry_backoff = backoff_builder.build();
+                                // It was up, so the next failure is news again.
+                                retry_notice.clear();
                             }
 
                             if let Some(duration) = retry_backoff.next() {
-                                error!("{:#}. Retry in {:?}...", err, duration);
+                                retry_notice.report(
+                                    || info!("{:#}. Retry in {:?}...", err, duration),
+                                    || debug!("{:#}. Retry in {:?}...", err, duration),
+                                );
                                 time::sleep(duration).await;
                             } else {
                                 // Should never be reached with the current backoff policy,

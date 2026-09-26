@@ -333,6 +333,23 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 Log lines carry colored levels (red ERROR, yellow WARN, green INFO, cyan DEBUG, purple TRACE) and the active span context, e.g. `handle{service=ssh}:`, so every line of a busy server tells you which service produced it. Colors are enabled only on terminals; redirected output stays plain (also honoring `NO_COLOR`). At `debug`/`trace` level the source module is appended to each line.
 
+### What each level means
+
+The level says who has to act, not how alarming the event sounds:
+
+| Level | Means | Examples |
+|-------|-------|----------|
+| `ERROR` | a human has to do something; the tool cannot fix it | a registration the server rejected, a listener that cannot accept, the backoff giving up |
+| `WARN` | the software handled it, and it is worth one line | a config key that was removed and is ignored, a token the server rejected |
+| `INFO` | lifecycle: something started, stopped or changed state | a service registered, a control channel established, a shutdown |
+| `DEBUG` | one connection's or one session's business | a visitor whose local service refused the connection, a data channel that ended, a retry after the first |
+
+Consequences worth stating, because they are what keeps a busy log readable:
+
+- **A failed request is not a WARN.** A visitor whose `local_addr` refuses the connection is one closed connection; that line is `DEBUG`, and `docs/configuration.md#a-local-service-that-is-down` describes what the visitor sees.
+- **A repeating condition is reported once.** A client that starts before its server, or retries with the wrong token, produces one `INFO`/`WARN` and then `DEBUG` until it recovers; a healthy run emits no `WARN` or `ERROR` at all. `tests/log_budget_test.rs` measures exactly that against the real binary, so the guarantee is enforced rather than intended.
+- **`RUST_LOG=debug` is the troubleshooting level** and is expected to be voluminous: it is where per-connection detail lives.
+
 ## Tuning
 
 The step-by-step way to pick `mode`/`count`/`carrier`/transport for your
