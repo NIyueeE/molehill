@@ -164,23 +164,36 @@ and may land first; M7 after M2a.
   or any message shape repeated more than three times — it found its first
   violation itself (an ERROR for a port probe that connected and hung up).
 
+### Withdrawn: the v0.9.1 tag that shipped only half the theme
+
+The first `v0.9.1` was tagged and published with M0/M3/M4/M5 only, on the
+reasoning below ("M1's shape"). **That was wrong, and it was reverted**: the
+GitHub Release and the tag were deleted, crates.io never published (the workflow
+was cancelled before that step), and the work continues toward a v0.9.1 that
+carries the whole theme. The mistake was not the engineering judgement that M1
+is large — it is that the judgement was turned into a *release* without asking
+the person whose plan it is. A release is a deliberate act (AGENTS.md §5), and
+"continue the plan, then tag" is not a licence to redefine what the plan
+contains. The only remnant is the GHCR image (`:v0.9.1`, and `:latest` moved to
+it), which needs `delete:packages` to remove.
+
+The commit history keeps the milestone work; what follows replaces the staging
+note below with the shape that actually finishes the theme.
+
 ### M1's shape, revised now that M0–M5 have landed
 
 D1–D31 stand: the model is the model. The *staging* did not survive contact with
 the interop matrix, and this is the revision the next cycle follows.
 
-- **The new dialect is opt-in for one release, not the default.** M0 exists to
-  make a wire change safe, and its value collapses the moment the client
-  switches dialect silently: a new client against a v0.9.0 server would stop
-  working with nothing to catch it but a user's bug report. The shape that keeps
-  both directions testable: the **server accepts both** dialects (v3, today's
-  one-session-per-service grammar, unchanged) so operators upgrade servers
-  first; the **client picks** the new one only when the config asks for it (the
-  `shared_pool` switch already in the config shape), and otherwise speaks v3;
-  an **old server refuses the new dialect cleanly** — that is M0's third case —
-  and the new client reports it as a protocol mismatch instead of retrying.
-  This is also what §8 of the plan said ("opt-in for one release"); it is the
-  difference between a rollout and a flag day.
+- **The new dialect is the client's only dialect, and the server keeps v3 for
+  old clients.** This supersedes the earlier "opt-in for one release" note: an
+  opt-in switch would leave `count`/`pool_size`/`default_count` alive (M6 cannot
+  delete keys the default path still reads), and it would ship two client data
+  paths. So the client speaks v4 only, the server accepts both (operators
+  upgrade servers first, old clients keep working), and an **old server refuses
+  v4 cleanly** — M0's third case, which is exactly the typed rejection the plan
+  asks for, not a silent downgrade. M0's first case therefore changes meaning:
+  it asserts the *refusal and its message*, not forwarding.
 - **The dialect is a version byte, not a new hello variant.** The existing
   `Hello::ControlChannelHello(version, digest)` already carries a `u8` version
   that the server validates and M0's third case already exercises; the new

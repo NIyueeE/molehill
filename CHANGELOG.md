@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
-
-## [0.9.1] - 2026-09-26
-
 ### Changed
 
 - **The log has a level contract, and a healthy run is quiet.** `ERROR` now
