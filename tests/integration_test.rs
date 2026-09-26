@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpStream, UdpSocket},
     sync::broadcast,
     time,
 };
@@ -1157,15 +1157,15 @@ async fn dead_backend_fails_one_visitor_and_stays_registered() -> Result<()> {
             .unwrap();
     });
 
-    // The dead service is registered as soon as the server holds its exposed
-    // port (a port this process can no longer bind). This is the registration
-    // proof, and it creates no visitor traffic to explain away.
-    wait_for_port_bound(DEAD_EXPOSED).await?;
-    // The healthy neighbour doubles as the control: the client itself is fine.
+    // The healthy neighbour doubles as the control: the client itself is fine,
+    // and its exposed port appears only once its registration landed.
     wait_for_echo(DEAD_NEIGHBOUR_EXPOSED, Type::Tcp).await?;
 
-    // 1. One visitor, one failure — and it must not hang.
-    visitor_gets_a_failed_request(DEAD_EXPOSED).await?;
+    // 1. One visitor, one failure — and it must not hang. The registration is
+    //    what makes the connection possible at all, so this is also the proof
+    //    that the dead service is still registered (see
+    //    `wait_for_failed_request`).
+    wait_for_failed_request(DEAD_EXPOSED).await?;
 
     // 2. The backend appears. Nothing is restarted: the registration was never
     //    withdrawn, so the same exposed port starts forwarding.
@@ -1183,6 +1183,35 @@ async fn dead_backend_fails_one_visitor_and_stays_registered() -> Result<()> {
     let _ = tokio::join!(client, server);
 
     Ok(())
+}
+
+/// Wait until a visitor to `addr` gets a *failure* rather than a hang.
+///
+/// Two "not yet" states are indistinguishable from the intended one on the
+/// first attempt: the exposed port refuses connections until the client's
+/// registration lands, and the first accepted visitor may arrive before the
+/// server's pool is ready. So the check is retried, and what it waits for is
+/// the assertion itself: a connection that the server *accepted* (nothing else
+/// can produce a post-connect outcome) and that then ends instead of waiting
+/// for a backend nobody is listening on.
+///
+/// Deliberately not a bind probe: asking the OS "is this port held?" reads the
+/// platform's `SO_REUSEADDR` semantics, not the tool's behaviour — a wildcard
+/// listener refuses a specific-address bind on Linux and accepts it on macOS,
+/// which is exactly how this test failed its first CI run.
+async fn wait_for_failed_request(addr: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match visitor_gets_a_failed_request(addr).await {
+            std::result::Result::Ok(()) => return Ok(()),
+            std::result::Result::Err(e) => {
+                if std::time::Instant::now() > deadline {
+                    anyhow::bail!("a visitor to {addr} never failed within 15 s (last: {e})");
+                }
+            }
+        }
+        time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Connect to `addr` and require the connection to *end*: EOF or a reset.
@@ -1248,28 +1277,6 @@ async fn finished_control_channel_releases_its_ports() -> Result<()> {
     let _ = tokio::join!(server);
 
     Ok(())
-}
-
-/// Wait until `addr` is *held* by someone else, i.e. binding it fails.
-///
-/// The inverse of `wait_for_port_release`, and the way to observe a listener
-/// without making a visitor: a bind that succeeds means nothing is listening
-/// yet, and the listener is dropped immediately so the observation cannot
-/// itself hold the port.
-async fn wait_for_port_bound(addr: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match TcpListener::bind(addr).await {
-            std::result::Result::Err(_) => return Ok(()),
-            std::result::Result::Ok(listener) => {
-                drop(listener);
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("nothing bound {addr} within 15 s");
-                }
-                time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    }
 }
 
 /// Wait until `addr` can be bound again, failing the test after a generous

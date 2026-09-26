@@ -15,6 +15,13 @@
 //! process boundary means one scenario's events cannot leak into another's
 //! count.
 //!
+//! **Unix only**: the measurement ends with a *graceful* shutdown, which is a
+//! signal (`SIGINT`, the one the binary turns into a clean exit). Windows has
+//! no portable way to deliver `CTRL_C_EVENT` to a child process, and killing it
+//! instead would truncate the log mid-line and lose the teardown path — where
+//! most of the noise this test exists for used to be.
+#![cfg(unix)]
+
 //! The budget:
 //!
 //! * **zero WARN and zero ERROR on a run where nothing failed** — the strict
