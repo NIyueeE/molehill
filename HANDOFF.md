@@ -164,6 +164,305 @@ and may land first; M7 after M2a.
   or any message shape repeated more than three times — it found its first
   violation itself (an ERROR for a port probe that connected and hung up).
 
+## Plan of record: v0.10.0 — the session merge, the shared pool, the config sweep
+
+**This section is the execution plan.** It supersedes the *staging* in the
+v0.9.1 section above (the decisions D1–D31 there still stand); the tag is
+**v0.10.0**, because the wire protocol and the configuration surface both
+change. Written for whoever executes it next, including a fresh session: every
+milestone below names the files it touches, the contract it must hold, the
+tests that prove it and the gate it must pass.
+
+### Context an executor needs
+
+- **Branch and flow.** Work happens on `feat/session-and-pool` (cut from
+  `main` at `ab0bf11`). Never implement on `main`. A milestone is a commit (or a
+  few commits split by logical change) with its docs in the same commit. When
+  the whole plan is done: sweep → PR → CI green → merge → `just tag` on `main`
+  → push the tag (that is the release act).
+- **Gates.** `just check` (fmt/secrets/machete/docs/ruff×2/clippy×2 +
+  audit/deny/outdated/test) is the per-commit rehearsal; `just interop` is the
+  previous-release matrix (`#[ignore]`d, needs `MOLEHILL_OLD_BIN`); `just
+  soak-check` is the benchmark gate. Waivers: AGENTS.md §2.
+- **Measurement discipline.** AGENTS.md §10. A number describes a revision and
+  a binary fingerprint; the sweep runs on a *quiet* machine (no builds) and its
+  `meta` must show `tree_clean: true`, `stale: false`.
+- **State at the time of writing.** `main` = `ab0bf11`: M0 (interop matrix), M3
+  (transparent visibility, `health_check` gone), M4 (IPv6 path MTU), M5 (log
+  contract + budget) are merged. Protocol is v3. This plan is M1, M2a, M6, M7.
+
+### M1 — one control session per endpoint (protocol v4, the client's only dialect)
+
+**Goal.** One authenticated control connection per `(client, remote_addr)`
+carrying N service registrations, each with its own credential; commands carry a
+service id; one heartbeat per session; a rejected service never kills the
+session (D1, D2, D3, D5).
+
+**Wire contract** (`src/protocol.rs`, the contract both ends compile against):
+
+| Direction | Message | Notes |
+|---|---|---|
+| C→S | `Hello::ControlChannelHello(4, session_tag)` | `session_tag` is 32 random bytes; the session's identity is no longer a service digest |
+| S→C | `Hello::ControlChannelHello(4, nonce)` | same shape as v3, version 4 |
+| C→S | `Auth(digest(default_token ‖ nonce))` | session credential = the endpoint's default token |
+| S→C | `Ack::SessionOk { heartbeat_interval_secs }` (new variant) | the server **declares** its cadence (D11); `AuthFailed` stays as is |
+| C→S | `SessionCmd::Register(SessionRegistration)` | `SessionRegistration { service_id: u32, auth: Digest, reg: ServiceRegistrationV4 }`; `auth = digest(service_token ‖ nonce)` — per-service credential (D2) |
+| S→C | `Ack::Ok` / `Ack::RegisterRejected(reason)` | per registration, u16-length-prefixed like today's registration result |
+| C→S | `SessionCmd::Deregister(u32)` | hot-reload removal: the server drops the listener and drains |
+| S→C | `ControlChannelCmd::CreateDataChannelFor(u32)` (new variant) | one visitor arrived for that service |
+| S→C | `ControlChannelCmd::HeartBeat` (existing variant) | session-level cadence |
+| S→C | `ControlChannelCmd::ServiceDropped(u32)` (new variant) | the server lost the listener; the client re-registers it |
+| data channels | framing unchanged, hello version 4 | the service is implicit: the client dials the one it was asked for |
+
+- `ServiceRegistrationV4` = today's `ServiceRegistration` **minus `pool_size`**
+  (the pool is per carrier now, D4/D13); `udp_buffer_size` stays.
+- The v3 structs stay byte-identical for old clients: do not add fields to
+  `ServiceRegistration`, do not renumber variants.
+- `CURRENT_PROTO_VERSION = 4`; `read_hello` accepts **3 and 4** and returns
+  which one it read, so the server can branch. A v3 session keeps today's
+  behaviour exactly (one service per connection).
+- **Rejection semantics.** A v0.9.0 server reads version 4, fails its version
+  check and closes without a reply (this is M0's third case, already tested). The
+  new client must turn "the connection closed before the server's hello" into a
+  typed error naming the likely cause (server too old), and must **not** retry
+  in a loop or fall back to v3.
+- `PACKET_LEN` (protocol.rs) computes fixed frame lengths; every new variant has
+  to be added there or the reader will read the wrong length.
+
+**Server** (`src/core/server.rs`):
+
+- Replace `ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>`
+  with a **session registry**: `HashMap<SessionId, SessionHandle>` where
+  `SessionHandle` holds one entry per `service_id`: the bound endpoint, the
+  visitor queue, the data-channel handle and the KCP/UDP plumbing. A session is
+  identified by the connection (its `nonce` is the data-plane credential, as
+  today).
+- `do_control_channel_handshake` becomes: read hello → branch on the version →
+  v4 path: session auth → `Ack::SessionOk{interval}` → loop over `SessionCmd`
+  while also servicing that session's data-channel requests, the heartbeat timer
+  and shutdown. The registration path reuses the existing validation
+  (`allow_ports`, carrier availability via `ensure_kcp_listener`, bind via
+  `bind_with_retry`, `describe_bind_error`) per service.
+- Per-service teardown on `Deregister` and on session teardown: drop the
+  listener, let live streams drain, release the port (there is an existing
+  teardown test, `finished_control_channel_releases_its_ports`).
+- Re-registration of the same `service_id` on the same session replaces the old
+  endpoint and logs `Dropping previous control channel` at INFO (it is lifecycle,
+  M5).
+- `max_tunnels_per_client` (added in M6) is enforced here: over the cap, reply
+  with a typed `Ack::RegisterRejected` and stop growing (D14); the client retries
+  only when a tunnel dies and demand remains.
+
+**Client** (`src/core/client.rs`):
+
+- `ClientSession` replaces `ControlChannelHandle::new`'s per-service shape: one
+  task per `remote_addr`, holding every service that dials that endpoint (a
+  service with its own `remote_addr` gets its own session — D1's key).
+- Per service, inside the session: registration (own token), a state machine
+  (`Registering → Active → Rejected`), and the existing `spawn_data_channel`
+  path driven by `CreateDataChannelFor(service_id)`; a `Rejected` service stops
+  and reports, the others continue (D2).
+- One heartbeat timer per session, derived from `Ack::SessionOk`'s declared
+  interval: `timeout = 2 × interval + 5 s`, floor 10 s; an explicit
+  `[client.control].default_heartbeat_timeout` below the floor is a startup
+  error; `interval = 0` means no timeout (D11).
+- Endpoint-level backoff and reconnect; per-session `RepeatNotice` for the retry
+  line (M5 established the pattern: INFO once, DEBUG after).
+- Hot reload: added services `Register`, removed ones `Deregister`; the config
+  watcher's event plumbing (`ClientServiceChange`) is the place to hook.
+
+**Tests and gate for M1**
+
+- `tests/interop_test.rs`: case 1 becomes "an old server refuses the v4 client
+  cleanly, and the client says so" (assert the refusal *and* that the client's
+  error names a protocol mismatch, not a generic failure); cases 2 and 3 stay.
+- New fixture + integration test: two services on one client produce **one**
+  control connection (assert by counting the server's accepted control
+  connections, or by the server's log lines) while both forward traffic.
+- A per-service rejection test: one service with a port outside `allow_ports`,
+  the other valid → the valid one forwards, the session stays up.
+- Heartbeat contract test: a client configured below the derived floor fails at
+  startup with a precise message.
+- Everything existing stays green, in particular `multiplex_tunnel_pool`,
+  `per_service_data_modes`, `per_service_transport`, `separate_data_plane`,
+  `services_on_different_servers`, `teardown_release`, `udp_session_affinity`,
+  `kcp_tunnel`, `kcp_same_port`, `mixed_transports`.
+- Docs in the same commit: `docs/internals.md` (the session model, the wire
+  table above, the rejection semantics), `docs/configuration.md` (+zh) for
+  anything user-visible, `CHANGELOG.md` (`BREAKING CHANGE:` — a v0.9.0 server
+  cannot serve a v0.10.0 client).
+
+### M2a — one shared elastic pool per carrier, plus the S1 observation
+
+**Goal.** One pool per `(session, carrier)` shared by every service of that
+session; the client decides growth locally (D5); the server routes an inbound
+stream to a service by a prologue on the stream; shrink is conservative (D26,
+D30).
+
+**Data plane**
+
+- `src/transport/multiplex.rs`: `TunnelPool` becomes per `(session, carrier)`
+  rather than per service; `ClientTunnel` gains the service-aware prologue.
+  Every stream starts with a `DataChannelCmd`-style tag: the service id plus
+  `StartForwardTcp` / `StartForwardUdp` / `StartForwardStripedTcp`, so the
+  server's `run_server_tunnel` (currently forwarding every inbound stream into
+  **one** service's `tx`) can dispatch per stream.
+- The stream's own identity must be readable by the placement code (D28 needs
+  "which tunnel is this stream on"): tag each stream with its tunnel id when it
+  is handed to a service queue.
+- Stripe groups: `open_streams(n)` must place the n streams on n **distinct**
+  tunnels (D24), all-or-nothing per group (D29).
+- UDP channels are never recycled (D8): a channel with pinned peers is not idle.
+
+**Growth/shrink state machine (client, internal constants until measured, D15)**
+
+- Grow: `Cold` + any active service has traffic → +1; or every tunnel ≥ 80 % of
+  its stream cap, or any open has been waiting > 1 RTT → +1 (≤ 1 per RTT, and
+  < `max_tunnels`); or the UDP-derived floor > current size → grow to the floor.
+- Shrink: whole pool has 0 streams **and `pinned_peers == 0`** (D30) and has been
+  idle ≥ `idle_timeout` and size > UDP floor → −1, then re-evaluate.
+- Hysteresis: `MIN_WARM_HOLD` after growth, `SHRINK_COOLDOWN` after a shrink.
+- UDP-derived floor (D7): `max over active UDP services of
+  ceil(udp_workers / streams-per-tunnel)`, maintained across tunnel death.
+
+**S1 instrumentation (observe before choosing a policy, D22 — falsifiable)**
+
+- `MOLEHILL_PLACEMENT_STATS=1`: per placement — chosen tunnel's stream count /
+  send credit / pending opens, candidate count, best-candidate values, whether a
+  `Closed` fallback was used, open latency.
+- `MOLEHILL_POOL_STATS=1`: the pool's timeline — size, per-tunnel streams,
+  pinned peers, and the reason for each grow/shrink.
+- Both go into the results `meta.instrumentation` when the bench runs with them.
+- **Pre-registered kill criterion**: run the mixed workload (interactive + 20
+  bulk + churn + UDP) on `clean`, `loss1`, `rtt100`. If the spread between
+  candidates is inside the run-to-run noise, **S2 and D28 do not land** and the
+  numbers go into HANDOFF. Decide with data, not with intent.
+
+**Server side**
+
+- `run_udp_connection_pool` / `route_udp_datagram`: keep affinity, add
+  `pinned_peers` per tunnel (a peer pinned to a channel keeps that channel alive,
+  D30); the affinity table's entry count and eviction count go to telemetry; a
+  **new source never creates a channel** (D31 — the worker set comes from
+  `udp_workers`).
+- Waiting visitors stay FIFO (D28); **spare** streams are picked from the
+  least-loaded tunnel; stripe groups are atomic (D29).
+- D27 (new UDP peer → shortest worker queue) only if the drop counters say the
+  current round-robin loses datagrams.
+
+**Gate for M2a**: pool telemetry present; first-visitor-after-idle latency
+measured (`--test=reconnect` shape); placement state-spread data recorded;
+mixed-workload throughput and interactive p99 do not regress; UDP source port
+unchanged across a grow/shrink cycle (integration test); a tunnel with pinned
+peers is never shrunk (integration test); stripe group on K distinct tunnels
+(integration test).
+
+### M6 — the configuration surface (only possible once the v3 client path is gone)
+
+**Remove**: `[client.data].default_count`, per-service `count`, per-service
+`pool_size`, `[server].max_pool_size`, per-service `heartbeat_timeout`
+(`health_check` went in M3).
+**Add/rename**: `[client.data].idle_timeout` (60), `[client.data.tcp|kcp]
+.max_tunnels` (4), per-service `udp_workers` (2, was the UDP `pool_size`),
+`[server.data].max_tunnels_per_client` (0 = unlimited).
+**Validation**: `max_tunnels >= 1`; `udp_workers` only meaningful for UDP
+services in multiplex mode; `carrier` must name a configured pool; an explicit
+heartbeat timeout below the derived floor is an error; a UDP service writing a
+TCP-only key is an error.
+**Migration**: the removed-key mechanism from M3 (`REMOVED_KEYS` +
+`strip_removed_keys` in `src/config/parsing.rs`) is the pattern — warn for one
+release, then delete the entry and let `deny_unknown_fields` reject it. The
+message must name the replacement, and both language pages carry the same table.
+**Tests**: every fixture in `tests/for_tcp/` and `tests/for_udp/` updated; new
+invalid-config fixtures (`tests/config_test/invalid_config/`, first line
+`# expect:`); `test_documented_defaults_are_pinned` and the doc-example test
+updated; a test that each removed key warns once and still starts.
+**Wire**: v3 registration fields stay (old clients), v4 drops `pool_size`.
+
+### M7 — what `direct` is for
+
+**Experiment**: inject a slow visitor (one connection that reads slowly) next to
+an interactive visitor, on the shared pool and on `direct`, same machine, same
+run if possible (`--ab`). Measure the interactive p99.
+**Gate**: if the shared pool does not lose to `direct`, `direct` keeps only its
+documented isolation/measurement-arm role; if it loses, the docs say exactly
+what it costs and when to choose it. Bench support: add the `direct` variant
+mapping (`mux-off`) and FD counts to the runner.
+
+### Documentation alignment (a merge precondition, not an afterthought)
+
+Every milestone carries its own docs. On top of that, before the PR:
+
+- `docs/configuration.md` (+`docs/configuration.zh.md`): the new keys, the
+  removal table, the heartbeat derivation, and *no* stale `count`/`pool_size`/
+  `health_check` mentions; heading parity between the two files (check-docs
+  enforces the count).
+- `docs/internals.md`: the v4 handshake table, the session model, the stream
+  prologue, the scheduling rules (eligibility + rotation + hysteresis, why FIFO
+  for waiting visitors and least-loaded for spares), the UDP invariants
+  (`pinned_peers`, new sources never create channels).
+- `docs/benchmarks.md` (+zh): the new instrumentation switches, what changed in
+  the method, what is no longer comparable.
+- `README.md` (+zh): the benchmark numbers/charts and any feature claim that
+  mentions the protocol or the configuration.
+- `docs/structure.md`: new files and their roles; `docs/checks.md` if a
+  recipe/gate is added; `docs/release.md` if the ritual changes.
+- `AGENTS.md`: only if a rule or the gate chain changes (the §12 protocol fact
+  says v3 — it must become v4).
+- `CHANGELOG.md`: user-visible entries as they land, with `BREAKING CHANGE:`
+  where a v0.9.0 peer can no longer interoperate.
+- `HANDOFF.md`: the measurement records (S1 spread, M7 experiment, log the
+  hypothesis and the outcome even when the answer is "do not land it").
+
+### Release (v0.10.0)
+
+1. Freeze: `chore(release): prepare v0.10.0` — `version = "0.10.0"` in
+   `Cargo.toml`, the `[Unreleased]` content moved under `## [0.10.0] - <date>`.
+2. Delete the withdrawn version's artifacts (`results-soak-v0.9.1.json`,
+   `assets/soak-v0.9.1*.png`) as part of the release commit.
+3. Fresh sweep on the frozen commit, quiet machine, `cargo build --release`
+   first: `just soak --test=rrul --tools molehill,frp,rathole,nps
+   --out benches/scripts/soak/results-soak-v0.10.0.json` (~80 min).
+4. `just soak-plot` → `assets/soak-v0.10.0*.png`; update the README (+zh) numbers
+   and prose; `just soak-check` (self-check + comparability rule).
+5. `just check`, `just interop`, then push the branch and open the PR; the PR
+   description states what changed, what the gates said and what is deliberately
+   not done.
+6. CI green → merge (merge commit) → on `main`: `just tag` → `git push origin
+   v0.10.0` → the release workflow publishes (GitHub Release, GHCR, crates.io).
+7. Leftover to clean by hand (needs `delete:packages`, the workflow token cannot):
+   the withdrawn release's GHCR images `ghcr.io/niyuee/molehill:v0.9.1` and the
+   `:latest` that moved to it.
+
+### Risks and unknowns
+
+- **Blast radius.** After M1 one connection carries every service of an
+  endpoint: a session-level bug takes all of them down. The mitigations are the
+  per-service state machine, the per-service rejection test and the heartbeat
+  contract test.
+- **M1 is a rewrite of the two largest files** (`client.rs` ~1900 lines,
+  `server.rs` ~2000). Split it: protocol first (a commit that changes nothing
+  behaviourally), then the server, then the client; keep the tree compiling at
+  every step, with v3 still working until the client flips.
+- **M2a's prologue** adds one write per stream: measure the open latency
+  (`--test=cost`) before and after.
+- **Elastic pool × UDP stickiness** is the most delicate interaction: the
+  `pinned_peers` shrink gate and the source-port test are what hold it.
+- **The v3 path is now dead weight** kept only for old clients: it must not
+  acquire new features, and its removal is a future cycle's work.
+- **The bench host changes between sessions** (the container is recreated, so
+  `meta.hostname` changes and the gate correctly refuses to compare across
+  runs). A stable host identity is a calibration measurement, not a name; until
+  then, expect `soak-check` to gate on the absolute SLO for a cross-host pair.
+
+### Definition of done
+
+- M1, M2a, M6, M7 landed on the branch, each with its gate and its docs.
+- `just check`, `just interop`, `just soak-check` green on the final commit.
+- README (+zh) numbers from the v0.10.0 sweep; no stale v0.9.x claims anywhere.
+- PR merged to `main`; `v0.10.0` tagged on `main`; the release workflow green;
+  the GHCR leftover from the withdrawn tag removed.
+
 ### Withdrawn: the v0.9.1 tag that shipped only half the theme
 
 The first `v0.9.1` was tagged and published with M0/M3/M4/M5 only, on the
