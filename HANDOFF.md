@@ -284,8 +284,17 @@ The pre-merge history cleanup renumbered that commit (it is `0072098` now:
 tree is content-addressed: `0072098^{tree}` is
 `6a46fa14b083f7d3fe9e3ad4c3c7fa77f9569dd0`, byte-identical to
 `ac42490^{tree}` — the cleanup moved one hunk between two commits *before* it
-and changed no tree at or after it (verified: the branch's final tree is
-unchanged too). Anyone checking the sweep out checks out that tree. The results file and the chart set are the release artifacts:
+and changed no tree at or after it. Anyone checking the sweep out checks out
+that tree.
+
+**And the source has not moved since**: `git diff 0072098..HEAD -- src/
+build.rs` is empty, so the released binary is built from exactly the measured
+source. What changed between the two is the version bump, this record, the
+results file and its charts, the gate fixes, the README numbers and `tests/` —
+the last of which is where CI found a platform-dependent assertion of mine and
+it was fixed (the test asked the OS whether a port was bound instead of asking
+the tool whether a visitor fails; macOS answers the first question
+differently). The results file and the chart set are the release artifacts:
 `benches/scripts/soak/results-soak-v0.9.1.json`, `assets/soak-v0.9.1*.png`.
 
 **The self-check passes**: every coverage axis carried samples (106 568 for
