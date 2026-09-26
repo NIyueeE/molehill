@@ -345,6 +345,26 @@ asserted):
    now reported with their numbers and do not block.
 4. **The comparability rule was documented but not enforced.** See above.
 
+**Release incident: the first `v0.9.1` tag push failed, and why it was worth
+one.** The release workflow tests every target it publishes, and on
+`arm-unknown-linux-musleabi` — which runs under `cross`, i.e. emulation — the
+log-budget test failed with `failed to start the server: Exec format error`.
+The test spawns the freshly built binary, which is the whole point of it
+(`§10`: measure what an operator sees, with the production formatter), and a
+child process cannot be exec'd from inside the emulated test binary. Nothing was
+published (every later job was cancelled or skipped), so the tag was deleted and
+re-pushed after the fix, as AGENTS.md §5 allows.
+
+The fix is a build-script cfg, `native_target`, emitted when the target's
+architecture matches the host's: an `x86_64` host runs an `x86_64-musl` binary
+directly (verified — the budget runs and passes there), while a different
+architecture reports `0 tests` instead of a budget that silently measured
+nothing. Falsified before committing: forcing the cfg off turns the same target
+into `0 tests`. The wider lesson is that *any* test which executes its own
+artifacts has to answer this question — the interop matrix does it with
+`#[ignore]` plus an explicit `MOLEHILL_OLD_BIN`, this one with a compile-time
+capability.
+
 **For the next method revision** (recorded here, not fixed at release time):
 the host key is the container hostname, which changes under the bench — it fails
 safe (refuses to compare) but it also means two runs on the same hardware will
