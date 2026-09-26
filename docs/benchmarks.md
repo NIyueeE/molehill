@@ -138,7 +138,7 @@ These figures are from the **retired per-cell model** (the v0.8.x method: one
 cold-started average per tool per network condition, reported as a median over
 repetitions). They are kept because they are still the only measured basis for
 a few configuration decisions, and they are **not comparable** with the
-workload-over-time figures above — the v0.9.0 run covers the default
+workload-over-time figures above — the v0.9.1 run covers the default
 configuration only. Treat them as directional, and re-measure your own case.
 
 | Decision | Option | Measured basis (retired per-cell model) |

@@ -307,6 +307,15 @@ Details: [docs/release.md](docs/release.md).
   commits.
 - **Timebox rabbit holes.** Three failed attempts on the same problem: stop,
   write the findings into HANDOFF.md, and ask the human.
+- **Log levels follow the contract, not the mood.** The definitions live in
+  `docs/configuration.md`, "What each level means": `ERROR` = a human must act,
+  `WARN` = handled and worth one line, `INFO` = lifecycle, `DEBUG` = one
+  connection's business. A failed request is therefore `DEBUG` however alarming
+  it looks, and a condition that can repeat is reported once
+  (`logging::RepeatNotice`) and then at `DEBUG`. `tests/log_budget_test.rs`
+  fails a healthy run that emits a single `WARN` or `ERROR`, so this is
+  enforced rather than intended — never relax it by adding a loud line to a hot
+  path.
 - **Clear → act; ambiguous or irreversible → ask.** Renames, deletions,
   settings changes, and anything touching releases need the human's go.
 - **Secrets never enter the repository.** Tokens, keys, and credentials live

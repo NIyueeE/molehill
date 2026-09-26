@@ -165,7 +165,6 @@ count = 4 # Optional. Override `client.data.default_count` for this service only
 carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only; valid only with `mode = "multiplex"`. Inherits the default when unset
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
 pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`. For UDP this shards distinct visitors across channels; each visitor is pinned to one channel (session affinity)
-health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Probes the local service and removes it from the server while it is down (see "Health check" below)
 
 [client.services.service2] # Multiple services can be defined
 protocol = "udp"
@@ -334,6 +333,23 @@ If `RUST_LOG` is not present, the default logging level is `info`.
 
 Log lines carry colored levels (red ERROR, yellow WARN, green INFO, cyan DEBUG, purple TRACE) and the active span context, e.g. `handle{service=ssh}:`, so every line of a busy server tells you which service produced it. Colors are enabled only on terminals; redirected output stays plain (also honoring `NO_COLOR`). At `debug`/`trace` level the source module is appended to each line.
 
+### What each level means
+
+The level says who has to act, not how alarming the event sounds:
+
+| Level | Means | Examples |
+|-------|-------|----------|
+| `ERROR` | a human has to do something; the tool cannot fix it | a registration the server rejected, a listener that cannot accept, the backoff giving up |
+| `WARN` | the software handled it, and it is worth one line | a config key that was removed and is ignored, a token the server rejected |
+| `INFO` | lifecycle: something started, stopped or changed state | a service registered, a control channel established, a shutdown |
+| `DEBUG` | one connection's or one session's business | a visitor whose local service refused the connection, a data channel that ended, a retry after the first |
+
+Consequences worth stating, because they are what keeps a busy log readable:
+
+- **A failed request is not a WARN.** A visitor whose `local_addr` refuses the connection is one closed connection; that line is `DEBUG`, and `docs/configuration.md#a-local-service-that-is-down` describes what the visitor sees.
+- **A repeating condition is reported once.** A client that starts before its server, or retries with the wrong token, produces one `INFO`/`WARN` and then `DEBUG` until it recovers; a healthy run emits no `WARN` or `ERROR` at all. `tests/log_budget_test.rs` measures exactly that against the real binary, so the guarantee is enforced rather than intended.
+- **`RUST_LOG=debug` is the troubleshooting level** and is expected to be voluminous: it is where per-connection detail lives.
+
 ## Tuning
 
 The step-by-step way to pick `mode`/`count`/`carrier`/transport for your
@@ -419,7 +435,6 @@ local_addr = "127.0.0.1:22" # Necessary. The address of the local service
 nodelay = true # Optional. Per-service TCP_NODELAY override. Default: true
 retry_interval = 1 # Optional. Override the global `client.control.default_retry_interval` per service
 udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only)
-health_check = { type = "tcp", interval = 10, timeout = 3, max_failed = 1 } # Optional. TCP services only. Remove the service from the server while the local service is down (see "Health check")
 remote_bind_addr = "0.0.0.0:5202"
 
 [client.services.dns] # A UDP service example
@@ -901,18 +916,18 @@ WantedBy=multi-user.target
 - `client.control.default_heartbeat_timeout` must be greater than `server.control.heartbeat_interval`, otherwise the client treats a healthy server as dead and reconnects in a loop.
 - Set `server.control.heartbeat_interval = 0` to disable heartbeats (then set `client.control.default_heartbeat_timeout = 0` as well).
 
-### Health check
+### A local service that is down
 
-- `health_check` is optional and only supported on TCP services. It makes the client probe `local_addr` every `interval` seconds (default 10) with a `timeout` of `timeout` seconds (default 3). After `max_failed` consecutive failed probes (default 1) the service is declared unhealthy: its control channel is dropped, so the server stops serving it and visitors fail fast instead of being forwarded to a dead local service. Once a probe succeeds again, the client re-registers the service automatically.
-- Two probe types: `type = "tcp"` (default) opens a TCP connection to the service; `type = "http"` sends an HTTP GET to `http_path` (default `/`) and accepts any 2xx/3xx response.
-- Example: `health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }`.
+- **A service is registered for as long as its client runs.** There is no health check and no health-driven deregistration: `local_addr` does not have to be up when the client starts, and nothing is withdrawn from the server when it goes down.
+- A visitor whose request cannot be forwarded to `local_addr` (connection refused, timeout, ...) gets a **failed request for that connection only** — the same thing any reverse proxy in front of a dead backend does. The visitor's client sees the connection close or reset; the reason is logged on the client (`service=<name>`). Other visitors and every other service of that client are unaffected.
+- The consequence for operations: recovering a backend needs no action from molehill. Start it whenever you like, and the already-registered service forwards again — and a backend that flaps does not cost the client a re-registration cycle.
+- **Upgrading from 0.9.0 or earlier:** the `health_check` key was removed. Delete it from `[client.services.<name>]`. A config that still carries it starts and logs a warning in this release; from the next release the key is an error.
 
 ### UDP services
 
 - The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535); larger datagrams are dropped while the channel stays usable. Configure it identically on the service and remember that the server enforces its own copy received at registration time.
 - **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `pool_size` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels.
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
-- `health_check` does not apply to UDP services.
 
 ### Transports
 

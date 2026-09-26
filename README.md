@@ -108,49 +108,55 @@ Every tool is driven through the identical workload — one interactive stream
 (the SLO instrument), N = 20 bulk TCP streams, 16 short connections per
 second and one UDP session — while the path follows the stage schedule
 (netem on `lo`, the control plane left unshaped). The chart below is the
-v0.9.0 run on one host (molehill's default `multiplex`, `count = 4`, plain
+v0.9.1 run on one host (molehill's default `multiplex`, `count = 4`, plain
 transport): the orange line is the bulk throughput, the blue points the
 interactive stream's RTT, the shaded bands the path classes, the dashed
 line the SLO (p99 <= 50 ms).
 
-![Soak: molehill and the peers over the stage schedule](assets/soak-v0.9.0.png)
+![Soak: molehill and the peers over the stage schedule](assets/soak-v0.9.1.png)
 
 The same run as small multiples — one panel per stage, a lollipop per tool
 (dot = p50, bar = p99, tick = worst second), so "who wins which condition"
 reads without a table:
 
-![Interactive RTT per stage, per tool](assets/soak-v0.9.0-stages.png)
+![Interactive RTT per stage, per tool](assets/soak-v0.9.1-stages.png)
 
 **Interactive stream RTT p99, per stage** (ms; "wedge" = the stream produced
 no response for > 5 s):
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | **6.8** | wedge | 1338 | 2873 | 641 | 4969 | 4029 | **4.9** |
-| frp 0.71.0 | **2.8** | wedge | 3955 | wedge | wedge | 2139 | 2535 | **3.0** |
-| rathole 0.5.0 | 80 | wedge | 1335 | wedge | 162 | 2397 | 218 | 77 |
-| nps 0.26.10 | 68 | 855 | 1137 | 2879 | wedge | 709 | 3616 | 69 |
+| **molehill (mux)** | **9.3** | wedge | 1305 | 3050 | 683 | 4870 | 3440 | **5.4** |
+| frp 0.71.0 | **2.9** | wedge | 4819 | 6110 | wedge | 2703 | 1818 | **3.4** |
+| rathole 0.5.0 | 99 | wedge | 1324 | 4421 | wedge | 6820 | 4688 | 108 |
+| nps 0.26.10 | 66 | 861 | 1124 | 2933 | 6263 | 323 | 3037 | 65 |
 
-**Bulk throughput per stage** (Gbit/s): molehill 18.9 on clean -> 2.4 at
-rtt100 -> 0.03 at rate100 -> **20.6 on the return to clean**; frp 5.9 -> 2.2 ->
-5.9; rathole 18.4 -> 2.5 -> 18.5; nps 0.1 throughout.
+**Bulk throughput per stage** (Gbit/s): molehill 12.7 on clean -> 2.4 at
+rtt100 -> 0.03 at rate100 -> **16.2 on the return to clean**; frp 6.0 -> 2.1 ->
+5.9; rathole 12.4 -> 2.5 -> 12.4; nps 0.1 throughout.
 
 **What these shapes say.** Every tool degrades under a bad path and every
 tool recovers on the return to clean — that recovery is what the last band
 measures, and a tool that stayed wedged would be a finding. The interactive
 stream's p99 is what a new visitor actually feels: under saturation it is
 the number that separates tools, and it is where the throughput axis is
-blind — molehill and rathole carry nearly the same bulk on the clean stage
-(17.0 vs 16.9 Gbit/s) while a fresh interactive connection costs 7.6 ms
-versus 81 ms, and on the 1%-loss cell both carry ~4.9 Gbit/s but the
-interactive stream sits at 1334 ms versus 1311 ms. The peers are driven by
-the same workload and charted in the same panels; the drift axis (open fds,
-RSS and CPU slopes over the run) is in `soak-v0.9.0-drift.png` and the UDP
-session's RTT/loss in `soak-v0.9.0-udp.png` (a sliding loss *rate*, not a
-count of loss events).
+blind — molehill and rathole carry the same bulk on the clean stage (12.7
+vs 12.4 Gbit/s) while a fresh interactive connection costs 9.3 ms versus
+99 ms, and on the 1%-loss cell both carry ~4.9 Gbit/s but the interactive
+stream sits at 1305 ms versus 1324 ms. The peers are driven by the same
+workload and charted in the same panels; the drift axis (open fds, RSS and
+CPU slopes over the run) is in `soak-v0.9.1-drift.png` and the UDP session's
+RTT/loss in `soak-v0.9.1-udp.png` (a sliding loss *rate*, not a count of
+loss events).
 
-These are v0.9.0 numbers from one host, and only runs of the same model on the
-same host compare directly. How to read a chart in detail (the log axis, the
+These are v0.9.1 numbers from one host, and only runs of the same model on the
+same host compare directly. The clean-stage bulk is lower than the v0.9.0
+sweep's 18.9/20.6 Gbit/s on the same hardware: an interleaved A/B of the two
+*binaries* (the `screen` mode, both builds in one run) refuses to claim a
+difference in either direction, and the v0.9.0 binary measured in it reaches
+the same 7.6-24.5 Gbit/s spread, so the ceiling moved with the host, not with
+the code. The comparability boundary is in
+[Benchmarks](docs/benchmarks.md). How to read a chart in detail (the log axis, the
 step lines, the wedge bars, what each band means), the stage schedule, the test
 types and how to reproduce a run on your own hardware:
 [Benchmarks](docs/benchmarks.md).

@@ -66,6 +66,8 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | Path | Purpose |
 |------|---------|
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports |
+| `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
+| `tests/interop_test.rs` | this build against the previous release's binary, both directions (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the control-channel teardown case, valid/invalid configs |
 | `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`) |

@@ -7,8 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet: v0.9.0 below is the state being prepared, and the next change
-opens its own section here.
+Nothing yet.
+
+## [0.9.1] - 2026-09-26
+
+### Changed
+
+- **The log has a level contract, and a healthy run is quiet.** `ERROR` now
+  means a human has to act, `WARN` something the tool handled and is worth one
+  line, `INFO` lifecycle, and `DEBUG` one connection's business — so a visitor
+  whose local service refused the connection is a `DEBUG` line, not the `WARN`
+  it used to be, and a client retrying (started before its server, wrong token)
+  is reported once and then at `DEBUG`. Sixteen `Failed to run the data
+  channel: early eof` lines from a shutdown that went perfectly are gone; a
+  client that starts before its server no longer prints a page of connection
+  refusals. `tests/log_budget_test.rs` drives the real binary and fails if a
+  healthy run emits a single `WARN` or `ERROR`, or repeats one message shape
+  more than three times — the guarantee is measured, not intended. Details and
+  the per-level table: `docs/configuration.md`, "What each level means".
+
+- **The benchmark gate now judges what it says it judges.** `just soak-check`
+  compares a run against the previous release only when the two are comparable
+  (the runs record their host, and a number from another host is context, not a
+  baseline — the rule was documented but not enforced); the fd/RSS drift limits
+  are applied to the `soak` leak axis they are calibrated for instead of to
+  every test type; the interactive error-rate limit compares percentage points
+  rather than a ratio, which had turned a 0.03pp wobble into a "+13%" failure;
+  and a reference peer's swing is reported with its numbers instead of blocking
+  this release. Anyone reading a `soak-check` verdict, or reproducing one, is
+  affected; the reasoning each fix rests on is in HANDOFF.md.
+
+### Removed
+
+- **`health_check` (the per-service health probe) is gone, and a service is no
+  longer withdrawn from the server when its local backend goes down.** This is
+  the transparent-visibility model: registration is the only thing that decides
+  whether a service is visible, so a dead backend is a failed request for the
+  one visitor who asked (connection closed or reset, like any reverse proxy in
+  front of a dead upstream) instead of a service that silently disappears for
+  everyone. The old behaviour could not tell "the backend is down" from "the
+  process that accepts connections is up but broken", and its deregister/
+  re-register cycle was itself a source of control-plane churn; the cause of a
+  failed request now goes to the client's log, where an operator can see it.
+  Operationally nothing needs to be done to recover a backend: it is enough to
+  start it, and the service that was never deregistered forwards again. A config
+  that still carries `health_check` starts and logs a warning; the key becomes
+  an error in the next release. See `docs/configuration.md`, "A local service
+  that is down".
+
+### Fixed
+
+- **A KCP data channel on an IPv6 path no longer fragments either.** The
+  path-MTU clamp shipped in v0.9.0 read the kernel's MTU through `IP_MTU`, which
+  answers for IPv4 only, so an IPv6 KCP session kept its 1400-byte datagram and
+  the kernel split it on any smaller path — the same failure the v4 fix removed,
+  where one lost fragment costs the whole datagram. The probe now asks
+  `IPV6_MTU` for an IPv6 peer too (declared in-crate on top of `nix`'s socket
+  option macros, so the crate still adds no `unsafe`), and the session shrinks to
+  the path minus the 40-byte IPv6 header and the UDP header. The arithmetic and
+  the shrink-only contract are unchanged.
 
 ## [0.9.0] - 2026-09-25
 

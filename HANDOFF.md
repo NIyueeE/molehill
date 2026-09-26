@@ -1,11 +1,14 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-25.** Branch `perf/data-path-optimizations` (106
-> commits ahead of `main` at `8584945`, pushed, **not merged**). It contains
-> the data-path rework — the in-repo tokio-native mux engine, the zero-copy
-> route, KCP batching, data-channel striping, opt-in Noise session resume —
-> plus the Soak benchmark model that replaced the measurement matrix. Shipped
-> work: [CHANGELOG.md](CHANGELOG.md). Design: [docs/internals.md](docs/internals.md)
+> **State as of 2026-09-26.** `main` is at `cccffcd` (v0.9.0 released, with the
+> v0.9.1 plan of record committed on it). `feat/single-control-session`, cut
+> from that `main`, carries the independent half of the v0.9.1 theme: M0 (the
+> interop matrix), M3 (transparent visibility — the health check is gone), M4
+> (the IPv6 half of the KCP path-MTU fix) and M5 (the log level contract and
+> the log budget). The session/pool merge itself (M1, M2a) is **not** in it:
+> "M1's shape" below records why it became opt-in and what the next cycle does
+> first. **Nothing here is merged yet.** Shipped work:
+> [CHANGELOG.md](CHANGELOG.md). Design: [docs/internals.md](docs/internals.md)
 > and [docs/structure.md](docs/structure.md). Method and how to read the
 > numbers: [docs/benchmarks.md](docs/benchmarks.md).
 >
@@ -14,142 +17,343 @@
 > number. Per AGENTS.md §3 it is a contributor page — user-facing facts belong
 > in the docs pages, and anything released belongs in CHANGELOG.md.
 >
-> **Not this branch's business:** the configuration model. That landed on
-> `main` (`ee8e1a2`, "0.8 configuration model"), before this branch was cut;
-> here the config surface only gained the two options this branch's features
-> need (`[transport.noise] resume`, `[server.data] stripe_count`) plus tests
-> and documentation fixes.
+> **Not this theme's business:** the configuration model. The 0.8 model landed
+> on `main` (`ee8e1a2`) before any of these branches were cut; the config
+> surface only gains what a committed milestone's feature needs.
 
-## Next: the theme for the next update
+## Plan of record: v0.9.1 — one control session per endpoint, shared elastic pool, transparent visibility, quiet logs
 
-**Theme — "measure the three unmeasured axes of the data path, then fix what
-they show": establishment, fragmentation, reconnect.**
+Planned on `feat/single-control-session` (cut from `main` after v0.9.0), and
+landed one milestone per commit — M4 first on its own branch, `feat/ipv6-path-mtu`,
+then folded in. The previous theme is closed: the fragmentation fix and the
+cold-start probe landed, and parallel establishment was measured and **not**
+shipped (three instruments, no effect) — the numbers are in CHANGELOG.md and in
+the historical records below. This is the plan the work follows; it is the record
+of the decisions taken while designing it, including the ones that were
+rejected.
 
-Every remaining data-path question in this file is blocked by an instrument,
-not by an idea: the rtt100 8-stream cell wedges on *every* arm (so several
-A/B verdicts in this file are unquotable), no bench cell exists for a
-reconnect (so the session-resume win has no bench-level claim), and loopback
-is MTU 65536 (so fragmentation — the one real-world failure mode no molehill
-arm handles — cannot be measured at all). Per AGENTS.md §10 the instrument
-comes first: a metric without contrast is not a measurement, and for
-fragmentation the **cell is the deliverable**.
+**Model.** One authenticated control session per `(client, remote_addr)` — direct,
+its own connection, never multiplexed into the pool — carrying N service
+registrations with per-service credentials; commands carry a service id, and
+per-service state lives inside the session. One shared tunnel pool per carrier
+(a stream cannot move between carriers); growth is client-local and
+client-initiated; shrink is zero streams **and zero pinned peers** after
+`idle_timeout`. Visibility follows registration only: no health probing, no
+health-driven deregistration, a dead backend is a failed request (nginx-502
+semantics) and its precise cause goes to logs, not to a state machine.
 
-| # | Deliverable | Gate it must pass | Why this and not something else |
+### Decisions
+
+| # | Decision |
+|---|---|
+| D1 | Session per `(client, remote_addr)` |
+| D2 | Per-service auth inside one session; one denied registration never kills the session |
+| D3 | Control channel direct and independent (dependency direction, liveness isolation, repair ability) |
+| D4 | Pool per carrier; `carrier` stays a per-service selector |
+| D5 | Growth needs no new control command (client-local, client-initiated — NAT-friendly) |
+| D6 | `min_tunnels` deleted; warmth is derived (warm for `idle_timeout` after activity) |
+| D7 | UDP-derived floor = max over active services of `ceil(udp_workers / streams-per-tunnel)`; the worker set is maintained |
+| D8 | UDP channels are never recycled (peer affinity + the local source port the backend sees) |
+| D9 | `[server].max_pool_size` deleted → `[server.data].max_tunnels_per_client`, default `0` = unlimited |
+| D10 | `health_check` deleted (probe, state change and key) |
+| D11 | Heartbeat kept, but the server **declares** its interval in the session hello; the client derives/validates `timeout`; `interval = 0` ⇒ no client timeout |
+| D12 | `pool_size` split: TCP warmth = client-local hint; UDP parallelism = `udp_workers` |
+| D13 | Bounds live at the connection layer; the server does not arbitrate channel counts |
+| D14 | Over-cap ⇒ typed, non-fatal refusal; cap below the UDP requirement ⇒ degrade and log once |
+| D15 | Growth thresholds and hysteresis stay internal constants until measured |
+| D16 | `direct` mode kept (sparse visitors + measurement control arm); its final role is decided by M7 |
+| D17 | IPv6 path MTU is covered by an in-crate `Ipv6Mtu` declared with nix's exported `sockopt_impl!`/`getsockopt_impl!` — no `unsafe` |
+| D18 | Log model: level contract + aggregation + a log-budget test |
+| D19 | Config shape: client-level policy, service-level intent; no knob without evidence |
+| D20 | One commit per milestone with its own verification; docs in the same commit; upgrade instructions on user pages |
+| D21 | Scheduling is two layers: pool placement (client) and pairing/assignment (server); the server does not choose tunnels |
+| D22 | Instrument before policy (falsifiable): S1 adds only read-only accessors + telemetry; if the state spread is inside the noise, S2 does not land |
+| D23 | Placement policy = eligibility + rotation + hysteresis (never a weighted score) |
+| D24 | A stripe group's K streams must land on K distinct tunnels (guaranteed inside the pool) |
+| D25 | No RTT sampling; the algorithm may use stream count, pending opens, send credit, worker queue depth — nothing else |
+| D26 | Growth/shrink is a hysteretic, rate-limited state machine (≤ 1 tunnel per RTT) |
+| D27 | UDP assigns a *new* peer to the shortest worker queue (replacing round-robin), affinity unchanged; gated on the drop counter |
+| D28 | Waiting visitors stay FIFO (fairness; with on-demand channels it is a 1:1 handoff); **spare** streams are picked from the least-loaded tunnel instead |
+| D29 | Stripe pairing is atomic: K spares from K distinct tunnels, all or none |
+| D30 | Shrink requires `pinned_peers == 0`: a channel with pinned-but-idle peers is not idle |
+| D31 | New sources never create channels (invariant); floods cost affinity entries only; table size, evictions and per-tunnel `pinned_peers` go to telemetry; add a hard cap only if measurement asks for one |
+
+### Config shape (M6)
+
+```toml
+[client.data]
+shared_pool = true          # opt-in for one release, then default
+default_carrier = "tcp"
+idle_timeout = 60
+[client.data.tcp]
+max_tunnels = 4             # cap; the pool grows below it
+[client.data.kcp]
+max_tunnels = 4
+[client.services.game]
+protocol = "udp"
+local_addr = "127.0.0.1:8083"
+remote_bind_addr = "0.0.0.0:8083"
+udp_workers = 2             # was the UDP pool_size
+[server.data]
+max_tunnels_per_client = 0  # 0 = unlimited (default); an operator valve
+```
+
+Removed/renamed: `default_count`, per-service `count`, per-service `pool_size`
+(→ `udp_workers` for UDP), `[server].max_pool_size` (→ the valve above),
+`health_check`, per-service `heartbeat_timeout`. New validation: `max_tunnels >= 1`;
+`udp_workers` only in multiplex mode; `carrier` must name a configured pool; an
+explicit heartbeat timeout below the derived floor is an error; a UDP service
+writing `health_check` or tunnel keys is an error (silently ignored today);
+removed keys warn for one release, then error.
+
+### Milestones and their gates
+
+| # | Milestone | Depends on | Gate |
 |---|---|---|---|
-| 1 | **Establishment** — overlap the data-channel setups (candidate **B**: one batched `CreateDataChannels(n)` command, or N concurrent spawns) | the rtt100 8-stream cell completes a rep instead of `None`, with 1-stream inside its spread | it is the last cell where the engine's own behaviour cannot be seen at all; every earlier link's verdict on that cell was "not attributable" for this reason |
-| 2 | **Fragmentation** — PMTU-aware KCP segment size (candidate **D**: `IP_MTU_DISCOVER = DO` + `IP_RECVERR`, shrink-only, never grow) **plus the MTU-1280 shaped cell it needs** | the new cell shows the unfixed build losing roughly half its throughput to fragment-loss amplification and the fixed build recovering it | a 1400 B datagram on an MTU-1280 path is silently fragmented and one lost fragment costs the whole datagram; every TCP arm gets PMTU from the kernel, KCP gets none. D must ship as a pair — DF without the error-queue handler turns a sub-MTU path from "fragmented" into "black hole" |
-| 3 | **Reconnect** — a cold-start/reconnect probe: client start → every registered port answering, for an N-service client | the probe reports per-service and total time, with enough repetitions to state a spread | it is the missing gate for the Noise-resume work (setup 442.7 → 38.5 µs per pair, currently only an in-process probe) *and* for the single-control-channel consolidation below; without it that change "ships with its probe or not at all" |
+| M0 | Interop matrix (new) | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
+| M0 | Interop matrix (new) — **landed** | — | Green against today's code: old↔new forward in both directions; an old server rejects an unknown dialect cleanly |
+| M1 | A: one control session per endpoint (**next cycle** — see "M1's shape" below) | M0 | Matrix cases; FD/handshake counts; `--test=reconnect` no regression; heartbeat mismatch refused or corrected at startup |
+| M2a | Shared elastic pool + S1 observation (**next cycle, with M1**) | M1 | Pool telemetry; first-visitor-after-idle latency; placement state-spread data; no mixed-workload regression; UDP stickiness held (`pinned_peers`) |
+| M2b | S2 placement + D28 spare selection (**conditional**) | M2a data | Only if the spread is significant: no hysteresis flapping; stripe groups still distinct; no regression |
+| M2c | UDP shortest-queue assignment (**conditional**) | drop counter | Lower drop rate under mixed UDP load, no regression |
+| M3 | Transparent visibility: delete health check — **landed** | — | No deregistration on backend death; per-visitor failure reproducible; both languages updated |
+| M4 | E: IPv6 path MTU — **landed** | — | Clamp fires on a shrunk-MTU IPv6 loopback; clippy clean under `unsafe_code = deny` |
+| M5 | Log model — **landed** | — | Log-budget: zero WARN/ERROR on the happy path, bounded INFO, no shape repeated more than three times |
+| M6 | Config consolidation (**split** — see below) | M1, M2a | Removals/renames + migration tables; defaults-pinning and doc-example tests updated |
+| M7 | `direct` mode's role | M2a | Isolation experiment: the shared pool matches direct on interactive p99, or direct keeps its documented role |
 
-Not in this theme, recorded so they are not re-litigated: candidates **A**
-(state-aware channel placement) and **C** (UDP drop counter first, load-aware
-assignment second) — both real, neither blocked by an instrument, so they wait
-until the three above have their numbers. The single-control-channel
-consolidation is a *later* theme: its design is scoped below, and deliverable 3
-is what gates it.
+Order: M0 → M1 → M2a → (M2b/M2c if the data asks) → M6; M3/M4/M5 independent
+and may land first; M7 after M2a.
 
-### Phase log (this session)
+**Landed on this branch** (in order), with the evidence each one rests on:
 
-The theme above is being executed in phases; each lands as one commit with its
-own measurement, and the harness changes it needed are recorded with it.
+- **M0, the interop matrix** — `tests/interop_test.rs` and `just interop`:
+  this build against the previous release's *asset*, never a local build (a
+  binary compiled from today's tree cannot test yesterday's protocol). Three
+  cases: old server + new client forwards, new server + old client forwards, and
+  an old server refuses an unknown dialect on that one connection yet keeps
+  serving. They are `#[ignore]`d until `MOLEHILL_OLD_BIN` is set, so a plain
+  green run reports `3 ignored` instead of claiming the matrix ran. It was
+  falsified before it was trusted: with the "unknown" version byte set to one
+  v0.9.0 knows, the old server answers 34 bytes instead of closing and the case
+  fails with that payload. Re-run green after M3, M4 and M5.
+- **M3, transparent visibility** — the health check is gone: code, config key
+  and both language pages. `dead_backend_fails_one_visitor_and_stays_registered`
+  asserts the contract in order — a visitor to a dead-backend service *ends*
+  instead of hanging; the service is still registered (its exposed port is held
+  by the server, observed by a failed bind, so the check creates no visitor
+  traffic of its own); and the same port forwards the moment a backend binds,
+  with no client restart. The removed key is stripped from the parsed document
+  with a warning naming the new contract (verified against the real binary, not
+  only in a unit test); `deny_unknown_fields` is what turns it into an error
+  once the entry is deleted.
+- **M4, IPv6 path MTU** — the probe now answers for both families
+  (`transport::kcp::probe_path_mtu`), so an IPv6 KCP session sheds the 40-byte
+  IPv6 header plus UDP the way the IPv4 one always has; the end-to-end proof is
+  the `#[ignore]`d `ipv6_path_mtu_clamps_on_a_shrunk_loopback`, which asserts the
+  live session's datagram size under `sudo unshare -n` (a netns `lo` at MTU 1280
+  gives 1232 bytes) and fails loudly on a normal host instead of passing
+  vacuously.
+- **M5, the log model** — a level contract (docs/configuration.md, "What each
+  level means"), the per-connection reclassifications that follow from it, and
+  `logging::RepeatNotice` for conditions that repeat. The measurement that
+  justifies it: one integration test emitted 19 WARN/ERROR lines on a run in
+  which nothing failed, and the whole 15-test suite now emits **zero**.
+  `tests/log_budget_test.rs` drives the real binary, with the production
+  formatter, and fails on one WARN, one ERROR, an INFO count over the ceiling,
+  or any message shape repeated more than three times — it found its first
+  violation itself (an ERROR for a port probe that connected and hung up).
 
-| Phase | State | Evidence |
-|---|---|---|
-| 1 — UDP drop counters (`MOLEHILL_UDP_STATS=1`) | **landed** (`38b7acd`) | routing returns `UdpRouteOutcome`; unit-tested without racing on the globals |
-| 2 — the fragmentation axis in the harness (`mtu1280`, `loss1_mtu1280`) | **landed with the D commit** | the classes are `PathClass{netem, mtu}`; the shaper applies `ip link set lo mtu` and **verifies the restore**; `restore_stale_mtu` at startup cleans up after a SIGKILLed run; `meta.mtu_restore_to` records the interface's starting MTU |
-| 3 — D: PMTU-aware KCP | **gate met** | alternating parent/child `cost` runs on `loss1_mtu1280` (kcp4, 1 stream, 3 pairs): **A 0.000/0.000/0.000 vs B 0.303/0.294/0.369 Gbit/s**; control cell `loss1` (same loss, MTU 65536) overlaps (A 0.313/0.320/0.316, B 0.311/0.399/0.348), so the change costs nothing where it does not apply |
-| 4 — B: parallel establishment | **not shipped — no measurable effect** | see below |
-| 5 — reconnect probe (`--test=reconnect`) | **landed** | ~154 ms clean cold start; A/B interleaved, five reps per build |
-| 6-7 — docs, release sweep, gate | **done; gate green** | `results-soak-v0.9.0.json` on `v0.8.1-122-g710186c`, `tree_clean: true`, binary fingerprint recorded and not stale, four tools × 8 stages, `soak-check`: "OK: no gate violation" |
+### M1's shape, revised now that M0–M5 have landed
 
-The sweep's first two attempts are worth recording, because both were caught by
-the harness rather than by reading it:
+D1–D31 stand: the model is the model. The *staging* did not survive contact with
+the interop matrix, and this is the revision the next cycle follows.
 
-- **nps failed outright** with `EXDEV` — its shipped conf files were hard-linked
-  from a peer cache on another filesystem, while the binaries' own links had a
-  fallback. Fixed in `edaee3c` (copy when a link is impossible).
-- **the gate failed on one clean stage**: molehill recorded 2 interactive errors
-  in 2912 samples (0.069%). The same run measured frp 0, rathole 0.05 % and nps
-  0.31 % on their clean stages — so an absolute zero-error SLO was flagging the
-  middle of the host's own spread. The rule became a 0.5 % rate (`710186c`), and
-  the artifact was re-measured under it rather than judged by the stricter rule
-  that happened to be in force when it ran.
-- **two false starts on the command line**: the ritual's documented invocation
-  omitted `--test=rrul`, and the default is `capacity`, so a four-minute ceiling
-  probe was written to the release path and looked like a release artifact
-  (`f8f5e37` fixes the page). The same shape of mistake — a binary built before
-  a revert, claiming the later revision — is now impossible to record silently:
-  the meta carries the binary's sha256, size and mtime plus a `stale` flag
-  (`553a41d`).
+- **The new dialect is opt-in for one release, not the default.** M0 exists to
+  make a wire change safe, and its value collapses the moment the client
+  switches dialect silently: a new client against a v0.9.0 server would stop
+  working with nothing to catch it but a user's bug report. The shape that keeps
+  both directions testable: the **server accepts both** dialects (v3, today's
+  one-session-per-service grammar, unchanged) so operators upgrade servers
+  first; the **client picks** the new one only when the config asks for it (the
+  `shared_pool` switch already in the config shape), and otherwise speaks v3;
+  an **old server refuses the new dialect cleanly** — that is M0's third case —
+  and the new client reports it as a protocol mismatch instead of retrying.
+  This is also what §8 of the plan said ("opt-in for one release"); it is the
+  difference between a rollout and a flag day.
+- **The dialect is a version byte, not a new hello variant.** The existing
+  `Hello::ControlChannelHello(version, digest)` already carries a `u8` version
+  that the server validates and M0's third case already exercises; the new
+  session dialect is version 4 on that same message, so the *framing* stays
+  byte-identical (34 bytes) and an old server rejects it with the error path
+  that is tested today. A new `Hello` variant cannot work: the variant tag lives
+  inside the postcard payload, so a peer cannot see it before parsing, and the
+  length it must read is not yet known. What follows the handshake is where the
+  new grammar lives — a session hello acknowledgment carrying the capability
+  block (protocol version, heartbeat interval, flags), registrations and
+  commands that carry a service id, and self-describing tags for the new
+  variants, the pattern `StartForwardStripedTcp` established.
+- **M1 and M2a are one change, not two.** A merged session is only worth its
+  plumbing if the data plane is shared too: the shared pool is what routes an
+  inbound stream to a service (a stream prologue), and it is what gives
+  `pool_size`/`count` a different meaning. Merging control channels while
+  leaving N per-service pools would be a lot of risk for a partial win, so the
+  next cycle does "session + pool" as one milestone with the S1 instrumentation
+  inside it.
+- **M6 cannot delete the old keys until the client default flips.**
+  `default_count`, per-service `count` and `pool_size` are what the v3 path
+  uses; deleting them while v3 is the default would break the default
+  configuration. M6 therefore splits: the *additions*, renames and removed-key
+  warnings land with M1/M2a, and the *deletions* land with the release that
+  makes the new dialect the default and removes the v3 client path (which is
+  also when `[server].max_pool_size` goes — it is the server's arbiter for the
+  v3 pool).
+- **Aggregation is smaller than planned, deliberately.** With per-connection
+  failures at `DEBUG` (M5), no `WARN`/`ERROR` site fires per connection in a
+  healthy run, so a windowed counter would have had no user.
+  `logging::RepeatNotice` — loud once, then `DEBUG`, loud again after recovery —
+  is what landed, and `tests/log_budget_test.rs` keeps the premise true. If a
+  future change reintroduces a repeating `WARN`, the notice is the tool; a
+  counter is not justified until one exists.
 
-**B's premise is real in the code and costs nothing measurable on today's
-instruments.** The tunnel driver held a *single* pending open and a single SYN
-announcement, so N concurrent callers were served one SYN round trip at a time —
-the serialization the rtt100 wedge was attributed to. Opening them concurrently
-(a queue of pending opens, `MAX_OPENS_IN_FLIGHT`) was implemented and measured:
+### Rejected, with the reason (so it is not re-litigated)
 
-| Metric | Parent | Concurrent opens | Reading |
-|---|---|---|---|
-| rtt100, 8-stream `cost` bulk | 1.039 / 1.160 Gbit/s | 1.130 / 1.105 Gbit/s | overlapping — and the cell **no longer wedges on either build** |
-| rtt100, 26-stream `cost` bulk | 1.512 Gbit/s | 1.336 Gbit/s | no win; steady-state rate does not depend on setup order |
-| clean cold start (`reconnect`, 5 reps) | median 0.1540 s | median 0.1532 s | identical |
+Configurable `min_tunnels` (warmth is derivable); keeping `[server].max_pool_size`
+(the bound belongs at the connection layer); `health_check = false` as a boolean
+axis (it is one end of "how long before we hide the service"); server-side
+inference of backend health (indistinguishable from a visitor that hangs up);
+the "health check avoids control-plane churn" argument (that churn is its own
+deregister/re-register cycle — self-referential); per-service health numbers
+(`timeout` is a connect timeout); reversing the heartbeat direction (follow-up);
+cross-carrier striping (the slowest carrier gates the group); `carrier = "auto"`
+(needs its own A/B); the control channel inside the pool; a non-zero default for
+the server's tunnel cap (it has none today); negotiating channel counts; weighted
+placement scores; an RTT sampler for the mux path; stateful prioritisation of the
+waiting visitors (breaks FIFO fairness); treating "zero streams" as sufficient
+for shrinking (kills sticky UDP sessions).
 
-The reason is structural: streams start flowing as soon as *their own* setup
-completes, so serialized setup delays **when stream N starts**, not the rate
-once it is running — and cold start never opens data channels at all (they are
-opened per visitor connection). So the change was reverted rather than shipped
-on a premise, and the patch is parked at `/tmp/b-parallel-opens.patch` (and in
-this session's transcript) with its unit-test-free diff.
+### To measure before deciding
 
-**What B actually needs is a different instrument**: N visitors connecting
-*simultaneously*, timed until all N are established. That is the honest gate for
-"parallel establishment", it does not exist yet, and it belongs with the next
-theme — the `reconnect` probe landed here measures registration cold start, not
-concurrent establishment, so the two are deliberately separate numbers.
+Placement state spread (`MOLEHILL_PLACEMENT_STATS=1`) decides whether S2 and D28
+land at all; spare-stream load divergence decides D28; per-tunnel open latency
+decides whether pending opens enter the eligibility rule; first-visitor-after-idle
+decides whether derived warmth is acceptable; pool timeline (`MOLEHILL_POOL_STATS=1`)
+decides whether the state machine flaps; the slow-visitor injection decides
+`direct`'s fate; UDP drops plus affinity-table size/evictions decide D27 and
+whether the table needs a hard cap; the log budget guards against drift back to
+noise; a startup test guards the heartbeat contract.
 
-Two harness defects were found and fixed on the way, both by running the tool
-rather than reading it:
+### Edge cases that must behave as stated
 
-- **`screen` recorded `--path` without applying it**, so a screen run labelled
-  `loss1` was clean traffic and its results meta described a path the run never
-  had. It now applies the path once, before the interleave (constant for both
-  builds — a shape differing between them would be the second variable).
-- **The screen verdict chose its metric from step 1**: a cell hostile enough to
-  kill the bulk probe on the first step flipped the whole verdict to response
-  time while the columns still read like throughput. It now uses throughput
-  whenever any step has it, labels the unit, and says so when it falls back.
-  On the fragmentation cell this correctly reports "0 usable steps" — the
-  interleaved `iperf_burst` probe cannot survive that cell, which is why D's
-  gate uses the stage sampler (`--test=cost`) instead.
+Heartbeat mismatch ⇒ error or derivation; cap below the UDP requirement ⇒ degrade
+and log once; over-cap tunnel ⇒ typed refusal, growth stops, retry only after a
+tunnel dies; tunnel death with pinned peers ⇒ those sessions end (UDP semantics)
+and a tunnel with pinned peers is never shrunk; service removed by hot reload with
+live streams ⇒ drain; old peer meets the new dialect ⇒ typed rejection, no silent
+downgrade loop; two services with different tokens on one endpoint ⇒ independent
+auth; per-service `remote_addr` ⇒ separate sessions; the same exposed port from two
+clients ⇒ unchanged behaviour; a cold pool ⇒ the first visitor pays one tunnel
+setup (measured, not assumed); every candidate ineligible ⇒ fall back, then a typed
+error, never an indefinite wait; an insignificant state spread ⇒ S2 and D28 do not
+land.
 
-Known limit of D: the probe is **IPv4-only**. `IPV6_MTU` has no safe wrapper in
-this crate's dependencies, and the alternatives were both rejected — `unsafe`
-for one `getsockopt` in a crate that denies it, or a blanket clamp to the IPv6
-minimum (1280), which would cost throughput on every IPv6 path including the
-65536-byte ones. An IPv6 session therefore keeps kernel fragmentation until a
-safe wrapper exists. Recorded here as the remaining half.
 
 ### Scoping notes carried forward
 
-- **Single control channel per client** (later theme, design already
-  reviewed). The client currently keeps one control connection *and* one mux
-  tunnel per service; consolidating is mostly plumbing now that the engine is
-  stable and gives another order-of-magnitude FD/handshake reduction for
-  many-service clients. Two constraints: (a) the control channel stays
-  0.8.x-interoperable, so the consolidated form is a **new hello variant**
-  (`ControlChannelHelloMulti`) announced per connection — never a silent change
-  to the v3 grammar — with a service id added to the commands that need one
-  (`CreateDataChannel`, `HeartBeat`) and per-service server state keyed under
-  one client session; the auth handshake stays per connection. (b) The bench
-  probes all dial the exposed port, so the change is invisible to them — it
-  ships with deliverable 3 or not at all. Its crypto half already landed
-  separately: the Noise session resume (`resume = true`) removes the
-  handshake's DH turns on reconnect, opt-in, with replay and forward-secrecy
-  trade-offs documented in docs/transport.md.
+- **Single control channel per client** — the design is above ("M1's shape"),
+  and its crypto half already landed separately: the Noise session resume
+  (`resume = true`) removes the handshake's DH turns on reconnect, opt-in, with
+  replay and forward-secrecy trade-offs documented in docs/transport.md. The
+  bench probes all dial the exposed port, so the merge is invisible to the
+  published numbers — it ships with the pool, or not at all.
 - **Scheduling-review candidates** (A, B, C, D) keep the full statement of
   what is static today, why it is believed true and the gate each must pass —
   that table stays in the backlog below, and its B/D rows are this theme's
   first two deliverables.
 
+
+## The v0.9.1 sweep: what it measured, and what the gate said
+
+**The run.** `just soak --test=rrul --tools molehill,frp,rathole,nps` on
+`ac42490` (`tree_clean: true`, binary fingerprint recorded, `stale: false`,
+version 0.9.1), host `16b4dc8db68b`, 4 tools, the default eight-stage timeline,
+~80 minutes.
+
+The pre-merge history cleanup renumbered that commit (it is `0072098` now:
+`ac42490` itself is unreachable). The provenance survives exactly, because a
+tree is content-addressed: `0072098^{tree}` is
+`6a46fa14b083f7d3fe9e3ad4c3c7fa77f9569dd0`, byte-identical to
+`ac42490^{tree}` — the cleanup moved one hunk between two commits *before* it
+and changed no tree at or after it. Anyone checking the sweep out checks out
+that tree.
+
+**And the source has not moved since**: `git diff 0072098..HEAD -- src/
+build.rs` is empty, so the released binary is built from exactly the measured
+source. What changed between the two is the version bump, this record, the
+results file and its charts, the gate fixes, the README numbers and `tests/` —
+the last of which is where CI found a platform-dependent assertion of mine and
+it was fixed (the test asked the OS whether a port was bound instead of asking
+the tool whether a visitor fails; macOS answers the first question
+differently). The results file and the chart set are the release artifacts:
+`benches/scripts/soak/results-soak-v0.9.1.json`, `assets/soak-v0.9.1*.png`.
+
+**The self-check passes**: every coverage axis carried samples (106 568 for
+molehill), every throughput sample dialled the exposed port rather than the
+backend, and the absolute SLO holds on both unshaped clean stages — interactive
+p99 9.334 ms and 5.389 ms against a 50 ms SLO, error rate 0 on both. The shaped
+stages sit above the SLO by design; that is the degradation curve, reported as a
+note.
+
+**The comparison against v0.9.0 is not a gate input**, and that is now enforced
+rather than assumed (`soak_check.comparability`): the two runs were made on
+different hosts (`98c48ea3fa68` vs `16b4dc8db68b` — the bench container is
+recreated between sessions, so its hostname changes), and `docs/release.md`
+already says a number from another host is not a baseline. The evidence that
+this is a statement about the environment and not a way past a regression:
+
+- the peer signature is an environment change: molehill and **rathole** both
+  lost ~33% of clean-stage bulk (18.9/20.6 -> 12.7/16.2 and 18.4/18.5 ->
+  12.4/12.4 Gbit/s) while frp (5.9 -> 6.0) and nps (0.13 -> 0.13), which never
+  reach that ceiling, did not move at all;
+- an interleaved A/B of the two **binaries** (`--test=screen --path=clean
+  --streams-max=8 --ab <v0.9.0 release>,<v0.9.1 build>`) refuses to claim a
+  difference in either direction at the 15% threshold: B ahead on 4 of 8 steps
+  and A on 3, and the same v0.9.0 binary measures 7.6-24.5 Gbit/s across the
+  steps of that one run.
+
+So v0.9.1 is gated the way v0.9.0 was — the absolute SLO plus the run's own
+completeness and endpoint checks — with the comparison *recorded* rather than
+judged.
+
+**Four gate defects were found by running the ritual, and fixed in this
+release** (the fixes are part of the release commit; each is falsified, not just
+asserted):
+
+1. **The leak axis was applied to a test type it is not calibrated for.** The
+   absolute ±1 fd/min limit is the *soak* axis; an `rrul` run grows server fds
+   by warm-up — identically in both runs (31 -> 165 at v0.9.0, 31 -> 169 here),
+   which the gate reported as drift. Non-`soak` runs now compare the slope
+   against their baseline (a doubled slope still fails; `soak` keeps the
+   absolute limit).
+2. **The error-rate limit compared units.** Rates are stored as fractions and
+   the limit is documented in percentage points, but the check took a *ratio*:
+   a 0.248% -> 0.281% wobble (0.03pp) printed as "+13.3pp" and failed. It now
+   takes the difference; 0.2% -> 6% still fails.
+3. **A peer's violation counted as a release blocker.** Third-party behaviour
+   swings between runs (rathole's `rate100` p99 moved 161 ms -> 7064 ms here)
+   while the docs say the SLO gates the tool this repository releases. Peers are
+   now reported with their numbers and do not block.
+4. **The comparability rule was documented but not enforced.** See above.
+
+**For the next method revision** (recorded here, not fixed at release time):
+the host key is the container hostname, which changes under the bench — it fails
+safe (refuses to compare) but it also means two runs on the same hardware will
+never compare. A stable host identity is a calibration measurement (kernel +
+CPU model + a fixed-workload throughput probe), not a name. And a single sample
+per stage cannot resolve a 25% change when the model's own within-run spread on
+clean stages is 40-70% (9.334 vs 5.389 ms p99; 12.7 vs 16.2 Gbit/s in one run):
+either repeat the stage or state the interval the comparison can actually
+resolve.
 
 ## Provenance of the published v0.9.0 numbers
 
@@ -220,13 +424,17 @@ and created the GitHub Release with its archives and `SHA256SUMS`. The branch
 `perf/data-path-optimizations` is merged into `main` (`c6e8c1f`) and its 34 topic
 commits are the release's history.
 
-**The data-path rework is complete on its own terms.**
+**The data-path rework is complete on its own terms.** One release theme is
+being landed after it: the v0.9.1 plan above, where M4 (IPv6 path MTU) is the
+first milestone in.
 
-This session added two measured improvements on top of it — the KCP path-MTU
-fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no cost
-where it does not apply) and the UDP drop counters — plus the fragmentation
-axis and the cold-start probe in the harness, and the docs-only path in the
-hooks. See "Phase log" below.
+The release session added two measured improvements on top of that rework — the
+KCP path-MTU fix (0.000 → 0.303/0.294/0.369 Gbit/s on the fragmentation cell, no
+cost where it does not apply, **IPv4 only at the time**) and the UDP drop
+counters — plus the fragmentation axis and the cold-start probe in the harness,
+and the docs-only path in the hooks. The IPv6 half of that fix is what M4
+closed; the numbers above were taken on a v4 path and are not re-measured for
+it. See "Phase log" below.
 
 - **Cumulative branch-vs-`main` A/B (2026-09-24, the fixed harness):** latency
   at parity or better on every arm and cell; throughput net favourable (15

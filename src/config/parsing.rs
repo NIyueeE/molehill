@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
+use tracing::warn;
 use url::Url;
 
 #[cfg(feature = "multiplex")]
@@ -160,7 +161,6 @@ pub struct ClientServiceConfig {
     /// valid only with `mode = "multiplex"`.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
-    pub health_check: Option<HealthCheckConfig>,
     /// Per-service transport override (encryption enablement + keys).
     pub transport: Option<ClientServiceTransportConfig>,
     /// Requested number of pre-established data channels.
@@ -221,71 +221,6 @@ pub enum ServiceType {
 
 fn default_service_type() -> ServiceType {
     ServiceType::default()
-}
-
-/// How the client probes the local service of a TCP service
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HealthCheckType {
-    /// Establish a TCP connection to the service
-    #[default]
-    #[serde(rename = "tcp")]
-    Tcp,
-    /// Send an HTTP GET request and accept any 2xx/3xx response
-    #[serde(rename = "http")]
-    Http,
-}
-
-const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
-const DEFAULT_HEALTH_CHECK_TIMEOUT_SECS: u64 = 3;
-const DEFAULT_HEALTH_CHECK_MAX_FAILED: u32 = 1;
-const DEFAULT_HEALTH_CHECK_HTTP_PATH: &str = "/";
-
-fn default_health_check_type() -> HealthCheckType {
-    HealthCheckType::default()
-}
-
-fn default_health_check_interval() -> u64 {
-    DEFAULT_HEALTH_CHECK_INTERVAL_SECS
-}
-
-fn default_health_check_timeout() -> u64 {
-    DEFAULT_HEALTH_CHECK_TIMEOUT_SECS
-}
-
-fn default_health_check_max_failed() -> u32 {
-    DEFAULT_HEALTH_CHECK_MAX_FAILED
-}
-
-fn default_health_check_http_path() -> String {
-    DEFAULT_HEALTH_CHECK_HTTP_PATH.to_string()
-}
-
-/// Health check of a client-side service (TCP services only).
-///
-/// The client probes `local_addr` every `interval` seconds with a timeout of
-/// `timeout` seconds. After `max_failed` consecutive failed probes the service
-/// is declared unhealthy and its control channel is dropped, which removes the
-/// service from the server (visitors then fail fast instead of being forwarded
-/// to a dead local service). Once a probe succeeds again the client
-/// re-registers the service automatically.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct HealthCheckConfig {
-    #[serde(rename = "type", default = "default_health_check_type")]
-    pub check_type: HealthCheckType,
-    /// Probe interval in seconds. Default: 10
-    #[serde(default = "default_health_check_interval")]
-    pub interval: u64,
-    /// Probe timeout in seconds. Default: 3
-    #[serde(default = "default_health_check_timeout")]
-    pub timeout: u64,
-    /// Consecutive failures before the service is declared unhealthy.
-    /// Default: 1
-    #[serde(default = "default_health_check_max_failed")]
-    pub max_failed: u32,
-    /// Path for `http` probes. Default: "/"
-    #[serde(default = "default_health_check_http_path")]
-    pub http_path: String,
 }
 
 /// A closed port range parsed from a config string, either `"8080"` or
@@ -647,9 +582,77 @@ pub struct Config {
     pub client: Option<ClientConfig>,
 }
 
+/// Keys a release removed, and what to write instead.
+///
+/// A removed key is not left to `deny_unknown_fields`: that says *what* is
+/// wrong but not what to do about it, and a config whose owner believes a
+/// behaviour is still configured is worse off than one that fails to start.
+/// For one release the key is therefore accepted and warned about; the entry is
+/// then deleted, and `deny_unknown_fields` rejects it from that release on.
+/// Paths are `client.services.*.health_check`-shaped, `*` matching any table
+/// key.
+const REMOVED_KEYS: &[(&str, &str)] = &[(
+    "client.services.*.health_check",
+    "a service stays registered for as long as its client runs: a request that cannot be \
+     forwarded fails for that visitor, and the reason goes to the log",
+)];
+
+/// Remove every key in [`REMOVED_KEYS`] from a parsed config document,
+/// warning about each one found.
+///
+/// It works on the document rather than the typed config because the typed
+/// config is deliberately strict — the key has to be gone before the struct
+/// that forbids unknown fields sees it.
+fn strip_removed_keys(doc: &mut toml::Value) {
+    for (pattern, advice) in REMOVED_KEYS {
+        let segments: Vec<&str> = pattern.split('.').collect();
+        let mut hits = 0;
+        strip_at(doc, &segments, &mut hits);
+        if hits > 0 {
+            warn!(
+                "`{pattern}` was removed in v0.9.1 and is ignored ({hits}x): {advice}. \
+                 Remove the key from the config."
+            );
+        }
+    }
+}
+
+/// Walk `value` along `segments`, counting the leaves that were present and
+/// removing them. `*` descends into every value of a table.
+fn strip_at(value: &mut toml::Value, segments: &[&str], hits: &mut usize) {
+    match segments {
+        [] => {}
+        [last] => {
+            if let Some(table) = value.as_table_mut()
+                && table.remove(*last).is_some()
+            {
+                *hits += 1;
+            }
+        }
+        [head, rest @ ..] => {
+            let Some(table) = value.as_table_mut() else {
+                return;
+            };
+            if *head == "*" {
+                for (_, child) in table.iter_mut() {
+                    strip_at(child, rest, hits);
+                }
+            } else if let Some(child) = table.get_mut(*head) {
+                strip_at(child, rest, hits);
+            }
+        }
+    }
+}
+
 impl Config {
     fn from_str(s: &str) -> Result<Config> {
-        let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
+        // Parse to a document first: a removed key has to be seen (and taken
+        // out) before the strict struct parse, which rejects unknown fields.
+        let mut doc: toml::Value =
+            toml::from_str(s).with_context(|| "Failed to parse the config")?;
+        strip_removed_keys(&mut doc);
+        let mut config: Config =
+            Config::deserialize(doc).with_context(|| "Failed to parse the config")?;
 
         if let Some(server) = config.server.as_mut() {
             Config::validate_server_config(server)?;
@@ -730,23 +733,6 @@ impl Config {
                 bail!(
                     "service {name}: Noise is the effective transport (per-service                     `transport.type = \"noise\"` or the client-wide `type = \"noise\"`)                     but no Noise keys are configured — set them in                     `[client.transport.noise]` or                     `[client.services.{name}.transport.noise]`"
                 );
-            }
-            if let Some(hc) = &s.health_check {
-                if s.service_type != ServiceType::Tcp {
-                    bail!(
-                        "health_check is only supported for TCP services, but service {name} is {:?}",
-                        s.service_type
-                    );
-                }
-                if hc.interval == 0 {
-                    bail!("health_check.interval must be greater than 0 for service {name}");
-                }
-                if hc.timeout == 0 {
-                    bail!("health_check.timeout must be greater than 0 for service {name}");
-                }
-                if hc.max_failed == 0 {
-                    bail!("health_check.max_failed must be greater than 0 for service {name}");
-                }
             }
 
             // The public endpoint is client-declared and required.
@@ -1037,19 +1023,6 @@ mod tests {
         assert_eq!(DEFAULT_UDP_BUFFER_SIZE, 2048, "udp_buffer_size");
         assert_eq!(DEFAULT_UDP_IDLE_TIMEOUT_SECS, 60, "udp_idle_timeout");
         assert_eq!(DEFAULT_UDP_SENDQ_SIZE, 1024, "udp_send_queue_size");
-        assert_eq!(
-            DEFAULT_HEALTH_CHECK_INTERVAL_SECS, 10,
-            "health_check.interval"
-        );
-        assert_eq!(DEFAULT_HEALTH_CHECK_TIMEOUT_SECS, 3, "health_check.timeout");
-        assert_eq!(
-            DEFAULT_HEALTH_CHECK_MAX_FAILED, 1,
-            "health_check.max_failed"
-        );
-        assert_eq!(
-            DEFAULT_HEALTH_CHECK_HTTP_PATH, "/",
-            "health_check.http_path"
-        );
         assert!(DEFAULT_NODELAY, "nodelay");
         assert_eq!(DEFAULT_KEEPALIVE_SECS, 20, "tcp keepalive");
         assert_eq!(DEFAULT_KEEPALIVE_INTERVAL, 8, "tcp keepalive interval");
@@ -1320,7 +1293,12 @@ psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }
 
     #[test]
-    fn test_health_check_config() {
+    fn test_removed_keys_are_stripped_and_the_rest_parses() {
+        // `health_check` was removed in v0.9.1. The config still has to start
+        // (the owner is told, not stopped), so the mechanism under test is:
+        // find the key, drop it from the document, then let the strict parse
+        // run on what is left. Without the strip, `deny_unknown_fields` would
+        // refuse the whole file.
         let config = r#"
 [client]
 default_token = "t"
@@ -1331,84 +1309,34 @@ default_remote_addr = "example.com:2333"
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3, http_path = "/healthz" }
+health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3 }
 "#;
-        let cfg = Config::from_str(config).unwrap();
-        let hc = cfg
-            .client
-            .as_ref()
-            .unwrap()
-            .services
-            .get("test")
-            .unwrap()
-            .health_check
-            .as_ref()
-            .unwrap();
-        assert_eq!(hc.check_type, HealthCheckType::Http);
-        assert_eq!(hc.interval, 5);
-        assert_eq!(hc.timeout, 2);
-        assert_eq!(hc.max_failed, 3);
-        assert_eq!(hc.http_path, "/healthz");
-    }
-
-    #[test]
-    fn test_health_check_defaults() {
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-health_check = {}
-"#;
-        let cfg = Config::from_str(config).unwrap();
-        let hc = cfg
-            .client
-            .as_ref()
-            .unwrap()
-            .services
-            .get("test")
-            .unwrap()
-            .health_check
-            .as_ref()
-            .unwrap();
-        assert_eq!(hc.check_type, HealthCheckType::Tcp);
-        assert_eq!(hc.interval, DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
-        assert_eq!(hc.timeout, DEFAULT_HEALTH_CHECK_TIMEOUT_SECS);
-        assert_eq!(hc.max_failed, DEFAULT_HEALTH_CHECK_MAX_FAILED);
-        assert_eq!(hc.http_path, DEFAULT_HEALTH_CHECK_HTTP_PATH);
-    }
-
-    #[test]
-    fn test_health_check_rejected_on_udp_service() {
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.services.test]
-protocol = "udp"
-local_addr = "127.0.0.1:53"
-remote_bind_addr = "0.0.0.0:6053"
-health_check = { interval = 5 }
-"#;
-        // The reason matters: with the pre-0.8 `type` key this failed as an
-        // unknown field and never reached the health-check rule it tests.
-        let err = Config::from_str(config).unwrap_err().to_string();
+        let mut doc: toml::Value = toml::from_str(config).unwrap();
+        strip_removed_keys(&mut doc);
         assert!(
-            err.contains("health_check"),
-            "expected the health_check rule to reject this, got: {err}"
+            doc["client"]["services"]["test"]
+                .get("health_check")
+                .is_none(),
+            "the removed key must be gone before the strict parse sees it"
+        );
+        let cfg = Config::from_str(config).unwrap();
+        assert_eq!(
+            cfg.client
+                .as_ref()
+                .unwrap()
+                .services
+                .get("test")
+                .unwrap()
+                .local_addr,
+            "127.0.0.1:80",
+            "the rest of the service must parse unchanged"
         );
     }
 
     #[test]
-    fn test_health_check_rejects_zero_values() {
+    fn test_a_config_without_removed_keys_is_untouched() {
+        // The strip must not report (or remove) anything from a current config
+        // — otherwise every reload would log a warning that is not true.
         let config = r#"
 [client]
 default_token = "t"
@@ -1419,9 +1347,12 @@ default_remote_addr = "example.com:2333"
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-health_check = { interval = 0 }
 "#;
-        assert!(Config::from_str(config).is_err());
+        let mut doc: toml::Value = toml::from_str(config).unwrap();
+        let before = doc.clone();
+        strip_removed_keys(&mut doc);
+        assert_eq!(doc, before, "a current config must come out unchanged");
+        assert!(Config::from_str(config).is_ok());
     }
 
     #[test]

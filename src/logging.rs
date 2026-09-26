@@ -21,6 +21,7 @@
 
 use std::fmt;
 use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nu_ansi_term as ansi;
 use tracing::{Event, Level};
@@ -51,6 +52,51 @@ fn level_style(level: Level) -> ansi::Style {
         Level::INFO => ansi::Color::Green.normal(),
         Level::DEBUG => ansi::Color::Cyan.normal(),
         Level::TRACE => ansi::Color::Purple.normal(),
+    }
+}
+
+/// Reports a repeating condition loudly once, then quietly.
+///
+/// A condition that can repeat on every connection — a rejected token, a
+/// retry, a listener that ran out of file descriptors — must not produce a
+/// line per occurrence: at a thousand connections a minute the log *is* the
+/// outage, and the operator stops reading it. The first occurrence is reported
+/// at the level an operator acts on, every later one at `debug`, and
+/// [`RepeatNotice::clear`] resets it once the condition has gone away, so a
+/// new failure after a healthy period is loud again.
+///
+/// This is the whole of the aggregation rule for now: there is no windowed
+/// counter because, once per-connection failures are `debug`, no remaining
+/// `warn!`/`error!` site fires per connection in a healthy run — and the
+/// log-budget test (`tests/log_budget_test.rs`) is what keeps that true.
+#[derive(Debug, Default)]
+pub struct RepeatNotice {
+    reported: AtomicBool,
+}
+
+impl RepeatNotice {
+    /// A notice that has not reported anything yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    /// `true` on the first call, `false` on every later one.
+    pub fn first(&self) -> bool {
+        !self.reported.swap(true, Ordering::Relaxed)
+    }
+
+    /// Forget the previous occurrences: the next [`Self::first`] is `true`
+    /// again.
+    pub fn clear(&self) {
+        self.reported.store(false, Ordering::Relaxed);
+    }
+
+    /// Run `loud` on the first occurrence and `quiet` on the rest.
+    pub fn report<R>(&self, loud: impl FnOnce() -> R, quiet: impl FnOnce() -> R) -> R {
+        if self.first() { loud() } else { quiet() }
     }
 }
 
@@ -250,6 +296,22 @@ mod tests {
             level_style(Level::ERROR).prefix().to_string(),
             ansi::Style::new().prefix().to_string()
         );
+    }
+
+    #[test]
+    fn a_repeat_notice_is_loud_once_and_quiet_after() {
+        let notice = RepeatNotice::new();
+        let mut loud = 0;
+        let mut quiet = 0;
+        for _ in 0..5 {
+            notice.report(|| loud += 1, || quiet += 1);
+        }
+        assert_eq!(loud, 1, "the first occurrence must be the loud one");
+        assert_eq!(quiet, 4, "every later occurrence must be quiet");
+
+        notice.clear();
+        assert!(notice.first(), "a cleared notice is loud again");
+        assert!(!notice.first());
     }
 
     #[test]

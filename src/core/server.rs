@@ -3,6 +3,7 @@ use crate::common::helper::write_and_flush;
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
 use crate::config::{Config, ServerConfig, ServiceType};
+use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, Ack, Carrier, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello,
@@ -42,6 +43,24 @@ use crate::transport::kcp::KcpAcceptor;
 
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
+
+/// Process-wide rate limit for token rejections: a client that keeps retrying
+/// with the wrong token must not be able to fill the log (see `RepeatNotice`).
+static AUTH_FAILURES: RepeatNotice = RepeatNotice::new();
+
+/// Report a rejected token: once per process at `warn`, then at `debug`.
+fn report_auth_failure() {
+    AUTH_FAILURES.report(
+        || {
+            warn!(
+                "Rejected a control channel with a wrong token: the client's \
+                 `default_token` must match `[server].default_token`. Further \
+                 rejections are logged at debug level."
+            );
+        },
+        || debug!("Rejected a control channel with a wrong token"),
+    );
+}
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
@@ -403,6 +422,10 @@ async fn run_accept_loop(
     // Retry at least every 100ms
     let backoff_builder = ExponentialBuilder::default().with_max_delay(Duration::from_millis(100));
     let mut backoff = backoff_builder.build();
+    // A failing `accept` retries every 100ms. The first failure is the
+    // operator's (EMFILE means "raise the limit"); a hundred identical lines
+    // are not, and they would bury everything else.
+    let accept_notice = RepeatNotice::new();
 
     loop {
         tokio::select! {
@@ -411,7 +434,10 @@ async fn run_accept_loop(
                     Err(err) => {
                         if should_retry_accept(&err) {
                             if let Some(d) = backoff.next() {
-                                error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
+                                accept_notice.report(
+                                    || error!("Failed to accept: {:#}. Retry in {:?}...", err, d),
+                                    || debug!("Failed to accept: {:#}. Retry in {:?}...", err, d),
+                                );
                                 time::sleep(d).await;
                             } else {
                                 error!("Too many retries. Aborting...");
@@ -426,6 +452,7 @@ async fn run_accept_loop(
                     }
                     Ok((conn, addr)) => {
                         backoff = backoff_builder.build();
+                        accept_notice.clear();
 
                         // Transport selector + optional Noise handshake,
                         // under the handshake timeout.
@@ -450,17 +477,21 @@ async fn run_accept_loop(
                                             )
                                             .await
                                             {
-                                                error!("{:#}", err);
+                                                // One connection's failure:
+                                                // a scanner, a peer that hung
+                                                // up, a version mismatch. The
+                                                // peer logs its own side.
+                                                debug!("{:#}", err);
                                             }
                                         }.instrument(info_span!("connection", %addr)));
                                     }
                                     Err(e) => {
-                                        error!("{:#}", e);
+                                        debug!("{:#}", e);
                                     }
                                 }
                             }
                             Err(e) => {
-                                error!("Transport handshake timeout: {}", e);
+                                debug!("Transport handshake timeout: {}", e);
                             }
                         }
                     }
@@ -546,6 +577,7 @@ async fn do_control_channel_handshake(
             hex::encode(session_key),
             hex::encode(d)
         );
+        report_auth_failure();
         bail!("Authentication failed");
     }
     write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
@@ -610,7 +642,7 @@ async fn do_control_channel_handshake(
     {
         let mut h = control_channels.write().await;
         if h.remove1(&service_digest).is_some() {
-            warn!(service = %reg.name, "Dropping previous control channel");
+            info!(service = %reg.name, "Dropping previous control channel");
         }
     }
 
@@ -1025,7 +1057,7 @@ impl ControlChannelHandle {
         // Cache some data channels for later use
         for _i in 0..pool_size {
             if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
+                debug!("Failed to request data channel {}", e);
             }
         }
 
@@ -1050,7 +1082,9 @@ impl ControlChannelHandle {
         let control_task = tokio::spawn(
             async move {
                 if let Err(err) = ch.run().await {
-                    error!("{:#}", err);
+                    // The client logs the cause of its control channel ending;
+                    // the server's copy is per-session detail.
+                    debug!("{:#}", err);
                 }
             }
             .instrument(Span::current()),
@@ -1142,7 +1176,9 @@ impl ControlChannel {
                     match val {
                         Some(_) => {
                             if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
-                                error!("{:#}", e);
+                                // The client is gone: one session's end. Its
+                                // own log says why.
+                                debug!("{:#}", e);
                                 break;
                             }
                         }
@@ -1153,7 +1189,7 @@ impl ControlChannel {
                 },
                 () = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
                             if let Err(e) = self.write_and_flush(&heartbeat).await {
-                                error!("{:#}", e);
+                                debug!("{:#}", e);
                                 break;
                             }
                 }
@@ -1198,6 +1234,7 @@ where
     // Retry at least every 1s
     let backoff_builder = ExponentialBuilder::default().with_max_delay(Duration::from_secs(1));
     let mut backoff = backoff_builder.build();
+    let listen_notice = RepeatNotice::new();
 
     'pool: loop {
         tokio::select! {
@@ -1208,9 +1245,13 @@ where
             _ = &mut control_task => break,
             val = l.accept() => match val {
                 Err(e) => {
-                    // `l` is a TCP listener so this must be a IO error
-                    // Possibly a EMFILE. So sleep for a while
-                    error!("{}. Sleep for a while", e);
+                    // `l` is a TCP listener so this must be an IO error —
+                    // possibly EMFILE, which is the operator's problem and
+                    // therefore loud once, then debug while it retries.
+                    listen_notice.report(
+                        || error!("{e}. Sleep for a while"),
+                        || debug!("{e}. Sleep for a while"),
+                    );
                     if let Some(d) = backoff.next() {
                         time::sleep(d).await;
                     } else {
@@ -1220,6 +1261,7 @@ where
                     }
                 }
                 Ok((mut incoming, addr)) => {
+                    listen_notice.clear();
                     // For every visitor, request to create a data channel:
                     // one per stripe when the visitor connection is striped.
                     for _ in 0..stripe_count {
@@ -1482,7 +1524,7 @@ where
                     break;
                 };
                 if let Err(e) = write_and_flush(&mut conn, &cmd).await {
-                    error!("Failed to init UDP channel: {:#}", e);
+                    debug!("Failed to init UDP channel: {:#}", e);
                     continue;
                 }
                 let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);

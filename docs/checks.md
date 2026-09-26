@@ -154,7 +154,30 @@ job), `just py-lint` (both ruff gates, also in the pre-commit gate),
 `just soak-plot` (charts + markdown tables from the latest results file),
 `just soak-check` (the gate: latest results vs the previous release's file;
 `--screen <file>` for a development A/B verdict), `just container` (scratch
-image).
+image), `just interop` (the interop matrix, below).
+
+## Outside the chain: the interop matrix (`just interop`)
+
+Every other test compiles **both** ends from the working tree, so no gate in
+the chain can see a wire-format break: a change that stops this build from
+talking to the previous release passes all of them. `just interop` closes that
+hole by running a real server and a real client as subprocesses with one of
+them the *released asset* — a binary built from today's tree cannot test
+yesterday's protocol.
+
+`benches/scripts/interop/fetch_old.py` downloads the newest release (asset for
+this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
+release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
+`cargo test --test interop_test`. Three cases: old server + new client forwards
+traffic, new server + old client forwards traffic, and an old server refuses an
+unknown dialect on that one connection yet keeps serving valid clients.
+
+It is **not** part of `just check` or CI: it needs network access and a GitHub
+release asset, and a CI runner has neither the previous release nor a reason to
+trust one. It is a local and pre-release step — `docs/release.md` lists it in
+the tag ritual, and `tests/interop_test.rs` **skips loudly** (never silently)
+when `MOLEHILL_OLD_BIN` is unset, so a plain `cargo test` stays honest about
+what it did not check.
 
 ## When a gate blocks you
 
