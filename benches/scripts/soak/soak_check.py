@@ -25,6 +25,7 @@ believed if the run is complete and was measured on the right endpoint.
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import lib
@@ -60,6 +61,27 @@ COVERAGE_SERIES = {
     "tcp_churn": "churn_setup_ms",
     "udp_session": "rtt_udp_ms",
 }
+# A stage's bulk intervals are the ones timestamped inside its window. The
+# runner marks `t_start` *before* the spine starts, so no interval of a stage
+# can precede it — and allowing a tolerance below `t_start` would credit a dead
+# stage with the previous stage's dying spine (measured: the frozen-commit
+# sweep's `jitter` stage read "2 intervals" that way, and both samples were the
+# `rate20` tail at `t_start - 1.8 s` and `-0.8 s`; the jitter spine itself
+# recorded none). The window is inclusive at the right edge because a stage's
+# last interval can be emitted a fraction of a second after its nominal end.
+
+
+def min_bulk_intervals(secs: float) -> int:
+    """The fewest bulk intervals a stage of this length may carry and count.
+
+    The spine emits one interval per second, so a stage that ran its bulk load
+    carries roughly `secs` minus a warmup of them; the floor is deliberately
+    far below that so ordinary variance never trips it, and only a spine that
+    did not run at all is caught. One interval per 30 s, minimum one, separates
+    a dead stage (zero) from a loaded one (91-294 on the frozen-commit sweep),
+    and the healthy stages of all four tools sit 17-37x above it.
+    """
+    return max(1, int(secs // 30))
 
 
 def env_pct(name: str) -> float:
@@ -232,6 +254,48 @@ def check_run(cur: dict, rep: Report) -> None:
         check_slo(name, t, rep, slo_p99, slo_err)
 
 
+def check_bulk_per_stage(name: str, t: dict, rep: Report) -> None:
+    """Every stage must carry the bulk spine the coverage claims.
+
+    A `throughput_bulk_gbps` count over the whole run hides a hole the size of
+    one stage: the frozen-commit sweep's `jitter` stage recorded **no**
+    intervals at all (the bulk client could not dial the exposed port and the
+    retry timed out) and the run still read "complete (95660 samples, 8
+    stage(s))", because the global count was 849 and every other stage carried
+    its spine. A stage is where the bulk load either ran or did not, so the
+    check is per stage against a floor that scales with the stage length, and a
+    stage that recorded why it failed reports that reason rather than a bare
+    zero.
+
+    The intervals are collected once and then counted per stage: the series
+    holds tens of thousands of samples and the naive form rescanned all of them
+    for every stage.
+    """
+    if not (t.get("coverage") or {}).get("tcp_bulk"):
+        return
+    stamps = [
+        r.get("t", 0)
+        for r in t.get("series", [])
+        if r.get("metric") == "throughput_bulk_gbps"
+    ]
+    for st in t.get("stages", []):
+        t0 = st.get("t_start")
+        if t0 is None:
+            continue  # no `t_start`: the stage cannot be attributed to
+        t1 = t0 + float(st.get("secs", 0))
+        n = sum(1 for ts in stamps if t0 <= ts <= t1)
+        floor = min_bulk_intervals(float(st.get("secs", 0)))
+        if n >= floor:
+            continue
+        reason = st.get("bulk_error") or f"{n} interval(s) in {st.get('secs')}s"
+        detail = st.get("bulk_client_error")
+        rep.fail(
+            f"{name} {st.get('stage')}: the bulk spine carried {n} interval(s), "
+            f"below the {floor} a {st.get('secs')}s stage needs "
+            f"({reason}{'; ' + detail if detail else ''})"
+        )
+
+
 def check_completeness(name: str, t: dict, rep: Report) -> None:
     """Every coverage axis the test claims must have carried samples."""
     if not t.get("coverage"):
@@ -249,6 +313,7 @@ def check_completeness(name: str, t: dict, rep: Report) -> None:
             f"{name}: complete ({len(t['series'])} samples, "
             f"{len(t.get('stages', []))} stage(s))"
         )
+    check_bulk_per_stage(name, t, rep)
 
 
 def check_endpoints(name: str, t: dict, rep: Report) -> None:
@@ -555,7 +620,11 @@ def screen_slow_visitor(rounds: list) -> None:
     states = [p.get("slow_visitor_state") for r in rounds for p in r["pair"]]
     if not any(states):
         return
-    counts = {s: states.count(s) for s in sorted(set(states)) if s}
+    # One pass, not `states.count(s)` per distinct state: the list holds two
+    # entries per round, so the old form was quadratic in the round count for
+    # no reason (a screen run is short today, but this reads a per-round table
+    # and had no bound).
+    counts = {s: n for s, n in sorted(Counter(states).items()) if s}
     print(f"        slow visitor (SOAK_SLOW_VISITOR_BPS): {counts}")
     for reason in sorted(
         {

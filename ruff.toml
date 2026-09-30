@@ -8,6 +8,8 @@ line-length = 88
 [lint]
 extend-select = [
     "E402",   # sys.path.insert before imports is the bench-lib pattern
+    "E501",   # line length: the formatter wraps code, but a docstring or URL
+              # can still run long, and one of them had (lib.py, 94 chars)
     "I",      # import sorting
     "UP",     # pyupgrade
     "SIM",    # simplify
@@ -28,6 +30,11 @@ extend-select = [
     "FA",     # from __future__ placement
     "FLY",    # f-string join instead of a str.join call
     "PERF",   # perflint's loop-invariant checks
+    "DTZ",    # naive datetimes: these scripts timestamp runs and compare them
+    "TID",    # a relative import would break the `uv run <script>` entry shape
+    "PIE",    # misc dead code (useless `pass`, unnecessary `map`, ...)
+    "PGH",    # blanket `# type: ignore` (waive per code, never per file)
+    "LOG",    # logging misuse in the shared bench lib
 ]
 
 # Waivers — repo-wide only for the one property that is genuinely true of
@@ -47,6 +54,11 @@ extend-select = [
 #   rest to inference; ANN001-003 would demand annotations on every parameter.
 # - T20: every `print` here is deliberate output (the runner logs live, the
 #   plotter emits markdown, the gate emits verdicts).
+# - COM812 (trailing comma): ruff's own formatter documents it as a conflicting
+#   rule and prints a warning when both are enabled; it rewrites exactly the
+#   files `ruff format` owns, so the lint gate and the format gate fight over
+#   the tree. The formatter already inserts a trailing comma where its own
+#   style wants one (magic trailing comma), so nothing is lost.
 # - BLE001's five waivers live inline at their sites, including three inside
 #   the `PROBE_SRC` string that ruff cannot see (soak.py) -- that code is
 #   exec'd in a separate process on purpose (GIL isolation) and its blind

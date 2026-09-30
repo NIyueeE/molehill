@@ -113,9 +113,12 @@ stage its first tens of seconds. Measured with **no tool in the path at all**
 (htb + netem on `lo`, 20 bulk streams killed as the qdisc changed): a fresh
 connect timed out after 10.5 s and the next round trip took 3.5-6.7 s,
 reaching the steady state only ~15 s in. So the harness waits, at the *old*
-shaper, until the tool's netem queue has been empty **and** its bulk port has
-had no established connection, both for two consecutive polls, bounded by
+shaper, until the tool's netem queue has been empty **and** its throughput port
+has had no established connection, both for two consecutive polls, bounded by
 `SOAK_DRAIN_BUDGET` (30 s) — and only then applies the next stage's shaping.
+Three predicate variants were measured in the 2026-09-28 cycle and this is the
+one that produced a `rate20` spine; the two that read better on paper are
+recorded in `Shaper::_busy_sockets`, so the choice is not re-derived by guess.
 The wait is not part of any stage's window, and an expired budget is logged
 rather than absorbed. For the same reason the single-test `iperf3` backend is
 restarted before every stage's bulk attempt and not only after a failed one: a
@@ -269,7 +272,7 @@ configuration only. Treat them as directional, and re-measure your own case.
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
-| `[server.data].stripe_count` | `K = 4` (experimental; a v4 session is served unstriped, so a 0.10 client does not get it — see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
+| `[server.data].stripe_count` | `K = 4` (a striped group spreads one visitor connection over K data channels; see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
 
 Which setting to pick, and why: [configuration.md](configuration.md#choosing-your-configuration-decision-tree).
 

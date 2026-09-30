@@ -969,7 +969,7 @@ WantedBy=multi-user.target
 - **A service is registered for as long as its client runs.** There is no health check and no health-driven deregistration: `local_addr` does not have to be up when the client starts, and nothing is withdrawn from the server when it goes down.
 - A visitor whose request cannot be forwarded to `local_addr` (connection refused, timeout, ...) gets a **failed request for that connection only** — the same thing any reverse proxy in front of a dead backend does. The visitor's client sees the connection close or reset; the reason is logged on the client (`service=<name>`). Other visitors and every other service of that client are unaffected.
 - The consequence for operations: recovering a backend needs no action from molehill. Start it whenever you like, and the already-registered service forwards again — and a backend that flaps does not cost the client a re-registration cycle.
-- **Upgrading from 0.9.0 or earlier:** the `health_check` key was removed. Delete it from `[client.services.<name>]`. A config that still carries it starts and logs a warning in this release; from the next release the key is an error.
+- **Upgrading from 0.9.0 or earlier:** the `health_check` key was removed. Delete it from `[client.services.<name>]` — a config that still carries it does not start, and the refusal names the key and what to write instead (see the migration table above).
 
 ### UDP services
 

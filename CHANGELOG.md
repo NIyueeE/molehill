@@ -120,6 +120,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a reference peer's swing is reported with its numbers instead of blocking
   this release. Anyone reading a `soak-check` verdict, or reproducing one, is
   affected; the reasoning each fix rests on is in HANDOFF.md.
+- **The gate checks the bulk spine per stage, not per run.** `just soak-check`
+  used to ask only that a stage-scheduled run carry *some* throughput samples
+  somewhere; a stage whose bulk probe never connected reported "complete"
+  because the other stages had plenty. Completeness now counts each stage's
+  intervals inside its own window against a floor of one per 30 s (minimum
+  one), and reports the recorded reason for a stage that carried none. The
+  clean-tree verdict in a results file is fixed in the same pass: the pathspec
+  that excludes the run's own output from `git status` never matched, so every
+  artifact recorded `tree_clean: false` whatever the tree looked like — a field
+  that had quietly stopped meaning anything.
 - **The host key is now stable, so the comparison half of the gate can run.**
   Results carried the container hostname as the host identity, which changes on
   every container restart while the hardware does not — so two runs on the same
@@ -332,11 +342,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain and FIN retransmissions shared the new, slower queue with the next
   stage's handshake. Measured with no tool in the path at all, a fresh connect
   timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
-  now waits at the *old* shaper until the netem queue is empty and the bulk
-  port has no established connection (bounded by `SOAK_DRAIN_BUDGET`, 30 s),
-  restarts the single-test `iperf3` backend before every stage's bulk attempt,
-  and records the client's own failure text instead of a bare exit code. See
-  `docs/benchmarks.md`, "The stage schedule".
+  now waits at the *old* shaper until the netem queue is empty and the
+  throughput port has no established connection (bounded by
+  `SOAK_DRAIN_BUDGET`, 30 s), restarts the single-test `iperf3` backend
+  before every stage's bulk attempt, and records the client's own failure text
+  instead of a bare exit code. See `docs/benchmarks.md`, "The stage schedule".
 
 - **A `client`-only build compiles again, and so does `client,kcp`.** Two
   `#[cfg]` gates were left behind when the v3 path was deleted, both by

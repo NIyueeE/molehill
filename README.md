@@ -63,44 +63,25 @@ recovering path is part of the measurement.
 ### Choosing a configuration
 
 The defaults — `mode = "multiplex"`, `max_tunnels = 4`, `carrier = "tcp"`,
-plain transport — are the right starting point for almost everyone. Deviate
-only when the tree says so. How to apply each choice: the `[client.data]` block
-holds the per-client defaults, and every service can override `mode` /
-`carrier` on its own `[client.services.<name>]` block — one client
-can mix a multiplexed interactive service with a `direct` bulk service, and
-can even point individual services at different molehill servers via
-`remote_addr`. The `[transport]` block is in
-[Configuration](docs/configuration.md); Noise keypairs in
-[Transport](docs/transport.md).
+plain transport — are the right starting point for almost everyone; deviate
+only when the tree says so. Three questions decide the rest, and each answer is
+one line in `[client.data]` or `[client.services.<name>]`: **encryption** (set
+`[client.transport] type = "noise"` and place the keys, see
+[Transport](docs/transport.md)); **concurrency** (raise `max_tunnels` — each
+tunnel carries ~64 concurrent connections, so `8` ≈ 512 — or spread one
+connection over `[server.data] stripe_count` parallel channels); and **the
+path** (A/B `carrier = "kcp"` when TCP data tunnels are throttled or you need
+latency-first UDP; keep `max_tunnels >= 4` on lossy paths so the pool aggregates
+and isolates head-of-line blocking).
 
-**How to choose, step by step.** Start from the defaults and answer three
-questions about your workload; change one thing at a time and re-test:
-
-1. **Do you need encryption?** Yes → set `[client.transport] type =
-   "noise"` and place the keys. No → keep `"plain"`.
-2. **One user or many, and how many concurrent connections?** A single
-   long-lived session (SSH, one Minecraft player) → `direct` or the default
-   mux both work; mux saves NAT mappings at low concurrency too. Many
-   users / churn / multiple services → keep or raise `max_tunnels` (each
-   tunnel carries ~64 concurrent connections before the yamux ceiling —
-   `max_tunnels = 8` ≈ 512). One connection can also be spread over K
-   parallel data channels with `[server.data] stripe_count`, but a 0.10
-   client is served unstriped today — see
-   [Configuration](docs/configuration.md).
-3. **What does the path look like, and do you forward UDP?** If TCP data
-   tunnels are blocked or throttled, or you need latency-first UDP at high
-   delay, A/B `carrier = "kcp"`. Otherwise keep the TCP carrier. For
-   lossy/wifi paths keep `max_tunnels >= 4` — the pool then aggregates and
-   isolates head-of-line blocking — and pick it for the per-tunnel connection
-   ceiling (`max_tunnels = 1 -> 64` connections, `max_tunnels = 4 -> 256`).
-
-Two numbers decide between these options, and they are best measured on your
+Two numbers decide between those options, and they are best measured on your
 own path rather than read off a table: the **sustainable load** (how many bulk
 streams the tool carries while a fresh interactive connection still meets the
-50 ms and 0.5 % errors) and the **cost at the operating point** (CPU-seconds per carried
-Gbit/s). What the published runs measured, and how to run the same comparison
-on your own hardware, is in [Benchmarks](docs/benchmarks.md); the settings
-themselves are in [Configuration](docs/configuration.md#choosing-your-configuration-decision-tree).
+50 ms and 0.5 % errors) and the **cost at the operating point** (CPU-seconds
+per carried Gbit/s). How to run that comparison is in
+[Benchmarks](docs/benchmarks.md); the settings themselves — including the
+step-by-step decision tree — are in
+[Configuration](docs/configuration.md#choosing-your-configuration-decision-tree).
 
 ### molehill vs the plain-TCP peers
 
@@ -131,46 +112,45 @@ spine produced no intervals at all, so its interactive number was measured
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | 6.5 | ‡7567 | 1335 | 2847 | ‡7686 | 6335 | †6369 | 6.0 |
-| frp 0.71.0 | **2.7** | ‡5638 | 4045 | ‡5966 | ‡8451 | 1940 | 3061 | **2.8** |
-| rathole 0.5.0 | 51 | ‡6755 | **1327** | ‡6270 | ‡7280 | 2367 | **2654** | 54 |
-| nps 0.26.10 | 104 | **874** | 1136 | 2431 | ‡7713 | **322** | 6419 | 106 |
+| **molehill (mux)** | 9.6 | ‡6382 | 1301 | 3447 | 2485 | ‡†3690 | 1275 | 6.6 |
+| frp 0.71.0 | **2.8** | ‡6562 | 5454 | ‡6357 | ‡8211 | 3279 | ‡7741 | **2.9** |
+| rathole 0.5.0 | 73 | ‡6134 | **1323** | ‡6203 | ‡7455 | 2018 | 5326 | 68 |
+| nps 0.26.10 | 70 | **858** | 1146 | 2859 | ‡7036 | 2669 | †220 | 67 |
 
 **Bulk throughput per stage** (Gbit/s, the stage's peak interval): molehill
-**22.8** on clean -> 3.03 at rtt100 -> 5.39 at loss1 -> 2.41 at loss5 ->
-**0.343 at rate100** -> **0.236 at rate20** -> no sample at jitter -> **22.8 on
-the return to clean**; frp 6.28 -> 3.03 -> 5.22 -> 3.54 -> 0.459 -> 0.296 ->
-0.212 -> 6.28; rathole 23.9 -> 3.04 -> 5.30 -> 3.27 -> 0.461 -> 0.127 -> 0.097
--> 23.9; nps 0.414 -> 1.50 -> 0.823 -> 1.86 -> 0.425 -> 0.124 -> 0.200 -> 0.414.
+**21.7** on clean -> 2.89 at rtt100 -> 5.35 at loss1 -> 2.43 at loss5 -> 0.816
+at rate100 -> **no sample at rate20** -> no sample at jitter -> **23.2 on the
+return to clean**; frp 7.09 -> 2.77 -> 5.34 -> 3.33 -> 0.535 -> 0.000 -> 0.000
+-> 6.78; rathole 22.9 -> 3.03 -> 5.33 -> 3.49 -> 0.712 -> 0.000 -> 0.000 ->
+24.0; nps 0.642 -> 1.53 -> 1.25 -> 1.07 -> 0.356 -> 0.000 -> no sample -> 0.453.
 
 The delay- and loss-shaped cells are quotable: **not one zero-byte interval**
 for molehill, frp or rathole across `rtt100`, `loss1` and `loss5`. The rate
-cells are the degenerate side, and they are flagged rather than hidden — the
-shaper holds each interval's bytes past the interval's own accounting window,
-so 28 % of molehill's `rate100` intervals read zero (34 % frp, 47 % rathole,
-49 % nps) and 64 % of its `rate20` ones (81 %, 81 %, 85 %). There the *peak* is
-the measurement and the median is 0; the paragraph above quotes the peak and
-says so. † molehill's `jitter` spine never connected at all — its client
-reported `Connection timed out` dialing the tool's exposed port, the harness
-waited the stage out, and the interactive number in the table is the load-free
-one. That cell is a hole, not a result.
+cells are the degenerate side, and in this run they are degenerate for every
+arm at once — the shaper holds each interval's bytes past the interval's own
+accounting window, so 59 % of molehill's `rate100` intervals read zero (73 %
+frp, 78 % rathole, 67 % nps), and every `rate20` and `jitter` interval that
+arrived at all read zero. Where the peak is 0 for every tool there is no
+contrast to read, so those cells are reported as `0.000` rather than drawn as a
+comparison. `†` marks a **live-tool, dead-probe** cell: molehill's `rate20`
+spine never connected (`control socket has closed unexpectedly`) and nps's
+`jitter` one failed the same way, so the harness waited the stage out. Their
+interactive numbers are real, but they describe that path with no bulk load on
+it, which is not the pair the other stages report.
 
-**What these shapes say.** Every tool degrades under a bad path, and every
-tool recovers on the return to clean — that recovery is what the last band
-measures, and a tool that stayed wedged would be a finding. On the clean stage
-molehill and rathole carry the same bulk (22.8 against 23.9 Gbit/s, frp 6.3 and
-nps 0.4) while a fresh interactive connection costs 6.5 ms for molehill against
-frp's 2.7, rathole's 51 and nps's 104. The shaped interactives are worst
-observations from tens of samples, and they move between runs of unchanged
-binaries by more than the code moves them, so they are context rather than a
-verdict: molehill is level with rathole on `loss1` (1335 against 1327 ms),
-ahead of frp on `loss5` (2847 against 5966) and behind nps on `rtt100` (7567
-against 874) and on `rate20` (6335 against 322). All four tools wedge on
-`rate100` (molehill's 5 flat segments, longest 54 s) and three of the four on
-`rtt100` — that is the shaped path, not one tool. The honest losses are carried
-in the table rather than smoothed over: frp's clean-stage interactive cost is
-2.7 ms against molehill's 6.5, and molehill's `jitter` cell has no bulk sample
-at all.
+**What these shapes say.** Every tool degrades under a bad path, and every tool
+recovers on the return to clean — that recovery is what the last band measures,
+and a tool that stayed wedged would be a finding. On the clean stage molehill
+and rathole carry the same bulk (21.7 against 22.9 Gbit/s; frp 7.1, nps 0.6)
+while a fresh interactive connection costs 9.6 ms for molehill against frp's
+2.8, rathole's 73 and nps's 70. The shaped interactives are worst observations
+from tens of samples, and they move between runs of unchanged code by more than
+the code moves them: molehill's `rate100` read 7686 ms in the previous sweep of
+this method and 2485 ms here, frp's `jitter` 3061 and 7741. They are context,
+not a verdict. All four tools wedge on `rate100` and three of the four on
+`rtt100` — the shaped path, not one tool. The honest losses are carried in the
+table rather than smoothed over: frp's clean-stage interactive cost is 2.8 ms
+against molehill's 9.6, and one bulk cell per run comes back empty (`†`).
 
 The peers are driven by the same workload and charted in the same panels; the
 drift axis (open fds, RSS and CPU slopes over the run) is in
@@ -270,8 +250,6 @@ scenarios.
 
 ## Deployment
 
-### Binary
-
 Download a pre-built binary for your platform from the
 [release page](https://github.com/NIyueeE/molehill/releases), or
 [build from source](./docs/build-guide.md) for other platforms and
@@ -282,32 +260,14 @@ minimal-sized binaries.
 ./molehill client.toml   # on the device behind NAT
 ```
 
-### systemd
-
-The [systemd units](./docs/configuration.md#systemd) show how to run molehill as a
-systemd service, both as root and rootless, including multiple instances.
-
-### Container
-
-Official multi-arch images (linux/amd64, linux/arm64) are published to
-`ghcr.io/niyueee/molehill`. The image is a single static musl binary on
-`scratch` (~1.2 MiB), runs as non-root UID 1000, and includes the same default
-feature set as the regular release builds (multiplexing and the `kcp` carrier
-included).
-
-```bash
-docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
-  ghcr.io/niyueee/molehill:latest server.toml
-```
-
-The image contains no configuration — mount your config file and pass its
-name as the argument. Two container-specific notes: the process runs as UID
-1000 (so mount the config world-readable, and prefer ports ≥ 1024), and under
-bridge networking a `carrier = "kcp"` service needs its data-plane port
-published over **UDP** as well. See the [container deployments](./docs/configuration.md#container)
-for Docker Compose (`compose.yaml` / `compose.bridge.yaml`) and Podman
-Quadlet (`molehill-server.container` / `molehill-client.container`)
-deployments.
+How to run it as a service is in [Configuration](./docs/configuration.md),
+which owns the [systemd units](./docs/configuration.md#systemd) (root and
+rootless, multiple instances) and the
+[container deployments](./docs/configuration.md#container) — the published
+`ghcr.io/niyueee/molehill` images (linux/amd64, linux/arm64; a static musl
+binary on `scratch`), the non-root UID they run as, and the one
+container-specific note that a `carrier = "kcp"` service needs its data-plane
+port published over **UDP**.
 
 ## Documentation
 

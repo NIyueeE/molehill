@@ -61,35 +61,19 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 ### 如何选配置
 
 默认值——`mode = "multiplex"`、`max_tunnels = 4`、`carrier = "tcp"`、
-明文传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。怎么落地:
-全局默认在 `[client.data]`,每个服务可在自己的 `[client.services.<name>]` 上
-单独覆盖 `mode` / `carrier`——同一客户端可以混跑 mux 交互服务与 `direct`
-大流量服务,还能用 `remote_addr` 把个别服务指向不同的 molehill 服务端。
-`[transport]` 见[配置](docs/configuration.zh.md),noise 密钥见
-[传输](docs/transport.zh.md)。
-
-**怎么选:分步走。** 从默认值出发,回答三个关于你负载的问题;一次只改一项,
-改完在**你自己的路径上**复测:
-
-1. **需要加密吗?** 需要 → 设 `[client.transport] type = "noise"` 并放置
-   密钥。不需要 → 保持 `"plain"`。
-2. **一个用户还是很多用户,并发连接多少?** 单条长连接(SSH、单个 Minecraft
-   玩家)→ `direct` 与默认 mux 都可行;低并发下 mux 同样省 NAT 映射。多用户 /
-   高连接频率 / 多服务 → 保持或提高 `max_tunnels`(每条隧道在 yamux 上限前
-   约承载 64 条并发连接——`max_tunnels = 8` ≈ 512)。`[server.data]
-   stripe_count` 可把一条连接摊到 K 条并行数据通道,但 0.10 客户端目前会被以
-   非条带方式服务——见[配置文档](docs/configuration.zh.md)。
-3. **路径什么状况,是否转发 UDP?** 若 TCP 数据隧道被封锁/限速,或需要高延迟
-   下的延迟优先 UDP,值得 A/B 试 `carrier = "kcp"`。否则保持 TCP 载体。
-   有损/wifi 路径保持 `max_tunnels >= 4`:池由此聚合并隔离队头阻塞;
-   它按"每隧道连接上限"选(`max_tunnels = 1 -> 64` 条连接,
-   `max_tunnels = 4 -> 256`)。
+明文传输——对绝大多数人是正确的起点;只有树上出现明确分支时才偏离。其余由
+三个问题决定,每个答案就是 `[client.data]` 或 `[client.services.<name>]` 里的
+一行:**是否加密**(设 `[client.transport] type = "noise"` 并放置密钥,见
+[传输](docs/transport.zh.md));**并发多少**(提高 `max_tunnels`——每条隧道约
+承载 64 条并发连接,`8` ≈ 512——或用 `[server.data] stripe_count` 把一条连接
+摊到多条并行通道);**路径什么状况**(TCP 数据隧道被限速、或需要延迟优先的
+UDP 时值得 A/B `carrier = "kcp"`;有损路径保持 `max_tunnels >= 4`,让池聚合
+并隔离队头阻塞)。
 
 在这两个数之间做取舍,最好在**你自己的路径上**测,而不是从表里读:
 **可持续负载**(交互流仍满足 50 ms SLO 时,工具能扛多少条 bulk 流)与
-**工作点成本**(每承载 1 Gbit/s 的 CPU 秒)。已发布的运行测到了什么、各项配置
-选择的实测代价、以及如何在自己的机器上跑同一套对比,见
-[基准测试](docs/benchmarks.zh.md);各设置本身见
+**工作点成本**(每承载 1 Gbit/s 的 CPU 秒)。如何跑这套对比见
+[基准测试](docs/benchmarks.zh.md);各设置本身(含分步决策树)见
 [配置文档](docs/configuration.zh.md#选择配置决策树)。
 
 ### molehill vs 明文 TCP 对端
@@ -116,37 +100,37 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 | 工具 | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean(回归) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | 6.5 | ‡7567 | 1335 | 2847 | ‡7686 | 6335 | †6369 | 6.0 |
-| frp 0.71.0 | **2.7** | ‡5638 | 4045 | ‡5966 | ‡8451 | 1940 | 3061 | **2.8** |
-| rathole 0.5.0 | 51 | ‡6755 | **1327** | ‡6270 | ‡7280 | 2367 | **2654** | 54 |
-| nps 0.26.10 | 104 | **874** | 1136 | 2431 | ‡7713 | **322** | 6419 | 106 |
+| **molehill (mux)** | 9.6 | ‡6382 | 1301 | 3447 | 2485 | ‡†3690 | 1275 | 6.6 |
+| frp 0.71.0 | **2.8** | ‡6562 | 5454 | ‡6357 | ‡8211 | 3279 | ‡7741 | **2.9** |
+| rathole 0.5.0 | 73 | ‡6134 | **1323** | ‡6203 | ‡7455 | 2018 | 5326 | 68 |
+| nps 0.26.10 | 70 | **858** | 1146 | 2859 | ‡7036 | 2669 | †220 | 67 |
 
-**Bulk 吞吐逐阶段**(Gbit/s,各阶段的峰值区间):molehill clean **22.8** → rtt100
-3.03 → loss1 5.39 → loss5 2.41 → **rate100 0.343** → **rate20 0.236** → jitter
-无样本 → **回归 clean 22.8**;frp 6.28 → 3.03 → 5.22 → 3.54 → 0.459 → 0.296 →
-0.212 → 6.28;rathole 23.9 → 3.04 → 5.30 → 3.27 → 0.461 → 0.127 → 0.097 →
-23.9;nps 0.414 → 1.50 → 0.823 → 1.86 → 0.425 → 0.124 → 0.200 → 0.414。
+**Bulk 吞吐逐阶段**(Gbit/s,各阶段的峰值区间):molehill clean **21.7** → rtt100
+2.89 → loss1 5.35 → loss5 2.43 → rate100 0.816 → **rate20 无样本** → jitter
+无样本 → **回归 clean 23.2**;frp 7.09 → 2.77 → 5.34 → 3.33 → 0.535 → 0.000 →
+0.000 → 6.78;rathole 22.9 → 3.03 → 5.33 → 3.49 → 0.712 → 0.000 → 0.000 →
+24.0;nps 0.642 → 1.53 → 1.25 → 1.07 → 0.356 → 0.000 → 无样本 → 0.453。
 
-延迟档与丢包档现在可引用:molehill、frp、rathole 在 `rtt100`、`loss1`、`loss5`
-上**没有任何一个零字节区间**。限速档是不可引用的一侧,而且被标出来而不是被藏
-起来——整形器会把每个区间的字节推过该区间自己的记账窗口,所以 molehill 的
-`rate100` 有 28% 的区间读数为零(frp 34%、rathole 47%、nps 49%),`rate20` 有
-64%(81%、81%、85%)。那里可引用的是**峰值**,中位数是 0;上面那段引的就是峰值,
-并且说明了这一点。† molehill 的 `jitter` 脊柱根本没连上:它的客户端在拨工具暴
-露端口时报 `Connection timed out`,harness 等满该阶段,表里的交互数字因此是无
-负载的那个。那一格是空洞,不是结果。
+延迟档与丢包档可引用:molehill、frp、rathole 在 `rtt100`、`loss1`、`loss5`
+上**没有任何一个零字节区间**。限速档是不可引用的一侧,而这一轮它对**所有**工具
+同时退化——整形器会把每个区间的字节推过该区间自己的记账窗口,所以 molehill 的
+`rate100` 有 59% 的区间读数为零(frp 73%、rathole 78%、nps 67%),而所有真正
+到达的 `rate20` 与 `jitter` 区间读数全为零。当每个工具的峰值都是 0 时,这一格
+没有可比性,于是它被如实报成 `0.000`,而不是画成一张对比图。`†` 表示**工具活着、
+探针死了**:molehill 的 `rate20` 脊柱根本没连上(`control socket has closed
+unexpectedly`),nps 的 `jitter` 同样失败,harness 只能等满该阶段。它们的交互
+数字是真实的,但描述的是没有 bulk 负载的那条路径,和其他档报的不是同一对数字。
 
-**这些形状说明什么。** 每个工具在劣化档上都退化、在回归 clean 档上都恢复
-——最后一段测的就是这个恢复;一个保持 wedge 的工具就是一个发现。clean 档上
-molehill 与 rathole 的 bulk 相同(22.8 对 23.9 Gbit/s,frp 6.3,nps 0.4),而一次
-全新交互连接的代价 molehill 是 6.5 ms,frp 2.7,rathole 51,nps 104。整形档的
-交互数字是几十个样本里的最差观测,而且**未改动二进制之间它们本身的移动就超过
-代码能带来的移动**,所以那些格子是背景不是结论:molehill 在 `loss1` 上与
-rathole 持平(1335 对 1327 ms),在 `loss5` 上领先 frp(2847 对 5966),在
-`rtt100` 与 `rate20` 上落后于 nps(7567 对 874;6335 对 322)。四个工具在
-`rate100` 上都出现 wedge(molehill 5 段,最长 54 s),`rtt100` 上四分之三也是
-——那是被整形的路径,不是某一个工具。诚实的劣势原样记在表里:clean 档交互代价
-frp 2.7 ms 对 molehill 6.5 ms,以及 molehill 的 `jitter` 格完全没有 bulk 样本。
+**这些形状说明什么。** 每个工具在劣化档上都退化、在回归 clean 档上都恢复——
+最后一段测的就是这个恢复;一个保持 wedge 的工具就是一个发现。clean 档上
+molehill 与 rathole 的 bulk 相同(21.7 对 22.9 Gbit/s;frp 7.1,nps 0.6),而一次
+全新交互连接的代价 molehill 是 9.6 ms,frp 2.8,rathole 73,nps 70。整形档的交互
+数字是几十个样本里的最差观测,而且**未改动代码之间它们本身的移动就超过代码能带
+来的移动**:同一方法的上一轮里 molehill 的 `rate100` 读 7686 ms,这一轮 2485 ms;
+frp 的 `jitter` 是 3061 与 7741。它们是背景,不是结论。四个工具在 `rate100` 上
+都出现 wedge,`rtt100` 上四分之三也是——那是被整形的路径,不是某一个工具。诚实
+的劣势原样记在表里:clean 档交互代价 frp 2.8 ms 对 molehill 9.6 ms,以及每一轮
+都会有一格 bulk 样本缺失(见 `†`)。
 
 对端由同一份工作负载驱动,画在同一批面板里;漂移轴(全程的打开 fd、RSS 与
 CPU 斜率)见 `soak-v0.10.0-drift.png`,UDP 会话的 RTT/丢包见
@@ -237,8 +221,6 @@ remote_bind_addr = "0.0.0.0:5202" # 在服务端暴露的公网地址
 
 ## 部署
 
-### 二进制
-
 从 [release 页面](https://github.com/NIyueeE/molehill/releases) 下载对应平台的预编译二进制，或者
 [从源码编译](./docs/build-guide.md) 获取其他平台和最小化的二进制。
 
@@ -247,23 +229,12 @@ remote_bind_addr = "0.0.0.0:5202" # 在服务端暴露的公网地址
 ./molehill client.toml   # 在 NAT 后的设备上
 ```
 
-### systemd
-
-[systemd 单元](./docs/configuration.zh.md#systemd) 演示了如何把 molehill 作为 systemd 服务运行，包含 root 和 rootless 两种方式，以及多实例管理。
-
-### 容器
-
-官方多架构镜像（linux/amd64、linux/arm64）发布在
-`ghcr.io/niyueee/molehill`。镜像是构建在 `scratch` 上的单个静态 musl 二进制（约 1.2 MiB），以非 root UID 1000 运行，并且与常规发布构建使用相同的默认特性集（包含多路复用与 `kcp` 载体）。
-
-```bash
-docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
-  ghcr.io/niyueee/molehill:latest server.toml
-```
-
-镜像内不包含任何配置——挂载你的配置文件，并把文件名作为参数传入。两个容器相关的注意点：进程以 UID 1000 运行（因此配置文件要对其他用户可读，端口尽量用 ≥ 1024），以及在 bridge 网络下，使用 `carrier = "kcp"` 的服务还需要把数据面端口按 **UDP** 发布出去。更多部署方式见
-[容器部署](./docs/configuration.zh.md#容器)，包括 Docker Compose（`compose.yaml` / `compose.bridge.yaml`）和 Podman
-Quadlet（`molehill-server.container` / `molehill-client.container`）。
+如何作为服务运行由[配置文档](./docs/configuration.zh.md)负责:它拥有
+[systemd 单元](./docs/configuration.zh.md#systemd)(root 与 rootless,含多实例)和
+[容器部署](./docs/configuration.zh.md#容器)——发布的 `ghcr.io/niyueee/molehill`
+镜像(linux/amd64、linux/arm64;`scratch` 上的静态 musl 二进制)、它以哪个非
+root UID 运行,以及唯一一条容器相关注意点:使用 `carrier = "kcp"` 的服务还需
+要把数据面端口按 **UDP** 发布出去。
 
 ## 文档
 

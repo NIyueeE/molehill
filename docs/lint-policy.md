@@ -105,11 +105,20 @@ The selected set is deliberately wider than "the code already passes":
 `B` (bugbear, e.g. `zip(strict=)`), `E7` (ambiguous `l`/`O`/`I` names, which
 the base rules cannot see), `ARG` (an unused argument is a dead parameter or
 a stale signature), `PTH` (these scripts build and read paths constantly),
-and the already-clean `RET`/`C4`/`N`/`FA`/`FLY`/`PERF` families as guards for
-future edits. `TRY`/`EM`, `ANN` and `T20` are deliberately **not** selected,
-with the reasoning recorded in `ruff.toml` itself: the first two fight the
-house style of actionable error messages and annotated-where-it-matters
-signatures, and every `print` in these scripts is deliberate output.
+`E501` (the formatter wraps code but not a docstring or a URL, and one had
+drifted to 94 characters), `DTZ` (a naive datetime in a run record cannot be
+compared to another run's), `TID` (a relative import would break the
+`uv run <script>` entry shape), and the already-clean
+`RET`/`C4`/`N`/`FA`/`FLY`/`PERF`/`PIE`/`PGH`/`LOG` families as guards for
+future edits. `TRY`/`EM`, `ANN`, `T20` and `COM812` are deliberately **not**
+selected, with the reasoning recorded in `ruff.toml` itself: the first two
+fight the house style of actionable error messages and
+annotated-where-it-matters signatures, every `print` in these scripts is
+deliberate output, and `COM812` (trailing commas) is [the one rule ruff's own
+formatter warns against][com812] — it rewrites exactly the files `ruff format`
+owns, so the two gates would fight over the tree.
+
+[com812]: https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
 
 ## Deviations from the rust-agents-template lint set
 

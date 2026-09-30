@@ -1206,28 +1206,71 @@ mod tests {
     /// states. If a default has to move, this test moves with it and the
     /// configuration pages change in the same commit (AGENTS.md §3).
     #[test]
-    // The whole point of this test is to assert on the constant values
-    // themselves, which is exactly what `assertions_on_constants` flags.
-    #[expect(
-        clippy::assertions_on_constants,
-        reason = "pinning documented defaults means asserting on constants"
-    )]
+    // A literal `assert_eq!(CONST, 30)` is folded to a constant and
+    // `assertions_on_constants` rightly flags it. Pinning the *documented*
+    // number is the point here, so the constant is passed through
+    // `black_box`: the assertion still compares the real value at run time,
+    // it is simply no longer a compile-time tautology.
     fn test_documented_defaults_are_pinned() {
-        assert_eq!(DEFAULT_HEARTBEAT_INTERVAL_SECS, 30, "server heartbeats");
-        assert_eq!(DEFAULT_CLIENT_RETRY_INTERVAL_SECS, 1, "retry interval");
-        assert_eq!(DEFAULT_UDP_WORKERS, 2, "udp_workers");
-        assert_eq!(DEFAULT_UDP_BUFFER_SIZE, 2048, "udp_buffer_size");
-        assert_eq!(DEFAULT_UDP_IDLE_TIMEOUT_SECS, 60, "udp_idle_timeout");
-        assert_eq!(DEFAULT_UDP_SENDQ_SIZE, 1024, "udp_send_queue_size");
-        assert!(DEFAULT_NODELAY, "nodelay");
-        assert_eq!(DEFAULT_KEEPALIVE_SECS, 20, "tcp keepalive");
-        assert_eq!(DEFAULT_KEEPALIVE_INTERVAL, 8, "tcp keepalive interval");
+        assert_eq!(
+            std::hint::black_box(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+            30,
+            "server heartbeats"
+        );
+        assert_eq!(
+            std::hint::black_box(DEFAULT_CLIENT_RETRY_INTERVAL_SECS),
+            1,
+            "retry interval"
+        );
+        assert_eq!(std::hint::black_box(DEFAULT_UDP_WORKERS), 2, "udp_workers");
+        assert_eq!(
+            std::hint::black_box(DEFAULT_UDP_BUFFER_SIZE),
+            2048,
+            "udp_buffer_size"
+        );
+        assert_eq!(
+            std::hint::black_box(DEFAULT_UDP_IDLE_TIMEOUT_SECS),
+            60,
+            "udp_idle_timeout"
+        );
+        assert_eq!(
+            std::hint::black_box(DEFAULT_UDP_SENDQ_SIZE),
+            1024,
+            "udp_send_queue_size"
+        );
+        assert!(std::hint::black_box(DEFAULT_NODELAY), "nodelay");
+        assert_eq!(
+            std::hint::black_box(DEFAULT_KEEPALIVE_SECS),
+            20,
+            "tcp keepalive"
+        );
+        assert_eq!(
+            std::hint::black_box(DEFAULT_KEEPALIVE_INTERVAL),
+            8,
+            "tcp keepalive interval"
+        );
         #[cfg(feature = "multiplex")]
         {
-            assert_eq!(DEFAULT_MUX_MAX_STREAMS, 64, "streams per tunnel");
-            assert_eq!(DEFAULT_MAX_TUNNELS, 4, "carrier max_tunnels");
-            assert_eq!(MAX_MUX_TUNNELS_CAP, 64, "max_tunnels clamp");
-            assert_eq!(DEFAULT_POOL_IDLE_TIMEOUT_SECS, 60, "pool idle_timeout");
+            assert_eq!(
+                std::hint::black_box(DEFAULT_MUX_MAX_STREAMS),
+                64,
+                "streams per tunnel"
+            );
+            assert_eq!(
+                std::hint::black_box(DEFAULT_MAX_TUNNELS),
+                4,
+                "carrier max_tunnels"
+            );
+            assert_eq!(
+                std::hint::black_box(MAX_MUX_TUNNELS_CAP),
+                64,
+                "max_tunnels clamp"
+            );
+            assert_eq!(
+                std::hint::black_box(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
+                60,
+                "pool idle_timeout"
+            );
         }
     }
 

@@ -6,10 +6,10 @@
 """Shared infrastructure for the Soak benchmark model.
 
 The model measures *workloads under staged network conditions* as time
-series — not one average per tool per network condition. This module carries only the reusable
-primitives (process bookkeeping, the lock, the local backends, the
-samplers, the individual probes); the model itself — test types, the
-timeline, the claim rules, per-tool shaping — lives in `soak.py`.
+series — not one average per tool per network condition. This module carries
+only the reusable primitives (process bookkeeping, the lock, the local
+backends, the samplers, the individual probes); the model itself — test
+types, the timeline, the claim rules, per-tool shaping — lives in `soak.py`.
 
 Design principles:
 - every metric is externally observable (peers are black boxes): the
@@ -1644,9 +1644,42 @@ def git_revision(exclude: Path | None = None) -> tuple:
     clean = None
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         args = ["git", "status", "--porcelain"]
+        # `:(exclude)` pathspec: everything except the run's own output. Two
+        # facts make this subtle, both measured rather than assumed:
+        #
+        # * the pathspec is interpreted from `here`, the cwd of this call, so a
+        #   repo-relative path (or an absolute one) never matches and the run's
+        #   own results file would mark every artifact dirty;
+        # * a path *outside* the repository cannot be excluded at all — git
+        #   exits 128 with "outside repository", which would turn the whole
+        #   verdict into `None` (an honest "cannot answer", but a worse one than
+        #   the truth).
+        #
+        # An output file outside the tree cannot make the tree dirty either, so
+        # the exclusion is simply not needed there and the plain verdict is the
+        # right answer.
+        exclude_in_tree = False
         if exclude is not None:
-            # `:(exclude)` pathspec: everything except the run's own output.
-            args += ["--", ".", f":(exclude){exclude}"]
+            try:
+                root = subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    cwd=here,
+                ).stdout.strip()
+                resolved = Path(exclude).resolve()
+                if root and resolved.is_relative_to(Path(root)):
+                    exclude_in_tree = True
+                    spec = Path(os.path.relpath(resolved, here.resolve()))
+                    args += ["--", ".", f":(exclude){spec}"]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                exclude_in_tree = False
+        if exclude is not None and not exclude_in_tree:
+            # Keep the `-- .` scope (repo files only): an outside output path
+            # needs no exclusion, and the caller's intent is still "the tree".
+            args += ["--", "."]
         r = subprocess.run(
             args, capture_output=True, text=True, check=False, timeout=20, cwd=here
         )

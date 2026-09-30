@@ -218,14 +218,36 @@ class Shaper:
                     return int(m.group(1))
         return None
 
-    def _established(self, port: int) -> int | None:
-        """Established sockets on one port, or None when `ss` cannot say.
+    def _busy_sockets(self, band: dict) -> int:
+        """Established sockets on the throughput port.
 
         The qdisc can be empty *between* retransmissions of a killed client's
         FIN, so an empty queue is not the same as a quiet stage: the teardown
-        of the previous stage's visitors lands on whatever the next stage
-        dials. This is the second half of the drain predicate.
+        of the previous stage's bulk lands on whatever the next stage dials.
+        This is the second half of the drain predicate, and its whole history
+        is worth the three lines — each variant was measured, and the one that
+        reads best on paper is the one that fails:
+
+        * `established` on the throughput port (this one) is what the
+          frozen-commit sweep ran with, and it produced a `rate20` spine of 91
+          intervals and a `jitter` spine of 2;
+        * *every* exposed port makes the predicate nearly unsatisfiable,
+          because the interactive and churn probes dial their own port from a
+          process that lives across every stage: measured at 30 s of budget
+          burned per transition;
+        * the teardown states on the throughput port (FIN-WAIT/CLOSE-WAIT/
+          LAST-ACK/CLOSING/SYN) look like the more faithful reading, and they
+          are — but measured on the 2026-09-28 release sweep, the `rate100 ->
+          rate20` transition then produced **no** `rate20` spine at all
+          (`control socket has closed unexpectedly`, reproduced twice), while
+          the same transition with this predicate carries its full spine. A
+          drain that exits *earlier* than the teardown is gone is worse than
+          one that waits too long: the next stage's dial races the old one's
+          FIN either way, and the failure is silent.
+
+        TIME-WAIT is not counted: it is the one state that cannot retransmit.
         """
+        port = band["iperf_exposed"]
         out = subprocess.run(
             [
                 "ss",
@@ -265,13 +287,19 @@ class Shaper:
 
         The predicate is two-part, because an empty queue is not a quiet
         stage: the qdisc drains *between* retransmissions of a killed client's
-        FIN, so the previous stage's visitor connections are still open
+        FIN, so the previous stage's bulk connection is still tearing down
         ~10 s later. Measured on `rate100:120,rate20:120`: with only the
         queue check the drain finished in 1.0-1.8 s and the bulk spine still
         died reporting `control socket has closed unexpectedly` — the server
         dropped the new visitor when the dying channel it had been paired with
-        ended. Waiting for the bulk port's own established sockets to reach
-        zero as well is what makes the next stage start from a quiet path.
+        ended. Waiting for the bulk port's own connections to reach zero as
+        well (`_busy_sockets`) is what makes the next stage start from a quiet
+        path.
+
+        Both halves of that predicate were re-derived on 2026-09-28 and both
+        went back to what the frozen-commit sweep ran with: see
+        `_busy_sockets`, which records the three variants and which of them
+        measurably failed.
 
         Returns the seconds actually spent, so the cost is visible in the
         results log. `budget` bounds the wait: a path that is still busy when
@@ -280,7 +308,6 @@ class Shaper:
         minor = cid.split(":")[1]
         handle = f"{minor}0:"
         band = next(b for c, b in self.classes if c == cid)
-        bulk_port = band["iperf_exposed"]
         started = time.time()
         deadline = started + budget
         quiet = 0
@@ -289,7 +316,7 @@ class Shaper:
             if backlog is None:
                 # No such qdisc (an unshaped stage): nothing to drain.
                 return time.time() - started
-            live = self._established(bulk_port)
+            live = self._busy_sockets(band)
             if backlog == 0 and live == 0:
                 quiet += 1
                 if quiet >= self.DRAIN_QUIET_POLLS:
@@ -300,7 +327,7 @@ class Shaper:
         self.log(
             f"    {cid} drain budget of {budget:.0f}s expired with the path "
             f"still busy (backlog={self._backlog(handle)}, "
-            f"bulk sockets={self._established(bulk_port)}); "
+            f"bulk sockets={self._busy_sockets(band)}); "
             f"the next stage starts anyway"
         )
         return time.time() - started

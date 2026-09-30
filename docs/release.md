@@ -126,8 +126,11 @@ writes the tests it completed.
    previous tag's charts from `assets/`.
 5. `just soak-check` — the gate, in two steps. First the run is checked
    against itself: every coverage axis a test claims must have carried
-   samples, every throughput sample must have dialed the tool's exposed port
-   rather than its backend, and the released tool must meet the absolute SLO
+   samples, **every stage that claims a bulk spine must have carried intervals
+   inside its own window** (a stage whose probe never connected used to pass on
+   the other stages' sample count), every throughput sample must have dialed
+   the tool's exposed port rather than its backend, and the released tool must
+   meet the absolute SLO
    **on the unshaped clean stages** (a saturated `rrul`/`soak` stage is above
    the SLO by design — that is the degradation curve, reported as a note, not
    judged). The SLO gates the tool this repository releases; a peer that

@@ -1,13 +1,17 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-27.** The v0.10.0 theme is implemented on
+> **State as of 2026-09-28 (evening).** The v0.10.0 theme is implemented on
 > `feat/session-and-pool`: **M1** (one control session per endpoint, protocol
 > v4), **M2a** (one shared elastic pool per carrier, plus the S1 observation),
 > **M6** (the configuration surface) and **M7** (`direct`'s role, measured) are
 > in, and the measurements this section records were taken on that branch.
 > `main` is at `ab0bf11` (v0.9.0 released, with the withdrawn v0.9.1 cycle
-> folded back into development). **Nothing here is merged yet**; the release
-> sweep, the PR and the tag are the remaining steps (see "Release (v0.10.0)").
+> folded back into development). **Nothing here is merged yet.** The freeze and
+> PR #4 are done; the release audit then found three gaps (a config-docs
+> contradiction, the sweep's provenance, and a completeness gate that could not
+> see a dead stage spine) and all three are now closed on the branch — see
+> "Remaining pre-tag items" for what each was and how it was settled. What is
+> left is the human checklist: the repo-settings items and the tag itself.
 > Shipped work: [CHANGELOG.md](CHANGELOG.md). Design:
 > [docs/internals.md](docs/internals.md). Method and how to read the numbers:
 > [docs/benchmarks.md](docs/benchmarks.md).
@@ -97,15 +101,15 @@ surface both change.
 | # | Milestone | Status | Evidence |
 |---|---|---|---|
 | M0 | Interop matrix | landed (merged) | `tests/interop_test.rs`, `just interop` |
-| M1 | One control session per endpoint (protocol v4) | **landed** | below, "M1" |
-| M2a | Shared elastic pool + S1 observation | **landed** | below, "M2a" and "S1" |
-| M2b | S2 placement + D28 spare selection | **not landed, on purpose** | the S1 spread is zero — "S1" below |
+| M1 | One control session per endpoint (protocol v4) | **landed** | archived record, "M1" |
+| M2a | Shared elastic pool + S1 observation | **landed** | archived records, "M2a" and "S1" |
+| M2b | S2 placement + D28 spare selection | **not landed, on purpose** | the S1 spread is zero (archived, "S1") |
 | M2c | UDP shortest-queue assignment (D27) | not landed | gated on the drop counters, which stayed at zero |
 | M3 | Transparent visibility (health check deleted) | landed (merged) | `CHANGELOG.md`, the dead-backend test |
 | M4 | IPv6 path MTU | landed (merged) | the `#[ignore]`d netns test |
 | M5 | Log model | landed (merged) | `tests/log_budget_test.rs` |
-| M6 | Configuration surface | **landed** | below, "M6" |
-| M7 | `direct`'s role | **measured** | below, "M7" |
+| M6 | Configuration surface | **landed** | archived record, "M6" |
+| M7 | `direct`'s role | **measured** | archived record, "M7" |
 
 ### Decisions
 
@@ -183,1251 +187,105 @@ has no initial size: it starts cold and grows on demand.
 
 ## Measurement records (v0.10.0 cycle)
 
-### M1 — one control session per endpoint (protocol v4)
-
-Commits `a68df08` (server half) and `81bd60a` (client half). One authenticated
-control session per `(remote_addr, effective transport)` carries every service
-that dials it; each registration carries its own credential
-(`digest(service_token ‖ nonce)`), so a rejected service is rejected alone. The
-server declares its heartbeat cadence in `Ack::SessionOk`; the client derives its
-timeout and refuses a config below the derived floor as soon as the cadence is
-known (not earlier: the cadence is the server's to declare). Every client-origin
-data channel and tunnel stream names its service with a four-byte prologue; a
-stream naming an unregistered service, or a second service on a tunnel, is
-dropped alone (warned once, then DEBUG).
-
-**Verified**: 140 lib, 20 integration, 7 `session_test`, 2 log-budget, and
-`just interop` against the released v0.9.0 binary — all three cases: the old
-client still forwards through the new server, the old server refuses the new
-client and the client reports `protocol v4` instead of retrying, and an unknown
-dialect is refused on that connection alone.
-
-**Two defects found while building it, both pinned by tests**: the server's v3
-branch answered with `CURRENT_PROTO_VERSION`, so flipping the constant would
-have told a v0.9.0 client the server speaks v4 (fixed to `PROTO_V3_VERSION`,
-`the_server_still_answers_a_v3_hello_in_v3`); and a session's writer is one queue
-for every service, so a sibling's command can land between a registration and its
-verdict — reading that as a framed ack misparsed 5 bytes as 512 and stalled the
-session. The verdict reader dispatches on the first byte instead, which is only
-sound while an ack stays under 256 bytes, so the writer shortens an oversized
-rejection reason (`MAX_REJECTION_REASON_LEN`, pinning test).
-
-**Landmine worth remembering**: `read_control_cmd` and `read_ack` are
-fixed-width readers. Any new command variant with a payload must be
-tag-dispatched or carry a fixed-width id, or the reader desyncs.
-
-### Open: the engine's stream cap is still reachable — a stream leak (2026-09-26)
-
-**The v0.10.0 release sweep does not complete.** Three consecutive
-`just soak --test=rrul --tools molehill,frp,rathole,nps` runs wedged ~6.5
-minutes in, each with the same line and each at the same point:
+**Archived.** Every measurement record this cycle produced — M1 (protocol v4),
+the stream-cap leak investigation, M2a, M6, M7, the S1 placement observation,
+both post-review rounds, the cycle's four sweeps and the CI-verification
+incident — lives in git history at the `v0.10.0` tag:
 
 ```
-ERROR 00000003: maximum number of streams reached (streams=64, max=64, mode=Server, ids=[...])
+git show v0.10.0:HANDOFF.md
 ```
 
-`mux/connection.rs` answers a 64th concurrent stream with
-`Terminate(Frame::internal_error())`: the tunnel dies, every visitor on it dies
-with it, and the run then waits on an iperf3 pair whose socket stays `ESTAB` for
-the next 46 minutes. The pool's placement ceiling (below) does **not** prevent
-it, and the instrumentation says why.
+Per this file's own rule (kept verbatim below the historical-records index) those
+records say what the branch's authors believed at the time and why a decision
+was taken; **no number in them may be quoted as a measurement of the current
+code, compared against a Soak result, or used to gate anything.** The live
+numbers are the sweep record for the release commit, in "Release (v0.10.0)"
+below. What each archived record settled, so it can be navigated:
 
-#### The wedge is pre-existing; what v0.10.0 changed is that it is now fatal
-
-`benches/scripts/soak/results-soak-v0.9.1.json` (v0.9.0-10-gac42490, this same
-host) is the control, and it settles the question of whether M1/M2a caused this:
-
-| | v0.9.1 baseline (same host) | v0.10.0 today |
-|---|---|---|
-| `rtt100` interactive p99 | 7309.7 ms | 7261.0 ms |
-| `rtt100` errors | 7 (22 % of samples) | 9 |
-| stages completed, per tool | **8 / 8, all four tools** | wedges at `rtt100` and never returns |
-
-The wedge itself — the interactive stream stalling for seconds on a 100 ms
-path — is therefore **not a v0.10.0 regression**; it reproduces the baseline to
-within noise. What changed is the consequence. In v0.9.1 each visitor got its
-own pre-opened channel (`default_count = 4`), so one visitor's stall cost that
-visitor. In v0.10.0 every channel is a stream of a shared tunnel, and the
-stalled visitors hold their streams; the tunnel then reaches the cap and the
-engine kills it — which is why a wedge that used to cost one stage now costs
-the whole run.
-
-**A live wedged run says how it fails.** With the run pinned at the cap, and
-both molehill processes still up and burning ~55 % CPU each:
-
-- the `echo` tunnel (a different connection) kept forwarding throughout — a
-  `/dev/tcp` round trip on its exposed port returned `ping`, and it went on
-  logging routes to the end of the log;
-- the `iperf` tunnel's exposed port had **7 connections in its accept
-  backlog**, unanswered: the mux could not open streams any more, so the
-  service's `data_ch_req` queue simply grew;
-- the backend's raw `iperf3.log` holds **zero** sender/receiver summaries for
-  the whole run — the 20-stream tests are accepted and then hang forever, which
-  is also why the harness waits 46 minutes on them.
-
-So the failure is tunnel-scoped, not process-wide: one tunnel wedges, every
-visitor queued behind it stalls, and the rest of the session keeps working.
-That is the shape a release cannot ship with, and it is also the shape a
-*single-tunnel* design has to defend against.
-
-**The mechanism, to the extent it is pinned.** The server hands each stream to
-`copy_bidirectional_with_sizes(&mut ch, &mut incoming, ..)` in its own task, and
-`ch` — the `DataChannel` holding the mux stream — drops only when that task
-ends. On the wedged connection all 79 streams were routed *and* paired (no
-queue), and the client had released its side, so the tasks are stuck rather than
-unstarted. Tokio's copy ends a direction only when it reads EOF, so a task
-wedges when its peer stops draining: the server's `data channel → visitor`
-write blocks on a full visitor socket, the task stops polling its reader, and
-the mux stream's receive window closes behind it. Two things then keep it there:
-the visitor (an iperf3 client waiting for a test summary that can never arrive)
-has no timeout of its own, and nothing in the pool notices that a stream has
-been alive for minutes without moving a byte.
-
-**What the fix has to do**, whichever shape it takes: a wedged stream must not
-be able to hold the tunnel's budget forever. The candidates are (1) an idle
-timeout on a data channel's copy task — a stream with no bytes in either
-direction for longer than some budget is closed, which returns the budget and
-the visitor's error; (2) making the pool treat a tunnel with several
-long-stalled streams as unhealthy and stop placing on it, so the other tunnels
-keep serving; (3) at the edge, refusing to open past `OPEN_BUDGET` pending
-rather than queueing behind a wedged tunnel (the accept backlog above is that
-queue, and it is unbounded today). All three are defensible; (1) is the
-smallest and the one the evidence points at, and it needs a measurement to pick
-the budget.
-
-The worst case is bounded and unshipped: the branch is green (`just check`,
-`just interop`), nothing is pushed, and the wedge is not a new defect — but it
-is the reason the sweep cannot complete and therefore the reason there is no
-release.
-
-**The client is not the side that is wrong.** With `MOLEHILL_POOL_STATS=1` on
-both ends plus per-stream diagnostics, the numbers at the cap were:
-
-| Observation | Value |
+| Record | What it settled |
 |---|---|
-| the leaking connection | `00000003` (a server-side tunnel) |
-| streams it created | 82 |
-| streams it released | 18 |
-| streams it held at the cap | **64** |
-| the client's pools, peak `streams` over the whole run | 5, 21 and 2 (three pools) |
-| the client's own tunnels, peak held (instrumented per connection, 4 runs) | **never 32** |
-| client-side "placed past its ceiling" events | **0** |
-
-The two sides disagree about the connection, which is the whole finding: the
-server's map says 64 streams are open, and the client — counting the leases its
-own forwarding tasks hold — never had more than 31 on *any* tunnel, across four
-instrumented runs. The stream ids in the server's map are client-initiated
-(odd) and non-contiguous, which is what a set of streams the client has
-*closed* looks like from a side that never dropped its handles.
-
-**The release of streams stops, it does not slow down.** The drops on
-`00000003` ran normally until 18:15:43, then stopped completely: in the ten
-seconds before the cap was hit the connection accepted no new streams and
-released none. On the client, the streams those drops belonged to are gone —
-its leases were released and its map is small — so the handles that persist are
-the server's.
-
-**Ruled out by measurement, so the next attempt does not redo it:**
-
-- **The client's placement is not at fault.** Its pools peaked at 5, 21 and 2
-  streams against a ceiling of 56, and no placement ever went past the ceiling.
-- **The visitor tasks are not the holders.** On the leaking connection,
-  6479 visitor tasks started and 6476 ended over the run — the imbalance is 3,
-  not 64 — and the leaked streams' ids do not cluster at the end.
-- **Neither is the routing queue.** On the instrumented run that paired
-  everything, all 79 streams the leaking connection carried were routed to the
-  iperf service *and* paired with a visitor (79 routed, 79 paired, 6342 pairs
-  over the run, 6340 pair tasks ended). Nothing sat in a queue.
-- **The bulk path works standalone.** A server+client pair with one TCP service
-  carries six sequential `iperf3 -P 20` runs at 17-20 Gbit/s with zero cap hits
-  and a steady 21 streams; the leak needs the *shaped, mixed* workload.
-
-**The holder is the server's pair task.** Every stream is handed to
-`copy_bidirectional_with_sizes(&mut ch, &mut incoming, ..)` in a spawned task,
-and `ch` — the `DataChannel` holding the mux stream — drops only when *that*
-task ends. The leaked streams' ids are exactly the ones whose pair task never
-ended, which is why the map keeps them and why the client (whose lease the same
-stream's end released) sees a small number. The ids also say *when*: on the
-last instrumented run the 64 held streams were created in one burst, and the
-drops stopped a few seconds later.
-
-**And the test itself never completes.** In every wedged run the backend's raw
-`iperf3.log` holds **zero** sender/receiver summaries — the 20-stream tests are
-accepted and then hang, which is also why the harness sits on them for 46
-minutes. That makes the sequence legible: the bulk test stalls under the lossy
-path, the client's streams end while the server's pair tasks do not, the map
-fills to the cap, and the engine kills the tunnel.
-
-**Where the next attempt should look**: why the server's pair task never
-returns. It is not the pool and not the routing — every stream was paired — so
-the question is what the task is waiting on. The mechanism section above names
-the shape (a blocked `data channel → visitor` write that stops the task polling
-its reader, with a visitor that has no timeout of its own) and the three
-candidate fixes, of which the smallest is a per-channel idle timeout. A
-reproducer that stays inside the lossy stage (`just soak --test=rrul`, or the
-harness with a one-stage `--timeline loss1:120`) is enough to see it.
-
-**What is already fixed and kept** (commit `1b5fa2a`, falsified by its own
-regression test): the pool's placement ceiling (56, counting reserved opens),
-growth on a *per-tunnel* rule as well as the pool total, and a typed
-`OpenError::AtCapacity` after a bounded wait. That makes a cap hit impossible
-for any load the pool places itself; it cannot help when the streams on the
-tunnel are not the pool's.
-
-**How the numbers above were taken** (the instrumentation is not in the tree):
-per-connection created/dropped counters and an inbound-RST counter in
-`mux/connection.rs` (gated on `MOLEHILL_POOL_STATS`), the client's held counter
-in `ClientTunnel::start`'s driver loop, and the visitor pairing/task-end pair in
-`run_tcp_connection_pool`'s spawn — each a one-line `info!` with the mux
-identity. Re-add those three rather than guessing.
-
-#### Resolved 2026-09-27: the cap is no longer fatal, and what that did not fix
-
-Three commits closed the *fatality*, and the sweep completes again:
-
-| | before | after |
-|---|---|---|
-| `just soak --test=rrul --tools molehill` | wedged at `rtt100`; run never finished | **8 of 8 stages, exit 0** |
-| engine cap events | 1, at ~6.5 min | **0** |
-
-1. `07fd09e` — `copy_bidirectional_with_idle` reaps a forward that has moved no
-   bytes in either direction for `FORWARD_IDLE_TIMEOUT` (5 min), at both copy
-   sites. A stall can no longer hold a tunnel stream for the session's life.
-2. `e25329e` — the placement ceiling is documented against the *burst* a stall
-   hands one tunnel, not against a teardown's few slots.
-3. `b732fd3` — **the actual fatality**: a 65th inbound stream used to answer
-   `Terminate(Frame::internal_error())`, a session-terminating goaway that took
-   the whole connection and every visitor on it. It now refuses that one stream
-   with a reset and keeps the connection. Pinned by a test on the decision
-   itself, falsified by restoring the old action.
-
-**The wedge itself is not fixed**, and the numbers say so. Same run, same host,
-against the v0.9.1 baseline:
-
-| stage | v0.9.1 baseline | v0.10.0 now |
-|---|---|---|
-| `rtt100` | p99 7310 ms, 7 errors | p99 6358 ms, 11 errors |
-| `rate100` | p99 683 ms, **0 errors** | p99 7718 ms, **13 errors** |
-| `rate20` | p99 4870 ms, 6 errors | **bulk spine produced nothing**, 20 errors |
-| `jitter` | p99 3440 ms, 5 errors | p99 7254 ms, 19 errors |
-| both `clean` | p99 9.3 / 5.4 ms | p99 2.5 / 2.1 ms |
-
-The tunnel survives those stages now instead of dying in them; it does not sail
-through them. So the release still cannot be called done on this evidence: a
-sweep with `rate20` producing no bulk sample at all fails the release ritual's
-own completeness rule, whatever the cap does. The next question is the wedge
-itself — why a 100 ms path (and a rate-limited one) stalls the interactive
-stream for seconds — and it is a *pre-existing* one: v0.9.1 shows the same
-shape at `rtt100`, just with per-visitor channels to absorb it.
-
-**A correction to the table above, found the hard way.** The `8 of 8 stages`
-result was measured with a binary that did **not** contain `b732fd3`: the run's
-own version line says `v0.9.0-34-ge25329e`, and its log carries the *old*
-`maximum number of streams reached` text, not the new `refusing stream N`. That
-run completed because the halved ceiling (`e25329e`) kept the pool away from the
-cap, not because the cap had stopped being fatal. Rebuilding from the committed
-tree and running again gives the real picture:
-
-- the refusal path **works as designed** — one `refusing stream 165`, the tunnel
-  stayed up, and the run went on;
-- but `loss5` and `rate100` still report `bulk spine produced nothing (exit -9)`,
-  so the sweep still fails the completeness rule.
-
-**The mechanism, from the backend's own log.** Under the shaped load the bulk
-`iperf3` client dies with `error - idle timeout for receiving data` — it is
-waiting for a test summary on its *control* connection while the bulk data
-saturates the tunnel those two share. The pool stayed at **size 1** through the
-whole run (`reason="cold"` and one `udp_floor`, no `load` growth ever), because
-its growth rule needs a tunnel at 51 streams and a 20-stream bulk test never
-gets there. One tunnel, twenty bulk streams and one control channel is exactly
-the head-of-line blocking a shared tunnel has to avoid — and v0.9.1 avoided it
-by construction, with four pre-opened channels per service (`default_count = 4`)
-that spread the load before it started.
-
-This is the same finding the S1 record already reached from the other side: "the
-growth rule fires above 80 % of the pool's stream capacity — 51 streams at size
-1 — and the mixed workload peaks at 21, so candidate choice never had a lever;
-*pool size* is the axis". The release sweep is the second measurement saying so,
-with a bulk workload that does reach the tunnel's useful capacity even though it
-never reaches the growth threshold.
-
-**Acted on 2026-09-27 (`ca93ad6`): the threshold was the bug.** `pending` was
-the wrong axis — telemetry showed it peaking at 2, because the harness dials
-visitors serially — but the *stream* threshold was miscalibrated: 80 % of the
-engine's cap is 51 streams, and every workload this project measures peaks below
-it (mixed soak 21, a 20-stream bulk test 20), so the rule could never fire. The
-threshold is now about how much one shared tunnel should carry (12 % of 64 = 7
-concurrent streams), with `max_tunnels` bounding the result at ~32 streams per
-service — the same order as v0.9.1's four pre-opened channels.
-
-Measured on the two-stage reproduction (`loss5:120,rate100:120`), telemetry on:
-
-| | before | after |
-|---|---|---|
-| pool size reached | 1 | **4** |
-| `rate100` interactive p99 | 7718 ms, 13 errors | **262 ms**, 8 errors |
-| `rate100` UDP loss | 7.2 % | **2.1 %** |
-| `rate100` churn/s | 10 | **428** |
-
-**Still blocked, and now on a different thing.** The bulk spine still reports
-nothing: its log shows the test running its full 115 s of intervals and then
-dying with `the client has unexpectedly closed the connection`, so the harness
-never sees a sample even though the tunnel carried the traffic. The control
-connection *through the muxed tunnel* does not survive the shaped path, where
-v0.9.1's dedicated per-visitor channel did. The candidate that follows from the
-evidence is therefore not another growth knob: **a visitor the pool cannot serve
-well should get its own channel**, which is what `direct` mode already is. That
-is a design change with its own measurement, so the release stays blocked.
-
-**A permanent stall, found and fixed (`444bd94`).** The accept loop pairs one
-visitor at a time, and its wait for a data channel had no bound. A request the
-client cannot answer never comes back at all: when the pool is at its placement
-ceiling it refuses the open and reports the refusal to nobody. One such visitor
-therefore parked the entire service for the rest of the session.
-
-Reproduced without a benchmark: saturate the pool, *drain it completely*
-(`size: 1, tunnels: [(0, 0, 0)]`), then ask for a fresh visitor — it hung, with
-capacity free and nothing in the way.
-`tests/pool_test.rs::a_saturated_pool_still_serves_the_next_visitor` fails
-without the fix and passes with it. The wait is now a budget that re-requests on
-expiry and sheds only a visitor the client refuses `PAIR_ATTEMPTS` times.
-
-**Ruled out for the `rate100`-after-`rtt100` collapse**, each by measurement:
-
-| Candidate | Result |
-|---|---|
-| the stall reaper | off (`MOLEHILL_REAPER_SECS=0`): 7145 ms vs 7076 with it |
-| the window size | 4 / 8 / 16 / 32 MiB: 7584 / 7893 / ~7000 / 7076 ms |
-| a prefetch window | `ready=3` confirmed in the loop, still ~7000 ms — and it breaks the documented cold start, so it was reverted |
-| mux vs `direct` | both bad: 7076 ms vs 7456 ms |
-| a saturated pool | not saturated: 21 streams over 4 tunnels during the failure |
-| the pairing loop | `accepted=87 paired=87 broken=0 shed=0` over three minutes |
-
-**The signature, as far as it goes.** During that stage the churn probe offers
-~16 connections/s and **14 succeed in 120 s** (the field is a count per stage,
-not a rate — `clean` shows 2398, which is 150 s × 16/s), while the pool is idle
-and the pairing window is full. So the failures are *after* pairing, not in the
-queue in front of it.
-
-#### The controlled reproductions do not reproduce it (2026-09-27)
-
-Two standalone reproductions ran the same workload against the same binary and
-**did not** reproduce the collapse, which retracts the explanations above:
-
-| Reproduction | Result |
-|---|---|
-| `rate100`, bulk (`-P 20`) + churn 16/s, interactive probe | **26/26 ok**, worst 882 ms |
-| an `rtt100` phase, then `rate100`, bulk + churn + the UDP service and probe | phase B **32/32 ok**, worst 1138 ms |
-
-Both used the harness's own commands and shaper classes, the same service shape
-(echo + iperf + udpecho, `max_tunnels = 4`, `udp_workers = 2`), the same probe
-bodies and the same 5 s timeout. The sweep's stage shows 25 attempts in 120 s
-(each timing out); the reproductions show a working path at 0.6–1.2 s.
-
-**So the workload shape does not explain it**, and the candidates named earlier
-in this section — head-of-line blocking on the tunnel, the command write, the
-pairing wait, the window, a prefetch window — are unsupported by this evidence.
-The pairing stall is real and fixed, but it is not this.
-
-**What differs in the real run**, in the order worth testing: it is ~9 minutes
-into a single continuous eight-stage run when `rate100` starts, where the
-reproductions reach the equivalent state at ~2 minutes; the harness switches the
-shaper between stages and restarts a wedged `iperf3` server per stage; and its
-probe processes are long-lived across all eight stages. A duration- or
-harness-state-dependent effect is now more likely than a data-path one, and the
-way to settle it is to instrument the **sweep itself** rather than another
-reproduction — the pairing counters and pool telemetry are already in the tree,
-and the missing piece is the probe's own failure kind (connect vs echo) at the
-moment it fails, which the harness currently records only as a count.
-
-#### The reference binary behaves the same (2026-09-27) — this is not a v0.10.0 regression
-
-The reproductions above shaped the **wrong ports**, which is why they looked
-healthy. The harness shapes the *data-plane* ports and deliberately leaves the
-control channel unshaped (`soak.py`, `_ports`: "the TOOL's control channel stays
-in the unshaped default class"), and it rate-limits with **`netem rate`**, not
-with the HTB class. Shaping the visitor and backend ports that way reproduces
-the sweep's signature in two minutes:
-
-| | attempts | ok | timeouts | worst |
-|---|---|---|---|---|
-| first (wrong ports: control only) | 32 | 32 | 0 | 1138 ms |
-| faithful (data-plane ports, `netem rate 100mbit delay 20ms limit 2000`) | 10 | 8 | **2** | **9475 ms** |
-| the sweep's own `rate100` stage | 24 in 120 s | 10 | 14 | 7076 ms |
-
-**And the released v0.9.0 binary does the same thing under all three phases:**
-
-| phase | v0.9.0 (released) | v0.10.0 (branch) |
-|---|---|---|
-| A: `rtt100` | 13 attempts, worst 6069 ms | 14 attempts, worst 6242 ms |
-| B: `rate100` after A | 10 attempts, 7 ok, **3 timeouts**, worst 9436 ms | 10 attempts, 8 ok, **2 timeouts**, worst 8330 ms |
-| C: `rate20`, **bulk spine** | **0 intervals** | **0 intervals** |
-| C: `rate20`, interactive | 3 attempts, **3 timeouts**, worst 9510 ms | 3 attempts, **3 timeouts**, worst 6548 ms |
-
-The `rate20` row is the one that matters most: the sweep's completeness failure
-("bulk spine produced nothing") reproduces on the **released** binary, with the
-same zero intervals.
-
-So the multi-second interactive round trip on a rate-limited path is **not**
-introduced by this cycle: the reference build shows it with the same workload,
-the same shaper and the same binary-independent probe. The v0.9.1 baseline file
-(683 ms p99, 0 errors, 171 samples at `rate100`, with bulk running — 218 bulk
-samples) is therefore **not reproducible by the v0.9.0 binary either**, in this
-controlled setting: it is either a lucky run against a host state that no longer
-exists, or it depends on the sweep's own accumulated sequence in a way the
-two-stage reproduction does not capture.
-
-**What this changes.** The table earlier in this section reads the
-`rate100`/`rate20`/`jitter` cells as a v0.10.0 regression; on this evidence it
-should not. Those cells are a property of the shaped path and this workload, and
-the honest gate comparison for them is *not* the single stored baseline run. The
-release decision therefore no longer rests on them — which is worth stating
-plainly, because several rounds of this investigation were spent looking for a
-regression that the reference build also has.
-
-**Environment, re-confirmed the hard way**: `/tmp` was wiped mid-session on
-2026-09-26/27, which took `iperf3` with it (`apt` had installed it into the
-container's writable layer) and deleted every bench work directory, including
-the logs the diagnosis above came from. Re-install with
-`sudo apt-get install -y --reinstall iperf3`; keep `--out` and logs under
-`~/tmp` or the repo.
-
-### M2a — one shared elastic pool per carrier
-
-Commit `d10e566` (+ its fixups). `shared_pool = false` keeps exactly today's
-per-service pool (asserted, not assumed); `true` serves every service of a
-session from one pool per carrier. Placement is least-loaded with the
-reservation charged before the first `await`, so back-to-back opens land on
-distinct tunnels while the pool has them. Growth: cold, load above 12 % of a
-tunnel's stream capacity as shipped (the sweep sections below record the
-threshold's history), an open that waited too long, or the UDP floor. Shrink
-only when the whole pool has no streams, no pending opens and no pinned peers
-and has been idle past `idle_timeout`, with a warm hold and a cooldown. A refused
-growth holds growth off (D14); a tunnel's death or a shrink releases the hold.
-
-#### The defect the first sweep found: the engine's stream cap was reachable
-
-The first `just soak --test=rrul` run (2026-09-26, 15:17) wedged 6.5 minutes
-in: `mux/connection.rs` logged `ERROR 00000003: maximum number of streams
-reached`, the iperf3 pair on that path stopped moving with its socket still
-`ESTAB`, and the run spent the next 46 minutes waiting on a test that could
-never finish. The log line is the engine's *connection-level* answer to a 64th
-concurrent stream — `Terminate(Frame::internal_error())` — so it takes the
-whole tunnel and every visitor on it, which is exactly what the pool exists to
-make unreachable.
-
-**Why it was reachable.** Growth fires on the pool's *total* usage, and the
-threshold scales with the pool (`size × cap × 80 %`): at size 1 that is 51
-streams, but the ceiling is per *tunnel* and does not scale. Worse, the only
-thing that can stop the pool from growing is the very state a bulk run
-produces — `max_tunnels`, or the server's `max_tunnels_per_client` valve — and
-placement had no bound of its own: it kept handing streams to the one tunnel it
-had. Growth fired at 51, the valve refused it, and the next 13 opens walked the
-tunnel into the engine's cap.
-
-**Reproduced, then fixed.** `tests/pool_test.rs` gained
-`a_refused_growth_still_never_reaches_the_stream_cap`, which holds 72 visitors
-against the valve scenario (`max_tunnels_per_client = 1`): 56 are forwarded, 16
-are refused, the tunnel survives. Falsified before being trusted — with the new
-placement ceiling disabled, that test fails with the sweep's exact `ERROR` and
-the whole tunnel dies under its visitors.
-
-The fix has three parts, all in the pool:
-
-1. **`TUNNEL_STREAM_CEILING` (56) is a hard placement bound**, counting
-   reserved-but-unfinished opens as well as established streams. It is
-   deliberately above the growth point (7 on the shipped cap): a pool that
-   *can* grow always grows before placement refuses, and a pool that cannot
-   grow refuses one visitor instead of costing every visitor on the tunnel.
-2. **Growth also fires per tunnel** (`tunnel_grow_at`, 12 % of the cap as
-   shipped), not only on the pool total. The total threshold scales with the
-   pool and the ceiling does not, so above size 1 the per-tunnel rule is the
-   stricter one.
-3. **A full pool waits, then refuses with a typed error.** `OpenError::
-   AtCapacity` replaces a silent queue: the open waits up to `CAPACITY_WAIT`
-   (250 ms) for a stream to retire — woken by the lease drop that frees it —
-   and is then refused, which fails that visitor and nothing else.
-
-Also fixed on the way: `grow_threshold`'s per-tunnel share is now the unit-tested
-composition of the two bounds (`tunnel_ceiling`, `tunnel_grow_at`), so the
-ordering "growth 7 < placement 56 < engine 64" is asserted rather than
-implied.
-
-**Tests**: `tests/pool_test.rs` (8: shared pool serves two services, the
-per-service default keeps two pools, the UDP source port across a grow/shrink,
-a cold pool grows under load and shrinks when idle, the telemetry is opt-in from
-a real binary, the server valve refuses growth without killing the session, a
-burst past the engine cap on a pool that *can* grow, and the refused-growth
-regression above — the one that fails if the ceiling is removed),
-plus pool unit tests for distinct placement, reuse when the pool is smaller than
-the demand, the pinned-tunnel shrink gate, the failed-growth hold and the
-ceiling ordering (**growth 51 < placement 56 < engine 64**, asserted).
-
-**First visitor after the pool shrank**: 2.15 / 2.01 / 2.08 ms (three runs;
-earlier three 2.07 / 3.23 / 1.99 ms), debug build, loopback, one service, no
-pre-opened channel — i.e. the cold path: visitor accepted, one channel
-requested, one stream opened on the surviving tunnel. Five single measurements
-quoted as a range, not a distribution.
-
-### M6 — the configuration surface
-
-Commit `82e741e`. Six keys removed with a warning that names the replacement
-(`REMOVED_KEYS` now carries the version that removed each key, so `health_check`
-reports v0.10.0 rather than the v0.9.1 tag that never shipped), two added
-(`udp_workers`, `max_tunnels_per_client`), and the UDP-only keys on a TCP service
-are errors instead of being silently ignored.
-
-**Four defects the cold pool exposed, all fixed**: a tunnel refusal could not be
-reported on the fixed-width ack path (new unit `Ack::TunnelRefused`, pinned by a
-protocol test and proven end to end); a server shutdown did not end its sessions
-(clearing both registries and `MultiMap::clear` — an in-process "restart" used to
-keep serving through a ghost session, which the pre-opened channels had hidden);
-a reconnect reused pools whose tunnels carried the previous session's nonce; and
-a concurrent first open raced the growth it needed.
-
-**Evidence**: 20 integration, 10 pool, 7 session, 2 log budget, 147 lib; both
-clippy passes; the docs gate. (Counts as of the post-review fixes; the striping
-defect that made this line read "19, 1 ignored" is fixed — see "Fixed: striping
-with the elastic pool".)
-
-### M7 — what `direct` is for
-
-One interleaved run, `--ab-variants direct,shared` on **one binary**
-(`workload_version` 2, `SOAK_SLOW_VISITOR_BPS=2000000`, clean loopback, 8 load
-steps, the slow visitor completed 16/16 arms): the question is whether one slow
-visitor's stream delays the interactive stream that shares its pool, and what
-`direct` costs or saves.
-
-| step | direct p99 (ms) | shared p99 (ms) | direct Gbit/s | shared Gbit/s |
-|---|---|---|---|---|
-| 1 | 1.93 | 3.57 | 17.95 | 8.64 |
-| 2 | 3.77 | 4.62 | 24.54 | 18.77 |
-| 3 | 3.63 | 5.32 | 21.93 | 17.50 |
-| 4 | 4.91 | 8.35 | 23.25 | 19.30 |
-| 5 | 9.75 | 8.21 | 29.79 | 19.44 |
-| 6 | 14.14 | 14.75 | 23.02 | 22.83 |
-| 7 | 17.59 | 14.49 | 19.66 | 23.17 |
-| 8 | 22.42 | 15.54 | 17.02 | 18.92 |
-| median | **7.33** | **8.28** | — | — |
-
-**Reading.** The interactive p99 medians differ by ~1 ms inside a step-to-step
-spread of 1.9–22.4 ms, so nothing here is claimable either way: `direct` is
-lower on the four lightest steps and the shared pool is lower on the two
-heaviest. Throughput is **directional, not a claim** (`direct` ahead on 5 of 8
-steps, `shared` on 1, past the 15 % threshold only where the shared arm's cold
-pool dominates step 1: 17.95 vs 8.64 Gbit/s). So the shared pool does **not**
-lose in any claimable way, `direct` keeps only its documented role (sparse
-visitors and the measurement control arm), and no configuration guidance
-changes. The step-1 gap is the cold pool, not the pool's design: the shared arm
-pays one tunnel establishment the first visitor would pay on a fresh service.
-
-### S1 — the placement observation (and why S2/D28 do not land)
-
-The pre-registered kill criterion: run the mixed workload (interactive, 20 bulk
-streams, churn, UDP) over `clean`, `loss1`, `rtt100` with
-`MOLEHILL_PLACEMENT_STATS=1` and `MOLEHILL_POOL_STATS=1`; if the spread between
-candidates is inside the noise, S2 and D28 do not land.
-
-**The spread is not merely inside the noise — it is zero.** 2687 placements
-across 183 one-second intervals: mean best-candidate load 0.437 stream slots,
-mean worst-candidate load 0.437, **mean spread 0.000**, fallbacks 0, weighted
-mean open latency 36 µs (max 6907 µs — the cold-pool dial).
-
-**Why**, from the same run's pool timeline: the pool stayed at **one tunnel**
-carrying up to 21 streams; it grew to two only for the UDP floor
-(`+udp_floor:1->2`). The growth rule fires above 80 % of the pool's stream
-capacity — 51 streams at size 1 — and the mixed workload peaks at 21, so
-candidate choice never had a lever: every candidate a placement could pick was
-equally loaded by construction. Placement policy is therefore not the axis that
-would improve anything here; *pool size* is, and the elastic rules own that.
-
-**Instrument defect found by taking the measurement**: `best` was overwritten
-with the chosen tunnel's load *after* the open, so `worst − best` came out
-negative on a single-tunnel pool (mean −1.0 slots on the first run). The
-candidate snapshot is what the spread must be measured against; fixed before the
-recorded run (the numbers above are from the corrected instrument).
-
-### Post-review fixes (2026-09-27): burst spreading, per-visitor pairing, the host key
-
-A design review of this branch (asked for before the PR) found four things
-worth changing, three of them in code and one in the bench model. All landed
-here, each with a test that fails without it, plus a same-host screen A/B of
-the pre-review binary (`8d3d440`) against the post-review one.
-
-**A1 — a burst stacked on one tunnel while it was placed.** Growth was read
-only on the 50 ms maintenance tick, so a back-to-back burst (a 20-stream bulk
-test) placed every stream on the same tunnel before the tick could see it; the
-tick then fixed the *next* burst. `open_stream` now grows first and places
-second when its chosen tunnel is already at the per-tunnel growth threshold,
-with every guard a no-op when growing is wrong (in flight, held off after a
-refusal, at `max_tunnels`, cold). Pinned by
-`a_burst_spreads_over_tunnels_while_it_is_placed`: without the in-path growth
-the burst reads `[10]` on one tunnel — verified by disabling the call.
-
-**A3 — one unanswerable visitor parked the service.** The accept loop paired
-one visitor at a time, so a request the client could not answer (a pool at its
-ceiling, whose refusal the client reported to nobody) held the accept loop for
-the visitor's whole 25 s budget; the k-th unanswerable visitor was shed one
-budget after the first. Pairing is per visitor now, in flight bounded by
-`MAX_CONCURRENT_VISITORS` (128), with the stripe gather still atomic under a
-lock. Pinned by `one_unanswerable_visitor_does_not_park_the_service`: the
-serial loop sheds the second visitor 49 s after the first.
-
-**The test that caught it had a defect of its own**:
-`a_refused_growth_still_never_reaches_the_stream_cap` checked the *timeout's*
-result and never the *read's*, so a shed visitor's closed socket read as four
-zero bytes of "garbage". The new assertion distinguishes an ended connection
-from a still-waiting one; the old guard would have failed on any run where a
-shed fell inside the read window. **This is the second latent guard defect the
-suite has grown** (the first was the `# requires:` fixture directive); both
-were guarded by "it passes on this host", not by the assertion's meaning.
-
-**A6** — `MOLEHILL_TCP_BUFFER_BYTES` removed from `diag_env`'s illustration: a
-switch that does not exist, kept alive only by a docstring.
-
-**B1 — the host key made the gate's comparison half runnable.** Results
-carried the container hostname as the host identity, which changes on every
-container restart while the hardware does not: `soak_check.comparability`
-refuses different hosts, so same-machine runs were refused and the stored
-baselines (three runs, three containers) were never comparable — the release
-verdict was the self-check alone. Runs now record `host_id` (machine-id + CPU
-model + core count, hashed); files that predate the field fall back to the
-hostname and the gate says which key it used. **B3** — per-stage comparisons
-are matched by occurrence, so the return-to-`clean` stage (the recovery axis)
-is judged against the baseline's *return* stage instead of against its fresh
-start; a regression there was previously compared against the wrong cell and
-masked.
-
-**Verification (same host, same batch, interleaved).** `just soak
---test=screen --path=clean --streams-max=8 --ab <pre-fix>,<post-fix>`, 8 load
-steps, one run:
-
-| step | streams | pre-fix Gbit/s | post-fix Gbit/s | pre p99 ms | post p99 ms |
-|---|---|---|---|---|---|
-| 1 | 1 | 10.68 | 9.79 | 5.03 | 4.55 |
-| 2 | 2 | 12.93 | **16.64** | 2.27 | 2.87 |
-| 3 | 3 | 13.32 | 12.97 | 1.88 | 2.39 |
-| 4 | 4 | 13.06 | **15.38** | 1.99 | 1.84 |
-| 5 | 5 | 13.66 | 15.51 | 2.54 | 1.87 |
-| 6 | 6 | 13.07 | 13.04 | 1.89 | 1.87 |
-| 7 | 7 | 19.17 | 18.44 | 2.19 | 2.59 |
-| 8 | 8 | 14.06 | **26.54** | 2.26 | 2.94 |
-
-Reading: the interactive p99 (the SLO instrument) is inside the same 1.8-3.0 ms
-band on both sides — no regression — and the post-fix arm is ahead on every
-multi-stream step (claims on 2, 4, 8; directional on 5), which is the burst
-spreading's signature: single-stream steps are unchanged because the rule
-fires at 7 streams. The aggregate verdict is DIRECTIONAL (three steps ahead,
-not all eight), so this is evidence of no harm with a throughput lean, not a
-claim.
-
-The same pair on the shaped path (`--path=rate100`, the cell where the burst
-spreading was found), same method:
-
-| step | streams | pre-fix Gbit/s | post-fix Gbit/s | pre p99 ms | post p99 ms |
-|---|---|---|---|---|---|
-| 1 | 1 | **0.071** | 0.045 | 1014 | 1065 |
-| 2 | 2 | 0.059 | 0.059 | 1031 | 1084 |
-| 3 | 3 | 0.044 | 0.044 | 1850 | 1928 |
-| 4 | 4 | 0.044 | **0.054** | 2318 | 2207 |
-| 5 | 5 | 0.035 | **0.044** | 2616 | 2545 |
-| 6 | 6 | 0.056 | **0.069** | 2752 | 2952 |
-| 7 | 7 | 0.058 | 0.058 | 3484 | 3320 |
-| 8 | 8 | 0.058 | 0.055 | 3560 | 3628 |
-
-Reading: the throughputs are shaped to a fraction of a Gbit/s, so the deltas
-are small in absolute terms; the interactive p99 sits in the same 1.0-3.6 s
-band on both sides (that band is the path, not the tool), the post-fix arm is
-again ahead on the multi-stream steps (4-6), and the one pre-fix win is the
-single-stream step 1 at the noise floor. Same verdict as the clean run: no
-harm, a directional throughput lean on the steps the rule fires at.
-
-**Still open, unchanged by this round** (both resolved later: the striping in
-"Fixed: striping with the elastic pool", the re-sweep in "The re-sweep on the
-post-review commit"): the rate20 bulk spine (the shaped-path control connection; the
-structural answer is a per-visitor channel, i.e. `direct`, which is a design
-change with its own measurement), and the re-sweep: **the published
-`results-soak-v0.10.0.json` predates these three code changes**, so it may not
-be quoted as the shipped binary's numbers. Re-running the four-tool sweep is a
-release-gate step before the tag (`just soak-peers` first — `~/tmp` was
-cleared); a molehill-only screen is not a substitute, because the batch
-composition (peers sharing the machine) is part of the method.
-
-### Post-review round 2 (2026-09-28): striping, the mux waker, and the compatibility layers
-
-The review round after the first set of fixes asked for five things: an audit of
-the main code's non-logic problems (unnecessary lint waivers, unnecessary
-`unsafe`), the removal of the compatibility layers, the same audit for the bench
-code plus a stronger ruff, a real stripe implementation, and another attempt at
-the `rate20` bulk spine. What landed:
-
-**Striping works** (two independent causes, both pinned): the gather asked for
-no channels at all, and a reader's park on the mux command channel overwrote the
-writer's waker. Both are recorded in "Fixed: striping with the elastic pool" at
-the top of this file, with the falsifications and the stress reproducer.
-
-**Protocol v3 is gone, and the removed config keys are refused.** v0.10.0 now
-serves one dialect — a v3 client's hello is closed on its own connection, the
-listener keeps serving, and the interop matrix's new-server/old-client case
-pins the refusal on this tree and against the released v0.9.0 binary. The
-`pool_size` wire field, the v3 handshakes and the two-key service registry are
-deleted with it. The removed config keys are errors now (one message naming every
-key and its replacement), which is what the 0.10.0 changelog had promised for
-"the next release" — doing it in the same unreleased version avoids a second
-breaking release for the same change.
-
-**Lint surface.** The main code's waiver audit found two things worth changing:
-`spawn_udp_worker` took eight arguments behind a `too_many_arguments` waiver (it
-is a method on a `UdpWorkerSet` now), and mux tests carried leftover diagnosis
-prints that asserted almost nothing (they assert now — one of them, in
-`src/transport/multiplex.rs`, would have hidden a lost waker behind
-`[cli] cmdN: READ PENDING (waker lost?)` on a green run). The remaining waivers
-all still fire, and `-D warnings` proves it: `unfulfilled_lint_expectations`
-fails the build on a stale `#[expect]`. The one `allow(dead_code)` in the tree
-stays for the KCP datagram-size accessor, with the cascade written down; the only
-`unsafe` is the audited `recvmmsg`/`sendmmsg` FFI, which has no safe
-equivalent.
-
-**Bench harness.** One crash (`SOAK_KEEP=1 SOAK_WORK=…` died on an unbound `fp`
-and discarded the requested work dir), one measured O(n²) (`lib.worst_window`
-sliced its tail per iteration: 0.99 s → 0.045 s at 18 000 points, byte-identical
-outputs), two reads that produced a traceback instead of a path and a parse
-error, one subject-gating mismatch between the gate's self-checks, Optional
-plumbing that six call sites dereferenced, and a wider ruff (`B`, `E7`, `ARG`,
-`PTH` plus the already-clean `RET`/`C4`/`N`/`FA`/`FLY`/`PERF`), with
-`TRY`/`EM`/`ANN`/`T20` explicitly not selected and the reasoning in
-`ruff.toml`. The first attempt at that widening broke the harness
-(`log_path` returned a `str`, so every arm died with `AttributeError` before the
-first stage — caught by the sweep's own per-arm error record); fixed in its own
-commit and verified with a 20-second single-stage run before the sweep.
-
-### The release sweep on the round-2 commit (2026-09-28, 04:29)
-
-`revision v0.9.0-68-g5cdd414`, tree clean, fresh release binary (`Commit SHA
-0c1fd0b` at build time; the python fix behind it does not touch the binary),
-peers re-fetched, `--test=rrul --tools molehill,frp,rathole,nps`, ~65 min,
-`soak complete: 4 test(s)`, host `a093c5fbe0dc` — **the same host as the
-previous sweep**, so the drift gate finally has both halves.
-
-**`just soak-check`: `OK: no gate violation`.** Completeness (8 stages per tool,
-98 180 samples for molehill), the endpoint invariant and the absolute SLO all
-pass. The committed baseline the gate picks is v0.9.0's (different host, so
-skipped, as always).
-
-**The clean path improved; the shaped cells are variance.** Same-host
-comparison against the previous sweep (`8ba40ce`):
-
-| cell | previous | this sweep | verdict |
-|---|---|---|---|
-| clean interactive p99 | 8.129 ms | **6.567 ms** | -19 % |
-| clean (return) worst 1 s | 220.264 ms | **4.080 ms** | -98 % |
-| clean bulk peak | 23.66 Gbit/s | **24.52** | +3.6 % |
-| `rate100` bulk peak | 0.7665 Gbit/s | **2.3509** | **3.1x** |
-| `rate20` bulk intervals | 0 (spine dead) | 5, all zero | spine still unusable |
-| `jitter` bulk intervals | 115 | **0** | spine died here instead |
-| `loss5` | no wedge | 1 flat segment | shape change |
-| `rate20` p99 | 3476.9 ms | 4876.1 ms | +40 % (limit 25) |
-| `jitter` p99 | 2652.9 ms | 6426.9 ms | +142 % (limit 25) |
-
-All three drift violations are shaped-stage cells, in the class where the
-*same* comparison moved unchanged peers by far more: rathole's `rate100`
-162 -> 6638 ms (+4003 %), nps's `rate20` 3124 -> 6504 ms, nps's clean worst-1s
-+182 %. rathole's 162 ms was the collapsed no-load artifact the previous
-section already documented. The clean cells (the SLO instrument) moved in the
-right direction, and the run's own gate is green; per §10, the shaped cells are
-recorded as variance and not read as a regression. `jitter` losing its bulk
-spine while `rate20` gained intervals *is* worth watching: the shaped 20 Mbit
-uplink still costs molehill the test's own control connection, and which stage
-pays it moves between runs.
-
-**The `rate20` question: the failure is the *transition*, and it is
-molehill's.** Follow-up probes on this host, same harness, all with
-`--test=rrul` (each arm one stage or two back-to-back):
-
-| arm | `rate100` spine | `rate20` spine |
-|---|---|---|
-| molehill mux, `rate20` alone | — | **115 intervals** (all zero) |
-| molehill direct, `rate20` alone | — | **115 intervals** (all zero) |
-| molehill mux, `rate100` then `rate20` | 116 intervals | **0 — "spine produced no intervals (exit 1)"** |
-| molehill direct, `rate100` then `rate20` | 116 | **95 intervals** |
-| frp / rathole / nps, `rate100` then `rate20` | 116 each | **95 / 91 / 92 intervals** |
-
-So the stage in isolation is fine in *both* modes, the peers survive the same
-sequence, and a **per-visitor channel survives it where the shared muxed tunnel
-does not**. With `MOLEHILL_POOL_STATS=1` during a failing run the iperf service's
-pool holds `size=4 streams=21` (20 bulk + the control connection) steadily
-through the second stage, with no capacity refusal and no growth hold — the
-connections are placed and the bytes simply never move. That rules out
-placement, the ceiling and a stream leak, and points at the **shared long-lived
-TCP connection across a shaper transition**: the tunnel accumulated the
-`rate100` stage's loss/RTO state, and the next stage's 120 s window is not
-enough for it to recover, where a fresh per-visitor connection starts clean.
-The probe that would settle it is `ss -tin` on the tunnel sockets during the
-second stage (retransmits, `rto`, `cwnd`, `unacked`).
-
-Directions, ranked by cost and by what they would settle:
-
-1. **Per-visitor channels for a saturating service** — already measurable and
-   measured above (95 vs 0 intervals); the config key exists
-   (`[client.services.<name>].mode = "direct"`). Cost: the FD/NAT amortization
-   of the mux is given up for that service.
-2. **Tunnel liveness recovery** (small-medium, code): the mux already samples
-   RTT with ping/pong, and the pool already owns tunnel lifetime — a tunnel
-   whose ping goes unanswered for N intervals, or that carries streams with
-   zero bytes for T, is dropped and re-dialed. This is what makes the *shared*
-   shape survive a transition instead of needing per-visitor channels.
-3. **Spread bulk further** (config, free to measure): a lower per-tunnel growth
-   threshold or a higher `max_tunnels` puts fewer bulk streams behind one
-   connection, shrinking the blast radius of one connection's RTO state.
-4. **Stream scheduling inside the mux** (least-queued/DRR, small frames first):
-   fixes head-of-line *latency* inside a healthy tunnel — orthogonal to the
-   measured failure (an RTO-bound connection has nothing to schedule).
-5. **Aggregate in-flight cap per tunnel** (BDP-aware, medium): bound what one
-   tunnel's socket may hold so a transition cannot leave megabytes queued.
-6. **Method-side, for the zeros**: every tool records a zero bulk series on the
-   shaped cells because the shaper's queue (`limit 2000`) is ~1.2 s deep at
-   20 Mbit/s — the interval's bytes are still queued when the interval is
-   accounted. A smaller `limit`, longer intervals, or a per-stage cumulative
-   throughput would make the shaped bulk cells quotable instead of "zero for
-   everyone", independently of molehill.
-
-**What became of those directions (2026-09-28):** (1) is still the measured
-workaround; (2)'s premise did not survive its own probe, but the pool *did*
-have a real defect beside it — a tunnel whose driver had ended was never
-removed, and one stream that outlived its connection kept the corpse placeable
-(`TunnelPool::reap_dead`, with a test that fails without it); (3) was not
-needed; (4) and (5) landed in the mux (bookkeeping frames leave ahead of
-payload, the receiver scan round-robins, and the userspace queue is bounded in
-bytes); (6) was the actual fix, together with the one server-side pairing gap.
-The evidence is in the next subsection.
-
-**The `rate20` bulk spine is therefore a tunnel-liveness defect, not a
-placement or stripe one, and it has a measured workaround (per-visitor
-channels) plus a measured reproducer (`rate100:120,rate20:120`, ~4 minutes).**
-
-#### The `rate20` spine: the RTO hypothesis is falsified, and the shaper owned the stall (2026-09-28)
-
-The paragraph above is **retracted as a mechanism**. The probe it asked for —
-`ss -tin` on the tunnel sockets during the second stage — was run on the
-`rate100:120,rate20:120` reproducer (`--tools molehill --variants mux`), and it
-says the tunnel is healthy:
-
-| Sampled sockets | Result over the whole transition |
-|---|---|
-| the tunnel/control port (26001) | `retrans 0/0`, `rto` flat at 201-220 ms, `cwnd` climbing 20 -> 45, no `unacked` |
-| the same tunnels, rate20 window | each of the four bulk tunnels still moved 5.4-9.2 MB |
-| the *shaped* legs (visitor 26002, backend 26090) | `cwnd` pinned at 10 with `rto` 4.4-31.6 s on the visitor sockets |
-
-So the shared tunnel carried the rate100 stage's loss state nowhere: there was
-no RTO state on it. (The harness shapes the tool's seven data-plane ports and
-deliberately leaves the control/tunnel port in the unshaped default class —
-`soak.py`, `_ports` — so "the tunnel accumulated the RTO" was never available
-to begin with.)
-
-**The stall is the shaper's, and it reproduces with no tool in the path.**
-Replicating the harness's exact `htb` + `netem` shape on `lo` and killing 20
-bulk TCP streams at the instant the qdisc changes from `rate100` to `rate20`:
-
-| | first fresh round trip | second | steady state |
-|---|---|---|---|
-| switch immediately after the kill | **connect timed out after 10.5 s** | 3.5-6.7 s | 161 ms, reached ~15 s in |
-| drain 10 s at the *old* shaper, then switch | **164 ms** | 161 ms | immediately |
-
-A killed TCP socket keeps delivering what its kernel side still holds and keeps
-retransmitting its FIN; reshaping at that moment puts the old stage's drain and
-the new stage's handshake into the same one-class queue. Two controls bound the
-claim: `iperf3 -P 20` against the bare shaper completes (exit 0, 30 intervals,
-0.25/1.04 Gbit/s peak), so the shaper alone does not kill the bulk client; and
-the backend's `Bad file descriptor` lines — which looked like a wedged
-single-test server — are iperf3's benign answer to an *aborted* connection (20
-RST aborts reproduce them exactly, and a real test on the same server then
-exits 0), so they are a symptom, not the wedge.
-
-**Three fixes, all measured on the reproducer:**
-
-1. `Shaper.settle` (`benches/scripts/soak/soak.py`) drains at the **old**
-   shaper before the next stage's `apply`: the predicate is the tool's netem
-   queue empty **and** its bulk port free of established connections, both for
-   two consecutive polls, bounded by `SOAK_DRAIN_BUDGET` (30 s, recorded in the
-   results meta). The queue alone is not enough — it is empty *between*
-   retransmissions of a killed client's FIN, and with only that check the drain
-   finished in 1.0-1.8 s while the previous stage's visitors were still
-   tearing down ~10 s later.
-2. The single-test `iperf3` backend is restarted **before every stage's** bulk
-   attempt, not only after a failed one (`restart_iperf`), so a teardown lands
-   on a process nobody will dial again.
-3. The harness records the bulk client's own failure text
-   (`stage.bulk_client_error`) instead of a bare exit code. That is what
-   produced the actual client-side reason for the first time:
-   **`control socket has closed unexpectedly`** — i.e. the *server* closed the
-   iperf3 client's control connection.
-
-**And the server closed it for a real reason** (`src/core/server.rs`): a
-visitor paired with a data channel that died before it carried
-`StartForwardTcp` was dropped on the spot. The client dials the local service
-only *after* that command, so a channel whose backend leg is already gone fails
-in exactly that window, and every later dial of the stage inherited the
-failure. The pairing now re-requests instead of dropping the visitor, under the
-same `PAIR_ATTEMPTS` allowance a missing channel gets.
-
-**Effect on the reproducer** (six runs of `rate100:120,rate20:120`, molehill
-mux), `rate20` stage:
-
-| | before | after the drain (3 runs) | after all three (2 runs) |
-|---|---|---|---|
-| bulk intervals | 0-5, `bulk_error` set | 0-5, `bulk_error` set | **38 and 10, no `bulk_error`** |
-| bulk peak | — | — | **0.124 and 0.275 Gbit/s** |
-| interactive / churn samples | 3-4 / 3-14 | 3-112 / 3-128 | 3 / 3 |
-
-Two runs is still a small sample, but the axis moved the right way and the
-failure mode changed shape: the stage now *completes* instead of recording
-nothing. The interactive/churn columns are variance and are not a claim — and
-the low counts in the last two runs have a reading of their own: once the
-20-stream bulk actually runs, it competes for the one 20 Mbit class the probes
-share, which is exactly what the peers' shaped cells look like. Before the fix
-the bulk died early, so the probes had the class to themselves.
-
-**What is now ruled out, with the probe that ruled it out**: the tunnel's RTO
-state (no retransmits on 26001), the pool's placement and ceiling
-(`MOLEHILL_POOL_STATS` held `size=4` with capacity free throughout), a stream
-leak (streams returned to 0), a wedged single-test backend (aborted connections
-reproduce its `Bad file descriptor` verbatim and it serves a real test
-afterwards), and the shaper alone (`iperf3 -P 20` against the bare shaper is
-clean).
-
-### The release sweep on the frozen commit (2026-09-28, 13:13)
-
-The sweep the release plan asked for, on the frozen tree, with the new method:
-`ca4ab4a` (clean, fresh release binary sha256 `0ab4072667c30498`, `stale false`,
-`stage_drain_budget_s 30.0`, `workload_version 1`, host `d764f9da9c7e5b2a`),
-`just soak --test=rrul --tools molehill,frp,rathole,nps --out
-benches/scripts/soak/results-soak-v0.10.0.json`, ~76 minutes,
-`soak complete: 4 test(s)`.
-
-**`just soak-check`: `OK: no gate violation`.** molehill complete (95 660
-samples, 8 stages), the throughput endpoint invariant holds, and both clean
-stages sit inside the SLO (6.482 and 6.039 ms against 50 ms). The comparison
-half was skipped again: the gate's baseline is `results-soak-v0.9.0.json`, which
-predates `host_id`, so it falls back to hostnames and refuses
-(`98c48ea3fa68` vs `a093c5fbe0dc`).
-
-**The `rate20` hole is closed; `jitter` is not.** molehill's per-stage bulk
-series this run, as intervals / peak Gbit/s / share of intervals reading zero:
-
-| stage | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
-|---|---|---|---|---|---|---|---|---|
-| intervals | 294 | 111 | 115 | 111 | 115 | **91** | **0** | 294 |
-| peak | 22.82 | 3.03 | 5.39 | 2.41 | 0.343 | **0.236** | — | 22.82 |
-| zero share | 0 % | 0 % | 0 % | 0 % | 28 % | 64 % | — | 0 % |
-
-The delay and loss cells have **no zero-byte interval at all** (also true for
-frp and rathole), so they are quotable; the rate cells are quotable as *peaks*
-only, because the shaper still holds most intervals' bytes past their own
-accounting window — flagged in the README rather than smoothed. `jitter` is
-still a hole, now with its reason captured by `bulk_client_error`: the client
-could not dial the exposed port (`Connection timed out`). The previous baseline
-had the same hole, so nothing regressed, but the cell is missing.
-
-**Same-host delta, and why only part of it reads as a delta.** The previous
-`results-soak-v0.10.0.json` (before this commit) was made on the *same*
-`host_id`, so it is comparable as a host — but it was measured with the **old
-method**, and the method is part of comparability:
-
-| cell | old method | this sweep |
-|---|---|---|
-| clean p99 / clean (return) p99 | 6.567 / 6.929 ms | 6.482 / 6.039 ms |
-| rtt100 p99 | 8082 ms | 7567 ms |
-| loss1 p99 | 1324 ms | 1335 ms |
-| loss5 p99 | 6032 ms | 2847 ms |
-| rate100 p99 | 6412 ms | 7686 ms |
-| rate20 p99 | 4876 ms | 6335 ms |
-| jitter p99 | 6427 ms | 6369 ms |
-| rate20 bulk | 5 intervals, all zero | **91 intervals, 0.236 peak** |
-
-The shaped-cell moves are not a claim in either direction: the old file's
-`rate20` stage carried no bulk load at all (its spine was dead or all-zero), so
-its 4876 ms interactive was measured against an idle path, while this run's
-6335 ms is measured with the 20 bulk streams the stage exists to impose. The
-one qualitative change is the `rate20` bulk row, which went from unmeasurable to
-measured. The old file's shaped *bulk peaks* (e.g. `rate100` 2.35 Gbit/s) are
-not comparable either — the drain changes what a peak interval contains — so
-they are not quoted as a delta.
-
-**Two known imperfections, recorded rather than hidden:**
-
-1. **Two drains spent their full 30 s budget going nowhere**: `drain budget of
-   30s expired with the path still busy (backlog=498, bulk sockets=0)`. The
-   predicate demands an exactly empty netem queue for two consecutive polls,
-   and a shaped path with the probes running always has a few hundred bytes in
-   flight, so the wait can never succeed — it just costs its budget. Nothing
-   was left to drain (`bulk sockets=0`), and the next stage started with a
-   sub-frame backlog, so no measurement is affected; the follow-up is to treat
-   a backlog below one frame as empty. The budget cost ~30 s per occurrence.
-2. **`jitter`'s dead spine** (above). The likely cause is the same artifact the
-   drain exists for, one step further out: the drain's socket predicate counts
-   only `ESTABLISHED` sockets, and a previous stage's visitors linger in
-   `CLOSING` / `FIN-WAIT-2` — measured at ~10 s in the rate100 -> rate20 case —
-   so their retransmissions can still meet the next stage's handshake. Next
-   iteration: count any non-`TIME-WAIT` socket on the bulk port, and consider
-   requiring one successful connect before the spine starts.
-
-### The re-sweep on the post-review commit (2026-09-27, 19:12)
-
-The sweep the release plan asked for, on the commit that carries the
-post-review fixes (`v0.9.0-59-g8ba40ce`, tree clean, fresh release binary):
-`just soak-peers` (the `~/tmp` peer cache was cleared), `cargo build --release`,
-then `just soak --test=rrul --tools molehill,frp,rathole,nps --out
-benches/scripts/soak/results-soak-v0.10.0.json`, ~70 min, `soak complete: 4
-test(s)`.
-
-**`just soak-check`: `OK: no gate violation`.** Completeness, the endpoint
-invariant and the absolute SLO pass for all four tools; the shaped stages are
-recorded as the degradation curve.
-
-**The same-host pre/post comparison ran for the first time on this host** — the
-`host_id` key (or its hostname fallback for the older file) makes the committed
-run comparable — and it reports **6 violations**, five of them molehill's, which
-is the honest headline of this round:
-
-| cell | pre-fix | post-fix | delta |
-|---|---|---|---|
-| clean p99 | 2.287 ms | 8.129 ms | +255 % |
-| clean worst 1 s | 2.140 ms | 4.958 ms | +132 % |
-| loss1 worst 1 s | 945.9 ms | 4596.7 ms | +386 % |
-| loss5 p99 / worst 1 s | 1908 ms | 4943 ms | +159 % |
-| clean (return) worst 1 s | 84.1 ms | 220.3 ms | +162 % |
-| jitter p99 | 7094.5 ms | 2652.9 ms | **-63 %** |
-
-**The clean-cell move is the fix working, not a regression.** The pre-fix
-initial `clean` stage carried **15.0 Gbit/s** of bulk (server/client CPU 2.0 %)
-while every other clean window in the same run carried 23-25 Gbit/s — the
-20-stream burst stacked on one tunnel, exactly the head-of-line blocking A1
-removes. The post-fix initial clean carries **21.2 Gbit/s** at 6.4 % CPU from
-the first interval, and the interactive median moves 1.49 -> 3.03 ms *because
-the stage now carries ~40 % more traffic through the tool*: the return-to-clean
-window, where both runs carry the same load, is unchanged (median 2.64 vs 2.72,
-p99 7.49 vs 7.42). The interleaved screen A/B on the same pair measured the same
-property without the load confound (+0.2 ms, not +1.5 ms). All of it stays
-inside the 50 ms SLO with 6x headroom.
-
-**The shaped-cell moves (loss1 worst-1s +386 %, loss5 +159 %) are inside the
-known variance, and the peers prove it**: between two runs of the *same*
-unchanged binaries on the same host, frp's jitter p99 moved 219 -> 4296 ms,
-nps's loss5 -28 %, rathole's rate100 collapsed to 161 ms — because rathole's
-`rate100` bulk spine produced no intervals in this run (exit 1), so that cell
-carried no load. molehill's `rate20` spine also produced nothing (exit -9), the
-known blocker this cycle has not closed.
-
-**What the sweep says overall** (all numbers quoted in the README pair):
-molehill's jitter cell is now the *best* of the four (2653 against 4296 / 3034
-/ 5063); on the clean stage molehill and rathole carry the same bulk (23.7 vs
-23.6 Gbit/s) while a fresh interactive connection costs 8.1 ms against frp's
-2.8; molehill leads the rate-limited cell (6537 against 7078 and 8120, 80
-samples against 12 and 13); and the two honest losses are carried in the table
-rather than smoothed over — the clean interactive cost against frp, and the
-`rate20` spine. The re-sweep is committed with the charts and the refreshed
-README pair, so the published numbers describe this commit's binary.
-
-### The v0.10.0 release sweep
-
-**Superseded by the re-sweep above** (measured on `8d3d440`, i.e. before the
-post-review fixes; kept as the record of the frozen commit's run). The published
-numbers, charts and README pair now come from the re-sweep.
-
-**Run (2026-09-27).** `revision v0.9.0-45-g8d3d440`, `tree_clean true`,
-`stale false`, binary `target/release/molehill` sha256 `df3b341b9e010449`
-(4 155 712 bytes), `molehill_version 0.10.0`, `workload_version 1`, host
-`a093c5fbe0dc`, `--tools molehill,frp,rathole,nps --test=rrul`, ~80 min,
-`soak complete: 4 test(s)`.
-
-**The provenance check earned its place.** The first attempt was refused by the
-harness — `target/release/molehill predates the newest source file` — because the
-previous round's temporary write-timing diagnostic had been reverted in the
-*source* without rebuilding the *binary*; `strings` confirmed the shipped binary
-still carried the diagnostic string. Rebuilt, re-verified (0 occurrences,
-`--version` reporting `8d3d440`), then swept. §10's "prove provenance" rule
-caught a real stale artifact rather than a hypothetical one.
-
-**`just soak-check`: `OK: no gate violation`.** Completeness, the endpoint
-invariant and the absolute SLO all pass for the four tools:
-
-```
-ok  molehill (mux): complete (95562 samples, 8 stage(s))
-ok  molehill (mux): throughput endpoint is the exposed port 26002 (backend 26090)
-ok  molehill (mux) clean: interactive p99 2.287 ms is inside the SLO (50.0 ms)
-ok  molehill (mux) clean: interactive p99 7.489 ms is inside the SLO (50.0 ms)
-NOTE molehill (mux): 5 shaped stage(s) sit above the SLO by design, p99 up to
-     7094.501 ms — that is the degradation curve, not a verdict
-```
-
-**The same-host baseline the plan relied on no longer exists.** The withdrawal
-note above kept `results-soak-v0.9.1.json` in the tree *because* it was measured
-on this host, which made it the only same-host delta available. That host was
-`16b4dc8db68b`; this run is on `a093c5fbe0dc` (the container was recreated after
-the `/tmp` wipe), so the file's whole reason for being here expired with the host
-name — and `soak-check` says so itself rather than guessing:
-
-```
-# Comparison against the baseline: skipped
-  NOTE baseline is not a gate input: the runs were made on different hosts
-       (16b4dc8db68b vs a093c5fbe0dc) ...
-  NOTE the run above is gated by its own checks: completeness, the endpoint
-       invariant and the absolute SLO
-```
-
-The file and its four charts are deleted in the sweep commit, per the release
-plan; the new baseline candidate (v0.9.0, host `98c48ea3fa68`) is a different
-host too, and is skipped identically. **Every stored baseline in this repository
-is from a different host than the run that consults it**, so the drift gate has
-in practice never been available here — worth knowing before anyone reads a
-cross-host delta as a regression, which is exactly the mistake this cycle spent
-several rounds on.
-
-**What the four tools did in the same run** (interactive p99 ms; `wedge` = no
-response inside the 5 s timeout):
-
-| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
-|---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | **2.3** | 5906 | **1305** | **1908** | **5258** | wedge | 7094 | 7.5 |
-| frp 0.71.0 | 2.9 | 7235 | 4281 | 5297 | 6995 | 6051 | **219** | **2.9** |
-| rathole 0.5.0 | 70 | 7589 | 1313 | 5418 | 7345 | 6219 | 2717 | 75 |
-| nps 0.26.10 | 65 | **861** | 1140 | 4458 | 7244 | 5900 | 3872 | 65 |
-
-molehill leads clean, loss1, loss5 and rate100, matches rathole on loss1, and is
-**worst on jitter** (7094 ms against frp's 219 ms) and the only tool whose
-`rate20` stage produced no interactive sample at all. Its bulk peak is 16.3
-Gbit/s on clean, 2.9 at rtt100, 0.7 at rate100 and **25.0** on the return to
-clean (frp 6.5 / 2.9 / 0.7 / 6.5; rathole 23.5 / 3.0 / 0.5 / 22.7; nps 0.5 /
-1.2 / 0.5 / 0.7). The wedge report is the mildest of the four at rate100 (one
-flat segment, 5.3 s) against frp's five (37.2 s) and nps's seven (41.1 s). The
-two honest losses are carried in the README table rather than smoothed over.
-
-### CI caught what `just check` cannot
-
-The PR's `test server+client lib only` leg went red on the first push: `cargo
-test --lib --no-default-features --features server,client` failed three config
-tests. `[client.data]` and `[server.data]` exist only with the `multiplex`
-feature (they are `#[cfg(feature = "multiplex")]` fields on the config structs),
-and two fixtures this cycle added — `valid_config/full.toml` and
-`invalid_config/max_tunnels_zero.toml` — carry them, so in that leg they parse as
-*unknown field `data`*.
-
-The local chain never sees it: `just check` compiles the minimal build only for
-clippy, and clippy does not run `#[test]` bodies. CI's feature-powerset leg is
-the only thing that runs them, which is exactly why it is there. **Three more
-legs' worth came out of the same well** once it was looked for, so the whole
-matrix was run locally afterwards:
-
-| leg | before | after |
-|---|---|---|
-| `--lib --no-default-features --features server,client` | 3 failed | 82 passed (2 fixtures skipped) |
-| `--no-default-features --features server,client,noise,hot-reload` | `log_budget_test` failed | 100 + 14 + 2 + 7 passed |
-| `--no-default-features --features server,client,noise,hot-reload,multiplex` | `test_per_service_data_overrides_parse` failed | 129 + 17 + 2 + 9 + 7 passed |
-
-The other two, both the same shape — a test assuming the default feature set:
-
-- `tests/log_budget_test.rs::every_removed_key_warns_and_is_otherwise_quiet`
-  injects `default_count = 4` into `[client.data]`, which the `multiplex`-less
-  leg does not have; the section is now included (and its expectation asserted)
-  only where it exists. The migration contract still holds for the five keys
-  every build has.
-- `tests/session_test.rs` proved port occupancy by binding `127.0.0.1:<port>`
-  while the server holds `0.0.0.0:<port>`. That is evidence on Linux and not on
-  a BSD-derived host, where `SO_REUSEADDR` (set by `TcpListener::bind`) lets a
-  specific-address bind coexist with a wildcard one — macOS failed
-  `a registered service must hold its port` for exactly that reason. The probes
-  bind the wildcard now, which is what the server binds.
-- `test_per_service_data_overrides_parse` used `default_carrier = "kcp"`, which
-  needs the `kcp` feature the noise legs do not build; it picks the carrier the
-  build has, because the property under test is that a service's own value wins.
-
-Then macOS CI failed a test from *this* cycle, and it was a real flake rather
-than a gating bug: `common::forward::tests::a_stream_that_keeps_moving_is_not_reaped`
-ran a 100 ms idle deadline against a byte every 50 ms — 2× headroom on a real
-clock, beside 140 other tests — and the runner's scheduling delay was read as
-silence. Margins are now 500 ms against 25 ms (20×, and twice the watchdog's own
-50 ms tick) for four deadlines' worth of movement, which is still far more than
-an age-based watchdog would tolerate, so the test keeps its power.
-
-The fix for the fixtures is a directive mirroring the existing `# expect:`
-convention:
-
-```toml
-# requires: multiplex
-```
-
-The fixture-driven tests skip a fixture whose declared feature is not compiled
-in, **reporting** the skip rather than dropping it silently, and an unknown
-feature name in the directive fails the test — a typo must not quietly retire a
-fixture. `test_every_removed_key_is_stripped` assembles its config by
-concatenation now (a `format!` string read the TOML's literal
-`health_check = { ... }` braces as placeholders) and only asserts on
-`[client.data]` where the section exists. The `clippy::panic` waiver for the
-directive sits on the test module, per AGENTS.md §2's test-module exception.
-
-Verified in both configurations: `--no-default-features --features server,client`
-82 passed (2 fixtures reported skipped), default build keeps full fixture
-coverage, clippy clean in both.
-
-#### The same well, again: two attribute/cfg orphans from the v3 removal (2026-09-28)
-
-CI had been red since `e4b8bb1a` (2026-09-28 04:36) — four runs, two jobs,
-never caught locally — and the cause is the mirror image of the fixture
-problem above: `just check` and CI's feature legs compile different feature
-sets, so a gate that only the legs exercise can stay red through a green local
-chain.
-
-Both failures are deletions that left an attribute behind:
-
-| where | what happened |
-|---|---|
-| `src/protocol.rs` | `df4f2e5` removed the v3 `read_registration`, and its doc comment plus `#[cfg(feature = "server")]` stayed where they were — stacked on top of `read_register_result`, which is the *client's* reader. The two cfgs AND-ed, so a `client`-only build lost a function its own session loop calls (`E0432`). |
-| `src/common.rs` | the same commit deleted `pub mod multi_map;` from under `#[cfg(feature = "server")]`, and the attribute attached itself to `pub mod owned_write;` — which the noise *and* KCP transports use, on either side. `client,kcp` then could not compile (`E0433`). |
-
-Fixed in both places: `owned_write` is gated `any(feature = "noise", feature =
-"kcp")` — exactly its two users, neither of which implies a side — and the
-orphan doc/cfg above `read_register_result` is gone, leaving the `client` gate
-its doc describes.
-
-Verified with the two failing CI jobs' own commands: `just powerset` — **all
-251 feature combinations**, `POWERSET=0` — and `cargo build --profile minimal
---no-default-features --features client` (`MINIMAL=0`). The lesson is the one
-the fixture section already states: the local chain never compiles every
-feature set a deletion can break, so a release-shaped change is not verified
-until the powerset and the minimal profile have both run.
+| M1 — one session per endpoint | one authenticated control session per `(remote_addr, effective transport)` carries every service; per-service auth inside it; the server declares the heartbeat cadence in the session ack |
+| The stream-cap leak (2026-09-26) | the engine's 64-stream cap is reachable and the bulk spine dies when it is; the shaped `rate20`/`jitter` failures reproduce on the **released v0.9.0 binary** too, so those cells describe the shaped path, not a v0.10.0 regression — which is why the release decision does not rest on them |
+| M2a — shared elastic pool | one pool per carrier, cold start, `max_tunnels` cap, the UDP-derived floor; growth is the client's own decision, shrink is conservative |
+| M6 — configuration surface | exactly what 0.10 removed and what to write instead |
+| M7 — `direct`'s role | what `direct` costs and buys against the mux; kept for sparse visitors and as the measurement control arm |
+| S1 — placement observation | the per-tunnel state spread is zero, so S2/D28 do not land (D22 applied as written) |
+| Post-review round 1 | burst spreading, per-visitor pairing, the stable host key |
+| Post-review round 2 | striping on a v4 session, the mux reader/writer waker fix, and the v3 removal |
+| The cycle's four sweeps | one per candidate release commit, each superseded by the next; a superseded sweep is evidence about the harness as much as about the tool |
+| CI caught what `just check` cannot | the local chain never compiles every feature set, so a release-shaped change is not verified until the powerset and the minimal profile have both run — that is what those CI jobs are for |
 
 ## Release (v0.10.0)
 
 1. ~~Freeze~~ **done (2026-09-28)** — `b305394 chore(release): prepare
-   v0.10.0`: `version = "0.10.0"` was already set, the `[Unreleased]` content
-   moved under `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, and the
-   withdrawn `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` were
-   already deleted. Merging the two sections exposed a contradiction inside
-   the release notes (the `health_check` bullet still promised a
-   warning-then-error path the same release had replaced with a refusal), fixed
-   in the same commit.
-2. ~~Re-sweep~~ **done, and now REQUIRED AGAIN** — see "The re-sweep on the
-   post-review commit" above: fresh binary on `8ba40ce`, peers re-fetched, 4
-   tools, 8/8 stages, `just soak-check` `OK: no gate violation`, the same-host
-   comparison reported (5 molehill violations, all explained in that section),
-   charts re-rendered and the README pair refreshed in the same commit.
-   **The 2026-09-28 method change invalidates it**: the stage drain, the
-   per-stage backend restart and the client-error recording all change what a
-   stage measures (`docs/benchmarks.md`, "The stage schedule"), so
-   `results-soak-v0.10.0.json`, the four charts and the README tables must be
-   regenerated on the frozen commit before the tag. The stored baselines are
-   not comparable to a run made with the new schedule — that is what
-   `meta`'s new `stage_drain_budget_s` key is for. **Re-run on `ca4ab4a` and
-   done** — `OK: no gate violation`, the `rate20` bulk spine now carries 91
-   intervals, and the charts and both READMEs are refreshed in the same commit;
-   see "The release sweep on the frozen commit" above for the record and for the
-   two imperfections it left open (a drain budget that expires with nothing to
-   drain, and molehill's still-dead `jitter` spine).
+   v0.10.0`: `version = "0.10.0"` set, the `[Unreleased]` content moved under
+   `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, the withdrawn
+   `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
+2. ~~Re-sweep~~ **done (2026-09-28, evening)** — a fresh binary on the release
+   commit, four tools, 8/8 stages, charts and both READMEs refreshed in the
+   same commit as the results file. The gate verdict is one waived violation;
+   the record and the waiver are the subsection below.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
-   `just tag-check` must be run on the frozen commit.
-4. `just check`, `just interop`, then push the branch and open the PR.
+   `just tag-check` must be run on the release commit.
+4. `just check`, `just interop`, then push the branch and open the PR. (The PR
+   exists and is re-green after each push.)
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
+
+### Release sweep (2026-09-28, evening)
+
+`v0.9.0-92-g1ddb5b7`, tree clean, fresh release binary sha256 `69d529a76959ca7c`
+(`stale: false`), host `a093c5fbe0dc` / `host_id d764f9da9c7e5b2a`, four tools,
+8/8 stages, `--test=rrul`, ~70 minutes. Charts and both READMEs are refreshed in
+the same commit.
+
+**`just soak-check` is RED, and this is the explicit waiver the gate asks for:**
+one violation, `molehill (mux) rate20: the bulk spine carried 0 interval(s),
+below the 4 a 120s stage needs (spine produced no intervals (exit 1); control
+socket has closed unexpectedly)`. The peer note is the same failure on nps's
+`jitter` stage. Both are disclosed in the README with `†`.
+
+Per-stage bulk intervals / peak Gbit/s this run:
+
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean |
+|---|---|---|---|---|---|---|---|---|
+| molehill | 147 / 21.65 | 111 / 2.89 | 114 / 5.35 | 108 / 2.43 | 116 / 0.816 | **0** | 115 / 0.000 | 147 / 23.19 |
+| frp | 147 / 7.09 | 111 / 2.77 | 116 / 5.34 | 108 / 3.33 | 116 / 0.535 | 114 / 0.000 | 80 / 0.000 | 147 / 6.78 |
+| rathole | 147 / 22.86 | 111 / 3.03 | 115 / 5.33 | 109 / 3.49 | 116 / 0.712 | 104 / 0.000 | 92 / 0.000 | 147 / 24.02 |
+| nps | 147 / 0.642 | 111 / 1.53 | 116 / 1.25 | 109 / 1.07 | 116 / 0.356 | 114 / 0.000 | **0** | 147 / 0.453 |
+
+**Why the violation is waived rather than fixed here.** Three facts, in order of
+weight:
+
+1. **It is not a v0.10.0 regression.** The archived stream-leak investigation
+   reproduced this exact cell (`rate20`, 0 intervals, same failure shape) on the
+   **released v0.9.0 binary**, with the same workload and shaper.
+2. **It moves between cells, not between builds.** Across the cycle's sweeps the
+   single dead cell has been `jitter` (frozen-commit sweep), `rate20` (the
+   superseded sweep and this one) and `jitter` for nps (this one), while both
+   two-stage probes of those very transitions — `rate100:120,rate20:120` and
+   `rate20:120,jitter:120` — carried 99-114 intervals each time. A cell that
+   passes in isolation and dies once per full run is harness fragility at a
+   shaped transition, not a tool defect that a code change would fix.
+3. **The rate cells carry no verdict anyway.** In this run every arm's `rate20`
+   and `jitter` peak is `0.000` (the shaper holds the bytes past each interval's
+   accounting window), so the release decision does not rest on them — which
+   the README states rather than implying a comparison that the data cannot
+   support.
+
+**What the next attempt should change, and what this one cannot claim.** The
+predicate was reverted to the frozen sweep's in `b32a5fb`, but *both halves* of
+it changed together (the backlog tolerance and the socket states), so which half
+mattered is **not isolated** — the next attempt must change one at a time and
+probe both transitions. Two candidate mechanisms are recorded for it: the
+per-stage `iperf3` restart may race the previous stage's dying control
+connection on the same port (the server is single-test), and the engine's
+64-stream cap is reachable and its wedge is inherited by every later dial of the
+stage (the archived investigation; it is the open thread below). A third,
+smaller defect is visible in this run's log: three drains spent their full 30 s
+budget with `backlog=412..1194, bulk sockets=0` — the "exactly empty queue"
+half of the predicate again — which costs wall time, not validity.
 
 ### The freeze found a gate that would have shipped empty release notes (2026-09-28)
 
@@ -1506,27 +364,41 @@ this paragraph and the deleted-file history.
 
 ## Release review — the state a reviewer should check
 
-Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
+The review below was last refreshed on `d8233c4` (`just check`, `just interop`
+and the CI query were re-run there); the open `[ ]` items need a human.
 
-- **PR**: #4, 33 commits, `mergeable=MERGEABLE`, CI **12/12 green** (four
-  platform builds, three feature-leg test jobs, full check chain, powerset,
-  docs alignment, musl static, minimal build size).
-- **Gates**: `just check` green (147 lib / 20 integration / 10 pool / 7 session
-  / 2 log-budget); `just interop` 3/3 against the released v0.9.0 binary (the
-  new-server/old-client case is a refusal case now — v4 only); `just
-  soak-check` `OK: no gate violation`; `just tag-check` "pre-tag review passed
-  for v0.10.0".
+- **PR**: #4, 64 commits (81 files, +14658/−3038), `mergeable=clean`, CI
+  **12/12 green** at `d8233c4` (four platform builds, three feature-leg test
+  jobs, full check chain, powerset, docs alignment, musl static, minimal build
+  size) — queried through the API, not assumed.
+- **Gates**: `just check` green on `d8233c4` (147 lib / 20 integration / 10
+  pool / 7 session / 2 log-budget; 3 ignored interop cases); `just interop` 3/3
+  against the released v0.9.0 binary (the new-server/old-client case is a
+  refusal case now — v4 only); `just soak-check` `OK: no gate violation`; `just
+  tag-check` "pre-tag review passed for v0.10.0".
 - **Benchmarks**: `results-soak-v0.10.0.json` + four charts are in the release
   commit, the README pair carries the same four-tool table, and the withdrawn
-  v0.9.1 file and charts are deleted.
+  v0.9.1 file and charts are deleted. **The provenance caveat is closed:** the
+  shipped sweep is `v0.9.0-92-g1ddb5b7` with binary sha256 `69d529a76959ca7c`
+  and `tree_clean: true`, i.e. a fresh binary on the release commit — which is
+  what the ritual asks for, and what the frozen-commit sweep (`ca4ab4a`) could
+  not claim. The gate verdict on it is one waived cell; the waiver is the
+  "Release sweep" subsection above.
 - **CHANGELOG**: the `[0.10.0]` section was audited against the cycle's commits
-  and five user-visible fixes were added (`899eb6f`).
+  and five user-visible fixes were added (`899eb6f`); it is dated
+  `2026-09-28`, one dated section, `[Unreleased]` empty.
 - **Container**: scratch from static musl, `bin/<arch>` for amd64 and arm64 from
   the same feature set (`server,client,noise,hot-reload,multiplex,kcp`), `USER
   1000:1000`, `--help` smoke test plus `imagetools inspect` in the workflow.
+  (The image itself was not rebuilt here; the workflow does that.)
 - **Docs defaults** checked against their constants: `max_tunnels` 4,
   `udp_workers` 2, `idle_timeout` 60, `max_tunnels_per_client` 0 (unlimited),
   `shared_pool` false.
+- **Docs gap found 2026-09-28 (fixed in the same commit as this line):** the
+  removal callouts for `health_check` in `docs/configuration.md` and
+  `docs/configuration.zh.md` still promised the "warn for one release, error
+  from the next" path that v0.10.0 replaced with a hard refusal — the same
+  contradiction the freeze fixed in the changelog, missed in the user pages.
 - [x] **`v0.9.1` on crates.io is yanked** (2026-09-27, by the owner; verified
   through the API, the sparse index and a real `cargo install`, see the incident
   section). The verification installed `molehill-rathole 0.9.0` into
@@ -1534,13 +406,98 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
   afterwards, because a stale binary earlier on `PATH` than the workspace one is
   exactly the provenance trap §10 exists for (the harness's own rebuild check
   caught that same class of mistake during this cycle's sweep).
-- [ ] **The `[0.10.0]` changelog date is `2026-09-26`** (the day it was
-  prepared). The check only requires *a* date, but the release date is the day
-  the tag is pushed — set it then if that is a different day.
+- [x] **The `[0.10.0]` changelog date is `2026-09-28`** — the day the freeze was
+  prepared and the same day as this sweep; re-date it in the release commit if
+  the tag lands on a later day.
 - Observation, not a blocker: `release.yml` runs `cargo publish --allow-dirty`.
   On a fresh checkout there is nothing dirty to allow, so it only matters if a
   build step ever starts modifying the tree; dropping the flag would make that
   impossible rather than permitted.
+
+### Pre-tag gaps found by the release audit (2026-09-28) — all closed
+
+The audit that produced "Release review" above was run again on `d8233c4` and
+turned up four gaps. None of them was a defect in the product; three were in
+the harness or the docs, and all four are fixed on the branch.
+
+1. **A config-docs contradiction — `539f4f5`.** The `health_check` removal
+   callouts in `docs/configuration.md` and `docs/configuration.zh.md` still
+   described the "starts and warns for one release, errors from the next" path,
+   while `reject_removed_keys` refuses the key outright and the changelog
+   already said so. Two user pages carried an instruction that would not have
+   survived contact with the binary; the migration table on the same pages was
+   right. Both languages corrected together.
+2. **Bench provenance, one commit weaker than the ritual asks — closed by the
+   re-sweep.** The frozen-commit sweep's `meta.revision` is `ca4ab4a` and its
+   binary sha256 is `0ab4072667c30498`; the release commit is two commits later
+   and touches `src/common.rs` (a `cfg` gate) and `src/protocol.rs` (a doc
+   comment). Rebuilding the default feature set on HEAD gives a 4155768-byte
+   binary identical except for the embedded `git describe` string, so those
+   numbers did describe HEAD's behaviour — but `molehill_bin_fingerprint.stale`
+   only proves the binary was not older than its own tree, not that it was
+   HEAD's. The ritual's answer is a fresh sweep on the release commit, and that
+   is what the current results file is (see the sweep record for this date).
+3. **The completeness gate did not look at the bulk spine per stage —
+   `5971cee`.** `check_completeness` asked only that `coverage.tcp_bulk` be
+   true *somewhere* in the run; molehill's `jitter` stage carried **no** bulk
+   intervals at all (the client could not dial the exposed port) and the run
+   still reported "complete (95660 samples, 8 stage(s))". The hole was
+   disclosed in the README (`†`) and in the sweep record, so nothing was
+   hidden — but §10's "the completeness of every test's series" was not what
+   was implemented. The gate now counts each stage's intervals inside its own
+   window against a floor of one per 30 s, and a run that carries such a hole
+   fails it (the shipped sweep's `rate20` cell does exactly that, and the
+   failure is waived in the "Release sweep" record rather than ignored).
+   `docs/release.md`, `CHANGELOG.md` and
+   `docs/benchmarks.md` describe the new verdict.
+4. **The provenance exclusion had never worked — `9d8b85a`.** The run
+   excludes its own results file from the clean-tree verdict, so that writing
+   the artifact does not mark the run dirty. The `:(exclude)` pathspec was
+   passed repo-relative while `git status` runs with `cwd=benches/scripts/soak`,
+   so it matched nothing: measured by dirtying a tracked results file and
+   calling the function, `tree_clean` came back `False` for both the relative
+   and the absolute spelling. Every artifact written that way recorded
+   `tree_clean: false` — which is why this is worth a line: the field silently
+   lost its meaning instead of failing. Fixed by relating the path to the
+   function's own cwd; an output path *outside* the repository cannot be
+   excluded at all (git exits 128 with "outside repository"), so the exclusion
+   is skipped there and the plain verdict answers instead. Verified on a clean
+   tree in all four cases: in-tree output clean, outside output clean, the
+   run's own dirty results file clean, an unrelated untracked file dirty.
+
+Two further harness defects were found and fixed in the same pass, both of them
+things the frozen sweep had already recorded as suspicions: the drain predicate
+and the `soak_check` screen table's quadratic state count (`5971cee`).
+
+**The drain predicate has its own table now** (`b32a5fb`). The 2026-09-28
+release sweep failed the new per-stage gate on molehill's `rate20` stage — 0
+intervals, `control socket has closed unexpectedly` — a stage the frozen-commit
+sweep had measured fine, and the only difference was this session's drain
+change. Three variants, all measured on the `rate100:120,rate20:120`
+transition:
+
+| drain predicate | measured outcome |
+|---|---|
+| exactly-empty queue + no `ESTAB` on the throughput port (frozen sweep's) | `rate20` 91 intervals then, 58 in the probe now |
+| backlog < one frame + teardown states on the throughput port | `rate20` **0** intervals, reproduced twice |
+| no `ESTAB` on all exposed ports | never re-measured to completion: the probe-heavy echo port makes it nearly unsatisfiable (30 s burned per transition) |
+
+The middle variant is the one that reads best and fails: exiting the drain
+*before* the old connection is gone is worse than waiting too long, because the
+next stage's dial then races the previous stage's FIN and the loss is silent —
+the stage simply carries no intervals. The predicate is back to the frozen
+sweep's, the backlog tolerance went with it, and `_busy_sockets` carries the
+table so it is not re-derived by guess. The sweep on the previous page is
+therefore **superseded**: it ran the middle variant, and the only thing it
+measured that survives is the provenance fix (`tree_clean: True` on a real
+run).
+
+**Verified before spending the release run** (2026-09-28, evening): a two-stage
+`rate20:120,jitter:120` probe on `molehill,frp` — the exact transition whose
+spine was dead in the frozen sweep — now carries **99** intervals in molehill's
+`jitter` stage (peak 0.157 Gbit/s) and 103 for frp, the drains return in 10.5 s
+and 17.2 s instead of the 30 s budget, and the new gate passes the probe. That
+probe is how the run below was de-risked rather than hoped for.
 
 ## Open threads for the next cycle
 
@@ -1582,7 +539,7 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
   illustration in the soak runner's `diag_env` list
   (`benches/scripts/soak/lib.py`).
 
-## Environment notes (this host, re-checked 2026-09-26)
+## Environment notes (this host, re-checked 2026-09-28)
 
 - **Verify `iperf3` before a long run.** The container's apt layer has dropped
   the package mid-session before; the bench then fails cleanly (every test
@@ -1595,12 +552,22 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
 - **Peers are cached** in `~/tmp/bench-peers` (frp 0.71.0, rathole 0.5.0,
   nps 0.26.10 — all still the latest releases) and the interop binary in
   `~/tmp/interop/v0.9.0`, so `just soak` and `just interop` need no network.
-- **This host is `16b4dc8db68b`**, the same host as the withdrawn v0.9.1 sweep,
-  and the source has not moved since it (`git diff 0072098..HEAD -- src/
-  build.rs` was empty at the branch point) — which is what makes that run a
-  same-host, same-source baseline for this cycle's delta.
 - **`sudo` works without a password** and `tc`/`ip` are present, so the shaped
   stages and the MTU classes run here.
+- **This host is `a093c5fbe0dc`** (re-checked 2026-09-28): 20 cores, 23 GB RAM,
+  kernel `6.12.0-160000.38-default`. `/etc/machine-id` is **absent**, so the
+  Soak harness's `host_id` hashes `cpu model + core count` only
+  (`host_id_basis.machine_id: false`) — *not* the hostname. That is why the
+  `16b4dc8db68b` → `a093c5fbe0dc` rename did not break comparability: the
+  frozen-commit sweep and the earlier v0.10.0 file share `host_id
+  d764f9da9c7e5b2a` and are comparable, which is what the same-host delta table
+  in "The release sweep on the frozen commit" rests on. The files that are
+  skipped are the ones *without* a `host_id` — `results-soak-v0.9.0.json`
+  (`98c48ea3fa68`) — where the gate falls back to the hostname and refuses.
+- **A baseline-less run is the norm here**: the gate's own self-check
+  (completeness, endpoint invariant, absolute SLO) is what a fresh sweep is
+  gated on, because every stored baseline either has no `host_id` or predates
+  the current method.
 
 ## Historical records (pre-v0.10.0)
 
