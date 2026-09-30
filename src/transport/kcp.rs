@@ -1751,14 +1751,18 @@ impl KcpStream {
     /// the test below, which asserts the *live* session instead of
     /// re-deriving the arithmetic.
     ///
-    /// This is the narrow case AGENTS.md §2 keeps `allow(dead_code)` for: a
-    /// `#[cfg(test)]` gate cascades, because the value read here is an
-    /// `Arc<AtomicUsize>` the pump carries as a parameter, and `#[expect]`
-    /// cannot hold since the test build *does* call it.
+    /// The narrow case AGENTS.md §2 keeps `allow(dead_code)` for: the counter
+    /// is written by the pump on every round and read by exactly one test —
+    /// the netns-gated `ipv6_path_mtu_clamps_on_a_shrunk_loopback`, which
+    /// asserts the live session's datagram size. Gating the accessor with
+    /// `#[cfg(test)]` cascades: the field's only reader is then this
+    /// accessor, so the field, its constructor parameter and the pump's
+    /// parameter would all have to be gated too, and `#[expect]` cannot hold
+    /// because the test build *does* call it.
     #[allow(
         dead_code,
-        reason = "only the test build reads it; a cfg(test) gate would cascade \
-                  into the field and the pump's parameter"
+        reason = "only the netns test reads it; a cfg(test) gate would cascade \
+                  into the field, the constructor parameter and the pump's"
     )]
     pub fn datagram_bytes(&self) -> usize {
         self.datagram_bytes.load(Ordering::Relaxed)

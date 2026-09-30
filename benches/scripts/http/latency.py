@@ -35,7 +35,7 @@ def vegeta(
 def attack(url: str, rate: str) -> Path:
     """One vegeta attack at `rate`, plus its printed report."""
     name = OUT_DIR / f"{url.rsplit(':', maxsplit=1)[-1]}-{rate}qps-{DURATION}.bin"
-    with open(name, "wb") as out:
+    with name.open("wb") as out:
         vegeta(["attack", "-rate", rate, "-duration", DURATION], url=url, stdout=out)
     report = subprocess.run(
         ["vegeta", "report", str(name)], capture_output=True, text=True, check=False

@@ -169,6 +169,13 @@ impl Stream {
         matches!(self.shared().state(), State::Closed)
     }
 
+    /// The command channel's remaining capacity: the depth a writer (or a
+    /// reader queueing a window update) can still fill before it parks.
+    #[cfg(test)]
+    pub(crate) fn channel_capacity(&self) -> usize {
+        self.sender.capacity()
+    }
+
     pub(crate) fn shared(&self) -> MutexGuard<'_, Shared> {
         self.shared.lock()
     }
@@ -215,6 +222,27 @@ impl Stream {
         }
     }
 
+    /// The reader's variant of [`Self::park_on_full_channel`], for the
+    /// window update `poll_read` has to queue.
+    ///
+    /// It must **not** park in the writer's slot: `poll_write` stores its
+    /// waker there when it runs out of send credit, and that is the waker
+    /// `on_window_update` wakes when credit comes back. A reader that
+    /// overwrites it strands the writer — it sleeps until some unrelated
+    /// resize happens to notify — and the stream stops for the rest of the
+    /// session, which is exactly how a stripe group's bulk transfer used to
+    /// hang (HANDOFF.md, "the stripe livelock"). Both parks are released by
+    /// the same event (a command leaving the channel frees the capacity), so
+    /// the connection wakes both slots.
+    fn park_on_full_channel_as_reader(&mut self, cx: &mut Context<'_>) {
+        self.shared().reader_park = Some(cx.waker().clone());
+        if self.sender.capacity() > 0
+            && let Some(w) = self.shared().reader_park.take()
+        {
+            w.wake();
+        }
+    }
+
     /// Send new credit to the sending side via a window update message if
     /// permitted.
     fn send_window_update(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -225,7 +253,7 @@ impl Stream {
         // Check channel capacity before consuming the credit: on a full
         // channel the next poll retries from here and nothing is lost.
         if self.sender.capacity() == 0 {
-            self.park_on_full_channel(cx);
+            self.park_on_full_channel_as_reader(cx);
             return Poll::Pending;
         }
 
@@ -437,6 +465,10 @@ pub(crate) struct Shared {
     pub(crate) buffer: Chunks,
     pub(crate) reader: Option<Waker>,
     pub(crate) writer: Option<Waker>,
+    /// A *reader* parked on a full command channel, waiting to queue a
+    /// window update. Its own slot, so it can never overwrite the writer's
+    /// (see [`Stream::park_on_full_channel_as_reader`]).
+    pub(crate) reader_park: Option<Waker>,
 }
 
 impl Shared {
@@ -461,6 +493,7 @@ impl Shared {
             buffer: Chunks::new(),
             reader: None,
             writer: None,
+            reader_park: None,
         }
     }
 

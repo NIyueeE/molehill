@@ -30,10 +30,10 @@ MOLEHILL_URL = "http://127.0.0.1:5202"
 def sample(pid: int, log: Path, stop: threading.Event) -> None:
     """Write the process's RSS in KiB every interval until `stop` is set."""
     page_kib = os.sysconf("SC_PAGE_SIZE") // 1024
-    with open(log, "w") as f:
+    with log.open("w") as f:
         while not stop.is_set():
             try:
-                with open(f"/proc/{pid}/statm") as fh:
+                with Path(f"/proc/{pid}/statm").open() as fh:
                     rss_pages = int(fh.read().split()[1])
                 f.write(f"{rss_pages * page_kib}\n")
                 f.flush()

@@ -219,6 +219,11 @@ def check_run(cur: dict, rep: Report) -> None:
         return
     for t in tests:
         name = t.get("tool", "?")
+        # One subject per test, set here: `check_completeness` and
+        # `check_endpoints` gate through `rep.subject`, and `check_slo` used to
+        # recompute it locally — so a peer's missing series failed the release
+        # gate while its SLO did not.
+        rep.set_subject(name)
         if t.get("error"):
             rep.fail(f"{name}: the test failed ({t['error']})")
             continue
@@ -286,9 +291,11 @@ def check_slo(name: str, t: dict, rep: Report, slo_p99, slo_err) -> None:
             "judged for this test"
         )
         return
-    subject = name.startswith(SUBJECT)
     # The SLO gates the tool this repository releases; a peer that misses it is
     # a finding about the peer (reported, with its number) and not a block.
+    # `rep.subject` is set per test by `check_run`, so this agrees with the
+    # completeness and endpoint checks instead of deciding on its own.
+    subject = rep.subject
     over = rep.fail if subject else rep.note
     peer_note = "" if subject else " (reference peer — reported, not gated)"
     for stage in clean:
@@ -684,21 +691,30 @@ def resolve_paths(args: list) -> tuple:
     return cur, (older[-1] if older else None)
 
 
+def load(path: Path) -> dict:
+    """Read one results file, or exit with its path and the parse error.
+
+    Every other user error in this gate exits with a message; a bare
+    traceback here would be the one failure an operator is most likely to
+    hit (a truncated run, a wrong path).
+    """
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+
+
 def main() -> None:
     args = sys.argv[1:]
     if args and args[0] == "--screen":
         if len(args) < SCREEN_ARGS:
             sys.exit("usage: soak_check.py --screen <results.json>")
-        sys.exit(screen(json.loads(Path(args[1]).read_text())))
+        sys.exit(screen(load(Path(args[1]))))
     cur, base = resolve_paths(args)
     print(f"current : {cur.name}")
     if base is not None:
         print(f"baseline: {base.name}")
-    sys.exit(
-        gate(
-            json.loads(cur.read_text()), json.loads(base.read_text()) if base else None
-        )
-    )
+    sys.exit(gate(load(cur), load(base) if base else None))
 
 
 if __name__ == "__main__":

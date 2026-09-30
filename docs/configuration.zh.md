@@ -72,21 +72,22 @@
 > (`default_` 前缀正是为了消解同名冲突而存在)。
 > 旧键会被拒绝(`deny_unknown_fields`),绝不会被静默忽略。
 >
-> **0.8 协议 v3**:每条连接以 1 字节传输选择器开头(`0x00` 明文 /
+> **0.8 协议**:每条连接以 1 字节传输选择器开头(`0x00` 明文 /
 > `0x01` noise),注册消息携带数据面 carrier——两端必须一起升级;版本
 > 不匹配是硬错误。
 >
 > **升级到 0.10(协议 v4)**:客户端改说 v4——每个端点一条控制会话,承载拨向该
-> 端点的所有服务。v0.9.0 服务端会拒绝它(自身版本检查失败后关闭连接;客户端
-> 会说明原因并停止,而不是反复重试),因此请先升级服务端,或两端一起升级。
-> v0.10.0 服务端仍然可以服务 v0.9.0 客户端。
+> 端点的所有服务;而 0.10.0 是第一个**只服务 v4** 的版本:v3 客户端的连接会在
+> 它发生的那条连接上被拒绝,且不会有任何回包。因此请两端一起升级;先后顺序无
+> 所谓,因为每一端都会拒绝对方的方言而不是继续通信,而被拒绝的连接会写明它期
+> 待的版本。
 
 ### 迁移到 0.10:已移除的键
 
 隧道池现在是每个会话、每个 carrier 一个弹性池,并且**冷启动**——因此那些描述
 「池的初始大小」「按服务的池」或 0.8 后期健康检查的键都已移除。仍带着这些键的
-配置在这一个版本里仍能启动,并打出一条指明替代写法的警告;从下一个版本起它就是
-错误(`deny_unknown_fields`)。请改写为:
+配置不会启动:拒绝信息会列出它找到的每一个键以及该改写成什么(只写「未知字段」
+能告诉你有东西不对,却不能告诉你该写什么)。请改写为:
 
 | 已移除的键 | 改写成 |
 |---|---|
@@ -94,7 +95,7 @@
 | `[client.services.<name>].count` | 无需填写:同样是冷启动,而且池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].max_tunnels` 是上限 |
 | `[client.services.<name>].pool_size` | UDP 服务写 `[client.services.<name>].udp_workers`(默认 2)。TCP 服务按访客即时打开数据通道 |
 | `[client.services.<name>].heartbeat_timeout` | 无需填写:服务端在会话确认里声明自己的心跳节奏,客户端据此推导超时。`[client.control].default_heartbeat_timeout` 仍作为可选下限保留 |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限)。它同时收敛 v3 客户端请求的通道数 |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限) |
 | `[client.services.<name>].health_check` | 无需填写:只要客户端在运行,服务就保持注册;无法转发的请求只对那个访客失败 |
 
 下一节说明每个替代键做什么、代价是什么;[CHANGELOG.md](../CHANGELOG.md) 记录
@@ -214,10 +215,10 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
-# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带")。**0.10 不支持**:0.10 客户端会被以非条带方式服务——条带组的批量路径会与弹性隧道池死锁,因此服务端只打一条警告,并对每个访客只用一条通道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
-# max_tunnels_per_client = 0 # 可选。运维方对弹性池的阀门:一个客户端在其会话的所有服务上一共可持有多少条多路复用数据隧道。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行。它同时收敛 v3 客户端请求的通道数
+# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
+# max_tunnels_per_client = 0 # 可选。运维方对弹性池的阀门:一个客户端在其会话的所有服务上一共可持有多少条多路复用数据隧道。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
 
-[server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 v3 传输选择器字节开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
+[server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
@@ -488,7 +489,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 # Data-plane options (`[server.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
 
-[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (v3 selector byte); placing the keys lets the server accept Noise connections too
+[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (the transport selector byte); placing the keys lets the server accept Noise connections too
 [server.transport.noise] # Keys for accepting Noise connections. See docs/transport.md
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
@@ -1016,7 +1017,7 @@ WantedBy=multi-user.target
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是旧版 molehill。两端一起升级(协议 v4 自 0.10 起——先升级服务端;v3 自 0.8 起;v2 自 0.7.0 起)。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v4 的 molehill。0.10 只服务 v4,因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
 | 客户端在服务端的 hello 始终不到达后以 `protocol v4` 停止 | 服务端早于 0.10:它读到版本 4、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |

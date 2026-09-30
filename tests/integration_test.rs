@@ -455,7 +455,6 @@ async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
 /// working beside it.
 #[cfg(feature = "multiplex")]
 #[tokio::test]
-#[ignore = "known defect: a stripe group's bulk path deadlocks with the elastic pool, and a v4 session is therefore served unstriped — see HANDOFF.md, \"Open: striping with the elastic pool\", for the falsification matrix, the trace and what would falsify the quarantine"]
 async fn striped_data_channels() -> Result<()> {
     init();
 
@@ -1506,20 +1505,31 @@ async fn a_foreign_service_token_rejects_only_that_service() -> Result<()> {
     Ok(())
 }
 
-/// The v0.9.0 half of the compatibility contract: the server still answers a
-/// **v3** control hello *in v3*.
+/// Protocol v3 is not served: a **v3** control hello is refused on its own
+/// connection, without an answer, and the listener keeps working.
 ///
-/// The client speaks v4, so nothing else in this suite touches the v3 branch —
-/// and a one-line change to the version constant is enough to break it, which
-/// is what happened while this branch was written. The interop matrix's
-/// new-server/old-client case is the other witness, but it needs the previous
-/// release's binary; this one needs nothing but the server.
+/// v0.10.0 changed the dialect the client speaks, so a server of this release
+/// has one dialect to serve. The interop matrix's new-server/old-client case
+/// is the witness that needs the previous release's binary; this one needs
+/// nothing but the server, and pins the two halves that matter on this tree —
+/// the refused connection gets no reply (the reader cannot parse a hello whose
+/// version it does not serve), and the same process then serves a v4 client
+/// through the same listener.
 #[cfg(all(feature = "client", feature = "server"))]
 #[tokio::test]
-async fn the_server_still_answers_a_v3_hello_in_v3() -> Result<()> {
+async fn a_v3_hello_is_refused_on_its_own_connection() -> Result<()> {
     init();
 
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
     let server = tokio::spawn(async move {
         run_molehill_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
             .await
@@ -1527,6 +1537,10 @@ async fn the_server_still_answers_a_v3_hello_in_v3() -> Result<()> {
     });
     // `[server.control].bind_addr` of `tcp_transport.toml`.
     wait_for_listener("127.0.0.1:2333").await?;
+
+    // The v4 half first: the refused connection below must not be confused
+    // with a listener that never came up.
+    wait_for_echo("127.0.0.1:2334", Type::Tcp).await?;
 
     let mut conn = TcpStream::connect("127.0.0.1:2333").await?;
     // The plain selector, then a v3 control hello: variant tag 0, version 3,
@@ -1536,16 +1550,18 @@ async fn the_server_still_answers_a_v3_hello_in_v3() -> Result<()> {
     conn.write_all(&hello).await?;
     conn.flush().await?;
 
-    let mut reply = [0u8; 34];
-    time::timeout(Duration::from_secs(10), conn.read_exact(&mut reply)).await??;
-    assert_eq!(reply[0], 0, "the server answered with a control hello");
-    assert_eq!(
-        reply[1], 3,
-        "a v3 client must get a v3 hello back, not this build's dialect"
-    );
+    // No answer at all: the version this server does not serve is refused by
+    // `read_hello`, which ends that connection.
+    let mut reply = [0u8; 1];
+    let read = time::timeout(Duration::from_secs(10), conn.read(&mut reply)).await??;
+    assert_eq!(read, 0, "a v3 hello must be answered with nothing");
 
+    // The refusal was local: that same v4 session is still forwarding.
+    wait_for_echo("127.0.0.1:2334", Type::Tcp).await?;
+
+    client_shutdown_tx.send(true)?;
     server_shutdown_tx.send(true)?;
-    let _ = tokio::join!(server);
+    let _ = tokio::join!(server, client);
     Ok(())
 }
 

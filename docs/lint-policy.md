@@ -101,6 +101,16 @@ the python equivalent of `#[expect(clippy::...)]` plus its reason comment.
 `uvx ruff check` and `uvx ruff format --check` are the two gates; `just
 py-fmt` applies the formatter's fixes.
 
+The selected set is deliberately wider than "the code already passes":
+`B` (bugbear, e.g. `zip(strict=)`), `E7` (ambiguous `l`/`O`/`I` names, which
+the base rules cannot see), `ARG` (an unused argument is a dead parameter or
+a stale signature), `PTH` (these scripts build and read paths constantly),
+and the already-clean `RET`/`C4`/`N`/`FA`/`FLY`/`PERF` families as guards for
+future edits. `TRY`/`EM`, `ANN` and `T20` are deliberately **not** selected,
+with the reasoning recorded in `ruff.toml` itself: the first two fight the
+house style of actionable error messages and annotated-where-it-matters
+signatures, and every `print` in these scripts is deliberate output.
+
 ## Deviations from the rust-agents-template lint set
 
 None. The template's `clippy::pedantic` (deny) and `missing_docs` (warn) are

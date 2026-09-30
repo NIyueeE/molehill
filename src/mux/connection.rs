@@ -475,12 +475,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         Poll::Ready(Ok(stream))
     }
 
-    /// Wake a stream writer that parked on a full command channel: taking
-    /// this stream's command off the channel freed capacity for it.
+    /// Wake a stream's parked writers: taking this stream's command off the
+    /// channel freed capacity for them.
+    ///
+    /// Two kinds of task park on that channel — the stream's writer (a
+    /// backpressured `poll_write`) and its reader (the window update
+    /// `poll_read` wants to queue) — and both are released by the same
+    /// event, so both slots are woken here.
     fn wake_stream_writer(&mut self, stream_id: StreamId) {
         if let Some(s) = self.streams.get(&stream_id) {
             let mut shared = s.lock();
             if let Some(w) = shared.writer.take() {
+                w.wake();
+            }
+            if let Some(w) = shared.reader_park.take() {
                 w.wake();
             }
         }
@@ -941,6 +949,10 @@ mod tests {
         clippy::expect_used,
         reason = "the test expects on values it just constructed"
     )]
+    #![expect(
+        clippy::panic,
+        reason = "a malformed peer frame is a test failure, and an assert would bury it"
+    )]
 
     use super::*;
     use crate::mux::frame::header::Header;
@@ -1003,5 +1015,136 @@ mod tests {
             "aimed at the new stream"
         );
         assert_eq!(active.streams.len(), cap, "the cap is still exactly full");
+    }
+
+    /// A distinguishable waker, so a test can ask which task is parked.
+    struct IdWaker(Arc<std::sync::atomic::AtomicU8>);
+
+    impl std::task::Wake for IdWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(1, Ordering::SeqCst);
+        }
+    }
+
+    fn id_waker() -> (Waker, Arc<std::sync::atomic::AtomicU8>) {
+        let flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        (Waker::from(Arc::new(IdWaker(Arc::clone(&flag)))), flag)
+    }
+
+    /// A reader parking on a full command channel keeps the writer's waker.
+    ///
+    /// `poll_read` queues each window update through the same per-stream
+    /// command channel `poll_write` uses, and both parks stored their waker
+    /// in `Shared::writer`. A reader that parked last erased the writer's
+    /// waker, so the window update that came back afterwards woke nobody:
+    /// the stream's send direction slept until some unrelated resize
+    /// happened to notify, and every visitor on that tunnel stalled — which
+    /// is how a striped bulk transfer hung (HANDOFF.md, "the stripe
+    /// livelock"). The reader now parks in its own slot, and the connection
+    /// wakes both when a command leaves the channel.
+    #[tokio::test]
+    async fn a_readers_channel_park_keeps_the_writers_waker() {
+        let mut config = Config::default();
+        config
+            .set_max_num_streams(2)
+            .set_max_connection_receive_window(Some(4 * DEFAULT_CREDIT as usize));
+        let (io, _peer) = tokio::io::duplex(4096);
+        let mut active = Active::new(io, config, Mode::Server);
+
+        // One inbound stream, as the server side of a tunnel sees one.
+        let id = StreamId::new(1);
+        let mut syn = Header::data(id, 0);
+        syn.syn();
+        let mut stream = match active.on_data(Frame::new(syn)) {
+            Action::New(s) => s,
+            other => panic!("the SYN must open a stream, got {other:?}"),
+        };
+
+        // Fill the stream's command channel with the reader's window updates:
+        // one update per half-window drained, and the channel holds ten.
+        let credit = DEFAULT_CREDIT / 2;
+        for _ in 0..10 {
+            {
+                let mut shared = stream.shared();
+                shared.buffer.push(vec![0u8; credit as usize]);
+                shared
+                    .consume_receive_window(credit)
+                    .expect("the receive window covers the buffered chunk");
+            }
+            let mut payload = vec![0u8; credit as usize];
+            let mut read = tokio::io::ReadBuf::new(&mut payload);
+            let (waker, _) = id_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                matches!(
+                    Pin::new(&mut stream).poll_read(&mut cx, &mut read),
+                    Poll::Ready(Ok(()))
+                ),
+                "the buffered chunk is delivered"
+            );
+        }
+        assert_eq!(
+            stream.channel_capacity(),
+            0,
+            "the command channel is full, so both parks are reachable"
+        );
+
+        // The writer parks first: it needs the channel and the channel is
+        // full, so its waker goes into the writer's slot.
+        let (writer_waker, _) = id_waker();
+        let mut cx = Context::from_waker(&writer_waker);
+        let payload = vec![0u8; 64];
+        assert!(
+            matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, &payload),
+                Poll::Pending
+            ),
+            "the writer parks on the full channel"
+        );
+        {
+            let shared = stream.shared();
+            assert!(
+                shared
+                    .writer
+                    .as_ref()
+                    .is_some_and(|w| w.will_wake(&writer_waker)),
+                "the writer's waker is the one parked"
+            );
+        }
+
+        // The reader parks next, with another update to queue. This is the
+        // step that used to overwrite the writer's waker.
+        let (reader_waker, _) = id_waker();
+        let mut cx = Context::from_waker(&reader_waker);
+        {
+            let mut shared = stream.shared();
+            shared.buffer.push(vec![0u8; credit as usize]);
+            shared
+                .consume_receive_window(credit)
+                .expect("the receive window covers the buffered chunk");
+        }
+        let mut payload = vec![0u8; credit as usize];
+        let mut read = tokio::io::ReadBuf::new(&mut payload);
+        let _ = Pin::new(&mut stream).poll_read(&mut cx, &mut read);
+
+        let shared = stream.shared();
+        assert!(
+            shared
+                .writer
+                .as_ref()
+                .is_some_and(|w| w.will_wake(&writer_waker)),
+            "a reader's channel park must not erase the writer's waker"
+        );
+        assert!(
+            shared
+                .reader_park
+                .as_ref()
+                .is_some_and(|w| w.will_wake(&reader_waker)),
+            "the reader parks in its own slot"
+        );
     }
 }

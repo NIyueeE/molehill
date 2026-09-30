@@ -651,8 +651,8 @@ class Pingers:
         self.slow: SlowVisitor | None = None
         self.slow_error = ""
 
-    def log_path(self, mode: str) -> str:
-        return str(Path(self.work) / f"probe-{mode}-{self.band['echo_exposed']}.log")
+    def log_path(self, mode: str) -> Path:
+        return Path(self.work) / f"probe-{mode}-{self.band['echo_exposed']}.log"
 
     def _spawn(
         self,
@@ -669,7 +669,7 @@ class Pingers:
         (the churn connector's connects/s, or the slow visitor's bit/s).
         """
         log_path = self.log_path(mode)
-        with open(log_path, "w") as errlog:
+        with log_path.open("w") as errlog:
             proc = subprocess.Popen(
                 [
                     sys.executable,
@@ -757,9 +757,7 @@ class Pingers:
         except OSError as e:
             self.slow_error = f"probe failed to start: {type(e).__name__}: {e}"
             return
-        self.slow = SlowVisitor(
-            proc=proc, reader=th, log=Path(log_path), t0=time.time()
-        )
+        self.slow = SlowVisitor(proc=proc, reader=th, log=log_path, t0=time.time())
         self.slow_error = ""
 
     def finish_slow_visitor(self, target: dict | None) -> None:
@@ -852,7 +850,7 @@ class Samplers:
     def _sampler(self, fn) -> None:
         while not self.stop.is_set():
             now = time.time()
-            for label, pid in zip(("server", "client"), self.pids_of()):
+            for label, pid in zip(("server", "client"), self.pids_of(), strict=True):
                 v = fn(pid)
                 if v is None:
                     continue
@@ -864,7 +862,7 @@ class Samplers:
     @staticmethod
     def rss_kb(pid: int):
         try:
-            with open(f"/proc/{pid}/statm") as fh:
+            with Path(f"/proc/{pid}/statm").open() as fh:
                 return int(fh.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
         except (OSError, ValueError, IndexError):
             return None
@@ -872,21 +870,21 @@ class Samplers:
     @staticmethod
     def fds(pid: int):
         try:
-            return len(os.listdir(f"/proc/{pid}/fd"))
+            return len(list(Path(f"/proc/{pid}/fd").iterdir()))
         except OSError:
             return None
 
     @staticmethod
     def thread_count(pid: int):
         try:
-            return len(os.listdir(f"/proc/{pid}/task"))
+            return len(list(Path(f"/proc/{pid}/task").iterdir()))
         except OSError:
             return None
 
     @staticmethod
     def cpu_ticks(pid: int):
         try:
-            with open(f"/proc/{pid}/stat") as fh:
+            with Path(f"/proc/{pid}/stat").open() as fh:
                 f = fh.read().split(") ", 1)[1].split()
             return int(f[11]) + int(f[12])
         except (OSError, ValueError, IndexError):
@@ -907,7 +905,7 @@ class Samplers:
         while not self.stop.is_set():
             self.stop.wait(0.5)
             now = time.monotonic()
-            for label, pid in zip(("server", "client"), self.pids_of()):
+            for label, pid in zip(("server", "client"), self.pids_of(), strict=True):
                 if not pid:
                     continue
                 cur = self.cpu_ticks(pid)
@@ -962,6 +960,24 @@ class RunContext:
     def with_pingers(self, pingers: "Pingers") -> "RunContext":
         self.pingers = pingers
         return self
+
+    def backend(self) -> lib.Backends:
+        """The live backend set.
+
+        Every runner is built through `with_backends`, so the contract is
+        checked here once instead of dereferencing an Optional at each call
+        site (the fields are Optional only so the builder can be chained, and
+        a missing one is a harness bug, not a measurement).
+        """
+        if self.backends is None:
+            raise RuntimeError("RunContext used before with_backends")
+        return self.backends
+
+    def pinger(self) -> "Pingers":
+        """The live pinger set, on the same terms as [`backend`]."""
+        if self.pingers is None:
+            raise RuntimeError("RunContext used before with_pingers")
+        return self.pingers
 
     @property
     def ceiling(self) -> int:
@@ -1024,7 +1040,7 @@ def stage_spine(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> dict:
             return outcome
         if attempt == 0:
             with contextlib.suppress(Exception):
-                ctx.backends.restart_iperf()
+                ctx.backend().restart_iperf()
     # the stage's full duration elapses regardless: a dead spine must not
     # cut the probes' and samplers' window short
     while time.time() < t_end:
@@ -1134,8 +1150,8 @@ def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
         mark = len(entry["series"])
         # One visitor per ramp step: the load level is this test's stage, so
         # the slow visitor's line belongs beside that level's p99.
-        ctx.pingers.start_slow_visitor(knobs.settle_s)
-        r = ctx.backends.iperf_burst(
+        ctx.pinger().start_slow_visitor(knobs.settle_s)
+        r = ctx.backend().iperf_burst(
             target, streams, knobs.settle_s, tag=f"{tool.label} cap"
         )
         window = entry["series"][mark:]
@@ -1163,7 +1179,7 @@ def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
             "slo_broken": broken,
             "reason": "; ".join(x for x in reasons if x) or None,
         }
-        ctx.pingers.finish_slow_visitor(point)
+        ctx.pinger().finish_slow_visitor(point)
         entry["metrics"].setdefault("curve", []).append(point)
         log(
             f"    load {streams}: {r.get('gbps_headline', '-')} Gbit/s, "
@@ -1222,9 +1238,9 @@ def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int
         {"stage": stage.path, "secs": stage.secs, "t_start": round(time.time(), 3)}
     )
     log(f"  stage {stage.path} ({stage.secs}s)")
-    ctx.pingers.start_slow_visitor(stage.secs)
+    ctx.pinger().start_slow_visitor(stage.secs)
     outcome = stage_spine(tool, ctx, entry, stage)
-    ctx.pingers.finish_slow_visitor(entry["stages"][-1])
+    ctx.pinger().finish_slow_visitor(entry["stages"][-1])
     if not outcome["intervals"]:
         entry["stages"][-1]["bulk_error"] = (
             f"spine produced no intervals (exit {outcome['exit']})"
@@ -1323,9 +1339,9 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
                 # mechanism of this arm swap.
                 tool.use_variant(variant)
             tool.restart(binary)
-            ctx.pingers.start_slow_visitor(ctx.knobs.settle_s)
+            ctx.pinger().start_slow_visitor(ctx.knobs.settle_s)
             mark = len(entry["series"])
-            r = ctx.backends.iperf_burst(
+            r = ctx.backend().iperf_burst(
                 target, step, ctx.knobs.settle_s, tag=f"{tool.label} {label}"
             )
             st = lib.series_stats(entry["series"][mark:], "rtt_interactive_ms")
@@ -1336,7 +1352,7 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
                 "rtt_n": st.get("n"),
                 "rtt_mean": st.get("mean"),
             }
-            ctx.pingers.finish_slow_visitor(arm)
+            ctx.pinger().finish_slow_visitor(arm)
             pair.append(arm)
         rounds.append({"streams": step, "pair": pair})
         log(
@@ -1581,7 +1597,7 @@ class Results:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with contextlib.suppress(OSError):
             tmp.write_text(json.dumps(payload))
-            os.replace(tmp, self.path)
+            tmp.replace(self.path)
 
 
 def parse_args(argv: list | None = None) -> argparse.Namespace:
@@ -1854,7 +1870,7 @@ def measure_batch(ctx: RunContext, group: list, work: Path, results: Results) ->
     shaper.build()
     try:
         log(f"== batch: {[f'{t} {v}'.strip() for t, v in group]}")
-        for (tool_name, variant), (cid, band) in zip(group, classes):
+        for (tool_name, variant), (cid, band) in zip(group, classes, strict=True):
             # The screen starts on build A and swaps per step; the other
             # test types start on the default binary.
             binary = ctx.args.ab[0] if ctx.args.ab and tool_name == "molehill" else ""
@@ -1959,11 +1975,9 @@ def main() -> None:
     # kcp-stats lines and the raw iperf3 output, and a run that deletes its own
     # evidence turns every such question into a re-run.
     keep_work = bool(os.environ.get("SOAK_KEEP"))
-    if keep_work and os.environ.get("SOAK_WORK"):
-        work = Path(os.environ["SOAK_WORK"])
-        work.mkdir(parents=True, exist_ok=True)
-    else:
-        fp = lib.binary_fingerprint(knobs.molehill_bin)
+    # The provenance check runs whatever the work dir is: `SOAK_KEEP` decides
+    # where the artifacts go, not whether the binary is current.
+    fp = lib.binary_fingerprint(knobs.molehill_bin)
     if fp.get("stale"):
         # Loud, but not fatal: a stale peer binary is a legitimate
         # reproduction, and refusing to run would be worse than recording it.
@@ -1972,7 +1986,11 @@ def main() -> None:
             f"WARNING: {knobs.molehill_bin} predates the newest source file — "
             f"these numbers describe an older build"
         )
-    work = Path(tempfile.mkdtemp(prefix=lib.WORK_PREFIX))
+    if keep_work and os.environ.get("SOAK_WORK"):
+        work = Path(os.environ["SOAK_WORK"])
+        work.mkdir(parents=True, exist_ok=True)
+    else:
+        work = Path(tempfile.mkdtemp(prefix=lib.WORK_PREFIX))
     if keep_work:
         log(f"work dir kept: {work}")
     restore_stale_mtu(log)

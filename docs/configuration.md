@@ -66,24 +66,27 @@ A typical setup:
 > disambiguate exactly that).
 > Old keys are rejected (`deny_unknown_fields`), never silently ignored.
 >
-> **0.8 protocol v3**: every connection starts with a one-byte transport
+> **0.8 protocol**: every connection starts with a one-byte transport
 > selector (`0x00` plain / `0x01` noise) and the registration carries the
 > data-plane carrier — both ends must upgrade together; a version mismatch
 > is a hard error.
 >
 > **Upgrading to 0.10 (protocol v4)**: the client speaks v4 — one control
-> session per endpoint, carrying every service that dials it. A v0.9.0 server
-> refuses it (its own version check fails and it closes the connection; the
-> client says so and stops instead of retrying), so upgrade the server first,
-> or both ends together. A v0.10.0 server still serves a v0.9.0 client.
+> session per endpoint, carrying every service that dials it — and 0.10.0 is
+> the first release that serves **v4 only**: a v3 client's connection is
+> refused on the connection it happens on, with nothing sent back. Upgrade
+> both ends together, then; either order works, because each side refuses the
+> other's dialect instead of continuing, and the refused connection names the
+> version that was expected.
 
 ### Migrating to 0.10: removed keys
 
 The tunnel pool is one elastic, per-carrier pool per session now, and it starts
 cold — so the keys that described a pool's *initial* size, a per-service pool,
-or a late-0.8 health check are gone. A config that still carries one starts for
-one release and logs a warning naming the replacement; from the next release it
-is an error (`deny_unknown_fields`). Write this instead:
+or a late-0.8 health check are gone. A config that still carries one does not
+start: the refusal names every key it found and what to write instead (a bare
+"unknown field" tells you *that* something is wrong without telling you what to
+write). Write this instead:
 
 | Removed key | Write instead |
 |---|---|
@@ -91,7 +94,7 @@ is an error (`deny_unknown_fields`). Write this instead:
 | `[client.services.<name>].count` | Nothing: same cold start, and the pool belongs to the session and carrier rather than to one service. `[client.data.tcp\|kcp].max_tunnels` is the cap |
 | `[client.services.<name>].pool_size` | `[client.services.<name>].udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
 | `[client.services.<name>].heartbeat_timeout` | Nothing: the server declares its cadence in the session ack and the client derives the timeout from it. `[client.control].default_heartbeat_timeout` remains as an optional floor |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the tunnels one client may hold; 0 = unlimited). It also clamps a v3 client's requested channel count |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the tunnels one client may hold; 0 = unlimited) |
 | `[client.services.<name>].health_check` | Nothing: a service stays registered for as long as its client runs; a request that cannot be forwarded fails for that visitor |
 
 The next section states what each of the replacements does and what it costs;
@@ -214,10 +217,10 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
-# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"). **Not supported in 0.10**: a 0.10 client is served unstriped — a stripe group's bulk path deadlocks with the elastic tunnel pool, so the server logs one warning and uses a single channel per visitor. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
-# max_tunnels_per_client = 0 # Optional. The operator's valve on the elastic pool: how many multiplexed data tunnels ONE client may hold across every service of its session. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running. It also clamps the channel count a v3 client asks for
+# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
+# max_tunnels_per_client = 0 # Optional. The operator's valve on the elastic pool: how many multiplexed data tunnels ONE client may hold across every service of its session. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running
 
-[server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a v3 transport selector byte); placing the keys lets the server accept Noise connections in addition to plain ones
+[server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
 local_private_key = "key_encoded_in_base64"
 remote_public_key = "key_encoded_in_base64"
@@ -503,7 +506,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 # Data-plane options (`[server.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
 
-[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (v3 selector byte); placing the keys lets the server accept Noise connections too
+[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (the transport selector byte); placing the keys lets the server accept Noise connections too
 [server.transport.noise] # Keys for accepting Noise connections. See docs/transport.md
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
 local_private_key = "key_encoded_in_base64" # Optional
@@ -1001,7 +1004,7 @@ above and follow that guide.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs an older molehill. Upgrade both ends together (protocol v4 since 0.10 — upgrade the server first; v3 since 0.8; v2 since 0.7.0). |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v4. 0.10 serves v4 only, so an older client *or* an older server gets this; upgrade both ends together. |
 | The client stops with `protocol v4` after a server's hello never arrives | The server is older than 0.10: it reads version 4, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |

@@ -14,7 +14,7 @@ use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
-    MAX_UDP_HEADER_LEN, PROTO_V4_VERSION, ServiceId, ServiceRegistrationV4, SessionCmd,
+    MAX_UDP_HEADER_LEN, PROTO_V4_VERSION, ServiceId, ServiceRegistration, SessionCmd,
     SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
     read_register_result, write_session_cmd, write_stream_prologue,
 };
@@ -327,7 +327,7 @@ impl ServiceSlot {
         Ok(SessionRegistration {
             service_id: self.id,
             auth: protocol::digest(&concat),
-            reg: ServiceRegistrationV4 {
+            reg: ServiceRegistration {
                 name: self.service.name.clone(),
                 service_type: self.service.service_type,
                 bind_addr,
@@ -2096,8 +2096,9 @@ impl ClientSession {
                         self.pending_drops.push(id);
                         self.drain_dropped(&nonce, &mut rd, &mut wr).await?;
                     }
-                    // v3-only, and this session was opened as v4: a server that
-                    // sends it is answering in another dialect.
+                    // Tag 0 is the v3 command: a server that answers in that
+                    // dialect is a mismatch this client must report, not
+                    // mis-read as an ack frame.
                     ControlChannelCmd::CreateDataChannel => {
                         bail!(
                             "Protocol violation: the server sent the v3-only command \

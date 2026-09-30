@@ -2,16 +2,15 @@ use crate::common::constants::FORWARD_IDLE_TIMEOUT;
 use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP_ROUTE_TTL_SECS};
 use crate::common::forward::copy_bidirectional_with_idle;
 use crate::common::helper::write_and_flush;
-use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
 use crate::config::{Config, ServerConfig, ServiceType};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, Ack, Carrier, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello,
-    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, PROTO_V3_VERSION, PROTO_V4_VERSION,
-    ServiceId, ServiceRegistrationV4, SessionCmd, SessionRegistration, UdpTraffic, read_auth,
-    read_hello, read_registration, read_session_cmd, read_stream_prologue, write_register_result,
+    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, PROTO_V4_VERSION, ServiceId,
+    ServiceRegistration, SessionCmd, SessionRegistration, UdpTraffic, read_auth, read_hello,
+    read_session_cmd, read_stream_prologue, write_register_result,
 };
 #[cfg(feature = "noise")]
 use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
@@ -41,7 +40,6 @@ use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn}
 #[cfg(feature = "kcp")]
 use crate::transport::kcp::KcpAcceptor;
 
-type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 /// Process-wide rate limit for token rejections: a client that keeps retrying
@@ -135,12 +133,6 @@ pub async fn run_server(
     Ok(())
 }
 
-/// v3 registry: one control channel per service registration — indexed by the
-/// service digest (takeover of a re-registration) *and* by the session key
-/// (data-plane lookups, see [`MultiMap`]). A v3 connection serves exactly one
-/// service, so this map keeps its pre-v4 shape untouched.
-type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
-
 /// One v4 control session: the services registered on it, beside the session's
 /// single writer and its shutdown signal.
 struct SessionHandle {
@@ -233,15 +225,13 @@ type SessionMap = HashMap<Nonce, SessionHandle>;
 /// planes by session key); v4 is keyed by *session*, because a session's
 /// identity is a nonce and its services are looked up by [`ServiceId`].
 struct Registry {
-    v3: Arc<RwLock<ControlChannelMap>>,
-    v4: Arc<RwLock<SessionMap>>,
+    sessions: Arc<RwLock<SessionMap>>,
 }
 
 impl Registry {
     fn new() -> Registry {
         Registry {
-            v3: Arc::new(RwLock::new(ControlChannelMap::new())),
-            v4: Arc::new(RwLock::new(SessionMap::new())),
+            sessions: Arc::new(RwLock::new(SessionMap::new())),
         }
     }
 }
@@ -254,7 +244,7 @@ async fn session_service(
     service_id: ServiceId,
 ) -> Option<ControlChannelHandle> {
     registry
-        .v4
+        .sessions
         .read()
         .await
         .get(nonce)
@@ -573,8 +563,7 @@ impl Server {
         // Dropping a handle stops that service and its pool; dropping the
         // session handle closes its control connection, which is how the
         // client learns to reconnect.
-        self.registry.v3.write().await.clear();
-        self.registry.v4.write().await.clear();
+        self.registry.sessions.write().await.clear();
         // The KCP listener task subscribed to this broadcast when the first
         // `kcp` registration bound it (the TCP accept loops watch the caller's
         // own receiver instead), so without the signal its socket stays bound
@@ -689,46 +678,34 @@ async fn handle_connection(
     server_config: Arc<ServerConfig>,
     shared: Arc<ServerShared>,
 ) -> Result<()> {
-    // Read hello, and with it the dialect the peer speaks: this server serves
-    // both (`SUPPORTED_PROTO_VERSIONS`), and every branch below depends on
-    // which one answered.
-    let (version, hello) = read_hello(&mut conn).await?;
+    // Read hello. `read_hello` has already refused every dialect this
+    // server does not serve (protocol v4, and nothing else), so the version
+    // it read is the one below; what the hello *variant* says is which kind
+    // of connection this is.
+    let (_version, hello) = read_hello(&mut conn).await?;
     match hello {
-        ControlChannelHello(_, tag) => {
-            if version == PROTO_V4_VERSION {
-                // The v4 hello's digest is a client-chosen session tag; the
-                // session's identity is the nonce *this* end issues below.
-                do_session_handshake(conn, registry, server_config, shared).await?;
-            } else {
-                do_control_channel_handshake(conn, registry, tag, server_config, shared).await?;
-            }
+        ControlChannelHello(_, _tag) => {
+            // The v4 hello's digest is a client-chosen session tag; the
+            // session's identity is the nonce *this* end issues below.
+            do_session_handshake(conn, registry, server_config, shared).await?;
         }
         DataChannelHello(_, nonce) => {
-            if version == PROTO_V4_VERSION {
-                // A v4 direct data channel names its service in the 4 bytes
-                // right after the hello. The hello itself stays fixed-width,
-                // so `read_hello` reads exactly what a v3 peer sends.
-                let service_id = read_stream_prologue(&mut conn).await?;
-                do_v4_data_channel(conn, registry, nonce, service_id).await?;
-            } else {
-                do_data_channel_handshake(conn, registry, nonce, false).await?;
-            }
+            // A direct data channel names its service in the 4 bytes right
+            // after the hello.
+            let service_id = read_stream_prologue(&mut conn).await?;
+            do_v4_data_channel(conn, registry, nonce, service_id).await?;
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
-            if version == PROTO_V4_VERSION {
-                // A v4 tunnel carries no service of its own: it belongs to the
-                // session, and every stream inside it names its own service.
-                do_v4_tunnel(
-                    conn,
-                    registry,
-                    nonce,
-                    server_config.max_tunnels_per_client(),
-                )
-                .await?;
-            } else {
-                do_data_channel_handshake(conn, registry, nonce, true).await?;
-            }
+            // A tunnel carries no service of its own: it belongs to the
+            // session, and every stream inside it names its own service.
+            do_v4_tunnel(
+                conn,
+                registry,
+                nonce,
+                server_config.max_tunnels_per_client(),
+            )
+            .await?;
         }
         #[cfg(not(feature = "multiplex"))]
         Hello::DataChannelTunnelHello(..) => {
@@ -737,103 +714,6 @@ async fn handle_connection(
             );
         }
     }
-    Ok(())
-}
-
-/// The v3 control channel: authenticate once, register one service, then hand
-/// the connection to that service's own control task.
-///
-/// Byte-identical to pre-v4 behaviour, including the takeover of a previous
-/// registration of the same service digest and the per-service heartbeat.
-async fn do_control_channel_handshake(
-    mut conn: ServerStream,
-    registry: Arc<Registry>,
-    service_digest: ServiceDigest,
-    server_config: Arc<ServerConfig>,
-    shared: Arc<ServerShared>,
-) -> Result<()> {
-    debug!("Handshaking a control channel");
-
-    conn.hint(SocketOpts::for_control_channel());
-
-    // Generate a nonce
-    let mut nonce = [0u8; HASH_WIDTH_IN_BYTES];
-    let mut rng = rand::rngs::SysRng;
-    rng.try_fill_bytes(&mut nonce)?;
-
-    // Send hello, in the dialect the peer opened with: this branch *is* the
-    // v3 path, so answering with `CURRENT_PROTO_VERSION` (v4) would tell an old
-    // client the server had moved on.
-    let hello_send = Hello::ControlChannelHello(PROTO_V3_VERSION, nonce);
-    conn.write_all(&postcard::to_stdvec(&hello_send)?).await?;
-    conn.flush().await?;
-
-    // Validate the auth response against the global token
-    let mut concat = Vec::from(server_config.default_token.as_bytes());
-    concat.extend_from_slice(&nonce);
-    let session_key = protocol::digest(&concat);
-
-    let protocol::Auth(d) = read_auth(&mut conn).await?;
-    if d != session_key {
-        write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::AuthFailed)?).await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
-        report_auth_failure();
-        bail!("Authentication failed");
-    }
-    write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
-
-    // Read the client's service registration
-    let reg = read_registration(&mut conn).await?;
-    let v4_reg: ServiceRegistrationV4 = reg.clone().into();
-
-    // Take over any previous control channel for this service name *before*
-    // binding: dropping the old handle starts the asynchronous teardown of
-    // its listeners, and `bind_with_retry` absorbs the remaining race.
-    {
-        let mut h = registry.v3.write().await;
-        if let Some(previous) = h.remove1(&service_digest) {
-            info!(service = %reg.name, "Dropping previous control channel");
-            previous.shutdown();
-        }
-    }
-
-    // Clamp the requested pool size to the operator's tunnel valve. A v3
-    // registration still carries a channel count of its own, so this is where
-    // `[server.data].max_tunnels_per_client` bounds a v3 client; `0` (the
-    // default) leaves the request alone, exactly as the removed
-    // `[server].max_pool_size` did.
-    let pool_size = match server_config.max_tunnels_per_client() {
-        0 => reg.pool_size,
-        max => reg.pool_size.min(u16::try_from(max).unwrap_or(u16::MAX)),
-    } as usize;
-
-    match register_service(&v4_reg, &server_config, &shared, &registry).await? {
-        Registration::Rejected(reason) => {
-            write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
-            bail!("Service {}: {reason}", reg.name);
-        }
-        Registration::Accepted(registered) => {
-            write_register_result(&mut conn, &Ack::Ok).await?;
-            let handle = ControlChannelHandle::new(
-                ControlSink::Connection(conn),
-                &registered.service,
-                registered.bound,
-                server_config.control.heartbeat_interval,
-                pool_size,
-                stripe_count(&server_config),
-            );
-
-            // Insert the new handle for this control channel
-            let mut h = registry.v3.write().await;
-            let _ = h.insert(service_digest, session_key, handle);
-            info!(service = %registered.service.name, "Control channel established");
-        }
-    }
-
     Ok(())
 }
 
@@ -863,7 +743,7 @@ enum Registration {
 /// any previous registration for the service *before* calling this, so
 /// `bind_with_retry` absorbs that asynchronous teardown.
 async fn register_service(
-    reg: &ServiceRegistrationV4,
+    reg: &ServiceRegistration,
     server_config: &Arc<ServerConfig>,
     #[cfg_attr(
         not(feature = "kcp"),
@@ -1019,7 +899,7 @@ async fn do_session_handshake(
         let handle = SessionHandle::new(write_tx, shutdown_tx);
         let heartbeat_tx = handle.write_tx.clone();
         let shutdown_rx = handle.shutdown.subscribe();
-        registry.v4.write().await.insert(nonce, handle);
+        registry.sessions.write().await.insert(nonce, handle);
         (heartbeat_tx, shutdown_rx)
     };
 
@@ -1058,7 +938,7 @@ async fn do_session_handshake(
     // Drop every service handle: each service's control task ends, its pool
     // task stops, and its listener and public port are released. Removing the
     // registry entry drops the last writers, which ends the writer task.
-    if let Some(mut session) = registry.v4.write().await.remove(&nonce) {
+    if let Some(mut session) = registry.sessions.write().await.remove(&nonce) {
         debug!(
             services = session.services.len(),
             "Control session closed, releasing its services"
@@ -1093,7 +973,7 @@ impl SessionCtx {
     /// The session's one writer, for as long as the session is registered.
     async fn write_tx(&self) -> Result<mpsc::UnboundedSender<Vec<u8>>> {
         self.registry
-            .v4
+            .sessions
             .read()
             .await
             .get(&self.nonce)
@@ -1130,7 +1010,7 @@ impl SessionCtx {
         // asynchronous teardown — the order the v3 path uses too.
         let replaced = self
             .registry
-            .v4
+            .sessions
             .write()
             .await
             .get_mut(&self.nonce)
@@ -1168,37 +1048,16 @@ impl SessionCtx {
             // turns its pool's requests into tagged commands.
             0,
             // v4 registrations carry no `pool_size`: the tunnel pool is a
-            // client-side, per-carrier concern and grows on demand, one
-            // request per visitor.
+            // client-side, per-carrier concern and grows on demand — one
+            // request per visitor, or one per stripe for a striped gather
+            // (see `pair_striped_group`).
             0,
-            // Striping is served *unstriped* on a v4 session: with the elastic
-            // pool, a group's channels are opened while the pool is still
-            // growing, and a stripe group that ends up sharing tunnels (or
-            // gathering a channel that is still being established) deadlocks
-            // the bulk path instead of degrading. A deadlock is not a
-            // degradation, so the feature is off until it is fixed — loudly,
-            // once, rather than silently (HANDOFF.md, "Open: striping with the
-            // elastic pool").
-            {
-                if stripe_count(&self.server_config) > 1 {
-                    STRIPING_UNAVAILABLE.report(
-                        || {
-                            warn!(
-                                "[server.data] stripe_count is not supported on a v4 session yet; \
-                                 serving unstriped. See HANDOFF.md, \"Open: striping with the \
-                                 elastic pool\"."
-                            );
-                        },
-                        || debug!("[server.data] stripe_count ignored on a v4 session"),
-                    );
-                }
-                1
-            },
+            stripe_count(&self.server_config),
         );
 
         // The handle *is* the service's lease: dropping it (Deregister, or the
         // session ending) stops the pool and releases the port.
-        let mut guard = self.registry.v4.write().await;
+        let mut guard = self.registry.sessions.write().await;
         let Some(session) = guard.get_mut(&self.nonce) else {
             // The session ended while this registration was being served.
             return Ok(());
@@ -1215,7 +1074,7 @@ impl SessionCtx {
     async fn deregister(&self, service_id: ServiceId) {
         let removed = self
             .registry
-            .v4
+            .sessions
             .write()
             .await
             .get_mut(&self.nonce)
@@ -1301,50 +1160,6 @@ impl tokio::io::AsyncWrite for DataChannel {
     }
 }
 
-async fn do_data_channel_handshake(
-    conn: ServerStream,
-    registry: Arc<Registry>,
-    nonce: Nonce,
-    #[cfg_attr(
-        not(feature = "multiplex"),
-        allow(unused_variables, reason = "only read by the multiplex arm")
-    )]
-    is_tunnel: bool,
-) -> Result<()> {
-    debug!("Handshaking a data channel");
-
-    // Validate: a v3 session key identifies the one service of that control
-    // channel, so the nonce alone names the service.
-    let handle = {
-        let guard = registry.v3.read().await;
-        let Some(handle) = guard.get2(&nonce).cloned() else {
-            warn!("Data channel has incorrect nonce");
-            return Ok(());
-        };
-        handle
-    };
-
-    conn.hint(SocketOpts::for_service(None));
-
-    #[cfg(feature = "multiplex")]
-    {
-        // The hello variant told us whether this connection is a plain data
-        // channel or the opening of a multiplexed tunnel.
-        if is_tunnel {
-            // v3: the requested channel count was clamped at registration, so a
-            // v3 tunnel takes no session slot of its own.
-            return upgrade_to_tunnel(conn, TunnelOwner::Service(handle), None).await;
-        }
-    }
-
-    handle
-        .data_channel
-        .send(new_data_channel(conn))
-        .await
-        .with_context(|| "Data channel for a stale control channel")?;
-    Ok(())
-}
-
 /// A v4 direct data channel: its prologue already named the service.
 ///
 /// A channel for a service that is not registered (a stale one, or an id the
@@ -1415,8 +1230,8 @@ async fn do_v4_tunnel(
     conn.hint(SocketOpts::for_service(None));
     upgrade_to_tunnel(
         conn,
-        TunnelOwner::Session {
-            sessions: Arc::clone(&registry.v4),
+        TunnelOwner {
+            sessions: Arc::clone(&registry.sessions),
             nonce,
         },
         Some(slot),
@@ -1459,7 +1274,7 @@ struct SessionTunnel {
 /// concurrent tunnel hellos of one client respect the cap together.
 #[cfg(feature = "multiplex")]
 async fn reserve_tunnel(registry: &Registry, nonce: &Nonce, cap: usize) -> TunnelSlot {
-    let guard = registry.v4.read().await;
+    let guard = registry.sessions.read().await;
     let Some(session) = guard.get(nonce) else {
         return TunnelSlot::NoSession;
     };
@@ -1496,12 +1311,6 @@ where
 #[cfg(feature = "multiplex")]
 static TUNNEL_VIOLATIONS: RepeatNotice = RepeatNotice::new();
 
-/// A v4 registration asked for striping while a v4 session cannot serve it yet
-/// (HANDOFF.md, "Open: striping with the elastic pool"): WARN once, then DEBUG.
-/// Not feature-gated: a build without `multiplex` reports `stripe_count() == 1`
-/// and never reaches this, but the session path that asks compiles either way.
-static STRIPING_UNAVAILABLE: RepeatNotice = RepeatNotice::new();
-
 /// Report a dropped tunnel stream: once per process at `warn`, then at `debug`.
 #[cfg(feature = "multiplex")]
 fn report_tunnel_violation(service_id: ServiceId, why: &str) {
@@ -1520,20 +1329,16 @@ fn report_tunnel_violation(service_id: ServiceId, why: &str) {
     );
 }
 
-/// Who a tunnel's streams belong to.
+/// Which session a tunnel's streams belong to.
+///
+/// The tunnel belongs to the session as a whole: each stream's 4-byte prologue
+/// names its service, so one tunnel may carry streams of **several** services —
+/// which is exactly what a shared pool (`[client.data].shared_pool`) produces,
+/// and what a per-service pool produces only by accident.
 #[cfg(feature = "multiplex")]
-enum TunnelOwner {
-    /// v3: one control channel serves exactly one service, so every stream on
-    /// the tunnel is that service's.
-    Service(ControlChannelHandle),
-    /// v4: the tunnel belongs to a session. Each stream's 4-byte prologue
-    /// names its service, so one tunnel may carry streams of **several**
-    /// services — which is exactly what a shared pool (`[client.data].shared_pool`)
-    /// produces, and what a per-service pool produces only by accident.
-    Session {
-        sessions: Arc<RwLock<SessionMap>>,
-        nonce: Nonce,
-    },
+struct TunnelOwner {
+    sessions: Arc<RwLock<SessionMap>>,
+    nonce: Nonce,
 }
 
 /// Finalize a tunnel upgrade on a validated tunnel stream: confirm with the
@@ -1588,16 +1393,11 @@ where
     });
     tokio::spawn(async move {
         while let Some(mut stream) = bridge_rx.recv().await {
-            let queue = match &owner {
-                TunnelOwner::Service(handle) => handle.data_channel.clone(),
-                TunnelOwner::Session { sessions, nonce } => {
-                    match route_tunnel_stream(&mut stream, sessions, nonce).await {
-                        Some(queue) => queue,
-                        // A stream this session may not carry: dropped here,
-                        // never the tunnel or the session.
-                        None => continue,
-                    }
-                }
+            let Some(queue) = route_tunnel_stream(&mut stream, &owner.sessions, &owner.nonce).await
+            else {
+                // A stream this session may not carry: dropped here, never the
+                // tunnel or the session.
+                continue;
             };
             if queue.send(DataChannel::Mux(stream)).await.is_err() {
                 break;
@@ -1734,76 +1534,59 @@ async fn handle_kcp_tunnel_session(
     };
 
     // Read and validate the tunnel hello, then run the shared upgrade.
-    let (owner, nonce, version) =
+    let (owner, nonce) =
         tokio::time::timeout(deadline, validate_tunnel_hello(&mut io, &registry, "KCP"))
             .await
             .with_context(|| "KCP tunnel hello timed out")??;
 
-    // A v4 KCP tunnel is one of the client's multiplexed tunnels and takes a
+    // A KCP tunnel is one of the client's multiplexed tunnels and takes a
     // slot exactly like a TCP one: the valve must not be bypassable by
-    // choosing the other carrier. A v3 KCP tunnel belongs to a single control
-    // channel, whose own channel count was clamped at registration.
-    let session = if version == PROTO_V4_VERSION {
-        match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
-            TunnelSlot::Held(slot) => Some(slot),
-            TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
-            TunnelSlot::OverCap { held } => {
-                debug!(
-                    "Refused a v{PROTO_V4_VERSION} KCP data tunnel for session {}: it already \
-                     holds {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
-                     {max_tunnels_per_client}",
-                    hex::encode(nonce)
-                );
-                refuse_tunnel(&mut io).await?;
-                return Ok(());
-            }
+    // choosing the other carrier.
+    let session = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
+        TunnelSlot::Held(slot) => Some(slot),
+        TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
+        TunnelSlot::OverCap { held } => {
+            debug!(
+                "Refused a v{PROTO_V4_VERSION} KCP data tunnel for session {}: it already \
+                 holds {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
+                 {max_tunnels_per_client}",
+                hex::encode(nonce)
+            );
+            refuse_tunnel(&mut io).await?;
+            return Ok(());
         }
-    } else {
-        None
     };
 
     upgrade_to_tunnel(io, owner, session).await
 }
 
 /// Read the tunnel hello on a freshly established tunnel stream (any arm)
-/// and resolve the control channel it belongs to via the session nonce.
+/// and resolve the session it belongs to via the session nonce.
 ///
-/// The version the peer opened with is returned beside the owner: only a v4
-/// tunnel draws on the session's tunnel budget (a v3 tunnel belongs to one
-/// control channel, whose requested channel count was already clamped).
+/// A tunnel names its session only; every stream inside it names its own
+/// service (see `TunnelOwner::Session`).
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 async fn validate_tunnel_hello<S>(
     conn: &mut S,
     registry: &Registry,
     arm: &str,
-) -> Result<(TunnelOwner, Nonce, u8)>
+) -> Result<(TunnelOwner, Nonce)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (version, hello) = read_hello(conn).await?;
+    let (_version, hello) = read_hello(conn).await?;
     match hello {
         Hello::DataChannelTunnelHello(_, nonce) => {
-            if version == PROTO_V4_VERSION {
-                // A v4 tunnel names its session only; its streams name their
-                // service (see `TunnelOwner::Session`).
-                if !registry.v4.read().await.contains_key(&nonce) {
-                    bail!("{arm} tunnel hello carried an incorrect nonce");
-                }
-                Ok((
-                    TunnelOwner::Session {
-                        sessions: Arc::clone(&registry.v4),
-                        nonce,
-                    },
-                    nonce,
-                    version,
-                ))
-            } else {
-                let guard = registry.v3.read().await;
-                let Some(handle) = guard.get2(&nonce).cloned() else {
-                    bail!("{arm} tunnel hello carried an incorrect nonce");
-                };
-                Ok((TunnelOwner::Service(handle), nonce, version))
+            if !registry.sessions.read().await.contains_key(&nonce) {
+                bail!("{arm} tunnel hello carried an incorrect nonce");
             }
+            Ok((
+                TunnelOwner {
+                    sessions: Arc::clone(&registry.sessions),
+                    nonce,
+                },
+                nonce,
+            ))
         }
         other => bail!("Expected a tunnel hello on the {arm} tunnel, got {other:?}"),
     }
@@ -1925,7 +1708,6 @@ fn stripe_count(server_config: &ServerConfig) -> usize {
 /// A v3 service owns its control connection; a v4 service shares the session's,
 /// so its commands are framed into the session's single writer instead.
 enum ControlSink {
-    Connection(ServerStream),
     Session {
         service_id: ServiceId,
         write_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -1933,24 +1715,20 @@ enum ControlSink {
 }
 
 impl ControlSink {
-    /// Send one already-framed command: straight out on a v3 connection, or
-    /// queued for the session's writer — the only task touching that socket.
-    async fn send(&mut self, data: &[u8]) -> Result<()> {
+    /// Send one already-framed command, queued for the session's writer — the
+    /// only task that touches that socket.
+    fn send(&mut self, data: &[u8]) -> Result<()> {
         match self {
-            ControlSink::Connection(conn) => write_and_flush(conn, data)
-                .await
-                .with_context(|| "Failed to write control cmds"),
             ControlSink::Session { write_tx, .. } => write_tx
                 .send(data.to_vec())
                 .map_err(|_| anyhow!("The control session is gone")),
         }
     }
 
-    /// The v4 service id this sink's commands are tagged with.
-    fn service_id(&self) -> Option<ServiceId> {
+    /// The service id this sink's commands are tagged with.
+    fn service_id(&self) -> ServiceId {
         match self {
-            ControlSink::Connection(_) => None,
-            ControlSink::Session { service_id, .. } => Some(*service_id),
+            ControlSink::Session { service_id, .. } => *service_id,
         }
     }
 }
@@ -1988,11 +1766,9 @@ impl ControlChannelHandle {
         // through this channel, and the per-service control task turns it into
         // `ServiceDropped`. v3 has no reporter — its control channel dies with
         // the pool anyway.
-        let (pool_died_tx, pool_died_rx) = if sink.service_id().is_some() {
+        let (pool_died_tx, pool_died_rx) = {
             let (tx, rx) = mpsc::unbounded_channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
+            (tx, rx)
         };
 
         let shutdown_rx_clone = shutdown_tx.subscribe();
@@ -2044,7 +1820,7 @@ impl ControlChannelHandle {
                         .with_context(|| "Failed to run TCP connection pool")
                         {
                             error!("{:#}", e);
-                            report_pool_death(pool_died_tx.as_ref());
+                            report_pool_death(&pool_died_tx);
                         }
                     }
                     .instrument(Span::current()),
@@ -2069,7 +1845,7 @@ impl ControlChannelHandle {
                         .with_context(|| "Failed to run UDP connection pool")
                         {
                             error!("{:#}", e);
-                            report_pool_death(pool_died_tx.as_ref());
+                            report_pool_death(&pool_died_tx);
                         }
                     }
                     .instrument(Span::current()),
@@ -2091,19 +1867,14 @@ impl ControlChannelHandle {
 /// orderly (shutdown, or the control channel gone), and must never tell the
 /// client its service was dropped. A no-op in v3, where the pool's end already
 /// stops that service's control channel.
-fn report_pool_death(tx: Option<&mpsc::UnboundedSender<()>>) {
-    if let Some(tx) = tx {
-        let _ = tx.send(());
-    }
+fn report_pool_death(tx: &mpsc::UnboundedSender<()>) {
+    let _ = tx.send(());
 }
 
 /// Wait for a service's pool task to report that it died. Never resolves when
 /// the service has no reporter (v3) or while its pool is healthy.
-async fn recv_pool_death(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> {
-    match rx {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
+async fn recv_pool_death(rx: &mut mpsc::UnboundedReceiver<()>) -> Option<()> {
+    rx.recv().await
 }
 
 /// One service's control path.
@@ -2113,30 +1884,24 @@ async fn recv_pool_death(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option
 /// connection, so this task only translates the pool's requests into
 /// service-tagged commands for the session's writer.
 struct ControlChannel {
-    sink: ControlSink,                                 // Where the commands go
-    shutdown_rx: broadcast::Receiver<bool>,            // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>,     // Receives visitor connections
-    heartbeat_interval: u64, // Application-layer heartbeat interval in secs
-    pool_died_rx: Option<mpsc::UnboundedReceiver<()>>, // v4: the pool's death notice
+    sink: ControlSink,                             // Where the commands go
+    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
+    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    pool_died_rx: mpsc::UnboundedReceiver<()>,     // the pool's death notice
 }
 
 impl ControlChannel {
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = match self.sink.service_id() {
-            Some(service_id) => {
-                postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(service_id))?
-            }
-            None => postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)?,
-        };
+        let service_id = self.sink.service_id();
+        let create_ch_cmd =
+            postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(service_id))?;
         let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
-        let dropped_cmd = match self.sink.service_id() {
-            Some(service_id) => Some(postcard::to_stdvec(&ControlChannelCmd::ServiceDropped(
-                service_id,
-            ))?),
-            None => None,
-        };
+        let dropped_cmd = Some(postcard::to_stdvec(&ControlChannelCmd::ServiceDropped(
+            service_id,
+        ))?);
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -2144,7 +1909,7 @@ impl ControlChannel {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.sink.send(&create_ch_cmd).await {
+                            if let Err(e) = self.sink.send(&create_ch_cmd) {
                                 // The client is gone: one session's end. Its
                                 // own log says why.
                                 debug!("{:#}", e);
@@ -2162,7 +1927,7 @@ impl ControlChannel {
                 Some(()) = recv_pool_death(&mut self.pool_died_rx) => {
                     match dropped_cmd.as_deref() {
                         Some(cmd) => {
-                            if let Err(e) = self.sink.send(cmd).await {
+                            if let Err(e) = self.sink.send(cmd) {
                                 debug!("{:#}", e);
                             }
                         }
@@ -2171,7 +1936,7 @@ impl ControlChannel {
                     break;
                 }
                 () = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.sink.send(&heartbeat).await {
+                            if let Err(e) = self.sink.send(&heartbeat) {
                                 debug!("{:#}", e);
                                 break;
                             }
@@ -2564,12 +2329,47 @@ where
     'gather: loop {
         let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
         let cmds = stripe_cmds(group, stripe_count)?;
+        // One `CreateDataChannelFor` per stripe, before the first wait: the
+        // unstriped path asks for its channel this way, and a striped gather
+        // that does not ask simply waits for channels nobody was told to
+        // open — the shape of the original defect (a cold pool never
+        // pre-opened anything, so the gather hung until the visitor's own
+        // read timed out). A request the client refuses is answered with
+        // nothing at all, which is why the wait below re-asks.
+        for _ in 0..stripe_count {
+            if data_ch_req_tx.send(true).is_err() {
+                return Ok(true);
+            }
+        }
         let mut gathered: Vec<C> = Vec::with_capacity(stripe_count);
+        let mut attempts = 0usize;
         loop {
             let next = tokio::select! {
                 _ = shutdown_rx.recv() => None,
                 _ = control_alive.changed() => None,
                 ch = take_channel(data_ch_rx) => ch,
+                () = time::sleep(PAIR_WAIT_BUDGET) => {
+                    // Nothing arrived inside the budget. Only the channels this
+                    // group still lacks are asked for again: the ones that
+                    // arrived are paired already, and re-asking for those would
+                    // open channels no visitor needs.
+                    attempts += 1;
+                    if attempts >= PAIR_ATTEMPTS {
+                        debug!("No data channel after {attempts} requests; dropping the visitor");
+                        // Nothing to release: a request the client refused left
+                        // nothing behind, and the channels that did arrive are
+                        // parked in the client's registry until its TTL reaps
+                        // them there.
+                        return Ok(false);
+                    }
+                    let missing = stripe_count - gathered.len();
+                    for _ in 0..missing {
+                        if data_ch_req_tx.send(true).is_err() {
+                            return Ok(true);
+                        }
+                    }
+                    continue;
+                }
             };
             let Some(mut ch) = next else {
                 return Ok(true);
@@ -2585,12 +2385,9 @@ where
             } else {
                 // A broken pooled channel: drop the attempt (the client's
                 // registry reaps its parked stripes) and gather a fresh one.
+                // The next iteration's own requests replace the channels that
+                // died with it, so nothing is re-asked here.
                 drop(gathered);
-                for _ in 0..stripe_count {
-                    if data_ch_req_tx.send(true).is_err() {
-                        return Ok(true);
-                    }
-                }
                 continue 'gather;
             }
         }
@@ -2749,49 +2546,64 @@ impl Drop for UdpWorkerGuard {
     }
 }
 
-/// Start one data-channel worker and register its queue.
+/// The UDP pool's worker set: the live workers plus the state a spawn and a
+/// route both need.
 ///
-/// The worker set is exactly what the client opened for the service's
-/// configured count (D31): this is the *only* place a worker is added, and it
-/// is reached only for a data channel the client actually sent. A new visitor
-/// source never creates one; `route_udp_datagram` drops its datagram instead.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the pool's own state, passed one piece per argument so the helper stays a plain function"
-)]
-fn spawn_udp_worker<C>(
-    l: &Arc<UdpSocket>,
-    conn: C,
-    workers: &Arc<UdpWorkerMap>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
-    shutting_down: &Arc<AtomicBool>,
-    next_worker: &mut usize,
-    buffer_size: usize,
-    shutdown_rx: &broadcast::Receiver<bool>,
-) where
-    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
-    let id = *next_worker;
-    *next_worker += 1;
-    workers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(id, tx);
-    let guard = UdpWorkerGuard {
-        id,
-        workers: Arc::clone(workers),
-        req_tx: data_ch_req_tx.clone(),
-        shutting_down: Arc::clone(shutting_down),
-    };
-    tokio::spawn(udp_forward_worker(
-        Arc::clone(l),
-        conn,
-        rx,
-        shutdown_rx.resubscribe(),
-        buffer_size,
-        guard,
-    ));
+/// Bundled for one reason — the spawn below takes the whole set, and passing
+/// its pieces one at a time made a six-argument helper whose arguments were
+/// the pool's own state in every slot.
+struct UdpWorkerSet {
+    /// Live data channels by worker id. Workers remove their own entry on
+    /// exit (via the guard) and request a replacement, so the pool keeps its
+    /// size for the session's lifetime.
+    workers: Arc<UdpWorkerMap>,
+    /// Asks the control channel for a replacement channel when a worker exits.
+    req_tx: mpsc::UnboundedSender<bool>,
+    /// Set while the pool shuts down, so an exit asks for nothing.
+    shutting_down: Arc<AtomicBool>,
+    /// The next worker id, and the round-robin cursor a route starts from.
+    next: usize,
+}
+
+impl UdpWorkerSet {
+    /// Start one data-channel worker and register its queue.
+    ///
+    /// The worker set is exactly what the client opened for the service's
+    /// configured count (D31): this is the *only* place a worker is added, and
+    /// it is reached only for a data channel the client actually sent. A new
+    /// visitor source never creates one; [`route_udp_datagram`] drops its
+    /// datagram instead.
+    fn spawn_worker<C>(
+        &mut self,
+        l: &Arc<UdpSocket>,
+        conn: C,
+        buffer_size: usize,
+        shutdown_rx: &broadcast::Receiver<bool>,
+    ) where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.workers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
+        let guard = UdpWorkerGuard {
+            id,
+            workers: Arc::clone(&self.workers),
+            req_tx: self.req_tx.clone(),
+            shutting_down: Arc::clone(&self.shutting_down),
+        };
+        tokio::spawn(udp_forward_worker(
+            Arc::clone(l),
+            conn,
+            rx,
+            shutdown_rx.resubscribe(),
+            buffer_size,
+            guard,
+        ));
+    }
 }
 
 /// Accept visitors on the pre-bound UDP socket and route every peer's
@@ -2819,13 +2631,16 @@ where
 
     let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp)?;
 
-    // Live data channels, keyed by a monotonically increasing worker id.
-    // Workers remove their own entry on exit (via the guard) and request a
-    // replacement, so the pool keeps its size for the session's lifetime.
-    let workers: Arc<UdpWorkerMap> = Arc::new(Mutex::new(HashMap::new()));
+    let worker_set = UdpWorkerSet {
+        workers: Arc::new(Mutex::new(HashMap::new())),
+        req_tx: data_ch_req_tx.clone(),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        next: 0,
+    };
+    let workers = Arc::clone(&worker_set.workers);
+    let shutting_down = Arc::clone(&worker_set.shutting_down);
     // The affinity table: peer address -> assigned data channel.
     let routes: Arc<UdpRouteMap> = Arc::new(Mutex::new(HashMap::new()));
-    let shutting_down = Arc::new(AtomicBool::new(false));
     // The worker ids and the round-robin cursor. Shared with the telemetry so
     // the periodic line reports live state instead of a spawn-time snapshot.
     let shared = Arc::new(UdpPoolShared {
@@ -2835,7 +2650,7 @@ where
         bind_addr: l.local_addr()?.to_string(),
     });
     register_udp_pool(&shared);
-    let mut next_worker = 0usize;
+    let mut worker_set = worker_set;
     // One socket reader: `recv_from` is the single entry point for all
     // visitors, and the affinity table below decides the channel. A single
     // reader also means one slow worker can never stall other peers.
@@ -2866,23 +2681,14 @@ where
                     debug!("Failed to init UDP channel: {:#}", e);
                     continue;
                 }
-                spawn_udp_worker(
-                    &l,
-                    conn,
-                    &workers,
-                    &data_ch_req_tx,
-                    &shutting_down,
-                    &mut next_worker,
-                    buffer_size,
-                    &shutdown_rx,
-                );
+                worker_set.spawn_worker(&l, conn, buffer_size, &shutdown_rx);
             }
             recv = l.recv_from(&mut buf) => match recv {
                 Ok((n, from)) => {
                     match route_udp_datagram(
                         &workers,
                         &routes,
-                        &mut next_worker,
+                        &mut worker_set.next,
                         from,
                         Bytes::copy_from_slice(&buf[..n]),
                     ) {
@@ -3335,6 +3141,9 @@ mod tests {
     /// stream — the session and its services stay untouched, which is what the
     /// assertions on the session map at the end pin down.
     #[cfg(feature = "multiplex")]
+    // The module-level waiver cannot carry `expect_used`: the only test that
+    // uses `.expect()` is multiplex-gated, so a feature-minimal build would
+    // leave the module's expectation unfulfilled.
     #[expect(
         clippy::expect_used,
         reason = "the test asserts on a routing decision it just made"

@@ -7,9 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (protocol): v3 is no longer served.** A v0.10.0 server refuses a
+  client that still speaks protocol v3 — the connection it happens on is
+  closed with no answer, exactly the way a *newer* client against an older
+  server has always been refused — and the server keeps its listener. The v3
+  path (one service per control connection, a registration carrying a
+  requested channel count) is gone with it, together with the two-key service
+  registry that indexed it. Both ends of a molehill deployment are the same
+  binary, so a wire break is a fact to announce rather than a state to serve:
+  upgrade both ends together, in either order, and the refused connection
+  names the version it expected. The interop matrix's new-server/old-client
+  case now pins the refusal, and
+  `tests/integration_test.rs::a_v3_hello_is_refused_on_its_own_connection`
+  pins it on this tree without the old binary.
+
+- **BREAKING (configuration): a removed key no longer starts.** The keys the
+  0.10 configuration surface removed — `[client.data].default_count`, a
+  service's `count`, `pool_size` and `heartbeat_timeout`,
+  `[server].max_pool_size`, a service's `health_check` — were stripped with
+  a warning for one release. They are refused now, in one message naming
+  every key found and what to write instead, because a key that secretes a
+  compatibility path for one release is a key that never gets removed. The
+  upgrade instruction in `docs/configuration.md`, "Migrating to 0.10" is the
+  same table, now as an error.
+
+### Fixed
+
+- **A stalled tunnel writer is woken again.** A stream's reader and writer
+  both park on the connection's per-stream command channel, and both stored
+  their waker in the same slot. A reader that parked last — queueing a window
+  update, which is what returns send credit to the other side — erased the
+  writer's waker, so the credit that came back afterwards woke nobody: the
+  stream's send direction slept until some unrelated resize happened to
+  notify, and every visitor on that tunnel stalled for the rest of the
+  session. The reader now parks in its own slot and the connection wakes both
+  when a command leaves the channel (`src/mux/connection.rs`,
+  `a_readers_channel_park_keeps_the_writers_waker` pins the slot discipline;
+  the stripe livelock it produced is recorded in HANDOFF.md).
+
 ## [0.10.0] - 2026-09-26
 
 ### Changed
+
+- **Data-channel striping works on a v4 session.** `[server.data]`
+  `stripe_count > 1` spreads every visitor connection over that many data
+  channels (a stripe group) on the elastic tunnel pool: the gather asks the
+  client for one channel per stripe — a v4 registration opens none itself, so
+  a gather that merely waited for channels nobody was told to open timed out —
+  and re-requests only the stripes still missing when a budget expires. A
+  group's channels land on distinct tunnels whenever the pool has that many,
+  and share them when it does not, so a group assembled from a cold pool loses
+  the spread but works. `tests/integration_test.rs::striped_data_channels`
+  runs in the suite again.
 
 - **The tunnel pool can be shared and is elastic.** Three new client settings
   decide what a pool is, how large it may get and how long it lives; the
@@ -35,29 +86,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affinity table's size, its evictions and each worker's pinned peers. See
   `docs/internals.md`, "The tunnel pool".
 
-- **Striping is not supported with the elastic pool yet.** `[server.data]`
-  `stripe_count > 1` asks for a visitor's connection to be spread over that
-  many data channels, and the striped bulk path deadlocks when a group's
-  channels are opened while the pool is still growing (the group ends up
-  sharing tunnels, and the reorder path waits for a sequence a broken channel
-  will never carry). A deadlock is not a degradation, so a v4 session is served
-  **unstriped**: the server logs one warning naming the key and uses a single
-  channel per visitor. Nothing else changes for a striped deployment, and
-  `stripe_count = 1` (the default) is unaffected — a configuration that
-  enables it keeps working, with the striping it asked for not applied yet.
 
 - **BREAKING (configuration)**: the pool has no initial size any more, so the
   keys that described one are gone — **`[client.data].default_count`, a
   service's `count`, a service's `pool_size` and a service's
   `heartbeat_timeout`, plus `[server].max_pool_size`**. A config that still
-  carries one starts for this release and logs a warning naming the
-  replacement; from the next release it is an error. What to write instead
+  carries one is refused before the start, naming every key and its
+  replacement. What to write instead
   (the full table is in `docs/configuration.md`, "Migrating to 0.10"):
   per-service `udp_workers` (default 2) replaces the UDP `pool_size`; a TCP
   service's channels are opened on demand, one per visitor; the heartbeat
   timeout is no longer per service because one session carries one timer; and
   the server's valve is `[server.data].max_tunnels_per_client` (default 0 =
-  unlimited), which also clamps the channel count a v3 client asks for. UDP-only
+  unlimited). UDP-only
   keys on a TCP service (`udp_buffer_size`, `udp_idle_timeout`,
   `udp_send_queue_size`, `udp_forwarder_ipv6`, `udp_workers`) are **errors**
   now instead of being accepted and silently ignored, which is the defect this

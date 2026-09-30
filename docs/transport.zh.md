@@ -2,7 +2,7 @@
 
 默认情况下,`molehill` 按原样转发流量(明文 TCP)。客户端的
 `[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
-决定**:每条连接以 v3 传输选择器字节开头,服务端接受客户端说的任何一种
+决定**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
 语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
 `type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见 README 的
 配置指南。本文只讲 `noise`;`plain` 除默认值外无需任何配置。
@@ -82,7 +82,7 @@ transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" }
 `transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
 Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
 (`carrier = "kcp"` 时的)Noise-over-KCP 包裹都用该服务的有效密钥。服务端
-只需要放置自己的密钥(v3 选择器:它接受每条连接所说的语言)。
+只需要放置自己的密钥(传输选择器:它接受每条连接所说的语言)。
 
 ### 指定 pattern
 

@@ -125,7 +125,7 @@ def reap_pids(pids: list) -> int:
         if probe not in cmd:
             continue
         try:
-            with open(f"/proc/{pid}/stat") as fh:
+            with Path(f"/proc/{pid}/stat").open() as fh:
                 stat = fh.read().split(") ", 1)[1]
             ppid = int(stat.split()[1])
             parent_cmd = _proc_cmdline(ppid)
@@ -893,18 +893,25 @@ def slope_per_min(rows: list, metric: str):
 
 def worst_window(rows: list, metric: str, window_s: float = 1.0):
     """The worst `window_s` slice's mean: the stability axis. A stage whose
-    worst second sits far above its mean is not a stable configuration."""
+    worst second sits far above its mean is not a stable configuration.
+
+    The window walks by index rather than slicing: `pts[i:]` copies the whole
+    tail on every iteration, which is O(n^2) on the long interactive series
+    (measured: 0.99 s at 18 000 points against 0.045 s here), and it runs a few
+    times per test on the harness's critical path.
+    """
     pts = points(rows, metric)
     if len(pts) < MIN_WINDOW_POINTS:
         return None
     best = None
-    for i, (t0, _) in enumerate(pts):
-        acc, n = 0.0, 0
-        for t1, v in pts[i:]:
-            if t1 - t0 > window_s:
-                break
-            acc += v
+    total = len(pts)
+    for i in range(total):
+        t0 = pts[i][0]
+        acc, n, j = 0.0, 0, i
+        while j < total and pts[j][0] - t0 <= window_s:
+            acc += pts[j][1]
             n += 1
+            j += 1
         if n:
             mean = acc / n
             if best is None or mean > best["mean"]:
@@ -988,7 +995,7 @@ class ArmProcs:
         if role:
             name = f"{name}.{role}"
         log = self.work / f"{name}.log"
-        with open(log, "ab") as f:
+        with log.open("ab") as f:
             pid = subprocess.Popen(cmd, stdout=f, stderr=f, cwd=cwd, env=env).pid
         record_pid(self.work, pid)
         self.pids.append(pid)
@@ -1422,7 +1429,11 @@ def tool_version(knobs: Knobs) -> str:
             timeout=15,
         ).stdout
         return next(
-            (l.split()[2] for l in out.splitlines() if l.startswith("Build Version:")),
+            (
+                line.split()[2]
+                for line in out.splitlines()
+                if line.startswith("Build Version:")
+            ),
             "dev",
         )
     except OSError:

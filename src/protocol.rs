@@ -14,15 +14,10 @@ type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
 const _PROTO_V2: u8 = 2u8;
-const PROTO_V3: u8 = 3u8;
+const _PROTO_V3: u8 = 3u8;
 const PROTO_V4: u8 = 4u8;
 
-/// v3: the dialect this build still *serves* (one service per control
-/// connection) but no longer speaks — a v3 client keeps working against a
-/// v0.10.0 server, whose own client registers as v4.
-pub const PROTO_V3_VERSION: ProtocolVersion = PROTO_V3;
-
-/// v3: every connection starts with a one-byte transport selector (`0x00`
+/// v4: every connection starts with a one-byte transport selector (`0x00`
 /// plain / `0x01` noise) so the server can accept both transports on one
 /// listener without a config-side `type` agreement, and the registration
 /// carries the service's data-plane carrier (client-declared, server
@@ -40,10 +35,14 @@ pub const PROTO_V4_VERSION: ProtocolVersion = PROTO_V4;
 /// because a server has to keep serving the dialects it no longer speaks.
 pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V4_VERSION;
 
-/// The dialects a *server* accepts. A v3 session keeps its one-service-per-
-/// connection behaviour exactly; a v4 session is served by the session
-/// registry. Anything else is refused loudly by [`read_hello`].
-pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 2] = [PROTO_V3_VERSION, PROTO_V4_VERSION];
+/// The dialect a *server* accepts, and the only one it speaks.
+///
+/// v3 (one service per control connection, a registration carrying a requested
+/// channel count) stopped being served when v4 landed in 0.10.0: this project
+/// is self-hosted, both ends are the same binary, and a wire break is
+/// announced on the connection it happens on (see [`read_hello`]). Anything
+/// else is refused there, loudly, with the version the peer actually sent.
+pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V4_VERSION];
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
@@ -79,12 +78,16 @@ impl Carrier {
     }
 }
 
-/// The client-driven service registration sent right after the control
-/// channel authentication succeeds.
+/// The client-driven service registration sent inside a v4 session, after
+/// its authentication succeeded.
 ///
 /// The server owns no per-service configuration: everything needed to expose
 /// a service (its name, type and public bind address) is declared by the
 /// client and validated against the server-side policy (`allow_ports`).
+///
+/// It carries no channel count: the tunnel pool is the client's own,
+/// per-carrier concern and grows on demand (D5), so a registration asks for
+/// the service and nothing about how it will be carried.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ServiceRegistration {
     pub name: String,
@@ -95,10 +98,6 @@ pub struct ServiceRegistration {
     /// (`tcp`/`kcp`, client-declared). The server validates it against its
     /// own capabilities and lazily opens its listeners on first use.
     pub carrier: Carrier,
-    /// Requested number of pre-established data channels. The server clamps
-    /// this to `[server.data].max_tunnels_per_client` when that valve is set;
-    /// v4 dropped the field (the pool is the client's own, per carrier).
-    pub pool_size: u16,
     /// Receive buffer size for UDP datagrams of this service. Ignored for
     /// TCP services. Wire-compatible up to `u16::MAX`.
     pub udp_buffer_size: u16,
@@ -133,39 +132,6 @@ impl std::fmt::Display for ServiceId {
     }
 }
 
-/// A v4 service registration: today's [`ServiceRegistration`] minus
-/// `pool_size`.
-///
-/// The tunnel pool is a client-side, per-carrier concern in v4 (its size is the
-/// client's to grow and shrink), so a registration no longer carries a request
-/// for a number of pre-established channels. The v3 struct stays
-/// byte-identical, because a v3 client is still served.
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct ServiceRegistrationV4 {
-    pub name: String,
-    pub service_type: ServiceType,
-    /// Public address the service is exposed at, chosen by the client.
-    pub bind_addr: SocketAddr,
-    /// The data-plane carrier this service's channels will use
-    /// (`tcp`/`kcp`, client-declared).
-    pub carrier: Carrier,
-    /// Receive buffer size for UDP datagrams of this service. Ignored for
-    /// TCP services. Wire-compatible up to `u16::MAX`.
-    pub udp_buffer_size: u16,
-}
-
-impl From<ServiceRegistration> for ServiceRegistrationV4 {
-    fn from(v3: ServiceRegistration) -> Self {
-        ServiceRegistrationV4 {
-            name: v3.name,
-            service_type: v3.service_type,
-            bind_addr: v3.bind_addr,
-            carrier: v3.carrier,
-            udp_buffer_size: v3.udp_buffer_size,
-        }
-    }
-}
-
 /// One service registration inside a v4 session: the service's own credential
 /// (`digest(service_token ‖ nonce)`) plus the registration it authorizes.
 ///
@@ -176,7 +142,7 @@ impl From<ServiceRegistration> for ServiceRegistrationV4 {
 pub struct SessionRegistration {
     pub service_id: ServiceId,
     pub auth: Digest,
-    pub reg: ServiceRegistrationV4,
+    pub reg: ServiceRegistration,
 }
 
 /// What a client sends on its session after authentication.
@@ -234,7 +200,7 @@ pub enum Hello {
     /// session's identity must not be derivable from a service name.
     /// Accepting both versions, it is 34 bytes either way.
     ControlChannelHello(ProtocolVersion, Digest),
-    DataChannelHello(ProtocolVersion, Digest), // token provided by CreateDataChannel
+    DataChannelHello(ProtocolVersion, Digest), // token provided by the session
     /// The opening half of a *multiplexed data tunnel*: after this hello the
     /// connection upgrades to yamux and every subsequent data channel is a
     /// stream inside it. See the `multiplex` feature.
@@ -293,6 +259,15 @@ impl std::fmt::Display for Ack {
 
 #[derive(Deserialize, Serialize, Debug)]
 pub enum ControlChannelCmd {
+    /// The v3 command a server used to send; no v4 build constructs it, and
+    /// the client refuses it if a peer in that dialect sends one.
+    ///
+    /// Its slot is load-bearing: postcard numbers variants by declaration
+    /// order, and the session reader tells an ack frame from a command by the
+    /// first byte — an ack's is its length's high byte, which is `0` as long
+    /// as the frame stays under 256 bytes. Keeping a variant at tag 0 is what
+    /// makes every command this build does speak sit at 1..=3, where that
+    /// disambiguation holds.
     CreateDataChannel,
     HeartBeat,
     /// v4: one visitor arrived for that service of this session. A session
@@ -637,30 +612,6 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
 
 /// Read a framed [`ServiceRegistration`] sent by a v3 client.
 #[cfg(feature = "server")]
-pub async fn read_registration<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<ServiceRegistration> {
-    let len = conn
-        .read_u16()
-        .await
-        .with_context(|| "Failed to read registration length")?;
-    anyhow::ensure!(
-        usize::from(len) <= MAX_REGISTRATION_LEN,
-        "Registration message too large: {len} bytes"
-    );
-    let mut buf = vec![0u8; usize::from(len)];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read registration")?;
-    let reg: ServiceRegistration =
-        postcard::from_bytes(&buf).with_context(|| "Failed to deserialize registration")?;
-    anyhow::ensure!(
-        !reg.name.is_empty(),
-        "Registration has an empty service name"
-    );
-    Ok(reg)
-}
-
 /// Read the framed registration result ack sent by the server after a
 /// `SessionCmd::Register`.
 ///
@@ -972,8 +923,10 @@ mod tests {
             payload.len() < 256,
             "the frame's length high byte must stay 0, else it reads as a command tag"
         );
-        // Every command tag a v4 session can receive is 1..=3, so a leading 0
-        // is unambiguous. Pin that, because it is the other half of the rule.
+        // Every command a v4 session can receive is tagged 1..=3, so a leading
+        // 0 is unambiguous (tag 0 is the reserved v3 command — see
+        // `command_tags_stay_out_of_the_ack_frame_range`). Pin that, because it
+        // is the other half of the rule.
         for cmd in [
             ControlChannelCmd::HeartBeat,
             ControlChannelCmd::CreateDataChannelFor(ServiceId::new(0)),
@@ -1057,7 +1010,6 @@ mod tests {
             service_type: crate::config::ServiceType::Tcp,
             bind_addr: sample_addr(),
             carrier: Carrier::Tcp,
-            pool_size: 8,
             udp_buffer_size: 2048,
         };
         let bytes = postcard::to_stdvec(&reg).unwrap();
@@ -1065,12 +1017,12 @@ mod tests {
         let back: ServiceRegistration = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back.name, "ssh");
         assert_eq!(back.bind_addr, sample_addr());
-        assert_eq!(back.pool_size, 8);
+        assert_eq!(back.udp_buffer_size, 2048);
     }
 
     #[test]
     fn control_cmd_roundtrip() {
-        // CreateDataChannel
+        // CreateDataChannel (the reserved tag, round-tripped like any other)
         let cmd = ControlChannelCmd::CreateDataChannel;
         let bytes = postcard::to_stdvec(&cmd).unwrap();
         let back: ControlChannelCmd = postcard::from_bytes(&bytes).unwrap();
@@ -1098,17 +1050,16 @@ mod tests {
         }
     }
 
-    /// A v3 client parses its two commands out of an *exact* one-byte frame, and
-    /// the v4 additions must not disturb that: their tags are new, and their
-    /// payload is a fixed 4-byte id so the command's length never depends on the
-    /// value it carries.
+    /// Every command's length is value-independent, and the two that carry a
+    /// service id carry a fixed 4-byte one: a tag-dispatched reader stays in
+    /// sync whatever the value is.
     #[test]
     fn control_cmd_widths_are_value_independent() {
-        let plain = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel).unwrap();
+        let reserved = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel).unwrap();
         let beat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat).unwrap();
-        assert_eq!(plain.len(), 1);
+        assert_eq!(reserved.len(), 1);
         assert_eq!(beat.len(), 1);
-        assert_ne!(plain[0], beat[0]);
+        assert_ne!(reserved[0], beat[0]);
 
         for raw in [0u32, 1, 0x7f, 0x80, 0xdead_beef, u32::MAX] {
             let for_service = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(
@@ -1120,7 +1071,7 @@ mod tests {
                     .unwrap();
             assert_eq!(for_service.len(), 5, "service {raw:#x} changed the length");
             assert_eq!(dropped.len(), 5, "service {raw:#x} changed the length");
-            assert_ne!(for_service[0], plain[0]);
+            assert_ne!(for_service[0], reserved[0]);
             assert_ne!(for_service[0], beat[0]);
             assert_ne!(for_service[0], dropped[0]);
         }
@@ -1145,7 +1096,7 @@ mod tests {
         let cmd = SessionCmd::Register(SessionRegistration {
             service_id: ServiceId::new(3),
             auth: sample_digest(9),
-            reg: ServiceRegistrationV4 {
+            reg: ServiceRegistration {
                 name: "ssh".to_string(),
                 service_type: crate::config::ServiceType::Tcp,
                 bind_addr: sample_addr(),
@@ -1170,34 +1121,22 @@ mod tests {
         ));
     }
 
-    /// A v4 registration is the v3 one without `pool_size`: the two encodings
-    /// are compared field by field so adding a field to v3 (which would break
-    /// every old client) cannot pass unnoticed.
+    /// Tag 0 belongs to a command no v4 build speaks, and that is what keeps
+    /// the session's first-byte disambiguation working. Pin the tag range
+    /// here rather than where the dispatch lives: the numbering is postcard's,
+    /// so reordering the enum silently moves every command's tag.
     #[test]
-    fn v4_registration_drops_only_pool_size() {
-        let v3 = ServiceRegistration {
-            name: "ssh".to_string(),
-            service_type: crate::config::ServiceType::Udp,
-            bind_addr: sample_addr(),
-            carrier: Carrier::Kcp,
-            pool_size: 8,
-            udp_buffer_size: 2048,
-        };
-        let v4: ServiceRegistrationV4 = v3.clone().into();
-        assert_eq!(v4.name, v3.name);
-        assert_eq!(v4.bind_addr, v3.bind_addr);
-        assert_eq!(v4.carrier, v3.carrier);
-        assert_eq!(v4.udp_buffer_size, v3.udp_buffer_size);
-
-        // The v3 encoding is byte-identical to what a released client sends:
-        // six fields, no more. `pool_size` is the only difference in v4.
-        let v3_bytes = postcard::to_stdvec(&v3).unwrap();
-        let back: ServiceRegistration = postcard::from_bytes(&v3_bytes).unwrap();
-        assert_eq!(back.pool_size, 8);
-        let v4_bytes = postcard::to_stdvec(&v4).unwrap();
-        assert!(
-            v4_bytes.len() < v3_bytes.len(),
-            "the v4 registration must be the smaller one"
+    fn command_tags_stay_out_of_the_ack_frame_range() {
+        let tag = |cmd: &ControlChannelCmd| postcard::to_stdvec(cmd).unwrap()[0];
+        assert_eq!(tag(&ControlChannelCmd::CreateDataChannel), 0);
+        assert_eq!(tag(&ControlChannelCmd::HeartBeat), 1);
+        assert_eq!(
+            tag(&ControlChannelCmd::CreateDataChannelFor(ServiceId::new(0))),
+            2
+        );
+        assert_eq!(
+            tag(&ControlChannelCmd::ServiceDropped(ServiceId::new(0))),
+            3
         );
     }
 
@@ -1584,7 +1523,7 @@ mod tests {
         let cmd = SessionCmd::Register(SessionRegistration {
             service_id: ServiceId::new(1),
             auth: sample_digest(5),
-            reg: ServiceRegistrationV4 {
+            reg: ServiceRegistration {
                 name: "a-service-with-a-long-enough-name".to_string(),
                 service_type: crate::config::ServiceType::Tcp,
                 bind_addr: sample_addr(),

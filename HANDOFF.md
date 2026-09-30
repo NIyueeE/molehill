@@ -17,58 +17,64 @@
 > contributor page — user-facing facts belong in the docs pages, and anything
 > released belongs in CHANGELOG.md.
 
-## Open: striping with the elastic pool
+## Fixed: striping with the elastic pool
 
-**A stripe group's bulk path deadlocks when its channels are opened while the
-pool is still growing**, so a v4 session is served **unstriped**: the server
-logs one warning naming `[server.data].stripe_count` and uses one channel per
-visitor. `tests/integration_test.rs::striped_data_channels` is `#[ignore]`d with
-a pointer to this section, so a plain run reports `19 passed; 1 ignored`.
+**The stripe livelock had two causes, both fixed.** The quarantine above
+(a v4 session served unstriped, `striped_data_channels` `#[ignore]`d) is
+lifted: the test runs in the suite now and the server serves
+`stripe_count > 1`.
 
-What is known, from a falsification matrix on this branch (each row three runs of
-`cargo test --test integration_test -- --test-threads=1 striped_data_channels`):
+1. **The gather never asked for its channels.** A v4 registration opens no
+   data channels of its own — the tunnel pool starts cold and the server
+   asks for one channel per visitor — but the striped gather waited for
+   channels without sending a single `CreateDataChannelFor`. On a cold pool
+   (the elastic pool's default state) it waited for the visitor's whole
+   25 s budget and then shed it, which is what the old falsification
+   matrix's "cold pool as it ships | 0/3" row measured. The gather now asks
+   for one channel per stripe before its first wait, and re-requests only
+   the stripes still missing when a budget expires. Falsified by disabling
+   the request loop: `striped_data_channels` then fails at its readiness
+   probe.
 
-| Configuration | Result |
-|---|---|
-| the branch before this milestone (pre-opened channels) | 3/3 pass |
-| cold pool, `stripe_count = 1` | 3/3 pass |
-| one warm tunnel, no pre-opened channel | 3/3 pass |
-| cold pool, the losing cold-grow opens staggered by 2 ms | 3/3 pass |
-| cold pool as it ships | **0/3 — "striped bulk echo read timed out"** |
+2. **A reader's park erased the writer's waker.** With the requests in
+   place the group still hung about one run in seven — always as a bulk
+   transfer that delivered most of its bytes and then stopped, with both
+   sides' stripe send directions parked mid-frame. The vendored mux parks a
+   stream's reader and writer on the connection's per-stream command
+   channel, and both stored their waker in `Shared::writer`. A reader
+   queueing a window update — the frame that returns the peer's send
+   credit — parked *last* and overwrote the writer's waker, so the credit
+   that came back woke nobody: the send direction slept until an unrelated
+   resize happened to notify. Instrumentation showed the shape directly: the
+   last no-credit park on the stalled stream, a peer reader that kept
+   polling and refusing its own updates below the half-window threshold,
+   and both stripe senders stuck on frame N while both receivers waited
+   for it. Reproduced deterministically (a first attempt at a fix — lowering
+   the window-update floor to one frame — made the failure 6/6, because a
+   reader that queues an update per frame fills that channel from its side
+   constantly), then fixed: the reader parks in `Shared::reader_park`, and
+   `wake_stream_writer` wakes both slots. Pinned by
+   `mux::connection::tests::a_readers_channel_park_keeps_the_writers_waker`,
+   which fails with "a reader's channel park must not erase the writer's
+   waker" when the fix is reverted; a 16-round × 8 MiB striped stress
+   reproducer (`dbg_stripe_stress`, not kept) went from 1-in-7 to 0 failures
+   in 100+ groups.
 
-The trace: the visitor is paired with a complete 4-stripe group and both sides
-log "stripe group started"; the group's receive direction ends after **one**
-frame, the stripe logs "stripe group finished" milliseconds later, and the
-visitor's read then waits for a sequence a broken channel will never carry. The
-mux framing counters freeze with it. Nothing in the log names a channel the
-*client* closed — which is where the next attempt should look first (the
-client's `StripeGroups` registration and the `open_stream` burst it sits on),
-because the only variable the matrix isolates is simultaneity: a burst of K
-opens differs from the same opens 2 ms apart.
+   The window-update floor stays at half the window: with the waker fixed
+   it measured no throughput difference (5 s for a 16-round stress either
+   way), and the smaller floor doubles the update frames on the read path.
 
-Fixed on the way there and kept: a concurrent first open waits for the growth in
-flight (`await_growth`, bounded by `GROW_WAIT_BUDGET`) instead of racing past it
-and failing with "the pool has no tunnel"; a refused growth holds growth off for
-`GROW_FAILURE_COOLDOWN`, and a tunnel's death or a shrink releases the hold; a
-server shutdown really ends its sessions now (`registry.v3`/`v4` cleared,
-`MultiMap::clear`, the shared shutdown stops the KCP listener), where an
-in-process "restart" used to keep serving through a ghost session; and a
-reconnect drops its stale tunnel pools.
+**What would falsify the fix**: a green `striped_data_channels` in three
+consecutive runs (it is in the suite now), the waker unit test above, and a
+stress run of repeated 8 MiB striped round trips.
 
-**What would falsify the quarantine**: a green `striped_data_channels` on the
-cold pool in three consecutive runs, with the `#[ignore]` removed. A fix has to
-explain the simultaneity difference — that is the one variable the matrix
-isolates, and a fix that only re-orders the burst (rather than removing the
-channel that dies with it) will not survive the third run.
+**Still open, unchanged**: a stripe group's K channels land on K distinct
+tunnels only while the pool has K; a group assembled from a cold pool shares
+one tunnel and loses the spread (it still works). Making the guarantee
+structural needs the wire command that names a group (D24/D29: the server
+names the group once, the client reserves K tunnels) — the natural next
+step, and the reason the placement rule alone was never the guarantee.
 
-A second, related open thread: the group's K channels are requested one at a
-time (`CreateDataChannelFor` per channel), so the client cannot reserve K
-**distinct** tunnels for one group (D24/D29). A `CreateStripedGroupFor(group,
-count)` command — the server names the group once, the client reserves K tunnels
-and answers with K prologues carrying `StartForwardStripedTcp(group, i, K)` —
-would make the guarantee structural and is the natural companion to whatever
-fixes the deadlock. It needs the stream prologue to carry the command, not just
-the service id, because a pooled stream has to say which group and index it is.
 
 ## The v0.10.0 theme
 
@@ -671,8 +677,10 @@ keep serving through a ghost session, which the pre-opened channels had hidden);
 a reconnect reused pools whose tunnels carried the previous session's nonce; and
 a concurrent first open raced the growth it needed.
 
-**Evidence**: 19 integration (1 ignored, the striping defect), 6 pool, 7
-session, 2 log budget, 140 lib; both clippy passes; the docs gate.
+**Evidence**: 20 integration, 10 pool, 7 session, 2 log budget, 147 lib; both
+clippy passes; the docs gate. (Counts as of the post-review fixes; the striping
+defect that made this line read "19, 1 ignored" is fixed — see "Fixed: striping
+with the elastic pool".)
 
 ### M7 — what `direct` is for
 
@@ -826,10 +834,9 @@ again ahead on the multi-stream steps (4-6), and the one pre-fix win is the
 single-stream step 1 at the noise floor. Same verdict as the clean run: no
 harm, a directional throughput lean on the steps the rule fires at.
 
-**Still open, unchanged by this round**: the striping deadlock (A2's fix is a
-documented "not supported on v4" in both configuration mirrors — the
-`CreateStripedGroupFor` command and the deadlock itself remain the next
-cycle's), the rate20 bulk spine (the shaped-path control connection; the
+**Still open, unchanged by this round** (both resolved later: the striping in
+"Fixed: striping with the elastic pool", the re-sweep in "The re-sweep on the
+post-review commit"): the rate20 bulk spine (the shaped-path control connection; the
 structural answer is a per-visitor channel, i.e. `direct`, which is a design
 change with its own measurement), and the re-sweep: **the published
 `results-soak-v0.10.0.json` predates these three code changes**, so it may not
@@ -837,6 +844,103 @@ be quoted as the shipped binary's numbers. Re-running the four-tool sweep is a
 release-gate step before the tag (`just soak-peers` first — `~/tmp` was
 cleared); a molehill-only screen is not a substitute, because the batch
 composition (peers sharing the machine) is part of the method.
+
+### Post-review round 2 (2026-09-28): striping, the mux waker, and the compatibility layers
+
+The review round after the first set of fixes asked for five things: an audit of
+the main code's non-logic problems (unnecessary lint waivers, unnecessary
+`unsafe`), the removal of the compatibility layers, the same audit for the bench
+code plus a stronger ruff, a real stripe implementation, and another attempt at
+the `rate20` bulk spine. What landed:
+
+**Striping works** (two independent causes, both pinned): the gather asked for
+no channels at all, and a reader's park on the mux command channel overwrote the
+writer's waker. Both are recorded in "Fixed: striping with the elastic pool" at
+the top of this file, with the falsifications and the stress reproducer.
+
+**Protocol v3 is gone, and the removed config keys are refused.** v0.10.0 now
+serves one dialect — a v3 client's hello is closed on its own connection, the
+listener keeps serving, and the interop matrix's new-server/old-client case
+pins the refusal on this tree and against the released v0.9.0 binary. The
+`pool_size` wire field, the v3 handshakes and the two-key service registry are
+deleted with it. The removed config keys are errors now (one message naming every
+key and its replacement), which is what the 0.10.0 changelog had promised for
+"the next release" — doing it in the same unreleased version avoids a second
+breaking release for the same change.
+
+**Lint surface.** The main code's waiver audit found two things worth changing:
+`spawn_udp_worker` took eight arguments behind a `too_many_arguments` waiver (it
+is a method on a `UdpWorkerSet` now), and mux tests carried leftover diagnosis
+prints that asserted almost nothing (they assert now — one of them, in
+`src/transport/multiplex.rs`, would have hidden a lost waker behind
+`[cli] cmdN: READ PENDING (waker lost?)` on a green run). The remaining waivers
+all still fire, and `-D warnings` proves it: `unfulfilled_lint_expectations`
+fails the build on a stale `#[expect]`. The one `allow(dead_code)` in the tree
+stays for the KCP datagram-size accessor, with the cascade written down; the only
+`unsafe` is the audited `recvmmsg`/`sendmmsg` FFI, which has no safe
+equivalent.
+
+**Bench harness.** One crash (`SOAK_KEEP=1 SOAK_WORK=…` died on an unbound `fp`
+and discarded the requested work dir), one measured O(n²) (`lib.worst_window`
+sliced its tail per iteration: 0.99 s → 0.045 s at 18 000 points, byte-identical
+outputs), two reads that produced a traceback instead of a path and a parse
+error, one subject-gating mismatch between the gate's self-checks, Optional
+plumbing that six call sites dereferenced, and a wider ruff (`B`, `E7`, `ARG`,
+`PTH` plus the already-clean `RET`/`C4`/`N`/`FA`/`FLY`/`PERF`), with
+`TRY`/`EM`/`ANN`/`T20` explicitly not selected and the reasoning in
+`ruff.toml`. The first attempt at that widening broke the harness
+(`log_path` returned a `str`, so every arm died with `AttributeError` before the
+first stage — caught by the sweep's own per-arm error record); fixed in its own
+commit and verified with a 20-second single-stage run before the sweep.
+
+### The release sweep on the round-2 commit (2026-09-28, 04:29)
+
+`revision v0.9.0-68-g5cdd414`, tree clean, fresh release binary (`Commit SHA
+0c1fd0b` at build time; the python fix behind it does not touch the binary),
+peers re-fetched, `--test=rrul --tools molehill,frp,rathole,nps`, ~65 min,
+`soak complete: 4 test(s)`, host `a093c5fbe0dc` — **the same host as the
+previous sweep**, so the drift gate finally has both halves.
+
+**`just soak-check`: `OK: no gate violation`.** Completeness (8 stages per tool,
+98 180 samples for molehill), the endpoint invariant and the absolute SLO all
+pass. The committed baseline the gate picks is v0.9.0's (different host, so
+skipped, as always).
+
+**The clean path improved; the shaped cells are variance.** Same-host
+comparison against the previous sweep (`8ba40ce`):
+
+| cell | previous | this sweep | verdict |
+|---|---|---|---|
+| clean interactive p99 | 8.129 ms | **6.567 ms** | -19 % |
+| clean (return) worst 1 s | 220.264 ms | **4.080 ms** | -98 % |
+| clean bulk peak | 23.66 Gbit/s | **24.52** | +3.6 % |
+| `rate100` bulk peak | 0.7665 Gbit/s | **2.3509** | **3.1x** |
+| `rate20` bulk intervals | 0 (spine dead) | 5, all zero | spine still unusable |
+| `jitter` bulk intervals | 115 | **0** | spine died here instead |
+| `loss5` | no wedge | 1 flat segment | shape change |
+| `rate20` p99 | 3476.9 ms | 4876.1 ms | +40 % (limit 25) |
+| `jitter` p99 | 2652.9 ms | 6426.9 ms | +142 % (limit 25) |
+
+All three drift violations are shaped-stage cells, in the class where the
+*same* comparison moved unchanged peers by far more: rathole's `rate100`
+162 -> 6638 ms (+4003 %), nps's `rate20` 3124 -> 6504 ms, nps's clean worst-1s
++182 %. rathole's 162 ms was the collapsed no-load artifact the previous
+section already documented. The clean cells (the SLO instrument) moved in the
+right direction, and the run's own gate is green; per §10, the shaped cells are
+recorded as variance and not read as a regression. `jitter` losing its bulk
+spine while `rate20` gained intervals *is* worth watching: the shaped 20 Mbit
+uplink still costs molehill the test's own control connection, and which stage
+pays it moves between runs.
+
+**The `rate20` question, answered as far as this model can.** The bulk spine
+through the muxed tunnel is the last open engine defect, and this sweep shows
+its shape rather than fixing it: the spine produced five intervals, all zero,
+i.e. iperf3's control connection now survives the stage but carries no data. The
+structural answer is a per-visitor channel — the config surface already has it
+(`[client.services.<name>].mode = "direct"`, each visitor its own connection),
+and measuring that arm is the next cycle's work: it is a *method* change (one
+service in a different mode from the shipped default), so it needs its own run
+and its own docs section rather than a footnote here.
 
 ### The re-sweep on the post-review commit (2026-09-27, 19:12)
 
@@ -1106,9 +1210,11 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
 - **PR**: #4, 33 commits, `mergeable=MERGEABLE`, CI **12/12 green** (four
   platform builds, three feature-leg test jobs, full check chain, powerset,
   docs alignment, musl static, minimal build size).
-- **Gates**: `just check` green (145 lib / 19 integration / 9 pool / 7 session /
-  2 log-budget); `just interop` 3/3; `just soak-check` `OK: no gate violation`;
-  `just tag-check` "pre-tag review passed for v0.10.0".
+- **Gates**: `just check` green (147 lib / 20 integration / 10 pool / 7 session
+  / 2 log-budget); `just interop` 3/3 against the released v0.9.0 binary (the
+  new-server/old-client case is a refusal case now — v4 only); `just
+  soak-check` `OK: no gate violation`; `just tag-check` "pre-tag review passed
+  for v0.10.0".
 - **Benchmarks**: `results-soak-v0.10.0.json` + four charts are in the release
   commit, the README pair carries the same four-tool table, and the withdrawn
   v0.9.1 file and charts are deleted.
@@ -1137,16 +1243,23 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
 
 ## Open threads for the next cycle
 
-- **Striping** — the deadlock above, and the group command that would make D24
-  structural (first item in this file). The configuration page (both mirrors)
-  now states plainly that `stripe_count > 1` is not served on a v4 session.
+- **The stripe group command** — a group's K channels land on K distinct
+  tunnels only while the pool has K; from a cold pool they share one tunnel
+  and the group works but loses the spread. The wire command that names a
+  group (the server names it once, the client reserves K tunnels and answers
+  with K prologues carrying `StartForwardStripedTcp(group, i, K)`) would make
+  D24 structural; it needs the stream prologue to carry the command, not just
+  the service id (see "Fixed: striping with the elastic pool").
 - **M2b/M2c (S2, D28, D27)** — do not land on this data: the spread is zero and
   the UDP drop counters stayed at zero. Re-open with a *pool-size* question
   (does growing earlier help a mixed workload?) rather than a
   placement question.
-- **The v3 server path** — kept only for old clients, and now dead weight: it
-  must not acquire features, and removing it is a future cycle's work. It owns
-  the only remaining `pool_size` on the wire (`ServiceRegistration`).
+- ~~**The v3 server path**~~ — **removed.** v0.10.0 is the first release that
+  serves v4 only: the v3 handshake, its one-service-per-connection control
+  path, the two-key registry (`MultiMap`) and `pool_size` on the wire are
+  gone, and the removed-config keys are refused instead of warned about. The
+  interop matrix's new-server/old-client case now pins the refusal, and
+  `a_v3_hello_is_refused_on_its_own_connection` pins it on this tree.
 - **The method revision** (recorded, not fixed): the host key is the container
   hostname, so two runs on the same hardware never compare; a single sample per
   stage cannot resolve a 25 % change when the within-run spread is 40-70 %; and

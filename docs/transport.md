@@ -2,7 +2,7 @@
 
 By default, `molehill` forwards traffic as it is (plain TCP). The client's
 `[client.transport]` block supports two types — `plain` and `noise` — and
-**the client decides**: every connection starts with a v3 transport selector
+**the client decides**: every connection starts with a one-byte transport selector
 byte, and the server accepts whatever the client speaks (its
 `[server.transport]` block only places the Noise keys — there is no
 server-side `type`). The noise-vs-plain benchmark is the price list for
@@ -86,7 +86,7 @@ Noise needs keys — its own `transport.noise` if set, else the global
 anywhere is a startup error. The data plane follows the service: TCP
 tunnels and (with `carrier = "kcp"`) the Noise-over-KCP wrapping both use
 the service's effective keys. The server needs nothing beyond placing its
-keys (v3 selector: it accepts whatever each connection speaks).
+keys (the transport selector: it accepts whatever each connection speaks).
 
 ### Specifying the pattern
 

@@ -159,7 +159,16 @@ def tool_colors(tests: list) -> dict:
 
 
 def load(path: Path) -> dict:
-    return json.loads(Path(path).read_text())
+    """Read one results file, or exit with its path and the parse error.
+
+    Every other user error here exits with a message (no results file, an
+    unknown chart); a bare traceback on a truncated file would be the odd one
+    out.
+    """
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"cannot read {path}: {e}")
 
 
 def series(test: dict, metric: str) -> list:
@@ -300,7 +309,7 @@ def footer(fig, meta: dict, tests: list, extra: str = "") -> None:
     )
 
 
-def save(fig, out: Path, bottom: float = 0.07) -> None:
+def save(fig, out: Path) -> None:
     fig.savefig(out, dpi=DPI, bbox_inches="tight", pad_inches=0.28, facecolor="white")
     plt.close(fig)
     print(f"wrote {out}")
@@ -345,7 +354,7 @@ def render_master(tests: list, meta: dict, out: Path) -> None:
     fig, axes = plt.subplots(
         len(tests), 1, figsize=(12.5, 2.9 * len(tests)), sharex=True, squeeze=False
     )
-    for row, test in zip(axes, tests):
+    for row, test in zip(axes, tests, strict=True):
         color = colors[test["tool"]]
         ax = row[0]
         spans = stage_spans(test)
@@ -444,7 +453,7 @@ def render_stages(tests: list, meta: dict, out: Path) -> None:
     slo = meta.get("slo", {}).get("rtt_p99_ms", 50.0)
     ypos = {t["tool"]: i for i, t in enumerate(tests)}
     wedges = stage_wedges(tests)
-    for ax, stage in zip(axes[0], stages):
+    for ax, stage in zip(axes[0], stages, strict=True):
         ax.axvspan(0.05, slo, color=CLEAN_FACE, zorder=0, lw=0)
         ax.axvline(slo, color=SLO_COLOR, ls=":", lw=1.0, zorder=1)
         for test in tests:
@@ -584,7 +593,7 @@ def render_udp(tests: list, meta: dict, out: Path) -> None:
     axes[0][0].minorticks_off()
     axes[0][0].set_ylabel("UDP RTT ms (log)")
     if panels == UDP_PANELS:  # the loss panel exists only with a loss series
-        for test, (_t, rows) in zip(tests, loss):
+        for test, (_t, rows) in zip(tests, loss, strict=True):
             if not rows:
                 continue
             axes[1][0].plot(
@@ -639,7 +648,7 @@ def _drift_panel(ax, tests: list, labels: "DriftPanel", colors: dict) -> None:
     lines = []
     for test in tests:
         color = colors[test["tool"]]
-        for metric, style in zip((metric_1, metric_2), ("-", "--")):
+        for metric, style in zip((metric_1, metric_2), ("-", "--"), strict=True):
             pts = series(test, metric)
             if not pts:
                 continue
@@ -684,7 +693,7 @@ def render_drift(tests: list, meta: dict, out: Path) -> None:
     fig, axes = plt.subplots(
         len(DRIFT_PANELS), 1, figsize=(12.5, 8.0), sharex=True, squeeze=False
     )
-    for panel, ax in zip(DRIFT_PANELS, axes[:, 0]):
+    for panel, ax in zip(DRIFT_PANELS, axes[:, 0], strict=True):
         _drift_panel(ax, tests, panel, colors)
     handles = [
         Line2D([], [], color=colors[t["tool"]], lw=1.4, label=t["tool"]) for t in tests

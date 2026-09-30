@@ -127,38 +127,44 @@ bulk spine produced no intervals, so its interactive number was measured
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | 8.1 | 6662 | 1337 | 4943 | **6537** | 3477 † | **2653** | 7.4 |
-| frp 0.71.0 | **2.8** | 5276 | 3272 | 5126 | 7078 | 5459 | 4296 | **2.8** |
-| rathole 0.5.0 | 72 | 7046 | 1316 | 3898 | 162 † | 2748 | 3034 | 77 |
-| nps 0.26.10 | 67 | **855** | 1126 | 2819 | 8120 | 3124 | 5063 | 68 |
+| **molehill (mux)** | 6.6 | 8082 | 1324 | 6032 | **6412** | 4876 | 6427 | 6.9 |
+| frp 0.71.0 | **2.8** | 7162 | 3620 | 5290 | 7171 | 5741 | 3568 | **2.9** |
+| rathole 0.5.0 | 73 | 8617 | **1311** | **4386** | 6638 | 5371 | **2069** | 71 |
+| nps 0.26.10 | 68 | **1201** | 1134 | 2190 | 7091 | 6504 | 4338 | 70 |
 
-**Bulk throughput per stage** (Gbit/s, per stage's peak): molehill **23.7** on
-clean -> 3.2 at rtt100 -> 5.4 at loss1 -> 0.77 at rate100 -> **24.5 on the
-return to clean**; frp 7.0 -> 2.7 -> 5.4 -> 0.27 -> 6.8; rathole 23.6 -> 3.0 ->
-5.4 -> (its rate100 spine produced no intervals) -> 23.9; nps 0.5 -> 1.1 -> 0.9
--> 0.36 -> 0.6. The rate- and jitter-limited cells record a bulk series of zero
+**Bulk throughput per stage** (Gbit/s, per stage's peak): molehill **24.5** on
+clean -> 3.1 at rtt100 -> 5.5 at loss1 -> 1.8 at loss5 -> **2.35 at rate100** ->
+**25.8 on the return to clean**; frp 7.0 -> 2.7 -> 5.4 -> 3.2 -> 0.62 -> 6.7;
+rathole 23.6 -> 2.9 -> 5.5 -> 3.3 -> 0.62 -> 23.4; nps 0.7 -> 1.3 -> 0.8 -> 1.8
+-> 0.44 -> 0.5. The rate- and jitter-limited cells record a bulk series of zero
 for *every* tool — the shaped path holds each interval's bytes past the
 interval's own accounting — so those cells are not quotable and are not quoted.
-† molehill's `rate20` spine and rathole's `rate100` spine produced no intervals
-at all: the harness waited the stage out and the interactive number above is the
-load-free one.
+† molehill's `jitter` spine produced no intervals at all: the harness waited the
+stage out and the interactive number above is the load-free one. Its `rate20`
+spine produced five intervals this run, all of them zero — the shaped 20 Mbit
+uplink still loses the test's own control connection, recorded as a known defect
+rather than a result.
 
 **What these shapes say.** Every tool degrades under a bad path, and every
 tool recovers on the return to clean — that recovery is what the last band
 measures, and a tool that stayed wedged would be a finding. The bulk axis and
 the interactive axis answer different questions and the table reads them
 separately: on the clean stage molehill and rathole carry the same bulk
-(23.7 against 23.6 Gbit/s, frp 7.0 and nps 0.5) while a fresh interactive
-connection costs 8.1 ms for molehill against 2.8 ms for frp, 72 ms for rathole
-and 67 ms for nps. Among the shaped cells molehill leads the rate-limited one
-(6537 ms against 7078 and 8120, with 80 samples against 12 and 13) and the
-jitter cell (**2653 ms against 4296, 3034 and 5063**), is level with rathole on
-the 1 %-loss cell (1337 against 1316 ms), and is behind nps on the 100 ms
-latency cell (6662 against 855 ms). The two honest losses are carried in the
-table rather than smoothed over: the clean-stage interactive cost against frp,
-and a `rate20` bulk spine that produced no intervals — the shaped 20 Mbit uplink
-is the one cell where molehill's muxed tunnel still loses the test's own
-control connection, which is recorded as a known defect rather than a result.
+(24.5 against 23.6 Gbit/s, frp 7.0 and nps 0.7) while a fresh interactive
+connection costs 6.6 ms for molehill against 2.8 ms for frp, 73 ms for rathole
+and 68 ms for nps. Among the shaped cells molehill leads the rate-limited one
+(6412 ms against 6638, 7091 and 7171), is level with rathole on the 1 %-loss
+cell (1324 against 1311 ms), and is behind nps on the 100 ms latency cell (8082
+against 1201 ms) and behind rathole on jitter (6427 against 2069). **The
+shaped-stage interactives move between runs of unchanged binaries by more than
+the code moves them** — in this run's own same-host comparison against the
+previous sweep, rathole's `rate100` went 162 -> 6638 ms and nps's `rate20`
+3124 -> 6504 ms, neither binary having changed — so those cells are context, not
+a verdict, and the two quotable axes are the clean stage and the run's own
+gate. The honest losses are carried in the table rather than smoothed over: the
+clean-stage interactive cost against frp, and the shaped bulk spines (molehill's
+`jitter` produced no intervals, its `rate20` five zero-byte ones, and frp's,
+rathole's and nps's rate20/jitter spines zero for the same reason).
 
 The peers are driven by the same workload and charted in the same panels; the
 drift axis (open fds, RSS and CPU slopes over the run) is in

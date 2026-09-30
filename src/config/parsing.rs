@@ -6,7 +6,6 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
-use tracing::warn;
 use url::Url;
 
 #[cfg(feature = "multiplex")]
@@ -718,48 +717,57 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Remove every key in [`REMOVED_KEYS`] from a parsed config document,
-/// warning about each one found.
+/// Refuse a config that still carries a key from [`REMOVED_KEYS`], naming
+/// every one it found and what to write instead.
 ///
-/// It works on the document rather than the typed config because the typed
-/// config is deliberately strict — the key has to be gone before the struct
-/// that forbids unknown fields sees it.
-fn strip_removed_keys(doc: &mut toml::Value) {
+/// It looks at the document rather than the typed config because the typed
+/// config is deliberately strict — `deny_unknown_fields` would reject the file
+/// with a bare "unknown field", which tells an operator *that* something is
+/// wrong without telling them what to write. One start, one message: an
+/// operator fixing the file has to run the binary once, not once per key.
+fn reject_removed_keys(doc: &mut toml::Value) -> Result<()> {
+    let mut found: Vec<String> = Vec::new();
     for (pattern, version, advice) in REMOVED_KEYS {
         let segments: Vec<&str> = pattern.split('.').collect();
         let mut hits = 0;
-        strip_at(doc, &segments, &mut hits);
+        count_at(doc, &segments, &mut hits);
         if hits > 0 {
-            warn!(
-                "`{pattern}` was removed in {version} and is ignored ({hits}x): {advice}. \
-                 Remove the key from the config."
-            );
+            found.push(format!(
+                "  `{pattern}` (removed in {version}, {hits}x): {advice}"
+            ));
         }
     }
+    anyhow::ensure!(
+        found.is_empty(),
+        "this config still carries keys this version does not know:\n{}\n\
+         Remove them, then start again.",
+        found.join("\n")
+    );
+    Ok(())
 }
 
-/// Walk `value` along `segments`, counting the leaves that were present and
-/// removing them. `*` descends into every value of a table.
-fn strip_at(value: &mut toml::Value, segments: &[&str], hits: &mut usize) {
+/// Walk `value` along `segments`, counting the leaves that are present. `*`
+/// descends into every value of a table.
+fn count_at(value: &toml::Value, segments: &[&str], hits: &mut usize) {
     match segments {
         [] => {}
         [last] => {
-            if let Some(table) = value.as_table_mut()
-                && table.remove(*last).is_some()
+            if let Some(table) = value.as_table()
+                && table.contains_key(*last)
             {
                 *hits += 1;
             }
         }
         [head, rest @ ..] => {
-            let Some(table) = value.as_table_mut() else {
+            let Some(table) = value.as_table() else {
                 return;
             };
             if *head == "*" {
-                for (_, child) in table.iter_mut() {
-                    strip_at(child, rest, hits);
+                for child in table.values() {
+                    count_at(child, rest, hits);
                 }
-            } else if let Some(child) = table.get_mut(*head) {
-                strip_at(child, rest, hits);
+            } else if let Some(child) = table.get(*head) {
+                count_at(child, rest, hits);
             }
         }
     }
@@ -771,7 +779,7 @@ impl Config {
         // out) before the strict struct parse, which rejects unknown fields.
         let mut doc: toml::Value =
             toml::from_str(s).with_context(|| "Failed to parse the config")?;
-        strip_removed_keys(&mut doc);
+        reject_removed_keys(&mut doc)?;
         let mut config: Config =
             Config::deserialize(doc).with_context(|| "Failed to parse the config")?;
 
@@ -1021,14 +1029,14 @@ impl Config {
     ///
     /// Fails when the file cannot be read, or when the parsed TOML violates
     /// validation rules (missing tokens, invalid addresses, ...). The error
-    /// message names the offending part of the file.
+    /// message names the offending part of the file: the context line below
+    /// points at the docs, and the cause is what the reader has to act on —
+    /// which is why it is not replaced by a generic "invalid configuration".
     pub async fn from_file(path: &Path) -> Result<Config> {
         let s: String = fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read the config {}", path.display()))?;
-        Config::from_str(&s).with_context(
-            || "Configuration is invalid. Please refer to the configuration specification.",
-        )
+        Config::from_str(&s).map_err(|e| e.context(format!("Failed to load {}", path.display())))
     }
 }
 
@@ -1036,7 +1044,9 @@ impl Config {
 mod tests {
     #![expect(
         clippy::unwrap_used,
-        reason = "tests unwrap values they just constructed"
+        clippy::expect_used,
+        reason = "tests unwrap values they just constructed, and expect on the \
+                  construction's result"
     )]
     // A fixture that names a feature the directive does not know is a typo,
     // and retiring a fixture silently is the failure mode the directive exists
@@ -1559,13 +1569,12 @@ psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
     }
 
     #[test]
-    fn test_removed_keys_are_stripped_and_the_rest_parses() {
+    fn test_a_removed_key_is_refused_and_names_its_replacement() {
         // `health_check` was removed in a withdrawn release and reports
-        // v0.10.0 now (the release that actually removes it). The config still
-        // has to start (the owner is told, not stopped), so the mechanism
-        // under test is: find the key, drop it from the document, then let the
-        // strict parse run on what is left. Without the strip,
-        // `deny_unknown_fields` would refuse the whole file.
+        // v0.10.0 now (the release that actually removes it). The config does
+        // not start: refusing beats obeying it silently, and the message has
+        // to name what to write instead — an error that says only "unknown
+        // field" leaves the reader guessing.
         let config = r#"
 [client]
 default_token = "t"
@@ -1578,33 +1587,19 @@ local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3 }
 "#;
-        let mut doc: toml::Value = toml::from_str(config).unwrap();
-        strip_removed_keys(&mut doc);
+        let err = Config::from_str(config)
+            .expect_err("a removed key must not start")
+            .to_string();
         assert!(
-            doc["client"]["services"]["test"]
-                .get("health_check")
-                .is_none(),
-            "the removed key must be gone before the strict parse sees it"
-        );
-        let cfg = Config::from_str(config).unwrap();
-        assert_eq!(
-            cfg.client
-                .as_ref()
-                .unwrap()
-                .services
-                .get("test")
-                .unwrap()
-                .local_addr,
-            "127.0.0.1:80",
-            "the rest of the service must parse unchanged"
+            err.contains("`client.services.*.health_check`") && err.contains("registered"),
+            "the refusal must name the key and its replacement: {err}"
         );
     }
 
-    /// Every key the v0.10.0 surface removed is stripped, wherever it lived,
-    /// and the rest of the config then parses: a config that only needs the
-    /// removals is not stopped by them (it is warned about, once per key).
+    /// Every key the v0.10.0 surface removed is refused, wherever it lived, and
+    /// the refusal names each one with its replacement in a single message.
     #[test]
-    fn test_every_removed_key_is_stripped() {
+    fn test_every_removed_key_is_refused() {
         // Assembled by concatenation, not `format!`: the TOML carries literal
         // braces (`health_check = { ... }`) that a format string would read as
         // placeholders. `[client.data]` is included only where it exists —
@@ -1641,24 +1636,33 @@ max_pool_size = 16
 bind_addr = "0.0.0.0:2333"
 "#,
         );
-        let mut doc: toml::Value = toml::from_str(&config).unwrap();
-        strip_removed_keys(&mut doc);
-        // The `[client.data]` clause only applies where the section exists.
-        let default_count_stripped =
-            !cfg!(feature = "multiplex") || doc["client"]["data"].get("default_count").is_none();
+        // The `[client.data]` clause only applies where the section exists;
+        // without it the key is not even an unknown field.
+        let err = Config::from_str(&config)
+            .expect_err("a config full of removed keys must not start")
+            .to_string();
+        for pattern in [
+            "client.data.default_count",
+            "client.services.*.count",
+            "client.services.*.pool_size",
+            "client.services.*.heartbeat_timeout",
+            "client.services.*.health_check",
+            "server.max_pool_size",
+        ] {
+            if pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
+                continue;
+            }
+            assert!(
+                err.contains(&format!("`{pattern}`")),
+                "the refusal must name `{pattern}`: {err}"
+            );
+        }
         assert!(
-            doc.get("server")
-                .and_then(|s| s.get("max_pool_size"))
-                .is_none()
-                && default_count_stripped
-                && ["count", "pool_size", "heartbeat_timeout", "health_check"]
-                    .iter()
-                    .all(|k| doc["client"]["services"]["test"].get(*k).is_none()),
-            "every removed key must be gone before the strict parse sees it: {doc}"
+            err.contains("max_tunnels")
+                && err.contains("udp_workers")
+                && err.contains("max_tunnels_per_client"),
+            "each removed key's replacement must be named: {err}"
         );
-        // A current config with none of them still comes out unchanged (the
-        // mirror of the check above): the strip removes exactly those keys.
-        assert!(Config::from_str(&config).is_ok());
     }
 
     #[test]
@@ -1677,9 +1681,7 @@ local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 "#;
         let mut doc: toml::Value = toml::from_str(config).unwrap();
-        let before = doc.clone();
-        strip_removed_keys(&mut doc);
-        assert_eq!(doc, before, "a current config must come out unchanged");
+        reject_removed_keys(&mut doc).expect("a current config must pass untouched");
         assert!(Config::from_str(config).is_ok());
     }
 

@@ -2087,23 +2087,28 @@ mod tests {
                 loop {
                     match s.read(&mut echo).await {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => eprintln!("[srv-stream] got {n} bytes"),
+                        Ok(_) => {}
                     }
                 }
             });
         }
 
-        // Client reads the commands back
+        // Client reads the commands back: each stream must carry exactly the
+        // command the server wrote into it, which is what a read-only pooled
+        // stream's SYN announcement buys.
         for (i, stream) in streams.iter_mut().enumerate() {
             let mut buf = [0u8; 5];
-            match tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
-                .await
-            {
-                Err(_) => eprintln!("[cli] cmd{i}: READ PENDING (waker lost?)"),
-                Ok(Ok(0)) => eprintln!("[cli] cmd{i}: EOF"),
-                Ok(Ok(n)) => eprintln!("[cli] cmd{i}: got {n} bytes"),
-                Ok(Err(e)) => eprintln!("[cli] cmd{i}: err {e}"),
-            }
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+                    .await
+                    .expect("stream {i}: the command never arrived")
+                    .expect("stream {i}: the stream read failed");
+            assert!(read > 0, "stream {i}: the server closed it with no command");
+            assert_eq!(
+                &buf[..read],
+                format!("cmd{i}").as_bytes(),
+                "stream {i} carried the wrong command"
+            );
         }
         drop(streams);
         drop(tunnel);
@@ -2142,12 +2147,12 @@ mod tests {
                 s.write_all(format!("m{i}").as_bytes()).await.unwrap();
             }));
         }
-        // Give the client driver time to wedge if it is going to
-        for check in 0..10 {
+        // Give the client driver time to wedge if it is going to: every open
+        // must complete inside two seconds even though the server side reads
+        // none of them yet.
+        for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let done = handles.iter().filter(|h| h.is_finished()).count();
-            eprintln!("[rapid] {done}/12 after {}ms", (check + 1) * 200);
-            if done == 12 {
+            if handles.iter().all(tokio::task::JoinHandle::is_finished) {
                 break;
             }
         }
@@ -2167,10 +2172,6 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::{TcpListener, TcpStream};
 
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::level_filters::LevelFilter::TRACE)
-            .with_ansi(false)
-            .try_init();
         // Production failure signature: initial pooled opens succeed, then
         // after an idle period a NEW open never completes.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2207,13 +2208,11 @@ mod tests {
         }
         // Drain server side fully
         for i in 0..8 {
-            eprintln!("[test] waiting for server stream {i}");
             let mut srv_stream =
                 tokio::time::timeout(std::time::Duration::from_secs(3), inbound_rx.recv())
                     .await
                     .expect("recv timed out")
                     .unwrap();
-            eprintln!("[test] got stream {i} debug={srv_stream:?} reading data");
             let mut buf = [0u8; 4];
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -2222,10 +2221,6 @@ mod tests {
             .await
             .expect("read_exact timed out")
             .unwrap();
-            eprintln!(
-                "[test] stream {i} data ok: {}",
-                std::str::from_utf8(&buf).unwrap()
-            );
             assert_eq!(&buf, format!("msg{i}").as_bytes());
         }
 
