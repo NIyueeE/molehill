@@ -598,8 +598,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                 return Action::Terminate(Frame::protocol_error());
             }
             if self.streams.len() == self.config.max_num_streams {
-                tracing::error!("{}: maximum number of streams reached", self.id);
-                return Action::Terminate(Frame::internal_error());
+                // A full connection refuses the *stream*, never itself.
+                //
+                // This used to answer `Terminate(Frame::internal_error())`,
+                // which sends a goaway and takes the whole connection down:
+                // every stream on it dies at once, including the visitors a
+                // proxy was carrying. That made the cap a cliff — the pool's
+                // whole reason for existing is to stay below it, but a pool
+                // cannot bound streams it does not own (a stalled visitor can
+                // hold one for minutes), and one unlucky burst then cost every
+                // visitor on the tunnel.
+                //
+                // The refusal is a reset of that one stream: the peer's open
+                // fails, its data channel ends, and every other stream on the
+                // connection keeps running. The `error!` stays — with the
+                // pool's ceiling in place this should not be reached — but it
+                // is now a reporting line, not a suicide note.
+                tracing::error!(
+                    "{}: maximum number of streams reached; refusing stream {stream_id}",
+                    self.id
+                );
+                let mut header = Header::data(stream_id, 0);
+                header.rst();
+                self.pending_read_frame = Some(Frame::new(header).into());
+                return Action::None;
             }
             if frame.body().len() > DEFAULT_CREDIT as usize {
                 tracing::error!(
@@ -910,5 +932,76 @@ impl<T> Active<T> {
             };
             wake_both(&wakers);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "the test expects on values it just constructed"
+    )]
+
+    use super::*;
+    use crate::mux::frame::header::Header;
+
+    /// A full connection refuses the stream that would cross its cap, and keeps
+    /// the connection.
+    ///
+    /// This pins the behaviour a shaped sweep paid for: the cap used to answer
+    /// `Terminate(Frame::internal_error())`, a session-terminating goaway that
+    /// took every stream on the connection down with it. A proxy's tunnel
+    /// carries many visitors, so one burst over the cap cost all of them.
+    ///
+    /// The assertion is on the decision itself — the `Action` the connection
+    /// returns for that SYN — because that is where the fatality lived, and it
+    /// is testable without a peer.
+    #[tokio::test]
+    async fn a_cap_hit_refuses_the_stream_not_the_connection() {
+        let cap = 1usize;
+        let mut config = Config::default();
+        config
+            .set_max_num_streams(cap)
+            .set_max_connection_receive_window(Some(2 * DEFAULT_CREDIT as usize));
+
+        let (io, _peer) = tokio::io::duplex(4096);
+        let mut active = Active::new(io, config, Mode::Server);
+
+        // Fill the connection's stream table to its cap with one inbound SYN.
+        let first = StreamId::new(1);
+        let mut syn = Header::data(first, 0);
+        syn.syn();
+        let first_action = active.on_data(Frame::new(syn));
+        assert!(
+            matches!(first_action, Action::New(_)),
+            "the first stream must simply be accepted, got {first_action:?}"
+        );
+        assert_eq!(active.streams.len(), cap, "the table is at its cap");
+
+        // One more SYN: this is the moment that used to kill the tunnel.
+        let extra = StreamId::new(3);
+        let mut syn = Header::data(extra, 0);
+        syn.syn();
+        let action = active.on_data(Frame::new(syn));
+
+        assert!(
+            !matches!(action, Action::Terminate(_)),
+            "a cap hit must not terminate the connection"
+        );
+        let queued = active
+            .pending_read_frame
+            .as_ref()
+            .expect("the refusal is queued as a reply");
+        assert!(
+            queued.header().flags().contains(header::RST),
+            "the refusal must be a reset: {:?}",
+            queued.header()
+        );
+        assert_eq!(
+            queued.header().stream_id(),
+            extra,
+            "aimed at the new stream"
+        );
+        assert_eq!(active.streams.len(), cap, "the cap is still exactly full");
     }
 }

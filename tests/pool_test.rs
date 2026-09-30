@@ -21,7 +21,7 @@
     reason = "integration tests unwrap and assert on values they just produced"
 )]
 
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use common::{PING, run_molehill_client, run_molehill_server};
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -56,6 +56,14 @@ const IDLE_POOL_EXPOSED: &str = "127.0.0.1:2396";
 
 // Ports for the operator's-valve scenario (`tests/for_tcp/tunnel_valve.toml`).
 const VALVE_EXPOSED: &str = "127.0.0.1:2371";
+
+/// Enough load to make the valve scenario's pool want a second tunnel while
+/// leaving the one it holds room to keep working. Holding the full
+/// `GROW_STREAMS` there would also put the single tunnel at its placement
+/// ceiling, and the visitors it then carries would be refused for capacity
+/// rather than forwarded — a different scenario, covered by
+/// `a_refused_growth_still_never_reaches_the_stream_cap`.
+const VALVE_LOAD: usize = 8;
 
 // The binary-run telemetry scenario writes its own config on ports the OS
 // picks at run time: a stale child from an interrupted run cannot make the
@@ -409,6 +417,84 @@ async fn udp_source_port_survives_a_grow_and_shrink_cycle() -> Result<()> {
 /// retired by the time the tick runs.
 const GROW_STREAMS: usize = 56;
 
+/// The engine's per-tunnel stream cap (`DEFAULT_MUX_MAX_STREAMS`), repeated
+/// here because the assertions below are about crossing it.
+const ENGINE_STREAM_CAP: usize = 64;
+
+/// The pool's own per-tunnel placement ceiling
+/// (`transport::pool::TUNNEL_STREAM_CEILING`), repeated for the same reason:
+/// the burst scenarios drive the pool up to it, and the two are deliberately
+/// different numbers.
+const POOL_STREAM_CEILING: usize = 56;
+
+/// A burst past the engine's stream cap must never cost a tunnel (D14's
+/// hard half).
+///
+/// `mux/connection.rs` answers the 64th inbound stream with
+/// `Terminate(Frame::internal_error())`: the **whole** tunnel dies and every
+/// visitor on it with it, and the vendored engine logs an unguarded `error!`
+/// first. The pool's job is to make that unreachable — growth keeps every
+/// tunnel strictly below the cap — so this scenario holds more concurrent
+/// visitors than one tunnel may carry and asserts that the engine's cap is
+/// never reached, that no visitor is dropped, and that the pool grew to take
+/// the load.
+#[tokio::test]
+async fn a_burst_past_the_stream_cap_never_costs_a_tunnel() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/idle_pool.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/idle_pool.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(IDLE_POOL_EXPOSED).await?;
+
+    // More concurrent visitors than one tunnel may carry, but no more than the
+    // pool's own cap can hold (two tunnels): the scenario is "the pool serves
+    // the burst by spreading it", not "the pool refuses most of it". Every one
+    // of these must therefore be forwarded.
+    let burst = POOL_STREAM_CEILING * 2;
+    let mut held = Vec::with_capacity(burst);
+    for _ in 0..burst {
+        held.push(TcpStream::connect(IDLE_POOL_EXPOSED).await?);
+    }
+    // Every visitor still answers: a terminated tunnel would have dropped
+    // them all at once, and the survivors would be the ones opened after it.
+    for conn in &mut held {
+        conn.write_all(PING.as_bytes()).await?;
+    }
+    for conn in &mut held {
+        let mut rd = [0u8; 4];
+        conn.read_exact(&mut rd).await?;
+        assert_eq!(&rd, PING.as_bytes(), "a visitor lost its tunnel to the cap");
+    }
+
+    let pools = molehill_rathole::live_pools();
+    let pool = pools
+        .first()
+        .unwrap_or_else(|| panic!("the pool exists once its service is up"));
+    assert!(
+        pool.size >= 2,
+        "{} concurrent visitors must have grown the pool past one tunnel: {pool:?}",
+        held.len()
+    );
+
+    drop(held);
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
 /// The cold start and the shrink rule, measured, in one scenario.
 ///
 /// There is no initial pool size any more (`default_count` / `count` are
@@ -570,9 +656,8 @@ async fn the_server_tunnel_valve_refuses_growth_without_killing_the_session() ->
     // once the control session has reconnected and registered it.
     wait_for_tcp(VALVE_EXPOSED).await?;
 
-    // The same load the idle-pool scenario uses to force a growth attempt.
-    let mut held = Vec::with_capacity(GROW_STREAMS);
-    for _ in 0..GROW_STREAMS {
+    let mut held = Vec::with_capacity(VALVE_LOAD);
+    for _ in 0..VALVE_LOAD {
         held.push(TcpStream::connect(VALVE_EXPOSED).await?);
     }
     // Give the maintenance ticks time to try (and keep trying) to grow: the
@@ -600,6 +685,167 @@ async fn the_server_tunnel_valve_refuses_growth_without_killing_the_session() ->
     assert!(
         molehill_rathole::control_sessions_accepted() > 0,
         "the session must still be up after the refusal"
+    );
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// A pool that **cannot grow** must still never reach the engine's stream cap
+/// (the regression the v0.10.0 sweep caught).
+///
+/// The pool's placement ceiling is the only thing between a burst and
+/// `mux/connection.rs`'s `Terminate(Frame::internal_error())`, which kills the
+/// whole tunnel and logs an unguarded `error!` — so the load that matters is
+/// the one where growth is *refused* and cannot relieve the pressure. The
+/// server's valve (`max_tunnels_per_client = 1`) is exactly that state, and
+/// this scenario holds more concurrent visitors than one tunnel may carry.
+///
+/// Before the ceiling existed this held 64 visitors and the server logged
+/// `maximum number of streams reached`, killing the tunnel under them; the
+/// assertion below is what fails if the ceiling is removed again.
+#[tokio::test]
+async fn a_refused_growth_still_never_reaches_the_stream_cap() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tunnel_valve.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/tunnel_valve.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(VALVE_EXPOSED).await?;
+
+    // Past the engine cap, with the pool pinned at one tunnel by the valve:
+    // the only way to serve these is to leave the cap alone.
+    let mut held = Vec::with_capacity(ENGINE_STREAM_CAP + 8);
+    for _ in 0..(ENGINE_STREAM_CAP + 8) {
+        held.push(TcpStream::connect(VALVE_EXPOSED).await?);
+    }
+    // The tunnel is still there: the visitors it turned away are the ones the
+    // ceiling refused, not the ones a terminated tunnel dropped. A terminated
+    // tunnel shows up as every visitor failing at once, so the round trips
+    // below are the signal — some are answered, and the survivors of a
+    // cap-hit would be none.
+    for conn in &mut held {
+        conn.write_all(PING.as_bytes()).await?;
+    }
+    let mut answered = 0;
+    for conn in &mut held {
+        let mut rd = [0u8; 4];
+        if time::timeout(Duration::from_secs(2), conn.read_exact(&mut rd))
+            .await
+            .is_ok()
+        {
+            assert_eq!(&rd, PING.as_bytes(), "a visitor was answered with garbage");
+            answered += 1;
+        }
+    }
+    assert!(
+        answered > 0,
+        "the tunnel must survive a burst its pool cannot grow for"
+    );
+
+    let pools = molehill_rathole::live_pools();
+    let pool = pools
+        .first()
+        .unwrap_or_else(|| panic!("the valve scenario must have a live pool: {pools:?}"));
+    assert_eq!(
+        pool.size, 1,
+        "the valve must still hold the pool at one tunnel"
+    );
+    assert!(
+        pool.streams() <= ENGINE_STREAM_CAP,
+        "the pool placed {} streams on {} tunnel(s): the engine's cap is {ENGINE_STREAM_CAP}",
+        pool.streams(),
+        pool.size
+    );
+
+    drop(held);
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// A service whose pool is saturated must still **recover**: once capacity
+/// comes back, the next visitor is served.
+///
+/// This is the difference between "the burst was refused" (acceptable: a
+/// visitor fails) and "the service stopped" (not acceptable: every later
+/// visitor hangs). A shaped sweep measured the second one — after a 100 ms
+/// path wedged the tunnels, the rest of the run showed `churn/s` collapsing
+/// from 2398 to 11 and every interactive probe timing out, which is what a
+/// service stuck behind one unanswerable visitor looks like (HANDOFF.md).
+///
+/// The scenario drives the pool to its ceiling with held visitors, drops them
+/// to return the capacity, and then asks the only question that matters: does
+/// a fresh visitor get served?
+#[tokio::test]
+async fn a_saturated_pool_still_serves_the_next_visitor() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tunnel_valve.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/tunnel_valve.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(VALVE_EXPOSED).await?;
+
+    // Saturate the pool: more concurrent visitors than its one tunnel may
+    // carry, so the tail of the burst meets the placement ceiling.
+    let mut held = Vec::with_capacity(ENGINE_STREAM_CAP + 8);
+    for _ in 0..(ENGINE_STREAM_CAP + 8) {
+        held.push(TcpStream::connect(VALVE_EXPOSED).await?);
+    }
+    for conn in &mut held {
+        let _ = conn.write_all(PING.as_bytes()).await;
+    }
+    settle(2.0).await;
+
+    // Return the capacity: every held visitor goes away, so the tunnel is
+    // empty again.
+    drop(held);
+    settle(2.0).await;
+
+    let pools = molehill_rathole::live_pools();
+    if let Some(pool) = pools.first() {
+        println!("after the burst: {pool:?}");
+    }
+
+    // The question: a visitor arriving now must be served, not left hanging
+    // behind a request the pool already refused.
+    let mut fresh = time::timeout(Duration::from_secs(10), TcpStream::connect(VALVE_EXPOSED))
+        .await
+        .map_err(|_| anyhow!("a fresh visitor must be accepted"))??;
+    fresh.write_all(PING.as_bytes()).await?;
+    let mut rd = [0u8; 4];
+    time::timeout(Duration::from_secs(10), fresh.read_exact(&mut rd))
+        .await
+        .map_err(|_| anyhow!("a fresh visitor must be served after the pool emptied"))??;
+    assert_eq!(
+        &rd,
+        PING.as_bytes(),
+        "the fresh visitor was answered with garbage"
     );
 
     client_shutdown_tx.send(true)?;

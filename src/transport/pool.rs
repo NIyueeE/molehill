@@ -9,15 +9,25 @@
 //! (see HANDOFF.md D15 — the benchmark matrices are what promote one to a
 //! configuration key).
 
-/// Grow when the pool's total usage reaches this fraction of its total stream
-/// capacity (equivalently, when every tunnel is that loaded once placement has
-/// spread the traffic).
+/// Grow when a tunnel's usage reaches this fraction of its stream capacity, or
+/// when the pool's total reaches the same fraction of its total capacity.
 ///
-/// The cap is `DEFAULT_MUX_MAX_STREAMS` (64) and the vendored engine logs an
-/// unguarded `error!` when a stream cap is hit, so the pool must grow while it
-/// still has headroom: at 80 % of 64 the next 12 opens have room, which is
-/// more than a burst can consume inside one maintenance tick.
-pub(crate) const GROW_PERCENT: usize = 80;
+/// The number was 80 % (51 streams of a 64-stream tunnel) until a release
+/// sweep measured what that actually does. Both the mixed soak workload and a
+/// 20-stream `iperf3` bulk test peak *below* 51 concurrent streams, so the rule
+/// never fired: the pool stayed at one tunnel, and one TCP tunnel carrying
+/// twenty bulk streams plus a control channel is exactly the head-of-line
+/// blocking this pool exists to avoid. The backend said so directly —
+/// `iperf3: error - idle timeout for receiving data`, waiting for a summary
+/// behind its own bulk data (HANDOFF.md).
+///
+/// The rule is therefore about *how much one tunnel should carry*, not about
+/// how close it is to the engine's cap: 12 % of 64 is 8 concurrent streams,
+/// which is where a shared tunnel starts to queue an interactive or control
+/// stream behind bulk traffic. The pool's own `max_tunnels` bounds the result
+/// (4 tunnels by default, ~32 concurrent streams per service — the same order
+/// as the four pre-opened channels v0.9.1 used to get this property for free).
+pub(crate) const GROW_PERCENT: usize = 12;
 
 /// How long the pool stays warm after a growth before a shrink may remove a
 /// tunnel. Without it, a pool grown for one burst shrinks immediately after
@@ -79,6 +89,57 @@ pub(crate) const COLD_GROW_WAIT: std::time::Duration = std::time::Duration::from
 /// request can put more than the budget into reservation state — the overshoot
 /// then only lives in the driver's own queue, which is bounded already.
 pub(crate) const OPEN_BUDGET: usize = 16;
+
+/// The concurrent streams the pool lets one tunnel carry.
+///
+/// This is a *hard* placement ceiling, strictly below the engine's own
+/// `DEFAULT_MUX_MAX_STREAMS` (64). The gap is not cosmetic: a 65th inbound
+/// stream is refused (the engine used to terminate the *whole connection* for
+/// it — see `mux/connection.rs`), and a refused stream is a visitor that fails.
+/// Crossing the ceiling needed a pool that could not grow (the server's
+/// `max_tunnels_per_client` valve, or `max_tunnels` itself) while the load kept
+/// arriving, which is exactly what a bulk run does; the reservation is charged
+/// before the first `await`, so the ceiling has to bound `streams + pending`,
+/// not the established count alone.
+///
+/// 56 leaves 8 slots of headroom: room for a stream the peer has not released
+/// yet (the engine drops a stream from its map on the *local* handle, so the
+/// two sides can disagree by a few during a teardown) and for the engine's own
+/// bookkeeping. It is deliberately above `grow_threshold`'s per-tunnel share
+/// (51), so the growth rule fires before placement ever reaches it.
+///
+/// The ceiling is a *soft* bound in the sense that reaching the engine's cap is
+/// no longer fatal: `mux/connection.rs` refuses the stream that would cross it
+/// instead of terminating the connection (see the comment there — the old
+/// behaviour took every stream on the tunnel down with it). The ceiling still
+/// exists because refusing a stream is worse than placing it elsewhere, and
+/// because a pool that grows is a pool that serves.
+pub(crate) const TUNNEL_STREAM_CEILING: usize = 56;
+
+/// The streams one tunnel may carry, never above the engine's own cap.
+///
+/// Two bounds, whichever is stricter: the pool's absolute ceiling
+/// ([`TUNNEL_STREAM_CEILING`], the one that caps one tunnel's concurrency for
+/// any engine cap) and a proportional headroom for a cap small enough that the
+/// absolute one would not leave any. The headroom is an eighth of the cap, at
+/// least one stream, which is deliberately under [`tunnel_grow_at`]'s four
+/// fifths: growth must fire before placement refuses, whatever the cap.
+#[must_use]
+pub(crate) fn tunnel_ceiling(stream_cap: usize) -> usize {
+    let headroom = (stream_cap / 8).max(1);
+    TUNNEL_STREAM_CEILING
+        .min(stream_cap.saturating_sub(headroom))
+        .max(1)
+}
+
+/// How long an open waits for a stream to retire when every tunnel is at the
+/// ceiling and the pool cannot grow.
+///
+/// Bounded on purpose: a refused visitor is a failure this pool can report,
+/// while an open that waits forever is a hung connection nobody can attribute.
+/// The wait exists so a burst that meets a full pool is served by the streams
+/// retiring under it, not refused on the instant it arrives.
+pub(crate) const CAPACITY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Why the pool changed size. Rendered verbatim in the `pool-stats` timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +257,20 @@ pub(crate) fn grow_threshold(size: usize, stream_cap: usize) -> usize {
     size * stream_cap * GROW_PERCENT / 100
 }
 
+/// The streams one tunnel carries before the pool grows, whatever its size.
+///
+/// [`grow_threshold`] answers "is the pool as a whole busy"; this answers "is
+/// *this* tunnel busy", which is the question that decides whether a cap is
+/// reachable. They agree at size 1 and diverge above it — the total threshold
+/// scales with the pool, so a tunnel of a 4-tunnel pool is at 4x its share
+/// before the total crosses — and it is the per-tunnel one that must fire
+/// first, because only it can keep every tunnel under
+/// [`TUNNEL_STREAM_CEILING`].
+#[must_use]
+pub(crate) fn tunnel_grow_at(stream_cap: usize) -> usize {
+    (stream_cap * GROW_PERCENT / 100).max(1)
+}
+
 /// The UDP-derived floor (D7): the number of tunnels that must stay for the
 /// deepest active UDP service to keep its configured workers.
 ///
@@ -264,6 +339,37 @@ pub(crate) fn may_shrink(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The placement ceiling is the pool's promise that the engine's own cap
+    /// is unreachable. Two properties matter: it stays strictly below the cap,
+    /// and — wherever it is the *binding* bound, i.e. below what the growth
+    /// rule reacts to — growth fires first, so a refusal only ever follows a
+    /// growth attempt rather than replacing one.
+    #[test]
+    fn the_placement_ceiling_keeps_headroom_below_the_engine_cap() {
+        for cap in [4usize, 16, 32, 64, 128, 256] {
+            let ceiling = tunnel_ceiling(cap);
+            assert!(
+                ceiling < cap,
+                "the ceiling ({ceiling}) must stay below the engine's cap ({cap})"
+            );
+            let grow_at = tunnel_grow_at(cap);
+            assert!(
+                grow_at <= ceiling || ceiling == TUNNEL_STREAM_CEILING,
+                "at cap {cap} the ceiling ({ceiling}) binds before growth ({grow_at}) does"
+            );
+        }
+        // The shipped cap: growth at 7, placement refuses at 56, the engine
+        // refuses a stream at 64 (and, since the connection no longer
+        // terminates, that refusal costs one visitor). Growth fires far below
+        // the ceiling on purpose — see `GROW_PERCENT`.
+        assert_eq!(tunnel_grow_at(64), 7);
+        assert_eq!(tunnel_ceiling(64), 56);
+        // A cap too small for the absolute ceiling still yields a usable one
+        // that growth reaches first.
+        assert_eq!(tunnel_ceiling(16), 14);
+        assert_eq!(tunnel_ceiling(4), 3);
+    }
 
     #[test]
     fn floor_is_the_deepest_active_udp_service() {
@@ -353,8 +459,8 @@ mod tests {
 
     #[test]
     fn grow_threshold_tracks_size() {
-        assert_eq!(grow_threshold(1, 64), 51);
-        assert_eq!(grow_threshold(4, 64), 204);
+        assert_eq!(grow_threshold(1, 64), 7);
+        assert_eq!(grow_threshold(4, 64), 30);
         assert_eq!(grow_threshold(0, 64), 0);
     }
 }

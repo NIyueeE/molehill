@@ -1,4 +1,6 @@
+use crate::common::constants::FORWARD_IDLE_TIMEOUT;
 use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP_ROUTE_TTL_SECS};
+use crate::common::forward::copy_bidirectional_with_idle;
 use crate::common::helper::write_and_flush;
 use crate::common::multi_map::MultiMap;
 use crate::config::ConfigChange;
@@ -29,10 +31,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 use std::time::Instant;
-use tokio::io::{
-    self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
-    copy_bidirectional_with_sizes,
-};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -85,6 +84,23 @@ fn report_auth_failure() {
 }
 
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
+
+/// How long the visitor-pairing loop waits for a data channel before asking
+/// for another one.
+///
+/// It has to be comfortably above a *legitimate* slow open — a cold pool dials
+/// a tunnel, and the client's own cold-growth budget is 15 s — so that ordinary
+/// work is never re-requested. Its job is not to time a healthy open out; it is
+/// to stop one unanswerable request from parking the accept loop, which stalls
+/// the whole service (see `pair_visitor`).
+const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
+
+/// How many `PAIR_WAIT_BUDGET` waits one visitor gets before it is shed.
+///
+/// Five tries is 25 s of patience for a visitor whose service is under
+/// pressure, after which the connection is closed — a failed request, reported
+/// at DEBUG, instead of a hang the operator cannot attribute.
+const PAIR_ATTEMPTS: usize = 5;
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 
 /// Runtime description of a service, as registered by a client.
@@ -2182,6 +2198,71 @@ impl ControlChannel {
 // multiplies its ceiling and window. The unstriped path (`stripe_count`
 // 1) is the default and stays the single-variable control for the striped
 // one.
+
+/// What the pairing wait decided.
+enum PairOutcome<C> {
+    /// A data channel to hand this visitor.
+    Channel(C),
+    /// No channel arrived within the visitor's allowance: shed it.
+    Shed,
+    /// The pool itself must stop (shutdown, or the control channel ended).
+    Stop,
+}
+
+/// Wait for a data channel for one visitor, asking for more when none arrives.
+///
+/// This is the accept loop's critical section, so its bound is load bearing: as
+/// long as it waits for one visitor the service accepts no other. A request the
+/// client cannot answer — the pool is at its placement ceiling and refuses the
+/// open, which the client reports to nobody — would otherwise park the whole
+/// service for the rest of the session. Measured: a saturated pool left the
+/// service unable to serve a *fresh* visitor even with every stream released
+/// (`tests/pool_test.rs`, `a_saturated_pool_still_serves_the_next_visitor`).
+///
+/// So the wait is a budget, and its expiry re-requests rather than giving up:
+/// capacity usually comes back (a stream retires, a tunnel grows) and at most
+/// this one visitor is waiting, so a re-request is cheap. Only a visitor the
+/// client refuses `PAIR_ATTEMPTS` times in a row is shed — a typed failure for
+/// that visitor and nothing for the service.
+async fn pair_visitor<C>(
+    data_ch_rx: &mut mpsc::Receiver<C>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    shutdown_rx: &mut broadcast::Receiver<bool>,
+    control_task: &mut tokio::task::JoinHandle<()>,
+) -> PairOutcome<C>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut attempts = 0usize;
+    loop {
+        // A visitor can be waiting for a data channel that will never arrive
+        // once its control channel is gone, so this loop watches both signals
+        // too.
+        let next = tokio::select! {
+            _ = shutdown_rx.recv() => None,
+            _ = &mut *control_task => None,
+            ch = data_ch_rx.recv() => ch,
+            () = time::sleep(PAIR_WAIT_BUDGET) => {
+                // Nothing arrived in the budget: ask again, unless this
+                // visitor has waited out its whole allowance.
+                attempts += 1;
+                if attempts >= PAIR_ATTEMPTS {
+                    debug!("No data channel after {attempts} requests; dropping the visitor");
+                    return PairOutcome::Shed;
+                }
+                if data_ch_req_tx.send(true).is_err() {
+                    return PairOutcome::Stop;
+                }
+                continue;
+            }
+        };
+        let Some(ch) = next else {
+            return PairOutcome::Stop;
+        };
+        return PairOutcome::Channel(ch);
+    }
+}
+
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<C>(
     l: TcpListener,
@@ -2251,37 +2332,39 @@ where
                     sock_opts.apply(&incoming);
 
                     if stripe_count <= 1 {
-                        // Pair the visitor with a data channel. A broken
-                        // channel (e.g. stale pooled one) is discarded and
-                        // replaced.
-                        loop {
-                            // A visitor can be waiting for a data channel that
-                            // will never arrive once its control channel is gone,
-                            // so this loop watches both signals too.
-                            let next = tokio::select! {
-                                _ = shutdown_rx.recv() => None,
-                                _ = &mut control_task => None,
-                                ch = data_ch_rx.recv() => ch,
-                            };
-                            let Some(mut ch) = next else {
-                                break 'pool;
-                            };
-                            if write_and_flush(&mut ch, &cmd).await.is_ok() {
-                                tokio::spawn(async move {
-                                    let _ = copy_bidirectional_with_sizes(
-                                        &mut ch,
-                                        &mut incoming,
-                                        TCP_COPY_BUFFER_SIZE,
-                                        TCP_COPY_BUFFER_SIZE,
-                                    )
-                                    .await;
-                                });
-                                break;
+                        match pair_visitor(
+                            &mut data_ch_rx,
+                            &data_ch_req_tx,
+                            &mut shutdown_rx,
+                            &mut control_task,
+                        )
+                        .await
+                        {
+                            PairOutcome::Channel(mut ch) => {
+                                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                                    tokio::spawn(async move {
+                                        // A stalled forward is closed by the
+                                        // watchdog: a wedged visitor must not
+                                        // hold a tunnel stream for the
+                                        // session's life (see
+                                        // `FORWARD_IDLE_TIMEOUT`).
+                                        if let Err(e) = copy_bidirectional_with_idle(
+                                            &mut ch,
+                                            &mut incoming,
+                                            TCP_COPY_BUFFER_SIZE,
+                                            FORWARD_IDLE_TIMEOUT,
+                                        )
+                                        .await
+                                        {
+                                            debug!("Data channel closed: {e}");
+                                        }
+                                    });
+                                }
                             }
-                            // Current data channel is broken. Request for a new one
-                            if data_ch_req_tx.send(true).is_err() {
-                                break 'pool;
-                            }
+                            // The visitor waited out its whole allowance: a
+                            // failed request for it, nothing for the service.
+                            PairOutcome::Shed => {}
+                            PairOutcome::Stop => break 'pool,
                         }
                     } else if pair_striped_group(
                         incoming,

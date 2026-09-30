@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{
     self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-    copy_bidirectional_with_sizes,
 };
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
@@ -46,8 +45,9 @@ use crate::transport::multiplex::{Carrier, ClientTunnel, Dialer, StreamLease, Tu
 
 use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
-    DEFAULT_UDP_WORKERS, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
+    DEFAULT_UDP_WORKERS, FORWARD_IDLE_TIMEOUT, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
 };
+use crate::common::forward::copy_bidirectional_with_idle;
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -1215,13 +1215,20 @@ where
     // The leg towards the local service needs explicit socket options;
     // without them Nagle stays enabled and interactive traffic stalls.
     sock_opts.apply(&local);
-    let _ = copy_bidirectional_with_sizes(
+    // A stalled forward is closed by the watchdog rather than left to hold a
+    // tunnel stream for the session's lifetime (see `FORWARD_IDLE_TIMEOUT`).
+    if let Err(e) = copy_bidirectional_with_idle(
         &mut conn,
         &mut local,
         TCP_COPY_BUFFER_SIZE,
-        TCP_COPY_BUFFER_SIZE,
+        FORWARD_IDLE_TIMEOUT,
     )
-    .await;
+    .await
+    {
+        // A reaped connection is a failed request, not a lifecycle event:
+        // DEBUG, like every other per-connection failure.
+        debug!("Data channel closed: {e}");
+    }
     Ok(())
 }
 

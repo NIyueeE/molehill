@@ -168,11 +168,4 @@ impl Frame<GoAway> {
             body: Vec::new(),
         }
     }
-
-    pub fn internal_error() -> Self {
-        Frame {
-            header: Header::internal_error(),
-            body: Vec::new(),
-        }
-    }
 }

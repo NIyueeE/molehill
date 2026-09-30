@@ -202,6 +202,382 @@ rejection reason (`MAX_REJECTION_REASON_LEN`, pinning test).
 fixed-width readers. Any new command variant with a payload must be
 tag-dispatched or carry a fixed-width id, or the reader desyncs.
 
+### Open: the engine's stream cap is still reachable — a stream leak (2026-09-26)
+
+**The v0.10.0 release sweep does not complete.** Three consecutive
+`just soak --test=rrul --tools molehill,frp,rathole,nps` runs wedged ~6.5
+minutes in, each with the same line and each at the same point:
+
+```
+ERROR 00000003: maximum number of streams reached (streams=64, max=64, mode=Server, ids=[...])
+```
+
+`mux/connection.rs` answers a 64th concurrent stream with
+`Terminate(Frame::internal_error())`: the tunnel dies, every visitor on it dies
+with it, and the run then waits on an iperf3 pair whose socket stays `ESTAB` for
+the next 46 minutes. The pool's placement ceiling (below) does **not** prevent
+it, and the instrumentation says why.
+
+#### The wedge is pre-existing; what v0.10.0 changed is that it is now fatal
+
+`benches/scripts/soak/results-soak-v0.9.1.json` (v0.9.0-10-gac42490, this same
+host) is the control, and it settles the question of whether M1/M2a caused this:
+
+| | v0.9.1 baseline (same host) | v0.10.0 today |
+|---|---|---|
+| `rtt100` interactive p99 | 7309.7 ms | 7261.0 ms |
+| `rtt100` errors | 7 (22 % of samples) | 9 |
+| stages completed, per tool | **8 / 8, all four tools** | wedges at `rtt100` and never returns |
+
+The wedge itself — the interactive stream stalling for seconds on a 100 ms
+path — is therefore **not a v0.10.0 regression**; it reproduces the baseline to
+within noise. What changed is the consequence. In v0.9.1 each visitor got its
+own pre-opened channel (`default_count = 4`), so one visitor's stall cost that
+visitor. In v0.10.0 every channel is a stream of a shared tunnel, and the
+stalled visitors hold their streams; the tunnel then reaches the cap and the
+engine kills it — which is why a wedge that used to cost one stage now costs
+the whole run.
+
+**A live wedged run says how it fails.** With the run pinned at the cap, and
+both molehill processes still up and burning ~55 % CPU each:
+
+- the `echo` tunnel (a different connection) kept forwarding throughout — a
+  `/dev/tcp` round trip on its exposed port returned `ping`, and it went on
+  logging routes to the end of the log;
+- the `iperf` tunnel's exposed port had **7 connections in its accept
+  backlog**, unanswered: the mux could not open streams any more, so the
+  service's `data_ch_req` queue simply grew;
+- the backend's raw `iperf3.log` holds **zero** sender/receiver summaries for
+  the whole run — the 20-stream tests are accepted and then hang forever, which
+  is also why the harness waits 46 minutes on them.
+
+So the failure is tunnel-scoped, not process-wide: one tunnel wedges, every
+visitor queued behind it stalls, and the rest of the session keeps working.
+That is the shape a release cannot ship with, and it is also the shape a
+*single-tunnel* design has to defend against.
+
+**The mechanism, to the extent it is pinned.** The server hands each stream to
+`copy_bidirectional_with_sizes(&mut ch, &mut incoming, ..)` in its own task, and
+`ch` — the `DataChannel` holding the mux stream — drops only when that task
+ends. On the wedged connection all 79 streams were routed *and* paired (no
+queue), and the client had released its side, so the tasks are stuck rather than
+unstarted. Tokio's copy ends a direction only when it reads EOF, so a task
+wedges when its peer stops draining: the server's `data channel → visitor`
+write blocks on a full visitor socket, the task stops polling its reader, and
+the mux stream's receive window closes behind it. Two things then keep it there:
+the visitor (an iperf3 client waiting for a test summary that can never arrive)
+has no timeout of its own, and nothing in the pool notices that a stream has
+been alive for minutes without moving a byte.
+
+**What the fix has to do**, whichever shape it takes: a wedged stream must not
+be able to hold the tunnel's budget forever. The candidates are (1) an idle
+timeout on a data channel's copy task — a stream with no bytes in either
+direction for longer than some budget is closed, which returns the budget and
+the visitor's error; (2) making the pool treat a tunnel with several
+long-stalled streams as unhealthy and stop placing on it, so the other tunnels
+keep serving; (3) at the edge, refusing to open past `OPEN_BUDGET` pending
+rather than queueing behind a wedged tunnel (the accept backlog above is that
+queue, and it is unbounded today). All three are defensible; (1) is the
+smallest and the one the evidence points at, and it needs a measurement to pick
+the budget.
+
+The worst case is bounded and unshipped: the branch is green (`just check`,
+`just interop`), nothing is pushed, and the wedge is not a new defect — but it
+is the reason the sweep cannot complete and therefore the reason there is no
+release.
+
+**The client is not the side that is wrong.** With `MOLEHILL_POOL_STATS=1` on
+both ends plus per-stream diagnostics, the numbers at the cap were:
+
+| Observation | Value |
+|---|---|
+| the leaking connection | `00000003` (a server-side tunnel) |
+| streams it created | 82 |
+| streams it released | 18 |
+| streams it held at the cap | **64** |
+| the client's pools, peak `streams` over the whole run | 5, 21 and 2 (three pools) |
+| the client's own tunnels, peak held (instrumented per connection, 4 runs) | **never 32** |
+| client-side "placed past its ceiling" events | **0** |
+
+The two sides disagree about the connection, which is the whole finding: the
+server's map says 64 streams are open, and the client — counting the leases its
+own forwarding tasks hold — never had more than 31 on *any* tunnel, across four
+instrumented runs. The stream ids in the server's map are client-initiated
+(odd) and non-contiguous, which is what a set of streams the client has
+*closed* looks like from a side that never dropped its handles.
+
+**The release of streams stops, it does not slow down.** The drops on
+`00000003` ran normally until 18:15:43, then stopped completely: in the ten
+seconds before the cap was hit the connection accepted no new streams and
+released none. On the client, the streams those drops belonged to are gone —
+its leases were released and its map is small — so the handles that persist are
+the server's.
+
+**Ruled out by measurement, so the next attempt does not redo it:**
+
+- **The client's placement is not at fault.** Its pools peaked at 5, 21 and 2
+  streams against a ceiling of 56, and no placement ever went past the ceiling.
+- **The visitor tasks are not the holders.** On the leaking connection,
+  6479 visitor tasks started and 6476 ended over the run — the imbalance is 3,
+  not 64 — and the leaked streams' ids do not cluster at the end.
+- **Neither is the routing queue.** On the instrumented run that paired
+  everything, all 79 streams the leaking connection carried were routed to the
+  iperf service *and* paired with a visitor (79 routed, 79 paired, 6342 pairs
+  over the run, 6340 pair tasks ended). Nothing sat in a queue.
+- **The bulk path works standalone.** A server+client pair with one TCP service
+  carries six sequential `iperf3 -P 20` runs at 17-20 Gbit/s with zero cap hits
+  and a steady 21 streams; the leak needs the *shaped, mixed* workload.
+
+**The holder is the server's pair task.** Every stream is handed to
+`copy_bidirectional_with_sizes(&mut ch, &mut incoming, ..)` in a spawned task,
+and `ch` — the `DataChannel` holding the mux stream — drops only when *that*
+task ends. The leaked streams' ids are exactly the ones whose pair task never
+ended, which is why the map keeps them and why the client (whose lease the same
+stream's end released) sees a small number. The ids also say *when*: on the
+last instrumented run the 64 held streams were created in one burst, and the
+drops stopped a few seconds later.
+
+**And the test itself never completes.** In every wedged run the backend's raw
+`iperf3.log` holds **zero** sender/receiver summaries — the 20-stream tests are
+accepted and then hang, which is also why the harness sits on them for 46
+minutes. That makes the sequence legible: the bulk test stalls under the lossy
+path, the client's streams end while the server's pair tasks do not, the map
+fills to the cap, and the engine kills the tunnel.
+
+**Where the next attempt should look**: why the server's pair task never
+returns. It is not the pool and not the routing — every stream was paired — so
+the question is what the task is waiting on. The mechanism section above names
+the shape (a blocked `data channel → visitor` write that stops the task polling
+its reader, with a visitor that has no timeout of its own) and the three
+candidate fixes, of which the smallest is a per-channel idle timeout. A
+reproducer that stays inside the lossy stage (`just soak --test=rrul`, or the
+harness with a one-stage `--timeline loss1:120`) is enough to see it.
+
+**What is already fixed and kept** (commit `1b5fa2a`, falsified by its own
+regression test): the pool's placement ceiling (56, counting reserved opens),
+growth on a *per-tunnel* rule as well as the pool total, and a typed
+`OpenError::AtCapacity` after a bounded wait. That makes a cap hit impossible
+for any load the pool places itself; it cannot help when the streams on the
+tunnel are not the pool's.
+
+**How the numbers above were taken** (the instrumentation is not in the tree):
+per-connection created/dropped counters and an inbound-RST counter in
+`mux/connection.rs` (gated on `MOLEHILL_POOL_STATS`), the client's held counter
+in `ClientTunnel::start`'s driver loop, and the visitor pairing/task-end pair in
+`run_tcp_connection_pool`'s spawn — each a one-line `info!` with the mux
+identity. Re-add those three rather than guessing.
+
+#### Resolved 2026-09-27: the cap is no longer fatal, and what that did not fix
+
+Three commits closed the *fatality*, and the sweep completes again:
+
+| | before | after |
+|---|---|---|
+| `just soak --test=rrul --tools molehill` | wedged at `rtt100`; run never finished | **8 of 8 stages, exit 0** |
+| engine cap events | 1, at ~6.5 min | **0** |
+
+1. `07fd09e` — `copy_bidirectional_with_idle` reaps a forward that has moved no
+   bytes in either direction for `FORWARD_IDLE_TIMEOUT` (5 min), at both copy
+   sites. A stall can no longer hold a tunnel stream for the session's life.
+2. `e25329e` — the placement ceiling is documented against the *burst* a stall
+   hands one tunnel, not against a teardown's few slots.
+3. `b732fd3` — **the actual fatality**: a 65th inbound stream used to answer
+   `Terminate(Frame::internal_error())`, a session-terminating goaway that took
+   the whole connection and every visitor on it. It now refuses that one stream
+   with a reset and keeps the connection. Pinned by a test on the decision
+   itself, falsified by restoring the old action.
+
+**The wedge itself is not fixed**, and the numbers say so. Same run, same host,
+against the v0.9.1 baseline:
+
+| stage | v0.9.1 baseline | v0.10.0 now |
+|---|---|---|
+| `rtt100` | p99 7310 ms, 7 errors | p99 6358 ms, 11 errors |
+| `rate100` | p99 683 ms, **0 errors** | p99 7718 ms, **13 errors** |
+| `rate20` | p99 4870 ms, 6 errors | **bulk spine produced nothing**, 20 errors |
+| `jitter` | p99 3440 ms, 5 errors | p99 7254 ms, 19 errors |
+| both `clean` | p99 9.3 / 5.4 ms | p99 2.5 / 2.1 ms |
+
+The tunnel survives those stages now instead of dying in them; it does not sail
+through them. So the release still cannot be called done on this evidence: a
+sweep with `rate20` producing no bulk sample at all fails the release ritual's
+own completeness rule, whatever the cap does. The next question is the wedge
+itself — why a 100 ms path (and a rate-limited one) stalls the interactive
+stream for seconds — and it is a *pre-existing* one: v0.9.1 shows the same
+shape at `rtt100`, just with per-visitor channels to absorb it.
+
+**A correction to the table above, found the hard way.** The `8 of 8 stages`
+result was measured with a binary that did **not** contain `b732fd3`: the run's
+own version line says `v0.9.0-34-ge25329e`, and its log carries the *old*
+`maximum number of streams reached` text, not the new `refusing stream N`. That
+run completed because the halved ceiling (`e25329e`) kept the pool away from the
+cap, not because the cap had stopped being fatal. Rebuilding from the committed
+tree and running again gives the real picture:
+
+- the refusal path **works as designed** — one `refusing stream 165`, the tunnel
+  stayed up, and the run went on;
+- but `loss5` and `rate100` still report `bulk spine produced nothing (exit -9)`,
+  so the sweep still fails the completeness rule.
+
+**The mechanism, from the backend's own log.** Under the shaped load the bulk
+`iperf3` client dies with `error - idle timeout for receiving data` — it is
+waiting for a test summary on its *control* connection while the bulk data
+saturates the tunnel those two share. The pool stayed at **size 1** through the
+whole run (`reason="cold"` and one `udp_floor`, no `load` growth ever), because
+its growth rule needs a tunnel at 51 streams and a 20-stream bulk test never
+gets there. One tunnel, twenty bulk streams and one control channel is exactly
+the head-of-line blocking a shared tunnel has to avoid — and v0.9.1 avoided it
+by construction, with four pre-opened channels per service (`default_count = 4`)
+that spread the load before it started.
+
+This is the same finding the S1 record already reached from the other side: "the
+growth rule fires above 80 % of the pool's stream capacity — 51 streams at size
+1 — and the mixed workload peaks at 21, so candidate choice never had a lever;
+*pool size* is the axis". The release sweep is the second measurement saying so,
+with a bulk workload that does reach the tunnel's useful capacity even though it
+never reaches the growth threshold.
+
+**Acted on 2026-09-27 (`ca93ad6`): the threshold was the bug.** `pending` was
+the wrong axis — telemetry showed it peaking at 2, because the harness dials
+visitors serially — but the *stream* threshold was miscalibrated: 80 % of the
+engine's cap is 51 streams, and every workload this project measures peaks below
+it (mixed soak 21, a 20-stream bulk test 20), so the rule could never fire. The
+threshold is now about how much one shared tunnel should carry (12 % of 64 = 8
+concurrent streams), with `max_tunnels` bounding the result at ~32 streams per
+service — the same order as v0.9.1's four pre-opened channels.
+
+Measured on the two-stage reproduction (`loss5:120,rate100:120`), telemetry on:
+
+| | before | after |
+|---|---|---|
+| pool size reached | 1 | **4** |
+| `rate100` interactive p99 | 7718 ms, 13 errors | **262 ms**, 8 errors |
+| `rate100` UDP loss | 7.2 % | **2.1 %** |
+| `rate100` churn/s | 10 | **428** |
+
+**Still blocked, and now on a different thing.** The bulk spine still reports
+nothing: its log shows the test running its full 115 s of intervals and then
+dying with `the client has unexpectedly closed the connection`, so the harness
+never sees a sample even though the tunnel carried the traffic. The control
+connection *through the muxed tunnel* does not survive the shaped path, where
+v0.9.1's dedicated per-visitor channel did. The candidate that follows from the
+evidence is therefore not another growth knob: **a visitor the pool cannot serve
+well should get its own channel**, which is what `direct` mode already is. That
+is a design change with its own measurement, so the release stays blocked.
+
+**A permanent stall, found and fixed (`444bd94`).** The accept loop pairs one
+visitor at a time, and its wait for a data channel had no bound. A request the
+client cannot answer never comes back at all: when the pool is at its placement
+ceiling it refuses the open and reports the refusal to nobody. One such visitor
+therefore parked the entire service for the rest of the session.
+
+Reproduced without a benchmark: saturate the pool, *drain it completely*
+(`size: 1, tunnels: [(0, 0, 0)]`), then ask for a fresh visitor — it hung, with
+capacity free and nothing in the way.
+`tests/pool_test.rs::a_saturated_pool_still_serves_the_next_visitor` fails
+without the fix and passes with it. The wait is now a budget that re-requests on
+expiry and sheds only a visitor the client refuses `PAIR_ATTEMPTS` times.
+
+**Ruled out for the `rate100`-after-`rtt100` collapse**, each by measurement:
+
+| Candidate | Result |
+|---|---|
+| the stall reaper | off (`MOLEHILL_REAPER_SECS=0`): 7145 ms vs 7076 with it |
+| the window size | 4 / 8 / 16 / 32 MiB: 7584 / 7893 / ~7000 / 7076 ms |
+| a prefetch window | `ready=3` confirmed in the loop, still ~7000 ms — and it breaks the documented cold start, so it was reverted |
+| mux vs `direct` | both bad: 7076 ms vs 7456 ms |
+| a saturated pool | not saturated: 21 streams over 4 tunnels during the failure |
+| the pairing loop | `accepted=87 paired=87 broken=0 shed=0` over three minutes |
+
+**The signature, as far as it goes.** During that stage the churn probe offers
+~16 connections/s and **14 succeed in 120 s** (the field is a count per stage,
+not a rate — `clean` shows 2398, which is 150 s × 16/s), while the pool is idle
+and the pairing window is full. So the failures are *after* pairing, not in the
+queue in front of it.
+
+#### The controlled reproductions do not reproduce it (2026-09-27)
+
+Two standalone reproductions ran the same workload against the same binary and
+**did not** reproduce the collapse, which retracts the explanations above:
+
+| Reproduction | Result |
+|---|---|
+| `rate100`, bulk (`-P 20`) + churn 16/s, interactive probe | **26/26 ok**, worst 882 ms |
+| an `rtt100` phase, then `rate100`, bulk + churn + the UDP service and probe | phase B **32/32 ok**, worst 1138 ms |
+
+Both used the harness's own commands and shaper classes, the same service shape
+(echo + iperf + udpecho, `max_tunnels = 4`, `udp_workers = 2`), the same probe
+bodies and the same 5 s timeout. The sweep's stage shows 25 attempts in 120 s
+(each timing out); the reproductions show a working path at 0.6–1.2 s.
+
+**So the workload shape does not explain it**, and the candidates named earlier
+in this section — head-of-line blocking on the tunnel, the command write, the
+pairing wait, the window, a prefetch window — are unsupported by this evidence.
+The pairing stall is real and fixed, but it is not this.
+
+**What differs in the real run**, in the order worth testing: it is ~9 minutes
+into a single continuous eight-stage run when `rate100` starts, where the
+reproductions reach the equivalent state at ~2 minutes; the harness switches the
+shaper between stages and restarts a wedged `iperf3` server per stage; and its
+probe processes are long-lived across all eight stages. A duration- or
+harness-state-dependent effect is now more likely than a data-path one, and the
+way to settle it is to instrument the **sweep itself** rather than another
+reproduction — the pairing counters and pool telemetry are already in the tree,
+and the missing piece is the probe's own failure kind (connect vs echo) at the
+moment it fails, which the harness currently records only as a count.
+
+#### The reference binary behaves the same (2026-09-27) — this is not a v0.10.0 regression
+
+The reproductions above shaped the **wrong ports**, which is why they looked
+healthy. The harness shapes the *data-plane* ports and deliberately leaves the
+control channel unshaped (`soak.py`, `_ports`: "the TOOL's control channel stays
+in the unshaped default class"), and it rate-limits with **`netem rate`**, not
+with the HTB class. Shaping the visitor and backend ports that way reproduces
+the sweep's signature in two minutes:
+
+| | attempts | ok | timeouts | worst |
+|---|---|---|---|---|
+| first (wrong ports: control only) | 32 | 32 | 0 | 1138 ms |
+| faithful (data-plane ports, `netem rate 100mbit delay 20ms limit 2000`) | 10 | 8 | **2** | **9475 ms** |
+| the sweep's own `rate100` stage | 24 in 120 s | 10 | 14 | 7076 ms |
+
+**And the released v0.9.0 binary does the same thing under all three phases:**
+
+| phase | v0.9.0 (released) | v0.10.0 (branch) |
+|---|---|---|
+| A: `rtt100` | 13 attempts, worst 6069 ms | 14 attempts, worst 6242 ms |
+| B: `rate100` after A | 10 attempts, 7 ok, **3 timeouts**, worst 9436 ms | 10 attempts, 8 ok, **2 timeouts**, worst 8330 ms |
+| C: `rate20`, **bulk spine** | **0 intervals** | **0 intervals** |
+| C: `rate20`, interactive | 3 attempts, **3 timeouts**, worst 9510 ms | 3 attempts, **3 timeouts**, worst 6548 ms |
+
+The `rate20` row is the one that matters most: the sweep's completeness failure
+("bulk spine produced nothing") reproduces on the **released** binary, with the
+same zero intervals.
+
+So the multi-second interactive round trip on a rate-limited path is **not**
+introduced by this cycle: the reference build shows it with the same workload,
+the same shaper and the same binary-independent probe. The v0.9.1 baseline file
+(683 ms p99, 0 errors, 171 samples at `rate100`, with bulk running — 218 bulk
+samples) is therefore **not reproducible by the v0.9.0 binary either**, in this
+controlled setting: it is either a lucky run against a host state that no longer
+exists, or it depends on the sweep's own accumulated sequence in a way the
+two-stage reproduction does not capture.
+
+**What this changes.** The table earlier in this section reads the
+`rate100`/`rate20`/`jitter` cells as a v0.10.0 regression; on this evidence it
+should not. Those cells are a property of the shaped path and this workload, and
+the honest gate comparison for them is *not* the single stored baseline run. The
+release decision therefore no longer rests on them — which is worth stating
+plainly, because several rounds of this investigation were spent looking for a
+regression that the reference build also has.
+
+**Environment, re-confirmed the hard way**: `/tmp` was wiped mid-session on
+2026-09-26/27, which took `iperf3` with it (`apt` had installed it into the
+container's writable layer) and deleted every bench work directory, including
+the logs the diagnosis above came from. Re-install with
+`sudo apt-get install -y --reinstall iperf3`; keep `--out` and logs under
+`~/tmp` or the repo.
+
 ### M2a — one shared elastic pool per carrier
 
 Commit `d10e566` (+ its fixups). `shared_pool = false` keeps exactly today's
@@ -214,18 +590,68 @@ only when the whole pool has no streams, no pending opens and no pinned peers
 and has been idle past `idle_timeout`, with a warm hold and a cooldown. A refused
 growth holds growth off (D14); a tunnel's death or a shrink releases the hold.
 
+#### The defect the first sweep found: the engine's stream cap was reachable
+
+The first `just soak --test=rrul` run (2026-09-26, 15:17) wedged 6.5 minutes
+in: `mux/connection.rs` logged `ERROR 00000003: maximum number of streams
+reached`, the iperf3 pair on that path stopped moving with its socket still
+`ESTAB`, and the run spent the next 46 minutes waiting on a test that could
+never finish. The log line is the engine's *connection-level* answer to a 64th
+concurrent stream — `Terminate(Frame::internal_error())` — so it takes the
+whole tunnel and every visitor on it, which is exactly what the pool exists to
+make unreachable.
+
+**Why it was reachable.** Growth fires on the pool's *total* usage, and the
+threshold scales with the pool (`size × cap × 80 %`): at size 1 that is 51
+streams, but the ceiling is per *tunnel* and does not scale. Worse, the only
+thing that can stop the pool from growing is the very state a bulk run
+produces — `max_tunnels`, or the server's `max_tunnels_per_client` valve — and
+placement had no bound of its own: it kept handing streams to the one tunnel it
+had. Growth fired at 51, the valve refused it, and the next 13 opens walked the
+tunnel into the engine's cap.
+
+**Reproduced, then fixed.** `tests/pool_test.rs` gained
+`a_refused_growth_still_never_reaches_the_stream_cap`, which holds 72 visitors
+against the valve scenario (`max_tunnels_per_client = 1`): 56 are forwarded, 16
+are refused, the tunnel survives. Falsified before being trusted — with the new
+placement ceiling disabled, that test fails with the sweep's exact `ERROR` and
+the whole tunnel dies under its visitors.
+
+The fix has three parts, all in the pool:
+
+1. **`TUNNEL_STREAM_CEILING` (56) is a hard placement bound**, counting
+   reserved-but-unfinished opens as well as established streams. It is
+   deliberately above the 80 % growth point (51): a pool that *can* grow always
+   grows before placement refuses, and a pool that cannot grow refuses one
+   visitor instead of costing every visitor on the tunnel.
+2. **Growth also fires per tunnel** (`tunnel_grow_at`, 80 % of the cap), not
+   only on the pool total. The total threshold scales with the pool and the
+   ceiling does not, so above size 1 the per-tunnel rule is the stricter one.
+3. **A full pool waits, then refuses with a typed error.** `OpenError::
+   AtCapacity` replaces a silent queue: the open waits up to `CAPACITY_WAIT`
+   (250 ms) for a stream to retire — woken by the lease drop that frees it —
+   and is then refused, which fails that visitor and nothing else.
+
+Also fixed on the way: `grow_threshold`'s per-tunnel share is now the unit-tested
+composition of the two bounds (`tunnel_ceiling`, `tunnel_grow_at`), so the
+ordering "growth 51 < placement 56 < engine 64" is asserted rather than
+implied.
+
+**Tests**: `tests/pool_test.rs` (8: shared pool serves two services, the
+per-service default keeps two pools, the UDP source port across a grow/shrink,
+a cold pool grows under load and shrinks when idle, the telemetry is opt-in from
+a real binary, the server valve refuses growth without killing the session, a
+burst past the engine cap on a pool that *can* grow, and the refused-growth
+regression above — the one that fails if the ceiling is removed),
+plus pool unit tests for distinct placement, reuse when the pool is smaller than
+the demand, the pinned-tunnel shrink gate, the failed-growth hold and the
+ceiling ordering (**growth 51 < placement 56 < engine 64**, asserted).
+
 **First visitor after the pool shrank**: 2.15 / 2.01 / 2.08 ms (three runs;
 earlier three 2.07 / 3.23 / 1.99 ms), debug build, loopback, one service, no
 pre-opened channel — i.e. the cold path: visitor accepted, one channel
 requested, one stream opened on the surviving tunnel. Five single measurements
 quoted as a range, not a distribution.
-
-**Tests**: `tests/pool_test.rs` (6: shared pool serves two services, the
-per-service default keeps two pools, the UDP source port across a grow/shrink,
-a cold pool grows under load and shrinks when idle, the telemetry is opt-in from
-a real binary, the server valve refuses growth without killing the session),
-plus pool unit tests for distinct placement, reuse when the pool is smaller than
-the demand, the pinned-tunnel shrink gate and the failed-growth hold.
 
 ### M6 — the configuration surface
 

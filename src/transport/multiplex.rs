@@ -264,6 +264,10 @@ pub(crate) struct StreamLease {
     /// The id of the tunnel this stream is charged to (unique per process).
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
+    /// The pool this stream came from, for the capacity wake-up: an open that
+    /// found every tunnel at its ceiling is waiting for exactly this drop, and
+    /// a weak reference cannot keep a dead pool alive.
+    pool: std::sync::Weak<PoolShared>,
 }
 
 impl StreamLease {
@@ -278,6 +282,13 @@ impl Drop for StreamLease {
         self.counters
             .streams
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(pool) = self.pool.upgrade() {
+            // One stream of capacity came back. `notify_waiters` (not
+            // `notify_one`) because every waiter re-reads the whole pool: the
+            // wake-up is a hint that the state changed, not a hand-off of one
+            // slot.
+            pool.capacity_freed.notify_waiters();
+        }
     }
 }
 
@@ -428,6 +439,9 @@ impl PoolState {
 struct Reservation {
     /// The tunnel's index in the pool.
     index: usize,
+    /// The pool the reservation was taken from, handed to the lease it becomes
+    /// (see [`StreamLease::pool`]).
+    pool: std::sync::Weak<PoolShared>,
     placement: Placement,
     tunnel: ClientTunnel,
 }
@@ -451,6 +465,16 @@ pub(crate) enum OpenError {
     NoTunnel,
     /// Every candidate tunnel refused the stream.
     Refused(crate::mux::ConnectionError),
+    /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
+    /// the pool could not grow past it (its own `max_tunnels`, or the server's
+    /// `max_tunnels_per_client` valve).
+    ///
+    /// A typed refusal rather than a queued open: the engine's cap is *fatal*
+    /// to a tunnel, so the pool refuses one visitor instead of risking every
+    /// other visitor on that tunnel. The alternative — waiting for a stream to
+    /// retire — is what the caller does first (`CAPACITY_WAIT`); this is what
+    /// it reports when the wait ran out.
+    AtCapacity,
 }
 
 impl std::fmt::Display for OpenError {
@@ -458,6 +482,10 @@ impl std::fmt::Display for OpenError {
         match self {
             Self::NoTunnel => write!(f, "the pool has no tunnel"),
             Self::Refused(e) => write!(f, "every tunnel refused the stream: {e}"),
+            Self::AtCapacity => write!(
+                f,
+                "every tunnel is at its stream ceiling and the pool cannot grow"
+            ),
         }
     }
 }
@@ -498,6 +526,11 @@ struct PoolShared {
     /// losing opens wait on it for the tunnel the winner is dialing, instead
     /// of reserving against an empty pool.
     grown: tokio::sync::Notify,
+    /// Signalled when a tunnel's stream count drops, so an open that found
+    /// every tunnel at its ceiling can re-read the pool instead of failing
+    /// while capacity is about to come back. Only ever waited on with a
+    /// timeout (`CAPACITY_WAIT`).
+    capacity_freed: tokio::sync::Notify,
     /// Dropped with the last real user of the pool: the maintenance and
     /// telemetry tasks hold only a `Weak` and exit on it.
     alive: std::sync::Arc<()>,
@@ -685,6 +718,7 @@ impl TunnelPool {
             events: std::sync::Mutex::new(Vec::new()),
             resizing: std::sync::atomic::AtomicBool::new(false),
             grown: tokio::sync::Notify::new(),
+            capacity_freed: tokio::sync::Notify::new(),
             alive: std::sync::Arc::new(()),
         });
         let mut state = PoolState {
@@ -837,10 +871,45 @@ impl TunnelPool {
                 tokio::time::timeout(crate::transport::pool::COLD_GROW_WAIT, self.await_growth())
                     .await;
         }
-        let Some(reservation) = self.reserve(&[]) else {
-            return Err(OpenError::NoTunnel);
+        let ceiling = self.ceiling();
+        let Some(reservation) = self.reserve(&[], ceiling) else {
+            // Nothing under the ceiling. An empty pool is a different failure
+            // from a full one — the dialer could not bring a tunnel up — and
+            // reporting it as `AtCapacity` would blame the load for the
+            // network.
+            if self.size() == 0 {
+                return Err(OpenError::NoTunnel);
+            }
+            // Every tunnel carries as many streams as it may. Growth is the
+            // rule's answer, so ask for it and give a retiring stream (or the
+            // tick) a moment before refusing this visitor: without the wait a
+            // pool that cannot grow would fail whichever open happened to
+            // arrive while every tunnel sat exactly at the ceiling.
+            self.demand();
+            let freed = self.inner.shared.capacity_freed.notified();
+            tokio::pin!(freed);
+            // Register before the second look, or a retirement landing in
+            // between would be lost and this open would sleep out the budget.
+            freed.as_mut().enable();
+            if self.reserve(&[], ceiling).is_none() {
+                let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
+            }
+            let Some(reservation) = self.reserve(&[], ceiling) else {
+                return Err(OpenError::AtCapacity);
+            };
+            return self.complete(reservation).await;
         };
         self.complete(reservation).await
+    }
+
+    /// The concurrent streams one tunnel of this pool may carry.
+    ///
+    /// Always strictly below the engine's cap (see
+    /// [`crate::transport::pool::TUNNEL_STREAM_CEILING`]): the pool's whole
+    /// reason to exist is that a cap hit is fatal to a tunnel, so placement
+    /// must make it unreachable.
+    fn ceiling(&self) -> usize {
+        crate::transport::pool::tunnel_ceiling(self.inner.shared.stream_cap)
     }
 
     /// Wait for the growth in flight to end, or for there to be none any more.
@@ -882,7 +951,7 @@ impl TunnelPool {
     /// Synchronous, and the only place placement reads the tunnel list: the
     /// reservation is charged before the first `await` of an open, which is
     /// what makes back-to-back opens land on distinct tunnels.
-    fn reserve(&self, tried: &[usize]) -> Option<Reservation> {
+    fn reserve(&self, tried: &[usize], ceiling: usize) -> Option<Reservation> {
         let mut state = self.inner.state.lock();
         let loads = state.loads();
         let cursor = state.next_cursor;
@@ -892,13 +961,24 @@ impl TunnelPool {
         // candidate is at its budget, the least-loaded untried one still takes
         // the open — refusing a visitor outright is worse, and a full budget is
         // exactly the demand the growth rule reads.
+        //
+        // The stream ceiling is a hard bound, unlike the pending budget, and it
+        // has no fallback: a tunnel at the ceiling is *never* given another
+        // stream, however empty the contender list looks. The engine's own cap
+        // would take the whole tunnel down, so the pool's answer to a full pool
+        // is `open_stream`'s bounded wait and then a typed refusal — not one
+        // more stream, which is the mistake that cost a tunnel in the v0.10.0
+        // sweep.
         let mut over_budget = None;
         let mut chosen = None;
         for index in order.iter().copied().filter(|i| !tried.contains(i)) {
-            if loads
-                .get(index)
-                .is_none_or(|l| l.pending < crate::transport::pool::OPEN_BUDGET)
-            {
+            let Some(load) = loads.get(index) else {
+                continue;
+            };
+            if load.total() >= ceiling {
+                continue;
+            }
+            if load.pending < crate::transport::pool::OPEN_BUDGET {
                 chosen = Some(index);
                 break;
             }
@@ -918,6 +998,7 @@ impl TunnelPool {
             .unwrap_or_default();
         Some(Reservation {
             index,
+            pool: std::sync::Arc::downgrade(&self.inner.shared),
             placement: Placement {
                 chosen: index,
                 candidates: order.len(),
@@ -943,6 +1024,7 @@ impl TunnelPool {
         let started = std::time::Instant::now();
         let Reservation {
             index,
+            pool,
             mut placement,
             tunnel,
         } = reservation;
@@ -962,6 +1044,7 @@ impl TunnelPool {
                     stream,
                     tunnel_id: tunnel.id(),
                     counters,
+                    pool,
                 })
             }
             Err(e) => {
@@ -990,7 +1073,8 @@ impl TunnelPool {
                 // `Closed` immediately, so this is a bounded scan.
                 let mut last = e;
                 let mut tried = vec![index];
-                while let Some(mut next) = self.reserve(&tried) {
+                let ceiling = self.ceiling();
+                while let Some(mut next) = self.reserve(&tried, ceiling) {
                     tried.push(next.index);
                     next.placement.fallback = true;
                     match next.tunnel.open_stream().await {
@@ -1008,6 +1092,7 @@ impl TunnelPool {
                                 stream,
                                 tunnel_id: next.tunnel.id(),
                                 counters,
+                                pool: next.pool,
                             });
                         }
                         Err(e) => {
@@ -1293,9 +1378,19 @@ impl TunnelPool {
             } else if !busy {
                 None
             } else {
+                // Both questions matter, and the per-tunnel one is the stricter
+                // of the two above size 1: the pool's total threshold scales
+                // with its size (a tunnel of a 4-tunnel pool reaches 4x its
+                // share before the total crosses), while the placement ceiling
+                // does not. Growing on the per-tunnel rule is what keeps
+                // `TUNNEL_STREAM_CEILING` from ever being placement's answer.
                 let used: usize = loads.iter().map(|l| l.total()).sum();
-                (used > crate::transport::pool::grow_threshold(size, self.inner.shared.stream_cap))
-                    .then_some(GrowReason::Load)
+                let cap = self.inner.shared.stream_cap;
+                let total_busy = used > crate::transport::pool::grow_threshold(size, cap);
+                let tunnel_busy = loads
+                    .iter()
+                    .any(|l| l.total() >= crate::transport::pool::tunnel_grow_at(cap));
+                (total_busy || tunnel_busy).then_some(GrowReason::Load)
             }
         };
         // An idle pool just keeps its shrink clock running.
