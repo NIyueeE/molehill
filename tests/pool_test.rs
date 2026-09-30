@@ -409,12 +409,9 @@ async fn udp_source_port_survives_a_grow_and_shrink_cycle() -> Result<()> {
     Ok(())
 }
 
-/// How many concurrent streams the load rule needs before it adds a tunnel.
-///
-/// `grow_threshold(size, cap) = size * cap * 80 / 100` with a 64-stream cap,
-/// so a one-tunnel pool must be *strictly above* 51 streams for the
-/// maintenance tick to grow it. 56 leaves room for a stream that has already
-/// retired by the time the tick runs.
+/// Concurrent visitors one load test holds at once: past the per-tunnel
+/// growth threshold (7 on a 64-stream cap) and at the placement ceiling
+/// (56), which is the shape the growth rule exists for.
 const GROW_STREAMS: usize = 56;
 
 /// The engine's per-tunnel stream cap (`DEFAULT_MUX_MAX_STREAMS`), repeated
@@ -430,14 +427,14 @@ const POOL_STREAM_CEILING: usize = 56;
 /// A burst past the engine's stream cap must never cost a tunnel (D14's
 /// hard half).
 ///
-/// `mux/connection.rs` answers the 64th inbound stream with
-/// `Terminate(Frame::internal_error())`: the **whole** tunnel dies and every
-/// visitor on it with it, and the vendored engine logs an unguarded `error!`
-/// first. The pool's job is to make that unreachable — growth keeps every
-/// tunnel strictly below the cap — so this scenario holds more concurrent
-/// visitors than one tunnel may carry and asserts that the engine's cap is
-/// never reached, that no visitor is dropped, and that the pool grew to take
-/// the load.
+/// A 65th inbound stream is answered with a reset of that one stream — the
+/// tunnel survives, where a session-terminating goaway used to take the
+/// whole connection and every visitor on it down — and the vendored engine
+/// logs an unguarded `error!` first. The pool's job is to keep even that
+/// unreachable — growth keeps every tunnel strictly below the cap — so this
+/// scenario holds more concurrent visitors than one tunnel may carry and
+/// asserts that the engine's cap is never reached, that no visitor is
+/// dropped, and that the pool grew to take the load.
 #[tokio::test]
 async fn a_burst_past_the_stream_cap_never_costs_a_tunnel() -> Result<()> {
     init();
@@ -503,8 +500,8 @@ async fn a_burst_past_the_stream_cap_never_costs_a_tunnel() -> Result<()> {
 /// 1. the pool exists but is **cold** — size 0, nothing to carry;
 /// 2. its first visitor grows it synchronously (the setup cost the M2a
 ///    measurement records, printed here);
-/// 3. load above 80 % of a tunnel's stream capacity grows it again, up to
-///    `max_tunnels`;
+/// 3. load above the growth threshold (12 % of a tunnel's stream capacity)
+///    grows it again, up to `max_tunnels`;
 /// 4. once nothing is carried for `idle_timeout`, the shrink rule removes one
 ///    tunnel — down to the floor of one, never to zero while the service is
 ///    registered.
@@ -564,8 +561,8 @@ async fn a_cold_pool_grows_under_load_and_shrinks_when_idle() -> Result<()> {
     );
 
     // The load rule: hold enough concurrent visitors that the one tunnel is
-    // above 80 % of its stream capacity, and the tick adds the second (its
-    // cap).
+    // above the growth threshold (12 % of its stream capacity), and the tick
+    // adds the second (its cap).
     let startup = Instant::now();
     let mut held = Vec::with_capacity(GROW_STREAMS);
     for _ in 0..GROW_STREAMS {
@@ -696,12 +693,12 @@ async fn the_server_tunnel_valve_refuses_growth_without_killing_the_session() ->
 /// A pool that **cannot grow** must still never reach the engine's stream cap
 /// (the regression the v0.10.0 sweep caught).
 ///
-/// The pool's placement ceiling is the only thing between a burst and
-/// `mux/connection.rs`'s `Terminate(Frame::internal_error())`, which kills the
-/// whole tunnel and logs an unguarded `error!` — so the load that matters is
-/// the one where growth is *refused* and cannot relieve the pressure. The
-/// server's valve (`max_tunnels_per_client = 1`) is exactly that state, and
-/// this scenario holds more concurrent visitors than one tunnel may carry.
+/// A stream past the engine's cap is refused on its own now, but the refusal
+/// is a failed visitor and the vendored engine logs an unguarded `error!`
+/// first — so the load that matters is the one where growth is *refused* and
+/// cannot relieve the pressure. The server's valve
+/// (`max_tunnels_per_client = 1`) is exactly that state, and this scenario
+/// holds more concurrent visitors than one tunnel may carry.
 ///
 /// Before the ceiling existed this held 64 visitors and the server logged
 /// `maximum number of streams reached`, killing the tunnel under them; the

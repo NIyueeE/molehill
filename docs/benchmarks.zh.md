@@ -175,7 +175,7 @@ worker 的 pinned peer 数。
 | transport | `"plain"` | 回环 10.0 / 19.5 Gbit/s(1 / 8 流) |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s;RTT 代价亚毫秒;满载下 CPU 持平 |
 | `pool_size` | 8 TCP / 2 UDP(默认值) | 16 路 churn 下建连到首字节 p99 ~3.5 ms;UDP 把不同访客分片到不同通道,绝不拆分单个会话(会话亲和) |
-| `[server.data].stripe_count` | `K = 4`(实验性) | 单条长连接不再被一条隧道流钉死:回环 1 流吞吐 +48.7%,代价是重排缓冲、RSS +8.7%、CPU +40.8%(每帧 CPU 减半,因为帧摊到了四个驱动任务上) |
+| `[server.data].stripe_count` | `K = 4`(实验性;v4 会话以非条带方式服务,0.10 客户端用不上它——见[配置文档](configuration.zh.md)) | 单条长连接不再被一条隧道流钉死:回环 1 流吞吐 +48.7%,代价是重排缓冲、RSS +8.7%、CPU +40.8%(每帧 CPU 减半,因为帧摊到了四个驱动任务上) |
 
 该选哪个设置、为什么:
 [configuration.zh.md](configuration.zh.md#选择配置决策树)。
@@ -210,8 +210,8 @@ just soak-plot     # 渲染图表并打印 markdown 表格
 just soak-check    # 判定:完整性、端点、SLO、漂移
 ```
 
-`just soak --help` 会列出测试类型、各 variant(`mux`、`direct`、`noise`、
-`mux1`、`kcp4`、`noise-direct`,以及 `direct` 的历史拼写 `mux-off`)、阶段日程与
+`just soak --help` 会列出测试类型、各 variant(`mux`、`shared`、`direct`、
+`noise`、`mux1`、`kcp4`、`noise-direct`,以及 `direct` 的历史拼写 `mux-off`)、阶段日程与
 批处理控制;负载、SLO 与采样率这些旋钮都是环境变量(`SOAK_*`),每一个都会被回
 显进结果 meta。
 

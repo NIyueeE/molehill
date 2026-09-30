@@ -79,10 +79,10 @@ impl std::future::Future for SynAnnounce {
     }
 }
 
-/// Build the session configuration for every tunnel: a 64 MiB total
+/// Build the session configuration for every tunnel: a 32 MiB total
 /// receive window (bounded loss backlog — yamux's own 1 GiB default
-/// accumulates without bound under loss) with 32 streams, each guaranteed
-/// the 256 KiB default credit, leaving 56 MiB for the auto-tuner.
+/// accumulates without bound under loss) with 64 streams, each guaranteed
+/// the 256 KiB default credit, leaving 16 MiB for the auto-tuner.
 ///
 /// The two values are coupled by an upstream invariant (`window >=
 /// streams * 256 KiB` asserted on every setter), so they are fixed internal

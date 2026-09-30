@@ -270,7 +270,7 @@ handshake) and cuts FD usage under many concurrent visitors.
 - The decision belongs to the client alone (`[client.data].default_mode`); the server
   adapts per connection automatically.
 - `mode = "direct"` restores the one-connection-per-channel path.
-- Per-tunnel buffering is bounded by internal defaults (64 MiB yamux receive
+- Per-tunnel buffering is bounded by internal defaults (32 MiB yamux receive
   window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
 - **The pool starts cold.** Nothing is dialed until something needs a tunnel:

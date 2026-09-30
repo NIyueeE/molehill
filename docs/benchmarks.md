@@ -215,7 +215,7 @@ configuration only. Treat them as directional, and re-measure your own case.
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
-| `[server.data].stripe_count` | `K = 4` (experimental) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
+| `[server.data].stripe_count` | `K = 4` (experimental; a v4 session is served unstriped, so a 0.10 client does not get it — see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
 
 Which setting to pick, and why: [configuration.md](configuration.md#choosing-your-configuration-decision-tree).
 
@@ -256,11 +256,11 @@ just soak-plot     # render the charts and print the markdown tables
 just soak-check    # verdict: completeness, endpoints, SLO, drift
 ```
 
-`just soak --help` lists the test types, the variants (`mux`, `direct`,
-`noise`, `mux1`, `kcp4`, `noise-direct`, and `mux-off`, the historical spelling
-of `direct`), the stage schedule and the batching controls; the load, SLO and
-sample-rate knobs are environment variables (`SOAK_*`) and every one of them is
-echoed into the results meta.
+`just soak --help` lists the test types, the variants (`mux`, `shared`,
+`direct`, `noise`, `mux1`, `kcp4`, `noise-direct`, and `mux-off`, the historical
+spelling of `direct`), the stage schedule and the batching controls; the load,
+SLO and sample-rate knobs are environment variables (`SOAK_*`) and every one of
+them is echoed into the results meta.
 
 To compare **two of your own builds** — or two configurations of one build —
 without a full run:

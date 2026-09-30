@@ -22,8 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams, no pending opens and no pinned UDP peers must stay idle before it
   gives one tunnel back, and `[client.data.tcp|kcp].max_tunnels` (default 4,
   validated `>= 1`) is the cap it may grow to. Growth is the client's own
-  decision — an open that would queue, a pool at 80 % of its stream capacity,
-  or a UDP service whose configured workers need more tunnels — and shrink is
+  decision — an open that would queue, a pool at 12 % of a tunnel's stream
+  capacity, or a UDP service whose configured workers need more tunnels —
+  and shrink is
   deliberately conservative: a tunnel carrying a live UDP peer is never
   removed, so a stateful UDP session keeps the source port its service sees.
   Two opt-in switches make the policy measurable rather than asserted:
@@ -170,6 +171,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until something else rebuilt the session. The pools are dropped with the
   connection now (the reconnect path re-registers and re-activates every
   service, each of which builds the pool it needs).
+
+- **One stream past a tunnel's cap no longer takes the tunnel down.** A
+  multiplex tunnel carries at most 64 concurrent streams, and the 65th used to
+  be answered with a protocol error that terminated the whole connection: a
+  burst that crossed the cap destroyed every service sharing that tunnel —
+  every visitor on it failed at once — and the pool rebuilt from nothing. The
+  one stream is refused now (the engine queues a reset for it, at `ERROR` once
+  and then quietly) while the tunnel keeps serving the streams it already had.
+  The refusal is a failure for the visitor that arrived at the wrong moment and
+  nothing for anyone else. The placement ceiling — 56 of those 64 streams —
+  keeps the case rare; this is what makes it survivable when it happens.
+
+- **A service can no longer be parked for good by one unanswerable request.**
+  The visitor accept loop pairs one connection at a time: it takes a visitor,
+  asks the client for a data channel, waits, forwards, and only then accepts
+  the next one. That wait had no bound, and a request the client cannot answer
+  never comes back at all — a pool at its placement ceiling refuses the open
+  and reports the refusal to nobody. One such visitor therefore stopped the
+  service from accepting anything, permanently, even after every stream had
+  been released and the pool was empty. It is reproducible without a
+  benchmark: saturate a pool, drain it completely, then connect — the fresh
+  visitor hung. The wait is a budget now (5 s) that asks again on expiry,
+  because capacity usually comes back and at most one visitor is waiting, and
+  only a visitor the client refuses five times in a row is dropped.
+
+- **The pool grows before it has to refuse.** Growth needed 80 % of a tunnel's
+  stream capacity — 51 of 64 — which a workload has to be shaped deliberately
+  to reach: the benchmark's own peak is 20-21 concurrent streams per service,
+  so the pool stayed at a single tunnel and everything queued behind it. It
+  grows at 12 % instead, once a tunnel carries seven streams, which is where
+  head-of-line blocking starts to show in the interactive stream.
+
+- **A forwarded connection that moves nothing in either direction is closed.**
+  A visitor whose stream wedged — the path recovered, the connection never did
+  — held that stream for the life of the session, because nothing released it,
+  and the pool had one less place to put a working visitor. A forward that
+  moves no bytes either way for 300 s is closed now, which releases the stream.
+
+- **The multiplex receive window is 32 MiB, not 64.** At 64 MiB a saturating
+  bulk transfer starved the engine's own window accounting, so `iperf3` ended
+  a completed transfer with `error - idle timeout for receiving data` and exit
+  1 — a finished measurement reported as a failed one. The boundary is
+  measured: 8, 16 and 32 MiB all finish with exit 0 on the same path, 64 MiB
+  does not, and the smaller window costs no throughput.
 
 ## [0.9.0] - 2026-09-25
 

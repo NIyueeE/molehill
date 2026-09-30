@@ -442,7 +442,7 @@ the wrong axis — telemetry showed it peaking at 2, because the harness dials
 visitors serially — but the *stream* threshold was miscalibrated: 80 % of the
 engine's cap is 51 streams, and every workload this project measures peaks below
 it (mixed soak 21, a 20-stream bulk test 20), so the rule could never fire. The
-threshold is now about how much one shared tunnel should carry (12 % of 64 = 8
+threshold is now about how much one shared tunnel should carry (12 % of 64 = 7
 concurrent streams), with `max_tunnels` bounding the result at ~32 streams per
 service — the same order as v0.9.1's four pre-opened channels.
 
@@ -584,8 +584,9 @@ Commit `d10e566` (+ its fixups). `shared_pool = false` keeps exactly today's
 per-service pool (asserted, not assumed); `true` serves every service of a
 session from one pool per carrier. Placement is least-loaded with the
 reservation charged before the first `await`, so back-to-back opens land on
-distinct tunnels while the pool has them. Growth: cold, load above 80 % of the
-pool's stream capacity, an open that waited too long, or the UDP floor. Shrink
+distinct tunnels while the pool has them. Growth: cold, load above 12 % of a
+tunnel's stream capacity as shipped (the sweep sections below record the
+threshold's history), an open that waited too long, or the UDP floor. Shrink
 only when the whole pool has no streams, no pending opens and no pinned peers
 and has been idle past `idle_timeout`, with a warm hold and a cooldown. A refused
 growth holds growth off (D14); a tunnel's death or a shrink releases the hold.
@@ -621,12 +622,13 @@ The fix has three parts, all in the pool:
 
 1. **`TUNNEL_STREAM_CEILING` (56) is a hard placement bound**, counting
    reserved-but-unfinished opens as well as established streams. It is
-   deliberately above the 80 % growth point (51): a pool that *can* grow always
-   grows before placement refuses, and a pool that cannot grow refuses one
-   visitor instead of costing every visitor on the tunnel.
-2. **Growth also fires per tunnel** (`tunnel_grow_at`, 80 % of the cap), not
-   only on the pool total. The total threshold scales with the pool and the
-   ceiling does not, so above size 1 the per-tunnel rule is the stricter one.
+   deliberately above the growth point (7 on the shipped cap): a pool that
+   *can* grow always grows before placement refuses, and a pool that cannot
+   grow refuses one visitor instead of costing every visitor on the tunnel.
+2. **Growth also fires per tunnel** (`tunnel_grow_at`, 12 % of the cap as
+   shipped), not only on the pool total. The total threshold scales with the
+   pool and the ceiling does not, so above size 1 the per-tunnel rule is the
+   stricter one.
 3. **A full pool waits, then refuses with a typed error.** `OpenError::
    AtCapacity` replaces a silent queue: the open waits up to `CAPACITY_WAIT`
    (250 ms) for a stream to retire — woken by the lease drop that frees it —
@@ -634,7 +636,7 @@ The fix has three parts, all in the pool:
 
 Also fixed on the way: `grow_threshold`'s per-tunnel share is now the unit-tested
 composition of the two bounds (`tunnel_ceiling`, `tunnel_grow_at`), so the
-ordering "growth 51 < placement 56 < engine 64" is asserted rather than
+ordering "growth 7 < placement 56 < engine 64" is asserted rather than
 implied.
 
 **Tests**: `tests/pool_test.rs` (8: shared pool serves two services, the
@@ -896,13 +898,72 @@ longer exists.
 
 A `v0.9.1` was tagged and published with only M0/M3/M4/M5, on the reasoning that
 the rest could wait. **It was withdrawn**: the GitHub Release and both tags
-(local and remote) were deleted, crates.io never received the version, and the
-branch went back into development. The mistake was not judging M1 large; it was
+(local and remote) were deleted, the GHCR image was removed, and the branch went
+back into development.
+
+**Correction (2026-09-27, found by the release review): crates.io *did* receive
+the version — and it is now yanked.** `molehill-rathole 0.9.1` was published
+(2026-09-26, 14 downloads): the tag push ran `release.yml`, which publishes to
+crates.io, and a crates.io version cannot be deleted, only yanked. This
+paragraph claimed the opposite ("crates.io never received the version") and was
+wrong; the withdrawal covered every surface except the one that cannot be
+un-published. `cargo install molehill-rathole` therefore resolved to the
+withdrawn build.
+
+**Fixed the same day** (a human action on crates.io, taken by the owner), and
+verified rather than assumed:
+
+```
+crates.io API  : 0.9.1  yanked=True
+sparse index   : yanked versions: 0.9.1 | installable max: 0.9.0
+cargo install  : Installed package `molehill-rathole v0.9.0`
+```
+
+Yank is the right primitive, not a compromise: it removes the version from
+resolution (so `cargo install` and `cargo add` cannot pick it) while a lockfile
+or an explicit `=0.9.1` pin still resolves, so nobody's build breaks, and it is
+reversible if the decision is ever revisited. The mistake was not judging M1 large; it was
 turning that judgement into a *release* without asking the person whose plan it
 is — a release is a deliberate act (AGENTS.md §5), and "continue the plan, then
 tag" is not a licence to redefine what the plan contains. The GHCR images were
 removed as part of the withdrawal (see the note above); the only trace left is
 this paragraph and the deleted-file history.
+
+## Release review — the state a reviewer should check
+
+Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
+
+- **PR**: #4, 33 commits, `mergeable=MERGEABLE`, CI **12/12 green** (four
+  platform builds, three feature-leg test jobs, full check chain, powerset,
+  docs alignment, musl static, minimal build size).
+- **Gates**: `just check` green (145 lib / 19 integration / 9 pool / 7 session /
+  2 log-budget); `just interop` 3/3; `just soak-check` `OK: no gate violation`;
+  `just tag-check` "pre-tag review passed for v0.10.0".
+- **Benchmarks**: `results-soak-v0.10.0.json` + four charts are in the release
+  commit, the README pair carries the same four-tool table, and the withdrawn
+  v0.9.1 file and charts are deleted.
+- **CHANGELOG**: the `[0.10.0]` section was audited against the cycle's commits
+  and five user-visible fixes were added (`899eb6f`).
+- **Container**: scratch from static musl, `bin/<arch>` for amd64 and arm64 from
+  the same feature set (`server,client,noise,hot-reload,multiplex,kcp`), `USER
+  1000:1000`, `--help` smoke test plus `imagetools inspect` in the workflow.
+- **Docs defaults** checked against their constants: `max_tunnels` 4,
+  `udp_workers` 2, `idle_timeout` 60, `max_tunnels_per_client` 0 (unlimited),
+  `shared_pool` false.
+- [x] **`v0.9.1` on crates.io is yanked** (2026-09-27, by the owner; verified
+  through the API, the sparse index and a real `cargo install`, see the incident
+  section). The verification installed `molehill-rathole 0.9.0` into
+  `~/.cargo/bin/molehill` to prove the resolution changed — it was uninstalled
+  afterwards, because a stale binary earlier on `PATH` than the workspace one is
+  exactly the provenance trap §10 exists for (the harness's own rebuild check
+  caught that same class of mistake during this cycle's sweep).
+- [ ] **The `[0.10.0]` changelog date is `2026-09-26`** (the day it was
+  prepared). The check only requires *a* date, but the release date is the day
+  the tag is pushed — set it then if that is a different day.
+- Observation, not a blocker: `release.yml` runs `cargo publish --allow-dirty`.
+  On a fresh checkout there is nothing dirty to allow, so it only matters if a
+  build step ever starts modifying the tree; dropping the flag would make that
+  impossible rather than permitted.
 
 ## Open threads for the next cycle
 
@@ -910,7 +971,7 @@ this paragraph and the deleted-file history.
   structural (first item in this file).
 - **M2b/M2c (S2, D28, D27)** — do not land on this data: the spread is zero and
   the UDP drop counters stayed at zero. Re-open with a *pool-size* question
-  (does growing earlier than 80 % help a mixed workload?) rather than a
+  (does growing earlier help a mixed workload?) rather than a
   placement question.
 - **The v3 server path** — kept only for old clients, and now dead weight: it
   must not acquire features, and removing it is a future cycle's work. It owns
@@ -931,9 +992,10 @@ this paragraph and the deleted-file history.
   replacing the python bench/test entries with `cargo-script` once it is stable,
   and QUIC (implemented and measured, parked in the `archive/transport-test`
   tag; revisit only for a UDP-only path or multi-stream loss isolation).
-- **`MOLEHILL_TCP_BUFFER_BYTES`** is referenced by a doc comment in
-  `src/stripe.rs` but implemented nowhere — a dangling reference to a switch
-  that no longer exists.
+- **`MOLEHILL_TCP_BUFFER_BYTES`** does not exist as a switch: its doc-comment
+  reference in `src/stripe.rs` is removed, and the name now survives only as an
+  illustration in the soak runner's `diag_env` list
+  (`benches/scripts/soak/lib.py`).
 
 ## Environment notes (this host, re-checked 2026-09-26)
 

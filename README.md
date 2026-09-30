@@ -80,13 +80,13 @@ questions about your workload; change one thing at a time and re-test:
    "noise"` and place the keys. No → keep `"plain"`.
 2. **One user or many, and how many concurrent connections?** A single
    long-lived session (SSH, one Minecraft player) → `direct` or the default
-   mux both work; mux saves NAT mappings at low concurrency too. When that
-   one stream must not be bounded by a single tunnel flow (bulk over one
-   session), set `[server.data] stripe_count` (K=4) — the connection then
-   rides K parallel data channels, at K× channels per visitor and a bounded
-   reorder buffer. Many users / churn / multiple services → keep or raise
-   `max_tunnels` (each tunnel carries ~64 concurrent connections before the
-   yamux ceiling — `max_tunnels = 8` ≈ 512).
+   mux both work; mux saves NAT mappings at low concurrency too. Many
+   users / churn / multiple services → keep or raise `max_tunnels` (each
+   tunnel carries ~64 concurrent connections before the yamux ceiling —
+   `max_tunnels = 8` ≈ 512). One connection can also be spread over K
+   parallel data channels with `[server.data] stripe_count`, but a 0.10
+   client is served unstriped today — see
+   [Configuration](docs/configuration.md).
 3. **What does the path look like, and do you forward UDP?** If TCP data
    tunnels are blocked or throttled, or you need latency-first UDP at high
    delay, A/B `carrier = "kcp"`. Otherwise keep the TCP carrier. For
@@ -155,11 +155,10 @@ drift axis (open fds, RSS and CPU slopes over the run) is in
 `soak-v0.10.0-udp.png` (a sliding loss *rate*, not a count of loss events).
 
 These are v0.10.0 numbers from one host. Only runs of the same model on the
-same host compare directly, and the host name is recorded in every results
-file: `just soak-check` reads it and refuses to gate one host's run against
-another's — for v0.10.0's baseline (v0.9.1, a different host) it reports the
-comparison as skipped and gates the run on its own completeness, endpoint and
-SLO checks instead. That boundary, and the release gate's verdict, are in
+same host compare directly, and every results file records the host it was
+measured on: `just soak-check` reads it, refuses to gate one host's run against
+another's, and gates each run on its own completeness, endpoint and SLO checks.
+Reading a chart, reproducing a run and the gate's verdict:
 [Benchmarks](docs/benchmarks.md). How to read a chart in detail (the log axis, the
 step lines, the wedge bars, what each band means), the stage schedule, the test
 types and how to reproduce a run on your own hardware:

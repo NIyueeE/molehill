@@ -22,7 +22,7 @@
 /// behind its own bulk data (HANDOFF.md).
 ///
 /// The rule is therefore about *how much one tunnel should carry*, not about
-/// how close it is to the engine's cap: 12 % of 64 is 8 concurrent streams,
+/// how close it is to the engine's cap: 12 % of 64 is 7 concurrent streams,
 /// which is where a shared tunnel starts to queue an interactive or control
 /// stream behind bulk traffic. The pool's own `max_tunnels` bounds the result
 /// (4 tunnels by default, ~32 concurrent streams per service — the same order
@@ -105,8 +105,9 @@ pub(crate) const OPEN_BUDGET: usize = 16;
 /// 56 leaves 8 slots of headroom: room for a stream the peer has not released
 /// yet (the engine drops a stream from its map on the *local* handle, so the
 /// two sides can disagree by a few during a teardown) and for the engine's own
-/// bookkeeping. It is deliberately above `grow_threshold`'s per-tunnel share
-/// (51), so the growth rule fires before placement ever reaches it.
+/// bookkeeping. It is deliberately above the growth rule's per-tunnel
+/// threshold (`tunnel_grow_at`, 7 on the shipped cap), so the growth rule
+/// fires long before placement ever reaches it.
 ///
 /// The ceiling is a *soft* bound in the sense that reaching the engine's cap is
 /// no longer fatal: `mux/connection.rs` refuses the stream that would cross it
@@ -122,8 +123,9 @@ pub(crate) const TUNNEL_STREAM_CEILING: usize = 56;
 /// ([`TUNNEL_STREAM_CEILING`], the one that caps one tunnel's concurrency for
 /// any engine cap) and a proportional headroom for a cap small enough that the
 /// absolute one would not leave any. The headroom is an eighth of the cap, at
-/// least one stream, which is deliberately under [`tunnel_grow_at`]'s four
-/// fifths: growth must fire before placement refuses, whatever the cap.
+/// least one stream, which leaves the proportional ceiling well above
+/// [`tunnel_grow_at`]'s 12 %: growth must fire before placement refuses,
+/// whatever the cap.
 #[must_use]
 pub(crate) fn tunnel_ceiling(stream_cap: usize) -> usize {
     let headroom = (stream_cap / 8).max(1);
@@ -146,7 +148,7 @@ pub(crate) const CAPACITY_WAIT: std::time::Duration = std::time::Duration::from_
 pub(crate) enum GrowReason {
     /// The pool had no tunnel and a service asked for one.
     Cold,
-    /// Every tunnel is at or above `GROW_AT_STREAM_FRACTION` of its cap.
+    /// Every tunnel is at or above `GROW_PERCENT` of its cap.
     Load,
     /// An open waited longer than `OPEN_WAIT_BUDGET`.
     Wait,
@@ -247,13 +249,13 @@ pub(crate) fn order_candidates(loads: &[TunnelLoad], start: usize) -> Vec<usize>
 /// The stream-cap headroom the grow rule uses: `size * cap * fraction`.
 ///
 /// The threshold is compared against the pool's *total* usage, which is
-/// exactly "every tunnel is at least `GROW_AT_STREAM_FRACTION` of its cap"
+/// exactly "every tunnel is at least `GROW_PERCENT` of its cap"
 /// once placement has spread the load the way it does — and unlike a
 /// per-tunnel comparison it stays reachable for a tunnel the pool just added.
 pub(crate) fn grow_threshold(size: usize, stream_cap: usize) -> usize {
     // The pool size and the stream cap are small counters; this is the
-    // integer form of `size * cap * 80 / 100`, with the fraction's own
-    // precision (0.8 is not exact in binary) immaterial at these magnitudes.
+    // integer form of `size * cap * 12 / 100`, with the fraction's own
+    // precision immaterial at these magnitudes.
     size * stream_cap * GROW_PERCENT / 100
 }
 

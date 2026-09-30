@@ -84,10 +84,10 @@ const STRIPE_GROUP_TTL: Duration = Duration::from_secs(60);
 /// Environment override for the server's stripe count (multiplex builds
 /// only).
 ///
-/// Same pattern as `MOLEHILL_TCP_BUFFER_BYTES`: an opt-in switch for
-/// measurements (the bench sets it per arm) that never enters the config
-/// surface. An unparsable or out-of-range value is ignored with a warning,
-/// so a typo degrades to the configured count instead of the data path.
+/// An opt-in switch for measurements (the bench sets it per arm) that never
+/// enters the config surface. An unparsable or out-of-range value is ignored
+/// with a warning, so a typo degrades to the configured count instead of the
+/// data path.
 #[cfg(feature = "multiplex")]
 pub const STRIPE_COUNT_ENV: &str = "MOLEHILL_STRIPE_COUNT";
 

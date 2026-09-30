@@ -85,9 +85,9 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 32 * 1024 * 1024;
 /// window pins every stream at 256 KiB — measured 0.1 Gbps at 10 ms RTT,
 /// a ~30x drop — so the pairing with `DEFAULT_MUX_RECEIVE_WINDOW` is
 /// guarded by a unit test (the reservation must stay under half the
-/// window). 32 streams reserve 8 MiB of the 64 MiB window; 64 reserve
-/// 16 MiB and still leave 48 MiB (75%) auto-tunable, while doubling the
-/// per-client connection ceiling at the default `count = 4` (128 -> 256).
+/// window). 64 streams reserve 16 MiB of the 32 MiB window and still
+/// leave 16 MiB (50%) auto-tunable, while doubling the per-client
+/// connection ceiling at the default `max_tunnels = 4` (128 -> 256).
 /// Measured on the `mux1` arm across the full matrix: see HANDOFF.md,
 /// "Phase 4: L2 landed".
 #[cfg(feature = "multiplex")]
