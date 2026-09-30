@@ -157,7 +157,7 @@ the selector reject it and the client falls back to a full handshake
 
 Measured on this host (release build, in-process pair over a duplex, the
 default pattern): the full handshake plus the ticket exchange costs
-~451 us per pair, a resumed exchange ~39 us — the handshake's key
+442.7 us per pair, a resumed exchange 38.5 us — the handshake's key
 exchanges are ~97% of the setup CPU, and resume removes them. The
 remaining cost is symmetric crypto plus two round trips.
 

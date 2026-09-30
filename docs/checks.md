@@ -168,9 +168,11 @@ yesterday's protocol.
 `benches/scripts/interop/fetch_old.py` downloads the newest release (asset for
 this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
 release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
-`cargo test --test interop_test`. Three cases: old server + new client forwards
-traffic, new server + old client forwards traffic, and an old server refuses an
-unknown dialect on that one connection yet keeps serving valid clients.
+`cargo test --test interop_test`. Three cases, all of them about a refusal
+being *local*: an old server refuses the new client's dialect, a new server
+refuses the old client's dialect (v0.10 serves v4 only), and an old server
+refuses an unknown dialect — each on that connection alone, while the same
+process keeps serving a client of its own version.
 
 It is **not** part of `just check` or CI: it needs network access and a GitHub
 release asset, and a CI runner has neither the previous release nor a reason to

@@ -189,8 +189,10 @@ code-level.**
   wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
   still in development it is still being defined, so commands may be extended
   **in place** under that number; once the tag exists, the next change to the
-  wire is the next number. The line so far: 0.6–0.7 v2, 0.8–0.9 v3, 0.10 v4
-  (verified from each tag's `CURRENT_PROTO_VERSION`).
+  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
+  — the first three read off each tag's `CURRENT_PROTO_VERSION`, 0.10 off
+  `src/protocol.rs` at HEAD, because the tag that would confirm it does not
+  exist yet.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -453,10 +455,14 @@ Details that agents need constantly:
 - **Unsafe is denied crate-wide** (`unsafe_code = "deny"`): the one module
   that needs it — `src/transport/udp_batch.rs`, the `recvmmsg`/`sendmmsg`
   batching FFI — opts in per item with `#[expect(unsafe_code, reason = ...)]`
-  and a `// SAFETY:` comment, and `src/mux.rs` forbids it outright. Every other
-  waiver in the tree is an `#[expect]`, so `-D warnings` (which denies
-  `unfulfilled_lint_expectations`) fails the build on a stale one — verified,
-  not assumed.
+  and a `// SAFETY:` comment, and `src/mux.rs` forbids it outright. Every
+  waiver in the tree is an `#[expect]` but one — `KcpStream::datagram_bytes` in
+  `src/transport/kcp.rs` keeps an `#[allow(dead_code, reason = ...)]`, because
+  its only reader is the netns test and a `#[cfg(test)]` gate would cascade
+  into the field, the constructor parameter and the pump (the one case §2 keeps
+  the `allow` for). The norm is still `#[expect]`, so `-D warnings` (which
+  denies `unfulfilled_lint_expectations`) fails the build on a stale one —
+  verified, not assumed.
 - **Bench/test entries are PEP 723 python scripts run via `uv run`** (no
   shell test entries; see docs/release.md). They are linted *and*
   format-checked by ruff (`ruff.toml`) in the pre-commit gate — fix the code,

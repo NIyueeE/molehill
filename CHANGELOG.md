@@ -84,11 +84,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pays the setup per service on first use instead of holding a tunnel for each
   one for its whole lifetime.
 
-- **BREAKING (protocol v4)**: the client speaks protocol v4 now, so **upgrade
-  the server first, or both ends together** — a v0.9.0 server cannot serve a
-  v0.10.0 client (it fails its own version check and closes the connection, and
-  the client says so and stops instead of retrying into the void), while a
-  v0.10.0 server still serves a v0.9.0 client. What the dialect buys: one
+- **BREAKING (protocol v4)**: the client speaks protocol v4 and the server
+  serves v4 only, so **upgrade both ends together** — there is no compatibility
+  window in either direction: a v0.9.0 server cannot serve a v0.10.0 client,
+  and a v0.10.0 server refuses a v0.9.0 client's hello. Each side refuses the
+  other's dialect on the connection it happens on and sends nothing back, the
+  side that refused names the version it expected, and the client stops instead
+  of retrying into the void. Both directions are pinned against the released
+  v0.9.0 binary by `just interop`; the migration note is in
+  `docs/configuration.md`, "Upgrading to 0.10 (protocol v4)". What the dialect
+  buys: one
   control session per endpoint carries *every* service that dials it, each
   service proving its own credential, so a service the server refuses — a port
   outside `allow_ports`, a token that is not the server's — is rejected on its
@@ -541,14 +546,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   *And the run now states its own noise.* The schedule measures `clean` at both
   ends of every timeline, so every run contains a replicate of one condition
-  about an hour apart. `just soak-check` reports that spread per tool — 21.73 to
-  23.80 Gbit/s for molehill, 1.2 % for frp — and it is the scale a between-tool
+  about an hour apart. `just soak-check` reports that spread per tool — 18.83 to
+  20.48 Gbit/s for molehill, 0.4 % for frp — and it is the scale a between-tool
   difference has to clear. It is reported, never judged: variance is data, and
-  a threshold on it would be invented. Applied to this release's numbers it
-  corrects what the README previously implied: on the clean path molehill and
-  rathole are **indistinguishable** in throughput, because their replicate
-  ranges overlap, while frp is 3.2x behind and molehill's clean latency is 10x
-  better than rathole's. See `docs/benchmarks.md`, "Comparability".
+  a threshold on it would be invented. Applied to this release's numbers, the
+  clean path reads molehill 18.8-20.5 Gbit/s against rathole's 17.6-18.0:
+  ranges that do not overlap, but a gap inside molehill's own replicate spread,
+  so this run does not separate them either; frp is 3.1-3.4x behind, and
+  molehill's clean latency (7.6-8.4 ms) is an order of magnitude better than
+  rathole's (77.4-77.7 ms). See `docs/benchmarks.md`, "Comparability".
 
 - **A `client`-only build compiles again, and so does `client,kcp`.** Two
   `#[cfg]` gates were left behind when the v3 path was deleted, both by

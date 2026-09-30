@@ -102,7 +102,12 @@ writes the tests it completed.
 1. `just interop` — the interop matrix ([checks.md](checks.md#outside-the-chain-the-interop-matrix-just-interop)):
    this build against the previous release's binary. A wire-format change first
    meets a real old peer here, and nowhere else, so run it **before** the sweep
-   — it is seconds, and a rejection means the release is not ready.
+   — it is seconds. What it asserts is that both cross-version directions
+   **refuse** each other on the connection it happens on, and that the refusing
+   process keeps serving a peer of its own version. For a v4-only release that
+   refusal *is* the expected result: a matrix that starts forwarding across
+   releases, or one whose refusal is not local, is what means the release is not
+   ready.
 2. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
 3. `just soak --test=rrul,capacity --tools molehill,frp,rathole,nps
    --out benches/scripts/soak/results-soak-vX.Y.Z.json`

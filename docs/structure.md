@@ -14,9 +14,10 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `Cargo.toml` | crate manifest; `[lints]` is policy documented in [lint-policy](lint-policy.md) |
 | `Cargo.lock` | locked dependency graph (committed; verified with `--locked` in CI builds) |
 | `build.rs` | build metadata injection via vergen (git SHA, timestamp, features, target) |
-| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `soak` / `soak-peers` / `soak-plot` / `soak-check` / `container` |
+| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `interop` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `soak` / `soak-peers` / `soak-plot` / `soak-check` / `container` |
 | `rust-toolchain.toml` | `channel = "stable"` + clippy/rustfmt components; never hardcode versions |
 | `deny.toml` | cargo-deny policy: licenses, bans, advisories (pre-push + CI) |
+| `ruff.toml` | ruff configuration for the python bench/test entries: the lint set and the repo-wide waivers (see [lint-policy](lint-policy.md)) |
 | `.editorconfig` | editor defaults (4-space Rust, 2-space YAML/TOML, md keeps trailing spaces) |
 | `AGENTS.md` | repository rules for AI agents and humans; entry point for every session |
 | `HANDOFF.md` | current working state, decisions, open threads — read after AGENTS.md |
@@ -69,10 +70,13 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `tests/pool_test.rs` | the tunnel pool end to end: a shared pool serving two services, the per-service default, UDP source-port stickiness across a grow/shrink, the first visitor after the pool shrank, a burst spreading over tunnels while it is placed, an unanswerable visitor not parking the service, the valve refusing growth without killing the tunnel, and the opt-in telemetry lines from a real binary |
 | `tests/session_test.rs` | the v4 server contract driven by a hand-written v4 client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
 | `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
-| `tests/interop_test.rs` | this build against the previous release's binary: the old client still forwards, the old server refuses the new dialect and the new client says why, an unknown dialect is refused on that connection alone (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
+| `tests/interop_test.rs` | this build against the previous release's binary: each side refuses the other's dialect on that connection alone (v0.10 serves v4 only), an unknown dialect is refused the same way, and a refusing process keeps serving a peer of its own version (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
+| `tests/hot_reload_test.rs` | the config watcher against a real binary: a changed file reaches the running service |
+| `tests/noise_keys_test.rs` | `--genkey` and the Noise key/PSK paths end to end, including the refusal when a key does not match |
+| `tests/startup_failure_test.rs` | a process that cannot serve its instance ends instead of running deaf |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the session cases, the control-channel teardown case, valid/invalid configs |
-| `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`) |
+| `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`), the interop fetcher (`scripts/interop/fetch_old.py`), the UDP stress probe (`scripts/udp_stress.py`) |
 | `docs/configuration.md` (Complete examples / Deployment) | ready-to-run configs and systemd/container deployment files, as code blocks (previously the `examples/` directory) |
 | `docs/benchmarks.md` (+ `.zh.md`) | how the published numbers are produced, read and reproduced — the home of the benchmark method |
 | `docs/` | documentation set — one owner per topic, everything else links (see below) |

@@ -26,17 +26,28 @@
 > **Update 2026-09-29.** The dead bulk spine is fixed: the drain was reading
 > `tc`'s backlog wrong, the spine had a single dial, and the drain budget was
 > shorter than the 106 s flush it waits for. All three are in "The dead bulk
-> spine: three defects, and what the third one is not", and the sweep they
+> spine: four defects, one retraction", and the sweep they
 > produced carries all 32 tool-stages. Two earlier diagnoses recorded here —
 > tunnel liveness, and the backend leg — were **falsified by measurement** and
 > are retracted in place.
+>
+> **Update 2026-09-30 (pre-merge).** The branch's CI was red at `b996d24` in
+> four jobs — two real defects (a `multiplex`-only fixture loaded by the
+> feature-reduced test leg; an oversized UDP datagram read as a dead socket on
+> Windows) plus a matrix that cancelled its other platforms and a cache key it
+> could not accept. All four are fixed in "Pre-merge triage", together with the
+> dependency refresh that clears `cargo outdated` and what it cost in
+> duplicate-version warnings. **The sweep in the tree is superseded**: those
+> fixes change `src/`, `Cargo.toml` and `Cargo.lock`, so the tag's drift check
+> now demands a re-sweep on the frozen commit. Order: freeze → sweep → docs
+> (changelog date, PR body) → merge → tag.
 
 ## Fixed: striping with the elastic pool
 
-**The stripe livelock had two causes, both fixed.** The quarantine above
-(a v4 session served unstriped, `striped_data_channels` `#[ignore]`d) is
-lifted: the test runs in the suite now and the server serves
-`stripe_count > 1`.
+**The stripe livelock had two causes, both fixed.** The earlier quarantine
+(a v4 session served unstriped, `striped_data_channels` `#[ignore]`d — see the
+archived records) is lifted: the test runs in the suite now and the server
+serves `stripe_count > 1`.
 
 1. **The gather never asked for its channels.** A v4 registration opens no
    data channels of its own — the tunnel pool starts cold and the server
@@ -199,11 +210,12 @@ has no initial size: it starts cold and grows on demand.
 
 ## Measurement records (v0.10.0 cycle)
 
-**Archived.** Every measurement record this cycle produced — M1 (protocol v4),
-the stream-cap leak investigation, M2a, M6, M7, the S1 placement observation,
-both post-review rounds, the cycle's four sweeps and the CI-verification
-incident — lives in git history in the revision *before* the one that archived
-it (`f2156de chore(release): re-sweep v0.10.0 on the release commit`):
+**Archived, then reopened.** The records this cycle produced *up to the
+2026-09-28 freeze* — M1 (protocol v4), the stream-cap leak investigation, M2a,
+M6, M7, the S1 placement observation, both post-review rounds, the cycle's four
+sweeps and the CI-verification incident — live in git history in the revision
+*before* the one that archived them (`f2156de chore(release): re-sweep v0.10.0
+on the release commit`):
 
 ```
 git show f2156de^:HANDOFF.md
@@ -213,8 +225,11 @@ Named by revision rather than by the `v0.10.0` tag on purpose: the tag lands on
 a commit that already carries this shortened page, so `git show
 v0.10.0:HANDOFF.md` returns the index, not the records.
 
-Per this file's own rule (kept verbatim below the historical-records index) those
-records say what the branch's authors believed at the time and why a decision
+The sections that follow this one were written *after* that archive — the
+pre-merge triage, the frozen-commit sweep and the release review — so they are
+live records, not archived ones; read them as the current state. Per this
+file's own rule (kept verbatim below the historical-records index) any *archived*
+record says what the branch's authors believed at the time and why a decision
 was taken; **no number in them may be quoted as a measurement of the current
 code, compared against a Soak result, or used to gate anything.** The live
 numbers are the sweep record for the release commit, in "Release (v0.10.0)"
@@ -248,13 +263,152 @@ below. What each archived record settled, so it can be navigated:
    rathole's baseline). `githooks/pre-tag` reads the results file's recorded
    revision and now passes: docs, assets and the artifact itself may follow a
    sweep, code may not.
+   **Superseded (2026-09-30):** the pre-merge triage below changed `src/`,
+   `Cargo.toml` and `Cargo.lock`, so that artifact no longer described the
+   release commit and the drift check would have failed the tag. **Re-swept on
+   the frozen commit** — `746a413`, `OK: no gate violation`, no waiver; the
+   record is "Release sweep on the frozen commit" below, and it is the artifact
+   the README and the charts now carry.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
-   `just tag-check` must be run on the release commit (it now passes — the
-   artifact is measured at `c265af3` and only docs/assets followed).
+   `just tag-check` must be run on the release commit. The sweep above is
+   measured at `746a413`; **only docs and assets may follow it** — the
+   changelog date and the README numbers do, anything under `src/`, `tests/`,
+   `Cargo.*` or `benches/scripts/soak/*.py` does not.
 4. `just check`, `just interop`, then push the branch and open the PR. (The PR
    exists and is re-green after each push.)
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
+
+### Pre-merge triage (2026-09-30): the branch's CI was red
+
+Found while preparing the merge: the PR's CI run at `b996d24` was **red**, in
+four jobs, all of them this branch's own defects — `just check` on Linux with
+default features cannot see any of them, which is exactly what the matrix jobs
+are for. All are fixed; none of them is a product regression on the code paths
+the sweep measured except where noted.
+
+1. **`test noise` — the striped v4 scenario loads a `multiplex`-only config.**
+   `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
+   starts `tests/for_tcp/session_v4_striped.toml`, which sets
+   `[server.data] stripe_count` — and `ServerDataConfig` is `#[cfg(feature =
+   "multiplex")]`, so the leg without that feature failed to parse the fixture
+   ("unknown field `data`") before the scenario ran. The scenario and its three
+   constants are now gated on the feature, the way `integration_test.rs` gates
+   its multiplex scenarios. Verified locally in the same feature set: 7 passed,
+   0 failed.
+2. **`build x86_64-pc-windows-msvc` — an oversized UDP datagram killed the
+   service.** `udp_buffer_size` promises truncation, and POSIX delivers it
+   (the kernel fills the buffer and returns its length). Windows fills the same
+   buffer with the same prefix but returns `WSAEMSGSIZE` (10040) — `mio`
+   documents that split in its `net` module notes — and both receive paths
+   treated that error as fatal: the server's UDP pool died (the client was told
+   the service was no longer exposed) and the client's per-peer forwarder broke
+   on an oversized backend reply. Fixed at both sites: the server reads a
+   whole-datagram buffer and applies the limit to what it read, because a
+   failed `recv_from` is also where the visitor's address is lost; the client's
+   connected socket reads the error as the full buffer it stands for
+   (`common::helper::datagram_len`, with unit tests for the translation).
+   `udp_buffer_size_bounds_a_datagram_without_breaking_the_channel` is the test
+   that caught it and now pins both halves — **CI is the only place it can be
+   verified from this host**, so that job is the evidence to watch on the next
+   push, not the local run.
+3. **The Linux and macOS `build` legs were not failing — they were
+   cancelled.** The matrix had the default `fail-fast`, so the Windows failure
+   cancelled the two in-flight legs, which reads like a platform verdict and is
+   not one. `fail-fast: false` now, so a run answers "does every platform
+   build?" instead of "which platform failed first?".
+4. **The feature-matrix legs never had a cache.** `Swatinem/rust-cache`
+   rejected the key ("cannot contain commas") because it was built from
+   `matrix.args`; the key is `matrix.name` now.
+
+**Dependency refresh (its own commit, per AGENTS.md §9).** `cargo outdated
+--root-deps-only` is clean ("All dependencies are up to date"), which needed
+two breaking bumps, not just the compatible ones: `base64` 0.22 → 0.23 (API
+unchanged for `Engine`/`STANDARD`) and `chacha20poly1305` 0.10.1 → 0.11
+(`aead` 0.6: `AeadInPlace` → `AeadInOut`; `Key::from_slice`/`Nonce::from_slice`
+are deprecated in favour of the infallible `From<[u8; N]>`, which is what the
+resume path now uses; the `std` feature no longer exists — `alloc` is the
+equivalent). The Noise resume tests, `noise_keys_test` and the 20 lib noise
+tests all pass on the new generation.
+
+**What the refresh cost, measured.** `cargo deny`'s duplicate-version warnings
+went 22 → 28 groups, and all six new ones (`aead`, `chacha20poly1305`,
+`cipher`, `inout`, `poly1305`, `universal-hash`) are the same fact: **snow
+0.10.0 pins the 0.10 RustCrypto generation**, so our 0.11 sits beside it. The
+`license-not-encountered` warning is gone (the `BSD-2-Clause` allowance no
+dependency used was removed from `deny.toml`). The one warning that stays is
+the `chacha20@0.10.1` yanked advisory waived in `deny.toml` — still correct:
+`rand` 0.10.3 (the newest) and `chacha20poly1305` 0.11 both require
+`chacha20 ^0.10`, so no manifest of ours can remove it. Two ways to trade the
+six new warnings back, if a later cycle wants them: keep our AEAD on 0.10.1
+(one generation in the tree, but our direct dep is then a version behind), or
+drop snow's `default-resolver-crypto` (the ring resolver carries the ciphers;
+the handshake hash still needs the pure-Rust one) — the second is a real change
+to the Noise backend and needs its own verification, not a cleanup commit.
+
+**The changelog's upgrade instruction was wrong, and `just interop` is how that
+was settled.** The `[0.10.0]` section still carried the sentence the v4 *client*
+commit wrote — "a v0.10.0 server still serves a v0.9.0 client" — and advised
+upgrading the server first. `df4f2e5` had already dropped the v3 server path,
+and `docs/configuration.md` said so; the two pages disagreed. Run against the
+released v0.9.0 binary, `just interop`'s three cases pass and name the truth:
+`new_server_refuses_old_client_and_keeps_serving` and
+`old_server_refuses_new_client_and_says_so`. The changelog now states that both
+ends refuse each other's dialect, points at the configuration page for the
+migration, and the wrong advice ("server first") is gone. This is the item the
+pre-tag checklist's "CHANGELOG audit" exists to catch — a grep would not have:
+both pages read plausibly on their own.
+
+**The ordering consequence.** The release checklist above was written when the
+last sweep was the last code change. It is not any more: the triage touches
+`src/`, `Cargo.toml` and `Cargo.lock`, so `just tag-check`'s drift check will
+fail the tag until a sweep is measured on the frozen commit. Freeze → sweep →
+docs (changelog date, PR body) → merge → tag.
+
+### Release sweep on the frozen commit (2026-09-30, `746a413`)
+
+`v0.9.0-131-g746a413`, tree clean, `stale: false`, binary sha256
+`1c1e3a6574a54803` (4 181 840 bytes), host `3f8b4508ab91` / host_id
+`d764f9da9c7e5b2a` (the same host as the `fb2542a` sweep), calibration
+416.9 MiB/s, loopback probe 21.46 Gbit/s, `shape_legs=visitor`,
+`rate_socket_window=256K`, four tools, 8/8 stages each plus the capacity ramp,
+`--test=rrul,capacity`, ~55 minutes. **`just soak-check`: `OK: no gate
+violation`**, no waiver. Charts re-rendered and both READMEs refilled from the
+plot's own tables.
+
+| tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | ramp |
+|---|---|---|---|---|---|---|---|
+| molehill | 18.830-20.482 | 8.1 % | 7.6-8.4 | 9.717 | 0.100 | 0.019 | 8/8, never broke |
+| frp | 6.036-6.058 | 0.4 % | 2.8-2.9 | 5.709 | 0.100 | 0.019 | 8/8, never broke |
+| rathole | 17.585-17.986 | 2.2 % | 77.4-77.7 | 9.692 | 0.100 | 0.019 | 3/8, broke at 4 (err 0.006 > 0.005) |
+| nps | 0.133-0.135 | 1.8 % | 66.4-68.1 | 0.139 | 0.100 | 0.019 | 0/8, broke at 1 (p99 205.0 > 50) |
+
+Four things this run is worth reading for:
+
+- **It is the first sweep on the triage code**, so it also measures that the UDP
+  fix and the dependency bump cost nothing on the paths the schedule exercises.
+- **Molehill's replicate spread is 8.1 % this time** (0.7 % at `fb2542a`), which
+  is larger than the molehill-vs-rathole clean gap (4.5 %): the README now says
+  the two ranges do not overlap but that this run cannot separate them, instead
+  of the previous run's "27 % apart". That is what the replicate instrument is
+  for, and it is why no clean-throughput claim is published off one run.
+- **Rathole's ramp broke at load 4** (~20.1 Gbit/s offered, interactive error
+  rate 0.63 %) where the `fb2542a` sweep carried all 8 — the ramp's ceiling is 8
+  streams, and a peer that reaches it reads as a floor, not a maximum.
+- **All four arms' `jitter` stage carries no bulk reading** (96-100 % of its
+  intervals read zero bytes and the dial produced no receiver summary), so it is
+  printed as `— †` with the reason, as before; `rate20` reads the shaper's
+  0.019 Gbit/s on every arm.
+
+**Two provenance notes.** The first attempt of this sweep was **aborted by the
+harness's own warning** — `target/release/molehill` predated the triage commits,
+so its numbers would have described code that no longer exists; the binary was
+rebuilt (the sha256 above) and the run restarted, which is the §10 rule doing its
+job rather than a human catching it. And `just soak-peers` could not refresh the
+peers (GitHub API `403 rate limit exceeded`), so the run used the cached release
+binaries fetched 2026-09-27 — frp 0.71.0, rathole 0.5.0, nps 0.26.10, the same
+versions the previous sweeps of this cycle compared against, recorded in the
+results meta.
 
 ### Release sweep (2026-09-29)
 
@@ -1263,6 +1417,14 @@ budget, as the 2026-09-29 record explains.)
 
 ## Open threads for the next cycle
 
+- **Replacing the `udp_batch` FFI waivers (`quinn-udp`) is an A/B, not a cleanup.**
+  `docs/lint-policy.md` ("Unsafe") records why the eight `unsafe_code`
+  expectations in `src/transport/udp_batch.rs` are hand-rolled rather than taken
+  from `quinn-udp`: the crate removes them, but it also brings GSO/GRO
+  segmentation, i.e. it changes the KCP send path's syscall shape. That is a
+  measurable change to a data path, so it belongs in its own
+  `just soak --test=screen` run against the current batching, not in a lint
+  cleanup.
 - ~~**The stripe group command**~~ — **landed** (`CreateDataChannelForStripe`,
   part of v4, whose release is still in development, so the dialect is still
   being defined — AGENTS.md §5). One design

@@ -317,8 +317,8 @@ Stated so a reader does not ask a chart for something it never measured:
   schedule visits once. The schedule visits `clean` twice (the run's own
   replicate, reported by `just soak-check`), and the shaped classes' repeatability
   was measured separately: three runs of one unchanged method moved a shaped p99
-  cell by 5-24 % and a shaped bulk cell by 0.2-3 % on this host (HANDOFF.md,
-  "Shaped-cell resolution"). A cross-run difference smaller than the class's own
+  cell by 5-24 % and a shaped bulk cell by 0.2-3 % on this host. A cross-run
+  difference smaller than the class's own
   spread is not resolvable by one pair of runs — that is what the `screen`
   interleave is for, and it is why `soak-check` refuses a difference verdict on a
   shaped stage at all (see Comparability).
@@ -343,10 +343,11 @@ Stated so a reader does not ask a chart for something it never measured:
 
 The elastic pool's own thresholds — grow at 12 % of a tunnel's stream capacity
 (7 of 64), refuse placement at 56, reap a forward that moves nothing for 5
-minutes — are internal constants, not settings: their calibration (the
-two-stage reproduction that found the growth rule's threshold, and the sweep
-records) is in HANDOFF.md, and they change only with a measurement behind
-them.
+minutes — are internal constants, not settings, and they change only with a
+measurement behind them: the growth threshold came out of a two-stage
+reproduction (a pool that never grew past one tunnel because the rule needed
+51 of 64 streams, where the workloads peak at 20-21), and each was re-checked
+against the sweeps that followed.
 
 These figures are from the **retired per-cell model** (the v0.8.x method: one
 cold-started average per tool per network condition, reported as a median over
@@ -384,8 +385,9 @@ drops (its own socket buffer throttles it at ~29.8k datagrams/s), many visitors
 saturate the pool at ~1 Gbit/s regardless of `udp_workers` (1.14 / 1.00 / 0.98 at
 1 / 2 / 4) or visitor count, the spread stays even, and the drops equal the
 excess over that ceiling to within 0.07 %. The number a user needs is on the
-configuration page beside `udp_workers`; the full record is HANDOFF.md, "D27's
-evidence, measured".
+configuration page beside `udp_workers`. The probe behind it is
+`benches/scripts/udp_stress.py`; run it the same way to reproduce the ceiling on
+your own host.
 
 ## Comparability
 
@@ -457,8 +459,9 @@ evidence, measured".
   5-24 % (and the two-leg scope's by up to 48 %) against the 25 % limit the gate
   applies to a per-stage p99. So the gate *reports* a shaped stage's number and
   fails only a blow-up (3× or more), and the README marks those columns as
-  context instead of picking a winner in them. The measured per-class spread and
-  the command that produced it are in HANDOFF.md, "Shaping scope, the rate cells, and the shaped-cell rule".
+  context instead of picking a winner in them. Per class, the spread was
+  measured by re-running one unchanged method three times: a shaped p99 cell
+  moves by 5-24 % and a shaped bulk cell by 0.2-3 %.
 - **A stage that carried no reading says so, with the reason.** `— (reason)` in
   the plot's table, and `bulk_gbps_source` in the results file, distinguish "the
   path carried nothing" from "nobody could measure what it carried". A bare
