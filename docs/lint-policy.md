@@ -108,7 +108,10 @@ a stale signature), `PTH` (these scripts build and read paths constantly),
 `E501` (the formatter wraps code but not a docstring or a URL, and one had
 drifted to 94 characters), `DTZ` (a naive datetime in a run record cannot be
 compared to another run's), `TID` (a relative import would break the
-`uv run <script>` entry shape), and the already-clean
+`uv run <script>` entry shape), `C901` (cyclomatic complexity, default limit
+10 — the two functions over it were split rather than waived, and both splits
+were checked to leave stdout and exit codes byte-identical on recorded
+fixtures), and the already-clean
 `RET`/`C4`/`N`/`FA`/`FLY`/`PERF`/`PIE`/`PGH`/`LOG` families as guards for
 future edits. `TRY`/`EM`, `ANN`, `T20` and `COM812` are deliberately **not**
 selected, with the reasoning recorded in `ruff.toml` itself: the first two

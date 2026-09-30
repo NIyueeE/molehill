@@ -103,6 +103,20 @@ produced it. So is the shaping applied to each class — including the rate
 stages' queue depth (`rate`/`limit 2000`), which bounds how much traffic the
 shaper may hold and therefore what a burst through it can do.
 
+**A class is applied to the visitor's leg** — the ports the workload dials on
+the tool's exposed side — plus, for the KCP carrier, the tunnel's own UDP port,
+the one tunnel the harness can name on the wire. The tool's backend leg (the
+client process to the backend it forwards to) stays unshaped, because a real
+deployment's WAN is on the visitor's side and the backend is next to the tool.
+Shaping both legs was the model until 2026-09-29 and it is not the same
+measurement: one HTB class serves both legs, so a `rate100` class carried
+100 Mbit *in total* — all four tools read ~42 % of the nominal rate end to end
+— and every injected delay was paid twice, which is why a `rtt100` stage's
+interactive floor read 802 ms then and 401 ms now (a fresh connection per ping
+pays the one-way delay twice: handshake and request). `SOAK_SHAPE_LEGS=both`
+restores the old scope for reproducing a run measured under it; the value a run
+used is in its `meta.shape_legs`.
+
 A stage does not start until the previous one has gone quiet. The boundary
 kills the bulk client, and a killed TCP socket keeps delivering what its
 kernel side still holds — and keeps retransmitting its FIN through whatever
@@ -113,14 +127,59 @@ stage its first tens of seconds. Measured with **no tool in the path at all**
 (htb + netem on `lo`, 20 bulk streams killed as the qdisc changed): a fresh
 connect timed out after 10.5 s and the next round trip took 3.5-6.7 s,
 reaching the steady state only ~15 s in. So the harness waits, at the *old*
-shaper, until the tool's netem queue has been empty **and** its throughput port
-has had no established connection, both for two consecutive polls, bounded by
-`SOAK_DRAIN_BUDGET` (30 s) — and only then applies the next stage's shaping.
-Three predicate variants were measured in the 2026-09-28 cycle and this is the
-one that produced a `rate20` spine; the two that read better on paper are
-recorded in `Shaper::_busy_sockets`, so the choice is not re-derived by guess.
-The wait is not part of any stage's window, and an expired budget is logged
-rather than absorbed. For the same reason the single-test `iperf3` backend is
+shaper, until the path is quiet by two measurements — no more than a frame's
+worth queued (`64 KiB`, one `lo` MTU) **and** no socket on the throughput port in
+a state that can still send (`ESTAB`, `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`,
+`SYN-RECV`) — both holding for two consecutive polls, and only then applies the
+next stage's shaping. `SOAK_DRAIN_BUDGET` (180 s) is a **safety net, not the
+mechanism**: the wait ends on the predicate, and a budget that fires is logged
+and recorded rather than absorbed.
+
+Both halves are tolerances for a measured reason. The queue never reaches zero,
+because the interactive, churn and UDP probes share the tool's class and leave
+~1.2 KB in it permanently; a drain that waits for an exactly empty queue can
+only ever end by burning its budget, which makes the whole transition
+timer-driven — the next stage's start state then depends on the clock rather
+than on the path. And "no socket" cannot mean "no non-LISTEN socket" either:
+`FIN-WAIT-2` and `CLOSING` linger for *minutes* after a bulk client is killed
+while carrying nothing, whereas `FIN-WAIT-1`/`CLOSE-WAIT` are exactly the
+states that retransmit the tens of MB such a client's kernel still holds. The
+states above are the ones that can still send; the ones left out cannot.
+
+Sized from the measurement, not from taste: after a `rate20` stage's bulk client
+is killed, its kernel still holds tens of MB and delivers them at that stage's
+own 20 Mbit/s. Measured over three runs of the shipped schedule, the transitions
+of a `rtt100 → loss5 → rate100 → rate20` timeline cost 0.5-7 s each — and the
+same timeline under the two-leg scope (`SOAK_SHAPE_LEGS=both`) costs 25-28 s at
+its `rate20` boundary. A shorter budget would start the next stage inside a
+flush that is still carrying the previous stage's bytes, and its dial is then
+closed however often it is retried. The wait is not part of any stage's window,
+and the queue half is a *reading*, not an assumption: `tc` renders the backlog
+with a unit suffix (`b`, `Kb`, `Mb`, `Gb`), so the drain parses the suffix into
+bytes before it decides anything. What the wait cost and what it left behind travel with the stage it
+precedes
+(`drain_s`, `drain_expired`, `drain_final_backlog`, `drain_busy_sockets`), and
+so does the transition the spine itself saw (`spine_sockets` on both throughput
+legs, `backend_restart`, `spine_attempts`, `spine_first_interval_s`) — a drain
+that ends on its budget leaves the next stage's bulk starting in a state that
+is recorded rather than implied.
+
+A drain that ends on its budget is not the end of the story, because a
+transition cannot always be made quiet *quickly*: a killed 20-stream client's
+teardown retransmits what its kernel holds at the stage's own rate, and on a
+20 Mbit path that outlives the next stage's first dial. The spine is
+therefore dialed at `SOAK_SPINE_RETRY_S` (seconds into the stage; default
+`0,25,50,80`) and stops at the first dial that carries intervals, and a dial
+that has carried *nothing* is abandoned at the next offset so a stuck one
+cannot eat the retry it exists to leave room for. A healthy stage never notices
+— its first dial runs the stage out, and the later offsets cost it nothing —
+while a stage that needed a later dial says so: `spine_attempts` counts the
+dials and `spine_first_interval_s` says when the bulk actually started. Under
+the visitor-leg scope no stage of the shipped schedule needed a retry (three
+runs, `spine_attempts: 1` on every stage); the schedule stays as the second
+line of defence for a path the drain cannot quiet.
+
+For the same reason the single-test `iperf3` backend is
 restarted before every stage's bulk attempt and not only after a failed one: a
 teardown that lands on it can leave it answering `Bad file descriptor`, after
 which every later dial hangs.
@@ -145,6 +204,14 @@ Half a percent is above every arm measured so far and far below anything a user
 would notice; a run may tighten it with `SOAK_SLO_ERROR_RATE`.
 
 ## Test types
+
+`--test` takes a comma list, because one artifact can carry several types: the
+release sweep runs `rrul,capacity`, so the staged schedule and the load ramp
+travel in the same file (one `meta`, one host, one revision). They are **two
+different instruments** and never cross-check each other: the schedule answers
+"what happens as the path changes over time", the ramp answers "how much can it
+carry before the SLO breaks". Each test entry in the file carries its own
+`test` type, and the gate compares like with like (per tool *and* test type).
 
 | Type | The question it answers |
 |---|---|
@@ -221,12 +288,15 @@ table's size, its evictions and each worker's pinned peers.
 Stated so a reader does not ask a chart for something it never measured:
 
 - **One sample per stage.** A stage's numbers come from one walk of that
-  schedule. The within-run spread of a shaped stage is large (a saturated
-  `rtt100` stage's p99 can move by hundreds of milliseconds between runs), so a
-  cross-run difference smaller than that spread is not resolvable by a single
-  pair of runs — that is what the `screen` interleave is for, and it is why
-  `soak-check`'s cross-run verdicts use percentage limits rather than a
-  difference test.
+  schedule, so a single run cannot state its own repeatability for a class the
+  schedule visits once. The schedule visits `clean` twice (the run's own
+  replicate, reported by `just soak-check`), and the shaped classes' repeatability
+  was measured separately: three runs of one unchanged method moved a shaped p99
+  cell by 5-24 % and a shaped bulk cell by 0.2-3 % on this host (HANDOFF.md,
+  "Shaped-cell resolution"). A cross-run difference smaller than the class's own
+  spread is not resolvable by one pair of runs — that is what the `screen`
+  interleave is for, and it is why `soak-check` refuses a difference verdict on a
+  shaped stage at all (see Comparability).
 - **The control plane under degradation.** Only the data plane is shaped; the
   tool's own control channel stays on the unshaped path, because shaping it
   turns a capacity measurement into a wedge study. Anything the control channel
@@ -278,18 +348,73 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
 
 ## Comparability
 
-- **Same model, same host.** Every results file records the method version, the
-  host and the harness revision; a number from another host or another model is
-  context, not a baseline. The host is recorded twice: `hostname` (what a reader
-  recognises) and `host_id` — the machine id plus the CPU model and core count,
-  hashed — because the path, the CPU budget and the loopback ceiling are
-  properties of the *machine*. A containerized bench host changes its hostname
-  on every restart while the hardware does not, so the comparison key is
-  `host_id`: keying on the name refused two runs of the same machine (the
-  container was recreated between them) and would have admitted a different
-  machine that reused the name. A results file that predates the field carries
-  no `host_id`, and the gate then compares the recorded hostnames instead —
-  conservative in the safe direction (refusing to compare).
+- **Same model, same method, same host.** Every results file records the method
+  version, the host and the harness revision; a number from another host or
+  another model is context, not a baseline.
+- **The gate compares the method record, not just its version number.** A
+  method version is one integer for the whole model, so it cannot notice that
+  the stage transition, the drain predicate, the retry schedule or a probe rate
+  changed underneath it — five such keys changed during the v0.10.0 cycle while
+  the version stayed `1`. `soak_check.METHOD_KEYS` lists the keys that carry the
+  method (the schedule, the shaper classes, the load, the SLO, the probe rates
+  and the transition settings), and a comparison is refused — naming the keys
+  that differ, and the keys a file does not record at all — rather than printed.
+  An absent key is not read as a default: it means that file predates the
+  instrument, and inventing a value for it would invent a method.
+- **Same host — and the same measured state.** The host is recorded three ways:
+  `hostname` (what a reader recognises), `host_id` — the machine id plus the CPU
+  model and core count, hashed — and `host_calibration`, a fixed, tool-free
+  workload the runner measures before every run (SHA-256 over a 192 MiB buffer,
+  median of three readings, MiB/s; its own spread travels with it). The path,
+  the CPU budget and the loopback ceiling are properties of the *machine*, so a
+  containerized bench host changing its hostname on every restart must not break
+  comparability — that is what `host_id` is for, and the rename it survived is
+  recorded in HANDOFF.md. But an identity key is a *name*, and on a host with no
+  readable machine id it reduces to `cpu_model | nproc`: two different machines
+  can then hash to the same host. The calibration is the measurement that closes
+  that hole — a run is comparable only if the identity matches **and** the fixed
+  workload measured within 25 %
+  (`soak_check.HOST_CALIBRATION_TOLERANCE_PCT`), which is also what catches one
+  machine measured in two different states (busy, throttled, or thermally
+  limited). A results file that predates the probe is reported as *unverifiable*
+  rather than read as agreement, and the comparison then rests on the identity
+  key alone; a file with no `host_id` at all falls back to the recorded
+  hostnames, which is conservative in the safe direction (refusing to compare).
+- **Every blocking reason is reported, not just the first.** A baseline can
+  fail more than one test, and naming only the first would suggest that
+  clearing it makes the pair comparable.
+- **A stage's bulk cell is the load over its whole window, and the side that
+  measured it is named.** The reading is the sender's bytes over the stage's
+  measured window, span-weighted — not its best second, because netem releases a
+  shaped burst into whichever interval it likes, so the peak is a property of the
+  shaper's schedule. On a **rate** class the sender's accounting is structurally
+  defeated: the client's socket buffer absorbs megabytes, the measured intervals
+  read zero bytes while the path drains, and at `rate20` the client is still
+  blocked 30 s past the stage boundary, so its own summary never arrives. There
+  the reading is the **receiver's own window**, and the plot and README mark it
+  (`*`); when a rate stage's dial produced no receiver summary at all the cell
+  carries **no** reading and says why, rather than reporting the defeated side.
+  Which side a cell used is recorded with it (`bulk_gbps_source`), so the choice
+  is auditable and never varies between runs of one cell.
+- **A shaped stage's interactive cell is context, not a verdict.** The netem
+  queue the harness installed dominates it, and a single run does not repeat it:
+  three runs of one unchanged method on this host moved the shaped p99 cells by
+  5-24 % (and the two-leg scope's by up to 48 %) against the 25 % limit the gate
+  applies to a per-stage p99. So the gate *reports* a shaped stage's number and
+  fails only a blow-up (3× or more), and the README marks those columns as
+  context instead of picking a winner in them. The measured per-class spread and
+  the command that produced it are in HANDOFF.md, "Shaping scope, the rate cells, and the shaped-cell rule".
+- **A stage that carried no reading says so, with the reason.** `— (reason)` in
+  the plot's table, and `bulk_gbps_source` in the results file, distinguish "the
+  path carried nothing" from "nobody could measure what it carried". A bare
+  `0` cannot: it is the number a defeated sender reports for a path that was
+  full.
+- **A repeated stage class is the run's own replicate.** The schedule measures
+  `clean` at both ends of every timeline, so those two readings are two samples
+  of one condition about an hour apart: `just soak-check` reports their spread,
+  and it is the scale every between-tool difference has to clear. It is
+  reported, never judged — variance is data, and a threshold on it would be
+  invented.
 - **Older releases are a different instrument.** Releases up to v0.8.x measured
   one average per tool per network condition, in a cold-started process, and
   reported a median over repetitions. Those tables cannot be compared with these
@@ -332,6 +457,14 @@ just soak-peers    # download the peer tools' latest release binaries
 just soak          # one tool (or a batch) through the stage schedule
 just soak-plot     # render the charts and print the markdown tables
 just soak-check    # verdict: completeness, endpoints, SLO, drift
+```
+
+The release sweep is one command — the staged schedule and the load ramp in one
+artifact (see [release.md](release.md), "Benchmarks"):
+
+```bash
+just soak --test=rrul,capacity --tools molehill,frp,rathole,nps \
+     --out benches/scripts/soak/results-soak-vX.Y.Z.json
 ```
 
 `just soak --help` lists the test types, the variants (`mux`, `shared`,

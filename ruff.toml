@@ -30,6 +30,9 @@ extend-select = [
     "FA",     # from __future__ placement
     "FLY",    # f-string join instead of a str.join call
     "PERF",   # perflint's loop-invariant checks
+    "C901",   # cyclomatic complexity (default limit 10): the two functions
+              # over it were split rather than waived, and each split was
+              # checked to leave stdout and exit codes byte-identical
     "DTZ",    # naive datetimes: these scripts timestamp runs and compare them
     "TID",    # a relative import would break the `uv run <script>` entry shape
     "PIE",    # misc dead code (useless `pass`, unnecessary `map`, ...)

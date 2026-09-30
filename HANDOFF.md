@@ -1,17 +1,19 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-28 (evening).** The v0.10.0 theme is implemented on
+> **State as of 2026-09-29.** The v0.10.0 theme is implemented on
 > `feat/session-and-pool`: **M1** (one control session per endpoint, protocol
 > v4), **M2a** (one shared elastic pool per carrier, plus the S1 observation),
 > **M6** (the configuration surface) and **M7** (`direct`'s role, measured) are
 > in, and the measurements this section records were taken on that branch.
 > `main` is at `ab0bf11` (v0.9.0 released, with the withdrawn v0.9.1 cycle
 > folded back into development). **Nothing here is merged yet.** The freeze and
-> PR #4 are done; the release audit then found three gaps (a config-docs
+> PR #4 are done; the release audit found three gaps (a config-docs
 > contradiction, the sweep's provenance, and a completeness gate that could not
-> see a dead stage spine) and all three are now closed on the branch — see
-> "Remaining pre-tag items" for what each was and how it was settled. What is
-> left is the human checklist: the repo-settings items and the tag itself.
+> see a dead stage spine) and all three are closed on the branch. The gate then
+> did its job: it failed the shipped sweep's dead `rate20` cell, that cell was
+> traced to three harness defects over 2026-09-29, and the re-sweep on the fixed
+> harness is **green with no waiver** — see "Release sweep (2026-09-29)". What
+> is left is the human checklist: the repo-settings items and the tag itself.
 > Shipped work: [CHANGELOG.md](CHANGELOG.md). Design:
 > [docs/internals.md](docs/internals.md). Method and how to read the numbers:
 > [docs/benchmarks.md](docs/benchmarks.md).
@@ -21,13 +23,13 @@
 > contributor page — user-facing facts belong in the docs pages, and anything
 > released belongs in CHANGELOG.md.
 >
-> **Update 2026-09-28.** The `rate20` bulk spine — the completeness failure
-> that has blocked the release ritual all cycle — now produces intervals on the
-> `rate100:120,rate20:120` reproducer. The tunnel-liveness diagnosis recorded
-> below was **falsified by the `ss -tin` probe it asked for**; the stall was the
-> harness's own stage transition, plus one server-side pairing gap. Three fixes
-> and the measurements are in "The `rate20` spine: the RTO hypothesis is
-> falsified", below the retracted paragraph.
+> **Update 2026-09-29.** The dead bulk spine is fixed: the drain was reading
+> `tc`'s backlog wrong, the spine had a single dial, and the drain budget was
+> shorter than the 106 s flush it waits for. All three are in "The dead bulk
+> spine: three defects, and what the third one is not", and the sweep they
+> produced carries all 32 tool-stages. Two earlier diagnoses recorded here —
+> tunnel liveness, and the backend leg — were **falsified by measurement** and
+> are retracted in place.
 
 ## Fixed: striping with the elastic pool
 
@@ -190,11 +192,16 @@ has no initial size: it starts cold and grows on demand.
 **Archived.** Every measurement record this cycle produced — M1 (protocol v4),
 the stream-cap leak investigation, M2a, M6, M7, the S1 placement observation,
 both post-review rounds, the cycle's four sweeps and the CI-verification
-incident — lives in git history at the `v0.10.0` tag:
+incident — lives in git history in the revision *before* the one that archived
+it (`f2156de chore(release): re-sweep v0.10.0 on the release commit`):
 
 ```
-git show v0.10.0:HANDOFF.md
+git show f2156de^:HANDOFF.md
 ```
+
+Named by revision rather than by the `v0.10.0` tag on purpose: the tag lands on
+a commit that already carries this shortened page, so `git show
+v0.10.0:HANDOFF.md` returns the index, not the records.
 
 Per this file's own rule (kept verbatim below the historical-records index) those
 records say what the branch's authors believed at the time and why a decision
@@ -222,10 +229,10 @@ below. What each archived record settled, so it can be navigated:
    v0.10.0`: `version = "0.10.0"` set, the `[Unreleased]` content moved under
    `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, the withdrawn
    `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. ~~Re-sweep~~ **done (2026-09-28, evening)** — a fresh binary on the release
-   commit, four tools, 8/8 stages, charts and both READMEs refreshed in the
-   same commit as the results file. The gate verdict is one waived violation;
-   the record and the waiver are the subsection below.
+2. ~~Re-sweep~~ **done (2026-09-29)** — a fresh binary on the release commit,
+   four tools, 8/8 stages of all four, `just soak-check` **green with no
+   waiver**; charts and both READMEs refreshed in the same commit as the results
+   file. The record is the subsection below.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
    `just tag-check` must be run on the release commit.
 4. `just check`, `just interop`, then push the branch and open the PR. (The PR
@@ -233,59 +240,342 @@ below. What each archived record settled, so it can be navigated:
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
 
-### Release sweep (2026-09-28, evening)
+### Release sweep (2026-09-29)
 
-`v0.9.0-92-g1ddb5b7`, tree clean, fresh release binary sha256 `69d529a76959ca7c`
-(`stale: false`), host `a093c5fbe0dc` / `host_id d764f9da9c7e5b2a`, four tools,
-8/8 stages, `--test=rrul`, ~70 minutes. Charts and both READMEs are refreshed in
-the same commit.
+`v0.9.0-101-g401aeda`, tree clean, fresh release binary (`stale: false`), host
+`2967a5748835` / `host_id d764f9da9c7e5b2a`, four tools, 8/8 stages each,
+`--test=rrul`, ~120 minutes. Charts and both READMEs are refreshed in the same
+commit.
 
-**`just soak-check` is RED, and this is the explicit waiver the gate asks for:**
-one violation, `molehill (mux) rate20: the bulk spine carried 0 interval(s),
-below the 4 a 120s stage needs (spine produced no intervals (exit 1); control
-socket has closed unexpectedly)`. The peer note is the same failure on nps's
-`jitter` stage. Both are disclosed in the README with `†`.
+**`just soak-check`: `OK: no gate violation`.** Every one of the 32 tool-stages
+carried its bulk spine inside its own window, **every one of them on its first
+dial**, the endpoint invariant holds, and the released tool is inside the SLO on
+both clean stages. The comparison half is skipped, as it is here by default:
+`results-soak-v0.9.0.json` is the baseline candidate and it has no `host_id`, so
+the run is gated by its own checks.
 
 Per-stage bulk intervals / peak Gbit/s this run:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean |
 |---|---|---|---|---|---|---|---|---|
-| molehill | 147 / 21.65 | 111 / 2.89 | 114 / 5.35 | 108 / 2.43 | 116 / 0.816 | **0** | 115 / 0.000 | 147 / 23.19 |
-| frp | 147 / 7.09 | 111 / 2.77 | 116 / 5.34 | 108 / 3.33 | 116 / 0.535 | 114 / 0.000 | 80 / 0.000 | 147 / 6.78 |
-| rathole | 147 / 22.86 | 111 / 3.03 | 115 / 5.33 | 109 / 3.49 | 116 / 0.712 | 104 / 0.000 | 92 / 0.000 | 147 / 24.02 |
-| nps | 147 / 0.642 | 111 / 1.53 | 116 / 1.25 | 109 / 1.07 | 116 / 0.356 | 114 / 0.000 | **0** | 147 / 0.453 |
+| molehill | 147 / 21.73 | 111 / 2.950 | 116 / 5.949 | 109 / 2.930 | 115 / 0.720 | 112 / 0.177 | 115 / 0.503 | 147 / 23.80 |
+| frp | 147 / 6.797 | 111 / 2.765 | 115 / 5.392 | 108 / 3.320 | 116 / 0.707 | 114 / 0.000 | 115 / 0.000 | 147 / 6.881 |
+| rathole | 147 / 23.75 | 111 / 3.121 | 116 / 5.381 | 108 / 3.394 | 116 / 1.062 | 114 / 0.000 | 115 / 0.090 | 147 / 23.33 |
+| nps | 147 / 0.540 | 111 / 1.270 | 116 / 0.801 | 107 / 1.790 | 116 / 0.799 | 114 / 0.000 | 115 / 0.000 | 147 / 0.724 |
 
-**Why the violation is waived rather than fixed here.** Three facts, in order of
-weight:
+Two things this run shows that the previous one could not. **Every stage dialed
+once**, so no cell is measured under a different load than its peers — the
+previous sweep's molehill `jitter` needed a second dial at t+44 s and had to be
+flagged as not load-matched. And the rate cells are no longer uniformly zero:
+molehill's `rate20` and `jitter` now carry real (if thin) peaks, because the
+stage starts from a path that actually satisfies the drain's predicate rather
+than from whatever a fixed timer allowed. They are still mostly zero-byte
+intervals (88 % and 96 % of them), so the README reports the peaks without
+drawing a comparison.
 
-1. **It is not a v0.10.0 regression.** The archived stream-leak investigation
-   reproduced this exact cell (`rate20`, 0 intervals, same failure shape) on the
-   **released v0.9.0 binary**, with the same workload and shaper.
-2. **It moves between cells, not between builds.** Across the cycle's sweeps the
-   single dead cell has been `jitter` (frozen-commit sweep), `rate20` (the
-   superseded sweep and this one) and `jitter` for nps (this one), while both
-   two-stage probes of those very transitions — `rate100:120,rate20:120` and
-   `rate20:120,jitter:120` — carried 99-114 intervals each time. A cell that
-   passes in isolation and dies once per full run is harness fragility at a
-   shaped transition, not a tool defect that a code change would fix.
-3. **The rate cells carry no verdict anyway.** In this run every arm's `rate20`
-   and `jitter` peak is `0.000` (the shaper holds the bytes past each interval's
-   accounting window), so the release decision does not rest on them — which
-   the README states rather than implying a comparison that the data cannot
-   support.
+The transitions themselves, per the stage records: 0.28 s, 4.1 s, 1.6 s, 9.0 s,
+35.3 s, 71.0 s and 76.0 s — each ending because the path was quiet, none by
+budget expiry. The previous harness spent a flat 120 s on every one of them.
 
-**What the next attempt should change, and what this one cannot claim.** The
-predicate was reverted to the frozen sweep's in `b32a5fb`, but *both halves* of
-it changed together (the backlog tolerance and the socket states), so which half
-mattered is **not isolated** — the next attempt must change one at a time and
-probe both transitions. Two candidate mechanisms are recorded for it: the
-per-stage `iperf3` restart may race the previous stage's dying control
-connection on the same port (the server is single-test), and the engine's
-64-stream cap is reachable and its wedge is inherited by every later dial of the
-stage (the archived investigation; it is the open thread below). A third,
-smaller defect is visible in this run's log: three drains spent their full 30 s
-budget with `backlog=412..1194, bulk sockets=0` — the "exactly empty queue"
-half of the predicate again — which costs wall time, not validity.
+**What this sweep cannot be used for.** Two boundaries a reader has to carry:
+
+- **No cross-run comparison happened.** The gate skipped it — the baseline
+  candidate (`results-soak-v0.9.0.json`) has no `host_id`, so the run is gated
+  by its own completeness, endpoint and SLO checks alone. Nothing here says
+  anything about v0.9.0.
+- The method itself changed across this commit series (drain predicate, retry
+  schedule, suffix parsing), so this sweep is not comparable to earlier sweeps
+  of this cycle either; `workload_version` stays 1 because the drain has never
+  been in a released version (introduced in `e33ece3`, after v0.9.0).
+
+### The dead bulk spine: four defects, one retraction (2026-09-29)
+
+The cycle's sweeps lost one bulk cell per run, always at a rate transition
+(stages 6-7). It turned out to be four separate things, found in this order,
+each fixed only after the previous one was measured out of the way.
+
+1. **The drain was a silent no-op** (`78984ef`). `tc` renders a queue's backlog
+   with a unit suffix (`b`, `Kb`, `Mb`, `Gb`) and `_backlog`'s pattern accepted
+   only the bare `b`, so a backlog large enough to print as `Kb` — which is
+   every backlog at a rate-shaped transition — was read as *no qdisc at all*,
+   and `Shaper.settle` returned without waiting. A/B on
+   `rate100:120,rate20:120`: **3/3 dead before, 3/3 carrying their spine
+   after**. The KiB scale was checked against `tc -s -j` at the same instant
+   (`28447Kb` read 29129713 bytes).
+
+2. **The spine had one dial** (`78984ef`). A dial that landed on a busy path
+   died and took the stage's whole bulk axis with it. The spine is now dialed at
+   `SOAK_SPINE_RETRY_S` seconds into the stage (default `0,25,50,80`) and stops
+   at the first dial that carries intervals; a dial that has carried *nothing*
+   is abandoned at the next offset by a watchdog thread, because the read loop
+   blocks and a stuck dial would otherwise hold the stage to its end (measured:
+   `exit -9`). Gaps cannot be tightened below ~25 s: healthy first intervals
+   were measured at up to 13.5 s, so ~4 dials is the safe maximum per 120 s
+   stage. A recovered stage is visible, not silent — `spine_attempts` and
+   `spine_first_interval_s` travel in the stage record.
+
+3. **The budget was shorter than the flush it waits for** (`0dc1692`). With 1
+   and 2 in place the reproducer still failed 2 of 3, always at `jitter`. A 30 s
+   budget started that stage *inside* the flush window, and the retry schedule
+   only reaches 30+80 s, so it could not escape. At 120 s the reproducer went
+   **3/3 green** — `jitter` recovering on dial 2 at t+39.8, t+44.6, t+47.5 s.
+
+4. **But that was still a timer, not a predicate** (`401aeda`) — the defect the
+   whole exercise was really about. `backlog == 0` was **unsatisfiable**: the
+   interactive, churn and UDP probes share the tool's class and leave ~1.2 KB
+   queued permanently. Measured with a 400 s budget, the queue settled at
+   ~1.2 KB at t≈159 s and sat there for the remaining 240 s without ever
+   reaching zero. So the drain could only ever end by *expiring*: the fixed
+   120 s was a constant tuned until the gate stopped failing, and whether the
+   next stage's first dial survived depended on whether the clock happened to
+   allow enough time. That is the difference between a benchmark whose
+   variables are controlled and one whose constants were fitted to the result.
+   The predicate is now decidable, and both halves are tolerances for a
+   measured reason:
+
+   - the queue half is one `lo` frame (64 KiB), which separates the probes'
+     1.2 KB floor from the tens of MB a killed bulk client leaves by three
+     orders of magnitude;
+   - the socket half counts the states that can still *send* — `ESTAB`,
+     `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`. `FIN-WAIT-1` is the
+     dominant carrier of the tail (the killed client's kernel retransmitting
+     what it holds, measured per socket), while `FIN-WAIT-2`/`CLOSING` linger
+     for *minutes* carrying nothing, so "any non-LISTEN state" never ends and
+     `established` alone reads **0** from ~t+20 s while megabytes are still
+     moving.
+
+   `SOAK_DRAIN_BUDGET` is now a safety net sized above the measured worst case
+   (180 s against ~159 s), and both the tolerance and the state set travel in
+   `meta`. On `rate20:120,jitter:120`: drain **168.1 s with `expired: False`**,
+   and `jitter`'s **first** dial carries its intervals from t+5.2 s (it needed
+   a second dial and started at t+44 s under the timer).
+
+**Retraction: this is not a product defect.** An earlier pass of this record
+claimed the tool was leaking a dead visitor's data for ~100 s, on the evidence
+that a no-tool control arm (identical shaping, identical 20-stream iperf3
+SIGKILLed at the boundary) cleared the same class in **9.6 s** where the harness
+took ~106 s. That claim was wrong, and the per-socket byte counters are what
+refuted it: the traffic is the **killed client's own kernel** still delivering
+what it holds, into a tool that is applying correct TCP backpressure. The
+harness shapes the tool's **backend** leg at the same 20 Mbit/s as its visitor
+leg, so the tool is squeezed between two rate limits, its receive window stays
+mostly closed, and the client's kernel accumulates tens of MB during the stage —
+which it then spends ~159 s flushing after the kill. The no-tool arm had no
+second rate limit, so nothing accumulated and nothing had to be flushed. The
+shaping is the cause; the tool's behaviour is what a proxy should do.
+
+**What was tried and rejected, so it is not re-litigated.** The plan's four
+hypotheses were falsified by measurement: the backend leg is clean from t+35 s
+at the failing transition (`backend: {'LISTEN': 1}`), the engine's 64-stream cap
+never appears in a tool log, and the `established`-only socket half is not what
+failed (it is defect 4). Extending the drain's port scope to `iperf_backend`
+would have waited on nothing. **Lifting the shaper** during the drain — so the
+residual flushes at line rate instead of 20 Mbit/s — was tried and reverted:
+`tc qdisc replace`/`change` cannot clear a netem queue at all (netem gives each
+packet its departure time at enqueue, so a 29 MB backlog kept draining at the
+old 20 Mbit/s after `rate 10Gbit` was set; only `qdisc del` drops it), and the
+delete-based version, while it cut the drain to 0.006 s and passed
+`rate20 -> jitter` once, regressed `rate100 -> rate20` to `exit -9` — it drops
+the queue but not the client's kernel buffers, so the flood simply arrives
+later, into the next stage's shaper.
+
+**The rate cells are still degenerate, and that is separate.** `rate20` and
+`jitter` peaks are `0.000` for every arm including three unrelated peers: the
+shaper holds each interval's bytes past the interval's own accounting window.
+The spine behind them is now real, which is what the gate checks; the numbers
+are still not comparable, and the README says so.
+
+**The cost went down, not up.** Ending on the predicate turned out to be
+*cheaper* than the fitted timer it replaced: the seven transitions cost 0.28,
+4.1, 1.6, 9.0, 35.3, 71.0 and 76.0 s — **197 s per tool in total**, against the
+840 s the fixed 120 s spent expiring at every one of them. Waiting for the path
+to say it is ready is both the controlled thing and the fast thing; the timer
+was paying for the transitions that did not need it in order to cover the one
+that did.
+
+### The instrument's claims: what the gate now refuses to say (2026-09-29)
+
+The release sweep was green and every cell carried its spine, and the numbers
+still could not support the claims being read off them. Three defects, all in
+what the gate and the plot *say* rather than in what they measure. None needed
+a re-run: the current artifact already carries every key involved.
+
+1. **Comparability was one integer.** `soak_check.comparability` checked
+   `workload_version` and `host_id` and nothing else. `workload_version` stayed
+   `1` across this whole cycle while **five** method keys changed under it (the
+   drain's introduction, the log-suffix fix, the spine retry, the drain budget,
+   the drain predicate), so the gate would have called two different instruments
+   comparable and printed verdicts from that comparison — the one failure mode
+   that makes a benchmark worse than no benchmark, because it looks like
+   evidence. It now compares the runs' method records (`METHOD_KEYS`) and
+   refuses, naming every key that differs **and** every key a file does not
+   record at all; an absent key is an instrument that file cannot describe, not
+   a default to assume. Every blocking reason is reported, not just the first —
+   the shipped baseline fails on host *and* on method, and naming only the host
+   would tell a reader that clearing it makes the pair comparable, which would
+   cost them a run to disprove.
+
+2. **A degenerate cell was published as a number.** At or over half of a
+   stage's bulk intervals reading zero bytes, the peak that remains is not a
+   throughput measurement. `just soak-plot` printed it anyway, and the README's
+   bulk figures were transcribed by hand from an ad-hoc script. There is now a
+   per-stage bulk table in the plot — the first time those numbers have been
+   machine-generated — and both it and the README print the zero share instead
+   of a figure. **The rule immediately caught an error of mine**: the README
+   claimed "not one zero-byte interval for molehill, frp or rathole across
+   `rtt100`, `loss1` and `loss5`", carried over from the previous sweep without
+   re-checking; in this sweep molehill's `loss5` is **82 of 109 intervals at
+   zero**. The claim is gone and the cell reads `— (75% zero)`.
+
+3. **A run did not state its own noise.** Every stage is one sample, so a
+   single run seemed unable to say how repeatable it is — but the schedule
+   measures `clean` at both ends of every timeline, so each run contains a
+   replicate of one condition about an hour apart. `just soak-check` now
+   reports that spread per tool, and it is the scale every between-tool
+   difference has to clear: 21.730-23.795 Gbit/s for molehill (8.7 %),
+   6.797-6.881 for frp (1.2 %), 23.334-23.754 for rathole (1.8 %),
+   0.540-0.724 for nps (25.4 %). Reported, never judged: variance is data and a
+   threshold on it would be invented.
+
+**What 3 changed about the release's own claim.** Applied to this sweep it
+corrects the phrasing the README carried: on the clean path **molehill and
+rathole are indistinguishable in throughput** — their replicate ranges overlap
+— so "rathole is marginally ahead" was never supported. What *is* supported,
+because each difference clears the replicate by an order of magnitude: frp
+carries 3.2x less bulk than molehill, molehill's clean latency is 10.4x lower
+than rathole's and 2.1x higher than frp's, and nps is behind on both. The
+gate's own `METHOD_KEYS` and the degenerate-cell rule were also folded into
+`docs/benchmarks.md` ("Comparability") and `docs/release.md`.
+
+**Still not fixed, and now stated rather than implied:** the shaped interactive
+cells remain worst-observations from tens of samples whose spread between runs
+of the same code exceeds the between-tool differences, so they are context and
+the README says so; the release artifact still carries no capacity number (the
+README delegates it to the reader's own path); and the rate-shaped cells stay
+unmeasurable under this method rather than merely unreported.
+
+### Shaping scope, the rate cells, and the shaped-cell rule (2026-09-29)
+
+The open threads the gate work exposed, worked in one session. Every number
+below is a measurement from this host (`a093c5fbe0dc` renamed to
+`2967a5748835`; `host_id d764f9da9c7e5b2a`), on one binary, with only the knob
+under test changed.
+
+**1. The shaping scope: `visitor` vs `both` (A/B, adopted).**
+`SOAK_SHAPE_LEGS` now selects which legs a stage class is applied to, and the
+default is `visitor` — the visitor's access link plus (for the KCP carrier) the
+tunnel's own UDP port. The old model shaped the tool's backend leg as well, and
+one HTB class then served both legs.
+
+```
+# balanced in time: V B B V V; one binary, one method, only the knob differs
+just soak --test=rrul --tools molehill --timeline rtt100:90,loss5:90,rate100:90,rate20:90
+  (SOAK_SHAPE_LEGS=visitor|both, --out ~/tmp/shaped/ab{1..5}-*.json)
+```
+
+| legs | stage | p99 (ms), per run | bulk reading (Gbit/s) | interactive floor (ms) | transition (s) |
+|---|---|---|---|---|---|
+| `both` | rtt100 | 7430, 7439 | 2.408, 2.386 | 801, 802 | — |
+| `both` | loss5 | 4338, 4998 | 2.667, 2.651 | 801, 802 | 3.6, 4.6 |
+| `both` | rate100 | 8990, 8652 | **no reading** (78-85 % zero intervals) | 162 | 2.8, 3.1 |
+| `both` | rate20 | 1985, 3826 | **no reading** (100 %) | 283, 322 | 25.0, 27.8 |
+| `visitor` | rtt100 | 8198, 6753, 6234 | 5.211, 5.203, 5.205 | 401, 401, 401 | — |
+| `visitor` | loss5 | 4248, 5215, 4110 | 5.224, 5.224, 5.284 | 401, 401, 401 | 0.5, 4.6, 2.8 |
+| `visitor` | rate100 | 3094, 3157, 2987 | 0.0939, 0.0910, 0.0919 | 82, 82, 82 | 0.5, 2.3, 1.8 |
+| `visitor` | rate20 | 7411, 8340, 7591 | **no reading** (95-100 %) | 82*, 163, 102 | 0.5, 0.5, 7.2 |
+
+`*` a stale sample from the previous stage's class; the true rate20 floor is
+163 ms (40 ms x 2 traversals x handshake+request).
+
+What the A/B settled, none of it assumed:
+- **The delay is now paid once.** A fresh connection per ping pays the one-way
+  delay twice (handshake, request), so `rtt100` floors at 401 ms instead of the
+  802 ms the two-leg class produced, and `rate100` at 82 ms instead of 162. The
+  stage table's "100 ms delay" now describes the path it produces.
+- **A rate class carries its nominal rate.** `both` shared one 100 Mbit class
+  between two legs, so every arm read ~42 % of nominal end to end; `visitor`
+  reads 0.0910-0.0996 (91-100 %), the spread being the shaper's own burstiness.
+- **Transitions collapse.** The worst transition on this timeline is 7.2 s
+  (`visitor`) against 25.0-27.8 s (`both`) at the `rate20` boundary — the tool
+  no longer backpressures against a shaped backend leg.
+- **The two-leg model was also *hiding* queueing.** At `rate20` its interactive
+  p99 read 2.0-3.8 s against `visitor`'s 7.4-8.3 s: with both legs shaped, the
+  end-to-end rate was halved, so the 20 Mbit class was never saturated and the
+  bufferbloat a saturated 20 Mbit access link really produces never appeared.
+  The `visitor` numbers are the honest ones for the path the docs describe.
+- **Attenuation, stated as a limit:** the two-leg numbers above are *not*
+  comparable with any other sweep, and `shape_legs` is in `METHOD_KEYS`, so the
+  gate refuses that comparison rather than printing one. Every stored result
+  before this date carries `both` (or, before the key existed, no scope at all).
+
+**2. The receiver's window at a rate cell, and a defect in reading it.**
+`_spine_once` now keeps reading past the stage boundary (bounded by
+`SPINE_SUMMARY_GRACE_S`) for the client's `end` event, which is the only place
+the receiver's own window is reported. The first version tested `proc.poll()`
+in that loop, which **skips the output of a client that exits exactly at the
+boundary** — the very case `-t` is sized for. Measured: the same `rate100` cell
+read `0.0995` (receiver) in one run and `0.0902` (sender) in the next, i.e. one
+cell, two instruments, ~10 % apart. With the poll guard removed and the reading
+chosen by the *class* (a rate shaper defeats the sender's accounting by
+construction, not by this run's zero-share), three runs of
+`rate100:60,rate20:90` read **0.0995, 0.0996, 0.0995** from the receiver's own
+window.
+
+`rate20` still carries no reading, and that is now recorded rather than
+papered over: `SOAK_SPINE_SUMMARY_GRACE_S=5,15,30` all end `truncated` — the
+client's kernel is still delivering the stage's bytes 30 s past the boundary,
+so its summary never arrives inside any grace a stage can afford. The cell
+prints `— (the rate class defeats the sender's interval accounting (95-100 %
+zero-byte intervals) and the dial produced no receiver summary (truncated))`.
+**Follow-up, not yet measured:** a bounded socket window (`iperf3 -w`) on the
+rate classes would keep the sender's writes tracking the path, which should
+give both sides a live window; it changes an instrument parameter, so it needs
+its own A/B before it becomes the method.
+
+**3. The shaped-cell rule (A4/A6).** Three runs of one unchanged method give
+the per-class repeatability a single run cannot state:
+
+| class | p99 spread (3 runs) | bulk-reading spread | gate limit |
+|---|---|---|---|
+| `rtt100` | 24.0 % | 0.2 % | 25 % |
+| `loss5` | 21.2 % | 1.1 % | 25 % |
+| `rate100` | 5.4 % | 3.1 % | 25 % |
+| `rate20` | 11.1 % | — | 25 % |
+| (`both` arm, 2 runs) `rate20` | 48.1 % | — | 25 % |
+
+The p99 spread sits *at* the limit the gate applies to a per-stage difference,
+and the older reading's spreads (74-86 % on the peak-interval metric) were
+larger still, so a difference verdict on a shaped stage is a verdict on the
+harness's own queue. The gate now reports a shaped stage's number as context
+and fails only a blow-up (3x); the README marks those columns and picks no
+winner in them; the plot prefixes them with `~`. The spread values above live
+in this record, not in the code: a table of per-class thresholds baked into the
+gate would go stale with the next method change.
+
+**4. The host key is now a measurement too (A3).** `meta.host_calibration`
+records a fixed CPU-bound workload (`sha256_fixed_buffer`: SHA-256 over a
+192 MiB buffer, median of three, MiB/s) taken before every run. The probe was
+chosen by measurement: a 128 MiB loopback socket pair drifts 18.7 % across
+median-of-five readings on this host (it follows the CPU's power state), while
+the SHA-256 probe repeats to 1.0-2.2 % (415-424 MiB/s). `soak_check` refuses a
+comparison whose calibrations are more than 25 % apart and *reports* a file
+that predates the probe as unverifiable rather than reading its silence as
+agreement — the hole this closes is that on a host with no `/etc/machine-id`
+the identity key reduces to `cpu_model | nproc`, so two machines can name the
+same host.
+
+**5. The load axis is now in the release artifact (A5).** The release sweep is
+one command, `--test=rrul,capacity`, and `--test` takes a comma list: the
+staged schedule and the load ramp travel in one `results-soak-vX.Y.Z.json`, so
+they share one `meta`, one host and one revision. The alternative the thread
+weighed — a second artifact with a name of its own — was rejected after
+checking what it would cost: the plot and the gate already render and compare
+*every test entry in one file*, so a second file would have meant a second
+naming scheme, a second resolution rule in three tools and a second pairing in
+the ritual, for no gain. The two curves are still declared **two different
+instruments** (docs/benchmarks.md) and are never cross-checked; the gate keys
+each comparison by (tool, test type), so a capacity entry can only be compared
+with a capacity entry.
 
 ### The freeze found a gate that would have shipped empty release notes (2026-09-28)
 
@@ -379,11 +669,11 @@ and the CI query were re-run there); the open `[ ]` items need a human.
 - **Benchmarks**: `results-soak-v0.10.0.json` + four charts are in the release
   commit, the README pair carries the same four-tool table, and the withdrawn
   v0.9.1 file and charts are deleted. **The provenance caveat is closed:** the
-  shipped sweep is `v0.9.0-92-g1ddb5b7` with binary sha256 `69d529a76959ca7c`
-  and `tree_clean: true`, i.e. a fresh binary on the release commit — which is
-  what the ritual asks for, and what the frozen-commit sweep (`ca4ab4a`) could
-  not claim. The gate verdict on it is one waived cell; the waiver is the
-  "Release sweep" subsection above.
+  shipped sweep is `v0.9.0-101-g401aeda` with `tree_clean: true`, i.e. a fresh
+  binary on the release commit — which is what the ritual asks for, and what the
+  frozen-commit sweep (`ca4ab4a`) could not claim. The gate verdict on it is
+  `OK: no gate violation`, with no waiver: 32 of 32 tool-stages carry their
+  spine, every one of them on its first dial. The record is the "Release sweep (2026-09-29)" subsection above.
 - **CHANGELOG**: the `[0.10.0]` section was audited against the cycle's commits
   and five user-visible fixes were added (`899eb6f`); it is dated
   `2026-09-28`, one dated section, `[Unreleased]` empty.
@@ -446,8 +736,9 @@ the harness or the docs, and all four are fixed on the branch.
    hidden — but §10's "the completeness of every test's series" was not what
    was implemented. The gate now counts each stage's intervals inside its own
    window against a floor of one per 30 s, and a run that carries such a hole
-   fails it (the shipped sweep's `rate20` cell does exactly that, and the
-   failure is waived in the "Release sweep" record rather than ignored).
+   fails it. That is what caught this cycle's dead cells rather than letting
+   them ship: the sweep before the fix failed on molehill's `rate20`, and the
+   sweep now shipped passes all 32 tool-stages.
    `docs/release.md`, `CHANGELOG.md` and
    `docs/benchmarks.md` describe the new verdict.
 4. **The provenance exclusion had never worked — `9d8b85a`.** The run
@@ -487,17 +778,27 @@ The middle variant is the one that reads best and fails: exiting the drain
 next stage's dial then races the previous stage's FIN and the loss is silent —
 the stage simply carries no intervals. The predicate is back to the frozen
 sweep's, the backlog tolerance went with it, and `_busy_sockets` carries the
-table so it is not re-derived by guess. The sweep on the previous page is
-therefore **superseded**: it ran the middle variant, and the only thing it
-measured that survives is the provenance fix (`tree_clean: True` on a real
-run).
+table so it is not re-derived by guess.
+
+**Retracted on 2026-09-29.** That table's comparison is not usable as evidence,
+because both variants were measured while `_backlog` could not read a `Kb`
+backlog at all (see "The dead bulk spine", defect 1): at exactly the transitions
+the table is about, the drain returned before evaluating *either* half of its
+predicate. The variants therefore differed only in whether the suffix bug
+happened to trigger on that run, not in the predicate they claim to compare.
+The conclusion drawn from it ("the middle variant fails") is withdrawn; what
+replaced it is defect 3, the budget. The table stays as a record of what was
+run — it is not a comparison to build on.
 
 **Verified before spending the release run** (2026-09-28, evening): a two-stage
 `rate20:120,jitter:120` probe on `molehill,frp` — the exact transition whose
 spine was dead in the frozen sweep — now carries **99** intervals in molehill's
 `jitter` stage (peak 0.157 Gbit/s) and 103 for frp, the drains return in 10.5 s
 and 17.2 s instead of the 30 s budget, and the new gate passes the probe. That
-probe is how the run below was de-risked rather than hoped for.
+probe is how the run below was de-risked rather than hoped for. (Those drain
+durations belong to the *pre-fix* harness: at the time a large backlog made
+`settle` return early. On the fixed harness the same transition spends the full
+budget, as the 2026-09-29 record explains.)
 
 ## Open threads for the next cycle
 
@@ -518,11 +819,89 @@ probe is how the run below was de-risked rather than hoped for.
   gone, and the removed-config keys are refused instead of warned about. The
   interop matrix's new-server/old-client case now pins the refusal, and
   `a_v3_hello_is_refused_on_its_own_connection` pins it on this tree.
-- **The method revision** (recorded, not fixed): the host key is the container
-  hostname, so two runs on the same hardware never compare; a single sample per
-  stage cannot resolve a 25 % change when the within-run spread is 40-70 %; and
-  the 64-stream scale point is single-rep, which makes that cell structurally
-  undecidable.
+- ~~**The drain's socket half is not provably sufficient.**~~ — **fixed**
+  (`401aeda`). It now counts the states that can still send (`ESTAB`,
+  `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`) rather than
+  `established` alone, which read 0 from ~t+20 s while the killed client's
+  `FIN-WAIT-1` sockets were still retransmitting megabytes. The teardown states
+  are deliberately excluded and that is measured, not stylistic:
+  `FIN-WAIT-2`/`CLOSING` persist for minutes after a kill and carry nothing, so
+  including them makes the predicate unsatisfiable.
+- ~~**The drain costs real wall time, and the queue half is a fitted
+  constant.**~~ — **fixed** (`401aeda`). The queue half is now a tolerance (one
+  `lo` frame, 64 KiB) instead of an unreachable zero, so the drain ends on the
+  path's state rather than on the clock; `SOAK_DRAIN_BUDGET` is a safety net
+  sized above the measured worst case. It is also **cheaper**: the transitions
+  in the shipped sweep total 197 s per tool against the 840 s the fitted timer
+  spent expiring on all seven.
+- **The rate cells still carry no comparison.** Fixing the spine did not make
+  `rate20`/`jitter` quotable: every arm's peak interval is `0.000` because the
+  shaper holds each interval's bytes past that interval's own accounting
+  window, and `rate100` runs 63-74 % zero-byte intervals. The gate checks that
+  a spine *ran*, which is now true; it does not make the numbers comparable,
+  and no amount of harness fixing will. Making those cells measurable is a
+  model question (a longer interval, or accounting on the receiver's window),
+  not a defect.
+- **The transition is long because the harness shapes both legs at once.** The
+  ~159 s flush exists because `_ports` puts the tool's backend leg in the same
+  rate class as its visitor leg, so the tool backpressures and the iperf3
+  client's kernel accumulates tens of MB before the stage boundary kills it.
+  That is a deliberate shaping choice (both legs are "the path under test"),
+  but it is worth re-deriving: shaping only the visitor leg would shorten every
+  rate transition by an order of magnitude. Untested — it changes what the rate
+  cells measure, so it needs its own A/B.
+- **The host key is stable, but it is a *name*, not a calibration.** The old
+  form of this thread said "the host key is the container hostname, so two runs
+  on the same hardware never compare" — that was **fixed** by `host_identity()`,
+  which keys on `machine_id | cpu_model | nproc` and keeps `hostname` only for a
+  reader to recognise. The evidence it works is the rename it survived: the
+  `16b4dc8db68b` → `a093c5fbe0dc` container change did **not** break
+  comparability (both runs carry `host_id d764f9da9c7e5b2a`). What is still open
+  is smaller and sharper: on a host with **no** `/etc/machine-id` — this one —
+  the key reduces to `cpu_model | nproc`, so two *different* machines with the
+  same CPU model and core count would be called the same host and the gate would
+  compare them. The original note proposed a calibration measurement (a
+  fixed-workload throughput probe) rather than more identity fields; that was
+  never implemented.
+- **One sample per stage, and the shaped cells are the ones that pay.** The
+  figure this thread used to quote — "the model's own within-run spread on
+  clean stages is 40-70 %", sourced to `9.334 vs 5.389 ms p99` in one older
+  run — is stale **in its attribution**, and the shipped sweep's own replicate
+  says so: its two `clean` stages agree to 8.7 % on bulk peak and 6.122 vs
+  6.731 ms on p99 for molehill, 1.2 % and 2.877 vs 2.890 ms for frp, 1.8 % and
+  70.022 vs 71.376 ms for rathole (`just soak-check` reports this per run now,
+  so it cannot go stale again). The *magnitude*, though, is real — it just
+  belongs to the shaped cells, and three repetitions of one *unchanged* method
+  measure it directly — same revision (`401aeda`), budget, tolerance and retry
+  schedule, from `just soak --test=rrul --tools molehill --timeline
+  rtt100:120,loss1:120,loss5:120,rate100:120,rate20:120,jitter:120` run three
+  times. (Those files are scratch and uncommitted, so the command is the
+  source, not a path.) molehill's `loss1` repeats to 3.2 % (1301-1345 ms) while
+  `rate100` spans 2534-9782 ms (**74 %** apart) and `jitter` 551-4045 ms
+  (**86 %**), against between-tool differences of ~2x in the same stages. So
+  the shaped cells are published as context and never as a comparison — a limit
+  on the claim, not a fix.
+- **The load axis is absent from the release artifact.** The full open form of
+  the "64-stream scale point" clause below: that scale point belonged to the
+  **retired per-cell matrix** (single-rep by construction, and bimodal on both
+  binaries across its 13 rounds), and it went out with the matrix. What the
+  current model has instead is `--test=capacity` — a ramp to the first load
+  level that breaks the SLO — and the release sweep does **not** run it, so
+  `results-soak-vX.Y.Z.json` carries no "how much can it carry" number at all.
+  The README delegates that to the reader's own path, which is honest but leaves
+  the release's headline claim at "here is a chart". Adding it is cheap to run
+  (~1 min/tool: `ceiling` = `--streams-max`, 8 steps × `settle_s`) and
+  expensive to plumb: a second artifact needs a name of its own (the plot and
+  the gate resolve only `results-soak-vX.Y.Z.json`), plus ritual text, both
+  READMEs and `docs/benchmarks.md`, and the two curves must be stated as two
+  different instruments rather than cross-checked.
+- **The shaped interactive cells are published without a rule.** They are
+  labelled "context, not a verdict" in the README, and they are still printed to
+  one decimal as if they were measurements. Either give them a rule (an interval
+  over R runs, and a stated minimum difference the run can resolve) or stop
+  printing them as numbers; the present state is neither, and §10's "a metric
+  without contrast is not a measurement" applies to a cell whose spread between
+  runs of unchanged code exceeds every between-tool difference in it.
 - **The config-test gaps** still open from the v0.9.0 audit: `allow_ports`
   rejection end to end, per-service `token` resolution, the UDP knobs'
   documented effects, a PSK handshake, hot-reload add/delete/modify, and

@@ -78,7 +78,14 @@ the SLO, the test types, and how to reproduce a run — is owned by
 The ritual produces three artifacts and one verdict — the results file
 (`benches/scripts/soak/results-soak-vX.Y.Z.json`), the chart set in `assets/`
 and the refreshed README benchmark numbers, then `soak-check`'s verdict on the
-run and its comparison against the previous tag.
+run and its comparison against the previous tag. **The results file carries the
+load axis as well as the staged schedule**: the sweep runs
+`--test=rrul,capacity`, so "how much can it carry before the SLO breaks" travels
+in the same artifact, measured on the same host at the same revision. The two
+are separate instruments and are never cross-checked — the schedule answers what
+happens as the path changes over time, the ramp answers where the ceiling is —
+and the file keys each entry by (tool, test type), so the gate compares like
+with like.
 
 The tools live in `benches/scripts/soak/`; peers are frp, rathole (upstream)
 and nps, each fetched as the **latest GitHub release** binary, never built
@@ -92,17 +99,17 @@ writes the tests it completed.
    meets a real old peer here, and nowhere else, so run it **before** the sweep
    — it is seconds, and a rejection means the release is not ready.
 2. `just soak-peers` — fetch/refresh the peer binaries (cached per release).
-3. `just soak --test=rrul --tools molehill,frp,rathole,nps
+3. `just soak --test=rrul,capacity --tools molehill,frp,rathole,nps
    --out benches/scripts/soak/results-soak-vX.Y.Z.json`
    — run the sweep (one tool or a batch of them, per its own shaped path in
    one HTB class each, so concurrent tools never share a shaper; the batch
    size comes from the host's CPU budget). **`--tools` is required**: its
    default is `molehill` alone, which produces a file that looks exactly like
    a release artifact but has an empty peer comparison in it — every tool the
-   README's table names has to be in the run. **`--test=rrul` is required**: the
-   default test type is `capacity`, which produces a ceiling probe rather than
-   the staged release sweep, and the file it writes looks like a release
-   artifact. The release artifact path is passed
+   README's table names has to be in the run. **Both test types are required**:
+   `--test` defaults to `capacity` alone, so a run without `rrul` has no staged
+   schedule, and a run without `capacity` publishes no load axis at all — both
+   write a file that looks like a release artifact. The release artifact path is passed
    explicitly: the default `--out` is `results-soak-dev.json` beside the
    script, which `soak-plot`/`soak-check` do read but which is never the
    committed evidence. The run covers the test types the release needs
@@ -129,8 +136,10 @@ writes the tests it completed.
    samples, **every stage that claims a bulk spine must have carried intervals
    inside its own window** (a stage whose probe never connected used to pass on
    the other stages' sample count), every throughput sample must have dialed
-   the tool's exposed port rather than its backend, and the released tool must
-   meet the absolute SLO
+   the tool's exposed port rather than its backend, every stage that carried a
+   spine states what it carried or why it cannot (a rate stage's defeated
+   sender accounting is reported, not published as a number), and the released
+   tool must meet the absolute SLO
    **on the unshaped clean stages** (a saturated `rrul`/`soak` stage is above
    the SLO by design — that is the degradation curve, reported as a note, not
    judged). The SLO gates the tool this repository releases; a peer that
@@ -140,10 +149,22 @@ writes the tests it completed.
    the run's own completeness and endpoint checks. With the previous tag's
    file it then compares per test type: **a tool must not lose capacity, must
    not break its SLO earlier, must not wedge where it did not and must not
-   drift**; a violation blocks the tag until fixed or explicitly waived
-   (record the waiver in `HANDOFF.md`). Only same-schema, same-host runs are
-   comparable, so a baseline from another host or another `workload_version`
-   is not a gate input. A run that predates a field the gate needs (the
+   drift**; a violation blocks the tag until fixed or explicitly waived.
+   Per-stage p99 difference verdicts apply to the **unshaped** control stages:
+   a netem stage's number is dominated by the queue the harness installed and
+   one run does not repeat it (measured: 5-24 % across three runs of one
+   unchanged method), so the gate reports it as context and fails only a
+   blow-up — see benchmarks.md, "Comparability".
+   (record the waiver in `HANDOFF.md`). Only same-schema, same-method, same-host
+   runs are comparable, so a baseline from another host, another
+   `workload_version` **or another instrument** is not a gate input: the gate
+   compares the runs' method records — the schedule, the shaper classes, the
+   load, the SLO, the probe rates and the stage-transition settings
+   (`soak_check.METHOD_KEYS`) — and refuses the comparison naming every key
+   that differs, and every key one file does not record at all. A single
+   `workload_version` integer cannot carry that on its own: the v0.10.0 cycle
+   changed five of those keys while it stayed `1`. A run that predates a field
+   the gate needs (the
    endpoint record, the revision) is reported as `LEGACY`: neither a pass nor
    a violation — the gate names what it could not verify, and the count of
    those checks is printed in the summary.

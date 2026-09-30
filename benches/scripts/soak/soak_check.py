@@ -26,9 +26,11 @@ import json
 import os
 import sys
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import lib
+import soak
 
 # Per-type gate thresholds (percent unless noted). They are method
 # constants — the env var of the same name overrides one for an experiment.
@@ -43,6 +45,15 @@ THRESHOLDS = {
 }
 # The screen's claim threshold: same direction on every step AND this much.
 SCREEN_CLAIM_PCT = 15.0
+#: The verdict a *shaped* stage class can still carry: a blow-up bound, not a
+#: difference test. A netem stage's interactive distribution is dominated by the
+#: queue the harness itself installed, and one run of that class does not
+#: repeat: measured on this host, three runs of one unchanged method moved the
+#: shaped cells by 24-86 % (HANDOFF.md, "Shaped-cell resolution") against a
+#: per-stage limit of 25 %. Gating those cells at the limit is gating noise, so
+#: the gate reports them as context and keeps only a safety net — a shaped stage
+#: that triples is a regression whatever the noise does.
+SHAPED_BLOWUP_PCT = 200.0
 # A screen needs at least this many steps to carry a claim at all.
 SCREEN_MIN_STEPS = 2
 # `--screen <file>` takes the flag plus one path.
@@ -60,6 +71,15 @@ COVERAGE_SERIES = {
     "tcp_interactive": "rtt_interactive_ms",
     "tcp_churn": "churn_setup_ms",
     "udp_session": "rtt_udp_ms",
+}
+#: The axes a test type records when it is not a staged walk. A capacity ramp
+#: drives its load through `iperf_burst` (one sample per load level, in
+#: `metrics.curve`) instead of the staged `throughput_bulk_gbps` series, so the
+#: claim to check is this set — and an entry that claims more than its type can
+#: record is reported, because that is a record describing a series it never
+#: wrote.
+TEST_COVERAGE = {
+    "capacity": ("tcp_interactive", "tcp_churn", "udp_session"),
 }
 # A stage's bulk intervals are the ones timestamped inside its window. The
 # runner marks `t_start` *before* the spine starts, so no interval of a stage
@@ -156,48 +176,203 @@ class Report:
             self.fail(fmt + f" ({d:+.1f}%, limit +{limit:.0f}%)", *a)
 
 
+#: The `meta` keys that carry the **method** rather than the machine or the
+#: result: what was measured, over which schedule, with which instrument
+#: settings. Two files that disagree on any of them were produced by different
+#: instruments, and comparing them would print verdicts about a method nobody
+#: ran. `workload_version` is not enough on its own — it is a single integer
+#: for the whole model, and this cycle changed five of these keys while it
+#: stayed `1` (the drain's introduction, the backlog suffix, the spine retry,
+#: the drain budget, and the drain predicate), so the gate would have called
+#: two different instruments comparable.
+#:
+#: `slow_visitor_bps` is deliberately absent: it has its own check below, with
+#: a better message, because a missing key there means "no visitor" rather than
+#: "unknown method".
+METHOD_KEYS = (
+    "timeline",
+    "path_classes",
+    "streams_max",
+    "settle_s",
+    "stage_drain_budget_s",
+    "drain_backlog_tolerance_b",
+    "drain_send_states",
+    "spine_retry_s",
+    # The legs a stage's class is applied to, and how long a spine waits for
+    # the receiver's summary: the first decides what a rate class measures
+    # (one access link or two sharing it), the second whether a stage has a
+    # receiver half at all.
+    "shape_legs",
+    "spine_summary_grace_s",
+    "interactive_ping_interval_ms",
+    "udp_ping_interval_ms",
+    "churn_connects_s",
+    "slo",
+    "load_fractions",
+    "mtu_restore_to",
+    "cores_per_pair",
+    "batch",
+)
+
+
+#: How many differing key names to spell out before eliding the rest: enough to
+#: diagnose the usual one-or-two, short enough to stay one line.
+_FMT_KEYS_MAX = 6
+
+#: A stage class has to appear at least this often in the schedule to be a
+#: replicate of itself. Two is the schedule's `clean` at both ends.
+_REPLICATE_MIN = 2
+
+
+def _fmt_keys(keys: list) -> str:
+    more = " …" if len(keys) > _FMT_KEYS_MAX else ""
+    return ", ".join(f"`{k}`" for k in keys[:_FMT_KEYS_MAX]) + more
+
+
 def comparability(base: dict, cur: dict) -> str | None:
     """Why these two runs may not be compared, or `None` when they may.
 
     docs/release.md and docs/benchmarks.md both state the boundary: only
-    same-schema, same-host runs are comparable. This is that sentence as a
-    function, so the gate refuses an invalid comparison instead of printing
-    verdicts nobody may act on. The host key is `meta.host_id` — machine id +
-    CPU model + core count, because the path, the CPU budget and the loopback
-    ceiling are properties of the *machine*, and a container hostname (what
-    the records carried before) changes on every restart while the hardware
-    does not: keying on it refused same-host runs and would admit a different
-    host that happened to reuse the name. Runs that predate the field fall
-    back to the recorded hostname, which is conservative in the safe direction
-    (refusing to compare) and recorded in HANDOFF.md as the method fix — a
-    stable host identity is a calibration measurement, not a name.
+    same-schema, same-method, same-host runs are comparable. This is that
+    sentence as a function, so the gate refuses an invalid comparison instead
+    of printing verdicts nobody may act on.
+
+    **Every** blocking reason is reported, not just the first. A baseline can
+    fail more than one — the release path's `results-soak-v0.9.0.json` differs
+    in host *and* in method — and naming only the first would tell a reader
+    that clearing it would make the pair comparable, which would be false and
+    would cost them a run to discover.
+
+    The host key is `meta.host_id` — machine id + CPU model + core count,
+    because the path, the CPU budget and the loopback ceiling are properties of
+    the *machine*, and a container hostname (what the records carried before)
+    changes on every restart while the hardware does not: keying on it refused
+    same-host runs and would admit a different host that happened to reuse the
+    name. Runs that predate the field fall back to the recorded hostname, which
+    is conservative in the safe direction (refusing to compare) and recorded in
+    HANDOFF.md as the method fix — a stable host identity is a calibration
+    measurement, not a name.
     """
+    reasons = []
     if base["meta"].get("workload_version") != cur["meta"].get("workload_version"):
-        return (
+        reasons.append(
             "the runs have different workload versions "
             f"({base['meta'].get('workload_version')} vs "
             f"{cur['meta'].get('workload_version')}): different method"
         )
     bh, ch = base["meta"].get("host_id"), cur["meta"].get("host_id")
-    if not (bh and ch):
+    if bh and ch:
+        if bh != ch:
+            reasons.append(
+                f"the runs were made on different hosts (host_id {bh} vs {ch}, "
+                f"{base['meta'].get('hostname')} vs {cur['meta'].get('hostname')}): "
+                "the path, the CPU budget and the loopback ceiling are properties "
+                "of the machine, and the peers' clean-tool spread shows it"
+            )
+    else:
         # One of the runs predates `host_id`: compare the recorded hostnames,
         # which is what the older files have, and say which key was used.
         bh, ch = base["meta"].get("hostname"), cur["meta"].get("hostname")
         if bh and ch and bh != ch:
-            return (
+            reasons.append(
                 f"the runs were made on different hosts ({bh} vs {ch}): the path, "
                 "the CPU budget and the loopback ceiling are properties of where a "
                 "run happens, and the peers' clean-tool spread shows it"
             )
-        return None
-    if bh != ch:
-        return (
-            f"the runs were made on different hosts (host_id {bh} vs {ch}, "
-            f"{base['meta'].get('hostname')} vs {cur['meta'].get('hostname')}): "
-            "the path, the CPU budget and the loopback ceiling are properties of "
-            "the machine, and the peers' clean-tool spread shows it"
+    reasons.extend(
+        r
+        for r in (
+            _comparability_visitor(base, cur),
+            _comparability_method(base, cur),
+            _comparability_calibration(base, cur),
         )
-    return _comparability_visitor(base, cur)
+        if r
+    )
+    return " Also, ".join(reasons) if reasons else None
+
+
+#: How far apart two runs' host calibrations may sit before the gate refuses to
+#: compare them, in percent. Sized from both ends: the probe repeats to ~1-2 %
+#: on an idle host (measured here; `host_calibration.spread_pct` records each
+#: run's own figure), while a machine that is merely *busy* — a neighbour
+#: stealing cores, a thermal-throttled clock — moves a fixed CPU workload by
+#: far more than this, and those are exactly the runs whose throughput numbers
+#: must not be compared with an idle run's. A quarter is deliberately loose:
+#: refusing a comparable pair costs one run, accepting an incomparable one
+#: publishes a verdict about the machine as if it were about the tool.
+HOST_CALIBRATION_TOLERANCE_PCT = 25.0
+
+
+def _comparability_calibration(base: dict, cur: dict) -> str | None:
+    """Refuse two runs whose host was not in the same measured state.
+
+    The identity check above answers "same machine?" by a *name*
+    (`machine_id | cpu_model | nproc`, and on a host without a machine id that
+    is the whole key). This answers the question the name cannot: was the
+    machine in the same state? Both halves are needed — two machines can share
+    every identity field, and one machine can be a different machine's worth of
+    busy between two runs.
+
+    A file that predates the probe is not read as agreement: it is reported as
+    unverifiable, and the comparison proceeds on the identity check alone,
+    which is the behaviour every stored file gets today.
+    """
+    bcal = base["meta"].get("host_calibration") or {}
+    ccal = cur["meta"].get("host_calibration") or {}
+    if not (bcal.get("ok") and ccal.get("ok")):
+        return None  # reported by the caller's own note; never read as equal
+    b, c = bcal.get("median"), ccal.get("median")
+    if not b or not c:
+        return None
+    delta = abs(c - b) / b * 100.0
+    if delta <= HOST_CALIBRATION_TOLERANCE_PCT:
+        return None
+    return (
+        f"the hosts measure differently at the fixed calibration workload "
+        f"({b} vs {c} MiB/s, {delta:.1f}% apart, over the "
+        f"{HOST_CALIBRATION_TOLERANCE_PCT:.0f}% the gate allows): the runs did "
+        "not see the same machine state (a different machine sharing the "
+        f"identity, or one of them busy/throttled), and {bcal.get('probe')} is "
+        "the measurement a host key alone cannot make"
+    )
+
+
+def _comparability_method(base: dict, cur: dict) -> str | None:
+    """Refuse to compare two runs whose *method record* differs.
+
+    The host check above answers "same machine?"; this answers "same
+    instrument?", which is the half a single `workload_version` integer cannot
+    carry. It is the check that matters most on one host — the case where
+    everything else looks comparable.
+
+    A key missing from either file is not treated as a default: unlike
+    `slow_visitor_bps` (where absence means "off"), an absent
+    `drain_backlog_tolerance_b` means the file predates that instrument, and
+    reading it as "the default" would invent a method rather than refuse one.
+    """
+    bm, cm = base["meta"], cur["meta"]
+    b_missing = [k for k in METHOD_KEYS if k not in bm]
+    c_missing = [k for k in METHOD_KEYS if k not in cm]
+    if b_missing or c_missing:
+        who = []
+        if b_missing:
+            who.append(f"the baseline records no {_fmt_keys(b_missing)}")
+        if c_missing:
+            who.append(f"this run records no {_fmt_keys(c_missing)}")
+        return (
+            "the method record is incomplete — " + "; ".join(who) + ": a key "
+            "absent from a file is an instrument that file cannot describe, so "
+            "the two cannot be shown to have measured the same way"
+        )
+    diff = [k for k in METHOD_KEYS if bm[k] != cm[k]]
+    if diff:
+        detail = "; ".join(f"{k}: {bm[k]!r} vs {cm[k]!r}" for k in diff[:3])
+        return (
+            f"the runs used different methods ({_fmt_keys(diff)} differ — "
+            f"{detail}): same host or not, a comparison would be a verdict "
+            "about an instrument neither run used (AGENTS.md §10)"
+        )
+    return None
 
 
 def _comparability_visitor(base: dict, cur: dict) -> str | None:
@@ -220,6 +395,39 @@ def _comparability_visitor(base: dict, cur: dict) -> str | None:
     return None
 
 
+def calibration_note(base: dict, cur: dict) -> str | None:
+    """What the host calibration could *not* verify about a comparison.
+
+    Printed when the pair is compared anyway, because a check that silently
+    does not run is the failure mode this whole function family exists to
+    prevent: a reader has to know whether "same host" was verified by a
+    measurement or only by a name. `None` when both files carried a probe —
+    the pair was checked, and `comparability` already refused it if the two
+    readings were too far apart to compare.
+    """
+    braw = base["meta"].get("host_calibration")
+    craw = cur["meta"].get("host_calibration")
+    if braw is not None and craw is not None:
+        if braw.get("ok") and craw.get("ok"):
+            return None
+        who = "the baseline" if not braw.get("ok") else "this run"
+        return (
+            f"the host calibration probe did not run on {who}: 'same host' "
+            "rests on the identity key alone, which on a host without a "
+            "machine id is `cpu_model | nproc`"
+        )
+    who = [
+        label
+        for label, raw in (("the baseline", braw), ("this run", craw))
+        if raw is None
+    ]
+    return (
+        f"{' and '.join(who)} carr{'ies' if len(who) == 1 else 'y'} no host "
+        "calibration: 'same host' rests on the identity key alone, which on a "
+        "host without a machine id is `cpu_model | nproc`"
+    )
+
+
 def metric_count(test: dict, metric: str) -> int:
     return sum(1 for r in test.get("series", []) if r.get("metric") == metric)
 
@@ -232,9 +440,7 @@ def check_run(cur: dict, rep: Report) -> None:
     reshaping data" rule: a renamed or missing series, or a throughput sample
     that dialed the backend, must fail the gate rather than plot as a hole.
     """
-    slo = cur.get("meta", {}).get("slo") or {}
-    slo_p99 = slo.get("rtt_p99_ms")
-    slo_err = slo.get("error_rate")
+    slo = SloContract.from_meta(cur.get("meta") or {})
     tests = cur.get("tests", [])
     if not tests:
         rep.fail("the results file contains no tests")
@@ -251,7 +457,37 @@ def check_run(cur: dict, rep: Report) -> None:
             continue
         check_completeness(name, t, rep)
         check_endpoints(name, t, rep)
-        check_slo(name, t, rep, slo_p99, slo_err)
+        if t.get("stages"):
+            check_slo(name, t, rep, slo)
+            check_bulk_readings(name, t, rep)
+            check_replicate(name, t, rep)
+        else:
+            # A test that walks no schedule (the capacity ramp) is judged by
+            # what it does record, not by staging checks that cannot apply.
+            check_capacity_run(name, t, rep)
+
+
+def check_capacity_run(name: str, t: dict, rep: Report) -> None:
+    """A capacity ramp must carry the curve and the verdict it claims."""
+    if t.get("test") != "capacity":
+        return
+    m = t.get("metrics") or {}
+    curve = m.get("curve") or []
+    if not curve:
+        rep.fail(f"{name}: the capacity ramp recorded no load level")
+    elif "max_sustainable_streams" not in m:
+        rep.fail(f"{name}: the capacity ramp has no sustainable-load verdict")
+    else:
+        broken = next((p for p in curve if p.get("slo_broken")), None)
+        why = (
+            f", broken at {broken['streams']} ({broken.get('reason')})"
+            if broken
+            else ", never broke the SLO"
+        )
+        rep.ok(
+            f"{name}: capacity ramp carried {len(curve)} load level(s), "
+            f"{m['max_sustainable_streams']} sustainable{why}"
+        )
 
 
 def check_bulk_per_stage(name: str, t: dict, rep: Report) -> None:
@@ -301,10 +537,21 @@ def check_completeness(name: str, t: dict, rep: Report) -> None:
     if not t.get("coverage"):
         rep.fail(f"{name}: no coverage record")
         return
+    claimed = t["coverage"]
+    kind = t.get("test")
+    if kind in TEST_COVERAGE:
+        # Check what this test type records, and report a claim it cannot back.
+        extra = [a for a in claimed if a not in TEST_COVERAGE[kind] and claimed[a]]
+        if extra:
+            rep.note(
+                f"{name}: a {kind} entry claims {', '.join(sorted(extra))} — that "
+                "test type records one sample per load level, not a series"
+            )
+        claimed = {a: claimed.get(a) for a in TEST_COVERAGE[kind]}
     missing = [
         axis
         for axis, metric in COVERAGE_SERIES.items()
-        if t["coverage"].get(axis) and metric_count(t, metric) == 0
+        if claimed.get(axis) and metric_count(t, metric) == 0
     ]
     if missing:
         rep.fail(f"{name}: claimed coverage with no series for {', '.join(missing)}")
@@ -314,6 +561,75 @@ def check_completeness(name: str, t: dict, rep: Report) -> None:
             f"{len(t.get('stages', []))} stage(s))"
         )
     check_bulk_per_stage(name, t, rep)
+
+
+def _stage_bulk_reading(st: dict):
+    """The stage's bulk reading, derived from its recorded evidence.
+
+    Derived rather than read from a stored value: the rule needs the interval
+    distribution, the class and the client's `end` event, all of which the
+    stage records, and the same function serves the plot and the runner's log —
+    one rule with three readers instead of three rules. A stored reading would
+    also be a number frozen under whatever rule was current the day it ran.
+    """
+    return soak.bulk_reading(st)[0]
+
+
+def check_bulk_readings(name: str, t: dict, rep: Report) -> None:
+    """Every stage that carried a spine must state what it carried.
+
+    A stage with intervals but no reading is not a failure — it is a stage
+    whose *sender* accounting was defeated (the shape of a shaped stage) and
+    whose dial produced no receiver summary, so the data says what happened
+    but not how much the path carried. It is reported rather than passed in
+    silence, because a table with a hole in it and no explanation is how a
+    degenerate cell gets read as a zero.
+    """
+    for st in t.get("stages", []):
+        gbps, why = soak.bulk_reading(st)
+        if st.get("bulk_intervals") and gbps is None:
+            rep.note(
+                f"{name} {st.get('stage')}: {st['bulk_intervals']} bulk "
+                f"interval(s) but no reading — {why}"
+            )
+
+
+def check_replicate(name: str, t: dict, rep: Report) -> None:
+    """Report what the schedule's repeated stage classes say about noise.
+
+    Every stage is one sample, so a run cannot normally state its own
+    repeatability — but the schedule measures `clean` at both ends of every
+    timeline. Those two readings are two samples of the same condition taken
+    about an hour apart, and they are the closest thing this instrument has to
+    a control. Their agreement is the scale a reader has to hold every other
+    cell against: a between-tool difference smaller than the same condition's
+    spread an hour apart is not a difference this run can see.
+
+    Reported, never judged. Variance is data (AGENTS.md §10): a threshold here
+    would be invented, and the point is to publish the number the other claims
+    have to clear, not to fail a run for being noisy.
+    """
+    by_class: dict = {}
+    for st in t.get("stages", []):
+        by_class.setdefault(st.get("stage"), []).append(st)
+    for cls, sts in by_class.items():
+        if len(sts) < _REPLICATE_MIN:
+            continue
+        peaks = [_stage_bulk_reading(st) for st in sts]
+        p99s = [st.get("rtt_p99") for st in sts]
+        if any(p is None for p in peaks) or any(p is None for p in p99s):
+            continue
+        blo, bhi = min(peaks), max(peaks)
+        rlo, rhi = min(p99s), max(p99s)
+        # A peak of zero makes the relative spread meaningless; report the
+        # absolute readings instead of inventing a percentage.
+        spread = f"{(bhi - blo) / bhi * 100:.1f}%" if bhi else "n/a (both 0)"
+        rep.note(
+            f"{name}: the schedule measures `{cls}` {len(sts)} times, so those are "
+            f"the run's own replicate — bulk {blo:.3f}-{bhi:.3f} Gbit/s "
+            f"({spread} apart), interactive p99 {rlo:.1f}-{rhi:.1f} ms; a "
+            "between-tool difference smaller than this is not one this run can see"
+        )
 
 
 def check_endpoints(name: str, t: dict, rep: Report) -> None:
@@ -339,7 +655,41 @@ def check_endpoints(name: str, t: dict, rep: Report) -> None:
         )
 
 
-def check_slo(name: str, t: dict, rep: Report, slo_p99, slo_err) -> None:
+@dataclass(frozen=True)
+class SloContract:
+    """The SLO the run was taken against, plus the classes it applies to.
+
+    One value rather than three parameters: the p99, the error rate and the
+    set of *unshaped* classes are all "what this run's numbers may be judged
+    against", and a caller that got two of the three would judge a shaped
+    stage by a clean-path contract — the failure this grouping makes
+    unrepresentable.
+    """
+
+    rtt_p99_ms: float | None
+    error_rate: float | None
+    #: Stage classes that apply no netem: the control stages, where the SLO is
+    #: a contract and a single run can compare numbers.
+    comparable: frozenset
+
+    @classmethod
+    def from_meta(cls, meta: dict) -> "SloContract":
+        slo = meta.get("slo") or {}
+        classes = meta.get("path_classes") or {}
+        return cls(
+            rtt_p99_ms=slo.get("rtt_p99_ms"),
+            error_rate=slo.get("error_rate"),
+            comparable=frozenset(
+                name for name, cls in classes.items() if not (cls or {}).get("netem")
+            ),
+        )
+
+    def is_shaped(self, stage: str) -> bool:
+        """Whether a stage class imposes a netem queue (see `SHAPED_BLOWUP_PCT`)."""
+        return stage not in self.comparable
+
+
+def check_slo(name: str, t: dict, rep: Report, slo: SloContract) -> None:
     """The absolute SLO, applied where the model defines it to apply.
 
     The SLO is a *clean-path* contract: the compliant path is the unshaped
@@ -367,25 +717,25 @@ def check_slo(name: str, t: dict, rep: Report, slo_p99, slo_err) -> None:
         p99, err = stage.get("rtt_p99"), stage.get("rtt_error_rate")
         if p99 is None:
             rep.note(f"{name} clean: no interactive p99 to judge")
-        elif slo_p99 is not None and p99 > slo_p99:
+        elif slo.rtt_p99_ms is not None and p99 > slo.rtt_p99_ms:
             over(
                 f"{name} clean: interactive p99 {p99} ms is over the SLO "
-                f"({slo_p99} ms){peer_note}"
+                f"({slo.rtt_p99_ms} ms){peer_note}"
             )
         else:
             rep.ok(
                 f"{name} clean: interactive p99 {p99} ms is inside the SLO "
-                f"({slo_p99} ms)"
+                f"({slo.rtt_p99_ms} ms)"
             )
-        if err is not None and slo_err is not None and err > slo_err:
+        if err is not None and slo.error_rate is not None and err > slo.error_rate:
             over(
                 f"{name} clean: interactive error rate {err} is over the SLO "
-                f"({slo_err}){peer_note}"
+                f"({slo.error_rate}){peer_note}"
             )
     shaped = [
         s.get("rtt_p99")
         for s in t.get("stages", [])
-        if s.get("stage") != "clean" and s.get("rtt_p99") is not None
+        if slo.is_shaped(s.get("stage")) and s.get("rtt_p99") is not None
     ]
     if shaped:
         rep.note(
@@ -423,7 +773,7 @@ def check_capacity(tool: str, rep: Report, c: dict, b: dict) -> None:
         )
 
 
-def check_stages(tool: str, rep: Report, c: dict, b: dict) -> None:
+def check_stages(tool: str, rep: Report, c: dict, b: dict, slo: SloContract) -> None:
     """Per-stage verdicts: the interactive distribution and the worst second.
 
     Stages are matched by **occurrence**, not by name. The default schedule
@@ -458,22 +808,37 @@ def check_stages(tool: str, rep: Report, c: dict, b: dict) -> None:
             )
             continue
         stage_b = candidates[index]
-        rep.limit(
-            stage_c.get("rtt_p99"),
-            stage_b.get("rtt_p99"),
-            p99_lim,
-            f"{tool} {stage_c['stage']} p99: "
-            f"{stage_b.get('rtt_p99')} -> {stage_c.get('rtt_p99')} ms",
-        )
+        # A shaped class is context: its p99 is dominated by the queue the
+        # harness installed, and one run does not repeat it (see
+        # `SHAPED_BLOWUP_PCT`). It is reported, and only a blow-up fails.
+        shaped = slo.is_shaped(name)
+        if shaped:
+            rep.note(
+                f"{tool} {name} p99: {stage_b.get('rtt_p99')} -> "
+                f"{stage_c.get('rtt_p99')} ms (shaped class — context, not a "
+                "verdict: a same-code re-run moves this cell by far more than "
+                "the limit)"
+            )
+        else:
+            rep.limit(
+                stage_c.get("rtt_p99"),
+                stage_b.get("rtt_p99"),
+                p99_lim,
+                f"{tool} {stage_c['stage']} p99: "
+                f"{stage_b.get('rtt_p99')} -> {stage_c.get('rtt_p99')} ms",
+            )
         # The worst second is the stability axis: a stage may hold its median
-        # while a single second blows up, which is what a queue does.
+        # while a single second blows up, which is what a queue does. It is a
+        # shaped cell too, so it gets the same blow-up bound rather than the
+        # difference test (a queue that spikes is the *measurement* at a shaped
+        # stage, not a regression).
         worst_c = stage_c.get("rtt_worst_1s")
         worst_b = stage_b.get("rtt_worst_1s")
         if worst_c is not None and worst_b is not None:
             rep.limit(
                 worst_c,
                 worst_b,
-                worst_lim,
+                SHAPED_BLOWUP_PCT if shaped else worst_lim,
                 f"{tool} {stage_c['stage']} worst 1s: {worst_b} -> {worst_c} ms",
             )
         # a stage that wedges only in the current run is a regression even
@@ -582,18 +947,37 @@ def gate(cur: dict, base: dict | None) -> int:
                 "completeness, the endpoint invariant and the absolute SLO"
             )
         else:
-            cur_tools = {t["tool"]: t for t in cur["tests"] if not t.get("error")}
-            base_tools = {t["tool"]: t for t in base["tests"] if not t.get("error")}
+            # Keyed by (tool, test): one file may carry several test types per
+            # tool — the release sweep runs the staged schedule *and* the load
+            # ramp into the same artifact — and keying by tool alone silently
+            # kept whichever came last and dropped the other.
+            cur_tests = {
+                (t["tool"], t.get("test")): t
+                for t in cur["tests"]
+                if not t.get("error")
+            }
+            base_tests = {
+                (t["tool"], t.get("test")): t
+                for t in base["tests"]
+                if not t.get("error")
+            }
+            per_tool = Counter(tool for tool, _ in cur_tests)
             print("\n# Comparison against the baseline")
-            for tool, c in sorted(cur_tools.items()):
-                b = base_tools.get(tool)
+            cal = calibration_note(base, cur)
+            if cal is not None:
+                rep.note(cal)
+            for (tool, test), c in sorted(cur_tests.items()):
+                b = base_tests.get((tool, test))
+                # Name the test type only where a tool has more than one: a
+                # single-test file keeps the short label its history uses.
+                label = f"{tool} [{test}]" if per_tool[tool] > 1 else tool
                 if b is None:
-                    rep.note(f"{tool}: not in the baseline (new tool?)")
+                    rep.note(f"{label}: not in the baseline (new test?)")
                     continue
                 rep.set_subject(tool)
-                check_capacity(tool, rep, c, b)
-                check_stages(tool, rep, c, b)
-                check_cost_and_drift(tool, rep, c, b)
+                check_capacity(label, rep, c, b)
+                check_stages(label, rep, c, b, SloContract.from_meta(cur["meta"]))
+                check_cost_and_drift(label, rep, c, b)
     print()
     if rep.legacy_checks:
         print(
@@ -649,12 +1033,28 @@ def screen(data: dict) -> int:
     binary (`--ab-variants`). The header says which one was measured —
     printing a version and a path on both sides of a variant run would
     present a config comparison as a build comparison.
+
+    Four steps, one function each: what was compared, the slow visitor, which
+    metric the table shows, then the table and the verdict. The split is what
+    keeps each piece readable (the whole thing measured C901 12 as one
+    function).
     """
     t = next((t for t in data["tests"] if t["test"] == "screen"), None)
     if t is None:
         sys.exit("no screen test in that results file")
     rounds = t["metrics"].get("rounds") or []
-    builds = t["metrics"].get("builds") or {}
+    screen_header(t["metrics"].get("builds") or {})
+    screen_slow_visitor(rounds)
+    if not rounds:
+        sys.exit("no rounds recorded")
+    key, better = screen_metric(rounds)
+    steps, a_ahead, b_ahead = screen_table(rounds, key, better)
+    print()
+    return screen_verdict(steps, a_ahead, b_ahead)
+
+
+def screen_header(builds: dict) -> None:
+    """Say which two things were compared, and on which axis."""
     if builds.get("axis") == "variant":
         print(
             f"screen: axis=variant  A={builds.get('A_variant')} "
@@ -666,16 +1066,22 @@ def screen(data: dict) -> int:
             f"screen: A={builds.get('A_version')} ({builds.get('A')})\n"
             f"        B={builds.get('B_version')} ({builds.get('B')})"
         )
-    screen_slow_visitor(rounds)
-    if not rounds:
-        sys.exit("no rounds recorded")
-    # Which metric the table shows, decided by what the run actually produced —
-    # not by its first step. A cell hostile enough to kill the bulk probe on
-    # step 1 (the MTU/fragmentation cell does exactly that) used to flip the
-    # whole verdict to response time while the columns still read like
-    # throughput, so a "claim B" could be about milliseconds and look like
-    # Gbit/s. Throughput is the primary metric: use it whenever any step has
-    # it, and label the table so the units are never in doubt.
+
+
+def screen_metric(rounds: list) -> tuple:
+    """Decide which metric the table shows, and print that decision.
+
+    Decided by what the run actually produced — not by its first step. A cell
+    hostile enough to kill the bulk probe on step 1 (the MTU/fragmentation
+    cell does exactly that) used to flip the whole verdict to response time
+    while the columns still read like throughput, so a "claim B" could be
+    about milliseconds and look like Gbit/s. Throughput is the primary
+    metric: use it whenever any step has it, and label the table so the units
+    are never in doubt.
+
+    Returns `(key, better)` where `better` is the sign that favours A: for
+    throughput a higher value is better, for a response time a lower one is.
+    """
     have_gbps = any(p.get("gbps") is not None for r in rounds for p in r["pair"])
     key = "gbps" if have_gbps else "rtt_p99"
     unit = "Gbit/s" if key == "gbps" else "ms (p99)"
@@ -684,9 +1090,12 @@ def screen(data: dict) -> int:
             "\nnote: no step produced a throughput sample (the bulk probe "
             "failed on every step); comparing response time instead"
         )
-    # For throughput a higher A is better; for a response time a lower A is.
-    better = 1.0 if key == "gbps" else -1.0
     print(f"\n{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading  [{unit}]")
+    return key, 1.0 if key == "gbps" else -1.0
+
+
+def screen_table(rounds: list, key: str, better: float) -> tuple:
+    """Print one row per step; return `(usable, a_ahead, b_ahead)`."""
     steps = 0
     a_ahead = b_ahead = 0
     for r in rounds:
@@ -708,7 +1117,11 @@ def screen(data: dict) -> int:
             f"{r['streams']:>8}{a:>10.3f}{b:>10.3f}{d:>+8.1f}%   "
             f"{'claim ' + winner if strong else 'directional ' + winner}"
         )
-    print()
+    return steps, a_ahead, b_ahead
+
+
+def screen_verdict(steps: int, a_ahead: int, b_ahead: int) -> int:
+    """The verdict line, and the exit code `main` propagates."""
     if steps < SCREEN_MIN_STEPS:
         print(
             f"NO CLAIM: {steps} usable step(s) — a verdict needs "

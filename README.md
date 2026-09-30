@@ -105,62 +105,101 @@ reads without a table:
 **Interactive stream RTT p99, per stage** (ms). A shaped stage of a saturated
 run carries tens of samples, and a stage under a hundred reports its *worst
 observation* rather than a p99 — the sample counts are in the results file
-beside these numbers. `‡` marks a stage that also recorded a wedge (a silent
-stretch, drawn as a flat segment in the chart); `†` marks a stage whose bulk
-spine produced no intervals at all, so its interactive number was measured
-*without* the bulk load.
+beside these numbers. `~` marks a **shaped** class: the value is the run's
+reading, but the harness installed the queue that dominates it and one run does
+not repeat it — three runs of one unchanged method moved these cells by 5-24 %
+on this host — so the `~` columns are context and no winner is marked in them.
+`‡` marks a stage that also recorded a wedge (a silent stretch, drawn as a flat
+segment in the chart); a stage that recovered carries both the marker and its
+number.
 
-| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | 9.6 | ‡6382 | 1301 | 3447 | 2485 | ‡†3690 | 1275 | 6.6 |
-| frp 0.71.0 | **2.8** | ‡6562 | 5454 | ‡6357 | ‡8211 | 3279 | ‡7741 | **2.9** |
-| rathole 0.5.0 | 73 | ‡6134 | **1323** | ‡6203 | ‡7455 | 2018 | 5326 | 68 |
-| nps 0.26.10 | 70 | **858** | 1146 | 2859 | ‡7036 | 2669 | †220 | 67 |
+| molehill (mux) | 7.3 | ~7466‡ | ~1131 | ~3104‡ | ~3225 | ~9308‡ | ~5820‡ | 7.3 |
+| frp | 2.8 | ~7150‡ | ~1066 | ~5011‡ | ~3195 | ~8722‡ | ~9381‡ | 2.8 |
+| rathole | 70.5 | ~8232‡ | ~1136 | ~3890‡ | ~3218 | ~7088‡ | ~5174‡ | 77.3 |
+| nps | 67.0 | ~471 | ~1080 | ~3520 | ~3294 | ~9214‡ | ~7437‡ | 67.9 |
 
-**Bulk throughput per stage** (Gbit/s, the stage's peak interval): molehill
-**21.7** on clean -> 2.89 at rtt100 -> 5.35 at loss1 -> 2.43 at loss5 -> 0.816
-at rate100 -> **no sample at rate20** -> no sample at jitter -> **23.2 on the
-return to clean**; frp 7.09 -> 2.77 -> 5.34 -> 3.33 -> 0.535 -> 0.000 -> 0.000
--> 6.78; rathole 22.9 -> 3.03 -> 5.33 -> 3.49 -> 0.712 -> 0.000 -> 0.000 ->
-24.0; nps 0.642 -> 1.53 -> 1.25 -> 1.07 -> 0.356 -> 0.000 -> no sample -> 0.453.
+**Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
+not its best second: netem releases a shaped burst into whichever interval it
+likes, so the peak is the shaper's schedule, not the path). `*` marks a cell
+read from the **receiver's** own window — on a rate class the client's socket
+buffer absorbs megabytes, the sender's intervals read zero bytes while the path
+drains, and the receiver is the only side that can speak for it. `— †` is a
+stage with **no reading at all**: the sender's accounting is defeated (90-100 %
+zero-byte intervals here) and the dial produced no receiver summary, because
+the client was still blocked past the stage boundary. `rate100` reading
+0.100 Gbit/s on every arm is the shaper's own number — that cell has no contrast
+by construction — and `rate20`/`jitter` carry no reading at all, which is a
+limit of the model and not a result about any tool.
 
-The delay- and loss-shaped cells are quotable: **not one zero-byte interval**
-for molehill, frp or rathole across `rtt100`, `loss1` and `loss5`. The rate
-cells are the degenerate side, and in this run they are degenerate for every
-arm at once — the shaper holds each interval's bytes past the interval's own
-accounting window, so 59 % of molehill's `rate100` intervals read zero (73 %
-frp, 78 % rathole, 67 % nps), and every `rate20` and `jitter` interval that
-arrived at all read zero. Where the peak is 0 for every tool there is no
-contrast to read, so those cells are reported as `0.000` rather than drawn as a
-comparison. `†` marks a **live-tool, dead-probe** cell: molehill's `rate20`
-spine never connected (`control socket has closed unexpectedly`) and nps's
-`jitter` one failed the same way, so the harness waited the stage out. Their
-interactive numbers are real, but they describe that path with no bulk load on
-it, which is not the pair the other stages report.
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
+|---|---|---|---|---|---|---|---|---|
+| molehill (mux) | 21.783 | 5.224 | 9.703 | 5.266 | 0.100 * | — † | — † | 22.160 |
+| frp | 6.057 | 5.566 | 5.657 | 5.276 | 0.100 * | — † | — † | 6.085 |
+| rathole | 21.184 | 5.234 | 9.694 | 5.239 | 0.100 * | — † | — † | 21.057 |
+| nps | 0.134 | 0.156 | 0.143 | 0.166 | 0.100 * | — † | — † | 0.132 |
 
-**What these shapes say.** Every tool degrades under a bad path, and every tool
-recovers on the return to clean — that recovery is what the last band measures,
-and a tool that stayed wedged would be a finding. On the clean stage molehill
-and rathole carry the same bulk (21.7 against 22.9 Gbit/s; frp 7.1, nps 0.6)
-while a fresh interactive connection costs 9.6 ms for molehill against frp's
-2.8, rathole's 73 and nps's 70. The shaped interactives are worst observations
-from tens of samples, and they move between runs of unchanged code by more than
-the code moves them: molehill's `rate100` read 7686 ms in the previous sweep of
-this method and 2485 ms here, frp's `jitter` 3061 and 7741. They are context,
-not a verdict. All four tools wedge on `rate100` and three of the four on
-`rtt100` — the shaped path, not one tool. The honest losses are carried in the
-table rather than smoothed over: frp's clean-stage interactive cost is 2.8 ms
-against molehill's 9.6, and one bulk cell per run comes back empty (`†`).
+**The noise these numbers have to clear.** The schedule measures `clean` at
+both ends of every timeline, so each tool's two clean readings are two samples
+of one condition about an hour apart — the run's own replicate, and the scale
+every other cell has to be read against. `just soak-check` reports it:
+
+| tool | clean bulk reading | clean interactive p99 |
+|---|---|---|
+| molehill (mux) | 21.783 – 22.160 Gbit/s (**1.7 %** apart) | 7.3 – 7.3 ms |
+| frp | 6.057 – 6.085 Gbit/s (**0.5 %** apart) | 2.8 – 2.8 ms |
+| rathole | 21.057 – 21.184 Gbit/s (**0.6 %** apart) | 70.5 – 77.3 ms |
+| nps | 0.132 – 0.134 Gbit/s (**1.0 %** apart) | 67.0 – 67.9 ms |
+
+**How much it carries.** The same artifact carries the load ramp: the first
+bulk load level at which a fresh interactive connection breaks the SLO (p99
+50 ms, 0.5 % errors). It is a *different instrument* from the staged schedule —
+the schedule asks what happens as the path changes, the ramp asks where the
+ceiling is — and neither cross-checks the other.
+
+| tool | sustainable streams | ceiling | headroom | reason at the break |
+|---|---|---|---|---|
+| molehill (mux) | 8 | 8 | 0.0 | never broke |
+| frp | 8 | 8 | 0.0 | never broke |
+| rathole | 8 | 8 | 0.0 | never broke |
+| nps | 0 | 8 | 1.0 | interactive p99 204.916 > 50.0 |
+
+![Sustainable load: the first bulk load level that breaks the SLO](assets/soak-v0.10.0-capacity.png)
+
+Three arms carried the ramp's full 8 streams, which is the ramp's own ceiling,
+so that reads as a **floor** ("at least 8"), not as a measured maximum; nps
+breaks the SLO at the first stream it is offered.
+
+**What these shapes say.** Every tool degrades under a bad path and every tool
+recovers on the return to clean — that recovery is what the last column
+measures, and a tool that stayed wedged would be a finding. On the clean path
+**molehill and rathole are the throughput pair** (21.1-22.2 Gbit/s against
+21.1-21.2; the ~3 % gap is inside twice the run's own replicate, so this run
+does not separate them) at very different latency: 7.3 ms against 70.5-77.3 ms.
+frp carries 3.6x less bulk (6.06) but answers in 2.8 ms, and it is the only arm
+inside the SLO on both axes with molehill. nps is 160x behind on clean bulk
+(0.13 Gbit/s) and 67 ms on latency. `loss1` (10 ms delay, 1 % loss) separates
+the throughput pair from frp: 9.7 Gbit/s for molehill and rathole against 5.7
+for frp, with nps at 0.14. On the shaped stages the interactives are *context*:
+they are dominated by the queue the harness installed, they swing by more than
+any between-tool gap in them between runs of unchanged code, and every arm
+wedges on `rate20` and `jitter` — that is the path, not one tool. The honest
+losses are carried rather than smoothed over: frp's clean-stage interactive cost
+is 2.8 ms against molehill's 7.3, and nps again reads zero bytes on a share of
+its intervals in *every* stage including the clean ones, which no other arm does.
 
 The peers are driven by the same workload and charted in the same panels; the
 drift axis (open fds, RSS and CPU slopes over the run) is in
-`soak-v0.10.0-drift.png` and the UDP session's RTT/loss in
-`soak-v0.10.0-udp.png` (a sliding loss *rate*, not a count of loss events).
+`soak-v0.10.0-drift.png`, the UDP session's RTT/loss in
+`soak-v0.10.0-udp.png` (a sliding loss *rate*, not a count of loss events), and
+the load ramp in `soak-v0.10.0-capacity.png`.
 
-These are v0.10.0 numbers from one host. Only runs of the same model, method
-and host compare directly, and every results file records the host it was
-measured on: `just soak-check` reads it, refuses to gate one host's run against
-another's, and gates each run on its own completeness, endpoint and SLO checks.
+These are v0.10.0 numbers from one host, measured with the method this page
+describes. Only runs of the same model, method and host compare directly, and
+every results file records the host and the method it used: `just soak-check`
+reads both, refuses to gate one host's or one method's run against another's,
+and gates each run on its own completeness, endpoint and SLO checks.
 The per-stage numbers carry their sample count in the results file
 (`rtt_n`): a stage that carried fewer than a hundred interactive samples
 reports its *worst observation* as the p99, which is what a shaped stage of a

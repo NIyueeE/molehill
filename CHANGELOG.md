@@ -164,7 +164,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every key found and what to write instead, because a key that secretes a
   compatibility path for one release is a key that never gets removed. The
   upgrade instruction in `docs/configuration.md`, "Migrating to 0.10" is the
-  same table, now as an error.
+  - **The Soak method was re-derived: the path is shaped once, the cells say how
+  they were measured, and the release artifact carries the load axis.** Four
+  changes to what a published benchmark number means, each with its A/B in
+  HANDOFF.md ("Shaping scope, the rate cells, and the shaped-cell rule"):
+
+  *The stage classes apply to the visitor's leg only.* Until now one HTB class
+  shaped both the visitor leg and the tool's backend leg, so every injected
+  delay was paid twice (a `rtt100` stage's interactive floor read 802 ms) and a
+  `rate100` class carried 100 Mbit *in total* — around 42 % of nominal end to
+  end on every arm. Measured on one binary, one method, only the scope changed:
+  floors halve (802 -> 401 ms, 162 -> 82 ms), the rate classes read 91-100 % of
+  nominal, the worst stage transition drops from 25-28 s to 7 s, and a saturated
+  20 Mbit link's real queueing becomes visible (p99 7.4-8.3 s against the 2.0-3.8
+  s the old scope hid by halving the offered load). `SOAK_SHAPE_LEGS=both`
+  reproduces the old scope; the value used is in `meta.shape_legs` and in the
+  gate's method keys, so runs across the change are refused, not compared.
+
+  *A stage's bulk cell is the load over its whole window, and the cell names the
+  side that measured it.* The peak interval was a property of the shaper's
+  schedule; the reading is now span-weighted over the stage, and on a rate class
+  — where the client's socket buffer defeats the sender's accounting by
+  construction — it is the receiver's own window, marked `*` in the tables. A
+  rate stage whose dial produced no receiver summary carries no reading and says
+  why (`rate20`, whose client is still blocked 30 s past the boundary, is such a
+  cell) instead of publishing the defeated side's zero.
+
+  *A shaped stage's interactive cell is reported as context, not judged.* Three
+  runs of one unchanged method move a shaped p99 cell by 5-24 % against the 25 %
+  limit the gate applies per stage, so the gate now fails only a blow-up (3x)
+  there and the README marks those columns and picks no winner in them.
+
+  *The host key is a measurement as well as a name.* Every run records
+  `host_calibration` (SHA-256 over a fixed 192 MiB buffer, median of three,
+  1-2 % repeatable), and the gate refuses to compare two runs whose calibrations
+  differ by more than 25 % — closing the hole that on a host without
+  `/etc/machine-id` the identity key is only `cpu_model | nproc`.
+
+- **The release sweep publishes the load axis too.** `--test` takes a comma
+  list and the ritual runs `--test=rrul,capacity`, so
+  `results-soak-vX.Y.Z.json` carries "how many bulk streams it sustains before
+  the SLO breaks" beside the staged schedule, measured on the same host at the
+  same revision. The two are separate instruments and are never cross-checked.
+  See `docs/release.md`, "Benchmarks", and `docs/benchmarks.md`, "Test types".
 
 ### Removed
 
@@ -344,9 +386,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
   now waits at the *old* shaper until the netem queue is empty and the
   throughput port has no established connection (bounded by
-  `SOAK_DRAIN_BUDGET`, 30 s), restarts the single-test `iperf3` backend
+  `SOAK_DRAIN_BUDGET`; both halves of that predicate were later widened, see
+  the two bullets below), restarts the single-test `iperf3` backend
   before every stage's bulk attempt, and records the client's own failure text
   instead of a bare exit code. See `docs/benchmarks.md`, "The stage schedule".
+
+- **The Soak drain reads the queue it claims to drain.** That wait had a hole
+  in it: `tc` renders a `backlog` with a unit suffix (`b`, `Kb`, `Mb`, `Gb`)
+  and the drain's pattern accepted only the bare `b`, so any queue large enough
+  to print as `Kb` — which is every backlog at a rate-shaped transition — was
+  read as *no qdisc at all*, and the drain returned without waiting for
+  anything. It was a silent no-op at exactly the transitions whose queued bulk
+  it exists to absorb, which is where every empty bulk cell of this cycle's
+  sweeps was (`molehill`'s `rate20`, `nps`'s `jitter`): reproduced
+  deterministically on the `rate100:20,rate20:20` transition, 3 of 3 runs dead
+  before the change and 3 of 3 carrying their spine after it, with the suffix
+  scale (KiB) checked against `tc -s -j` on the same instant. The drain and the
+  transition now also record what they left behind, per stage
+  (`drain_s`, `drain_expired`, `drain_final_backlog`, `drain_busy_sockets`,
+  `spine_sockets`, `backend_restart`, `spine_attempts`,
+  `spine_first_interval_s`), so a stage that starts on a busy path says so
+  rather than leaving it to be guessed. No schedule, port set, load fraction or
+  SLO changed. See `docs/benchmarks.md`, "The stage schedule".
+
+- **A stage transition ends when the path is quiet, not when a timer runs
+  out, and the bulk spine is redialed if it has to be.** Three things were
+  wrong with the wait between stages, and all three are fixed together because
+  they are one behaviour:
+
+  *The wait could not be satisfied.* Its predicate was "the netem queue is
+  exactly empty **and** the throughput port has no established connection", and
+  neither half was decidable: the interactive, churn and UDP probes share the
+  tool's class and leave ~1.2 KB queued permanently (measured with a 400 s
+  budget — the queue settled at 1.2 KB and never reached zero), and
+  `established` alone reads **0** from ~t+20 s while the killed client's
+  `FIN-WAIT-1` sockets are still retransmitting megabytes. So the wait could
+  only ever end by expiring, which made every transition timer-driven: whether
+  the next stage's dial survived depended on whether the clock happened to
+  allow enough time. It now waits for a queue *tolerance* (no more than one
+  `lo` frame, 64 KiB) **and** for no socket in a state that can still send —
+  `ESTAB`, `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`, and not the
+  teardown states, which linger for minutes carrying nothing.
+
+  *`SOAK_DRAIN_BUDGET` is a safety net, not the mechanism*, sized above the
+  measured worst case (180 s against ~159 s: that is how long a `rate20`
+  stage's killed 20-stream client takes to retransmit what its kernel holds at
+  that stage's own 20 Mbit/s). A net that fires is recorded per stage, and both
+  the tolerance and the state set travel in `meta`.
+
+  *The spine is dialed at `SOAK_SPINE_RETRY_S` seconds into the stage* (default
+  `0,25,50,80`) and stops at the first dial that carries intervals; a dial that
+  has carried nothing is abandoned at the next offset, so a stuck one cannot
+  eat the retry it exists to leave room for. A healthy stage never notices —
+  its first dial runs the stage out — and a recovered stage is visible rather
+  than silent: `spine_attempts` counts the dials and `spine_first_interval_s`
+  records when bulk started.
+
+  The result is a measurement whose start state is controlled rather than
+  fitted: in the release sweep every one of the 32 tool-stages dialed on its
+  first attempt, and the transitions cost less than the fixed budget they
+  replaced (197 s per tool in total, against 840 s of budget expiry). See
+  `docs/benchmarks.md`, "The stage schedule".
+
+- **`just soak-check` compares the method, and refuses a cell the method
+  cannot measure.** Two things the release gate stated too weakly:
+
+  *Comparability was checked as one integer.* `workload_version` is a single
+  number for the whole model, and this cycle changed five method keys while it
+  stayed `1` — the stage transition, the drain's predicate and budget, the
+  spine's retry schedule — so the gate would have called two different
+  instruments comparable and printed verdicts from the comparison. It now
+  compares the runs' method records (`soak_check.METHOD_KEYS`: the schedule,
+  the shaper classes, the load, the SLO, the probe rates and the transition
+  settings) and refuses, naming every key that differs **and** every key one
+  file does not record at all — an absent key is an instrument that file cannot
+  describe, not a default to be assumed. Every blocking reason is reported, not
+  just the first, because a baseline can fail more than one and naming only one
+  would suggest that clearing it makes the pair comparable.
+
+  *A degenerate cell was still published as a number.* At or over half of a
+  stage's bulk intervals reading zero bytes — which is every rate-shaped stage,
+  because netem holds each interval's bytes past that interval's own accounting
+  window — the peak that remains is not a throughput measurement, and both the
+  plot's tables and the README now print that share instead of a figure. The
+  per-stage bulk table is generated by `just soak-plot` for the first time, so
+  the README's bulk numbers and the tool cannot drift apart.
+
+  *And the run now states its own noise.* The schedule measures `clean` at both
+  ends of every timeline, so every run contains a replicate of one condition
+  about an hour apart. `just soak-check` reports that spread per tool — 21.73 to
+  23.80 Gbit/s for molehill, 1.2 % for frp — and it is the scale a between-tool
+  difference has to clear. It is reported, never judged: variance is data, and
+  a threshold on it would be invented. Applied to this release's numbers it
+  corrects what the README previously implied: on the clean path molehill and
+  rathole are **indistinguishable** in throughput, because their replicate
+  ranges overlap, while frp is 3.2x behind and molehill's clean latency is 10x
+  better than rathole's. See `docs/benchmarks.md`, "Comparability".
 
 - **A `client`-only build compiles again, and so does `client,kcp`.** Two
   `#[cfg]` gates were left behind when the v3 path was deleted, both by

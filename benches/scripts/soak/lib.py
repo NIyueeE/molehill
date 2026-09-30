@@ -32,6 +32,7 @@ import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 # The runner that owns the lock ledger and the process groups. Identified by
 # its own name so the liveness guards below can never drift from the file
@@ -253,14 +255,41 @@ class Knobs:
     # --- test-type parameters ---------------------------------------------
     # per load-step settle window and the interactive-stream sample rate
     settle_s: float = 6.0
-    #: Upper bound on the wait for a stage's in-flight bulk to drain before the
-    #: next stage reshapes the path (see `Shaper.settle` in the runner). It is
-    #: a budget, not a fixed delay: the wait ends as soon as the tool's netem
-    #: queue is empty, so an unshaped or light stage costs almost nothing. 30 s
-    #: covers the worst measured case — a `rate20` stage's killed 20-stream
-    #: client, whose kernel-side send buffers still hold megabytes that can
-    #: only leave at 20 Mbit/s.
-    stage_drain_budget: float = 30.0
+    #: **Safety net, not the mechanism**: a stage transition ends when the path
+    #: is quiet by the drain's predicate (`Shaper.settle`), and this only
+    #: bounds how long that may take. Sized above the measured worst case —
+    #: after a `rate20` stage's bulk client is killed, the tens of MB its
+    #: kernel still holds take ~159 s to clear at that stage's own 20 Mbit/s,
+    #: because the harness shapes the *backend* leg at the same rate, so the
+    #: tool applies backpressure and the client's kernel accumulates. At 120 s
+    #: the net fired mid-flush and the next stage's dial was closed; a net that
+    #: fires is logged and recorded (`drain_expired`), never absorbed.
+    stage_drain_budget: float = 180.0
+    #: Seconds into a stage at which its bulk spine is dialed. The first entry
+    #: is the design point and a *healthy* dial runs the stage out from there;
+    #: the later ones are second chances, used only after a dial has already
+    #: given up, so they cost a healthy stage nothing. They exist because a
+    #: drain cannot always make the path quiet in bounded time: measured on the
+    #: `rate20 -> jitter` transition, the killed 20-stream client's teardown
+    #: holds ~33 MB and retransmits it for ~106 s at that stage's 20 Mbit/s, so
+    #: the next stage's dial lands on a busy path through no fault of its own
+    #: (see docs/benchmarks.md, "The stage schedule").
+    spine_retry_s: tuple = (0, 25, 50, 80)
+    #: How long past a stage's boundary its bulk client keeps reading for the
+    #: `end` event that carries the receiver's own window. Part of the method:
+    #: a dial that gets no summary records no receiver half.
+    spine_summary_grace_s: float = 5.0
+    #: Which legs of the path the shaper applies a stage's class to. `visitor`
+    #: shapes the workload's own access link (and the KCP tunnel port, the one
+    #: tunnel the harness can name); `both` adds the tool's backend leg, which
+    #: is what every run before 2026-09-29 measured. See `Shaper.PATH_PORTS`.
+    #:
+    #: The default is `visitor` on the A/B recorded in HANDOFF.md ("Shaping
+    #: scope"): the two legs share one HTB class, so `both` halves every rate
+    #: class and doubles every injected delay, and `visitor` is what the stage
+    #: table in docs/benchmarks.md has always said the classes do.
+    SHAPE_LEGS: ClassVar[tuple] = ("visitor", "both")
+    shape_legs: str = "visitor"
     ping_interval_ms: int = 50
     # the operating point for `cost`: fraction of the configured max load
     cost_operating_point: float = 0.8
@@ -297,7 +326,10 @@ class Knobs:
             slo_rtt_p99_ms=_env_float("SOAK_SLO_RTT_P99_MS", 50.0),
             slo_error_rate=_env_float("SOAK_SLO_ERROR_RATE", 0.005),
             settle_s=_env_float("SOAK_SETTLE_S", 6.0),
-            stage_drain_budget=_env_float("SOAK_DRAIN_BUDGET", 30.0),
+            stage_drain_budget=_env_float("SOAK_DRAIN_BUDGET", 180.0),
+            spine_retry_s=_env_seconds("SOAK_SPINE_RETRY_S", (0, 25, 50, 80)),
+            spine_summary_grace_s=_env_float("SOAK_SPINE_SUMMARY_GRACE_S", 5.0),
+            shape_legs=_env_choice("SOAK_SHAPE_LEGS", "visitor", cls.SHAPE_LEGS),
             ping_interval_ms=_env_int("SOAK_PING_INTERVAL_MS", 50),
             cost_operating_point=_env_float("SOAK_COST_OPERATING_POINT", 0.8),
             rrul_stream_factor=_env_int("SOAK_RRUL_STREAM_FACTOR", 1),
@@ -323,6 +355,87 @@ def _env_float(name: str, default: float) -> float:
         return float(v) if v else default
     except ValueError:
         return default
+
+
+def _env_choice(name: str, default: str, allowed: tuple) -> str:
+    """Environment override of a string knob, restricted to `allowed`.
+
+    A value outside the set keeps the default *and* the runner reports it:
+    the alternative — accepting whatever was typed — is how a run measures a
+    configuration nobody asked for and records it under a name that says
+    otherwise. (The variant A/B's list has the same rule for the same reason.)
+    """
+    v = (os.environ.get(name) or "").strip()
+    return v if v in allowed else default
+
+
+def _env_seconds(name: str, default: tuple) -> tuple:
+    """Environment override of a list of offsets in seconds, e.g. "0,25,50,80".
+
+    Unset, blank or unparsable keeps the default: a malformed retry schedule
+    must not be able to leave the spine with no dial at all, which is the
+    failure a schedule exists to prevent.
+    """
+    v = os.environ.get(name)
+    if not v:
+        return default
+    try:
+        out = tuple(float(p) for p in v.split(","))
+    except ValueError:
+        return default
+    return out or default
+
+
+# --- TCP socket state observation --------------------------------------------
+#: The columns `ss -tan` prints for a socket row: state, Recv-Q, Send-Q, local
+#: address, peer address. A line with fewer is the header or a variant.
+SS_MIN_COLUMNS = 5
+
+
+def tcp_state_counts(ports: dict) -> dict:
+    """Live TCP socket counts per named port, by `ss` state, in one call.
+
+    The drain at a stage transition watches the throughput port alone, while
+    the shaped set also carries the backend leg: a transition can therefore
+    leave teardown sockets on a port nothing is waiting for, and the next
+    visitor's dial then races them. Recording the states puts that in the
+    stage record instead of leaving it to be re-derived by guess.
+
+    `ports` maps a label to a port number; the result maps each label that
+    had sockets to `{state: count}`. LISTEN is counted too -- the caller
+    decides what to ignore. `{}` when `ss` is missing or answers nothing:
+    this is evidence collected beside a measurement, so it must never be
+    able to fail a run.
+    """
+    wanted = {label: p for label, p in ports.items() if p}
+    if not wanted:
+        return {}
+    try:
+        out = subprocess.run(
+            ["ss", "-tan"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except Exception:  # noqa: BLE001 — diagnostics must not fail the run
+        return {}
+    counts: dict = {}
+    for line in out.splitlines():
+        f = line.split()
+        # `ss -tan` renders `State Recv-Q Send-Q Local Peer`. Anything with a
+        # different column count is the header or a variant we must not parse,
+        # so the test is on the numeric columns rather than on the state name,
+        # which differs between iproute2 versions.
+        if len(f) < SS_MIN_COLUMNS or not (f[1].isdigit() and f[2].isdigit()):
+            continue
+        for label, port in wanted.items():
+            # Match the port with its colon so 5201 cannot match 15201.
+            if f[3].endswith(f":{port}") or f[4].endswith(f":{port}"):
+                by_state = counts.setdefault(label, {})
+                by_state[f[0]] = by_state.get(f[0], 0) + 1
+                break
+    return counts
 
 
 # --- local backends ----------------------------------------------------------
@@ -365,6 +478,10 @@ class Backends:
         self._socks = []
         self._work = None
         self.ports = BackendPorts(0, 0, 0)
+        #: What the throughput port held before the last `restart_iperf`,
+        #: as `{"sockets_before", "states_before", "wait_s", "timed_out"}`.
+        #: `None` until a restart happens.
+        self.restart_report = None
 
     @property
     def iperf_port(self) -> int:
@@ -527,9 +644,24 @@ class Backends:
         clean state; the TCP/UDP echo servers are unaffected. Called by
         `run_throughput` after every failed rep; the old wedged process is
         killed and the new one re-recorded for crash reaping.
+
+        `self.restart_report` records what the port held *before* the kill.
+        The rrul spine restarts this server at every stage boundary, and one
+        candidate mechanism for a dead spine is that the rebind races the
+        previous stage's dying visitor connection -- which is state on the
+        port, not state in the server. Recorded, not yet waited on.
         """
         if not self._procs:
             raise RuntimeError("restart_iperf: no backend server running")
+        counts = tcp_state_counts({"iperf_backend": self.iperf_port}).get(
+            "iperf_backend", {}
+        )
+        self.restart_report = {
+            "sockets_before": sum(n for s, n in counts.items() if s != "LISTEN"),
+            "states_before": counts,
+            "wait_s": 0.0,
+            "timed_out": False,
+        }
         proc = self._procs.pop(0)  # index 0 is always the iperf3 server
         with contextlib.suppress(OSError):
             proc.kill()
@@ -1292,6 +1424,27 @@ token = "bench"
     s.procs.spawn([str(peer), "--client", str(d / "client.toml")])
 
 
+def hardlink_or_copy(src: Path, target: Path) -> None:
+    """Materialize `src` at `target` by hard link, falling back to a copy.
+
+    A hard link keeps the peer's ~24 MB of binaries on one inode, and
+    `/proc/self/exe` resolves to the linked path. The copy is the fallback for
+    a peer cache on another filesystem — measured: EXDEV from `/home` to
+    `/tmp`, which failed the whole nps test while the binaries' own link had a
+    fallback and quietly worked.
+    """
+    try:
+        os.link(src, target)
+    except OSError:
+        shutil.copy2(src, target)
+
+
+def await_port(port: int, failure: str) -> None:
+    """Wait for `port` to open, raising `failure` when it does not."""
+    if not wait_port(port, 10):
+        raise TimeoutError(failure)
+
+
 def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     """nps: one server (`nps`) plus one client (`npc`) holding all proxies.
 
@@ -1314,10 +1467,7 @@ def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     for binary in ("nps", "npc"):
         target = d / binary
         if not target.exists():
-            try:
-                os.link(peer / binary, target)
-            except OSError:  # different filesystem: fall back to a copy
-                shutil.copy2(peer / binary, target)
+            hardlink_or_copy(peer / binary, target)
         target.chmod(0o755)
     conf = d / "conf"
     conf.mkdir(exist_ok=True)
@@ -1326,15 +1476,7 @@ def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     # shipped file that is not the config itself.
     for shipped in (peer / "conf").iterdir():
         if shipped.name != "nps.conf" and not (conf / shipped.name).exists():
-            target = conf / shipped.name
-            try:
-                os.link(shipped, target)
-            except OSError:
-                # Different filesystem — the peer cache is not required to
-                # live on the same mount as the work dir (measured: EXDEV
-                # from /home to /tmp, which failed the whole nps test while
-                # the binaries' own link had a fallback and quietly worked).
-                shutil.copy2(shipped, target)
+            hardlink_or_copy(shipped, conf / shipped.name)
     # The web UI is mandatory in nps.conf; it takes a free slot in the
     # test's port band, and the http/https proxy ports stay empty so
     # nothing privileged is opened.
@@ -1398,14 +1540,12 @@ target_addr=127.0.0.1:{p["udp_backend"]}
 server_port={p["udp_exposed"]}
 """)
     s.procs.spawn([str(d / "nps")], cwd=d)
-    if not wait_port(p["control"], 10):
-        raise TimeoutError("nps bridge port did not open")
+    await_port(p["control"], "nps bridge port did not open")
     s.procs.spawn([str(d / "npc"), "-config", str(d / "npc.conf")], cwd=d)
     # The TCP tunnels only: a UDP task has no listening TCP port to wait
     # for (the bench's own UDP probe is what exercises it).
     for port in (p["iperf_exposed"], p["echo_exposed"]):
-        if not wait_port(port, 10):
-            raise TimeoutError(f"nps tunnel {port} not ready")
+        await_port(port, f"nps tunnel {port} not ready")
 
 
 def tool_band(base: int, off: int) -> dict:
@@ -1604,6 +1744,78 @@ def host_identity() -> dict:
             "cpu_model": cpu_model,
             "cpu_count": nproc,
         },
+    }
+
+
+#: The host calibration probe: a fixed CPU-bound workload (SHA-256 over a fixed
+#: buffer), reported as MiB/s.
+#:
+#: `host_id` answers "which machine is this?", and on a host *without*
+#: `/etc/machine-id` — this one, see HANDOFF.md — it reduces to
+#: `cpu_model | nproc`, so two different machines can hash to the same id.
+#: A name cannot close that hole; a measurement can: two runs are comparable
+#: only if the machine was in the same *state*, and the state (turbo, thermal,
+#: steal, a neighbour's load) is exactly what moves a fixed workload's
+#: throughput. The probe is deliberately CPU-bound rather than a loopback
+#: throughput measurement: measured on this host, a 128 MiB socketpair probe
+#: drifts 18.7 % across median-of-five readings (it follows the CPU's power
+#: state), while this one repeats to 2.2 % — a calibration key has to be
+#: stabler than the differences it exists to detect.
+CALIBRATION_MIB = 192
+#: Median of this many readings. Three is the smallest count with a median at
+#: all, and the probe is ~0.5 s per reading.
+CALIBRATION_REPS = 3
+#: The buffer hashed per iteration. 1 MiB keeps `hashlib` on its bulk path (it
+#: releases the GIL above ~2 KiB), so the number is a CPU measurement rather
+#: than a Python-loop measurement.
+CALIBRATION_CHUNK = 1 << 20
+
+
+def _calibration_once(buffer: bytes) -> float:
+    """One reading: MiB/s of SHA-256 over `buffer`, repeated to `CALIBRATION_MIB`."""
+    digest = hashlib.sha256()
+    iterations = CALIBRATION_MIB
+    started = time.perf_counter()
+    for _ in range(iterations):
+        digest.update(buffer)
+    elapsed = time.perf_counter() - started
+    digest.digest()
+    return iterations / elapsed if elapsed > 0 else 0.0
+
+
+def host_calibration(reps: int = CALIBRATION_REPS) -> dict:
+    """What this host measures at a fixed, tool-free workload — the *state* key.
+
+    `host_identity`'s `host_id` is stable but it is a name: it cannot tell two
+    machines with the same CPU model and core count apart, and on a host with
+    no machine id that is all it has. This is the measurement the original note
+    asked for instead of more identity fields, and it is recorded beside the
+    identity rather than hashed into it — a noisy reading folded into a key
+    would make the key as noisy as the reading and impossible to diagnose.
+
+    Never raises: a host that cannot run the probe (a sandbox without the
+    cycles, a platform where it is meaningless) records the typed failure, and
+    the gate then reports that the comparison could not be checked rather than
+    reading a missing value as agreement.
+    """
+    try:
+        buffer = bytes(CALIBRATION_CHUNK)  # zeroes: hashing does not care
+        values = [_calibration_once(buffer) for _ in range(max(1, reps))]
+    except (OSError, MemoryError, ValueError) as e:
+        return {"probe": "sha256_fixed_buffer", "ok": False, "reason": str(e)[:200]}
+    lo, hi = min(values), max(values)
+    return {
+        "probe": "sha256_fixed_buffer",
+        "ok": True,
+        "unit": "MiB/s",
+        "mib": CALIBRATION_MIB,
+        "reps": len(values),
+        "median": round(statistics.median(values), 1),
+        "min": round(lo, 1),
+        "max": round(hi, 1),
+        # The probe's own spread, recorded so a reader can hold a between-run
+        # difference against the instrument's repeatability instead of guessing.
+        "spread_pct": round((hi - lo) / hi * 100.0, 1) if hi else None,
     }
 
 

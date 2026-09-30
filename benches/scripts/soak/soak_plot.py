@@ -57,6 +57,7 @@ from matplotlib.patches import Patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import lib
+import soak
 
 DPI = 130
 THROUGHPUT_COLOR = "#b26a00"
@@ -75,6 +76,10 @@ TOOL_COLORS = [
     "#37474f",
 ]
 FONT = 8.0
+
+# (The bulk-cell rule lives in `soak.bulk_reading`: the reading and the side it
+# came from are one decision, and the chart renders it instead of re-deriving
+# it. The zero-share threshold is a *withholding* rule there, not a selector.)
 # Where the "no samples in this stage" marker sits on the log RTT axis.
 NO_DATA_X = 3.0
 # UDP figure: RTT panel, plus a loss panel when a loss series exists.
@@ -759,8 +764,14 @@ def _fmt(value, unit: str = "") -> str:
     return "—" if value is None else f"{value}{unit}"
 
 
-def tables(tests: list, meta: dict) -> None:
-    """The markdown view of the same numbers, for the README and the notes."""
+def tables(tests: list, staged: list, meta: dict) -> None:
+    """The markdown view of the same numbers, for the README and the notes.
+
+    `tests` is everything the file carries (the per-tool table has a `test`
+    column, and a capacity entry's `sustainable streams` is the load axis);
+    `staged` is the subset that walked a schedule, because the per-stage tables
+    read stages and a load ramp has none.
+    """
     slo = (meta.get("slo") or {}).get("rtt_p99_ms")
     print("\n## Soak results\n")
     print(
@@ -805,38 +816,168 @@ def tables(tests: list, meta: dict) -> None:
             f"{_fmt(m.get('server_rss_kb_slope_per_min'), ' KiB/min')} | "
             f"{_fmt(m.get('server_fds_slope_per_min'), '/min')} |"
         )
-    print_stage_table(tests, "rtt_p99", "interactive RTT p99 (ms)")
-    print_stage_table(tests, "udp_p99", "UDP RTT p99 (ms)", note_wedges=False)
-    print_wedges(tests)
+    print(
+        "\nThe `bulk Gbit/s` column above is a mean over **every** stage, so it "
+        "includes the stages the next table reports as degenerate; read a "
+        "throughput claim off that table, not off this column."
+    )
+    shaped = shaped_columns(staged, meta)
+    print_stage_table(staged, "rtt_p99", "interactive RTT p99 (ms)", shaped)
+    print_stage_table(staged, "udp_p99", "UDP RTT p99 (ms)", shaped, note_wedges=False)
+    print_bulk_stage_table(staged)
+    print_wedges(staged)
+
+
+def by_column(test: dict, index: int):
+    """The stage record in `index`-th schedule position, or `None`."""
+    sts = test.get("stages", [])
+    return sts[index] if index < len(sts) else None
+
+
+def stage_columns(tests: list) -> list:
+    """Stage names in schedule order, **repeats kept** and disambiguated.
+
+    A repeated class is not redundant: `clean` runs at both ends of every
+    timeline, and its two readings are the run's own replicate — the noise
+    scale every between-tool difference has to clear (`soak_check` reports
+    it). Collapsing them into one column is how a table hides its own noise
+    floor, so the second reading gets its own column.
+    """
+    # The schedule is the same for every tool, so the columns come from the
+    # first test that has one: iterating them all would repeat the schedule
+    # once per arm.
+    first = next((t for t in tests if t.get("stages")), None)
+    cols, seen = [], {}
+    for s in first.get("stages", []) if first else []:
+        name = s.get("stage")
+        if name is None:
+            continue
+        if name in seen:
+            seen[name] += 1
+            cols.append(f"{name} (repeat)")
+        else:
+            seen[name] = 1
+            cols.append(name)
+    return cols
+
+
+#: Prefix on a cell whose stage class applies netem. The same marker the README
+#: uses: the value is real, but a *single run* cannot compare it with another
+#: run's — see `soak_check.SHAPED_BLOWUP_PCT` and docs/benchmarks.md.
+SHAPED_MARK = "~"
+#: Prefix on a stage that recorded a wedge (a silent stretch). Marked *beside*
+#: the value, not instead of it: a stage that recovered carries both facts, and
+#: replacing the number with "wedge" threw away the one the table exists for.
+WEDGE_MARK = "‡"
+
+
+def shaped_columns(tests: list, meta: dict) -> set:
+    """Column indices whose stage class applies a netem queue.
+
+    Read from the run's own `meta.path_classes` (what the runner applied), not
+    from a list of names, so a class that gains or loses its netem cannot leave
+    the tables behind.
+    """
+    first = next((t for t in tests if t.get("stages")), None)
+    classes = meta.get("path_classes") or {}
+    out = set()
+    for i, st in enumerate(first.get("stages", []) if first else []):
+        cls = classes.get(st.get("stage")) or {}
+        if cls.get("netem"):
+            out.add(i)
+    return out
 
 
 def print_stage_table(
-    tests: list, key: str, title: str, note_wedges: bool = True
+    tests: list, key: str, title: str, shaped: set, note_wedges: bool = True
 ) -> None:
     """The per-stage matrix: the shape of the run, not its average."""
-    stages = []
-    for t in tests:
-        for s in t.get("stages", []):
-            if s["stage"] not in stages:
-                stages.append(s["stage"])
+    stages = stage_columns(tests)
     if not stages:
         return
     print(f"\n### Per stage: {title}\n")
+    if shaped:
+        print(
+            f"`{SHAPED_MARK}` marks a **shaped** class: the harness installed "
+            "the queue that dominates it and one run does not repeat it — the "
+            "same unchanged method moves these cells by 5-24 % between runs "
+            "here, and by more on the older peak-interval reading "
+            "(docs/benchmarks.md, 'Comparability'). Read them as context, never "
+            "as a ranking."
+        )
+    if note_wedges:
+        print(
+            f"`{WEDGE_MARK}` marks a stage that recorded a wedge (a silent "
+            "stretch, drawn on the chart as a flat segment); a stage that "
+            "recovered carries both the marker and its number."
+        )
     print("| tool | " + " | ".join(stages) + " |")
     print("|" + "---|" * (len(stages) + 1))
     for t in tests:
         cells = []
-        for stage in stages:
-            s = next((x for x in t.get("stages", []) if x["stage"] == stage), None)
+        for i, _stage in enumerate(stages):
+            s = by_column(t, i)
             if s is None:
                 cells.append("—")
-            elif note_wedges and s.get("flat_segments"):
-                cells.append("wedge")
             elif s.get(key) is not None:
-                cells.append(f"{s[key]}")
+                mark = SHAPED_MARK if i in shaped else ""
+                if note_wedges and s.get("flat_segments"):
+                    mark += WEDGE_MARK
+                cells.append(f"{mark}{s[key]}")
             else:
                 cells.append("no data")
         print(f"| {t['tool']} | " + " | ".join(cells) + " |")
+
+
+def bulk_cells(test: dict, stages: list) -> list:
+    """One stage's bulk reading — the record's own, never recomputed here.
+
+    Returned rather than printed so the rule has one home (`soak.bulk_reading`):
+    the README's bulk paragraph is written from this table, and a
+    hand-computed peak is how a degenerate cell gets published as a figure.
+    The runner decided which side's window the reading comes from, at the
+    moment it had both; the chart only renders that decision, marking the
+    cells whose reading is the receiver's own window (the sender's interval
+    accounting was defeated, which is the normal state of a shaped stage).
+    """
+    cells = []
+    for i, _stage in enumerate(stages):
+        s = by_column(test, i)
+        if s is None:
+            cells.append("—")
+            continue
+        gbps, source = soak.bulk_reading(s)
+        if gbps is None:
+            cells.append(f"— ({source})")
+        elif source == "receiver's own window":
+            cells.append(f"{gbps:.3f} *")
+        else:
+            cells.append(f"{gbps:.3f}")
+    return cells
+
+
+def print_bulk_stage_table(tests: list) -> None:
+    """Per stage: the bulk load over the stage's whole window, in Gbit/s."""
+    stages = stage_columns(tests)
+    if not stages:
+        return
+    print("\n### Per stage: bulk throughput over the stage window (Gbit/s)\n")
+    print(
+        "The reading is the load over the stage's **whole measured window**, "
+        "not its best second: netem releases a shaped burst into whichever "
+        "interval it likes, so the peak is a property of the shaper's "
+        "schedule. `*` marks a cell read from the **receiver's own window**, "
+        "which is the only side left when the sender's interval accounting is "
+        "defeated (its writes completed into a socket buffer the path cannot "
+        "drain, so the measured intervals read zero while the path keeps "
+        "carrying them); `— (reason)` is a stage that carried no reading, with "
+        "the reason it did not — that is what a defeated sender gets instead "
+        "of a figure, and `jitter` and `rate20` are where it happens."
+    )
+    print("\n| tool | " + " | ".join(stages) + " |")
+    print("|" + "---|" * (len(stages) + 1))
+    for t in tests:
+        print(f"| {t['tool']} | " + " | ".join(bulk_cells(t, stages)) + " |")
 
 
 def print_wedges(tests: list) -> None:
@@ -868,24 +1009,29 @@ def main() -> None:
     assets.mkdir(parents=True, exist_ok=True)
     tests = [t for t in data["tests"] if not t.get("error")]
     meta = data["meta"]
+    # A file may carry several test types per tool (the release sweep runs the
+    # staged schedule and the load ramp into one artifact). The staged subset
+    # drives every chart that reads a schedule; the load ramp drives the
+    # capacity chart and gets a row of its own in the per-tool table.
+    staged = [t for t in tests if t.get("stages")]
     apply_style()
-    render_master(tests, meta, assets / f"soak-{ver}.png")
-    if any(stage_rows(t, "rtt_interactive_ms") for t in tests):
-        render_stages(tests, meta, assets / f"soak-{ver}-stages.png")
+    render_master(staged, meta, assets / f"soak-{ver}.png")
+    if any(stage_rows(t, "rtt_interactive_ms") for t in staged):
+        render_stages(staged, meta, assets / f"soak-{ver}-stages.png")
     capacity = [t for t in tests if t["test"] == "capacity"]
     if capacity:
         render_capacity(capacity, meta, assets / f"soak-{ver}-capacity.png")
-    if any(series(t, "rtt_udp_ms") for t in tests):
-        render_udp(tests, meta, assets / f"soak-{ver}-udp.png")
-    if any("drift_from_t" in t.get("metrics", {}) for t in tests):
-        render_drift(tests, meta, assets / f"soak-{ver}-drift.png")
+    if any(series(t, "rtt_udp_ms") for t in staged):
+        render_udp(staged, meta, assets / f"soak-{ver}-udp.png")
+    if any("drift_from_t" in t.get("metrics", {}) for t in staged):
+        render_drift(staged, meta, assets / f"soak-{ver}-drift.png")
     if any(
         s.get("cost_cpu_per_gbit") is not None
-        for t in tests
+        for t in staged
         for s in t.get("stages", [])
     ):
-        render_cost(tests, meta, assets / f"soak-{ver}-cost.png")
-    tables(tests, meta)
+        render_cost(staged, meta, assets / f"soak-{ver}-cost.png")
+    tables(tests, staged, meta)
 
 
 if __name__ == "__main__":
