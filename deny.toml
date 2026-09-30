@@ -7,12 +7,16 @@ all-features = true
 
 [licenses]
 version = 2
-# permissive licenses accepted for dependencies; extend as needed
+# permissive licenses accepted for dependencies; extend as needed.
+# Listed exactly as wide as the graph needs: cargo-deny reports an allowance no
+# dependency uses (`license-not-encountered`), and "extend as needed" is what
+# that warning asks for — a new dependency under a new permissive license adds
+# its line here, consciously, instead of the list carrying entries that nothing
+# has exercised for releases.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",

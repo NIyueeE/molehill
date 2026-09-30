@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::TryRng;
 use sha2::{Digest, Sha256};
@@ -180,8 +180,8 @@ impl ResumedCipher {
     ) -> Self {
         let keys = SessionKeys::derive(hh, client_nonce, server_nonce);
         ResumedCipher {
-            send: ChaCha20Poly1305::new(Key::from_slice(&keys.initiator_egress)),
-            recv: ChaCha20Poly1305::new(Key::from_slice(&keys.responder_egress)),
+            send: ChaCha20Poly1305::new(&Key::from(keys.initiator_egress)),
+            recv: ChaCha20Poly1305::new(&Key::from(keys.responder_egress)),
             send_nonce: 0,
             recv_nonce: 0,
             scratch: Vec::new(),
@@ -196,8 +196,8 @@ impl ResumedCipher {
     ) -> Self {
         let keys = SessionKeys::derive(hh, client_nonce, server_nonce);
         ResumedCipher {
-            send: ChaCha20Poly1305::new(Key::from_slice(&keys.responder_egress)),
-            recv: ChaCha20Poly1305::new(Key::from_slice(&keys.initiator_egress)),
+            send: ChaCha20Poly1305::new(&Key::from(keys.responder_egress)),
+            recv: ChaCha20Poly1305::new(&Key::from(keys.initiator_egress)),
             send_nonce: 0,
             recv_nonce: 0,
             scratch: Vec::new(),
@@ -291,7 +291,7 @@ impl chacha20poly1305::aead::Buffer for SliceBuffer<'_> {
 fn record_nonce(counter: u64) -> Nonce {
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
-    *Nonce::from_slice(&nonce)
+    Nonce::from(nonce)
 }
 
 /// A fresh random nonce/identifier from the system RNG.
@@ -325,7 +325,7 @@ fn seal_ticket(
     issued: u64,
     hh: &[u8; 32],
 ) -> std::io::Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(ticket_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*ticket_key));
     let nonce_bytes = random_bytes::<12>()?;
     let mut plain = Vec::with_capacity(TICKET_PLAIN_LEN);
     plain.extend_from_slice(&id.to_be_bytes());
@@ -336,7 +336,7 @@ fn seal_ticket(
     // `TICKET_LEN`.
     let mut sealed = plain;
     cipher
-        .encrypt_in_place(Nonce::from_slice(&nonce_bytes), b"", &mut sealed)
+        .encrypt_in_place(&Nonce::from(nonce_bytes), b"", &mut sealed)
         .map_err(|_| std::io::Error::other("ticket seal failed"))?;
     debug_assert_eq!(sealed.len(), TICKET_PLAIN_LEN + TAG_LEN);
     let mut ticket = Vec::with_capacity(TICKET_LEN);
@@ -351,10 +351,12 @@ fn open_ticket(ticket_key: &[u8; 32], ticket: &[u8]) -> Option<(u64, u64, [u8; 3
     if ticket.len() != TICKET_LEN {
         return None;
     }
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(ticket_key));
+    let cipher = ChaCha20Poly1305::new(&Key::from(*ticket_key));
+    // The length check above makes the first 12 bytes the nonce.
+    let nonce: [u8; 12] = ticket[..12].try_into().ok()?;
     let mut buf = ticket[12..].to_vec();
     cipher
-        .decrypt_in_place(Nonce::from_slice(&ticket[..12]), b"", &mut buf)
+        .decrypt_in_place(&Nonce::from(nonce), b"", &mut buf)
         .ok()?;
     if buf.len() != TICKET_PLAIN_LEN {
         return None;
