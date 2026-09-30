@@ -731,13 +731,73 @@ recorded run (the numbers above are from the corrected instrument).
 
 ### The v0.10.0 release sweep
 
-To be recorded here after the sweep: the run's provenance (`revision`,
-`tree_clean`, `stale`, the binary fingerprint), `just soak-check`'s verdict, the
-self-check's SLO numbers, and the comparability against v0.9.1 (same host) and
-v0.9.0 (different host — the interleaved `--ab` screen is the evidence that
-travels). The withdrawn v0.9.1 file stays in the tree until then, because it was
-measured on this host and from this source, which makes it the only same-host
-baseline the delta can be read against.
+**Run (2026-09-27).** `revision v0.9.0-45-g8d3d440`, `tree_clean true`,
+`stale false`, binary `target/release/molehill` sha256 `df3b341b9e010449`
+(4 155 712 bytes), `molehill_version 0.10.0`, `workload_version 1`, host
+`a093c5fbe0dc`, `--tools molehill,frp,rathole,nps --test=rrul`, ~80 min,
+`soak complete: 4 test(s)`.
+
+**The provenance check earned its place.** The first attempt was refused by the
+harness — `target/release/molehill predates the newest source file` — because the
+previous round's temporary write-timing diagnostic had been reverted in the
+*source* without rebuilding the *binary*; `strings` confirmed the shipped binary
+still carried the diagnostic string. Rebuilt, re-verified (0 occurrences,
+`--version` reporting `8d3d440`), then swept. §10's "prove provenance" rule
+caught a real stale artifact rather than a hypothetical one.
+
+**`just soak-check`: `OK: no gate violation`.** Completeness, the endpoint
+invariant and the absolute SLO all pass for the four tools:
+
+```
+ok  molehill (mux): complete (95562 samples, 8 stage(s))
+ok  molehill (mux): throughput endpoint is the exposed port 26002 (backend 26090)
+ok  molehill (mux) clean: interactive p99 2.287 ms is inside the SLO (50.0 ms)
+ok  molehill (mux) clean: interactive p99 7.489 ms is inside the SLO (50.0 ms)
+NOTE molehill (mux): 5 shaped stage(s) sit above the SLO by design, p99 up to
+     7094.501 ms — that is the degradation curve, not a verdict
+```
+
+**The same-host baseline the plan relied on no longer exists.** The withdrawal
+note above kept `results-soak-v0.9.1.json` in the tree *because* it was measured
+on this host, which made it the only same-host delta available. That host was
+`16b4dc8db68b`; this run is on `a093c5fbe0dc` (the container was recreated after
+the `/tmp` wipe), so the file's whole reason for being here expired with the host
+name — and `soak-check` says so itself rather than guessing:
+
+```
+# Comparison against the baseline: skipped
+  NOTE baseline is not a gate input: the runs were made on different hosts
+       (16b4dc8db68b vs a093c5fbe0dc) ...
+  NOTE the run above is gated by its own checks: completeness, the endpoint
+       invariant and the absolute SLO
+```
+
+The file and its four charts are deleted in the sweep commit, per the release
+plan; the new baseline candidate (v0.9.0, host `98c48ea3fa68`) is a different
+host too, and is skipped identically. **Every stored baseline in this repository
+is from a different host than the run that consults it**, so the drift gate has
+in practice never been available here — worth knowing before anyone reads a
+cross-host delta as a regression, which is exactly the mistake this cycle spent
+several rounds on.
+
+**What the four tools did in the same run** (interactive p99 ms; `wedge` = no
+response inside the 5 s timeout):
+
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
+|---|---|---|---|---|---|---|---|---|
+| **molehill (mux)** | **2.3** | 5906 | **1305** | **1908** | **5258** | wedge | 7094 | 7.5 |
+| frp 0.71.0 | 2.9 | 7235 | 4281 | 5297 | 6995 | 6051 | **219** | **2.9** |
+| rathole 0.5.0 | 70 | 7589 | 1313 | 5418 | 7345 | 6219 | 2717 | 75 |
+| nps 0.26.10 | 65 | **861** | 1140 | 4458 | 7244 | 5900 | 3872 | 65 |
+
+molehill leads clean, loss1, loss5 and rate100, matches rathole on loss1, and is
+**worst on jitter** (7094 ms against frp's 219 ms) and the only tool whose
+`rate20` stage produced no interactive sample at all. Its bulk peak is 16.3
+Gbit/s on clean, 2.9 at rtt100, 0.7 at rate100 and **25.0** on the return to
+clean (frp 6.5 / 2.9 / 0.7 / 6.5; rathole 23.5 / 3.0 / 0.5 / 22.7; nps 0.5 /
+1.2 / 0.5 / 0.7). The wedge report is the mildest of the four at rate100 (one
+flat segment, 5.3 s) against frp's five (37.2 s) and nps's seven (41.1 s). The
+two honest losses are carried in the README table rather than smoothed over.
 
 ## Release (v0.10.0)
 

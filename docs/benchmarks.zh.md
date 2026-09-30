@@ -160,7 +160,7 @@ worker 的 pinned peer 数。
 
 这些数字来自**退役的逐格模型**(v0.8.x 方法:每工具每网络条件一个冷启动平均
 值,并对重复取中位数上报)。保留它们,是因为对少数配置决策来说,它们仍是唯一
-的实测依据;而它们与上面的「时间上的工作负载」数字**不可比**——v0.9.1 那一
+的实测依据;而它们与上面的「时间上的工作负载」数字**不可比**——v0.10.0 那一
 轮只覆盖默认配置。把它们当作方向性参考,并为你自己的场景重测一遍。
 
 | 决策 | 选项 | 实测依据(退役的逐格模型) |
@@ -192,10 +192,12 @@ worker 的 pinned peer 数。
   之内,就按 directional 上报,不从中得出任何 claim。
 - **tunnel pool 是弹性的,所以 pool 的尺寸是*结果*,不是设置。** 带共享弹性
   pool 的构建(`[client.data].shared_pool`、`[client.data].idle_timeout`、
-  `[client.data.tcp|kcp].max_tunnels`)从配置的 `count` 起步,之后自行增长与收
-  缩;下面逐项实测里的 `count` 数字是在固定尺寸模型下测的,描述的是*钉住*某个
-  pool 尺寸的代价。它们是选择初始尺寸的依据,不是对某一轮 pool 实际行为的预
-  测——某一轮真实用到的尺寸由 `MOLEHILL_POOL_STATS` 时间线记录。
+  `[client.data.tcp|kcp].max_tunnels`)是**冷启动**的——没有访客需要之前不存在
+  任何隧道——之后自行增长与收缩,上限是 `max_tunnels`。下面逐项实测里的 `count`
+  数字是在固定尺寸模型下测的(`count` 与 `default_count` 已是退役键;升级对照表
+  见 [configuration.zh.md](configuration.zh.md)),描述的是*钉住*某个 pool 尺
+  寸的代价。它们是选择该上限的依据,不是对某一轮 pool 实际行为的预测——某一轮
+  真实用到的尺寸由 `MOLEHILL_POOL_STATS` 时间线记录。
 
 ## 自己复现
 

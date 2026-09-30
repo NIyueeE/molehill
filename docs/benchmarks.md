@@ -200,7 +200,7 @@ These figures are from the **retired per-cell model** (the v0.8.x method: one
 cold-started average per tool per network condition, reported as a median over
 repetitions). They are kept because they are still the only measured basis for
 a few configuration decisions, and they are **not comparable** with the
-workload-over-time figures above — the v0.9.1 run covers the default
+workload-over-time figures above — the v0.10.0 run covers the default
 configuration only. Treat them as directional, and re-measure your own case.
 
 | Decision | Option | Measured basis (retired per-cell model) |
@@ -235,12 +235,15 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
   made from it.
 - **The tunnel pool is elastic, so the pool's size is a *result*, not a
   setting.** A build with the shared elastic pool (`[client.data].shared_pool`,
-  `[client.data].idle_timeout`, `[client.data.tcp|kcp].max_tunnels`) starts at
-  the configured `count` and then grows and shrinks on its own; the
-  per-decision `count` figures below were measured under the fixed-count model
-  and describe what a *pinned* pool size cost. They are the basis for choosing
-  an initial size, not a prediction of what a run's pool will do — the
-  `MOLEHILL_POOL_STATS` timeline is what records the size a run actually used.
+  `[client.data].idle_timeout`, `[client.data.tcp|kcp].max_tunnels`) starts
+  **cold** — no tunnel exists until a visitor needs one — and then grows and
+  shrinks on its own up to `max_tunnels`. The per-decision `count` figures below
+  were measured under the fixed-count model (`count` and `default_count` are
+  retired keys; the upgrade table is in
+  [configuration.md](configuration.md)) and describe what a *pinned* pool size
+  cost. They are the basis for choosing that cap, not a prediction of what a
+  run's pool will do — the `MOLEHILL_POOL_STATS` timeline is what records the
+  size a run actually used.
 
 ## Reproduce it yourself
 
