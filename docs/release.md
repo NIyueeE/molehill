@@ -168,6 +168,14 @@ just soak --test=screen --path=loss1 --streams-max=8 \
 just soak-check --screen results-screen.json    # per-step verdict
 ```
 
+The same interleave compares **two configurations of one build** when the
+question is a configuration decision rather than a code change
+(`--ab-variants mux,direct`): the arms then differ by config alone, which is
+what makes a placement or mode question answerable without a build axis riding
+along. The two modes and the slow-visitor probe that makes head-of-line
+blocking measurable are documented in
+[benchmarks.md](benchmarks.md#the-slow-visitor-soak_slow_visitor_bps).
+
 The run and the verdict are the fast, development-time form of
 [benchmarks.md](benchmarks.md#reproduce-it-yourself)'s two-build comparison —
 minutes instead of a sweep.

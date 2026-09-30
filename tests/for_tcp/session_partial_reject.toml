@@ -1,0 +1,32 @@
+# Fixture for `a_rejected_service_leaves_its_session_and_siblings_running`.
+#
+# One client, one server, one v4 control session carrying two services:
+# `outside` asks for a port the server's `allow_ports` does not cover, `inside`
+# for one it does. The refusal is the server's per-service ack, so `inside`
+# must forward while the session (and the client) carry on.
+
+[client]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.control]
+default_remote_addr = "127.0.0.1:2372"
+
+[client.transport]
+type = "plain"
+
+[client.services.inside]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2373"
+
+[client.services.outside]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2374"
+
+[server]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+allow_ports = ["2373"]
+
+[server.control]
+bind_addr = "127.0.0.1:2372"

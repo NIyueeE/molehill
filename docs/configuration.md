@@ -55,11 +55,11 @@ A typical setup:
 > The 0.8 client-side blocks use `default_`-prefixed names for the
 > client-wide defaults — `[client.control]` (`default_remote_addr`,
 > `default_heartbeat_timeout`, `default_retry_interval`) and `[client.data]`
-> (`default_data_addr`, `default_mode`, `default_count`, `default_carrier`) — so
-> they read distinctly from the per-service overlay keys on
+> (`default_data_addr`, `default_mode`, `default_carrier`) — so they read
+> distinctly from the per-service overlay keys on
 > `[client.services.<name>]` (`protocol`, `remote_addr`, `token`,
-> `heartbeat_timeout`, `retry_interval`, `mode`, `count`, `carrier`,
-> `transport`, `udp_forwarder_ipv6`, `udp_send_queue_size`, ...; new in 0.8).
+> `retry_interval`, `mode`, `carrier`, `transport`, `udp_workers`,
+> `udp_forwarder_ipv6`, `udp_send_queue_size`, ...; new in 0.8).
 > `[client.transport]` keeps `type`/`noise` unprefixed: its per-service
 > overrides live in the nested `transport` table, so there is no same-name
 > collision at the service level (the `default_` prefix exists to
@@ -70,26 +70,52 @@ A typical setup:
 > selector (`0x00` plain / `0x01` noise) and the registration carries the
 > data-plane carrier — both ends must upgrade together; a version mismatch
 > is a hard error.
+>
+> **Upgrading to 0.10 (protocol v4)**: the client speaks v4 — one control
+> session per endpoint, carrying every service that dials it. A v0.9.0 server
+> refuses it (its own version check fails and it closes the connection; the
+> client says so and stops instead of retrying), so upgrade the server first,
+> or both ends together. A v0.10.0 server still serves a v0.9.0 client.
+
+### Migrating to 0.10: removed keys
+
+The tunnel pool is one elastic, per-carrier pool per session now, and it starts
+cold — so the keys that described a pool's *initial* size, a per-service pool,
+or a late-0.8 health check are gone. A config that still carries one starts for
+one release and logs a warning naming the replacement; from the next release it
+is an error (`deny_unknown_fields`). Write this instead:
+
+| Removed key | Write instead |
+|---|---|
+| `[client.data].default_count` | Nothing: the pool starts cold and grows on demand. `[client.data.tcp].max_tunnels` (or `[client.data.kcp].max_tunnels`) is the cap it grows to, default 4 |
+| `[client.services.<name>].count` | Nothing: same cold start, and the pool belongs to the session and carrier rather than to one service. `[client.data.tcp\|kcp].max_tunnels` is the cap |
+| `[client.services.<name>].pool_size` | `[client.services.<name>].udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
+| `[client.services.<name>].heartbeat_timeout` | Nothing: the server declares its cadence in the session ack and the client derives the timeout from it. `[client.control].default_heartbeat_timeout` remains as an optional floor |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the tunnels one client may hold; 0 = unlimited). It also clamps a v3 client's requested channel count |
+| `[client.services.<name>].health_check` | Nothing: a service stays registered for as long as its client runs; a request that cannot be forwarded fails for that visitor |
+
+The next section states what each of the replacements does and what it costs;
+[CHANGELOG.md](../CHANGELOG.md) records why the removals happened.
 
 ## Choosing your configuration (decision tree)
 
-The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
-transport — are the right starting point for almost everyone. Deviate only
-when the tree says so, change one thing at a time, and measure the result on
-your own path: the published runs, their numbers and how to reproduce them are
+The defaults — `mode = "multiplex"`, `max_tunnels = 4`, `carrier = "tcp"`,
+plain transport — are the right starting point for almost everyone. Deviate
+only when the tree says so, change one thing at a time, and measure the result
+on your own path: the published runs, their numbers and how to reproduce them are
 in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
-    A["Start: defaults<br/>multiplex, count=4, carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
+    A["Start: defaults<br/>multiplex, max_tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
     B -- Yes --> C["transport type = noise<br/>+ keypair (Transport doc)"]
     B -- No --> D{"One service or a few<br/>long-lived connections?"}
     C --> D
     D -- "Yes, raw throughput first" --> E["mode = direct"]
     D -- "No: many services,<br/>many users, churn" --> F{"Many concurrent<br/>connections?"}
     E --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
-    F -- "> ~256 concurrent" --> G["count = 8 or higher"]
-    F -- Typical --> H["keep count = 4"]
+    F -- "> ~256 concurrent" --> G["max_tunnels = 8 or higher"]
+    F -- Typical --> H["keep max_tunnels = 4"]
     G --> I{"Path quality?"}
     H --> I
     I -- "High pure latency +<br/>UDP game (100ms+ RTT)" --> J["A/B test carrier = kcp"]
@@ -103,14 +129,15 @@ flowchart TD
 |---|---|---|
 | `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
 | `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
-| `count` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain |
-| `count` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `count × 64` concurrent connections |
-| `count` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
+| `max_tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain |
+| `max_tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
+| `max_tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
-| `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + `count` for the ceiling |
+| `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + a raised `max_tunnels` for the ceiling |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair; a sub-millisecond RTT cost and no CPU penalty under full load |
-| `pool_size` | 8 TCP / 2 UDP (defaults) | enough warm data channels to absorb churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
+| cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move — 2.0-3.2 ms on loopback (M2a), then it is warm again up to `max_tunnels` |
+| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity) |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -129,14 +156,19 @@ default_token = "change-me" # Necessary. Must match `[server].default_token`
 
 [client.control] # Necessary. Control-channel defaults: authentication, registration, heartbeat
 default_remote_addr = "example.com:2333" # Necessary. The address of the server
-default_heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. The value must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
+# default_heartbeat_timeout = 65 # Optional. Application-layer heartbeat timeout. Unset (the default) derives it from the cadence the server declares in the session ack: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. A value below that floor is refused at startup (it would time out a healthy server); 0 disables the check
 default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
-[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_mode/default_count/default_carrier individually — see the per-service keys in `[client.services.*]` below
+[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_mode/default_carrier individually — see the per-service keys in `[client.services.*]` below
 # default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). With `default_carrier = "kcp"` the KCP sessions dial the control address over UDP — TCP control and UDP KCP can share one port (distinct protocols)
-default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one connection per data channel; `count`/`carrier` do not apply)
-default_count = 4 # Optional. Default parallel tunnel connections per service; only with `default_mode = "multiplex"`. Default: 4 (throughput + head-of-line isolation beyond a single TCP flow; 1 = single-tunnel behavior), clamped to 1..=64
+default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one connection per data channel; `carrier` does not apply)
 default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted
+# shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool per carrier (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
+# idle_timeout = 60 # Optional. Seconds a tunnel pool with no streams, no pending opens and no pinned UDP peers must stay idle before it removes one tunnel. Default: 60. The pool never shrinks below one tunnel, nor below the UDP-derived floor
+[client.data.tcp] # Optional. The TCP carrier's elastic-pool cap
+# max_tunnels = 4 # Optional. The cap the pool may grow to for this carrier; it starts cold and grows on demand up to it. Validated `>= 1`, clamped to 1..=64. Default: 4
+[client.data.kcp] # Optional. The KCP carrier's cap, the same key and rules
+# max_tunnels = 4
 
 [client.transport] # Optional. How the wire is wrapped; applies to both planes
 type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
@@ -158,18 +190,16 @@ nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default
 retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
-heartbeat_timeout = 60 # Optional. Override `client.control.default_heartbeat_timeout` for this service only — e.g. when the service runs against a server with a different heartbeat interval
-udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only). Default: false
 mode = "multiplex" # Optional. Override `client.data.default_mode` for this service only. "multiplex" (default) or "direct"
-count = 4 # Optional. Override `client.data.default_count` for this service only; valid only with `mode = "multiplex"`, clamped to 1..=64. Inherits the default when unset
 carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only; valid only with `mode = "multiplex"`. Inherits the default when unset
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
-pool_size = 8 # Optional. Requested number of pre-established data channels. Defaults: 8 for TCP, 2 for UDP. Clamped by the server's `max_pool_size`. For UDP this shards distinct visitors across channels; each visitor is pinned to one channel (session affinity)
 
 [client.services.service2] # Multiple services can be defined
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
+udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2
+udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
 udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
@@ -177,15 +207,15 @@ udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per dat
 [server]
 default_token = "change-me" # Necessary. Must match `[client].default_token`
 allow_ports = ["6000-6999", "8080"] # Necessary to enable dynamic registration. Empty or missing: ALL registrations are rejected. A requested port is admitted when one of these entries contains it — a literal port, or a range covering it, privileged ports (<1024) included
-max_pool_size = 16 # Optional. Upper bound applied to every service's requested pool_size. Default: no limit
 
 [server.control] # Necessary. Control-channel listener
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be changed
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats. Set to 0 to disable sending heartbeats. Default: 30 seconds
+heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; the client derives its own timeout from this declared cadence. Set to 0 to disable sending heartbeats. Default: 30 seconds
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
-# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"). Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
+# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"). **Not supported in 0.10**: a 0.10 client is served unstriped — a stripe group's bulk path deadlocks with the elastic tunnel pool, so the server logs one warning and uses a single channel per visitor. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
+# max_tunnels_per_client = 0 # Optional. The operator's valve on the elastic pool: how many multiplexed data tunnels ONE client may hold across every service of its session. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running. It also clamps the channel count a v3 client asks for
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a v3 transport selector byte); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
@@ -204,7 +234,10 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
 2. For each configured service the client sends a `RegisterService` message:
    name, `protocol` (tcp/udp), `remote_bind_addr`, the data-plane `carrier`
    it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy UDP
-   listener), `pool_size` and the UDP buffer size.
+   listener) and the UDP buffer size. The channel count is not part of the
+   message: the client opens the channels it configured (one per visitor for
+   TCP, `udp_workers` for UDP) and the server asks for another when a visitor
+   arrives.
 3. The server validates:
    - **whitelist**: the requested port must be covered by `allow_ports`;
      an empty/missing `allow_ports` rejects *every* registration (this is
@@ -227,9 +260,10 @@ restarting client takes over cleanly.
 ## Multiplexing (`multiplex` feature)
 
 The `multiplex` feature is part of the default feature set. With
-`mode = "multiplex"` (the default), each service opens **N tunnel
-connections** (`count`, default 4) after registering, and every subsequent
-data channel becomes a yamux stream inside one of them. This removes the
+`mode = "multiplex"` (the default), a registered service runs over an
+**elastic pool of tunnel connections** (up to
+`[client.data.tcp|kcp].max_tunnels`, default 4), and every subsequent data
+channel becomes a yamux stream inside one of them. This removes the
 per-connection handshake latency (TCP connect plus, with `noise`, the Noise
 handshake) and cuts FD usage under many concurrent visitors.
 
@@ -239,12 +273,19 @@ handshake) and cuts FD usage under many concurrent visitors.
 - Per-tunnel buffering is bounded by internal defaults (64 MiB yamux receive
   window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
-- `count = N` opens N parallel tunnels per service and spreads data channels
-  across them round-robin. Independent TCP flows isolate head-of-line
-  blocking (a lost segment stalls only its own tunnel) and aggregate beyond
-  a single flow's congestion window. If one tunnel dies, opens transparently
-  fall through to the survivors until the usual heartbeat-driven reconnect
-  re-establishes the pool. Default: 4; `1` reproduces single-tunnel behavior.
+- **The pool starts cold.** Nothing is dialed until something needs a tunnel:
+  a service's first visitor grows the pool synchronously, so that visitor pays
+  one tunnel setup before its bytes move (2.0-3.2 ms on loopback, M2a); every
+  later visitor finds a warm tunnel, and the pool keeps growing on demand up to
+  `max_tunnels`. An idle pool gives tunnels back after
+  `[client.data].idle_timeout` (default 60 s), never below one and never below
+  the floor a UDP service's workers need.
+- `max_tunnels = N` is the cap the pool may grow to for that carrier.
+  Independent TCP flows isolate head-of-line blocking (a lost segment stalls
+  only its own tunnel) and aggregate beyond a single flow's congestion window.
+  If one tunnel dies, opens transparently fall through to the survivors until
+  the usual heartbeat-driven reconnect re-establishes the pool. Default: 4;
+  `1` reproduces single-tunnel behavior.
 - **Experimental (transport comparison arms):** `carrier = "kcp"` runs the
   data plane as KCP-over-UDP sessions instead of TCP connections (feature
   `kcp`, in the default set). KCP is a userspace ARQ protocol that trades
@@ -254,7 +295,7 @@ handshake) and cuts FD usage under many concurrent visitors.
   inter-packet gap at rtt100, where the TCP arms sit above 100 ms), at
   several times the CPU and RSS. The crypto stack is unchanged — with
   transport `noise` the same Noise handshake wraps each KCP session — and
-  yamux still carries the data channels, so `count` applies as usual. The
+  yamux still carries the data channels, so `max_tunnels` applies as usual. The
   server opens its UDP listener lazily — the first registration that
   declares the `kcp` carrier triggers the bind, and a bind failure is a
   precise registration rejection; servers whose clients never use KCP never
@@ -279,21 +320,22 @@ handshake) and cuts FD usage under many concurrent visitors.
   always uses the one-connection-per-channel path.
 
 **Per-service overrides.** `[client.data]` holds the defaults; each service
-can override `mode`, `count` and `carrier` individually on its own
+can override `mode` and `carrier` individually on its own
 `[client.services.<name>]` block. The same rules as the global block apply
-to the merged view: `count` and `carrier` are only valid with
-`mode = "multiplex"`, and `carrier = "kcp"` additionally needs the `kcp`
-feature. The tunnel pools were
-already provisioned per service — this makes the switch per service too, so
-one client can mix a multiplexed interactive service (few handshakes, NAT-
-friendly) with a `direct` bulk service (raw throughput) without any server
-configuration change: the server adapts per connection and opens its KCP
-listener on the first `kcp` registration (there is no per-carrier server
-configuration). The same overlay pattern covers the control defaults:
-`token`, `remote_addr` and `heartbeat_timeout` override
-`[client].default_token`, `[client.control].default_remote_addr` and
-`[client.control].default_heartbeat_timeout` respectively, and
-`retry_interval` overrides `default_retry_interval`. `default_data_addr` itself
+to the merged view: `carrier` is only valid with `mode = "multiplex"`, and
+`carrier = "kcp"` additionally needs the `kcp` feature. A service's carrier
+selects which of the two caps (`[client.data.tcp|kcp].max_tunnels`) its pool
+grows to; with `[client.data].shared_pool` every service of the session shares
+one pool per carrier. So one client can mix a multiplexed interactive service
+(few handshakes, NAT-friendly) with a `direct` bulk service (raw throughput)
+without any server configuration change: the server adapts per connection and
+opens its KCP listener on the first `kcp` registration (there is no per-carrier
+server configuration). The same overlay pattern covers the control defaults:
+`token` and `remote_addr` override `[client].default_token` and
+`[client.control].default_remote_addr`, and `retry_interval` overrides
+`default_retry_interval`. A service's heartbeat is not a per-service knob: one
+session carries one timer, derived from the cadence the server declares (see
+`[client.control].default_heartbeat_timeout`). `default_data_addr` itself
 cannot be overridden per service — the data-plane endpoint follows the
 service's own server when it has one (see below).
 
@@ -306,9 +348,10 @@ client can therefore spread its services across several molehill servers —
 a nearby replica per region, separate servers per tenant, or a migration
 window while moving services one by one. Every server must authenticate
 the service with a token: a service can carry its own `token` for a server
-that does not share the client's `default_token`, and its own
-`heartbeat_timeout` when that server's `heartbeat_interval` differs; each
-server's `allow_ports` must cover the services registered on it. The
+that does not share the client's `default_token`; each server's `allow_ports`
+must cover the services registered on it, and the client derives each
+session's heartbeat timeout from the cadence that server declares, so servers
+with different cadences coexist. The
 data-plane endpoint chain is: the service's own `remote_addr`, else
 `[client.data].default_data_addr`, else `[client.control].default_remote_addr`
 — so a global `default_data_addr` applies only to services without their own
@@ -352,8 +395,8 @@ Consequences worth stating, because they are what keeps a busy log readable:
 
 ## Tuning
 
-The step-by-step way to pick `mode`/`count`/`carrier`/transport for your
-workload is the [decision tree](#choosing-your-configuration-decision-tree)
+The step-by-step way to pick `mode`/`max_tunnels`/`carrier`/transport for
+your workload is the [decision tree](#choosing-your-configuration-decision-tree)
 above (with the measured costs and how to validate). This section covers
 the per-connection knobs.
 
@@ -410,12 +453,12 @@ default_token = "default_token_if_not_specify" # security-scan:allow documentati
 
 [client.control]
 default_remote_addr = "myserver.com:2333" # Necessary. The address of the server
-default_heartbeat_timeout = 40 # Optional. Set to 0 to disable the application-layer heartbeat test. Must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
+# default_heartbeat_timeout = 65 # Optional. Unset derives it from the cadence the server declares: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. Below that floor it is refused at startup; 0 disables the check
 default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
 # Data-plane options (`[client.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
-# Every service may also override mode/count/carrier on its own block.
+# Every service may also override mode/carrier on its own block.
 
 [client.transport] # Optional. The whole block is optional
 type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
@@ -434,13 +477,14 @@ protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 local_addr = "127.0.0.1:22" # Necessary. The address of the local service
 nodelay = true # Optional. Per-service TCP_NODELAY override. Default: true
 retry_interval = 1 # Optional. Override the global `client.control.default_retry_interval` per service
-udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only)
 remote_bind_addr = "0.0.0.0:5202"
 
 [client.services.dns] # A UDP service example
 protocol = "udp"
 local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:53"
+udp_workers = 2 # Optional. UDP services only: how many data channels the worker set uses
+udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the forwarder's connection to the local service
 ```
 
 ```toml
@@ -454,7 +498,7 @@ allow_ports = ["53", "5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; set to 0 to disable. Default: 30 seconds
+heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; the client derives its timeout from it. Set to 0 to disable. Default: 30 seconds
 
 # Data-plane options (`[server.data]`) live here too; see the specification.
 # They require the `multiplex` feature, which is part of the default build.
@@ -913,8 +957,9 @@ WantedBy=multi-user.target
 
 ### Heartbeat
 
-- `client.control.default_heartbeat_timeout` must be greater than `server.control.heartbeat_interval`, otherwise the client treats a healthy server as dead and reconnects in a loop.
-- Set `server.control.heartbeat_interval = 0` to disable heartbeats (then set `client.control.default_heartbeat_timeout = 0` as well).
+- The client derives its timeout from the cadence the server declares in the session ack: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. Leave `client.control.default_heartbeat_timeout` unset unless you want a different one; a value below the derived floor is refused at startup, naming the server's interval and the floor it needs — and `0` disables the check.
+- One session carries one timer, so the timeout is a session-level fact: a service cannot override it (that key is gone — see the migration table above), because a service that wanted faster detection would still share the timer with its siblings.
+- Set `server.control.heartbeat_interval = 0` to disable heartbeats; the client then has no cadence to derive a timeout from.
 
 ### A local service that is down
 
@@ -926,7 +971,7 @@ WantedBy=multi-user.target
 ### UDP services
 
 - The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535); larger datagrams are dropped while the channel stays usable. Configure it identically on the service and remember that the server enforces its own copy received at registration time.
-- **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `pool_size` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels.
+- **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `udp_workers` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels, and the pool keeps at least the tunnels those channels need.
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 
 ### Transports
@@ -956,11 +1001,12 @@ above and follow that guide.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs an older molehill. Upgrade both ends together (protocol v3 since 0.8; v2 since 0.7.0). |
+| `Protocol version mismatched ... Please update` | One side runs an older molehill. Upgrade both ends together (protocol v4 since 0.10 — upgrade the server first; v3 since 0.8; v2 since 0.7.0). |
+| The client stops with `protocol v4` after a server's hello never arrives | The server is older than 0.10: it reads version 4, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |
-| Repeated `Heartbeat timed out` | `client.control.default_heartbeat_timeout <= server.control.heartbeat_interval`, or the network path drops the connection. |
+| Repeated `Heartbeat timed out` | The network path drops the connection, or the server stalls. A configured timeout *below* the derived floor does not appear here — it is refused at startup. |
 | Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
 | `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |
 | UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are dropped; idle mappings time out after `udp_idle_timeout` seconds. |

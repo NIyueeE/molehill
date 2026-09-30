@@ -1,0 +1,31 @@
+# Fixture for `a_timeout_below_the_heartbeat_floor_is_refused_once`.
+#
+# The server declares a 30 s cadence, so the client's derived floor is
+# `2 × 30 + 5 = 65` s. The configured 20 s cannot survive it — a healthy
+# server would look dead every 20 s — so the session refuses to run at all:
+# one authenticated connection, a terminal error naming both numbers, and no
+# exposed port.
+
+[client]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.control]
+default_remote_addr = "127.0.0.1:2378"
+default_heartbeat_timeout = 20
+
+[client.transport]
+type = "plain"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2379"
+
+[server]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+allow_ports = ["2379"]
+
+[server.control]
+bind_addr = "127.0.0.1:2378"
+heartbeat_interval = 30

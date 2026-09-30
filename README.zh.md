@@ -45,7 +45,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 - **高性能** 具有更高的吞吐量，高并发下更稳定。
 - **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
 - **客户端声明服务** 从 v0.7 起，服务端不再需要逐服务配置：客户端声明要暴露的内容（包括公网端口），服务端只通过 `allow_ports` 白名单和共享 `default_token` 执行策略。
-- **多路复用** 默认情况下，每个数据通道都作为 yamux 流跑在 N 条并行隧道中的一条上（`[client.data].default_count = 4`）——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。可选的 `default_carrier = "kcp"`（feature `kcp`）把数据面换成 KCP-over-UDP 会话。`[client.data]` 默认选项与 `mode = "direct"` 回退路径见[配置文档](./docs/configuration.zh.md)。
+- **多路复用** 每个数据通道都作为 yamux 流跑在一个弹性隧道池（上限 `[client.data.tcp|kcp].max_tunnels`，默认 4）的某条隧道上——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。池冷启动、按需增长，空闲的客户端不持有任何隧道；可选的 `default_carrier = "kcp"`（feature `kcp`）把数据面换成 KCP-over-UDP 会话。`[client.data]` 选项与 `mode = "direct"` 回退路径见[配置文档](./docs/configuration.zh.md)。
 - **安全性** 共享 token 强制鉴权，`allow_ports` 白名单限制客户端可暴露的端口。可选的 Noise Protocol 只需一对预共享 X25519 密钥即可加密传输——没有 PKI、没有 CA；设置 `resume = true` 后，重连用一次 MAC 证明持有上次会话的握手摘要即可，不必重跑密钥交换(建连从每对 442.7 us 降到 38.5 us)。`plain` 为明文转发。
 - **热重载** 支持配置文件热重载，动态添加或移除端口转发服务。
 
@@ -60,10 +60,10 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 ### 如何选配置
 
-默认值——`mode = "multiplex"`、`count = 4`、`carrier = "tcp"`、明文传输
-——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。怎么落地:全局默认
-在 `[client.data]`,每个服务可在自己的 `[client.services.<name>]` 上单独覆盖
-`mode` / `count` / `carrier`——同一客户端可以混跑 mux 交互服务与 `direct`
+默认值——`mode = "multiplex"`、`max_tunnels = 4`、`carrier = "tcp"`、
+明文传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离。怎么落地:
+全局默认在 `[client.data]`,每个服务可在自己的 `[client.services.<name>]` 上
+单独覆盖 `mode` / `carrier`——同一客户端可以混跑 mux 交互服务与 `direct`
 大流量服务,还能用 `remote_addr` 把个别服务指向不同的 molehill 服务端。
 `[transport]` 见[配置](docs/configuration.zh.md),noise 密钥见
 [传输](docs/transport.zh.md)。
@@ -78,12 +78,13 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
    流不该被单条隧道流限制住(单会话大流量)时,设 `[server.data]
    stripe_count`(K=4)——该连接会摊到 K 条并行数据通道上,代价是每访客
    K× 通道与有界重排缓冲。多用户 / 高连接频率 / 多服务 → 保持或提高
-   `count`(每条隧道在 yamux 上限前约承载 64 条并发连接——`count = 8`
-   ≈ 512)。
+   `max_tunnels`(每条隧道在 yamux 上限前约承载 64 条并发连接——
+   `max_tunnels = 8` ≈ 512)。
 3. **路径什么状况,是否转发 UDP?** 若 TCP 数据隧道被封锁/限速,或需要高延迟
    下的延迟优先 UDP,值得 A/B 试 `carrier = "kcp"`。否则保持 TCP 载体。
-   有损/wifi 路径保持 `count >= 4`:它能聚合并隔离队头阻塞;`count` 按
-   "每隧道连接上限"选(`count = 1 -> 64` 条连接,`count = 4 -> 256`)。
+   有损/wifi 路径保持 `max_tunnels >= 4`:池由此聚合并隔离队头阻塞;
+   它按"每隧道连接上限"选(`max_tunnels = 1 -> 64` 条连接,
+   `max_tunnels = 4 -> 256`)。
 
 在这两个数之间做取舍,最好在**你自己的路径上**测,而不是从表里读:
 **可持续负载**(交互流仍满足 50 ms SLO 时,工具能扛多少条 bulk 流)与
@@ -96,8 +97,8 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 每个工具跑同一份工作负载——1 条交互流(SLO 仪器)、N = 20 条 bulk TCP 流、
 每秒 16 次短连接、1 条 UDP 会话——同时路径按阶段表推进(netem 塑造整个
-`lo`,控制面保持不整形)。下图是本主机上的 v0.9.1 一次运行(molehill 默认
-`multiplex`、`count = 4`、明文):橙色线是 bulk 吞吐,蓝色点是交互流 RTT,
+`lo`,控制面保持不整形)。下图是本主机上的 v0.9.1 一次运行(当时发布二进制的
+默认值:`multiplex`、当时的 `count = 4`、明文):橙色线是 bulk 吞吐,蓝色点是交互流 RTT,
 阴影带是路径档,虚线是 SLO(p99 ≤ 50 ms,错误率 ≤ 0.5%)。
 
 ![Soak: molehill 与对端在阶段日程上的形态](assets/soak-v0.9.1.png)

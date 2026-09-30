@@ -847,12 +847,12 @@ def main() -> None:
     if len(sys.argv) > 1:
         path = Path(sys.argv[1])
     else:
-        found = sorted(
-            Path(__file__).parent.glob("results-soak-*.json"), key=lambda p: p.name
-        )
-        if not found:
+        # The newest published file, by semantic version — a lexical pick puts
+        # v0.10.0 before v0.9.0 and would render the wrong file as this
+        # release's chart. A scratch file is only used when nothing else exists.
+        path = lib.newest_results(Path(__file__).parent)
+        if path is None:
             sys.exit("no results-soak-*.json found")
-        path = found[-1]
     data = load(path)
     ver = path.stem.replace("results-soak-", "") or "dev"
     assets = Path(__file__).parents[3] / "assets"

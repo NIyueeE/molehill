@@ -45,7 +45,7 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Client-Authoritative Services** Since v0.7 the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
-- **Multiplexing** Every data channel rides as a yamux stream over one of N parallel tunnel connections by default (`[client.data].default_count = 4`) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The optional `default_carrier = "kcp"` (feature `kcp`) moves the data plane onto KCP-over-UDP sessions. The `[client.data]` default knobs and the `mode = "direct"` fallback are covered in [Configuration](./docs/configuration.md).
+- **Multiplexing** Every data channel rides as a yamux stream over one of an elastic pool of tunnel connections (up to `[client.data.tcp|kcp].max_tunnels`, default 4) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The pool starts cold and grows on demand, so a client that is idle holds nothing; the optional `default_carrier = "kcp"` (feature `kcp`) moves the data plane onto KCP-over-UDP sessions. The `[client.data]` knobs and the `mode = "direct"` fallback are covered in [Configuration](./docs/configuration.md).
 - **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The optional Noise Protocol encrypts the wire with a single pre-shared X25519 keypair — no PKI, no CA — and, with `resume = true`, proves a reconnect with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 -> 38.5 us per pair). `plain` forwards unencrypted.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
 
@@ -62,11 +62,11 @@ recovering path is part of the measurement.
 
 ### Choosing a configuration
 
-The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
-transport — are the right starting point for almost everyone. Deviate only
-when the tree says so. How to apply each choice: the `[client.data]` block
+The defaults — `mode = "multiplex"`, `max_tunnels = 4`, `carrier = "tcp"`,
+plain transport — are the right starting point for almost everyone. Deviate
+only when the tree says so. How to apply each choice: the `[client.data]` block
 holds the per-client defaults, and every service can override `mode` /
-`count` / `carrier` on its own `[client.services.<name>]` block — one client
+`carrier` on its own `[client.services.<name>]` block — one client
 can mix a multiplexed interactive service with a `direct` bulk service, and
 can even point individual services at different molehill servers via
 `remote_addr`. The `[transport]` block is in
@@ -85,14 +85,14 @@ questions about your workload; change one thing at a time and re-test:
    session), set `[server.data] stripe_count` (K=4) — the connection then
    rides K parallel data channels, at K× channels per visitor and a bounded
    reorder buffer. Many users / churn / multiple services → keep or raise
-   `count` (each tunnel carries ~64 concurrent connections before the yamux
-   ceiling — `count = 8` ≈ 512).
+   `max_tunnels` (each tunnel carries ~64 concurrent connections before the
+   yamux ceiling — `max_tunnels = 8` ≈ 512).
 3. **What does the path look like, and do you forward UDP?** If TCP data
    tunnels are blocked or throttled, or you need latency-first UDP at high
    delay, A/B `carrier = "kcp"`. Otherwise keep the TCP carrier. For
-   lossy/wifi paths keep `count >= 4` — it aggregates and isolates
-   head-of-line blocking — and pick `count` for the per-tunnel connection
-   ceiling (`count = 1 -> 64` connections, `count = 4 -> 256`).
+   lossy/wifi paths keep `max_tunnels >= 4` — the pool then aggregates and
+   isolates head-of-line blocking — and pick it for the per-tunnel connection
+   ceiling (`max_tunnels = 1 -> 64` connections, `max_tunnels = 4 -> 256`).
 
 Two numbers decide between these options, and they are best measured on your
 own path rather than read off a table: the **sustainable load** (how many bulk
@@ -108,8 +108,8 @@ Every tool is driven through the identical workload — one interactive stream
 (the SLO instrument), N = 20 bulk TCP streams, 16 short connections per
 second and one UDP session — while the path follows the stage schedule
 (netem on `lo`, the control plane left unshaped). The chart below is the
-v0.9.1 run on one host (molehill's default `multiplex`, `count = 4`, plain
-transport): the orange line is the bulk throughput, the blue points the
+v0.9.1 run on one host (the released binary's defaults: `multiplex`, its
+then-current `count = 4`, plain transport): the orange line is the bulk throughput, the blue points the
 interactive stream's RTT, the shaded bands the path classes, the dashed
 line the SLO (p99 <= 50 ms).
 

@@ -130,7 +130,69 @@ would notice; a run may tighten it with `SOAK_SLO_ERROR_RATE`.
 | `rrul` | under saturation, what happens to a new visitor's latency as the path changes over time? (the figure in the README) |
 | `soak` | over a long run on a rotating path: does anything leak, drift or degrade? |
 | `cost` | at a fixed operating point, how many CPU-seconds does one carried Gbit/s cost? |
-| `screen` | for a development change: is the difference between two builds a claim or noise? |
+| `screen` | for a development change: is the difference between two builds — or between two configurations of one build — a claim or noise? |
+
+### Two ways to isolate one variable
+
+The stage schedule compares a tool against its peers. The two interleaved modes
+compare something against itself, which is what a development decision usually
+needs: both arms run inside every load step of one run, so they sample the same
+machine state, and sequential before/after runs — defeated by epoch drift — are
+never used to decide anything.
+
+- **`--ab BIN_A,BIN_B`** (`screen`) swaps two *builds* at every step.
+- **`--ab-variants VAR_A,VAR_B`** (`screen`) swaps two *configuration variants of
+  one binary* the same way: one build, two configs. This is how a configuration
+  decision — `direct` versus a shared pool, for instance — is measured without a
+  build axis riding along. The axis is recorded in the results file
+  (`meta.builds.axis`), and the verdict tool prints it, so a reader cannot
+  mistake a configuration pair for a build pair.
+
+Both are refused where they cannot apply rather than silently ignored: the
+variant pair only makes sense for `screen` (the staged types run one
+configuration throughout) and a mistyped variant name is rejected instead of
+measuring one configuration against itself.
+
+### The slow visitor (`SOAK_SLOW_VISITOR_BPS`)
+
+Off by default. With it set, every stage also runs one slow visitor: a connection
+to the tool's echo service that reads the response back at that rate, so the
+return path stays backpressured for the whole stage. It exists to make
+head-of-line blocking measurable — whether one slow visitor's stream delays the
+interactive stream sharing its pool — and the number to read beside it is the
+stage's interactive p99, never the visitor's own rate: a paced reader reports the
+knob it was given, which makes its series a stall detector (a stage below the
+knob is the finding), not a capacity number.
+
+An injected visitor is part of the workload, so a run that carries one records a
+different **method version** (`meta.workload_version` 1 without it, 2 with it).
+The gate therefore refuses to compare a probe run against a run without one, and
+refuses two probe runs at different rates. The probe runs in its own process
+like every other probe — the harness never sits in the path it measures — and
+its outcome is recorded per stage (`completed` / `failed` / `killed`, with the
+typed reason) and never fatal. It is refused for `reconnect`, which measures
+cold starts rather than a workload.
+
+### Instrumentation switches
+
+Three environment variables turn on opt-in, aggregated diagnostics. They are
+off by default, they never change the forwarding path, and the runner records
+whichever ones a run inherited in the results meta (`instrumentation`), so an
+instrumented run is never mistaken for a clean one.
+
+| Switch | Emitted | Carries |
+|---|---|---|
+| `MOLEHILL_MUX_STATS=1` | one INFO line per second per tunnel | cumulative yamux framing counters (`written`, `read`, `bytes`) — frames per second, and with a CPU sample, CPU per frame |
+| `MOLEHILL_POOL_STATS=1` | one INFO line per second per live pool | the pool's key, carrier, size, cap, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+load:1->2`, `-idle:2->1`) |
+| `MOLEHILL_PLACEMENT_STATS=1` | one INFO line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
+
+The pool and placement lines are the S1 observation of the shared elastic pool
+(what it does, and why the numbers are aggregated rather than per event:
+[internals.md](internals.md#the-tunnel-pool)). Every switch here is INFO like
+the rest of the family: turning it on *is* the consent, and a line an operator
+has to raise `RUST_LOG` to see never reaches a results file. The server's UDP
+line (`MOLEHILL_UDP_STATS=1`) is a fourth switch and carries the affinity
+table's size, its evictions and each worker's pinned peers.
 
 ## What each configuration choice costs (per-decision measurements)
 
@@ -146,15 +208,6 @@ configuration only. Treat them as directional, and re-measure your own case.
 | `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
 | `count` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at count = 4; loss5 head-of-line max 2.5 s vs 1.6 s) |
-| test type | what it answers |
-|---|---|
-| `rrul` | the mixed workload over the full stage schedule (the release run) |
-| `soak` | the same workload, longer, for drift |
-| `cost` | one stage, one path: what a configuration choice costs |
-| `capacity` | the ceiling probe: how many streams until it stops scaling |
-| `screen` | interleaved A/B of two builds on one path |
-| `reconnect` | cold start: client start → every registered service answering, five repetitions per build (interleaved when `--ab` is given) |
-
 | `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at count = 1); yamux ceiling `count × 64` concurrent connections |
 | `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
 | `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
@@ -180,6 +233,14 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
 - **Variance is stated, not smoothed.** If a difference sits inside the spread
   of the runs being compared, it is reported as directional and no claim is
   made from it.
+- **The tunnel pool is elastic, so the pool's size is a *result*, not a
+  setting.** A build with the shared elastic pool (`[client.data].shared_pool`,
+  `[client.data].idle_timeout`, `[client.data.tcp|kcp].max_tunnels`) starts at
+  the configured `count` and then grows and shrinks on its own; the
+  per-decision `count` figures below were measured under the fixed-count model
+  and describe what a *pinned* pool size cost. They are the basis for choosing
+  an initial size, not a prediction of what a run's pool will do — the
+  `MOLEHILL_POOL_STATS` timeline is what records the size a run actually used.
 
 ## Reproduce it yourself
 
@@ -192,22 +253,25 @@ just soak-plot     # render the charts and print the markdown tables
 just soak-check    # verdict: completeness, endpoints, SLO, drift
 ```
 
-`just soak --help` lists the test types, the variants (`mux`, `noise`, `mux1`,
-`kcp4`, `mux-off`), the stage schedule and the batching controls; the load,
-SLO and sample-rate knobs are environment variables (`SOAK_*`) and every one of
-them is echoed into the results meta.
+`just soak --help` lists the test types, the variants (`mux`, `direct`,
+`noise`, `mux1`, `kcp4`, `noise-direct`, and `mux-off`, the historical spelling
+of `direct`), the stage schedule and the batching controls; the load, SLO and
+sample-rate knobs are environment variables (`SOAK_*`) and every one of them is
+echoed into the results meta.
 
-To compare **two of your own builds** without a full run:
+To compare **two of your own builds** — or two configurations of one build —
+without a full run:
 
 ```bash
 just soak --test=screen --path=loss1 --streams-max=8 \
      --ab /path/to/bin-a,/path/to/bin-b --out results-screen.json
+just soak --test=screen --path=clean --ab-variants mux,direct \
+     --out results-screen-variants.json
 just soak-check --screen results-screen.json
 ```
 
-The two builds are interleaved step by step in one run, so both see the same
-machine state; the verdict claims a difference only when every step agrees in
-sign and exceeds the threshold, and calls everything else directional.
+The verdict claims a difference only when every step agrees in sign and exceeds
+the threshold, and calls everything else directional.
 
 The release gate — what a published number must satisfy before a tag can carry
 it — is documented in [release.md](release.md).

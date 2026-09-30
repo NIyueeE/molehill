@@ -7,8 +7,9 @@ use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
     self, Ack, Carrier, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello,
-    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, UdpTraffic, read_auth, read_hello,
-    read_registration, write_register_result,
+    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, PROTO_V3_VERSION, PROTO_V4_VERSION,
+    ServiceId, ServiceRegistrationV4, SessionCmd, SessionRegistration, UdpTraffic, read_auth,
+    read_hello, read_registration, read_session_cmd, read_stream_prologue, write_register_result,
 };
 #[cfg(feature = "noise")]
 use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
@@ -48,6 +49,27 @@ type Nonce = protocol::Digest; // Also called `session_key`
 /// with the wrong token must not be able to fill the log (see `RepeatNotice`).
 static AUTH_FAILURES: RepeatNotice = RepeatNotice::new();
 
+/// Control sessions this process has authenticated (v4 only: a v3 connection
+/// is one service, not a session).
+///
+/// The one fact about a session that is invisible from the outside is *how
+/// many* there are — a client that opened one connection per service would
+/// look identical in every forwarding test. The integration suite therefore
+/// counts them through [`control_sessions_accepted`] instead of parsing logs.
+static CONTROL_SESSIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many v4 control sessions this process has accepted and authenticated so
+/// far.
+///
+/// Monotone for the life of the process: a caller that wants "how many did
+/// *this* scenario open" takes a reading before it starts and subtracts. Only
+/// authenticated sessions count, so a refused token or a failed handshake does
+/// not move the number.
+#[must_use]
+pub fn control_sessions_accepted() -> u64 {
+    CONTROL_SESSIONS_ACCEPTED.load(Ordering::Relaxed)
+}
+
 /// Report a rejected token: once per process at `warn`, then at `debug`.
 fn report_auth_failure() {
     AUTH_FAILURES.report(
@@ -69,7 +91,7 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
 ///
 /// The server owns no per-service configuration: everything needed to expose
 /// the service arrives in the client's registration and has already been
-/// validated against `[server].allow_ports` / `max_pool_size`.
+/// validated against `[server].allow_ports`.
 #[derive(Clone, Debug)]
 struct RegisteredService {
     name: String,
@@ -97,9 +119,132 @@ pub async fn run_server(
     Ok(())
 }
 
-// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
-// See also MultiMap
+/// v3 registry: one control channel per service registration — indexed by the
+/// service digest (takeover of a re-registration) *and* by the session key
+/// (data-plane lookups, see [`MultiMap`]). A v3 connection serves exactly one
+/// service, so this map keeps its pre-v4 shape untouched.
 type ControlChannelMap = MultiMap<ServiceDigest, Nonce, ControlChannelHandle>;
+
+/// One v4 control session: the services registered on it, beside the session's
+/// single writer and its shutdown signal.
+struct SessionHandle {
+    /// Live services, keyed by the id the client gave each one. Dropping an
+    /// entry stops that service's control task, which stops its pool task and
+    /// releases its listener and public port.
+    services: HashMap<ServiceId, ControlChannelHandle>,
+    /// The multiplexed tunnels this client holds right now, shared with the
+    /// guards the tunnel tasks own. It is what
+    /// `[server.data].max_tunnels_per_client` is checked against. No tunnels
+    /// exist without the `multiplex` feature, so neither does the count.
+    #[cfg(feature = "multiplex")]
+    tunnels: TunnelCount,
+    /// The session's one and only writer: every service's commands are queued
+    /// here as framed bytes, and a single task drains the queue into the
+    /// socket. A session carries N services, so no service may write directly.
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Ends the session task. The registry entry holds the sender, so removing
+    /// the entry (or dropping the session) stops the session.
+    shutdown: broadcast::Sender<bool>,
+}
+
+impl SessionHandle {
+    /// A session with no services yet: the v4 handshake publishes this before
+    /// it serves anything, and the tests build the same shape.
+    fn new(
+        write_tx: mpsc::UnboundedSender<Vec<u8>>,
+        shutdown: broadcast::Sender<bool>,
+    ) -> SessionHandle {
+        SessionHandle {
+            services: HashMap::new(),
+            #[cfg(feature = "multiplex")]
+            tunnels: TunnelCount::default(),
+            write_tx,
+            shutdown,
+        }
+    }
+}
+
+/// One session's live tunnel count, and the reservation a tunnel holds.
+///
+/// The count is taken with a compare-exchange rather than a load-then-add so
+/// two tunnels of the same client arriving together cannot both slip past
+/// `max_tunnels_per_client`; the guard releases the slot when the tunnel ends,
+/// whatever ended it (a clean close, a dead peer, a shutdown).
+#[cfg(feature = "multiplex")]
+#[derive(Clone, Default)]
+struct TunnelCount(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "multiplex")]
+impl TunnelCount {
+    /// Reserve one tunnel slot under `cap` (`0` = unlimited). `Err(held)` is
+    /// the number of tunnels the client already holds, for the refusal line.
+    fn try_reserve(&self, cap: usize) -> std::result::Result<TunnelGuard, usize> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.0.load(Ordering::Acquire);
+        loop {
+            if cap != 0 && held >= cap {
+                return Err(held);
+            }
+            match self
+                .0
+                .compare_exchange_weak(held, held + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(TunnelGuard(self.clone())),
+                Err(actual) => held = actual,
+            }
+        }
+    }
+}
+
+/// Holds one tunnel's slot in its session's [`TunnelCount`] until it drops.
+#[cfg(feature = "multiplex")]
+struct TunnelGuard(TunnelCount);
+
+#[cfg(feature = "multiplex")]
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// v4 registry: one session per authenticated control connection, keyed by the
+/// nonce the server issued — the same value a data channel authenticates with.
+type SessionMap = HashMap<Nonce, SessionHandle>;
+
+/// The server's live registrations, one map per dialect.
+///
+/// v3 stays keyed by *service* (its takeover is by service digest, its data
+/// planes by session key); v4 is keyed by *session*, because a session's
+/// identity is a nonce and its services are looked up by [`ServiceId`].
+struct Registry {
+    v3: Arc<RwLock<ControlChannelMap>>,
+    v4: Arc<RwLock<SessionMap>>,
+}
+
+impl Registry {
+    fn new() -> Registry {
+        Registry {
+            v3: Arc::new(RwLock::new(ControlChannelMap::new())),
+            v4: Arc::new(RwLock::new(SessionMap::new())),
+        }
+    }
+}
+
+/// The service handle a v4 `(session nonce, service id)` names, when both are
+/// live.
+async fn session_service(
+    registry: &Registry,
+    nonce: &Nonce,
+    service_id: ServiceId,
+) -> Option<ControlChannelHandle> {
+    registry
+        .v4
+        .read()
+        .await
+        .get(nonce)
+        .and_then(|session| session.services.get(&service_id))
+        .cloned()
+}
 
 /// A connection accepted by the server, after the transport selector byte:
 /// plain TCP, or TCP wrapped in the Noise record stream when the client
@@ -268,7 +413,7 @@ impl Default for KcpListenerState {
 #[cfg(feature = "kcp")]
 async fn ensure_kcp_listener(
     shared: Arc<ServerShared>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     let mut guard = shared.kcp.acceptor.lock().await;
@@ -288,9 +433,10 @@ async fn ensure_kcp_listener(
     let acceptor = Arc::new(acceptor);
     tokio::spawn(run_kcp_tunnel_listener(
         Arc::clone(&acceptor),
-        Arc::clone(&control_channels),
+        Arc::clone(&registry),
         Arc::clone(&shared),
         shared.shutdown_tx.subscribe(),
+        server_config.max_tunnels_per_client(),
     ));
     *guard = Some(acceptor);
     Ok(())
@@ -301,8 +447,8 @@ struct Server {
     // `[server]` config
     config: Arc<ServerConfig>,
 
-    // Collection of contorl channels, each carrying one registered service
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    // Live registrations: v3 control channels and v4 sessions (see `Registry`)
+    registry: Arc<Registry>,
     // TCP transport + Noise keys + lazy KCP listener + shutdown broadcast
     // (see `ServerShared`).
     shared: Arc<ServerShared>,
@@ -312,7 +458,7 @@ impl Server {
     // Create a server from `[server]`
     pub fn from(config: ServerConfig) -> Result<Server> {
         let config = Arc::new(config);
-        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let registry = Arc::new(Registry::new());
         let tcp = Arc::new(TcpTransport::new(
             &crate::config::TransportConfig::default(),
         )?);
@@ -334,7 +480,7 @@ impl Server {
         });
         Ok(Server {
             config,
-            control_channels,
+            registry,
             shared,
         })
     }
@@ -358,7 +504,7 @@ impl Server {
         tokio::spawn(run_accept_loop(
             Arc::clone(&self.shared),
             control_l,
-            self.control_channels.clone(),
+            self.registry.clone(),
             self.config.clone(),
             shutdown_rx.resubscribe(),
         ));
@@ -377,7 +523,7 @@ impl Server {
                 tokio::spawn(run_accept_loop(
                     Arc::clone(&self.shared),
                     data_l,
-                    self.control_channels.clone(),
+                    self.registry.clone(),
                     self.config.clone(),
                     shutdown_rx.resubscribe(),
                 ));
@@ -403,6 +549,24 @@ impl Server {
             }
         }
 
+        // Stop the live connections with the listeners. A session left running
+        // would keep its services' listeners bound (and their public ports
+        // held) after the server reported a clean shutdown, and — in a test
+        // that restarts a server inside one process — would let the *old*
+        // server keep answering on the ports the new one is about to bind.
+        // Dropping a handle stops that service and its pool; dropping the
+        // session handle closes its control connection, which is how the
+        // client learns to reconnect.
+        self.registry.v3.write().await.clear();
+        self.registry.v4.write().await.clear();
+        // The KCP listener task subscribed to this broadcast when the first
+        // `kcp` registration bound it (the TCP accept loops watch the caller's
+        // own receiver instead), so without the signal its socket stays bound
+        // for the life of the process — and a server restarted in its place
+        // cannot bind that port again.
+        #[cfg(feature = "kcp")]
+        let _ = self.shared.shutdown_tx.send(true);
+
         info!("Shutdown");
 
         Ok(())
@@ -415,7 +579,7 @@ impl Server {
 async fn run_accept_loop(
     shared: Arc<ServerShared>,
     listener: TcpListener,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     server_config: Arc<ServerConfig>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) {
@@ -465,13 +629,13 @@ async fn run_accept_loop(
                             Ok(conn) => {
                                 match conn.with_context(|| "Failed to do transport handshake") {
                                     Ok(conn) => {
-                                        let control_channels = control_channels.clone();
+                                        let registry = registry.clone();
                                         let server_config = server_config.clone();
                                         let shared = Arc::clone(&shared);
                                         tokio::spawn(async move {
                                             if let Err(err) = handle_connection(
                                                 conn,
-                                                control_channels,
+                                                registry,
                                                 server_config,
                                                 shared,
                                             )
@@ -505,29 +669,50 @@ async fn run_accept_loop(
 // Handle connections accepted on the control or data listener.
 async fn handle_connection(
     mut conn: ServerStream,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     server_config: Arc<ServerConfig>,
     shared: Arc<ServerShared>,
 ) -> Result<()> {
-    // Read hello
-    let hello = read_hello(&mut conn).await?;
+    // Read hello, and with it the dialect the peer speaks: this server serves
+    // both (`SUPPORTED_PROTO_VERSIONS`), and every branch below depends on
+    // which one answered.
+    let (version, hello) = read_hello(&mut conn).await?;
     match hello {
-        ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(
-                conn,
-                control_channels,
-                service_digest,
-                server_config,
-                shared,
-            )
-            .await?;
+        ControlChannelHello(_, tag) => {
+            if version == PROTO_V4_VERSION {
+                // The v4 hello's digest is a client-chosen session tag; the
+                // session's identity is the nonce *this* end issues below.
+                do_session_handshake(conn, registry, server_config, shared).await?;
+            } else {
+                do_control_channel_handshake(conn, registry, tag, server_config, shared).await?;
+            }
         }
         DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce, false).await?;
+            if version == PROTO_V4_VERSION {
+                // A v4 direct data channel names its service in the 4 bytes
+                // right after the hello. The hello itself stays fixed-width,
+                // so `read_hello` reads exactly what a v3 peer sends.
+                let service_id = read_stream_prologue(&mut conn).await?;
+                do_v4_data_channel(conn, registry, nonce, service_id).await?;
+            } else {
+                do_data_channel_handshake(conn, registry, nonce, false).await?;
+            }
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce, true).await?;
+            if version == PROTO_V4_VERSION {
+                // A v4 tunnel carries no service of its own: it belongs to the
+                // session, and every stream inside it names its own service.
+                do_v4_tunnel(
+                    conn,
+                    registry,
+                    nonce,
+                    server_config.max_tunnels_per_client(),
+                )
+                .await?;
+            } else {
+                do_data_channel_handshake(conn, registry, nonce, true).await?;
+            }
         }
         #[cfg(not(feature = "multiplex"))]
         Hello::DataChannelTunnelHello(..) => {
@@ -539,15 +724,16 @@ async fn handle_connection(
     Ok(())
 }
 
+/// The v3 control channel: authenticate once, register one service, then hand
+/// the connection to that service's own control task.
+///
+/// Byte-identical to pre-v4 behaviour, including the takeover of a previous
+/// registration of the same service digest and the per-service heartbeat.
 async fn do_control_channel_handshake(
     mut conn: ServerStream,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
-    #[cfg_attr(
-        not(feature = "kcp"),
-        allow(unused_variables, reason = "only read by the kcp carrier-check arm")
-    )]
     shared: Arc<ServerShared>,
 ) -> Result<()> {
     debug!("Handshaking a control channel");
@@ -559,8 +745,10 @@ async fn do_control_channel_handshake(
     let mut rng = rand::rngs::SysRng;
     rng.try_fill_bytes(&mut nonce)?;
 
-    // Send hello
-    let hello_send = Hello::ControlChannelHello(protocol::CURRENT_PROTO_VERSION, nonce);
+    // Send hello, in the dialect the peer opened with: this branch *is* the
+    // v3 path, so answering with `CURRENT_PROTO_VERSION` (v4) would tell an old
+    // client the server had moved on.
+    let hello_send = Hello::ControlChannelHello(PROTO_V3_VERSION, nonce);
     conn.write_all(&postcard::to_stdvec(&hello_send)?).await?;
     conn.flush().await?;
 
@@ -584,6 +772,94 @@ async fn do_control_channel_handshake(
 
     // Read the client's service registration
     let reg = read_registration(&mut conn).await?;
+    let v4_reg: ServiceRegistrationV4 = reg.clone().into();
+
+    // Take over any previous control channel for this service name *before*
+    // binding: dropping the old handle starts the asynchronous teardown of
+    // its listeners, and `bind_with_retry` absorbs the remaining race.
+    {
+        let mut h = registry.v3.write().await;
+        if let Some(previous) = h.remove1(&service_digest) {
+            info!(service = %reg.name, "Dropping previous control channel");
+            previous.shutdown();
+        }
+    }
+
+    // Clamp the requested pool size to the operator's tunnel valve. A v3
+    // registration still carries a channel count of its own, so this is where
+    // `[server.data].max_tunnels_per_client` bounds a v3 client; `0` (the
+    // default) leaves the request alone, exactly as the removed
+    // `[server].max_pool_size` did.
+    let pool_size = match server_config.max_tunnels_per_client() {
+        0 => reg.pool_size,
+        max => reg.pool_size.min(u16::try_from(max).unwrap_or(u16::MAX)),
+    } as usize;
+
+    match register_service(&v4_reg, &server_config, &shared, &registry).await? {
+        Registration::Rejected(reason) => {
+            write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
+            bail!("Service {}: {reason}", reg.name);
+        }
+        Registration::Accepted(registered) => {
+            write_register_result(&mut conn, &Ack::Ok).await?;
+            let handle = ControlChannelHandle::new(
+                ControlSink::Connection(conn),
+                &registered.service,
+                registered.bound,
+                server_config.control.heartbeat_interval,
+                pool_size,
+                stripe_count(&server_config),
+            );
+
+            // Insert the new handle for this control channel
+            let mut h = registry.v3.write().await;
+            let _ = h.insert(service_digest, session_key, handle);
+            info!(service = %registered.service.name, "Control channel established");
+        }
+    }
+
+    Ok(())
+}
+
+/// A service that passed the server's policy and whose public endpoint is
+/// bound, ready for the caller to start its pool and control path.
+struct Registered {
+    service: RegisteredService,
+    bound: BoundEndpoint,
+}
+
+/// The outcome of one registration attempt.
+enum Registration {
+    /// Bound and ready. The caller starts the service and answers `Ack::Ok`.
+    Accepted(Box<Registered>),
+    /// The server refused it. The reason is what the client reads in
+    /// `Ack::RegisterRejected`; a v3 connection ends after it, while a v4
+    /// session rejects only that service and stays up.
+    Rejected(String),
+}
+
+/// Validate one service registration against the server's policy and bind its
+/// public endpoint: the body both dialects share.
+///
+/// Everything here is independent of *who owns the control connection* — the
+/// `allow_ports` check, the client-declared carrier check and the eager bind
+/// that turns a port conflict into a precise rejection. The caller takes over
+/// any previous registration for the service *before* calling this, so
+/// `bind_with_retry` absorbs that asynchronous teardown.
+async fn register_service(
+    reg: &ServiceRegistrationV4,
+    server_config: &Arc<ServerConfig>,
+    #[cfg_attr(
+        not(feature = "kcp"),
+        allow(unused_variables, reason = "only read by the kcp carrier-check arm")
+    )]
+    shared: &Arc<ServerShared>,
+    #[cfg_attr(
+        not(feature = "kcp"),
+        allow(unused_variables, reason = "only read by the kcp carrier-check arm")
+    )]
+    registry: &Arc<Registry>,
+) -> Result<Registration> {
     info!(service = %reg.name, "Registering service at {}", reg.bind_addr);
 
     // Policy check: `allow_ports` is the master switch for dynamic
@@ -598,8 +874,7 @@ async fn do_control_channel_handshake(
             format!("Port {port} rejected: not covered by the server's `allow_ports` whitelist")
         };
         warn!(service = %reg.name, "{reason}");
-        write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
-        bail!("Service {}: {reason}", reg.name);
+        return Ok(Registration::Rejected(reason));
     }
 
     // Client-declared carrier: the server opens the corresponding
@@ -608,9 +883,9 @@ async fn do_control_channel_handshake(
     if reg.carrier == Carrier::Kcp {
         #[cfg(feature = "kcp")]
         let result = ensure_kcp_listener(
-            Arc::clone(&shared),
-            Arc::clone(&control_channels),
-            Arc::clone(&server_config),
+            Arc::clone(shared),
+            Arc::clone(registry),
+            Arc::clone(server_config),
         )
         .await;
         #[cfg(not(feature = "kcp"))]
@@ -618,16 +893,9 @@ async fn do_control_channel_handshake(
         if let Err(e) = result {
             let reason = format!("{e:#}");
             warn!(service = %reg.name, "Registration failed: {reason}");
-            write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
-            bail!("Service {}: {reason}", reg.name);
+            return Ok(Registration::Rejected(reason));
         }
     }
-
-    // Clamp the requested pool size to the server-wide maximum
-    let pool_size = match server_config.max_pool_size {
-        Some(max) => reg.pool_size.min(max),
-        None => reg.pool_size,
-    } as usize;
 
     let service = RegisteredService {
         name: reg.name.clone(),
@@ -636,46 +904,315 @@ async fn do_control_channel_handshake(
         udp_buffer_size: reg.udp_buffer_size as usize,
     };
 
-    // Take over any previous control channel for this service name *before*
-    // binding: dropping the old handle starts the asynchronous teardown of
-    // its listeners, and `bind_with_retry` absorbs the remaining race.
-    {
-        let mut h = control_channels.write().await;
-        if h.remove1(&service_digest).is_some() {
-            info!(service = %reg.name, "Dropping previous control channel");
-        }
-    }
-
     // Bind the public endpoint eagerly so that conflicts are reported
     // precisely as a rejection instead of surfacing later as pool errors.
-    let bound = match bind_with_retry(&service).await {
-        Ok(b) => b,
+    match bind_with_retry(&service).await {
+        Ok(bound) => Ok(Registration::Accepted(Box::new(Registered {
+            service,
+            bound,
+        }))),
         Err(e) => {
             let reason = format!("{e:#}");
             warn!(service = %reg.name, "Registration failed: {reason}");
-            write_register_result(&mut conn, &Ack::RegisterRejected(reason.clone())).await?;
-            bail!("Service {}: {reason}", reg.name);
+            Ok(Registration::Rejected(reason))
         }
+    }
+}
+
+/// The v4 control session: authenticate once for the endpoint, then serve N
+/// service registrations over the one connection.
+///
+/// The session owns the connection — a reader loop (this task) consumes
+/// `SessionCmd`s and a writer task drains the session's queue — so a service
+/// never touches the socket itself; it only queues framed commands.
+async fn do_session_handshake(
+    mut conn: ServerStream,
+    registry: Arc<Registry>,
+    server_config: Arc<ServerConfig>,
+    shared: Arc<ServerShared>,
+) -> Result<()> {
+    debug!("Handshaking a control session");
+
+    conn.hint(SocketOpts::for_control_channel());
+
+    // The session's identity: 32 random bytes, not derivable from a service
+    // name the way a v3 digest is. It is also the data plane's credential.
+    let mut nonce = [0u8; HASH_WIDTH_IN_BYTES];
+    let mut rng = rand::rngs::SysRng;
+    rng.try_fill_bytes(&mut nonce)?;
+
+    let hello = Hello::ControlChannelHello(PROTO_V4_VERSION, nonce);
+    conn.write_all(&postcard::to_stdvec(&hello)?).await?;
+    conn.flush().await?;
+
+    // Session credential: the endpoint's default token, exactly as v3.
+    let mut concat = Vec::from(server_config.default_token.as_bytes());
+    concat.extend_from_slice(&nonce);
+    let session_key = protocol::digest(&concat);
+
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+    if d != session_key {
+        write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::AuthFailed)?).await?;
+        debug!(
+            "Expect {}, but got {}",
+            hex::encode(session_key),
+            hex::encode(d)
+        );
+        report_auth_failure();
+        bail!("Authentication failed");
+    }
+
+    // The server *declares* its cadence here (0 = none). `SessionOk` carries a
+    // payload, so it travels through the framed helper — never through the
+    // fixed-width 1-byte ack path.
+    let heartbeat_interval = server_config.control.heartbeat_interval;
+    let session_ok = Ack::SessionOk {
+        heartbeat_interval_secs: heartbeat_interval,
     };
+    write_register_result(&mut conn, &session_ok).await?;
+    // One authenticated session per control connection: the integration test
+    // for D1 asserts that a client's services share a session, which needs a
+    // number the process can be asked for (see `control_sessions_accepted`).
+    CONTROL_SESSIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 
-    write_register_result(&mut conn, &Ack::Ok).await?;
+    // Split *after* the socket options are set: these two halves are the
+    // session's single reader (below) and its single writer (the task).
+    let (mut rd, wr) = tokio::io::split(conn);
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (shutdown_tx, _) = broadcast::channel::<bool>(1);
 
-    let handle = ControlChannelHandle::new(
-        conn,
-        &service,
-        bound,
-        server_config.control.heartbeat_interval,
-        pool_size,
-        stripe_count(&server_config),
+    let mut writer = tokio::spawn(
+        async move {
+            let mut wr = wr;
+            while let Some(frame) = write_rx.recv().await {
+                if let Err(e) = write_and_flush(&mut wr, &frame).await {
+                    // The client is gone; the reader below ends with it.
+                    debug!("Failed to write a session command: {e:#}");
+                    break;
+                }
+            }
+        }
+        .instrument(Span::current()),
     );
 
-    // Insert the new handle for this control channel
-    let mut h = control_channels.write().await;
-    let _ = h.insert(service_digest, session_key, handle);
+    // Publish the session before serving it: a data channel for one of its
+    // services may arrive while this reader is still registering them. The
+    // cadence below and the writer every service queues to are read from the
+    // published handle, so the registry entry is what owns them.
+    let (heartbeat_tx, mut session_shutdown_rx) = {
+        let handle = SessionHandle::new(write_tx, shutdown_tx);
+        let heartbeat_tx = handle.write_tx.clone();
+        let shutdown_rx = handle.shutdown.subscribe();
+        registry.v4.write().await.insert(nonce, handle);
+        (heartbeat_tx, shutdown_rx)
+    };
 
-    info!(service = %reg.name, "Control channel established");
+    let ctx = SessionCtx {
+        nonce,
+        session_key,
+        registry: Arc::clone(&registry),
+        server_config: Arc::clone(&server_config),
+        shared: Arc::clone(&shared),
+    };
+    let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
 
+    let reason = loop {
+        tokio::select! {
+            cmd = read_session_cmd(&mut rd) => match cmd {
+                Ok(SessionCmd::Register(reg)) => {
+                    if let Err(e) = ctx.register(&reg).await {
+                        break e;
+                    }
+                }
+                Ok(SessionCmd::Deregister(service_id)) => ctx.deregister(service_id).await,
+                Err(e) => break e,
+            },
+            () = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
+                if heartbeat_tx.send(heartbeat.clone()).is_err() {
+                    break anyhow!("The session writer is gone");
+                }
+            }
+            // The socket's write half failed: the session goes with it.
+            _ = &mut writer => break anyhow!("The session writer stopped"),
+            _ = session_shutdown_rx.recv() => break anyhow!("The session was shut down"),
+        }
+    };
+    debug!("Control session ended: {reason:#}");
+
+    // Drop every service handle: each service's control task ends, its pool
+    // task stops, and its listener and public port are released. Removing the
+    // registry entry drops the last writers, which ends the writer task.
+    if let Some(mut session) = registry.v4.write().await.remove(&nonce) {
+        debug!(
+            services = session.services.len(),
+            "Control session closed, releasing its services"
+        );
+        // Explicit per-service teardown, for the same reason the takeover
+        // sends: a pool must stop even when something still holds a clone.
+        for (_, handle) in session.services.drain() {
+            handle.shutdown();
+        }
+        drop(session);
+    }
+    drop(ctx);
+    drop(heartbeat_tx);
+    drop(rd);
     Ok(())
+}
+
+/// One v4 session's registration path: the session it belongs to, plus the
+/// server-side policy every registration is checked against.
+struct SessionCtx {
+    nonce: Nonce,
+    /// The session credential — the server's default token bound to the nonce.
+    /// The server owns no per-service token table, so this is also the only
+    /// per-service credential it can check.
+    session_key: Nonce,
+    registry: Arc<Registry>,
+    server_config: Arc<ServerConfig>,
+    shared: Arc<ServerShared>,
+}
+
+impl SessionCtx {
+    /// The session's one writer, for as long as the session is registered.
+    async fn write_tx(&self) -> Result<mpsc::UnboundedSender<Vec<u8>>> {
+        self.registry
+            .v4
+            .read()
+            .await
+            .get(&self.nonce)
+            .map(|session| session.write_tx.clone())
+            .ok_or_else(|| anyhow!("The control session is gone"))
+    }
+
+    /// Frame an ack for the session's writer exactly as a connection write
+    /// would (`write_register_result`), without touching the socket.
+    async fn send_ack(&self, ack: &Ack) -> Result<()> {
+        let mut frame = Vec::new();
+        write_register_result(&mut frame, ack).await?;
+        self.write_tx()
+            .await?
+            .send(frame)
+            .map_err(|_| anyhow!("The control session is gone"))
+    }
+
+    /// One `SessionCmd::Register`.
+    ///
+    /// The service's own credential is checked first; a rejection answers that
+    /// service alone and leaves the session and its siblings running.
+    async fn register(&self, reg: &SessionRegistration) -> Result<()> {
+        let service_id = reg.service_id;
+
+        if reg.auth != self.session_key {
+            let reason = "Incorrect token for this service".to_owned();
+            debug!(service = %reg.reg.name, "Service {service_id} rejected: {reason}");
+            return self.send_ack(&Ack::RegisterRejected(reason)).await;
+        }
+
+        // Re-registering the same id replaces the endpoint. The takeover
+        // happens before binding, so `bind_with_retry` absorbs the
+        // asynchronous teardown — the order the v3 path uses too.
+        let replaced = self
+            .registry
+            .v4
+            .write()
+            .await
+            .get_mut(&self.nonce)
+            .and_then(|session| session.services.remove(&service_id));
+        if let Some(previous) = replaced {
+            info!(service = %reg.reg.name, "Dropping previous control channel");
+            previous.shutdown();
+        }
+
+        let registered =
+            match register_service(&reg.reg, &self.server_config, &self.shared, &self.registry)
+                .await?
+            {
+                Registration::Rejected(reason) => {
+                    return self.send_ack(&Ack::RegisterRejected(reason)).await;
+                }
+                Registration::Accepted(registered) => registered,
+            };
+        let Registered { service, bound } = *registered;
+
+        // The verdict precedes any command for this service: everything the
+        // per-service task queues goes through the same writer, so answering
+        // first keeps `Ok` ahead of the first `CreateDataChannelFor`.
+        self.send_ack(&Ack::Ok).await?;
+
+        let handle = ControlChannelHandle::new(
+            ControlSink::Session {
+                service_id,
+                write_tx: self.write_tx().await?,
+            },
+            &service,
+            bound,
+            // The session owns the cadence (`Ack::SessionOk` declared it), so
+            // this service's own heartbeat is off: the per-service task only
+            // turns its pool's requests into tagged commands.
+            0,
+            // v4 registrations carry no `pool_size`: the tunnel pool is a
+            // client-side, per-carrier concern and grows on demand, one
+            // request per visitor.
+            0,
+            // Striping is served *unstriped* on a v4 session: with the elastic
+            // pool, a group's channels are opened while the pool is still
+            // growing, and a stripe group that ends up sharing tunnels (or
+            // gathering a channel that is still being established) deadlocks
+            // the bulk path instead of degrading. A deadlock is not a
+            // degradation, so the feature is off until it is fixed — loudly,
+            // once, rather than silently (HANDOFF.md, "Open: striping with the
+            // elastic pool").
+            {
+                if stripe_count(&self.server_config) > 1 {
+                    STRIPING_UNAVAILABLE.report(
+                        || {
+                            warn!(
+                                "[server.data] stripe_count is not supported on a v4 session yet; \
+                                 serving unstriped. See HANDOFF.md, \"Open: striping with the \
+                                 elastic pool\"."
+                            );
+                        },
+                        || debug!("[server.data] stripe_count ignored on a v4 session"),
+                    );
+                }
+                1
+            },
+        );
+
+        // The handle *is* the service's lease: dropping it (Deregister, or the
+        // session ending) stops the pool and releases the port.
+        let mut guard = self.registry.v4.write().await;
+        let Some(session) = guard.get_mut(&self.nonce) else {
+            // The session ended while this registration was being served.
+            return Ok(());
+        };
+        session.services.insert(service_id, handle);
+        drop(guard);
+        info!(service = %service.name, "Control channel established");
+        Ok(())
+    }
+
+    /// One `SessionCmd::Deregister`: dropping the handle stops that service's
+    /// pool task, which releases its listener and public port. The session's
+    /// other services are untouched.
+    async fn deregister(&self, service_id: ServiceId) {
+        let removed = self
+            .registry
+            .v4
+            .write()
+            .await
+            .get_mut(&self.nonce)
+            .and_then(|session| session.services.remove(&service_id));
+        if let Some(handle) = removed {
+            // Ends the service's control task, which stops its pool task and
+            // releases the port.
+            debug!("Deregistered service {service_id}");
+            handle.shutdown();
+        } else {
+            debug!("Deregister for unknown service {service_id}");
+        }
+    }
 }
 
 /// One end of a forwarded connection, as handed to the connection pool.
@@ -750,7 +1287,7 @@ impl tokio::io::AsyncWrite for DataChannel {
 
 async fn do_data_channel_handshake(
     conn: ServerStream,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     nonce: Nonce,
     #[cfg_attr(
         not(feature = "multiplex"),
@@ -760,13 +1297,16 @@ async fn do_data_channel_handshake(
 ) -> Result<()> {
     debug!("Handshaking a data channel");
 
-    // Validate
-    let control_channels_guard = control_channels.read().await;
-    let Some(handle) = control_channels_guard.get2(&nonce).cloned() else {
-        warn!("Data channel has incorrect nonce");
-        return Ok(());
+    // Validate: a v3 session key identifies the one service of that control
+    // channel, so the nonce alone names the service.
+    let handle = {
+        let guard = registry.v3.read().await;
+        let Some(handle) = guard.get2(&nonce).cloned() else {
+            warn!("Data channel has incorrect nonce");
+            return Ok(());
+        };
+        handle
     };
-    drop(control_channels_guard);
 
     conn.hint(SocketOpts::for_service(None));
 
@@ -775,7 +1315,9 @@ async fn do_data_channel_handshake(
         // The hello variant told us whether this connection is a plain data
         // channel or the opening of a multiplexed tunnel.
         if is_tunnel {
-            return upgrade_to_tunnel(conn, handle).await;
+            // v3: the requested channel count was clamped at registration, so a
+            // v3 tunnel takes no session slot of its own.
+            return upgrade_to_tunnel(conn, TunnelOwner::Service(handle), None).await;
         }
     }
 
@@ -787,15 +1329,217 @@ async fn do_data_channel_handshake(
     Ok(())
 }
 
+/// A v4 direct data channel: its prologue already named the service.
+///
+/// A channel for a service that is not registered (a stale one, or an id the
+/// client never registered) is dropped here; the session — and every other
+/// service on it — is untouched.
+async fn do_v4_data_channel(
+    conn: ServerStream,
+    registry: Arc<Registry>,
+    nonce: Nonce,
+    service_id: ServiceId,
+) -> Result<()> {
+    debug!("Handshaking a data channel");
+
+    let Some(handle) = session_service(&registry, &nonce, service_id).await else {
+        debug!("Data channel names service {service_id}, which is not registered on that session");
+        return Ok(());
+    };
+
+    conn.hint(SocketOpts::for_service(None));
+    handle
+        .data_channel
+        .send(new_data_channel(conn))
+        .await
+        .with_context(|| "Data channel for a stale control session")?;
+    Ok(())
+}
+
+/// A v4 multiplex tunnel: it belongs to the session, not to a service, and
+/// each stream inside it names its service with the 4-byte prologue.
+///
+/// **This is where `[server.data].max_tunnels_per_client` lives** (the
+/// operator's valve): a tunnel that would push the client past its cap is
+/// refused with a typed answer and a `debug` line naming the cap, and the
+/// session keeps running — never killed, so an over-eager client loses one
+/// tunnel, not its services (D14).
+#[cfg(feature = "multiplex")]
+async fn do_v4_tunnel(
+    mut conn: ServerStream,
+    registry: Arc<Registry>,
+    nonce: Nonce,
+    max_tunnels_per_client: usize,
+) -> Result<()> {
+    debug!("Handshaking a multiplexed data tunnel");
+
+    // The reservation travels into `upgrade_to_tunnel`, which hands it to the
+    // task that lives as long as the tunnel: this function itself returns as
+    // soon as the tunnel is up.
+    let slot = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
+        TunnelSlot::NoSession => {
+            debug!("Data tunnel has an incorrect nonce");
+            return Ok(());
+        }
+        TunnelSlot::Held(slot) => slot,
+        TunnelSlot::OverCap { held } => {
+            // A refusal, not a failure: the client keeps its other tunnels and
+            // its session. The cap is named so the operator who set it reads
+            // the reason in the log, and the client reads it in the ack.
+            debug!(
+                "Refused a v{PROTO_V4_VERSION} data tunnel for session {}: it already holds \
+                 {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
+                 {max_tunnels_per_client}",
+                hex::encode(nonce)
+            );
+            return refuse_tunnel(&mut conn).await;
+        }
+    };
+
+    conn.hint(SocketOpts::for_service(None));
+    upgrade_to_tunnel(
+        conn,
+        TunnelOwner::Session {
+            sessions: Arc::clone(&registry.v4),
+            nonce,
+        },
+        Some(slot),
+    )
+    .await
+}
+
+/// The outcome of asking a session for one more tunnel.
+#[cfg(feature = "multiplex")]
+enum TunnelSlot {
+    /// The nonce names no live session; the caller reports that itself.
+    NoSession,
+    /// Reserved, and held until the guard drops.
+    Held(SessionTunnel),
+    /// The operator's cap is reached: this many tunnels are already held.
+    OverCap { held: usize },
+}
+
+/// What a v4 tunnel holds for its whole life: its slot in the session's tunnel
+/// count, and the news that the session ended.
+///
+/// A tunnel belongs to its session, so it must not outlive it: a tunnel whose
+/// session is gone has nowhere to route its streams (they are dropped with a
+/// "no such service on this session"), and — with the client's pool reused
+/// across a reconnect — it would keep a dead connection in the pool. The
+/// receiver is the session's own shutdown broadcast, so a clean teardown, a
+/// registry drop and a shutdown all end the tunnel the same way.
+#[cfg(feature = "multiplex")]
+struct SessionTunnel {
+    /// The tunnel's reservation in its session's count. Held by the tunnel's
+    /// driver task for the tunnel's whole life, so an over-cap client cannot
+    /// slip a second tunnel past the valve.
+    slot: TunnelGuard,
+    /// The session's own shutdown broadcast: the tunnel ends with the session.
+    ended: broadcast::Receiver<bool>,
+}
+
+/// Reserve one tunnel slot on a live v4 session against the operator's cap
+/// (`0` = unlimited). The compare-exchange inside [`TunnelCount`] is what makes
+/// concurrent tunnel hellos of one client respect the cap together.
+#[cfg(feature = "multiplex")]
+async fn reserve_tunnel(registry: &Registry, nonce: &Nonce, cap: usize) -> TunnelSlot {
+    let guard = registry.v4.read().await;
+    let Some(session) = guard.get(nonce) else {
+        return TunnelSlot::NoSession;
+    };
+    match session.tunnels.try_reserve(cap) {
+        Ok(slot) => TunnelSlot::Held(SessionTunnel {
+            slot,
+            ended: session.shutdown.subscribe(),
+        }),
+        Err(held) => TunnelSlot::OverCap { held },
+    }
+}
+
+/// Answer a tunnel that is over the cap with the typed refusal.
+///
+/// A tunnel hello is answered on the *fixed-width* ack path — the client reads
+/// exactly one byte there — so the refusal is the unit [`Ack::TunnelRefused`]
+/// and not a framed `RegisterRejected`: its payload would be misread as the
+/// ack itself. The client's tunnel dial reports the variant
+/// (`the server refused the multiplexed data tunnel: ...`), and the `debug!`
+/// at the TCP and KCP call sites names the cap.
+#[cfg(feature = "multiplex")]
+async fn refuse_tunnel<S>(conn: &mut S) -> Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    write_and_flush(conn, &postcard::to_stdvec(&Ack::TunnelRefused)?).await
+}
+
+/// Process-wide once-only line for a tunnel stream that names a service the
+/// session does not know (a stale registration, or an id the client never
+/// registered). A broken or hostile client must not be able to fill the log
+/// with these; the stream is dropped, never the tunnel or the session (see
+/// `RepeatNotice`).
+#[cfg(feature = "multiplex")]
+static TUNNEL_VIOLATIONS: RepeatNotice = RepeatNotice::new();
+
+/// A v4 registration asked for striping while a v4 session cannot serve it yet
+/// (HANDOFF.md, "Open: striping with the elastic pool"): WARN once, then DEBUG.
+/// Not feature-gated: a build without `multiplex` reports `stripe_count() == 1`
+/// and never reaches this, but the session path that asks compiles either way.
+static STRIPING_UNAVAILABLE: RepeatNotice = RepeatNotice::new();
+
+/// Report a dropped tunnel stream: once per process at `warn`, then at `debug`.
+#[cfg(feature = "multiplex")]
+fn report_tunnel_violation(service_id: ServiceId, why: &str) {
+    TUNNEL_VIOLATIONS.report(
+        || {
+            warn!(
+                "Dropped a v{PROTO_V4_VERSION} tunnel stream naming service {service_id}: {why}. \
+                 Further violations are logged at debug level."
+            );
+        },
+        || {
+            debug!(
+                "Dropped a v{PROTO_V4_VERSION} tunnel stream naming service {service_id}: {why}"
+            );
+        },
+    );
+}
+
+/// Who a tunnel's streams belong to.
+#[cfg(feature = "multiplex")]
+enum TunnelOwner {
+    /// v3: one control channel serves exactly one service, so every stream on
+    /// the tunnel is that service's.
+    Service(ControlChannelHandle),
+    /// v4: the tunnel belongs to a session. Each stream's 4-byte prologue
+    /// names its service, so one tunnel may carry streams of **several**
+    /// services — which is exactly what a shared pool (`[client.data].shared_pool`)
+    /// produces, and what a per-service pool produces only by accident.
+    Session {
+        sessions: Arc<RwLock<SessionMap>>,
+        nonce: Nonce,
+    },
+}
+
 /// Finalize a tunnel upgrade on a validated tunnel stream: confirm with the
 /// ack (the client waits for it, so a stale nonce surfaces as a clean error
 /// there), then run the yamux session and bridge every inbound stream — each
-/// one a requested data channel — into the control channel's pool.
+/// one a requested data channel — into the owning service's pool.
 ///
 /// Generic over the stream type so TCP tunnels and KCP tunnels (arm 2) share
 /// one implementation.
+///
+/// `session` is what a v4 tunnel holds for its whole life — its reservation in
+/// the session's tunnel count (`[server.data].max_tunnels_per_client`) and the
+/// session's shutdown signal — when it has one. This function returns as soon
+/// as the tunnel is up, so both have to travel into the task that lives as
+/// long as the tunnel; a v3 tunnel belongs to one control channel and takes
+/// neither.
 #[cfg(feature = "multiplex")]
-async fn upgrade_to_tunnel<S>(mut conn: S, handle: ControlChannelHandle) -> Result<()>
+async fn upgrade_to_tunnel<S>(
+    mut conn: S,
+    owner: TunnelOwner,
+    session: Option<SessionTunnel>,
+) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -803,22 +1547,87 @@ where
     let config = crate::transport::multiplex::mux_config();
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<crate::transport::MuxStream>(64);
     tokio::spawn(async move {
-        crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx).await;
+        // Held until this tunnel's IO ends — the slot's term in the session's
+        // tunnel count is exactly the tunnel's own lifetime — and ended by the
+        // session's own shutdown, so a tunnel never outlives the session it
+        // routes for. Both fields have to move into *this* task: destructuring
+        // the reservation out and dropping the rest would release the slot (and
+        // so the operator's cap) the moment the tunnel came up.
+        let (slot, mut ended) = match session {
+            Some(SessionTunnel { slot, ended }) => (Some(slot), Some(ended)),
+            None => (None, None),
+        };
+        let _slot = slot;
+        let tunnel = crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx);
+        match ended.as_mut() {
+            Some(ended) => {
+                tokio::select! {
+                    () = tunnel => {}
+                    _ = ended.recv() => debug!("Data tunnel ended with its session"),
+                }
+            }
+            None => tunnel.await,
+        }
         debug!("Multiplexed data tunnel closed");
     });
     tokio::spawn(async move {
-        while let Some(stream) = bridge_rx.recv().await {
-            if handle
-                .data_channel
-                .send(DataChannel::Mux(stream))
-                .await
-                .is_err()
-            {
+        while let Some(mut stream) = bridge_rx.recv().await {
+            let queue = match &owner {
+                TunnelOwner::Service(handle) => handle.data_channel.clone(),
+                TunnelOwner::Session { sessions, nonce } => {
+                    match route_tunnel_stream(&mut stream, sessions, nonce).await {
+                        Some(queue) => queue,
+                        // A stream this session may not carry: dropped here,
+                        // never the tunnel or the session.
+                        None => continue,
+                    }
+                }
+            };
+            if queue.send(DataChannel::Mux(stream)).await.is_err() {
                 break;
             }
         }
     });
     Ok(())
+}
+
+/// Resolve one inbound v4 tunnel stream to the queue of the service it names.
+///
+/// The 4-byte prologue opens the stream — the client writes it before anything
+/// else, so reading it here cannot eat payload. Returns `None` when the stream
+/// must be dropped: an unreadable prologue, or a service that is not registered
+/// on the session. Neither may take the tunnel or the session down.
+///
+/// Several services may share one tunnel: with `[client.data].shared_pool` the
+/// client places a session's streams on one pool, so a tunnel carries whichever
+/// service each stream's prologue names. The routing is per *stream*, not per
+/// tunnel, and has been since the prologue landed.
+#[cfg(feature = "multiplex")]
+async fn route_tunnel_stream<S>(
+    stream: &mut S,
+    sessions: &RwLock<SessionMap>,
+    nonce: &Nonce,
+) -> Option<mpsc::Sender<DataChannel>>
+where
+    S: AsyncRead + Unpin,
+{
+    let Ok(service_id) = read_stream_prologue(stream).await else {
+        // The stream ended before naming a service (a client that opened it
+        // and hung up): nothing to route it to.
+        debug!("Dropped a v{PROTO_V4_VERSION} tunnel stream with no prologue");
+        return None;
+    };
+    let queue = sessions
+        .read()
+        .await
+        .get(nonce)
+        .and_then(|session| session.services.get(&service_id))
+        .map(|handle| handle.data_channel.clone());
+    let Some(queue) = queue else {
+        report_tunnel_violation(service_id, "no such service on this session");
+        return None;
+    };
+    Some(queue)
 }
 
 /// Accept KCP tunnel sessions (arm 2 of the transport comparison) and
@@ -827,9 +1636,10 @@ where
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
 async fn run_kcp_tunnel_listener(
     acceptor: Arc<KcpAcceptor>,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     shared: Arc<ServerShared>,
     mut shutdown_rx: broadcast::Receiver<bool>,
+    max_tunnels_per_client: usize,
 ) {
     loop {
         tokio::select! {
@@ -837,14 +1647,15 @@ async fn run_kcp_tunnel_listener(
             session = acceptor.accept() => {
                 let Some(session) = session else { break };
                 let peer = session.peer;
-                let control_channels = control_channels.clone();
+                let registry = registry.clone();
                 let shared = Arc::clone(&shared);
                 tokio::spawn(
                     async move {
                         if let Err(e) = handle_kcp_tunnel_session(
                             session,
-                            control_channels,
+                            registry,
                             shared,
+                            max_tunnels_per_client,
                         )
                         .await
                         {
@@ -864,8 +1675,9 @@ async fn run_kcp_tunnel_listener(
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
 async fn handle_kcp_tunnel_session(
     mut session: crate::transport::kcp::AcceptedSession,
-    control_channels: Arc<RwLock<ControlChannelMap>>,
+    registry: Arc<Registry>,
     shared: Arc<ServerShared>,
+    max_tunnels_per_client: usize,
 ) -> Result<()> {
     use crate::transport::kcp::KcpTunnelStream;
 
@@ -906,34 +1718,76 @@ async fn handle_kcp_tunnel_session(
     };
 
     // Read and validate the tunnel hello, then run the shared upgrade.
-    let (handle, _nonce) = tokio::time::timeout(
-        deadline,
-        validate_tunnel_hello(&mut io, &control_channels, "KCP"),
-    )
-    .await
-    .with_context(|| "KCP tunnel hello timed out")??;
+    let (owner, nonce, version) =
+        tokio::time::timeout(deadline, validate_tunnel_hello(&mut io, &registry, "KCP"))
+            .await
+            .with_context(|| "KCP tunnel hello timed out")??;
 
-    upgrade_to_tunnel(io, handle).await
+    // A v4 KCP tunnel is one of the client's multiplexed tunnels and takes a
+    // slot exactly like a TCP one: the valve must not be bypassable by
+    // choosing the other carrier. A v3 KCP tunnel belongs to a single control
+    // channel, whose own channel count was clamped at registration.
+    let session = if version == PROTO_V4_VERSION {
+        match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
+            TunnelSlot::Held(slot) => Some(slot),
+            TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
+            TunnelSlot::OverCap { held } => {
+                debug!(
+                    "Refused a v{PROTO_V4_VERSION} KCP data tunnel for session {}: it already \
+                     holds {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
+                     {max_tunnels_per_client}",
+                    hex::encode(nonce)
+                );
+                refuse_tunnel(&mut io).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
+    upgrade_to_tunnel(io, owner, session).await
 }
 
 /// Read the tunnel hello on a freshly established tunnel stream (any arm)
 /// and resolve the control channel it belongs to via the session nonce.
+///
+/// The version the peer opened with is returned beside the owner: only a v4
+/// tunnel draws on the session's tunnel budget (a v3 tunnel belongs to one
+/// control channel, whose requested channel count was already clamped).
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 async fn validate_tunnel_hello<S>(
     conn: &mut S,
-    control_channels: &RwLock<ControlChannelMap>,
+    registry: &Registry,
     arm: &str,
-) -> Result<(ControlChannelHandle, Nonce)>
+) -> Result<(TunnelOwner, Nonce, u8)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    match read_hello(conn).await? {
+    let (version, hello) = read_hello(conn).await?;
+    match hello {
         Hello::DataChannelTunnelHello(_, nonce) => {
-            let guard = control_channels.read().await;
-            let Some(handle) = guard.get2(&nonce).cloned() else {
-                bail!("{arm} tunnel hello carried an incorrect nonce");
-            };
-            Ok((handle, nonce))
+            if version == PROTO_V4_VERSION {
+                // A v4 tunnel names its session only; its streams name their
+                // service (see `TunnelOwner::Session`).
+                if !registry.v4.read().await.contains_key(&nonce) {
+                    bail!("{arm} tunnel hello carried an incorrect nonce");
+                }
+                Ok((
+                    TunnelOwner::Session {
+                        sessions: Arc::clone(&registry.v4),
+                        nonce,
+                    },
+                    nonce,
+                    version,
+                ))
+            } else {
+                let guard = registry.v3.read().await;
+                let Some(handle) = guard.get2(&nonce).cloned() else {
+                    bail!("{arm} tunnel hello carried an incorrect nonce");
+                };
+                Ok((TunnelOwner::Service(handle), nonce, version))
+            }
         }
         other => bail!("Expected a tunnel hello on the {arm} tunnel, got {other:?}"),
     }
@@ -949,6 +1803,23 @@ pub struct ControlChannelHandle {
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
     data_ch_req: mpsc::UnboundedSender<bool>,
+}
+
+impl ControlChannelHandle {
+    /// Tear this service's control path down now: the pool task stops and its
+    /// public port is released.
+    ///
+    /// Dropping a handle is the usual shutdown signal (each field is a sender),
+    /// but a live multiplex tunnel's bridge task holds a *clone* of the handle
+    /// for as long as that tunnel lives. A takeover or a `Deregister` that only
+    /// dropped the registry's copy would therefore leave the old pool holding
+    /// the public port until the tunnel died (observed: a KCP tunnel outlives
+    /// its client by tens of seconds, and the re-registration that follows is
+    /// rejected with "Port N is already in use"). Sending on the shutdown
+    /// broadcast makes the teardown independent of whoever still holds a clone.
+    fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+    }
 }
 
 impl Clone for ControlChannelHandle {
@@ -1033,12 +1904,47 @@ fn stripe_count(server_config: &ServerConfig) -> usize {
     }
 }
 
+/// Where a service's control commands go.
+///
+/// A v3 service owns its control connection; a v4 service shares the session's,
+/// so its commands are framed into the session's single writer instead.
+enum ControlSink {
+    Connection(ServerStream),
+    Session {
+        service_id: ServiceId,
+        write_tx: mpsc::UnboundedSender<Vec<u8>>,
+    },
+}
+
+impl ControlSink {
+    /// Send one already-framed command: straight out on a v3 connection, or
+    /// queued for the session's writer — the only task touching that socket.
+    async fn send(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            ControlSink::Connection(conn) => write_and_flush(conn, data)
+                .await
+                .with_context(|| "Failed to write control cmds"),
+            ControlSink::Session { write_tx, .. } => write_tx
+                .send(data.to_vec())
+                .map_err(|_| anyhow!("The control session is gone")),
+        }
+    }
+
+    /// The v4 service id this sink's commands are tagged with.
+    fn service_id(&self) -> Option<ServiceId> {
+        match self {
+            ControlSink::Connection(_) => None,
+            ControlSink::Session { service_id, .. } => Some(*service_id),
+        }
+    }
+}
+
 impl ControlChannelHandle {
     // Create a control channel handle for an already-bound service: spawn
     // the connection pool task and the control channel handling task.
     #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
-        conn: ServerStream,
+        sink: ControlSink,
         service: &RegisteredService,
         bound: BoundEndpoint,
         heartbeat_interval: u64,
@@ -1061,6 +1967,18 @@ impl ControlChannelHandle {
             }
         }
 
+        // A v4 service's pool death has to reach the client, and the session
+        // owns the connection: the wrapper below reports a *failed* pool task
+        // through this channel, and the per-service control task turns it into
+        // `ServiceDropped`. v3 has no reporter — its control channel dies with
+        // the pool anyway.
+        let (pool_died_tx, pool_died_rx) = if sink.service_id().is_some() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         let shutdown_rx_clone = shutdown_tx.subscribe();
         // Socket options for visitor-facing connections: latency-friendly
         // defaults (nodelay + keepalive)
@@ -1074,10 +1992,11 @@ impl ControlChannelHandle {
         // nothing serving it and the next registration of that service is
         // rejected with "Port N is already in use".
         let ch = ControlChannel {
-            conn,
+            sink,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            pool_died_rx,
         };
         let control_task = tokio::spawn(
             async move {
@@ -1109,6 +2028,7 @@ impl ControlChannelHandle {
                         .with_context(|| "Failed to run TCP connection pool")
                         {
                             error!("{:#}", e);
+                            report_pool_death(pool_died_tx.as_ref());
                         }
                     }
                     .instrument(Span::current()),
@@ -1133,6 +2053,7 @@ impl ControlChannelHandle {
                         .with_context(|| "Failed to run UDP connection pool")
                         {
                             error!("{:#}", e);
+                            report_pool_death(pool_died_tx.as_ref());
                         }
                     }
                     .instrument(Span::current()),
@@ -1148,26 +2069,58 @@ impl ControlChannelHandle {
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
+/// Report that a service's pool task could not serve its listener any more.
+///
+/// Only the *abnormal* end is reported: a pool that returns `Ok` ended
+/// orderly (shutdown, or the control channel gone), and must never tell the
+/// client its service was dropped. A no-op in v3, where the pool's end already
+/// stops that service's control channel.
+fn report_pool_death(tx: Option<&mpsc::UnboundedSender<()>>) {
+    if let Some(tx) = tx {
+        let _ = tx.send(());
+    }
+}
+
+/// Wait for a service's pool task to report that it died. Never resolves when
+/// the service has no reporter (v3) or while its pool is healthy.
+async fn recv_pool_death(rx: &mut Option<mpsc::UnboundedReceiver<()>>) -> Option<()> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One service's control path.
+///
+/// v3: the service owns the connection, so this task writes its commands
+/// directly and runs the per-service heartbeat. v4: the session owns the
+/// connection, so this task only translates the pool's requests into
+/// service-tagged commands for the session's writer.
 struct ControlChannel {
-    conn: ServerStream,                            // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    sink: ControlSink,                                 // Where the commands go
+    shutdown_rx: broadcast::Receiver<bool>,            // Receives the shutdown signal
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>,     // Receives visitor connections
+    heartbeat_interval: u64, // Application-layer heartbeat interval in secs
+    pool_died_rx: Option<mpsc::UnboundedReceiver<()>>, // v4: the pool's death notice
 }
 
 impl ControlChannel {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        write_and_flush(&mut self.conn, data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
-        let create_ch_cmd = postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)?;
+        let create_ch_cmd = match self.sink.service_id() {
+            Some(service_id) => {
+                postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(service_id))?
+            }
+            None => postcard::to_stdvec(&ControlChannelCmd::CreateDataChannel)?,
+        };
         let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
+        let dropped_cmd = match self.sink.service_id() {
+            Some(service_id) => Some(postcard::to_stdvec(&ControlChannelCmd::ServiceDropped(
+                service_id,
+            ))?),
+            None => None,
+        };
 
         // Wait for data channel requests and the shutdown signal
         loop {
@@ -1175,7 +2128,7 @@ impl ControlChannel {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
                         Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
+                            if let Err(e) = self.sink.send(&create_ch_cmd).await {
                                 // The client is gone: one session's end. Its
                                 // own log says why.
                                 debug!("{:#}", e);
@@ -1187,8 +2140,22 @@ impl ControlChannel {
                         }
                     }
                 },
+                // v4 only: the pool task ended abnormally — its listener could
+                // not be served any more — so the client is told the service is
+                // no longer exposed. The session stays up for its siblings.
+                Some(()) = recv_pool_death(&mut self.pool_died_rx) => {
+                    match dropped_cmd.as_deref() {
+                        Some(cmd) => {
+                            if let Err(e) = self.sink.send(cmd).await {
+                                debug!("{:#}", e);
+                            }
+                        }
+                        None => break,
+                    }
+                    break;
+                }
                 () = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
+                            if let Err(e) = self.sink.send(&heartbeat).await {
                                 debug!("{:#}", e);
                                 break;
                             }
@@ -1255,9 +2222,12 @@ where
                     if let Some(d) = backoff.next() {
                         time::sleep(d).await;
                     } else {
-                        // This branch will never be reached for current backoff policy
+                        // This branch will never be reached for current backoff
+                        // policy. It is an abnormal end all the same: the
+                        // listener could not be served any more, which the
+                        // caller reports as a failed pool task.
                         error!("Too many retries. Aborting...");
-                        break;
+                        bail!("Too many retries. Aborting...");
                     }
                 }
                 Ok((mut incoming, addr)) => {
@@ -1433,6 +2403,87 @@ struct UdpRoute {
     last_seen: Instant,
 }
 
+/// The affinity state one UDP pool reports to the `MOLEHILL_UDP_STATS` line.
+///
+/// `affinity` is the table's live size and `evictions` its cumulative expiry
+/// count: the two numbers that say whether the TTL is doing its job (a table
+/// that only grows means address churn is winning; one that never evicts means
+/// the TTL is long enough not to matter).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UdpPoolStats {
+    /// The service's public endpoint, the line's identity.
+    pub(crate) bind_addr: String,
+    /// Live affinity entries.
+    pub(crate) affinity: usize,
+    /// Entries expired by the TTL sweep since the pool started.
+    pub(crate) evictions: u64,
+    /// Live data-channel workers.
+    pub(crate) workers: usize,
+    /// Per-worker `(worker id, peers pinned to it)`, ascending by id.
+    pub(crate) pinned: Vec<(usize, usize)>,
+    /// The visitor-datagram drops this pool counted.
+    pub(crate) drops_queue_full: u64,
+    pub(crate) drops_no_worker: u64,
+}
+
+/// The live state of one UDP pool, shared with the stats task.
+struct UdpPoolShared {
+    /// The pool's worker table and affinity table, for the snapshot.
+    workers: Arc<UdpWorkerMap>,
+    routes: Arc<UdpRouteMap>,
+    /// Cumulative TTL evictions.
+    evictions: AtomicU64,
+    bind_addr: String,
+}
+
+impl UdpPoolShared {
+    /// A consistent view of the pool, for the periodic line and for tests.
+    fn snapshot(&self) -> UdpPoolStats {
+        let workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        let routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
+        // A peer is *pinned* to the worker its affinity entry points at: this
+        // is the server's own count (D30), and it is what says a data channel
+        // is still serving a live UDP session.
+        let mut pinned: HashMap<usize, usize> = HashMap::new();
+        for route in routes.values() {
+            *pinned.entry(route.worker).or_insert(0) += 1;
+        }
+        let mut pinned: Vec<(usize, usize)> = pinned.into_iter().collect();
+        pinned.sort_unstable();
+        UdpPoolStats {
+            bind_addr: self.bind_addr.clone(),
+            affinity: routes.len(),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            workers: workers.len(),
+            pinned,
+            drops_queue_full: UDP_DROPS_QUEUE_FULL.load(Ordering::Relaxed),
+            drops_no_worker: UDP_DROPS_NO_WORKER.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Every live UDP pool of this process, for the `MOLEHILL_UDP_STATS` line.
+///
+/// `Once`-guarded and weak: the reporter reports each pool exactly while it
+/// lives, instead of one line per pool *creation* per process.
+static UDP_POOLS: std::sync::OnceLock<std::sync::Mutex<Vec<std::sync::Weak<UdpPoolShared>>>> =
+    std::sync::OnceLock::new();
+
+fn udp_pools() -> &'static std::sync::Mutex<Vec<std::sync::Weak<UdpPoolShared>>> {
+    UDP_POOLS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register one UDP pool with the telemetry, when `MOLEHILL_UDP_STATS` is on.
+fn register_udp_pool(shared: &Arc<UdpPoolShared>) {
+    if std::env::var_os("MOLEHILL_UDP_STATS").is_none() {
+        return;
+    }
+    udp_pools()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Arc::downgrade(shared));
+}
+
 /// Cleans up after a UDP worker task exits: removes its queue from the
 /// routing table and asks the control channel for a replacement data channel
 /// so the pool keeps its size. Runs on normal exits and on panics (the guard
@@ -1462,6 +2513,51 @@ impl Drop for UdpWorkerGuard {
             let _ = self.req_tx.send(true);
         }
     }
+}
+
+/// Start one data-channel worker and register its queue.
+///
+/// The worker set is exactly what the client opened for the service's
+/// configured count (D31): this is the *only* place a worker is added, and it
+/// is reached only for a data channel the client actually sent. A new visitor
+/// source never creates one; `route_udp_datagram` drops its datagram instead.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pool's own state, passed one piece per argument so the helper stays a plain function"
+)]
+fn spawn_udp_worker<C>(
+    l: &Arc<UdpSocket>,
+    conn: C,
+    workers: &Arc<UdpWorkerMap>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    shutting_down: &Arc<AtomicBool>,
+    next_worker: &mut usize,
+    buffer_size: usize,
+    shutdown_rx: &broadcast::Receiver<bool>,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+    let id = *next_worker;
+    *next_worker += 1;
+    workers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(id, tx);
+    let guard = UdpWorkerGuard {
+        id,
+        workers: Arc::clone(workers),
+        req_tx: data_ch_req_tx.clone(),
+        shutting_down: Arc::clone(shutting_down),
+    };
+    tokio::spawn(udp_forward_worker(
+        Arc::clone(l),
+        conn,
+        rx,
+        shutdown_rx.resubscribe(),
+        buffer_size,
+        guard,
+    ));
 }
 
 /// Accept visitors on the pre-bound UDP socket and route every peer's
@@ -1496,6 +2592,15 @@ where
     // The affinity table: peer address -> assigned data channel.
     let routes: Arc<UdpRouteMap> = Arc::new(Mutex::new(HashMap::new()));
     let shutting_down = Arc::new(AtomicBool::new(false));
+    // The worker ids and the round-robin cursor. Shared with the telemetry so
+    // the periodic line reports live state instead of a spawn-time snapshot.
+    let shared = Arc::new(UdpPoolShared {
+        workers: Arc::clone(&workers),
+        routes: Arc::clone(&routes),
+        evictions: AtomicU64::new(0),
+        bind_addr: l.local_addr()?.to_string(),
+    });
+    register_udp_pool(&shared);
     let mut next_worker = 0usize;
     // One socket reader: `recv_from` is the single entry point for all
     // visitors, and the affinity table below decides the channel. A single
@@ -1527,27 +2632,16 @@ where
                     debug!("Failed to init UDP channel: {:#}", e);
                     continue;
                 }
-                let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
-                let id = next_worker;
-                next_worker += 1;
-                workers
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(id, tx);
-                let guard = UdpWorkerGuard {
-                    id,
-                    workers: Arc::clone(&workers),
-                    req_tx: data_ch_req_tx.clone(),
-                    shutting_down: Arc::clone(&shutting_down),
-                };
-                tokio::spawn(udp_forward_worker(
-                    Arc::clone(&l),
+                spawn_udp_worker(
+                    &l,
                     conn,
-                    rx,
-                    shutdown_rx.resubscribe(),
+                    &workers,
+                    &data_ch_req_tx,
+                    &shutting_down,
+                    &mut next_worker,
                     buffer_size,
-                    guard,
-                ));
+                    &shutdown_rx,
+                );
             }
             recv = l.recv_from(&mut buf) => match recv {
                 Ok((n, from)) => {
@@ -1574,6 +2668,8 @@ where
                     debug!("Transient UDP recv error: {e}");
                 }
                 Err(e) => {
+                    // The listener is gone for good: an abnormal end, reported
+                    // by the failed pool task (see `ControlChannelHandle::new`).
                     shutting_down.store(true, Ordering::Relaxed);
                     return Err(e).with_context(|| "UDP service socket failed");
                 }
@@ -1584,12 +2680,16 @@ where
                 // peer onto another channel; the client-side hub keeps the
                 // peer's local outbound socket, so its source port is
                 // unaffected.
-                routes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .retain(|_, route| {
-                        route.last_seen.elapsed() < Duration::from_secs(UDP_ROUTE_TTL_SECS)
-                    });
+                let mut routes = routes.lock().unwrap_or_else(PoisonError::into_inner);
+                let before = routes.len();
+                routes.retain(|_, route| {
+                    route.last_seen.elapsed() < Duration::from_secs(UDP_ROUTE_TTL_SECS)
+                });
+                let evicted = before - routes.len();
+                drop(routes);
+                if evicted > 0 {
+                    shared.evictions.fetch_add(evicted as u64, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -1624,6 +2724,7 @@ static UDP_DROPS_NO_WORKER: AtomicU64 = AtomicU64::new(0);
 static UDP_STATS_SPAWNED: std::sync::Once = std::sync::Once::new();
 
 /// The two drop counters, for the periodic line and for tests.
+#[cfg(test)]
 pub(crate) fn udp_drop_stats() -> (u64, u64) {
     (
         UDP_DROPS_QUEUE_FULL.load(Ordering::Relaxed),
@@ -1631,10 +2732,16 @@ pub(crate) fn udp_drop_stats() -> (u64, u64) {
     )
 }
 
-/// Spawn the periodic drop line, once per process, when
+/// Spawn the periodic UDP line, once per process, when
 /// `MOLEHILL_UDP_STATS` is set. Cumulative counters, like the KCP ones: a
 /// reader that knows the window (or takes the first and last line of a run)
 /// gets a drop *rate*, which is the number a queue-depth decision needs.
+///
+/// One line per **live pool** per second, with the pool's identity, its
+/// affinity table (live entries and cumulative TTL evictions), its worker
+/// count, and each worker's pinned peers (D30). The per-worker pinned counts
+/// belong to this line rather than to a new one: they *are* the affinity
+/// table, cut by the channel each peer is pinned to.
 ///
 /// Deliberately independent of the KCP stats task: the default carrier is
 /// TCP, so a run can exercise the UDP path without any KCP session existing.
@@ -1648,11 +2755,29 @@ fn spawn_udp_stats() {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let (queue_full, no_worker) = udp_drop_stats();
-                info!(
-                    queue_full,
-                    no_worker, "udp-stats: cumulative visitor-datagram drops"
-                );
+                let pools: Vec<Arc<UdpPoolShared>> = {
+                    let mut guard = udp_pools().lock().unwrap_or_else(PoisonError::into_inner);
+                    guard.retain(|w| w.strong_count() > 0);
+                    guard.iter().filter_map(std::sync::Weak::upgrade).collect()
+                };
+                for pool in pools {
+                    let s = pool.snapshot();
+                    let pinned: Vec<String> = s
+                        .pinned
+                        .iter()
+                        .map(|(worker, peers)| format!("{worker}:{peers}"))
+                        .collect();
+                    info!(
+                        bind_addr = %s.bind_addr,
+                        affinity = s.affinity,
+                        evictions = s.evictions,
+                        workers = s.workers,
+                        pinned = %if pinned.is_empty() { "-".to_owned() } else { pinned.join(",") },
+                        queue_full = s.drops_queue_full,
+                        no_worker = s.drops_no_worker,
+                        "udp-stats: affinity table and per-worker pinned peers"
+                    );
+                }
             }
         });
     });
@@ -1833,6 +2958,36 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// The operator's valve, at the level the tunnel path reads it: a cap of
+    /// `N` admits N live tunnels and refuses the next, and a refused tunnel
+    /// leaves the count alone. `0` is unlimited.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn a_tunnel_slot_is_reserved_under_the_cap_and_released_on_drop() {
+        let count = TunnelCount::default();
+        assert_eq!(count.0.load(Ordering::Acquire), 0);
+
+        let first = count.try_reserve(2).unwrap();
+        let second = count.try_reserve(2).unwrap();
+        assert_eq!(
+            count.try_reserve(2).err(),
+            Some(2),
+            "a cap of 2 must refuse the third tunnel, reporting what is held"
+        );
+        drop(first);
+        let third = count.try_reserve(2).unwrap();
+        assert_eq!(count.0.load(Ordering::Acquire), 2);
+        drop((second, third));
+        assert_eq!(count.0.load(Ordering::Acquire), 0);
+
+        // 0 means "no valve": every reservation is admitted.
+        let unlimited = TunnelCount::default();
+        let slots: Vec<TunnelGuard> = (0..8).map(|_| unlimited.try_reserve(0).unwrap()).collect();
+        assert_eq!(unlimited.0.load(Ordering::Acquire), 8);
+        drop(slots);
+        assert_eq!(unlimited.0.load(Ordering::Acquire), 0);
+    }
+
     type UdpWorkerRxs = Vec<mpsc::Receiver<(SocketAddr, Bytes)>>;
 
     /// A routing table with `n` live workers; returns the maps and the
@@ -1882,6 +3037,135 @@ mod tests {
         let table = routes.lock().unwrap();
         assert_eq!(table.len(), 1);
         assert!(table.contains_key(&peer(1000)));
+    }
+
+    /// Build a session holding one service per id, and the queue receivers
+    /// those services would be served from.
+    #[cfg(feature = "multiplex")]
+    fn session_with_services(
+        nonce: Nonce,
+        ids: &[u32],
+    ) -> (
+        RwLock<SessionMap>,
+        Vec<mpsc::Receiver<DataChannel>>,
+        Vec<mpsc::Sender<DataChannel>>,
+    ) {
+        let mut services = HashMap::new();
+        let mut receivers = Vec::new();
+        let mut senders = Vec::new();
+        for id in ids {
+            let (data_ch_tx, data_ch_rx) = mpsc::channel(4);
+            let (request_tx, _request_rx) = mpsc::unbounded_channel();
+            let (shutdown_tx, _) = broadcast::channel(1);
+            services.insert(
+                ServiceId::new(*id),
+                ControlChannelHandle {
+                    shutdown: shutdown_tx,
+                    data_channel: data_ch_tx.clone(),
+                    data_ch_req: request_tx,
+                },
+            );
+            receivers.push(data_ch_rx);
+            senders.push(data_ch_tx);
+        }
+        let (write_tx, _write_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let mut map = SessionMap::new();
+        map.insert(nonce, {
+            let mut session = SessionHandle::new(write_tx, shutdown_tx);
+            session.services = services;
+            session
+        });
+        (RwLock::new(map), receivers, senders)
+    }
+
+    /// Write a stream's 4-byte service prologue.
+    #[cfg(feature = "multiplex")]
+    async fn write_prologue(tx: &mut tokio::io::DuplexStream, id: u32) {
+        tx.write_all(&id.to_be_bytes()).await.unwrap();
+        tx.flush().await.unwrap();
+    }
+
+    /// A loopback TCP stream wrapped the way a data channel can carry one, so
+    /// a routed queue can be shown to deliver.
+    #[cfg(feature = "multiplex")]
+    async fn probe_data_channel() -> DataChannel {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (client, _) = tokio::join!(TcpStream::connect(addr), l.accept());
+        DataChannel::Raw(ServerStream::Plain(client.unwrap()))
+    }
+
+    /// A v4 tunnel's streams are routed by their 4-byte prologue: to the queue
+    /// of the service they name, or nowhere at all. A violation drops that one
+    /// stream — the session and its services stay untouched, which is what the
+    /// assertions on the session map at the end pin down.
+    #[cfg(feature = "multiplex")]
+    #[expect(
+        clippy::expect_used,
+        reason = "the test asserts on a routing decision it just made"
+    )]
+    #[tokio::test]
+    async fn tunnel_streams_route_by_their_prologue() {
+        let nonce = [7u8; HASH_WIDTH_IN_BYTES];
+        let (sessions, mut queues, senders) = session_with_services(nonce, &[1, 2]);
+        let queue_a = senders[0].clone();
+        let queue_b = senders[1].clone();
+
+        // A registered service's stream lands on *that* service's queue.
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        write_prologue(&mut tx, 1).await;
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+            .await
+            .expect("a registered service must route");
+        assert!(routed.same_channel(&queue_a));
+        assert!(!routed.same_channel(&queue_b));
+
+        // An unregistered id is dropped.
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        write_prologue(&mut tx, 9).await;
+        assert!(
+            route_tunnel_stream(&mut rx, &sessions, &nonce)
+                .await
+                .is_none()
+        );
+
+        // A stream that ends before naming a service is dropped too.
+        let (tx, mut rx) = tokio::io::duplex(64);
+        drop(tx);
+        assert!(
+            route_tunnel_stream(&mut rx, &sessions, &nonce)
+                .await
+                .is_none()
+        );
+
+        // A *sibling* service is routable on the same session, which is what a
+        // shared pool (`[client.data].shared_pool`) needs: one tunnel carries
+        // streams of several services, each routed by its own prologue.
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        write_prologue(&mut tx, 2).await;
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+            .await
+            .expect("the sibling service must route too");
+        assert!(routed.same_channel(&queue_b));
+        assert!(!routed.same_channel(&queue_a));
+
+        // A stream that routed lands in *that* service's pool queue and in no
+        // other, which is what the pool pairing later consumes.
+        routed.send(probe_data_channel().await).await.unwrap();
+        assert!(queues[1].try_recv().is_ok());
+        assert!(
+            queues[0].try_recv().is_err(),
+            "the stream must not reach another service's queue"
+        );
+
+        // Nothing above ended a session or released a service.
+        let guard = sessions.read().await;
+        let session = guard.get(&nonce).expect("the session is still registered");
+        assert_eq!(session.services.len(), 2);
+        drop(guard);
+        assert!(!queues[0].is_closed(), "service 1 is still served");
+        assert!(!queues[1].is_closed(), "service 2 is still served");
     }
 
     /// Routing reports *what it did*; the caller counts it. Asserting the

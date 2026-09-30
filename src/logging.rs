@@ -100,6 +100,16 @@ impl RepeatNotice {
     }
 }
 
+/// Whether an opt-in instrumentation switch is on.
+///
+/// Set **and non-empty** is on: an operator who clears the variable while its
+/// children inherit it must get silence, not a flood of lines — `var_os(..)
+/// .is_some()` would read an empty value as "enabled".
+#[must_use]
+pub fn env_switch(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
 /// Install the global default subscriber.
 ///
 /// `RUST_LOG` wins when set; otherwise `default_level` applies. The `console`

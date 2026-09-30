@@ -1,0 +1,9 @@
+[server]
+default_token = "session_test_default_token" # security-scan:allow dummy fixture token; the v4 session test mirrors it and asserts the wrong-token paths
+allow_ports = ["2361-2363"]
+
+[server.control]
+bind_addr = "127.0.0.1:2360"
+# Declared to the client in `Ack::SessionOk`; the session test asserts the
+# declared cadence is what the server actually sends.
+heartbeat_interval = 5

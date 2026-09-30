@@ -1,0 +1,18 @@
+# expect: `[client.data.tcp].max_tunnels` must be at least 1
+
+# The cap is what the elastic pool may grow to, so `0` would mean "a pool
+# that may never hold a tunnel". It is refused with the carrier's name
+# rather than clamped, so a typo is visible.
+
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.data.tcp]
+max_tunnels = 0
+
+[client.services.test]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"

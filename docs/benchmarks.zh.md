@@ -101,7 +101,60 @@ MTU 是**接口**属性而非 qdisc:使用这两档的阶段会改变该阶段�
 | `rrul` | 饱和状态下,路径随时间变化时,新访客的延迟会怎样?(README 里的那张图) |
 | `soak` | 在轮换路径上长时间运行:有没有东西泄漏、漂移或退化? |
 | `cost` | 在固定工作点上,每承载 1 Gbit/s 要花多少 CPU 秒? |
-| `screen` | 针对一次开发改动:两个构建之间的差异是 claim 还是噪声? |
+| `screen` | 针对一次开发改动:两个构建之间——或同一个构建的两种配置之间——的差异是 claim 还是噪声? |
+
+### 隔离单一变量的两种方式
+
+阶段日程是把一个工具与它的对端相比。下面两种交错模式则是把某个东西与它自己相
+比,而这正是开发决策通常需要的:两条臂都跑在同一轮的每一个负载步里,因此看到
+的是同一份机器状态;靠先后两次运行来做前后对比会被 epoch 漂移打败,本仓库从
+不用它来决定任何事情。
+
+- **`--ab BIN_A,BIN_B`**(配合 `screen`)在每个负载步交换两个*构建*。
+- **`--ab-variants VAR_A,VAR_B`**(配合 `screen`)以同样的方式交换*同一个二进制
+  的两种配置*:一个构建、两份配置。某个配置决策——例如 `direct` 与共享池——
+  就是这样被测出来的,不会让构建这一维混进来。这一维记录在结果文件里
+  (`meta.builds.axis`),判定工具也会把它打印出来,因此读者不会把一对配置误读
+  成一对构建。
+
+两者在不适用的地方都会被拒绝而不是被默默忽略:`variant` 这一对只对 `screen` 有
+意义(其余测试类型全程只跑一种配置),而把 variant 名字写错会被拒绝,而不是拿
+一种配置去和它自己比较。
+
+### 慢访客(`SOAK_SLOW_VISITOR_BPS`)
+
+默认关闭。设置之后,每个阶段还会运行一个慢访客:一条连到工具 echo 服务的连接,
+按给定速率把响应读回来,于是整个阶段里回程都处于背压状态。它存在的目的是让队头
+阻塞变得可测——一个慢访客的流是否拖慢了与它共享同一个池的那条交互流——而它旁边
+要读的数字是**该阶段的交互 p99,绝不是访客自己的速率**:被限速的读取者只会报告
+你给它的那个旋钮值,所以它的序列是失速探测器(低于旋钮值的阶段才是发现),不是
+容量数字。
+
+被注入的访客是工作负载的一部分,因此带它的那一轮记录的是**不同的方法版本**
+(`meta.workload_version`:不带为 1,带为 2)。门禁因此拒绝把带探针的一轮与不带
+探针的一轮相比较,也拒绝比较两个速率不同的探针轮次。与其它探针一样,它跑在自己
+的进程里——harness 绝不进入它正在测量的路径——它的结果按阶段记录
+(`completed` / `failed` / `killed` 加类型化原因),并且从不让整轮失败。`reconnect`
+拒绝它:那个测试量的是冷启动,不是工作负载。
+
+### 仪器开关
+
+有三个环境变量用于打开按需、聚合的诊断;它们默认关闭,从不改变转发路径,而
+runner 会把某一轮继承到的开关记进结果 meta(`instrumentation`),因此带仪器的
+一轮不会被误认为干净的一轮。
+
+| 开关 | 输出 | 内容 |
+|---|---|---|
+| `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 INFO | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 INFO | pool 的 key、carrier、size、上限、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+load:1->2`、`-idle:2->1`) |
+| `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 INFO | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
+
+pool 与 placement 两行就是共享弹性 pool 的 S1 观测(它做什么,以及为什么这些
+数字是聚合而不是逐个事件:[internals.md](internals.md#the-tunnel-pool))。这里每
+个开关都和同一族里其它开关一样是 INFO:打开开关本身就是许可,而需要把
+`RUST_LOG` 提上去才看得见的行,永远不会落进结果文件。服务端的 UDP 行
+(`MOLEHILL_UDP_STATS=1`)是第四个开关,携带 affinity 表大小、淘汰次数与每个
+worker 的 pinned peer 数。
 
 ## 每个配置选择的代价(逐项实测)
 
@@ -115,15 +168,6 @@ MTU 是**接口**属性而非 qdisc:使用这两档的阶段会改变该阶段�
 | `mode` | `"multiplex"`(默认) | 回环 1 流 10.0 Gbit/s,`direct` 为 19.2;8 流分别 19.5 vs 23.3;multiplex 吸收每连接的建连成本(churn ~4.8k 连接/s)并节省 FD / 端口 / NAT 映射 |
 | `mode` | `"direct"` | 原始单流吞吐;每条流一条物理隧道(FD / 端口 / NAT 成本随流数增长) |
 | `count` | `1` | 所有流量共用一条隧道:没有聚合,所有流共享同一个重传域(回环 8 流聚合 9.2 Gbit/s,count = 4 时为 19.5;loss5 队头阻塞最大 2.5 s,count = 4 时为 1.6 s) |
-| 测试类型 | 回答什么问题 |
-|---|---|
-| `rrul` | 完整阶段日程上的混合负载(发布运行) |
-| `soak` | 同样的负载、更长时间,用来看漂移 |
-| `cost` | 单一阶段、单一档:某个配置选择的代价 |
-| `capacity` | 上限探针:多少条流之后不再扩展 |
-| `screen` | 同一档上两个构建的交错 A/B |
-| `reconnect` | 冷启动:客户端启动 → 每个已注册服务可应答,每个构建五次(给 `--ab` 时交错) |
-
 | `count` | `4`(默认) | 聚合越过单流(loss1 8 流 12.3 vs 4.5 Gbit/s)并隔离队头阻塞(rtt10 最大间隔 80.6,count = 1 时为 100.1 ms);yamux 上限 `count × 64` 条并发连接 |
 | `count` | `8+` | ~512 条并发连接(8 条隧道 × 每条 64 条 yamux 流);每服务 8 条物理隧道(NAT 映射 ×8) |
 | `carrier` | `"tcp"`(默认) | 在每一处未被标记的测量里都领先于 KCP 载体(noise 传输下回环 1 流 5.8,kcp4 arm 为 3.7 Gbit/s),内存开销也低得多(RSS 26 vs 85 MiB)。回环 8 流那一格(14.9 vs 1.1 Gbit/s)在这里排除:它在两个构建上跨重复都是双模的,因此不能作为任何结论的依据 |
@@ -146,6 +190,12 @@ MTU 是**接口**属性而非 qdisc:使用这两档的阶段会改变该阶段�
   史数字留在各自版本的发布说明里。
 - **方差是如实陈述的,不是抹平的。** 如果某个差异落在被比较各轮运行的离散范围
   之内,就按 directional 上报,不从中得出任何 claim。
+- **tunnel pool 是弹性的,所以 pool 的尺寸是*结果*,不是设置。** 带共享弹性
+  pool 的构建(`[client.data].shared_pool`、`[client.data].idle_timeout`、
+  `[client.data.tcp|kcp].max_tunnels`)从配置的 `count` 起步,之后自行增长与收
+  缩;下面逐项实测里的 `count` 数字是在固定尺寸模型下测的,描述的是*钉住*某个
+  pool 尺寸的代价。它们是选择初始尺寸的依据,不是对某一轮 pool 实际行为的预
+  测——某一轮真实用到的尺寸由 `MOLEHILL_POOL_STATS` 时间线记录。
 
 ## 自己复现
 
@@ -158,20 +208,23 @@ just soak-plot     # 渲染图表并打印 markdown 表格
 just soak-check    # 判定:完整性、端点、SLO、漂移
 ```
 
-`just soak --help` 会列出测试类型、各 variant(`mux`、`noise`、`mux1`、
-`kcp4`、`mux-off`)、阶段日程与批处理控制;负载、SLO 与采样率这些旋钮都是环境
-变量(`SOAK_*`),每一个都会被回显进结果 meta。
+`just soak --help` 会列出测试类型、各 variant(`mux`、`direct`、`noise`、
+`mux1`、`kcp4`、`noise-direct`,以及 `direct` 的历史拼写 `mux-off`)、阶段日程与
+批处理控制;负载、SLO 与采样率这些旋钮都是环境变量(`SOAK_*`),每一个都会被回
+显进结果 meta。
 
-要在不做完整一轮的前提下比较**你自己的两个构建**:
+要在不做完整一轮的前提下比较**你自己的两个构建**——或一个构建的两种配置:
 
 ```bash
 just soak --test=screen --path=loss1 --streams-max=8 \
      --ab /path/to/bin-a,/path/to/bin-b --out results-screen.json
+just soak --test=screen --path=clean --ab-variants mux,direct \
+     --out results-screen-variants.json
 just soak-check --screen results-screen.json
 ```
 
-两个构建在同一轮里逐步交替,因此看到的是同一份机器状态;只有当每一步的符号一
-致且超过阈值时,判定才声称存在差异,其余一律称为 directional。
+只有当每一步的符号一致且超过阈值时,判定才声称存在差异,其余一律称为
+directional。
 
 发布门禁——一个公开的数字在被某个 tag 带上之前必须满足什么——见
 [release.md](release.md)。

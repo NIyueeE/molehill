@@ -17,32 +17,19 @@ pub const DEFAULT_UDP_BUFFER_SIZE: usize = 2048;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const TCP_COPY_BUFFER_SIZE: usize = 32 * 1024;
 
-/// Default number of pre-established data channels per TCP service.
-pub const DEFAULT_TCP_POOL_SIZE: u16 = 8;
-/// Default number of pre-established data channels per UDP service.
-pub const DEFAULT_UDP_POOL_SIZE: u16 = 2;
+/// Default number of data channels a UDP service's worker set uses
+/// (`[client.services.<name>].udp_workers`).
+///
+/// A UDP service's channels are its *workers*: the server shards distinct
+/// visitors across them (session affinity) and the pool keeps at least as many
+/// tunnels as the workers need, so this is the one per-service channel count
+/// that survives. A TCP service has no worker set — one data channel is opened
+/// per visitor, on demand.
+pub const DEFAULT_UDP_WORKERS: u16 = 2;
 
 /// Queue size for visitor-bound UDP datagrams per data channel, on both the
 /// server (affinity routing queue) and the client (channel writer queue).
 pub const DEFAULT_UDP_SENDQ_SIZE: usize = 1024;
-
-/// Default number of parallel multiplex tunnels per control session.
-///
-/// 4 is the measured sweet spot of the transport comparison: it aggregates
-/// throughput beyond a single TCP flow (loopback 8-stream 4.3 -> 12 Gbps,
-/// 1% loss 3.7 -> 7.1 Gbps in the bench matrix) and cuts head-of-line
-/// latency (`rtt10` `HoL` max 101 -> 81 ms) while keeping connection overhead
-/// modest. Each tunnel is a full physical connection (TCP handshake +
-/// transport crypto + yamux session); `[client.data].default_count = 1` reproduces
-/// the single-tunnel behavior.
-#[cfg(feature = "multiplex")]
-pub const DEFAULT_MUX_TUNNELS: usize = 4;
-
-/// Upper bound for `[client.data].default_count`; larger values are clamped. Each
-/// tunnel is a full physical connection (TCP handshake + transport crypto +
-/// yamux session), so the sane range is small by construction.
-#[cfg(feature = "multiplex")]
-pub const MAX_MUX_TUNNELS: usize = 64;
 
 /// Default total yamux receive window (bytes) advertised per tunnel, on both
 /// ends.
@@ -75,6 +62,23 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 64 * 1024 * 1024;
 /// "Phase 4: L2 landed".
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
+
+/// Upper bound for `[client.data.tcp|kcp].max_tunnels`.
+///
+/// `max_tunnels` is the cap the elastic pool may grow to, so it is validated
+/// (`>= 1`) and clamped, never silently obeyed with an absurd value.
+#[cfg(feature = "multiplex")]
+pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
+
+/// Default cap for `[client.data.tcp|kcp].max_tunnels`.
+#[cfg(feature = "multiplex")]
+pub const DEFAULT_MAX_TUNNELS: u16 = 4;
+
+/// Default `[client.data].idle_timeout` (seconds): how long a client tunnel
+/// pool with no streams, no pending opens and no pinned UDP peers must stay
+/// that way before the elastic pool removes one tunnel.
+#[cfg(feature = "multiplex")]
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Default idle timeout (seconds) after which an inactive UDP peer mapping is
 /// cleaned up on the client side.

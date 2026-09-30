@@ -51,4 +51,12 @@ where
         self.map2.remove(&k2);
         Some(v)
     }
+
+    /// Drop every entry. A server shutdown uses it to stop the live control
+    /// channels: dropping a handle ends its service, which releases the
+    /// public port it held.
+    pub fn clear(&mut self) {
+        self.map1.clear();
+        self.map2.clear();
+    }
 }

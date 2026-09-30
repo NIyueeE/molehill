@@ -1,0 +1,40 @@
+# The UDP side of the shared elastic pool: one UDP service whose affinity peer
+# must survive the pool's grow/shrink cycle with its source port intact.
+#
+# The numbers are chosen so the cycle is observable: the pool starts cold and
+# grows for the service's channels — `udp_workers = 2` is the UDP-derived
+# floor, and `max_tunnels = 3` leaves room above it — then holds that floor
+# once a tunnel is idle, where the tunnel the visitor's peer is pinned to must
+# survive (D30).
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+
+[client.control]
+default_remote_addr = "127.0.0.1:2385"
+
+[client.transport]
+type = "plain"
+
+[client.data]
+default_mode = "multiplex"
+default_carrier = "tcp"
+shared_pool = true
+idle_timeout = 2
+
+[client.data.tcp]
+max_tunnels = 3
+
+[client.services.game]
+protocol = "udp"
+local_addr = "127.0.0.1:8083"
+remote_bind_addr = "127.0.0.1:2386"
+udp_workers = 2
+udp_idle_timeout = 60
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+allow_ports = ["2386"]
+
+[server.control]
+bind_addr = "127.0.0.1:2385"

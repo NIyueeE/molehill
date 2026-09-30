@@ -422,11 +422,12 @@ Details that agents need constantly:
   default set, see HANDOFF.md); `embedded` (minimal). Clippy runs twice in
   the pre-commit gate: the second pass covers the minimal no-default-features
   `server,client` build that the default-feature pass never compiles.
-- **Protocol**: v3 — client registers services dynamically after auth
-  (`RegisterService`, carrying the data-plane carrier), server enforces
-  `allow_ports`; every connection starts with a one-byte transport selector
-  (0x00 plain / 0x01 noise); protocol mismatch is a hard error. See
-  docs/internals.md.
+- **Protocol**: v4 — one control session per endpoint (the session authenticates
+  once, then carries every service that dials it, each registering dynamically
+  with its own credential and data-plane carrier; the server enforces
+  `allow_ports`), with v3 still served for old clients. Every connection starts
+  with a one-byte transport selector (0x00 plain / 0x01 noise); protocol
+  mismatch is a hard error. See docs/internals.md.
 - **Build profiles**: `release` (lto, strip, panic=abort), `minimal`
   (opt-level "z", ~500KiB), `bench`. Container image: static musl binary on
   scratch.

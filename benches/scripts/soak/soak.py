@@ -383,6 +383,17 @@ class Tool:
         self.procs = lib.ArmProcs(self.work, f"{self.name} {self.variant}".strip())
         self.start(binary)
 
+    def use_variant(self, variant: str) -> None:
+        """Point the tool at another configuration variant.
+
+        The screen's variant A/B (`--ab-variants`) changes `self.variant`
+        *before* the restart, because the restart is what rewrites the
+        config from it. Label and variant move together so the two arms'
+        logs and tags cannot land in each other's files.
+        """
+        self.variant = variant
+        self.label = f"{self.name} ({variant})" if variant else self.name
+
     def stop(self) -> None:
         self.procs.kill()
 
@@ -526,8 +537,99 @@ elif mode == "churn":
         except Exception:
             emit("churn_error", 1)
         time.sleep(max(0.0, 1.0 / rate - (time.perf_counter() - t0)))
+elif mode == "slow":
+    # The M7 slow visitor: ONE connection to the tool's echo service, held
+    # open for `interval` seconds and read back at `rate` bit/s. A writer
+    # thread offers the request body; the main thread consumes the echoed
+    # response no faster than the knob allows. Reading slowly IS the
+    # instrument -- the return path's buffer fills, the tool has to stop
+    # draining this one stream, and whether that costs the streams sharing
+    # its pool is what the stage's interactive p99 measures. The probe runs
+    # in its own process for the reason documented above PROBE_SRC: a
+    # throttled reader sharing the harness's GIL would put the instrument
+    # into the path it is measuring.
+    budget = interval
+    rate = float(sys.argv[5])
+    chunk = 4096
+    pace_s = chunk * 8.0 / rate
+    done = threading.Event()
+
+    def offer(sock):
+        payload = b"v" * 65536
+        while not done.is_set():
+            try:
+                sock.sendall(payload)
+            except OSError:
+                return
+
+    total = 0
+    try:
+        # The connect is inside the guard on purpose: a refused or timed-out
+        # connect is this probe's likeliest failure, and it has to leave the
+        # same typed reason as a failed read -- the harness records that line
+        # in the stage instead of a bare null.
+        s = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(max(5.0, pace_s * 4.0))
+        threading.Thread(target=offer, args=(s,), daemon=True).start()
+        t_start = time.perf_counter()
+        while time.perf_counter() - t_start < budget:
+            t_cycle = time.perf_counter()
+            data = s.recv(chunk)
+            if not data:
+                raise ConnectionError("closed by the tool")
+            total += len(data)
+            # One sample per paced read: the denominator is the whole cycle
+            # (read + deliberate delay), so the rate sits at the knob's
+            # unless the path stalled the visitor -- which is the one thing
+            # this series exists to show.
+            time.sleep(max(0.0, pace_s - (time.perf_counter() - t_cycle)))
+            paced_s = time.perf_counter() - t_cycle
+            # kbit/s, not Gbit/s: a throttled visitor is orders of magnitude
+            # below the bulk axis, and Gbit/s with three decimals rounds the
+            # whole reading to 0.0.
+            emit("slow_visitor_read_kbps",
+                 round(len(data) * 8 / max(paced_s, 1e-9) / 1e3, 3))
+            emit("slow_visitor_bytes", total)
+        emit("slow_visitor_done", 1)
+    except Exception as e:
+        sys.stderr.write(f"slow-visitor: {type(e).__name__}: {e}\\n")
+        sys.stderr.flush()
+        emit("slow_visitor_error", 1)
+        sys.exit(1)
+    finally:
+        done.set()
 
 """
+
+
+@dataclass
+class SlowVisitor:
+    """One stage's slow-visitor probe and what the stage must record.
+
+    `t0` bounds the samples that belong to this visitor: the series is
+    shared with the long-lived probes, and a stage's stats are derived from
+    a slice of it.
+    """
+
+    proc: subprocess.Popen
+    reader: threading.Thread
+    log: Path
+    t0: float
+
+
+def _probe_reason(path: Path) -> str:
+    """The probe's own last typed line, for the stage line's failure reason.
+
+    The child writes `slow-visitor: <ExceptionType>: <message>` on the way
+    out. Recording that line is what keeps a failed stage diagnosable
+    instead of a bare null (AGENTS.md §10, "every failure leaves evidence").
+    """
+    with contextlib.suppress(OSError):
+        lines = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+        if lines:
+            return lines[-1].removeprefix("slow-visitor: ")[:200]
+    return ""
 
 
 class Pingers:
@@ -544,6 +646,11 @@ class Pingers:
         self.procs: list = []
         self.readers: list = []
         self.stop = threading.Event()
+        # The M7 slow visitor is restarted per stage, so it is tracked apart
+        # from the three long-lived probes; `slow_error` carries a spawn
+        # failure to the stage line that would otherwise claim it ran.
+        self.slow: SlowVisitor | None = None
+        self.slow_error = ""
 
     def log_path(self, mode: str) -> str:
         return str(Path(self.work) / f"probe-{mode}-{self.band['echo_exposed']}.log")
@@ -555,7 +662,13 @@ class Pingers:
         interval: float,
         backend_port: int = 0,
         rate: float = 0.0,
-    ) -> None:
+    ) -> tuple:
+        """Start one probe process; returns `(proc, reader, log_path)`.
+
+        `interval` is the mode's rate knob (ping interval, or the slow
+        visitor's observation budget in seconds), and `rate` its rate knob
+        (the churn connector's connects/s, or the slow visitor's bit/s).
+        """
         log_path = self.log_path(mode)
         with open(log_path, "w") as errlog:
             proc = subprocess.Popen(
@@ -590,6 +703,7 @@ class Pingers:
         th = threading.Thread(target=reader, daemon=True)
         th.start()
         self.readers.append(th)
+        return proc, th, log_path
 
     def start(self) -> None:
         """Bind the echo backends the TOOL forwards to, then dial the tool.
@@ -616,6 +730,101 @@ class Pingers:
             1.0 / max(1, self.knobs.churn_connects_s),
             backend_port=self.band["echo_backend"],
             rate=float(self.knobs.churn_connects_s),
+        )
+
+    # --- the M7 slow visitor (opt-in; one fresh process per stage/step) -----
+    def start_slow_visitor(self, secs: float) -> None:
+        """Offer one slow-reading visitor for the next `secs` seconds.
+
+        A no-op unless `SOAK_SLOW_VISITOR_BPS` is set. One process per
+        stage, like every other external tool here: a wedged visitor must
+        not become the next stage's sample (AGENTS.md §10), and the stage
+        boundary is where its outcome is recorded. The visitor dials the
+        tool's exposed echo port — the path under test — and its backend is
+        the one the interactive probe already serves, so no new service or
+        backend binary appears in the tool's configuration.
+        """
+        self.finish_slow_visitor(None)
+        if not self.knobs.slow_visitor_bps:
+            return
+        try:
+            proc, th, log_path = self._spawn(
+                "slow",
+                self.band["echo_exposed"],
+                secs,
+                backend_port=self.band["echo_backend"],
+                rate=float(self.knobs.slow_visitor_bps),
+            )
+        except OSError as e:
+            self.slow_error = f"probe failed to start: {type(e).__name__}: {e}"
+            return
+        self.slow = SlowVisitor(
+            proc=proc, reader=th, log=Path(log_path), t0=time.time()
+        )
+        self.slow_error = ""
+
+    def finish_slow_visitor(self, target: dict | None) -> None:
+        """Record the slow visitor's outcome for the stage that just ended.
+
+        `target` is the stage (or screen arm) dictionary the rate, the byte
+        count and the state are written into; `None` on the pre-restart call
+        where the previous visitor is only reaped. Every exit path records a
+        state and a typed reason — a stage that had a visitor and no line
+        about it would be a bare null.
+        """
+        sv, self.slow = self.slow, None
+        if sv is None:
+            if target is not None and self.slow_error:
+                target["slow_visitor_state"] = "failed"
+                target["slow_visitor_reason"] = self.slow_error
+            self.slow_error = ""
+            return
+        killed = False
+        try:
+            code = sv.proc.wait(timeout=lib.SLOW_VISITOR_JOIN_S)
+        except subprocess.TimeoutExpired:
+            killed = True
+            with contextlib.suppress(OSError):
+                sv.proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                sv.proc.wait(timeout=5)
+            code = sv.proc.returncode
+        sv.reader.join(timeout=2)
+        window = [
+            r
+            for r in self.out
+            if r["t"] >= sv.t0 and str(r.get("metric", "")).startswith("slow_visitor_")
+        ]
+        rates = lib.series_stats(window, "slow_visitor_read_kbps")
+        errors = lib.series_stats(window, "slow_visitor_error").get("n", 0)
+        done = lib.series_stats(window, "slow_visitor_done").get("n", 0)
+        last_bytes = [r["v"] for r in window if r["metric"] == "slow_visitor_bytes"]
+        if errors:
+            state = "failed"
+            reason = _probe_reason(sv.log) or "probe reported an error without a line"
+        elif killed:
+            state = "killed"
+            reason = f"still running {lib.SLOW_VISITOR_JOIN_S:.0f}s after the stage"
+        elif code == 0 and done:
+            state, reason = "completed", ""
+        elif code == 0:
+            state, reason = "failed", "exited 0 without a completion sample"
+        else:
+            state = "failed"
+            reason = _probe_reason(sv.log) or f"exited {code} without a typed error"
+        if target is not None:
+            target["slow_visitor_state"] = state
+            target["slow_visitor_read_kbps"] = rates.get("mean")
+            target["slow_visitor_samples"] = rates.get("n", 0)
+            target["slow_visitor_bytes"] = last_bytes[-1] if last_bytes else 0
+            if reason:
+                target["slow_visitor_reason"] = reason
+        log(
+            f"    slow visitor: {state}"
+            + (f" ({reason})" if reason else "")
+            + f", read {rates.get('mean') or 0} kbit/s over "
+            f"{rates.get('n', 0)} sample(s), "
+            f"{last_bytes[-1] if last_bytes else 0} bytes"
         )
 
     def stop_and_join(self) -> None:
@@ -734,7 +943,9 @@ class RunContext:
 
     `backends` and `load` are filled in per test — the backends once they are
     up, the load when the test type picks its operating point — so the stage
-    runners take `(tool, ctx, entry)` and nothing else.
+    runners take `(tool, ctx, entry)` and nothing else. `pingers` follows the
+    same rule: it owns the M7 slow visitor's per-stage lifecycle, and a test
+    type that cannot see it could not restart that visitor per stage.
     """
 
     args: argparse.Namespace
@@ -742,10 +953,15 @@ class RunContext:
     timeline: list
     shaper: "Shaper"
     backends: lib.Backends | None = None
+    pingers: "Pingers | None" = None
     load: int = 0
 
     def with_backends(self, backends: lib.Backends) -> "RunContext":
         self.backends = backends
+        return self
+
+    def with_pingers(self, pingers: "Pingers") -> "RunContext":
+        self.pingers = pingers
         return self
 
     @property
@@ -917,6 +1133,9 @@ def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
     sustainable = 0
     for streams in range(1, ctx.ceiling + 1):
         mark = len(entry["series"])
+        # One visitor per ramp step: the load level is this test's stage, so
+        # the slow visitor's line belongs beside that level's p99.
+        ctx.pingers.start_slow_visitor(knobs.settle_s)
         r = ctx.backends.iperf_burst(
             target, streams, knobs.settle_s, tag=f"{tool.label} cap"
         )
@@ -935,18 +1154,18 @@ def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
                 f"interactive error rate {err_rate:.3f} > {knobs.slo_error_rate}"
             )
         broken = bool(reasons)
-        entry["metrics"].setdefault("curve", []).append(
-            {
-                "streams": streams,
-                "gbps": r.get("gbps_headline"),
-                "rtt_p99": p99,
-                "rtt_mean": st.get("mean"),
-                "rtt_n": st.get("n"),
-                "rtt_error_rate": round(err_rate, 5),
-                "slo_broken": broken,
-                "reason": "; ".join(x for x in reasons if x) or None,
-            }
-        )
+        point = {
+            "streams": streams,
+            "gbps": r.get("gbps_headline"),
+            "rtt_p99": p99,
+            "rtt_mean": st.get("mean"),
+            "rtt_n": st.get("n"),
+            "rtt_error_rate": round(err_rate, 5),
+            "slo_broken": broken,
+            "reason": "; ".join(x for x in reasons if x) or None,
+        }
+        ctx.pingers.finish_slow_visitor(point)
+        entry["metrics"].setdefault("curve", []).append(point)
         log(
             f"    load {streams}: {r.get('gbps_headline', '-')} Gbit/s, "
             f"interactive p99={p99} err={err_rate:.4f} (n={st.get('n', 0)}) -> "
@@ -991,14 +1210,22 @@ def run_staged(tool: Tool, ctx: RunContext, entry: dict) -> None:
 
 
 def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int:
-    """Shape one stage, run its bulk spine, record the stage's stats."""
+    """Shape one stage, run its bulk spine, record the stage's stats.
+
+    The M7 slow visitor is started with the stage and closed with it, so
+    each stage's interactive p99 is measured against a visitor that is
+    alive for exactly that window, and a visitor that fails is one stage's
+    recorded state rather than a poisoned axis (AGENTS.md §10).
+    """
     ctx.shaper.apply(tool.cid, stage.path)
     mark = len(entry["series"])
     entry["stages"].append(
         {"stage": stage.path, "secs": stage.secs, "t_start": round(time.time(), 3)}
     )
     log(f"  stage {stage.path} ({stage.secs}s)")
+    ctx.pingers.start_slow_visitor(stage.secs)
     outcome = stage_spine(tool, ctx, entry, stage)
+    ctx.pingers.finish_slow_visitor(entry["stages"][-1])
     if not outcome["intervals"]:
         entry["stages"][-1]["bulk_error"] = (
             f"spine produced no intervals (exit {outcome['exit']})"
@@ -1040,15 +1267,21 @@ def record_cost(entry: dict, mark: int, streams: int) -> None:
 
 
 def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
-    """Fast A/B: two builds, interleaved inside every step of one test.
+    """Fast A/B: two builds — or two variants of one build — interleaved.
 
     The pair runs in the same batch (same epoch) and the tool's processes
-    are swapped between the two builds at every load step, so both sample
+    are swapped between the two arms at every load step, so both sample
     the same machine state — sequential before/after runs are defeated by
     epoch drift, which is the whole reason this exists.
 
+    `--ab` interleaves two binaries; `--ab-variants` interleaves two
+    configurations of the *same* binary instead (M7's shared-pool vs
+    `direct` question), which is the axis a build A/B cannot isolate. The
+    axis is recorded in `metrics.builds` and the arm's rate/p99 in
+    `metrics.rounds`, so a reader can tell which question a file answers.
+
     The path is constant for the whole comparison: `--path` is applied once,
-    before the interleave, and never changes between the two builds — a shape
+    before the interleave, and never changes between the two arms — a shape
     differing between them would be a second variable, which is what makes
     this a single-variable test rather than two measurements. It used to be
     recorded without being applied at all, which made the results meta
@@ -1056,35 +1289,56 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
     clean traffic); applying it once is also what lets a shaped cell — the
     MTU/fragmentation cell, for instance — be A/B-ed at all.
     """
-    build_a, build_b = ctx.args.ab
+    variant_axis = bool(ctx.args.ab_variants)
+    if variant_axis:
+        arm_a, arm_b = ctx.args.ab_variants
+        # Both arms are the one binary this run measured: a variant A/B
+        # must not smuggle a build difference in beside the config change.
+        binary_a = binary_b = ctx.knobs.molehill_bin
+    else:
+        binary_a, binary_b = ctx.args.ab
+        arm_a = arm_b = ""
     target = lib.ThroughputTarget.from_band(tool.band)
     entry["metrics"]["builds"] = {
-        "A": build_a,
-        "B": build_b,
-        "A_version": tool.version(build_a),
-        "B_version": tool.version(build_b),
+        "axis": "variant" if variant_axis else "build",
+        "A": binary_a,
+        "B": binary_b,
+        "A_version": tool.version(binary_a),
+        "B_version": tool.version(binary_b),
     }
+    if variant_axis:
+        entry["metrics"]["builds"] |= {"A_variant": arm_a, "B_variant": arm_b}
+        log(f"    variant A/B on one binary: A={arm_a} vs B={arm_b} ({binary_a})")
     if ctx.args.path:
         ctx.shaper.apply(tool.cid, ctx.args.path)
     rounds = []
     for step in range(1, ctx.ceiling + 1):
         pair = []
-        for label, binary in (("A", build_a), ("B", build_b)):
+        for label, variant, binary in (
+            ("A", arm_a, binary_a),
+            ("B", arm_b, binary_b),
+        ):
+            if variant_axis:
+                # The config is rewritten by the restart, so the variant
+                # must be set before it — that ordering is the whole
+                # mechanism of this arm swap.
+                tool.use_variant(variant)
             tool.restart(binary)
+            ctx.pingers.start_slow_visitor(ctx.knobs.settle_s)
             mark = len(entry["series"])
             r = ctx.backends.iperf_burst(
                 target, step, ctx.knobs.settle_s, tag=f"{tool.label} {label}"
             )
             st = lib.series_stats(entry["series"][mark:], "rtt_interactive_ms")
-            pair.append(
-                {
-                    "build": label,
-                    "gbps": r.get("gbps_headline"),
-                    "rtt_p99": st.get("p99"),
-                    "rtt_n": st.get("n"),
-                    "rtt_mean": st.get("mean"),
-                }
-            )
+            arm = {
+                "build": label,
+                "gbps": r.get("gbps_headline"),
+                "rtt_p99": st.get("p99"),
+                "rtt_n": st.get("n"),
+                "rtt_mean": st.get("mean"),
+            }
+            ctx.pingers.finish_slow_visitor(arm)
+            pair.append(arm)
         rounds.append({"streams": step, "pair": pair})
         log(
             f"    step {step}: "
@@ -1093,6 +1347,11 @@ def run_screen(tool: Tool, ctx: RunContext, entry: dict) -> None:
             )
         )
     entry["metrics"]["rounds"] = rounds
+    if variant_axis:
+        # The entry's `tool`/`variant` record which configuration the run
+        # ended on; leave it on A so the file describes the reference arm
+        # (the axis itself lives in `metrics.builds`).
+        tool.use_variant(arm_a)
 
 
 #: Cold-start repetitions per build. Five is the smallest count that gives a
@@ -1194,6 +1453,25 @@ def run_tool(tool: Tool, cid: str, ctx: RunContext, entry: dict) -> dict:
     """
     args, knobs = ctx.args, ctx.knobs
     tool.cid = cid
+    endpoints = {
+        "throughput": asdict(lib.ThroughputTarget.from_band(tool.band)),
+        "interactive": {
+            "exposed": tool.band["echo_exposed"],
+            "backend": tool.band["echo_backend"],
+        },
+        "udp": {
+            "exposed": tool.band["udp_exposed"],
+            "backend": tool.band["udp_backend"],
+        },
+    }
+    if knobs.slow_visitor_bps:
+        # The slow visitor dials the tool's exposed echo port too (its reads
+        # must traverse the path under test, not the backend); it is recorded
+        # only when it ran, so the file never claims a probe that was off.
+        endpoints["slow_visitor"] = {
+            "exposed": tool.band["echo_exposed"],
+            "backend": tool.band["echo_backend"],
+        }
     entry.update(
         {
             "test": args.test,
@@ -1202,17 +1480,7 @@ def run_tool(tool: Tool, cid: str, ctx: RunContext, entry: dict) -> dict:
             # port the backend listens on. `soak_check` re-checks the pair, so a
             # sample that measured the backend instead of the tool cannot pass
             # the gate just because the numbers look plausible.
-            "endpoints": {
-                "throughput": asdict(lib.ThroughputTarget.from_band(tool.band)),
-                "interactive": {
-                    "exposed": tool.band["echo_exposed"],
-                    "backend": tool.band["echo_backend"],
-                },
-                "udp": {
-                    "exposed": tool.band["udp_exposed"],
-                    "backend": tool.band["udp_backend"],
-                },
-            },
+            "endpoints": endpoints,
         }
     )
     out = entry["series"]
@@ -1227,6 +1495,7 @@ def run_tool(tool: Tool, cid: str, ctx: RunContext, entry: dict) -> dict:
         entry["error"] = f"Backends: {e}"
         return entry
     ctx.with_backends(backends)
+    ctx.with_pingers(pingers)
     samplers.start()
     pingers.start()
     try:
@@ -1326,7 +1595,7 @@ def parse_args(argv: list | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--variants",
         default="mux",
-        help="molehill variants: mux,noise,mux1,kcp4,noise-direct,mux-off",
+        help="molehill variants (comma list): " + ",".join(lib.MOLEHILL_VARIANTS),
     )
     ap.add_argument("--test", default="capacity", choices=sorted(TEST_TYPES))
     ap.add_argument(
@@ -1359,11 +1628,47 @@ def parse_args(argv: list | None = None) -> argparse.Namespace:
         "budget from SOAK_CORES_PER_PAIR)",
     )
     ap.add_argument(
-        "--ab", metavar="BIN_A,BIN_B", help="screen: the two builds to interleave"
+        "--ab",
+        metavar="BIN_A,BIN_B",
+        help="screen/reconnect: the two builds to interleave",
+    )
+    ap.add_argument(
+        "--ab-variants",
+        metavar="VAR_A,VAR_B",
+        help="screen: two variants of the same binary to interleave "
+        "(the config is rewritten per arm; the axis replaces --variants and "
+        "is mutually exclusive with --ab)",
     )
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
-    if args.test in ("screen", "reconnect") and not args.ab:
+    if args.ab and args.ab_variants:
+        ap.error(
+            "--ab and --ab-variants are mutually exclusive: pick one axis "
+            "(two builds, or two variants of one binary)"
+        )
+    if args.ab_variants:
+        if args.test != "screen":
+            # Not supported rather than silently ignored: a variant swap
+            # would need its own cold-start metric in `reconnect` and would
+            # be a second variable in the single-configuration test types.
+            ap.error(
+                f"--ab-variants is not supported for the {args.test} test: "
+                "it interleaves two configurations of one binary, which only "
+                "the screen measures (reconnect's --ab is a build pair, and "
+                "the staged test types run one configuration throughout)"
+            )
+        args.ab_variants = [v.strip() for v in args.ab_variants.split(",") if v.strip()]
+        if len(args.ab_variants) != lib.AB_BUILDS:
+            ap.error("--ab-variants takes exactly two variants: VAR_A,VAR_B")
+        unknown = [v for v in args.ab_variants if v not in lib.MOLEHILL_VARIANTS]
+        if unknown:
+            # An unknown variant silently means the default control, so a
+            # typo would measure mux against mux and report "no effect".
+            ap.error(
+                f"unknown variant(s) {','.join(unknown)}: known variants are "
+                + ",".join(lib.MOLEHILL_VARIANTS)
+            )
+    if args.test in ("screen", "reconnect") and not (args.ab or args.ab_variants):
         ap.error(f"--ab BIN_A,BIN_B is required for the {args.test} test")
     if args.test not in ("screen", "reconnect") and args.ab:
         ap.error("--ab is only meaningful for the interleaved test types")
@@ -1454,7 +1759,11 @@ def build_meta(
     """
     revision, tree_clean = lib.git_revision(exclude=results_path(args))
     return {
-        "workload_version": WORKLOAD_VERSION,
+        # The slow visitor is an extra connection in the measured path, so a
+        # run that has one is a different workload and must not be compared
+        # across the version boundary (soak_check.comparability refuses it);
+        # a default run keeps the version it always had.
+        "workload_version": WORKLOAD_VERSION + (1 if knobs.slow_visitor_bps else 0),
         "slo": {"rtt_p99_ms": knobs.slo_rtt_p99_ms, "error_rate": knobs.slo_error_rate},
         "load_fractions": {
             "soak": knobs.soak_load_fraction,
@@ -1475,6 +1784,10 @@ def build_meta(
         "interactive_ping_interval_ms": knobs.ping_interval_ms,
         "udp_ping_interval_ms": knobs.udp_interval_ms,
         "churn_connects_s": knobs.churn_connects_s,
+        # 0 = the slow visitor is off (the default): the knob is part of the
+        # method whenever it is not, because it decides how much a visitor
+        # holds its stream and therefore what the interactive p99 sees.
+        "slow_visitor_bps": knobs.slow_visitor_bps,
         "wedge_silence_s": lib.WEDGE_SILENCE_S,
         "loss_window_s": lib.LOSS_WINDOW_S,
         # The opt-in molehill instrumentation the run inherited (empty for a
@@ -1568,9 +1881,68 @@ def new_entry(args: argparse.Namespace) -> dict:
     }
 
 
+def refuse_inapplicable_knobs(args: argparse.Namespace, knobs: lib.Knobs) -> None:
+    """Refuse a knob the chosen test type does not apply — never ignore it.
+
+    `reconnect` restarts the tool in a tight loop to time its cold start, so
+    a visitor restarted per stage would be measuring the harness's own
+    restart cadence. A knob that is accepted but not applied is a method
+    claim the run cannot back (`lib.Knobs`).
+    """
+    if knobs.slow_visitor_bps and args.test == "reconnect":
+        sys.exit(
+            f"SOAK_SLOW_VISITOR_BPS={knobs.slow_visitor_bps} is not applied to "
+            "--test=reconnect: the visitor is restarted per stage, and that "
+            "test's unit is a cold start (use screen, capacity, rrul, soak or "
+            "cost, or unset the knob)"
+        )
+
+
+def run_slots(args: argparse.Namespace) -> list:
+    """The run's `(tool, variant)` slots.
+
+    A variant A/B is ONE slot on purpose: the two configurations are
+    interleaved inside the screen, so listing both through `--variants`
+    would run each as its own tool and hide the comparison the axis exists
+    for. `--variants` is therefore replaced by the axis' A side, and the
+    run header logs the slots that actually ran.
+    """
+    tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+    if args.ab_variants:
+        variants = [args.ab_variants[0]]
+    else:
+        variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    return [(t, v) for t in tools for v in (variants if t == "molehill" else [""])]
+
+
+def announce_run(
+    args: argparse.Namespace, knobs: lib.Knobs, slots: list, timeline: list, batch: int
+) -> None:
+    """The run header: what is measured, and on which axis."""
+    log(
+        f"soak: test={args.test} path={args.path} slots={slots} "
+        f"timeline={[(s.path, s.secs) for s in timeline]} batch={batch} "
+        f"(nproc={os.cpu_count() or 1})"
+    )
+    if args.ab:
+        log(f"      A/B builds: {args.ab[0]} vs {args.ab[1]}")
+    if args.ab_variants:
+        log(
+            f"      A/B variants (same binary): {args.ab_variants[0]} vs "
+            f"{args.ab_variants[1]} — {knobs.molehill_bin}"
+        )
+    if knobs.slow_visitor_bps:
+        log(
+            f"      slow visitor: one connection at "
+            f"{knobs.slow_visitor_bps} bit/s per stage (workload version "
+            f"{WORKLOAD_VERSION + 1})"
+        )
+
+
 def main() -> None:
     args = parse_args()
     knobs = lib.Knobs.from_env()
+    refuse_inapplicable_knobs(args, knobs)
     lib.acquire_lock()
     # The run's working artifacts (tool logs, iperf-raw evidence, probe
     # logs) are evidence for the session, not repository content — and tool
@@ -1608,21 +1980,13 @@ def main() -> None:
     out = results_path(args)
     with contextlib.suppress(OSError):
         out.parent.mkdir(parents=True, exist_ok=True)
-    tools = [t.strip() for t in args.tools.split(",") if t.strip()]
-    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
     timeline = timeline_for(args)
     nproc = os.cpu_count() or 1
     budget = max(1, int(nproc / knobs.cores_per_pair))
     batch = args.batch or min(knobs.max_batch, budget)
-    slots = [(t, v) for t in tools for v in (variants if t == "molehill" else [""])]
+    slots = run_slots(args)
 
-    log(
-        f"soak: test={args.test} path={args.path} slots={slots} "
-        f"timeline={[(s.path, s.secs) for s in timeline]} batch={batch} "
-        f"(nproc={nproc})"
-    )
-    if args.ab:
-        log(f"      A/B: {args.ab[0]} vs {args.ab[1]}")
+    announce_run(args, knobs, slots, timeline, batch)
     results = Results(
         path=out,
         meta=build_meta(args, knobs, timeline, batch, nproc),

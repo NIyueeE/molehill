@@ -9,6 +9,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The tunnel pool can be shared and is elastic.** Three new client settings
+  decide what a pool is, how large it may get and how long it lives; the
+  shipped defaults keep today's shape. `[client.data].shared_pool` (default `false`)
+  serves every service of a control session from **one** tunnel pool per
+  carrier instead of one pool per service — the streams name their service on
+  the wire already, so nothing else changes, and a session with several
+  services pays for one set of tunnels instead of one set per service.
+  `[client.data].idle_timeout` (default 60 s) is how long a pool with no
+  streams, no pending opens and no pinned UDP peers must stay idle before it
+  gives one tunnel back, and `[client.data.tcp|kcp].max_tunnels` (default 4,
+  validated `>= 1`) is the cap it may grow to. Growth is the client's own
+  decision — an open that would queue, a pool at 80 % of its stream capacity,
+  or a UDP service whose configured workers need more tunnels — and shrink is
+  deliberately conservative: a tunnel carrying a live UDP peer is never
+  removed, so a stateful UDP session keeps the source port its service sees.
+  Two opt-in switches make the policy measurable rather than asserted:
+  `MOLEHILL_POOL_STATS=1` prints one line per live pool per second (size,
+  per-tunnel streams/pending/pinned, and the reason for each size change) and
+  `MOLEHILL_PLACEMENT_STATS=1` aggregates each second's placements and their
+  open latency. The server's `MOLEHILL_UDP_STATS=1` line now carries the
+  affinity table's size, its evictions and each worker's pinned peers. See
+  `docs/internals.md`, "The tunnel pool".
+
+- **Striping is not supported with the elastic pool yet.** `[server.data]`
+  `stripe_count > 1` asks for a visitor's connection to be spread over that
+  many data channels, and the striped bulk path deadlocks when a group's
+  channels are opened while the pool is still growing (the group ends up
+  sharing tunnels, and the reorder path waits for a sequence a broken channel
+  will never carry). A deadlock is not a degradation, so a v4 session is served
+  **unstriped**: the server logs one warning naming the key and uses a single
+  channel per visitor. Nothing else changes for a striped deployment, and
+  `stripe_count = 1` (the default) is unaffected — a configuration that
+  enables it keeps working, with the striping it asked for not applied yet.
+
+- **BREAKING (configuration)**: the pool has no initial size any more, so the
+  keys that described one are gone — **`[client.data].default_count`, a
+  service's `count`, a service's `pool_size` and a service's
+  `heartbeat_timeout`, plus `[server].max_pool_size`**. A config that still
+  carries one starts for this release and logs a warning naming the
+  replacement; from the next release it is an error. What to write instead
+  (the full table is in `docs/configuration.md`, "Migrating to 0.10"):
+  per-service `udp_workers` (default 2) replaces the UDP `pool_size`; a TCP
+  service's channels are opened on demand, one per visitor; the heartbeat
+  timeout is no longer per service because one session carries one timer; and
+  the server's valve is `[server.data].max_tunnels_per_client` (default 0 =
+  unlimited), which also clamps the channel count a v3 client asks for. UDP-only
+  keys on a TCP service (`udp_buffer_size`, `udp_idle_timeout`,
+  `udp_send_queue_size`, `udp_forwarder_ipv6`, `udp_workers`) are **errors**
+  now instead of being accepted and silently ignored, which is the defect this
+  closes. See `docs/configuration.md` for every key's meaning.
+
+- **The tunnel pool starts cold, and the first visitor pays for it.** With no
+  initial size to configure, a service's pool is empty until something needs a
+  tunnel: that first open grows the pool synchronously, so the first visitor
+  after an idle period waits for one tunnel setup before its bytes move —
+  2.0-3.2 ms on loopback (the M2a measurement). Nothing else changes: every
+  later visitor finds a warm tunnel, the pool still grows on demand up to
+  `max_tunnels`, and an idle pool still gives tunnels back after
+  `idle_timeout` (never below one). A client with many rarely used services
+  pays the setup per service on first use instead of holding a tunnel for each
+  one for its whole lifetime.
+
+- **BREAKING (protocol v4)**: the client speaks protocol v4 now, so **upgrade
+  the server first, or both ends together** — a v0.9.0 server cannot serve a
+  v0.10.0 client (it fails its own version check and closes the connection, and
+  the client says so and stops instead of retrying into the void), while a
+  v0.10.0 server still serves a v0.9.0 client. What the dialect buys: one
+  control session per endpoint carries *every* service that dials it, each
+  service proving its own credential, so a service the server refuses — a port
+  outside `allow_ports`, a token that is not the server's — is rejected on its
+  own instead of taking the connection and its siblings down with it, and a
+  service whose listener died is re-registered on the same session. The
+  heartbeat timeout is no longer a 40 s value the client guesses with: the
+  server declares its cadence in the session ack, the client derives
+  `max(10 s, 2 × interval + 5 s)` from it, and a configured
+  `client.control.default_heartbeat_timeout` below that floor is refused the
+  moment the session establishes — with both numbers in the message, and
+  without retrying — rather than timing out a healthy server. (It cannot be
+  checked earlier: the cadence is the server's to declare.) Existing
+  configurations keep working unchanged; leaving that key unset now means
+  "derive from the server", and `0` still disables the check. See
+  `docs/configuration.md`, "Upgrading to 0.10 (protocol v4)", and
+  `docs/internals.md`.
+
 - **The log has a level contract, and a healthy run is quiet.** `ERROR` now
   means a human has to act, `WARN` something the tool handled and is worth one
   line, `INFO` lifecycle, and `DEBUG` one connection's business — so a visitor
@@ -62,6 +146,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option macros, so the crate still adds no `unsafe`), and the session shrinks to
   the path minus the 40-byte IPv6 header and the UDP header. The arithmetic and
   the shrink-only contract are unchanged.
+
+- **A graceful server shutdown now ends the connections it was serving.** The
+  listeners stopped, but a live control session — and every service listener it
+  had bound, and every multiplex tunnel it owned — kept running until the
+  process exited; the lazily-bound KCP listener was not stopped either, so its
+  UDP port stayed bound for the life of the process. On a restart the old
+  session could therefore keep answering on the ports the new server was about
+  to bind (most visibly in a deployment that restarts in place), a restarted
+  server could not bind a KCP port its predecessor still held, and a public
+  port stayed held for as long as the shutdown took. Dropping the registrations
+  ends each session, its services and its tunnels together, and the KCP
+  listener is signalled with the same shutdown; the client sees the closed
+  control channel and reconnects, which is what a restart is supposed to look
+  like from its side.
+
+- **A client that reconnects starts with fresh tunnel pools.** The pools used
+  to survive a reconnect, but their tunnels carried the *previous* session's
+  nonce: the new server refuses them as stale, so every open on a reused pool
+  failed and the pool's own growth was refused too — forwarding stayed down
+  until something else rebuilt the session. The pools are dropped with the
+  connection now (the reconnect path re-registers and re-activates every
+  service, each of which builds the pool it needs).
 
 ## [0.9.0] - 2026-09-25
 

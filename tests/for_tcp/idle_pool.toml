@@ -1,0 +1,36 @@
+# A TCP tunnel pool with nothing to keep it warm: no service opens channels
+# up front (a TCP service opens one per visitor, on demand), the pool starts
+# cold, and `idle_timeout = 2` is its shrink clock. `max_tunnels = 2` is the
+# cap the assertions drive it to: the load rule grows the pool for 52+
+# concurrent streams, and an idle pool gives one tunnel back.
+#
+# `tests/pool_test.rs` reads the pool's own state (`live_pools()`), so the
+# numbers here are the ones those assertions expect.
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+
+[client.control]
+default_remote_addr = "127.0.0.1:2395"
+
+[client.transport]
+type = "plain"
+
+[client.data]
+default_mode = "multiplex"
+default_carrier = "tcp"
+idle_timeout = 2
+
+[client.data.tcp]
+max_tunnels = 2
+
+[client.services.idle]
+local_addr = "127.0.0.1:8090"
+remote_bind_addr = "127.0.0.1:2396"
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+allow_ports = ["2396"]
+
+[server.control]
+bind_addr = "127.0.0.1:2395"

@@ -83,7 +83,6 @@ type = "plain"
 [client.services.echo]
 local_addr = "127.0.0.1:{ECHO_BACKEND_PORT}"
 remote_bind_addr = "0.0.0.0:{VISITOR_PORT}"
-pool_size = 8
 """)
 
 

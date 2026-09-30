@@ -50,13 +50,13 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `src/main.rs` | binary entry point: CLI parsing, signals, logging setup |
 | `src/lib.rs` | library root: run-mode detection, main event loop, config-watcher lifecycle |
 | `src/cli.rs` | clap-derive CLI definitions |
-| `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands), postcard serialization, protocol version |
+| `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands, the v4 session commands and per-service prologue), postcard serialization, protocol version |
 | `src/common.rs` + `src/common/` | constants, DNS/keepalive/retry helpers, `MultiMap`, the `AsyncWriteOwned` owned-write capability boundary (`owned_write.rs`) |
 | `src/config.rs` + `src/config/` | TOML parsing/validation (`Config`, `ClientConfig`, …, `MaskedString`), hot-reload watcher |
-| `src/core/client.rs` | client mode: control channel, auth, registration, data-channel requests |
-| `src/core/server.rs` | server mode: registration policy, eager binding, connection pools |
+| `src/core/client.rs` | client mode: one control session per endpoint (auth, per-service registration, per-service state), data-channel requests, the UDP hub |
+| `src/core/server.rs` | server mode: registration policy, eager binding, the session registry, connection pools, UDP affinity |
 | `src/logging.rs` | colored span-aware log formatter |
-| `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (the `noise_stream.rs` record wrapper — ported from snowstorm and since extended in-repo: one-sweep record reads, direct decrypt into the caller's buffer, owned-record writes, opt-in session resume) / multiplex / kcp implementations |
+| `src/transport.rs` + `src/transport/` | `Transport` trait + tcp (plain) / noise (the `noise_stream.rs` record wrapper — ported from snowstorm and since extended in-repo: one-sweep record reads, direct decrypt into the caller's buffer, owned-record writes, opt-in session resume) / multiplex (the tunnel pool, placement, growth and shrink) / `pool.rs` (that policy's arithmetic, kept pure and separately testable) / kcp implementations |
 | `src/kcp.rs` + `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the SACK extensions the adapter needs; kept in-repo so nothing external needs patching and the module follows molehill's own rules. The tokio adapter around it (pump task, channels, send batching / receive coalescing, pacer, keepalive) is `src/transport/kcp.rs` |
 | `src/mux.rs` + `src/mux/` | the yamux framing engine — vendored from rust-yamux 0.14 and maintained in-repo (like the KCP engine), wire-identical with the yamux specification and tokio-native (tokio IO traits, no compat shim); the `multiplex` transport integrates it through `src/transport/multiplex.rs` |
 | `src/stripe.rs` | the stripe group: spreads one visitor connection over K data channels with numbered 32 KiB chunks (`[server.data] stripe_count`, default 1 = off) — the frame a chunk is read into crosses to the stripe by ownership, and the receiver reassembles by sequence number; design in docs/internals.md, "Data-channel striping" |
@@ -65,11 +65,13 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 
 | Path | Purpose |
 |------|---------|
-| `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports |
+| `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports and the session contract |
+| `tests/pool_test.rs` | the tunnel pool end to end: a shared pool serving two services, the per-service default, UDP source-port stickiness across a grow/shrink, the first visitor after the pool shrank, and the opt-in telemetry lines from a real binary |
+| `tests/session_test.rs` | the v4 server contract driven by a hand-written v4 client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
 | `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
-| `tests/interop_test.rs` | this build against the previous release's binary, both directions (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
+| `tests/interop_test.rs` | this build against the previous release's binary: the old client still forwards, the old server refuses the new dialect and the new client says why, an unknown dialect is refused on that connection alone (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
-| `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the control-channel teardown case, valid/invalid configs |
+| `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the session cases, the control-channel teardown case, valid/invalid configs |
 | `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`) |
 | `docs/configuration.md` (Complete examples / Deployment) | ready-to-run configs and systemd/container deployment files, as code blocks (previously the `examples/` directory) |
 | `docs/benchmarks.md` (+ `.zh.md`) | how the published numbers are produced, read and reproduced — the home of the benchmark method |

@@ -36,6 +36,21 @@ use core::run_client;
 #[cfg(feature = "server")]
 use core::run_server;
 
+/// How many v4 control sessions this process has accepted and authenticated so
+/// far (see the integration suite's session-count assertions).
+#[cfg(feature = "server")]
+pub use core::control_sessions_accepted;
+
+/// The client's elastic tunnel pool, re-exported for the integration suite:
+/// the pool's own state is what the pool tests assert on, instead of parsing
+/// the telemetry text (see `tests/integration_test.rs`).
+#[cfg(feature = "multiplex")]
+#[doc(hidden)]
+pub use transport::multiplex::live_pools;
+#[cfg(feature = "multiplex")]
+#[doc(hidden)]
+pub use transport::{Carrier, PoolSnapshot, TunnelPool};
+
 use crate::config::{ConfigChange, ConfigWatcherHandle};
 
 #[cfg(feature = "noise")]

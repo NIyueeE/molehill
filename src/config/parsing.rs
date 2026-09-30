@@ -10,15 +10,16 @@ use tracing::warn;
 use url::Url;
 
 #[cfg(feature = "multiplex")]
-use crate::common::constants::{DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS};
 use crate::common::constants::{
-    DEFAULT_TCP_POOL_SIZE, DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS,
-    DEFAULT_UDP_POOL_SIZE, DEFAULT_UDP_SENDQ_SIZE,
+    DEFAULT_MAX_TUNNELS, DEFAULT_POOL_IDLE_TIMEOUT_SECS, MAX_MUX_TUNNELS_CAP,
+};
+use crate::common::constants::{
+    DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
+    DEFAULT_UDP_WORKERS,
 };
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
-const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
@@ -96,6 +97,19 @@ pub enum DataCarrier {
     Kcp,
 }
 
+#[cfg(feature = "multiplex")]
+impl DataCarrier {
+    /// The carrier's name, as the configuration writes it: the pool key and
+    /// the telemetry use it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Kcp => "kcp",
+        }
+    }
+}
+
 /// Per-service transport override (`[client.services.<name>].transport`).
 ///
 /// Client-first encryption: the client-wide `[client.transport].type`
@@ -134,9 +148,8 @@ pub struct ClientServiceConfig {
     /// on the server. Required.
     pub remote_bind_addr: String,
     /// Prefer IPv6 for the UDP forwarder's connection to the local
-    /// service (UDP services only). Default: false.
-    #[serde(default)] // Default to false
-    pub udp_forwarder_ipv6: bool,
+    /// service (UDP services only). `None` = the key was not written.
+    pub udp_forwarder_ipv6: Option<bool>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
     /// Override `[client].default_token` for this service only — e.g. to
@@ -146,27 +159,21 @@ pub struct ClientServiceConfig {
     /// only: the service's control channel (and, by default, its data
     /// plane) dials this server instead of the client-wide one.
     pub remote_addr: Option<String>,
-    /// Override `[client.control].default_heartbeat_timeout` for this
-    /// service only (useful when services run against servers with
-    /// different heartbeat intervals).
-    pub heartbeat_timeout: Option<u64>,
     /// Override `[client.data].default_mode` for this service only.
     #[cfg(feature = "multiplex")]
     pub mode: Option<DataMode>,
-    /// Override `[client.data].default_count` for this service only; valid
-    /// only with `mode = "multiplex"`.
-    #[cfg(feature = "multiplex")]
-    pub count: Option<usize>,
     /// Override `[client.data].default_carrier` for this service only;
     /// valid only with `mode = "multiplex"`.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
     /// Per-service transport override (encryption enablement + keys).
     pub transport: Option<ClientServiceTransportConfig>,
-    /// Requested number of pre-established data channels.
-    /// Defaults: 8 for TCP, 2 for UDP. The server clamps it to
-    /// `[server].max_pool_size`.
-    pub pool_size: Option<u16>,
+    /// How many data channels this UDP service's worker set uses. The server
+    /// shards distinct visitors across the workers (session affinity) and the
+    /// tunnel pool keeps at least the tunnels they need. Default: 2. UDP
+    /// services only — a TCP service opens one data channel per visitor, on
+    /// demand, so the key is an error there.
+    pub udp_workers: Option<u16>,
     /// Receive buffer size for UDP datagrams in bytes. Default: 2048,
     /// maximum 65535 (bounded by the wire format's `u16` length).
     pub udp_buffer_size: Option<u16>,
@@ -183,6 +190,14 @@ impl ClientServiceConfig {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// The server this service dials: its own `remote_addr` when it declares
+    /// one, else `default`. The one place the override is resolved — the
+    /// control endpoint and the data endpoint both go through it, with their
+    /// own defaults, so a service can never end up on two servers.
+    pub fn endpoint_with<'a>(&'a self, default: &'a str) -> &'a str {
+        self.remote_addr.as_deref().unwrap_or(default)
     }
 
     /// The transport type this service will use: its `transport.type`
@@ -329,19 +344,14 @@ pub struct TransportConfig {
     pub noise: Option<NoiseConfig>,
 }
 
-fn default_heartbeat_timeout() -> u64 {
-    DEFAULT_HEARTBEAT_TIMEOUT_SECS
-}
-
 fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
 /// Control-channel defaults (`[client.control]`).
 ///
-/// Every service inherits these and may override `remote_addr`,
-/// `heartbeat_timeout` and `retry_interval` on its own
-/// `[client.services.<name>]` block.
+/// Every service inherits these and may override `remote_addr` and
+/// `retry_interval` on its own `[client.services.<name>]` block.
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 #[expect(
@@ -354,10 +364,13 @@ pub struct ClientControlConfig {
     /// Server address of the control channel, e.g. `"example.com:2333"`.
     /// Required.
     pub default_remote_addr: String,
-    /// Application-layer heartbeat timeout in seconds; `0` disables the
-    /// check. Must be greater than the server's `heartbeat_interval`.
-    #[serde(default = "default_heartbeat_timeout")]
-    pub default_heartbeat_timeout: u64,
+    /// Application-layer heartbeat timeout in seconds. Unset means *derive*
+    /// it from the cadence the server declares in the session ack
+    /// (`max(10 s, 2 × interval + 5 s)`); `0` disables the check. A value
+    /// below the derived floor is refused, because it would time out a
+    /// healthy server.
+    #[serde(default)]
+    pub default_heartbeat_timeout: Option<u64>,
     /// Delay between control-channel reconnect attempts.
     #[serde(default = "default_client_retry_interval")]
     pub default_retry_interval: u64,
@@ -365,19 +378,13 @@ pub struct ClientControlConfig {
 
 /// Data-plane defaults (`[client.data]`).
 ///
-/// Every service inherits these and may override `mode`, `count` and
-/// `carrier` individually on its own `[client.services.<name>]` block;
+/// Every service inherits these and may override `mode` and `carrier`
+/// individually on its own `[client.services.<name>]` block;
 /// `addr` itself cannot be overridden per service, but a service with its
 /// own `remote_addr` dials that server's data endpoint instead.
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the `default_` prefix is the config-surface naming rule that \
-              distinguishes client-wide defaults from the per-service overlay \
-              keys on `[client.services.<name>]`"
-)]
 pub struct ClientDataConfig {
     /// Data-plane endpoint; defaults to the service's control endpoint
     /// (`[client.services.<name>].remote_addr` when set, else
@@ -386,13 +393,55 @@ pub struct ClientDataConfig {
     pub default_data_addr: Option<String>,
     #[serde(default)]
     pub default_mode: DataMode,
-    /// Number of parallel tunnel connections; only with
-    /// `mode = "multiplex"`. Default: 4; clamped to 1..=64.
-    pub default_count: Option<usize>,
     #[serde(default)]
     pub default_carrier: DataCarrier,
+    /// Serve every service of one control session from **one** shared tunnel
+    /// pool per carrier, instead of one pool per service. Default: `false`
+    /// (one pool per service, the classic shape). Both modes are one code
+    /// path; they differ only in the pool's key.
+    #[serde(default)]
+    pub shared_pool: bool,
+    /// Seconds a tunnel pool with no streams, no pending opens and no pinned
+    /// UDP peers must stay idle before the pool removes one tunnel.
+    /// Default: 60. The pool never shrinks to zero while a service is
+    /// registered, and never below the UDP-derived floor.
+    pub idle_timeout: Option<u64>,
+    /// `[client.data.tcp]`: the TCP carrier's tunnel ceiling.
+    #[serde(default)]
+    pub tcp: DataCarrierLimits,
+    /// `[client.data.kcp]`: the KCP carrier's tunnel ceiling.
+    #[serde(default)]
+    pub kcp: DataCarrierLimits,
 }
 
+/// One carrier's elastic-pool limits (`[client.data.tcp]` / `[client.data.kcp]`).
+#[cfg(feature = "multiplex")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct DataCarrierLimits {
+    /// The cap the pool may grow to for this carrier. The pool starts cold
+    /// and grows on demand up to it. Must be `>= 1`; values above
+    /// [`MAX_MUX_TUNNELS_CAP`] are clamped.
+    pub max_tunnels: Option<u16>,
+}
+
+#[cfg(feature = "multiplex")]
+impl Default for DataCarrierLimits {
+    fn default() -> Self {
+        Self {
+            max_tunnels: Some(DEFAULT_MAX_TUNNELS),
+        }
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl DataCarrierLimits {
+    /// The effective cap, clamped into `1..=MAX_MUX_TUNNELS_CAP`.
+    pub fn max_tunnels(&self) -> usize {
+        usize::from(self.max_tunnels.unwrap_or(DEFAULT_MAX_TUNNELS))
+            .clamp(1, usize::from(MAX_MUX_TUNNELS_CAP))
+    }
+}
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -426,23 +475,32 @@ impl ClientConfig {
         false
     }
 
-    /// Default number of parallel tunnels per control session (a service's
-    /// own `count` wins), clamped to `1..=MAX_MUX_TUNNELS`.
+    /// Whether one control session's services share one tunnel pool per
+    /// carrier (`[client.data].shared_pool`). `false` is the classic shape:
+    /// one pool per service.
     #[cfg(feature = "multiplex")]
-    pub fn tunnel_count(&self) -> usize {
-        self.data
-            .default_count
-            .unwrap_or(DEFAULT_MUX_TUNNELS)
-            .clamp(1, MAX_MUX_TUNNELS)
+    pub fn shared_pool(&self) -> bool {
+        self.data.shared_pool
     }
 
-    /// Always 1 without the `multiplex` feature.
-    #[cfg(not(feature = "multiplex"))]
-    pub fn tunnel_count(&self) -> usize {
-        // No tunnels exist without the feature; keep the method signature
-        // uniform with the multiplex build.
-        let _ = self;
-        1
+    /// `[client.data].idle_timeout`, the elastic pool's shrink clock.
+    #[cfg(feature = "multiplex")]
+    pub fn pool_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.data
+                .idle_timeout
+                .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    /// The elastic pool's ceiling for one carrier: the carrier's
+    /// `max_tunnels`, clamped into `1..=MAX_MUX_TUNNELS_CAP`.
+    #[cfg(feature = "multiplex")]
+    pub fn max_tunnels(&self, carrier: DataCarrier) -> usize {
+        match carrier {
+            DataCarrier::Tcp => self.data.tcp.max_tunnels(),
+            DataCarrier::Kcp => self.data.kcp.max_tunnels(),
+        }
     }
 
     /// Endpoint the data plane dials: `[client.data].default_data_addr`,
@@ -500,6 +558,14 @@ pub struct ServerDataConfig {
     /// know the `StartForwardStripedTcp` command on both sides). See
     /// `docs/internals.md` ("Data-channel striping").
     pub stripe_count: Option<u16>,
+    /// The operator's valve on the elastic tunnel pool: how many multiplexed
+    /// data tunnels **one client** may hold across every service of its
+    /// session. `0` (the default) is unlimited. A tunnel over the cap is
+    /// refused with a typed answer and a `debug` line naming the cap; the
+    /// session itself is never touched (D14). A v3 client, whose registration
+    /// carries a channel count of its own, has that count clamped to this
+    /// value — one valve for both dialects.
+    pub max_tunnels_per_client: Option<u16>,
 }
 
 /// The server owns no per-service configuration. Services are registered at
@@ -517,8 +583,6 @@ pub struct ServerConfig {
     /// privilege, so list those literally when the server has it.
     #[serde(default)]
     pub allow_ports: Vec<PortRange>,
-    /// Upper bound applied to every service's requested `pool_size`.
-    pub max_pool_size: Option<u16>,
     #[serde(default)]
     pub control: ServerControlConfig,
     #[cfg(feature = "multiplex")]
@@ -563,6 +627,25 @@ impl ServerConfig {
         crate::stripe::stripe_count(self.data.stripe_count)
     }
 
+    /// The operator's tunnel valve, `[server.data].max_tunnels_per_client`:
+    /// the number of multiplexed data tunnels one client may hold. `0`
+    /// (including an absent key) means unlimited. Read by the two places that
+    /// accept a v4 tunnel and by the v3 registration path, which clamps the
+    /// channel count its dialect still asks for.
+    #[cfg(feature = "multiplex")]
+    pub fn max_tunnels_per_client(&self) -> usize {
+        usize::from(self.data.max_tunnels_per_client.unwrap_or(0))
+    }
+
+    /// Without the `multiplex` feature there is no `[server.data]` table and
+    /// no tunnel pool to bound, so the v3 clamp this feeds is a no-op; the
+    /// method keeps one signature across the two builds.
+    #[cfg(not(feature = "multiplex"))]
+    pub fn max_tunnels_per_client(&self) -> usize {
+        let _ = self;
+        0
+    }
+
     /// Without the multiplex feature the data plane follows the control
     /// channel.
     #[cfg(not(feature = "multiplex"))]
@@ -582,7 +665,8 @@ pub struct Config {
     pub client: Option<ClientConfig>,
 }
 
-/// Keys a release removed, and what to write instead.
+/// Keys a release removed, the version that removed each one, and what to
+/// write instead.
 ///
 /// A removed key is not left to `deny_unknown_fields`: that says *what* is
 /// wrong but not what to do about it, and a config whose owner believes a
@@ -590,12 +674,49 @@ pub struct Config {
 /// For one release the key is therefore accepted and warned about; the entry is
 /// then deleted, and `deny_unknown_fields` rejects it from that release on.
 /// Paths are `client.services.*.health_check`-shaped, `*` matching any table
-/// key.
-const REMOVED_KEYS: &[(&str, &str)] = &[(
-    "client.services.*.health_check",
-    "a service stays registered for as long as its client runs: a request that cannot be \
-     forwarded fails for that visitor, and the reason goes to the log",
-)];
+/// key. The advice names the replacement the reader has to write, so the
+/// warning is an upgrade instruction rather than a complaint.
+const REMOVED_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "client.data.default_count",
+        "v0.10.0",
+        "the tunnel pool now starts cold and grows on demand, so a service has no initial tunnel \
+         count to write; `[client.data.tcp].max_tunnels` (or `[client.data.kcp].max_tunnels`) is \
+         the cap it grows to",
+    ),
+    (
+        "client.services.*.count",
+        "v0.10.0",
+        "the tunnel pool now starts cold and grows on demand, and a pool belongs to the session \
+         and carrier rather than to one service; write `[client.data.tcp].max_tunnels` (or \
+         `[client.data.kcp].max_tunnels`) for the cap",
+    ),
+    (
+        "client.services.*.pool_size",
+        "v0.10.0",
+        "write `udp_workers` for a UDP service: it is the number of data channels the service's \
+         worker set uses; a TCP service's channels are opened on demand, one per visitor",
+    ),
+    (
+        "client.services.*.heartbeat_timeout",
+        "v0.10.0",
+        "the server declares its heartbeat cadence in the session ack and the client derives the \
+         timeout from it; `[client.control].default_heartbeat_timeout` remains as an optional \
+         floor",
+    ),
+    (
+        "server.max_pool_size",
+        "v0.10.0",
+        "write `[server.data].max_tunnels_per_client`: it is the tunnel cap one client may hold \
+         (0 = unlimited), where the old key bounded a v3 client's requested channel count",
+    ),
+    (
+        "client.services.*.health_check",
+        "v0.10.0",
+        "a service stays registered for as long as its client runs: a request that cannot be \
+         forwarded fails for that visitor, and the reason goes to the log",
+    ),
+];
 
 /// Remove every key in [`REMOVED_KEYS`] from a parsed config document,
 /// warning about each one found.
@@ -604,13 +725,13 @@ const REMOVED_KEYS: &[(&str, &str)] = &[(
 /// config is deliberately strict — the key has to be gone before the struct
 /// that forbids unknown fields sees it.
 fn strip_removed_keys(doc: &mut toml::Value) {
-    for (pattern, advice) in REMOVED_KEYS {
+    for (pattern, version, advice) in REMOVED_KEYS {
         let segments: Vec<&str> = pattern.split('.').collect();
         let mut hits = 0;
         strip_at(doc, &segments, &mut hits);
         if hits > 0 {
             warn!(
-                "`{pattern}` was removed in v0.9.1 and is ignored ({hits}x): {advice}. \
+                "`{pattern}` was removed in {version} and is ignored ({hits}x): {advice}. \
                  Remove the key from the config."
             );
         }
@@ -746,12 +867,35 @@ impl Config {
                 bail!("service {name}: `remote_bind_addr` port must not be 0");
             }
 
+            // UDP-only keys on a TCP service are refused, not ignored: they
+            // used to be accepted and silently dropped, which let a config's
+            // owner believe a buffer or a worker count was in effect when
+            // nothing read it. The message names the key and the protocol.
+            if matches!(s.service_type, ServiceType::Tcp) {
+                for (key, written) in [
+                    ("udp_workers", s.udp_workers.is_some()),
+                    ("udp_buffer_size", s.udp_buffer_size.is_some()),
+                    ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
+                    ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
+                    ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
+                ] {
+                    if written {
+                        bail!(
+                            "service {name}: `{key}` is only valid for a UDP service \
+                             (`protocol = \"udp\"`), but this service is TCP. Remove the key, or \
+                             declare the service as UDP"
+                        );
+                    }
+                }
+            }
+
             // Fill in runtime defaults.
-            if s.pool_size.is_none() {
-                s.pool_size = Some(match s.service_type {
-                    ServiceType::Tcp => DEFAULT_TCP_POOL_SIZE,
-                    ServiceType::Udp => DEFAULT_UDP_POOL_SIZE,
-                });
+            if matches!(s.service_type, ServiceType::Udp) {
+                match s.udp_workers {
+                    None => s.udp_workers = Some(DEFAULT_UDP_WORKERS),
+                    Some(0) => bail!("service {name}: udp_workers must be at least 1"),
+                    Some(_) => {}
+                }
             }
             if s.udp_buffer_size.is_none() {
                 s.udp_buffer_size =
@@ -788,8 +932,16 @@ impl Config {
 
         let data = &client.data;
 
-        if data.default_count == Some(0) {
-            bail!("`[client.data].default_count` must be greater than 0");
+        if data.idle_timeout == Some(0) {
+            bail!("`[client.data].idle_timeout` must be greater than 0");
+        }
+        // The elastic pool's per-carrier ceiling. `0` would mean "a pool that
+        // may never have a tunnel"; the value is validated rather than clamped
+        // so a typo is refused with the carrier's name in it.
+        for (carrier, limits) in [("tcp", &data.tcp), ("kcp", &data.kcp)] {
+            if limits.max_tunnels == Some(0) {
+                bail!("`[client.data.{carrier}].max_tunnels` must be at least 1");
+            }
         }
         if let Some(addr) = data.default_data_addr.as_deref()
             && addr.rfind(':').is_none()
@@ -798,11 +950,6 @@ impl Config {
         }
 
         if matches!(data.default_mode, Direct) {
-            if data.default_count.is_some() {
-                bail!(
-                    "`[client.data].default_count` is only valid with `default_mode = \"multiplex\"`"
-                );
-            }
             if matches!(data.default_carrier, Kcp) {
                 bail!(
                     "`[client.data].default_carrier = \"kcp\"` requires `default_mode = \"multiplex\"`"
@@ -833,15 +980,8 @@ impl Config {
         use DataCarrier::Kcp;
         use DataMode::Direct;
 
-        if s.count == Some(0) {
-            bail!("service {name}: `count` must be greater than 0");
-        }
-
         let mode = s.mode.unwrap_or(default_mode);
         if matches!(mode, Direct) {
-            if s.count.is_some() {
-                bail!("service {name}: `count` is only valid with `mode = \"multiplex\"`");
-            }
             if matches!(s.carrier, Some(Kcp)) {
                 bail!("service {name}: `carrier = \"kcp\"` requires `mode = \"multiplex\"`");
             }
@@ -903,7 +1043,7 @@ mod tests {
     // group exists only with the multiplex feature); at file scope the
     // feature-minimal build warns about unused imports.
     #[cfg(feature = "multiplex")]
-    use crate::common::constants::{DEFAULT_MUX_MAX_STREAMS, DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS};
+    use crate::common::constants::DEFAULT_MUX_MAX_STREAMS;
     use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
     use std::{fs, path::PathBuf};
 
@@ -1016,10 +1156,8 @@ mod tests {
     )]
     fn test_documented_defaults_are_pinned() {
         assert_eq!(DEFAULT_HEARTBEAT_INTERVAL_SECS, 30, "server heartbeats");
-        assert_eq!(DEFAULT_HEARTBEAT_TIMEOUT_SECS, 40, "client heartbeat");
         assert_eq!(DEFAULT_CLIENT_RETRY_INTERVAL_SECS, 1, "retry interval");
-        assert_eq!(DEFAULT_TCP_POOL_SIZE, 8, "TCP pool_size");
-        assert_eq!(DEFAULT_UDP_POOL_SIZE, 2, "UDP pool_size");
+        assert_eq!(DEFAULT_UDP_WORKERS, 2, "udp_workers");
         assert_eq!(DEFAULT_UDP_BUFFER_SIZE, 2048, "udp_buffer_size");
         assert_eq!(DEFAULT_UDP_IDLE_TIMEOUT_SECS, 60, "udp_idle_timeout");
         assert_eq!(DEFAULT_UDP_SENDQ_SIZE, 1024, "udp_send_queue_size");
@@ -1028,10 +1166,40 @@ mod tests {
         assert_eq!(DEFAULT_KEEPALIVE_INTERVAL, 8, "tcp keepalive interval");
         #[cfg(feature = "multiplex")]
         {
-            assert_eq!(DEFAULT_MUX_TUNNELS, 4, "data-plane tunnel count");
-            assert_eq!(MAX_MUX_TUNNELS, 64, "tunnel count clamp");
             assert_eq!(DEFAULT_MUX_MAX_STREAMS, 64, "streams per tunnel");
+            assert_eq!(DEFAULT_MAX_TUNNELS, 4, "carrier max_tunnels");
+            assert_eq!(MAX_MUX_TUNNELS_CAP, 64, "max_tunnels clamp");
+            assert_eq!(DEFAULT_POOL_IDLE_TIMEOUT_SECS, 60, "pool idle_timeout");
         }
+    }
+
+    /// The operator's valve defaults to "no cap": `0` and an absent key mean
+    /// the same thing, and neither refuses a tunnel.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn test_max_tunnels_per_client_defaults_to_unlimited() {
+        let config = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 0);
+
+        let config = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.data]
+max_tunnels_per_client = 6
+"#;
+        let cfg = Config::from_str(config).unwrap();
+        assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 6);
     }
 
     #[test]
@@ -1135,7 +1303,7 @@ mod tests {
         cfg.services.insert("foo1".into(), svc("0.0.0.0:6081"));
         Config::validate_client_config(&mut cfg)?;
         let s = cfg.services.get("foo1").unwrap();
-        assert_eq!(s.pool_size, Some(DEFAULT_UDP_POOL_SIZE));
+        assert_eq!(s.udp_workers, Some(DEFAULT_UDP_WORKERS));
         assert_eq!(
             s.udp_buffer_size,
             Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap())
@@ -1150,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_client_service_explicit_pool_and_udp_options() {
+    fn test_client_service_explicit_udp_options() {
         let config = r#"
 [client]
 default_token = "t"
@@ -1162,14 +1330,14 @@ default_remote_addr = "example.com:2333"
 protocol = "udp"
 local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:6053"
-pool_size = 4
+udp_workers = 4
 udp_buffer_size = 65535
 udp_idle_timeout = 30
 udp_send_queue_size = 128
 "#;
         let cfg = Config::from_str(config).unwrap();
         let s = &cfg.client.unwrap().services["test"];
-        assert_eq!(s.pool_size, Some(4));
+        assert_eq!(s.udp_workers, Some(4));
         assert_eq!(s.udp_buffer_size, Some(65535));
         assert_eq!(s.udp_idle_timeout, Some(30));
         assert_eq!(s.udp_send_queue_size, Some(128));
@@ -1177,6 +1345,53 @@ udp_send_queue_size = 128
         // Zero values are rejected
         let bad = config.replace("udp_buffer_size = 65535", "udp_buffer_size = 0");
         assert!(Config::from_str(&bad).is_err());
+
+        // So is a worker set with no workers: the pool's UDP floor counts the
+        // channels, and a count of zero would ask for none.
+        let bad = config.replace("udp_workers = 4", "udp_workers = 0");
+        assert!(Config::from_str(&bad).is_err());
+    }
+
+    /// The UDP-only keys are refused on a TCP service instead of being
+    /// silently ignored (the defect M6 closes); the empty-value case matters
+    /// too, because `udp_forwarder_ipv6 = false` is a key a reader wrote
+    /// believing it configured something.
+    #[test]
+    fn test_udp_only_keys_are_refused_on_a_tcp_service() {
+        let config = r#"
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.services.test]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
+{key}
+"#;
+        for key in [
+            "udp_workers = 4",
+            "udp_buffer_size = 2048",
+            "udp_idle_timeout = 30",
+            "udp_send_queue_size = 128",
+            "udp_forwarder_ipv6 = false",
+        ] {
+            let bad = config.replace("{key}", key);
+            let err = Config::from_str(&bad).unwrap_err();
+            let msg = format!("{err:#}");
+            let name = key.split(' ').next().unwrap();
+            assert!(
+                msg.contains(name) && msg.contains("UDP"),
+                "{key} must be refused by name and protocol, got: {msg}"
+            );
+        }
+
+        // The same keys on a UDP service stay valid.
+        let ok = config
+            .replace("{key}", "protocol = \"udp\"\nudp_workers = 4")
+            .replace("127.0.0.1:80", "127.0.0.1:53");
+        assert!(Config::from_str(&ok).is_ok());
     }
 
     #[test]
@@ -1294,11 +1509,12 @@ psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
     #[test]
     fn test_removed_keys_are_stripped_and_the_rest_parses() {
-        // `health_check` was removed in v0.9.1. The config still has to start
-        // (the owner is told, not stopped), so the mechanism under test is:
-        // find the key, drop it from the document, then let the strict parse
-        // run on what is left. Without the strip, `deny_unknown_fields` would
-        // refuse the whole file.
+        // `health_check` was removed in a withdrawn release and reports
+        // v0.10.0 now (the release that actually removes it). The config still
+        // has to start (the owner is told, not stopped), so the mechanism
+        // under test is: find the key, drop it from the document, then let the
+        // strict parse run on what is left. Without the strip,
+        // `deny_unknown_fields` would refuse the whole file.
         let config = r#"
 [client]
 default_token = "t"
@@ -1333,6 +1549,53 @@ health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3 }
         );
     }
 
+    /// Every key the v0.10.0 surface removed is stripped, wherever it lived,
+    /// and the rest of the config then parses: a config that only needs the
+    /// removals is not stopped by them (it is warned about, once per key).
+    #[test]
+    fn test_every_removed_key_is_stripped() {
+        let config = r#"
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.data]
+default_count = 4
+
+[client.services.test]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
+count = 2
+pool_size = 8
+heartbeat_timeout = 90
+health_check = { type = "tcp", interval = 5 }
+
+[server]
+default_token = "t"
+max_pool_size = 16
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+"#;
+        let mut doc: toml::Value = toml::from_str(config).unwrap();
+        strip_removed_keys(&mut doc);
+        assert!(
+            doc.get("server")
+                .and_then(|s| s.get("max_pool_size"))
+                .is_none()
+                && doc["client"]["data"].get("default_count").is_none()
+                && ["count", "pool_size", "heartbeat_timeout", "health_check"]
+                    .iter()
+                    .all(|k| doc["client"]["services"]["test"].get(*k).is_none()),
+            "every removed key must be gone before the strict parse sees it: {doc}"
+        );
+        // A current config with none of them still comes out unchanged (the
+        // mirror of the check above): the strip removes exactly those keys.
+        assert!(Config::from_str(config).is_ok());
+    }
+
     #[test]
     fn test_a_config_without_removed_keys_is_untouched() {
         // The strip must not report (or remove) anything from a current config
@@ -1359,7 +1622,8 @@ remote_bind_addr = "0.0.0.0:6080"
     fn test_service_udp_forwarder_ipv6_parsing() {
         // The client-level `prefer_ipv6` was removed (no consumer); the
         // per-service key stays (renamed `udp_forwarder_ipv6`): it steers
-        // the UDP forwarder's bind choice.
+        // the UDP forwarder's bind choice. It is UDP-only, so the service
+        // declares its protocol.
         let config = r#"
 [client]
 default_token = "t"
@@ -1368,12 +1632,16 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [client.services.test]
-local_addr = "127.0.0.1:80"
+protocol = "udp"
+local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:6080"
 udp_forwarder_ipv6 = true
 "#;
         let cfg = Config::from_str(config).unwrap();
-        assert!(cfg.client.unwrap().services["test"].udp_forwarder_ipv6);
+        assert_eq!(
+            cfg.client.unwrap().services["test"].udp_forwarder_ipv6,
+            Some(true)
+        );
     }
 
     #[test]
@@ -1439,9 +1707,9 @@ remote_bind_addr = "0.0.0.0:6080"
     #[cfg(feature = "multiplex")]
     #[test]
     fn test_per_service_data_overrides_parse() {
-        // `[client.data]` acts as defaults; a service's own mode/count/carrier
-        // win. The runtime merge lives in `DataOpts::for_service` (client
-        // code); here we pin that the keys parse and validate per service.
+        // `[client.data]` acts as defaults; a service's own mode/carrier win.
+        // The runtime merge lives in `DataOpts::for_service` (client code);
+        // here we pin that the keys parse and validate per service.
         let config = r#"
 [client]
 default_token = "t"
@@ -1451,7 +1719,10 @@ default_remote_addr = "example.com:2333"
 
 [client.data]
 default_mode = "multiplex"
-default_count = 4
+default_carrier = "kcp"
+
+[client.data.kcp]
+max_tunnels = 6
 
 [client.services.muxed]
 local_addr = "127.0.0.1:80"
@@ -1461,14 +1732,14 @@ mode = "direct"
 [client.services.bulk]
 local_addr = "127.0.0.1:81"
 remote_bind_addr = "0.0.0.0:6081"
-count = 2
+carrier = "tcp"
 "#;
         let cfg = Config::from_str(config).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(services["muxed"].mode, Some(DataMode::Direct));
-        assert_eq!(services["muxed"].count, None);
+        assert_eq!(services["muxed"].carrier, None);
         assert_eq!(services["bulk"].mode, None);
-        assert_eq!(services["bulk"].count, Some(2));
+        assert_eq!(services["bulk"].carrier, Some(DataCarrier::Tcp));
     }
 
     #[test]
@@ -1607,23 +1878,6 @@ remote_addr = "other.example.com:2444"
     #[cfg(feature = "multiplex")]
     #[test]
     fn test_per_service_data_validation() {
-        // `count` with a direct mode is rejected, exactly like the global
-        // `[client.data]` block.
-        let bad = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-mode = "direct"
-count = 2
-"#;
-        assert!(Config::from_str(bad).is_err());
-
         // `carrier = "kcp"` requires multiplex mode.
         let bad = r#"
 [client]
@@ -1640,7 +1894,7 @@ carrier = "kcp"
 "#;
         assert!(Config::from_str(bad).is_err());
 
-        // `count = 0` is rejected.
+        // `max_tunnels = 0` is rejected, with the carrier named.
         let bad = r#"
 [client]
 default_token = "t"
@@ -1648,11 +1902,17 @@ default_token = "t"
 [client.control]
 default_remote_addr = "example.com:2333"
 
+[client.data.tcp]
+max_tunnels = 0
+
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-count = 0
 "#;
-        assert!(Config::from_str(bad).is_err());
+        let err = Config::from_str(bad).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("max_tunnels"),
+            "the refusal must name the key: {err:#}"
+        );
     }
 }

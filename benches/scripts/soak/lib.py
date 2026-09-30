@@ -50,6 +50,46 @@ RUNNER_NAME = "soak.py"
 WORK_PREFIX = "molehill-bench."
 
 
+# --- release results files ---------------------------------------------------
+# A published results file's name carries its version, and the gate and the plot
+# both need "the newest one" and "the one before it". A LEXICAL sort answers
+# both wrongly the moment the version passes 0.9.x: "results-soak-v0.10.0.json"
+# sorts BEFORE "results-soak-v0.9.0.json" ("1" < "9"), so the gate would compare
+# the wrong pair and the plot would render an older file as the current release
+# — a silent failure in both directions. Parse the dotted version instead, and
+# keep the non-release files (`dev`, a screen output) out of the ordering
+# entirely: they are scratch, never a baseline.
+RESULTS_RE = re.compile(r"^results-soak-v(\d+)\.(\d+)\.(\d+)\.json$")
+
+
+def release_version(path: Path) -> tuple | None:
+    """`(major, minor, patch)` for a published results file, else `None`."""
+    m = RESULTS_RE.match(path.name)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def release_files(directory: Path) -> list:
+    """Every `results-soak-vX.Y.Z.json` in `directory`, oldest version first."""
+    found = [(release_version(p), p) for p in directory.glob("results-soak-*.json")]
+    found = [(v, p) for v, p in found if v is not None]
+    return [p for _, p in sorted(found, key=lambda item: item[0])]
+
+
+def newest_results(directory: Path) -> Path | None:
+    """The newest results file, or `None` when the directory holds none.
+
+    A published file wins over a scratch one, which is what both consumers did
+    before this helper existed and what a release reviewer expects; the scratch
+    fallback keeps `just soak-plot` usable on a directory that holds nothing
+    else (a quick `just soak` writes `results-soak-dev.json` and nothing more).
+    """
+    releases = release_files(directory)
+    if releases:
+        return releases[-1]
+    scratch = sorted(directory.glob("results-soak-*.json"), key=lambda p: p.name)
+    return scratch[-1] if scratch else None
+
+
 # --- stale-run pid ledger ----------------------------------------------------
 def record_pid(work: Path, pid: int) -> None:
     """Append a pid to work/pids.json so a later run can reap a crashed run."""
@@ -190,6 +230,14 @@ class Knobs:
     churn_connects_s: int = 16
     # the UDP session's ping interval
     udp_interval_ms: int = 20
+    # --- the M7 slow-visitor probe (opt-in, 0 = off) ------------------------
+    # One extra connection to the tool's echo service, read back at this rate
+    # (bit/s): the visitor whose slowness can block the streams that share its
+    # pool. Off by default — an injected visitor is part of the workload, so a
+    # run that has one changes the method (see `soak.build_meta`'s workload
+    # version note), and the runner applies it stage by stage (screen,
+    # capacity, rrul, soak, cost) rather than accepting it where it cannot.
+    slow_visitor_bps: int = 0
     # --- SLO (method constant) --------------------------------------------
     # the interactive stream must stay under this p99 AND under this error
     # rate for a load level to count as sustainable (`capacity`)
@@ -217,7 +265,6 @@ class Knobs:
     cores_per_pair: float = 7.0
     max_batch: int = 8
     # --- process / misc ----------------------------------------------------
-    pool_size: int = 8
     allow_port_hi: int = 26999  # server-side allow_ports upper bound
 
     @classmethod
@@ -238,6 +285,7 @@ class Knobs:
             streams_max=_env_int("SOAK_STREAMS_MAX", 8),
             churn_connects_s=_env_int("SOAK_CHURN_CONNECTS_S", 16),
             udp_interval_ms=_env_int("SOAK_UDP_INTERVAL_MS", 20),
+            slow_visitor_bps=_env_int("SOAK_SLOW_VISITOR_BPS", 0),
             slo_rtt_p99_ms=_env_float("SOAK_SLO_RTT_P99_MS", 50.0),
             slo_error_rate=_env_float("SOAK_SLO_ERROR_RATE", 0.005),
             settle_s=_env_float("SOAK_SETTLE_S", 6.0),
@@ -247,7 +295,6 @@ class Knobs:
             soak_load_fraction=_env_float("SOAK_SOAK_LOAD_FRACTION", 0.5),
             cores_per_pair=_env_float("SOAK_CORES_PER_PAIR", 7.0),
             max_batch=_env_int("SOAK_MAX_BATCH", 8),
-            pool_size=_env_int("POOL_SIZE", 8),
         )
 
 
@@ -788,6 +835,10 @@ WEDGE_SILENCE_S = 5.0
 # attempt stream is the denominator, so a shaped stage's loss is a rate and
 # not a count of 1s).
 LOSS_WINDOW_S = 5.0
+# The slow-visitor probe owns a per-stage budget; the stage boundary waits
+# this long for it to close itself before killing it and recording that it
+# had to (a killed probe is a state in the stage line, not a silent gap).
+SLOW_VISITOR_JOIN_S = 5.0
 
 
 # --- series statistics ------------------------------------------------------
@@ -975,40 +1026,76 @@ def noise_keys(binary: str) -> tuple[str, str]:
     return (priv, pub)
 
 
+#: The variants `molehill_config` gives a configuration of their own — the
+#: single source for the runner's `--variants` help and for the variant A/B's
+#: validation. Any other name falls through to the default control, so the
+#: list has to be explicit: a typo in a variant A/B would otherwise measure
+#: mux against mux and report it as "no effect".
+MOLEHILL_VARIANTS = (
+    "mux",  # control: plain transport, multiplex
+    "shared",  # pool axis: multiplex with one pool for every service
+    "direct",  # the docs' name for direct mode (same config as `mux-off`)
+    "mux-off",  # the historical name for that same configuration
+    "noise",  # transport axis
+    "noise-direct",  # transport x mode grid
+    "mux1",  # tunnel-count axis
+    "kcp4",  # data-plane carrier axis
+)
+
+
 def molehill_config(
     work: Path, variant: str, knobs: Knobs, p: dict, binary: str = ""
 ) -> Path:
     """Write server/client tomls for one molehill variant; returns config dir."""
     d = work / "molehill"
     d.mkdir(exist_ok=True)
-    mode = "direct" if variant in ("mux-off", "noise-direct") else "multiplex"
+    # The mode axis has two spellings for the same configuration: `direct` is
+    # the docs' word for the mode and the variant A/B's name for this arm,
+    # `mux-off` is the historical name carried by existing records and docs
+    # (both stay valid — retiring either would silently reinterpret a stored
+    # result file).
+    mode = "direct" if variant in ("direct", "mux-off", "noise-direct") else "multiplex"
     # Single-variable variants. `mux` is the default control (plain transport,
     # multiplex, count = 4): `noise` changes only the transport, `mux1` only
     # the tunnel count, `kcp4` only the data-plane carrier (on top of the
-    # noise variant). `noise-direct` is the noise transport in direct mode: a
-    # new point on the transport x mode grid, and the variant that isolates the
-    # record-stream cost with no mux framing in the way (the mux frame
-    # reader asks for less than a record, so a record staged in the wrapper
-    # is structural there — compare `mux-off` for the transport axis and
-    # `noise` for the mode axis).
+    # noise variant), `shared` only who owns the pool (one pool for every
+    # service of the session instead of one pool per service — the axis M7
+    # measures against `direct`). `noise-direct` is the noise transport in
+    # direct mode: a new point on the transport x mode grid, and the variant
+    # that isolates the record-stream cost with no mux framing in the way (the
+    # mux frame reader asks for less than a record, so a record staged in the
+    # wrapper is structural there — compare `mux-off`/`direct` for the transport
+    # axis and `noise` for the mode axis).
     data_c = data_s = ""
+    # The pool's cap, stated explicitly so each arm's shape is recorded in the
+    # config it emitted: the `mux` control arm keeps 4 (the default), `mux1`
+    # caps it at 1, and `kcp4` moves the cap onto the KCP carrier. The pool
+    # itself starts cold and grows to the cap on demand, which is the same
+    # shape as the previous release's initial `count` under the arms' load. A
+    # `direct` arm has no pool and states no cap.
+    caps = ""
     if variant == "noise":
         transport = "noise"
-    elif variant == "mux1":  # count axis: plain, one tunnel
+    elif variant == "shared":  # pool axis: one pool for the whole session
         transport = "plain"
-        data_c = "default_count = 1\n"
+        data_c = "shared_pool = true\n"
+    elif variant == "mux1":  # cap axis: plain, one tunnel
+        transport = "plain"
+        caps = "[client.data.tcp]\nmax_tunnels = 1\n"
     elif variant == "kcp4":  # carrier axis: noise + KCP-over-UDP
         transport = "noise"
         data_c = (
             f'default_carrier = "kcp"\n'
             f'default_data_addr = "127.0.0.1:{p["kcp_bind"]}"\n'
-            f"default_count = 4\n"
         )
+        caps = "[client.data.kcp]\nmax_tunnels = 4\n"
         data_s = f'bind_addr = "127.0.0.1:{p["kcp_bind"]}"\n'
     elif variant == "noise-direct":  # transport axis, no mux layer
         transport = "noise"
     else:
         transport = "plain"
+    if mode == "multiplex" and not caps:
+        caps = "[client.data.tcp]\nmax_tunnels = 4\n"
     noise_s = noise_c = ""
     if transport == "noise":
         priv, pub = noise_keys(binary or knobs.molehill_bin)
@@ -1034,24 +1121,22 @@ default_remote_addr = "127.0.0.1:{p["client_dial"]}"
 
 [client.data]
 default_mode = "{mode}"
-{data_c}[client.transport]
+{data_c}{caps}[client.transport]
 type = "{transport}"
 {noise_c}
 [client.services.iperf]
 local_addr = "127.0.0.1:{p["iperf_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["iperf_exposed"]}"
-pool_size = {knobs.pool_size}
 
 [client.services.echo]
 local_addr = "127.0.0.1:{p["echo_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["echo_exposed"]}"
-pool_size = {knobs.pool_size}
 
 [client.services.udpecho]
 protocol = "udp"
 local_addr = "127.0.0.1:{p["udp_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["udp_exposed"]}"
-pool_size = 2
+udp_workers = 2
 udp_buffer_size = 2048
 udp_idle_timeout = 60
 udp_send_queue_size = 1024

@@ -1,3 +1,10 @@
+//! Helpers shared by the integration test binaries. Each binary uses a subset,
+//! so the ones it does not call are dead *in that binary* by construction.
+#![allow(
+    dead_code,
+    reason = "a shared test-helper module compiled into several test binaries, each of which uses a subset"
+)]
+
 use std::path::PathBuf;
 
 use anyhow::Result;

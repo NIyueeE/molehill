@@ -1,0 +1,16 @@
+# expect: `udp_workers` is only valid for a UDP service
+
+# A worker set belongs to a UDP service: its channels are the sharding
+# targets the server pins visitors to. A TCP service opens one data channel
+# per visitor, so the key is refused rather than ignored.
+
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.services.tcp_service]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
+udp_workers = 4

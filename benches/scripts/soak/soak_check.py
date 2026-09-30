@@ -27,6 +27,8 @@ import os
 import sys
 from pathlib import Path
 
+import lib
+
 # Per-type gate thresholds (percent unless noted). They are method
 # constants — the env var of the same name overrides one for an experiment.
 THRESHOLDS = {
@@ -156,6 +158,22 @@ def comparability(base: dict, cur: dict) -> str | None:
             f"the runs were made on different hosts ({bh} vs {ch}): the path, "
             "the CPU budget and the loopback ceiling are properties of where a "
             "run happens, and the peers' clean-tool spread shows it"
+        )
+    # The injected slow visitor is part of the workload, not a viewer of it:
+    # two runs that throttled it differently measured different paths. The
+    # workload-version check above already separates "off" from "on" (an
+    # enabled visitor bumps the version); this catches two *different* rates,
+    # which both carry the same bumped version. Missing keys mean an older
+    # file, i.e. no visitor, which is what 0 reads as.
+    bv, cv = (
+        base["meta"].get("slow_visitor_bps") or 0,
+        (cur["meta"].get("slow_visitor_bps") or 0),
+    )
+    if bv != cv:
+        return (
+            f"the runs injected different slow visitors ({bv} vs {cv} bit/s): "
+            "the visitor shares the path it measures, so its rate is a method "
+            "parameter (AGENTS.md §10)"
         )
     return None
 
@@ -476,23 +494,59 @@ def gate(cur: dict, base: dict | None) -> int:
     return 0
 
 
+def screen_slow_visitor(rounds: list) -> None:
+    """The slow visitor's state beside the verdict it shaped.
+
+    The interactive p99 the table judges was measured with this visitor in
+    the path, so a stage where it failed (or never completed) has to be
+    visible here and not only in the series.
+    """
+    states = [p.get("slow_visitor_state") for r in rounds for p in r["pair"]]
+    if not any(states):
+        return
+    counts = {s: states.count(s) for s in sorted(set(states)) if s}
+    print(f"        slow visitor (SOAK_SLOW_VISITOR_BPS): {counts}")
+    for reason in sorted(
+        {
+            p.get("slow_visitor_reason")
+            for r in rounds
+            for p in r["pair"]
+            if p.get("slow_visitor_reason")
+        }
+    ):
+        print(f"        slow visitor failure: {reason}")
+
+
 def screen(data: dict) -> int:
     """The A/B verdict for a `--test=screen` run.
 
     Read in one direction only: every delta is `head - base` where A is the
-    first build on the command line. A step that favours B is reported as
+    first arm on the command line. A step that favours B is reported as
     such, and a run where every step favours B is a claim for B — the
     sequential decision the runner's interleave exists to support.
+
+    Two axes reach this file: two builds (`--ab`) and two variants of one
+    binary (`--ab-variants`). The header says which one was measured —
+    printing a version and a path on both sides of a variant run would
+    present a config comparison as a build comparison.
     """
     t = next((t for t in data["tests"] if t["test"] == "screen"), None)
     if t is None:
         sys.exit("no screen test in that results file")
     rounds = t["metrics"].get("rounds") or []
     builds = t["metrics"].get("builds") or {}
-    print(
-        f"screen: A={builds.get('A_version')} ({builds.get('A')})\n"
-        f"        B={builds.get('B_version')} ({builds.get('B')})"
-    )
+    if builds.get("axis") == "variant":
+        print(
+            f"screen: axis=variant  A={builds.get('A_variant')} "
+            f"(bin {builds.get('A_version')} {builds.get('A')})\n"
+            f"        B={builds.get('B_variant')} (same binary)"
+        )
+    else:
+        print(
+            f"screen: A={builds.get('A_version')} ({builds.get('A')})\n"
+            f"        B={builds.get('B_version')} ({builds.get('B')})"
+        )
+    screen_slow_visitor(rounds)
     if not rounds:
         sys.exit("no rounds recorded")
     # Which metric the table shows, decided by what the run actually produced —
@@ -560,15 +614,29 @@ def screen(data: dict) -> int:
 
 
 def resolve_paths(args: list) -> tuple:
-    """The (current, baseline) files to compare, from argv or by convention."""
+    """The (current, baseline) files to compare, from argv or by convention.
+
+    Only published files take part in the convention: a `dev` or screen output
+    is scratch, and it must never be picked as the newest run or as a baseline.
+    The ordering is `lib.release_files` (semantic version), because the lexical
+    one answers this wrongly from v0.10.0 on — `results-soak-v0.10.0.json` sorts
+    before `results-soak-v0.9.0.json`, so the gate would compare the wrong pair.
+    """
     here = Path(__file__).parent
-    found = sorted(here.glob("results-soak-*.json"), key=lambda p: p.name)
-    cur = Path(args[0]) if args else (found[-1] if found else None)
-    if cur is None:
-        sys.exit("no results-soak-*.json found")
+    if args:
+        cur = Path(args[0])
+    else:
+        cur = lib.newest_results(here)
+        if cur is None:
+            sys.exit("no results-soak-*.json found")
     if len(args) > 1:
         return cur, Path(args[1])
-    older = [p for p in found if p.name < cur.name]
+    cur_version = lib.release_version(cur)
+    older = [
+        p
+        for p in lib.release_files(here)
+        if cur_version is not None and lib.release_version(p) < cur_version
+    ]
     return cur, (older[-1] if older else None)
 
 

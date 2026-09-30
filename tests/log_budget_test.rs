@@ -148,6 +148,25 @@ impl Scenario {
     /// `client_extra` is appended to the `[client.services.echo]` table, which
     /// is how a test asks for a config that is not clean.
     fn start(label: &str, client_extra: &str) -> Scenario {
+        Scenario::start_with(label, client_extra, "", "")
+    }
+
+    /// The same, with extra keys in `[client.services.echo]`, `[client.data]`
+    /// and `[server]` — a removed key has to be strippable wherever it lived,
+    /// so the scenario that proves it has to be wrong in every section at
+    /// once. An empty `client_data_extra` omits the `[client.data]` table
+    /// entirely, so a clean scenario stays clean.
+    fn start_with(
+        label: &str,
+        client_extra: &str,
+        client_data_extra: &str,
+        server_extra: &str,
+    ) -> Scenario {
+        let data_block = if client_data_extra.is_empty() {
+            String::new()
+        } else {
+            format!("[client.data]\n{client_data_extra}\n")
+        };
         let dir = std::env::temp_dir().join(format!(
             "molehill-log-budget-{label}-{}",
             std::process::id()
@@ -168,7 +187,7 @@ impl Scenario {
                 "[server]\n\
                  default_token = \"{TOKEN}\"\n\
                  allow_ports = [\"{exposed}\"]\n\
-                 \n\
+                 {server_extra}\n\
                  [server.control]\n\
                  bind_addr = \"127.0.0.1:{control}\"\n"
             ),
@@ -183,6 +202,7 @@ impl Scenario {
                  [client.control]\n\
                  default_remote_addr = \"127.0.0.1:{control}\"\n\
                  \n\
+                 {data_block}\
                  [client.transport]\n\
                  type = \"plain\"\n\
                  \n\
@@ -425,42 +445,100 @@ fn a_healthy_run_stays_within_the_log_budget() {
     assert!(visitors >= 1, "the scenario never forwarded a visitor");
 }
 
-/// The migration wart, measured the same way: a config that still carries the
-/// removed `health_check` key starts, **warns** about it (rather than obeying
-/// it silently or refusing to start), and that warning is the *only* one.
+/// The migration wart, measured the same way: a config that still carries any
+/// key v0.10.0 removed starts, **warns** about each one (rather than obeying it
+/// silently or refusing to start), and each warning names the key *and* what to
+/// write instead — a warning that says only "removed" leaves the reader
+/// guessing.
 ///
-/// The count is deliberately not pinned: the warning is emitted per config
-/// parse, and the config watcher parses the file once more when its initial
-/// event arrives. Whether that lands inside this test's lifetime depends on the
-/// platform's notify backend — macOS delivered it before shutdown and Linux did
-/// not — so pinning "exactly one" made the test measure the watcher's timing.
-/// What matters is platform-independent: it warns at all, it names the key,
-/// everything it warns about is that key, and it is not yet an error.
+/// The per-key count is deliberately not pinned beyond "at least one, at most
+/// two": the warning is emitted per config parse, and the config watcher parses
+/// the file once more when its initial event arrives. Whether that second parse
+/// lands inside this test's lifetime depends on the platform's notify backend —
+/// macOS delivered it before shutdown and Linux did not — so pinning "exactly
+/// one" made the test measure the watcher's timing. What matters is
+/// platform-independent: every removed key warns at all, everything it warns
+/// about is one of the removed keys, the replacement is named, and it is not
+/// yet an error.
 #[test]
-fn a_removed_key_warns_and_is_otherwise_quiet() {
-    let mut scenario = Scenario::start(
+fn every_removed_key_warns_and_is_otherwise_quiet() {
+    // (the removed key's pattern, a fragment of the replacement its advice
+    // must name). The pattern is matched as the warning writes it —
+    // backticked — so `count` cannot be satisfied by the `default_count`
+    // line's text.
+    const REMOVED: [(&str, &str); 6] = [
+        ("client.data.default_count", "max_tunnels"),
+        ("client.services.*.count", "max_tunnels"),
+        ("client.services.*.pool_size", "udp_workers"),
+        (
+            "client.services.*.heartbeat_timeout",
+            "default_heartbeat_timeout",
+        ),
+        ("client.services.*.health_check", "registered"),
+        ("server.max_pool_size", "max_tunnels_per_client"),
+    ];
+    let mut scenario = Scenario::start_with(
         "removed-key",
-        "health_check = { type = \"tcp\", interval = 10 }\n",
+        "count = 2\n\
+         pool_size = 8\n\
+         heartbeat_timeout = 90\n\
+         health_check = { type = \"tcp\", interval = 10 }\n",
+        "default_count = 4\n",
+        "max_pool_size = 16\n",
     );
-    let (_, client_log) = scenario.stop();
+    let visitors = scenario.visitors;
+    let (server_log, client_log) = scenario.stop();
 
+    // The removed keys live in three different tables, so their warnings do
+    // too: five are the client's config, `server.max_pool_size` is the
+    // server's. Both processes parse their own file.
     let warnings: Vec<&str> = client_log
         .lines()
+        .chain(server_log.lines())
         .filter(|l| l.contains(" WARN "))
         .collect();
     assert!(
         !warnings.is_empty(),
-        "the removed key must warn — it is ignored, not silently obeyed:\n{client_log}"
+        "the removed keys must warn — they are ignored, not silently obeyed:\n{client_log}"
     );
-    for line in &warnings {
+    for (pattern, replacement) in REMOVED {
+        let quoted = format!("`{pattern}`");
+        let mentions: Vec<&&str> = warnings.iter().filter(|l| l.contains(&quoted)).collect();
         assert!(
-            line.contains("health_check"),
-            "the removed key is the only thing this path may warn about, got: {line}"
+            !mentions.is_empty(),
+            "`{pattern}` must be named by a warning:\n{client_log}"
+        );
+        assert!(
+            mentions.len() <= 2,
+            "`{pattern}` warned {} times; one parse warns once:\n{client_log}",
+            mentions.len()
+        );
+        assert!(
+            mentions.iter().all(|l| l.contains(replacement)),
+            "the `{pattern}` warning must name its replacement ({replacement}):\n{client_log}"
         );
     }
-    assert_eq!(
-        count_level(&client_log, "ERROR"),
-        0,
-        "the removed key must not be an error yet:\n{client_log}"
+    for line in &warnings {
+        assert!(
+            REMOVED
+                .iter()
+                .any(|(pattern, _)| line.contains(&format!("`{pattern}`"))),
+            "a removed key is the only thing this path may warn about, got: {line}"
+        );
+        assert!(
+            line.contains("v0.10.0"),
+            "the warning must name the release that removed the key: {line}"
+        );
+    }
+    assert!(
+        visitors >= 1,
+        "the config with removed keys must still start and forward"
     );
+    for (who, log) in [("client", &client_log), ("server", &server_log)] {
+        assert_eq!(
+            count_level(log, "ERROR"),
+            0,
+            "a removed key must not be an error yet ({who}):\n{log}"
+        );
+    }
 }
