@@ -6,7 +6,8 @@ By default, `molehill` forwards traffic as it is (plain TCP). The client's
 byte, and the server accepts whatever the client speaks (its
 `[server.transport]` block only places the Noise keys — there is no
 server-side `type`). The noise-vs-plain benchmark is the price list for
-this choice: see README's configuration guide. This page covers `noise`;
+this choice: see [benchmarks.md](benchmarks.md), "What each configuration
+choice costs". This page covers `noise`;
 `plain` needs no configuration beyond the default.
 
 ## Noise Protocol
@@ -14,9 +15,9 @@ this choice: see README's configuration guide. This page covers `noise`;
 The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight,
 easy-to-configure way to encrypt the connection: one X25519 keypair, no PKI.
 
-`molehill` comes with a reasonable default configuration; see the minimal [noise example](./configuration.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so MITM is no longer a problem.
+`molehill` comes with a reasonable default configuration; see the minimal [noise example](./deployment.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so MITM is no longer a problem.
 
-> **What does ring-accelerated change?** The default build links `snow`'s
+> **What ring-accelerated buys.** The default build links `snow`'s
 > **ring-accelerated** resolver, so the ChaCha20-Poly1305 data path — the
 > hot path for every encrypted byte — runs ring's hardware-dispatched
 > implementation: measured ~1.5x the pure-Rust resolver at the transport

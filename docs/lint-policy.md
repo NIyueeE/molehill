@@ -22,6 +22,12 @@ pre-commit). Changing a lint level or a waiver requires updating this page
 | `todo` | warn | stubs get removed, not accumulated (AGENTS.md §9) |
 | `pedantic` | deny | the whole pedantic clippy group (rust-agents-template parity); members that genuinely do not fit are relaxed per-item in code with a reason, never here |
 
+Deviations from the rust-agents-template lint set: none. The template's
+`clippy::pedantic` (deny) and `missing_docs` (warn) are declared above since the
+lint migration; individual pedantic members that do not fit this codebase are
+relaxed per-item in code — prefer `#[expect(..., reason = "...")]` — under the
+same waiver discipline as every other lint.
+
 ## Waiver discipline
 
 Fix the code first; a waiver is the last resort, and only code-level:
@@ -46,7 +52,7 @@ Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
 (machete, audit, deny, outdated, docs-sync, secret scan, the python gates)
 follow the same discipline.
 
-### Unsafe
+## Unsafe (the one opt-in module)
 
 `unsafe_code` is **deny**, so an unexpected `unsafe` fails a plain
 `cargo build` and not only the `-D warnings` gate. Exactly one module may ask
@@ -60,25 +66,12 @@ for it, per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 
-The FFI waivers are the one place where the "fix the code first" rule runs
-into "no equally reasonable alternative", so the reasoning is recorded here:
+The waivers are sanctioned because no equally reasonable alternative exists: the
+raw syscalls have no `std` equivalent. The analysis that rejected `nix` and
+evaluated `quinn-udp` is recorded in [HANDOFF.md](../HANDOFF.md), "Open threads
+for the next cycle" (the `quinn-udp` A/B entry).
 
-- the raw syscalls have no `std` equivalent; `socket2` (already a dependency)
-  covers everything *except* the batching calls;
-- **`nix` does not remove them.** Its `MultiHeaders<S>` holds
-  `Box<[libc::mmsghdr]>` (raw pointers inside) and is therefore itself
-  `!Send`/`!Sync`, so the three `unsafe impl Send`/`Sync` proofs — the part
-  that carries the real soundness argument — would still be required, at the
-  cost of a new dependency and a per-call `Vec<IoSliceMut>` allocation in the
-  hot path. Verified against `nix` 0.31.3's source, not assumed;
-- **`quinn-udp` could remove all eight** (`UdpSocketState` is a plain
-  `Send + Sync` struct whose `recv`/`send` take caller-owned slice buffers),
-  but it also brings GSO/GRO segmentation, i.e. it changes the send path's
-  syscall shape. That is a measurable change to the KCP data path, so it
-  belongs in its own A/B (`just soak --test=screen`) rather than in a lint
-  cleanup. Recorded as an open thread in HANDOFF.md.
-
-### Test modules
+## Test modules (the one sanctioned module-level waiver)
 
 A `#[cfg(test)] mod tests` may carry a module-level
 `#![expect(clippy::unwrap_used, reason = "tests unwrap values they just
@@ -88,7 +81,7 @@ sanctioned module-level waiver: a test's failure path *is* a panic, so
 waiving per call would bury the assertion under `.expect()` noise. Production
 modules get no such exception.
 
-### Python (ruff)
+## Python (ruff)
 
 The bench/test scripts under `benches/scripts/` are held to the same rule:
 fix the code first. `ruff.toml`'s `ignore` list is reserved for a property
@@ -122,11 +115,3 @@ formatter warns against][com812] — it rewrites exactly the files `ruff format`
 owns, so the two gates would fight over the tree.
 
 [com812]: https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
-
-## Deviations from the rust-agents-template lint set
-
-None. The template's `clippy::pedantic` (deny) and `missing_docs` (warn) are
-declared above since the lint migration. Individual pedantic members that do
-not fit this codebase are relaxed per-item in code — prefer
-`#[expect(..., reason = "...")]` — under the same waiver discipline as
-every other lint.

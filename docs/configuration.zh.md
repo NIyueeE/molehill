@@ -8,9 +8,21 @@
 `molehill --server config.toml`,在客户端运行 `molehill --client config.toml`,
 显式指定运行模式。
 
-在阅读完整配置规范之前,建议先浏览文末的[完整示例](#完整示例)熟悉配置格式。
+开箱即用的配置、systemd 单元与容器部署见[部署与示例](./deployment.zh.md)。
 
 加密与 `transport` 块的更多细节见[传输层文档](./transport.md)。
+
+页面索引:
+
+- [如何配置(v0.7+ 模型)](#如何配置v07-模型)
+- [选择配置(决策树)](#选择配置决策树)
+- [动态服务注册](#动态服务注册)
+- [多路复用(`multiplex` 特性)](#多路复用multiplex-特性)
+- [日志](#日志)
+- [调优](#调优)
+- [示例与部署](#示例与部署)
+- [使用说明](#使用说明)
+- [故障排查](#故障排查)
 
 ## 如何配置(v0.7+ 模型)
 
@@ -138,9 +150,9 @@ flowchart TD
 | `carrier` | `"tcp"`(默认) | 有损与限速路径上表现良好的默认值;前提是网络不封锁 TCP 隧道 |
 | `carrier` | `"kcp"` | TCP 隧道被封锁/限速时的延迟优先 UDP 传输;它不做多路复用,因此需要配合 `noise` + 调高 `max_tunnels` 来拿连接上限 |
 | transport | `"plain"` | 不加密;每字节开销最低 |
-| transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价亚毫秒,满载无 CPU 惩罚 |
-| 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节——回环上 2.0-3.2 ms(M2a),之后池就热了,并可按需长到 `max_tunnels` |
-| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和); **它不会提高服务的报文上限**:该上限**按池**计——实测 1、2、4 个 worker 下,1400 字节数据报分别承载 1.14、1.00、0.98 Gbit/s,16 个与 64 个访客都一样 |
+| transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
+| 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节,之后池就热了,并可按需长到 `max_tunnels` |
+| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型) |
 
 各选项的**实测代价**——这些取舍所依据的数字及其来源——见
 [基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
@@ -199,7 +211,7 @@ transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" =
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:服务的报文上限按池计(实测 1、2、4 个 worker 下 1400 字节数据报为 0.98-1.14 Gbit/s),超出部分会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)
+udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:报文上限是服务自身的属性,不随该值变化(多访客下 1400 字节数据报约 1 Gbit/s 即饱和),超过上限的数据报会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)。实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型)
 udp_forwarder_ipv6 = false # 可选。仅 UDP 服务:UDP 转发器连接本地服务时优先使用 IPv6。默认:false
 udp_buffer_size = 2048 # 可选。UDP 接收缓冲区,单位字节。默认:2048,最大 65535
 udp_idle_timeout = 60 # 可选。客户端上空闲 UDP 对端映射被丢弃的秒数(其本地 socket——即本地服务看到的源端口——随之回收)。默认:60
@@ -277,9 +289,9 @@ FD 占用。
   池。默认:4;`1` 恢复单隧道行为。
 - **实验性(传输层对比选项):** `carrier = "kcp"` 把数据面换成 KCP-over-UDP
   会话而不是 TCP 连接(特性 `kcp`,属于默认特性集)。KCP 是用户态 ARQ 协议,
-  用吞吐换 UDP 会话质量:它在每个实测格子的吞吐都输给 TCP carrier(常常差一个
-  数量级),但丢包和高 RTT 下的 UDP 回声实测更干净(rtt100 下 0% 丢包、最大
-  包间隔约 20 ms,而 TCP 各 arm 在 100 ms 以上),CPU 与 RSS 是数倍。加密栈不变——transport 为 `noise` 时同样的
+  用吞吐换 UDP 会话质量,所以它是 A/B 对比选项而不是默认:与 TCP carrier 的实测
+  对比见[基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
+  加密栈不变——transport 为 `noise` 时同样的
   Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`max_tunnels` 照常生效。
   服务端在第一条声明 `kcp` carrier 的注册到达时才打开 UDP 监听——绑定失败
   会变成精确的注册拒绝;没有 KCP 客户端的服务端永远不会打开 UDP socket。
@@ -371,6 +383,27 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 - **`RUST_LOG=debug` 是排障级别**,内容多是预期之中的:每条连接的细节都在
   那里。
 
+### 诊断开关(按需开启)
+
+五个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`。它们默认关闭,从不
+改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
+永远不会落到任何地方:
+
+| 开关 | 输出 | 内容 |
+|---|---|---|
+| `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
+| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain 与 ARQ update 的粗粒度分相计时 |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、上限、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+load:1->2`、`-idle:2->1`) |
+| `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
+| `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
+
+这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
+就能算出每秒速率与单位成本。pool 与 placement 两行就是共享弹性 pool 的 S1
+观测(它做什么,以及为什么这些数字是聚合而不是逐个事件:
+[internals.md](internals.md#the-tunnel-pool))。`MOLEHILL_STRIPE_COUNT` 是唯一
+一个改变行为而不是观测行为的开关,它记录在 `stripe_count` 旁边——也就是它所
+替换的那个值那里。
+
 ## 调优
 
 按负载选择 `mode`/`max_tunnels`/`carrier`/transport 的方法就是上面的
@@ -395,554 +428,12 @@ keepalive)。因此 `nodelay = false` 无法让这些 socket 重新启用 Nagle�
 如果带宽更重要,可以在每个服务上用 `nodelay = false` 关闭 TCP_NODELAY
 ——只作用于上面那些客户端侧 socket。
 
-## 完整示例
+## 示例与部署
 
-开箱即用的配置(以前作为独立文件放在 `examples/` 目录;现收录于此作为
-参考——以下每个代码块都能被当前二进制解析,配置测试套件会持续校验)。
-
-### 最小配置
-
-一对最小客户端与服务端:
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### 全部选项(完整参考)
-
-```toml
-# Complete client configuration example.
-# Every option is documented in the specification above.
-
-[client]
-default_token = "default_token_if_not_specify" # security-scan:allow documentation placeholder # Optional. Default token for services without their own
-
-[client.control]
-default_remote_addr = "myserver.com:2333" # Necessary. The address of the server
-# default_heartbeat_timeout = 65 # Optional. Unset derives it from the cadence the server declares: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. Below that floor it is refused at startup; 0 disables the check
-default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:延迟从 1 秒开始、按 3 倍增长并带抖动,最高不超过该值(抖动会让单次睡眠最长达到该上限的两倍),共 3 次重试;退避耗尽后客户端回落到固定 1 秒的重试循环。默认:1 秒
-
-# Data-plane options (`[client.data]`) live here too; see the specification.
-# They require the `multiplex` feature, which is part of the default build.
-# Every service may also override mode/carrier on its own block.
-
-[client.transport] # Optional. The whole block is optional
-type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect to the server via a proxy. `socks5` and `http` are supported
-
-[client.transport.noise] # Necessary only if `type` is "noise". See docs/transport.md
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
-
-[client.services.ssh] # A service to forward
-protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
-local_addr = "127.0.0.1:22" # Necessary. The address of the local service
-nodelay = true # Optional. Per-service TCP_NODELAY override. Default: true
-retry_interval = 1 # Optional. Override the global `client.control.default_retry_interval` per service
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.services.dns] # A UDP service example
-protocol = "udp"
-local_addr = "127.0.0.1:53"
-remote_bind_addr = "0.0.0.0:53"
-udp_workers = 2 # 可选。仅 UDP 服务:worker 集合使用多少条数据通道
-udp_forwarder_ipv6 = false # 可选。仅 UDP 服务:转发器连接本地服务时优先使用 IPv6
-```
-
-```toml
-# Complete server configuration example.
-# Every option is documented in the specification above.
-
-[server]
-default_token = "default_token_if_not_specify" # security-scan:allow documentation placeholder # Optional. Default token for services without their own
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["53", "5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; the client derives its timeout from it. Set to 0 to disable. Default: 30 seconds
-
-# Data-plane options (`[server.data]`) live here too; see the specification.
-# They require the `multiplex` feature, which is part of the default build.
-
-[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (the transport selector byte); placing the keys lets the server accept Noise connections too
-[server.transport.noise] # Keys for accepting Noise connections. See docs/transport.md
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
-```
-
-### Noise(加密传输)
-
-用 `molehill --genkey` 生成密钥对,把服务端公钥放到客户端、服务端私钥
-放到服务端(见[传输层文档](./transport.md)):
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo="
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM="
-```
-
-### UDP 服务
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-protocol = "udp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### 服务端与客户端合并到一个文件
-
-配置只含 `[client]` 或 `[server]` 之一时,molehill 自动判断模式;两者都
-在时用命令行显式指定:
-
-```toml
-# config.toml - run: molehill --server config.toml  /  molehill --client config.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### 通过代理连接
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "127.0.0.1:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.transport]
-type = "plain"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
-```
-
-### iperf3 测试服务
-
-同时以 TCP 和 UDP 转发本地 iperf3 服务:
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.iperf3-udp]
-protocol = "udp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.services.iperf3-tcp]
-protocol = "tcp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-## 部署
-
-### systemd
-
-把 molehill 作为 systemd 服务运行,支持 root 与 rootless,以及多实例。
-单元名中 `molehills` 代表 `molehill --server`,`molehillc` 代表
-`molehill --client`,`molehill` 是自动判断模式。单元名里的 `@` 表示按
-配置文件实例化。配置文件建议权限 `600`(内含共享 token)。
-
-```ini
-# molehills@.service - 每个配置一个服务端实例:systemctl enable molehills@app1 --now
-[Unit]
-Description=Molehill Server Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -s /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -s %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehills.service - 单服务端实例
-[Unit]
-Description=Molehill Server Service
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -s /etc/molehill/molehill.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -s %h/.local/etc/molehill/molehill.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehillc@.service - 每个配置一个客户端实例:systemctl enable molehillc@app1 --now
-[Unit]
-Description=Molehill Client Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -c %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehillc.service - 单客户端实例
-[Unit]
-Description=Molehill Client Service
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -c /etc/molehill/molehill.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -c %h/.local/etc/molehill/molehill.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehill@.service - 自动判断模式,每个配置一个实例
-[Unit]
-Description=Molehill Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-root 方式(假设 `molehill` 在 `/usr/bin`,配置在
-`/etc/molehill/app1.toml`):
-
-```bash
-sudo cp molehills@.service /etc/systemd/system/
-sudo mkdir -p /etc/molehill        # 然后在里面创建 app1.toml
-sudo systemctl daemon-reload
-sudo systemctl enable molehills@app1 --now
-```
-
-rootless 方式(假设 `molehill` 在 `~/.local/bin`,配置在
-`~/.local/etc/molehill/app1.toml`):先取消单元里 `%h` 那行 ExecStart 的
-注释,然后:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp molehills@.service ~/.config/systemd/user/
-mkdir -p ~/.local/etc/molehill    # 然后在里面创建 app1.toml
-systemctl --user daemon-reload
-systemctl --user enable molehills@app1 --now
-```
-
-多实例:再加一个配置(`app2.toml`)并 `enable molehills@app2`(`molehillc@.service`
-与 `molehill@.service` 同理)。
-
-### 容器
-
-官方镜像 `ghcr.io/niyueee/molehill:latest` 是 `scratch` 上的单个静态
-musl 二进制(约 1.2 MiB),以非 root UID 1000 运行,**不含任何配置**——把
-自己的 `server.toml` / `client.toml` 只读挂载到 `/app/server.toml`
-(或 `/app/client.toml`),把文件名作为命令行参数传入。
-
-```bash
-docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
-  ghcr.io/niyueee/molehill:latest server.toml
-```
-
-镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
-`multiplex`、`kcp`),所以 `default_carrier = "kcp"` 不需要换镜像。想要可
-复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.9.0`),而不是
-用 `:latest`。
-
-以 UID 1000 运行带来两个后果:
-
-- 挂载进去的配置文件必须对 UID 1000 可读——`chmod 644`(或 `chown 1000`),
-  否则容器会以权限错误退出。
-- **host** 网络下进程无法绑定 1024 以下的端口(生效的是宿主机的
-  `ip_unprivileged_port_start`,通常是 1024),所以所有 `remote_bind_addr`
-  以及 control/data 监听端口都要 ≥ 1024。bridge 网络下容器自己的 netns
-  通常允许低位端口,但通用的做法一样:容器端口保持高位,把特权宿主端口
-  映射上去(`-p 80:8080`,配置里写
-  `remote_bind_addr = "0.0.0.0:8080"`)。
-
-Docker / Podman Compose(host 网络——Linux 下最简单;服务端需要暴露任意
-服务端口):
-
-```yaml
-# compose.yaml - usage: docker compose up -d  (or: podman compose up -d)
-services:
-  molehill-server:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-server
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./server.toml:/app/server.toml:ro
-    command: server.toml
-
-  molehill-client:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-client
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./client.toml:/app/client.toml:ro
-    command: client.toml
-```
-
-桥接网络变体(用于 Docker Desktop 的 macOS/Windows);此时客户端通过
-compose 网络的 DNS 名访问服务端,因此 `client.toml` 里要写
-`default_remote_addr = "molehill-server:2333"`:
-
-```yaml
-# compose.bridge.yaml - usage: docker compose -f compose.bridge.yaml up -d
-services:
-  molehill-server:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-server
-    restart: unless-stopped
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./server.toml:/app/server.toml:ro
-    command: server.toml
-    ports:
-      - "2333:2333"     # 控制通道与 TCP 数据面(客户端连接到这里)
-      - "2333:2333/udp" # KCP 数据面,仅当服务使用 carrier = "kcp" 时需要
-      - "5202:5202"     # 暴露的 SSH 服务
-
-  molehill-client:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-client
-    restart: unless-stopped
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./client.toml:/app/client.toml:ro
-    command: client.toml
-```
-
-Podman Quadlet——`.container` 文件把镜像变成 systemd 服务(root:复制到
-`/etc/containers/systemd/`,`daemon-reload`,`systemctl enable --now
-molehill-server`;rootless:复制到 `~/.config/containers/systemd/`,用
-`systemctl --user`,并把 `WantedBy=` 改成 `default.target`):
-
-```ini
-# molehill-server.container
-[Unit]
-Description=Molehill server (container)
-After=network-online.target
-Wants=network-online.target
-
-[Container]
-Image=ghcr.io/niyueee/molehill:latest
-Volume=/etc/molehill/server.toml:/app/server.toml:ro
-Network=host
-Environment=RUST_LOG=info
-Exec=server.toml
-
-[Service]
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehill-client.container
-[Unit]
-Description=Molehill client (container)
-After=network-online.target
-Wants=network-online.target
-
-[Container]
-Image=ghcr.io/niyueee/molehill:latest
-Volume=/etc/molehill/client.toml:/app/client.toml:ro
-Network=host
-Environment=RUST_LOG=info
-Exec=client.toml
-
-[Service]
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
+常见场景的完整示例(最小配置、Noise、UDP、合并一个文件、代理、iperf3)、
+systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./deployment.zh.md)。
 
 ## 使用说明
-
-### 网络要求
-
-- **服务端**必须能从互联网访问:`server.control.bind_addr`、
-  `server.data.bind_addr`(设置时)和每个注册的 `remote_bind_addr` 都需要
-  入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。服务使用
-  `carrier = "kcp"` 时还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
-  `server.data.bind_addr`,默认就是控制端口,同一端口号上 TCP 与 UDP 并存。
-- **客户端**只需要到 `server.control.bind_addr` 的出站访问(数据端点不同时
-  也包括它;TCP,`carrier = "kcp"` 时还包括 UDP);NAT 后不需要任何入站端口。
-- 容器部署:镜像以 UID 1000 运行,无法绑定 1024 以下的端口——端口与配置
-  文件权限的后果见[容器](#容器)。
-- `client.control.default_remote_addr` 必须与 `server.control.bind_addr` 使用相同的
-  端口,除非服务端改动了控制监听地址。
-
-### 安全
-
-- 共享 token 是强制的。使用长随机值。
-- `allow_ports` 是你的授权边界:只列出客户端真正需要的端口。没有它,无论
-  客户端请求什么,服务端都不会暴露任何东西。
-- 配置文件以明文包含 token,请限制其权限(如 `chmod 600 config.toml`)。
-  token 在日志中被掩码显示(`MASKED`)。
-- 流量穿越不受信任的网络时使用 `noise` 传输;明文 `plain` 是不加密转发的。
-- Noise 私钥同样是机密。
 
 ### 心跳
 
@@ -983,9 +474,7 @@ WantedBy=multi-user.target
 - **会话亲和**:来自一个访客地址的所有数据报走同一条数据通道,并在访客的
   整个会话期间通过客户端上一个专用本地 socket 离开——有状态 UDP 服务
   (Minecraft Bedrock/RakNet、QUIC、WireGuard 等游戏服务器)会看到稳定的
-  `(ip, port)`,会话保持完整。`udp_workers` 把*不同的访客*分片到不同通道以
-  并行;绝不会把同一个访客拆到多个通道,隧道池也至少保留这些通道所需的
-  隧道数。
+  `(ip, port)`,会话保持完整。
 - 映射(及其本地 socket)在 `udp_idle_timeout` 秒(默认 60)内双向无流量后
   被清理;下一个数据报会重新绑定新 socket,这改变了本地服务看到的源端口。
   保持默认值,或对长生命周期的有状态会话调大它。
@@ -1013,7 +502,7 @@ WantedBy=multi-user.target
   多个客户端也可以连接同一个服务端。每个注册的服务名在同一服务端的所有
   客户端之间必须唯一。
 - 在一台主机上运行多个独立的 molehill 对时,让各实例的监听 `bind_addr`
-  使用不同的端口,并使用独立的配置文件([systemd 单元](#systemd)展示了模板化实例)。
+  使用不同的端口,并使用独立的配置文件([systemd 单元](./deployment.zh.md#systemd)展示了模板化实例)。
 
 ## 故障排查
 

@@ -19,15 +19,15 @@ with `curl -LsSf https://astral.sh/uv/install.sh | sh` (AGENTS.md §1).
 
 The authoritative gate tables — every command, what it does, and what to do
 when a gate blocks you — live in [docs/checks.md](docs/checks.md). In short:
-fast gates (fmt, secret scan, machete, docs↔code alignment, ruff lint +
-format, strict clippy ×2) on every commit, heavy gates (audit, deny, outdated,
-serial tests) on every push, and CI runs the whole chain via `just check`
-plus the feature powerset, the per-feature test matrix, the minimal-size
-check, the musl static build, and 4-platform builds.
+fast gates run on every commit, heavy gates on every push, and CI runs the
+same chain via `just check` plus the extra jobs `just check` cannot cover
+(feature powerset, the per-feature test matrix, the minimal-size check, the
+musl static build, the platform builds).
 
 The full discipline — including when a lint waiver is acceptable — lives in
-[AGENTS.md](AGENTS.md). In short: fix code first; waivers are code-level,
-minimal scope, with a reason comment; never weaken the checks.
+[AGENTS.md](AGENTS.md) §2 and [docs/lint-policy.md](docs/lint-policy.md). In
+short: fix code first; waivers are code-level, minimal scope, with a reason
+comment; never weaken the checks.
 
 ## Commit messages
 

@@ -4,8 +4,9 @@
 What every file and directory in this repository is for, and which page owns
 which topic (see "Documentation responsibilities" below — the ownership
 contract, not just a list). Deeper docs: [configuration](configuration.md),
-[transport](transport.md), [benchmarks](benchmarks.md),
-[internals](internals.md), [build guide](build-guide.md).
+[deployment](deployment.md), [transport](transport.md),
+[benchmarks](benchmarks.md), [internals](internals.md),
+[build guide](build-guide.md).
 
 ## Root
 
@@ -21,6 +22,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `.editorconfig` | editor defaults (4-space Rust, 2-space YAML/TOML, md keeps trailing spaces) |
 | `AGENTS.md` | repository rules for AI agents and humans; entry point for every session |
 | `HANDOFF.md` | current working state, decisions, open threads — read after AGENTS.md |
+| `HANDOFF-archive.md` | the closed half: incidents, superseded sweeps, measurement records and retracted diagnoses, indexed at the top |
 | `CHANGELOG.md` | single source of release notes (Keep a Changelog); gates releases |
 | `CONTRIBUTING.md` / `SECURITY.md` | contributor setup; private vulnerability reporting |
 | `README.md` / `README.zh.md` | bilingual landing pages; must document edition, channel, `just setup`, `just check`, hooks activation |
@@ -77,7 +79,8 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the session cases, the control-channel teardown case, valid/invalid configs |
 | `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`), the interop fetcher (`scripts/interop/fetch_old.py`), the UDP stress probe (`scripts/udp_stress.py`) |
-| `docs/configuration.md` (Complete examples / Deployment) | ready-to-run configs and systemd/container deployment files, as code blocks (previously the `examples/` directory) |
+| `docs/configuration.md` | every setting: meaning, default, allowed values, logging, tuning, troubleshooting, and the decision tree |
+| `docs/deployment.md` (+ `.zh.md`) | ready-to-run configurations for common scenarios, systemd units, container/compose/Quadlet recipes, network requirements, deployment security |
 | `docs/benchmarks.md` (+ `.zh.md`) | how the published numbers are produced, read and reproduced — the home of the benchmark method |
 | `docs/` | documentation set — one owner per topic, everything else links (see below) |
 
@@ -85,24 +88,15 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 
 **One topic, one home.** Every fact is written once, in the page that owns it,
 and every other page links to it. A fact written twice is a fact that will go
-stale in one of the two places — this table is the contract, and AGENTS.md §3
-carries the same routing rule for the moment a change is written.
-
-Two rules follow from it, and both have been broken before:
-
-- **No repository history in a user-facing page.** What replaced what, why a
-  model or design changed, and incident post-mortems are `CHANGELOG.md` (what
-  changed) or `HANDOFF.md` (why, and what it cost). A user page states what is
-  true now. Exception: an *upgrade instruction* a reader must act on — the
-  configuration page's old→new key migration callouts — stays where the reader
-  needs it; only the narrative around it belongs in the changelog.
-- **No contributor-page links from a user-facing page.** `HANDOFF.md`,
-  `AGENTS.md` and `docs/checks.md` are for people changing the repository.
+stale in one of the two places — this table is the contract. AGENTS.md §3
+routes by it, and carries the two rules that follow from it (what a user page
+must never explain, and who a user page may link to).
 
 | Doc | Audience | Owns | Does **not** own |
 |-----|----------|------|------------------|
 | `README.md` + `.zh.md` | users | the landing page: what molehill is, quick start, the published numbers, the docs index | method, release mechanics, configuration reference |
-| `configuration.md` + `.zh.md` | users | every setting: meaning, default, allowed values, logging, tuning, troubleshooting | measured costs (→ benchmarks), release history |
+| `configuration.md` + `.zh.md` | users | every setting: meaning, default, allowed values, logging, tuning, troubleshooting | measured costs (→ benchmarks), release history, the recipes (→ deployment) |
+| `deployment.md` + `.zh.md` | users | how to stand it up: worked examples, systemd units, container/compose/Quadlet recipes, network requirements, deployment security | what a setting means (→ configuration), measured costs (→ benchmarks) |
 | `transport.md` + `.zh.md` | users | Noise transport setup: keys, patterns, resume | configuration reference, measured costs |
 | `benchmarks.md` + `.zh.md` | users | the benchmark method: what is measured, how to read the charts, the stage schedule, the SLO, the test types, per-decision measurements, comparability, how to reproduce a run (including the two-build screen) | the release ritual and its gate (→ release), configuration reference |
 | `build-guide.md` | contributors | building from source, feature flags, minimal binaries | gate tables, release mechanics |
@@ -110,8 +104,9 @@ Two rules follow from it, and both have been broken before:
 | `checks.md` | contributors | gate tables: every command a hook runs and how to handle a block | lint levels, release mechanics |
 | `lint-policy.md` | contributors | declared lints, waiver discipline (Rust and python) | what the gates run |
 | `release.md` | contributors | release mechanics, versioning, CD test builds, the per-tag benchmark *ritual* and its gate | the measurement method (→ benchmarks) |
-| `structure.md` | contributors | this map — what every file is for, and which page owns which topic | any topic's content |
-| `HANDOFF.md` | contributors | working state: decisions, incidents, measurement records, open threads | anything a user needs |
+| `structure.md` | contributors | this map — what every file is for, and which page owns which topic (the routing table AGENTS.md §3 points to) | any topic's content |
+| `HANDOFF.md` | contributors | working state: decisions, open threads, the release checklist | anything a user needs, and the closed records (→ HANDOFF-archive.md) |
+| `HANDOFF-archive.md` | contributors | the closed records: incidents, superseded sweeps, measurement records, retracted diagnoses | the current state (→ HANDOFF.md) |
 | `AGENTS.md` | contributors | the rules that bind future changes (§2 lint, §5 release, §10 measurement) | topic content |
 | `CHANGELOG.md` | users | what changed, per release | design rationale |
-| `*.zh.md` | users | Chinese mirrors of the user-facing docs (`README`, `configuration`, `transport`, `benchmarks`) — governance and contributor docs are English-only by decision | — |
+| `*.zh.md` | users | Chinese mirrors of the user-facing docs (`README`, `configuration`, `deployment`, `transport`, `benchmarks`) — governance and contributor docs are English-only by decision | — |

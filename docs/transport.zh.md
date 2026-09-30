@@ -4,19 +4,20 @@
 `[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
 决定**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
 语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
-`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见 README 的
-配置指南。本文只讲 `noise`;`plain` 除默认值外无需任何配置。
+`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见
+[benchmarks.md](benchmarks.md)的「每个配置选择的代价」。本文只讲
+`noise`;`plain` 除默认值外无需任何配置。
 
 ## Noise 协议
 
 [Noise 协议](http://noiseprotocol.org/noise.html)是轻量、易配置的传输加密
 方式:一对 X25519 密钥对,不需要 PKI。
 
-`molehill` 自带合理的默认配置;见[noise 示例](./configuration.zh.md#noise加密传输)。默认
+`molehill` 自带合理的默认配置;见[noise 示例](./deployment.zh.md#noise加密传输)。默认
 pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不再有
 中间人(MITM)问题。
 
-> **ring-accelerated 改变了什么?** 默认构建链接了 `snow` 的
+> **ring-accelerated 带来了什么。** 默认构建链接了 `snow` 的
 > **ring-accelerated** resolver,于是 ChaCha20-Poly1305 数据路径——每个
 > 加密字节的热路径——走 ring 的硬件分派实现:x86-64 上传输层实测约为
 > 纯 Rust resolver 的 1.5 倍,端到端约 1.3 倍。pattern 的哈希(默认

@@ -4,11 +4,22 @@
 
 But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `molehill --server config.toml` and on the client side, run `molehill --client config.toml` to explicitly tell `molehill` the running mode.
 
-Before heading to the full configuration specification, it's recommended
-to skim the [complete examples](#complete-examples) to get a feeling of the
-configuration format.
+Ready-to-run configurations, systemd units and container deployments live
+in [Deployment & examples](./deployment.md).
 
 See [Transport](./transport.md) for more details about encryption and the `transport` block.
+
+Page index:
+
+- [How to configure (v0.7+ model)](#how-to-configure-v07-model)
+- [Choosing your configuration (decision tree)](#choosing-your-configuration-decision-tree)
+- [Dynamic service registration](#dynamic-service-registration)
+- [Multiplexing (`multiplex` feature)](#multiplexing-multiplex-feature)
+- [Logging](#logging)
+- [Tuning](#tuning)
+- [Examples & deployment](#examples--deployment)
+- [Usage notes](#usage-notes)
+- [Troubleshooting](#troubleshooting)
 
 ## How to configure (v0.7+ model)
 
@@ -139,9 +150,9 @@ flowchart TD
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
 | `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + a raised `max_tunnels` for the ceiling |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
-| transport | `"noise"` | encrypted wire with a single pre-shared keypair; a sub-millisecond RTT cost and no CPU penalty under full load |
-| cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move — 2.0-3.2 ms on loopback (M2a), then it is warm again up to `max_tunnels` |
-| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). **It does not raise the service's datagram ceiling**, which is per pool: measured, 1, 2 and 4 workers carried 1.14, 1.00 and 0.98 Gbit/s of 1400-byte datagrams on one host, with 16 or 64 visitors alike |
+| transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
+| cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move, then the pool is warm again up to `max_tunnels` |
+| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model) |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -202,7 +213,7 @@ transport = { type = "plain" } # Optional. Per-service transport override: `type
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. This is a fan-out, not a capacity knob: the service's datagram ceiling is per pool (measured 0.98-1.14 Gbit/s of 1400-byte datagrams at 1, 2 and 4 workers), and datagrams beyond it are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`)
+udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model)
 udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
@@ -293,11 +304,10 @@ handshake) and cuts FD usage under many concurrent visitors.
 - **Experimental (transport comparison arms):** `carrier = "kcp"` runs the
   data plane as KCP-over-UDP sessions instead of TCP connections (feature
   `kcp`, in the default set). KCP is a userspace ARQ protocol that trades
-  throughput for UDP session quality: it loses to the TCP carriers in every
-  measured cell (often by an order of magnitude) while its UDP echo is
-  measurably cleaner under loss and at high RTT (0% loss and a ~20 ms max
-  inter-packet gap at rtt100, where the TCP arms sit above 100 ms), at
-  several times the CPU and RSS. The crypto stack is unchanged — with
+  throughput for UDP session quality, so treat it as an A/B arm rather than
+  a default: the measured comparison against the TCP carriers is in
+  [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
+  The crypto stack is unchanged — with
   transport `noise` the same Noise handshake wraps each KCP session — and
   yamux still carries the data channels, so `max_tunnels` applies as usual. The
   server opens its UDP listener lazily — the first registration that
@@ -397,11 +407,34 @@ Consequences worth stating, because they are what keeps a busy log readable:
 - **A repeating condition is reported once.** A client that starts before its server, or retries with the wrong token, produces one `INFO`/`WARN` and then `DEBUG` until it recovers; a healthy run emits no `WARN` or `ERROR` at all. `tests/log_budget_test.rs` measures exactly that against the real binary, so the guarantee is enforced rather than intended.
 - **`RUST_LOG=debug` is the troubleshooting level** and is expected to be voluminous: it is where per-connection detail lives.
 
+### Diagnostics switches (opt-in)
+
+Five environment variables turn on aggregated diagnostics, one `INFO` line per
+second per subject. They are off by default, they never change the forwarding
+path, and turning one on is the consent — a line an operator would have to
+raise `RUST_LOG` to see never reaches anything:
+
+| Switch | Emitted | Carries |
+|---|---|---|
+| `MOLEHILL_MUX_STATS=1` | one line per second per tunnel | cumulative yamux framing counters (`written`, `read`, `bytes`) — frames per second, and with a CPU sample, CPU per frame |
+| `MOLEHILL_KCP_STATS=1` | one line per second per process | the KCP adapter's cumulative counters (`datagrams_in`/`out`, `retransmits`, `acks_out`, `sacks_sent`, `blobs_out`, pump rounds) and the coarse per-phase timings that split a segment's userspace cost into intake, delivery, writer drain, wire drain and ARQ update |
+| `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, cap, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+load:1->2`, `-idle:2->1`) |
+| `MOLEHILL_PLACEMENT_STATS=1` | one line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
+| `MOLEHILL_UDP_STATS=1` | one line per second per process | the UDP affinity table's size, its evictions, and each worker's pinned peers |
+
+The counters are cumulative, so a reader that knows the window — or takes the
+first and the last line of a run — gets per-second rates and cost per unit. The
+pool and placement lines are the S1 observation of the shared elastic pool
+(what it does, and why the numbers are aggregated rather than per event:
+[internals.md](internals.md#the-tunnel-pool)). `MOLEHILL_STRIPE_COUNT` is the
+one switch that changes behaviour rather than observing it; it is documented
+beside `stripe_count`, the value it replaces.
+
 ## Tuning
 
 The step-by-step way to pick `mode`/`max_tunnels`/`carrier`/transport for
 your workload is the [decision tree](#choosing-your-configuration-decision-tree)
-above (with the measured costs and how to validate). This section covers
+above (with the trade-offs and how to validate them). This section covers
 the per-connection knobs.
 
 From v0.4.7, molehill enables TCP_NODELAY by default on every TCP connection: the control channel, the data-plane tunnels, both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
@@ -412,552 +445,13 @@ TCP keepalive is also enabled by default on these sockets (20s idle time, 8s pro
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service — on the client-side sockets above.
 
-## Complete examples
-
-Ready-to-run configurations (previously shipped as separate files under
-`examples/`; reproduced here as reference — every block below parses with
-the current binary, enforced by the config test suite).
-
-### Minimal
-
-A minimal client and server pair:
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### Every option (full reference)
-
-```toml
-# Complete client configuration example.
-# Every option is documented in the specification above.
-
-[client]
-default_token = "default_token_if_not_specify" # security-scan:allow documentation placeholder # Optional. Default token for services without their own
-
-[client.control]
-default_remote_addr = "myserver.com:2333" # Necessary. The address of the server
-# default_heartbeat_timeout = 65 # Optional. Unset derives it from the cadence the server declares: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. Below that floor it is refused at startup; 0 disables the check
-default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
-
-# Data-plane options (`[client.data]`) live here too; see the specification.
-# They require the `multiplex` feature, which is part of the default build.
-# Every service may also override mode/carrier on its own block.
-
-[client.transport] # Optional. The whole block is optional
-type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect to the server via a proxy. `socks5` and `http` are supported
-
-[client.transport.noise] # Necessary only if `type` is "noise". See docs/transport.md
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
-
-[client.services.ssh] # A service to forward
-protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
-local_addr = "127.0.0.1:22" # Necessary. The address of the local service
-nodelay = true # Optional. Per-service TCP_NODELAY override. Default: true
-retry_interval = 1 # Optional. Override the global `client.control.default_retry_interval` per service
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.services.dns] # A UDP service example
-protocol = "udp"
-local_addr = "127.0.0.1:53"
-remote_bind_addr = "0.0.0.0:53"
-udp_workers = 2 # Optional. UDP services only: how many data channels the worker set uses
-udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the forwarder's connection to the local service
-```
-
-```toml
-# Complete server configuration example.
-# Every option is documented in the specification above.
-
-[server]
-default_token = "default_token_if_not_specify" # security-scan:allow documentation placeholder # Optional. Default token for services without their own
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["53", "5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; the client derives its timeout from it. Set to 0 to disable. Default: 30 seconds
-
-# Data-plane options (`[server.data]`) live here too; see the specification.
-# They require the `multiplex` feature, which is part of the default build.
-
-[server.transport] # Optional. Keys only - no `type`: the client decides whether a connection is encrypted (the transport selector byte); placing the keys lets the server accept Noise connections too
-[server.transport.noise] # Keys for accepting Noise connections. See docs/transport.md
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
-```
-
-### Noise (encrypted transport)
-
-Generate a keypair with `molehill --genkey`, put the client's copy of the
-server's public key on the client and the server's private key on the
-server (see [Transport](./transport.md)):
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo="
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM="
-```
-
-### UDP service
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-protocol = "udp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### Server and client in one file
-
-molehill can determine the mode from the config when only one of
-`[client]` / `[server]` is present; with both, pass the mode explicitly:
-
-```toml
-# config.toml - run: molehill --server config.toml  /  molehill --client config.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-### Connect through a proxy
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "127.0.0.1:2333"
-
-[client.services.foo1]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.transport]
-type = "plain"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
-```
-
-### iperf3 test services
-
-Forward a local iperf3 server over both TCP and UDP:
-
-```toml
-# client.toml
-[client]
-default_token = "123"
-
-[client.control]
-default_remote_addr = "localhost:2333"
-
-[client.services.iperf3-udp]
-protocol = "udp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-
-[client.services.iperf3-tcp]
-protocol = "tcp"
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:5202"
-```
-
-```toml
-# server.toml
-[server]
-default_token = "123"
-# Master switch for dynamic registration: empty/missing = all registrations rejected
-allow_ports = ["5202"]
-
-[server.control]
-bind_addr = "0.0.0.0:2333"
-```
-
-## Deployment
-
-### systemd
-
-Run molehill as a systemd service, with root or rootless, including
-multiple instances. In the unit names, `molehills` stands for
-`molehill --server`, `molehillc` for `molehill --client`, and `molehill`
-for the auto-detect mode. The `@` in a unit name instantiates it per config
-file. Store config files with permission `600` (they contain the shared
-token).
-
-```ini
-# molehills@.service - one server instance per config: systemctl enable molehills@app1 --now
-[Unit]
-Description=Molehill Server Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -s /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -s %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehills.service - a single server instance
-[Unit]
-Description=Molehill Server Service
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -s /etc/molehill/molehill.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -s %h/.local/etc/molehill/molehill.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehillc@.service - one client instance per config: systemctl enable molehillc@app1 --now
-[Unit]
-Description=Molehill Client Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -c %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehillc.service - a single client instance
-[Unit]
-Description=Molehill Client Service
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill -c /etc/molehill/molehill.toml
-# without root
-# ExecStart=%h/.local/bin/molehill -c %h/.local/etc/molehill/molehill.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehill@.service - auto-detect mode, one instance per config
-[Unit]
-Description=Molehill Service (%i)
-After=network.target
-
-[Service]
-Type=simple
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-# with root
-ExecStart=/usr/bin/molehill /etc/molehill/%i.toml
-# without root
-# ExecStart=%h/.local/bin/molehill %h/.local/etc/molehill/%i.toml
-
-[Install]
-WantedBy=multi-user.target
-```
-
-With root (assuming `molehill` in `/usr/bin` and configs under
-`/etc/molehill/app1.toml`):
-
-```bash
-sudo cp molehills@.service /etc/systemd/system/
-sudo mkdir -p /etc/molehill        # then create app1.toml inside
-sudo systemctl daemon-reload
-sudo systemctl enable molehills@app1 --now
-```
-
-Without root (assuming `molehill` in `~/.local/bin` and configs under
-`~/.local/etc/molehill/app1.toml`): uncomment the `%h` ExecStart line in
-the unit, then:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp molehills@.service ~/.config/systemd/user/
-mkdir -p ~/.local/etc/molehill    # then create app1.toml inside
-systemctl --user daemon-reload
-systemctl --user enable molehills@app1 --now
-```
-
-Multiple instances: add another config (`app2.toml`) and enable
-`molehills@app2` (same for `molehillc@.service` and `molehill@.service`).
-
-### Container
-
-The official image `ghcr.io/niyueee/molehill:latest` is a single static
-musl binary on `scratch` (~1.2 MiB), runs as non-root UID 1000 and contains
-**no configuration** — mount your own `server.toml` / `client.toml`
-read-only at `/app/server.toml` (or `/app/client.toml`) and pass its name
-as the command-line argument.
-
-```bash
-docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
-  ghcr.io/niyueee/molehill:latest server.toml
-```
-
-The image carries the full default feature set (`server`, `client`, `noise`,
-`hot-reload`, `multiplex`, `kcp`), so `default_carrier = "kcp"` needs no
-different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
-instead of `:latest` when you want reproducible upgrades.
-
-Two consequences of running as UID 1000:
-
-- The mounted config must be readable by UID 1000 — `chmod 644` it (or
-  `chown 1000`), otherwise the container exits with a permission error.
-- Under **host** networking the process cannot bind ports below 1024 (the
-  host's `ip_unprivileged_port_start`, normally 1024, applies), so every
-  `remote_bind_addr` and the control/data listeners need ports ≥ 1024. Under
-  bridge networking the container's own namespace usually allows low ports,
-  but the portable recipe is the same: keep the container port high and map
-  the privileged host port onto it (`-p 80:8080` with
-  `remote_bind_addr = "0.0.0.0:8080"`).
-
-Docker / Podman Compose (host networking — simplest on Linux; the server
-must expose arbitrary service ports):
-
-```yaml
-# compose.yaml - usage: docker compose up -d  (or: podman compose up -d)
-services:
-  molehill-server:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-server
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./server.toml:/app/server.toml:ro
-    command: server.toml
-
-  molehill-client:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-client
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./client.toml:/app/client.toml:ro
-    command: client.toml
-```
-
-Bridge-network variant for Docker Desktop (macOS/Windows); the client then
-reaches the server through the compose DNS name, so set
-`default_remote_addr = "molehill-server:2333"` in `client.toml`:
-
-```yaml
-# compose.bridge.yaml - usage: docker compose -f compose.bridge.yaml up -d
-services:
-  molehill-server:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-server
-    restart: unless-stopped
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./server.toml:/app/server.toml:ro
-    command: server.toml
-    ports:
-      - "2333:2333"     # Control channel and TCP data plane (clients connect here)
-      - "2333:2333/udp" # KCP data plane, only when a service uses carrier = "kcp"
-      - "5202:5202"     # Exposed SSH service
-
-  molehill-client:
-    image: ghcr.io/niyueee/molehill:latest
-    container_name: molehill-client
-    restart: unless-stopped
-    environment:
-      RUST_LOG: info
-    volumes:
-      - ./client.toml:/app/client.toml:ro
-    command: client.toml
-```
-
-Podman Quadlet — a `.container` file turns the image into a systemd
-service (root: copy to `/etc/containers/systemd/`, `daemon-reload`,
-`systemctl enable --now molehill-server`; rootless: copy to
-`~/.config/containers/systemd/`, use `systemctl --user`, and change
-`WantedBy=` to `default.target`):
-
-```ini
-# molehill-server.container
-[Unit]
-Description=Molehill server (container)
-After=network-online.target
-Wants=network-online.target
-
-[Container]
-Image=ghcr.io/niyueee/molehill:latest
-Volume=/etc/molehill/server.toml:/app/server.toml:ro
-Network=host
-Environment=RUST_LOG=info
-Exec=server.toml
-
-[Service]
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```ini
-# molehill-client.container
-[Unit]
-Description=Molehill client (container)
-After=network-online.target
-Wants=network-online.target
-
-[Container]
-Image=ghcr.io/niyueee/molehill:latest
-Volume=/etc/molehill/client.toml:/app/client.toml:ro
-Network=host
-Environment=RUST_LOG=info
-Exec=client.toml
-
-[Service]
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
+## Examples & deployment
+
+Worked examples for the common scenarios — minimal, Noise, UDP, one file,
+proxy, iperf3 — plus the systemd units and the container / compose / Quadlet
+deployments are in [Deployment & examples](./deployment.md).
 
 ## Usage notes
-
-### Network requirements
-
-- The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server). Add the matching **UDP** port whenever a service uses `carrier = "kcp"` — the KCP listener binds `server.data.bind_addr`, i.e. the control port by default, and TCP plus UDP coexist on that port number.
-- The **client** only needs outbound access to `server.control.bind_addr` (and the data endpoint when it differs; TCP, plus UDP for `carrier = "kcp"`); no inbound port is required behind the NAT.
-- Running in a container: the image runs as UID 1000 and cannot bind ports below 1024 — see [Container](#container) for the port and config-permission consequences.
-- `client.control.default_remote_addr` must use the same port as `server.control.bind_addr` unless the server moved its control listener.
-
-### Security
-
-- The shared token is mandatory. Use long random values.
-- `allow_ports` is your authorization boundary: only list what clients genuinely need. Without it, the server exposes nothing regardless of what clients request.
-- The config file contains tokens in plain text, so restrict its permissions (e.g. `chmod 600 config.toml`). Tokens are masked (`MASKED`) in logs.
-- Use the `noise` transport when traffic traverses untrusted networks; `plain` forwards unencrypted.
-- Noise private keys are secrets too.
 
 ### Heartbeat
 
@@ -975,7 +469,7 @@ WantedBy=multi-user.target
 ### UDP services
 
 - The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535): a datagram larger than it is **truncated to that size** on the way in — the first `udp_buffer_size` bytes are delivered and the rest is discarded — so the channel stays usable but the payload is short. Measured on a `udp_buffer_size = 1024` service: a 2000-byte datagram arrives at the backend as 1024 bytes and its reply reaches the visitor as 1024 bytes. Size it for the largest datagram the service sends, configure it identically on both ends, and remember that the server enforces its own copy received at registration time.
-- **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `udp_workers` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels, and the pool keeps at least the tunnels those channels need.
+- **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact.
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 
 ### Transports
@@ -997,7 +491,7 @@ above and follow that guide.
 ### Multiple services and instances
 
 - One client config can forward many services (multiple `[client.services.<name>]` blocks), and several clients can connect to the same server. Each registered service name must be unique across all clients of a server.
-- To run several independent molehill pairs on one host, use different ports for the control and data listeners and separate config files (the [systemd units](#systemd) show templated instances).
+- To run several independent molehill pairs on one host, use different ports for the control and data listeners and separate config files (the [systemd units](./deployment.md#systemd) show templated instances).
 
 ## Troubleshooting
 

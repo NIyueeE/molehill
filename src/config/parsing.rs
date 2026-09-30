@@ -1072,7 +1072,7 @@ mod tests {
     /// that schema are feature-gated: `[client.data]` and `[server.data]` need
     /// `multiplex`, so a fixture carrying them is meaningless — and parses as
     /// *unknown field* — in the `--no-default-features --features server,client`
-    /// leg CI runs (AGENTS.md §12). Such a fixture says so on a leading comment
+    /// leg CI runs (AGENTS.md §11). Such a fixture says so on a leading comment
     /// line, the way an invalid fixture declares `# expect:`:
     ///
     /// ```toml

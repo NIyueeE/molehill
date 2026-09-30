@@ -37,16 +37,12 @@ consequences are in [internals.md](internals.md), "Protocol versions".
 ## Tag-push policy: no casual release pushes
 
 Commits are always allowed — the fast gates guard them and they trigger
-nothing public. Pushing a `v*` tag is a deliberate release act; the five
-preconditions (explicit human request, `Cargo.toml` version match, dated
-changelog section, green `just check`, green benchmark gate — see below) are
-the repository rule stated in [AGENTS.md §5](../AGENTS.md) — the release
-workflow enforces the version and changelog ones mechanically, and the local
-tag review (`githooks/pre-tag`, next section) checks most of them before the
-tag exists.
-
-Re-tagging is allowed only to fix a failed release (delete the tag, fix,
-re-push). For verifying a commit without releasing, use CD test builds.
+nothing public. Pushing a `v*` tag is a deliberate release act; the rule and its
+five preconditions are stated in [AGENTS.md §5](../AGENTS.md). The release
+workflow enforces the version and changelog ones mechanically, and the local tag
+review (`githooks/pre-tag`, next section) checks most of the others before the
+tag exists. Re-tagging is allowed only to fix a failed release (delete the tag,
+fix, re-push).
 
 ## Tag review: `githooks/pre-tag`
 
@@ -148,63 +144,30 @@ writes the tests it completed.
    describe code that is no longer here is the one thing a reader cannot see.
    Doc and asset commits after the sweep are fine; that is how the ritual lands
    it.
-5. `just soak-check` — the gate, in two steps. First the run is checked
-   against itself: every coverage axis a test claims must have carried
-   samples, **every stage that claims a bulk spine must have carried intervals
-   inside its own window** (a stage whose probe never connected used to pass on
-   the other stages' sample count), every throughput sample must have dialed
-   the tool's exposed port rather than its backend, every stage that carried a
-   spine states what it carried or why it cannot (a rate stage's defeated
-   sender accounting is reported, not published as a number), and the released
-   tool must meet the absolute SLO
-   **on the unshaped clean stages** (a saturated `rrul`/`soak` stage is above
-   the SLO by design — that is the degradation curve, reported as a note, not
-   judged). The SLO gates the tool this repository releases; a peer that
-   misses it is reported with its number and does not block the tag. Without
-   a baseline that self-check *is* the verdict, and that is how the first
-   Soak release (v0.9.0) is gated: the absolute SLO on the clean stages plus
-   the run's own completeness and endpoint checks. With the previous tag's
-   file it then compares per test type: **a tool must not lose capacity, must
-   not break its SLO earlier, must not wedge where it did not and must not
-   drift**; a violation blocks the tag until fixed or explicitly waived.
-   Per-stage p99 difference verdicts apply to the **unshaped** control stages:
-   a netem stage's number is dominated by the queue the harness installed and
-   one run does not repeat it (measured: 5-24 % across three runs of one
-   unchanged method), so the gate reports it as context and fails only a
-   blow-up — see benchmarks.md, "Comparability".
-   (record the waiver in `HANDOFF.md`). Only same-schema, same-method, same-host
-   runs are comparable, so a baseline from another host, another
-   `workload_version` **or another instrument** is not a gate input: the gate
-   compares the runs' method records — the schedule, the shaper classes, the
-   load, the SLO, the probe rates and the stage-transition settings
-   (`soak_check.METHOD_KEYS`) — and refuses the comparison naming every key
-   that differs, and every key one file does not record at all. A single
-   `workload_version` integer cannot carry that on its own: the v0.10.0 cycle
-   changed five of those keys while it stayed `1`. A run that predates a field
-   the gate needs (the
-   endpoint record, the revision) is reported as `LEGACY`: neither a pass nor
-   a violation — the gate names what it could not verify, and the count of
-   those checks is printed in the summary.
+5. `just soak-check` — the gate. It blocks the tag on a capacity loss, an SLO
+   that breaks earlier, a wedge, or drift; a violation blocks until it is fixed
+   or explicitly waived, with the waiver recorded in `HANDOFF.md`. The absolute
+   SLO gates the tool this repository releases; a **peer** that misses it is
+   reported with its number and does not block the tag. A run that
+   predates a field the gate needs is reported as `LEGACY` — neither a pass nor
+   a violation. The gate runs locally before tagging and never in CI (shared
+   runners are too noisy for performance numbers), and weak-network loss cells
+   need `CAP_NET_ADMIN`; the method, the thresholds and the comparability rules
+   are in [benchmarks.md](benchmarks.md).
 
-The gate runs locally before tagging, never in CI: shared runners are too
-noisy for performance numbers. Weak-network loss cells need `CAP_NET_ADMIN`
-(netem); without it the run aborts — there is no userspace fallback, because
-a fallback path is a second measurement method. The gate is only meaningful
-between same-model results: the retired matrix's numbers (v0.8.x and
-earlier, in git history — its runner, charts and result files are no longer
-in the tree) measured cold cells with medians over reps, so they are a
-different instrument and never a regression signal against this model.
+There is no userspace fallback for the loss cells: a fallback path would be a
+second measurement method. The gate is only meaningful between same-model
+results — the retired matrix's numbers (v0.8.x and earlier) are a different
+instrument and never a regression signal.
 `benches/scripts/soak/soak_check.py` is the companion that applies the
 run's self-check, the per-type threshold rules and the screen verdict.
 
-### Comparing two builds (development screening)
+## Comparing two builds (development screening)
 
-Outside the release ritual, the question is usually *"is this direction
-worth pursuing?"* — and the answer must be minutes, not hours. That is the
-`screen` test type: one test type, one path class, one configuration pair,
-the two builds **interleaved inside every load step** (the pair runs in the
-same batch, so both sample the same machine state — sequential
-before/after runs are defeated by epoch drift), with a sequential decision:
+Outside the release ritual, the question is usually *"is this direction worth
+pursuing?"* — and the answer must be minutes, not hours. That is the `screen`
+test type: one test type, one path class, one configuration pair, two builds (or
+two configurations of one build) compared step by step, with a per-step verdict:
 
 ```bash
 # build both, then one interleaved screen run
@@ -213,27 +176,9 @@ just soak --test=screen --path=loss1 --streams-max=8 \
 just soak-check --screen results-screen.json    # per-step verdict
 ```
 
-The same interleave compares **two configurations of one build** when the
-question is a configuration decision rather than a code change
-(`--ab-variants mux,direct`): the arms then differ by config alone, which is
-what makes a placement or mode question answerable without a build axis riding
-along. The two modes and the slow-visitor probe that makes head-of-line
-blocking measurable are documented in
-[benchmarks.md](benchmarks.md#the-slow-visitor-soak_slow_visitor_bps).
-
-The run and the verdict are the fast, development-time form of
+It is the fast, development-time form of
 [benchmarks.md](benchmarks.md#reproduce-it-yourself)'s two-build comparison —
 minutes instead of a sweep.
-
-The verdict prints per-step values for both builds, the effect size, and a
-CLAIM only where **every** step favours the same build by more than the
-threshold (in either direction: a claim against the change is as much a
-verdict as one for it); anything else is reported as *directional*. A screen
-verdict is **domain-scoped**: it says whether to pursue the direction on
-that path class, never whether the change may ship — the sweep and the gate
-decide that. The retired matrix's `--ab` mode did the same job for the old
-model; the screen is its successor and adds the SLO instrument as the second
-measured axis.
 
 ## What the release workflow does
 
@@ -244,10 +189,9 @@ measured axis.
    msvc. musl artifacts build with the full feature set
    (`server,client,noise,hot-reload,multiplex`); linux artifacts are
    UPX-compressed. Tests run inside the matrix for native and cross targets.
-3. **GitHub Release**: published **directly** (no draft stage — the human
-   checkpoint is the tag push itself, guarded locally by the pre-tag
-   review), with notes extracted from `CHANGELOG.md`, all archives, and a
-   `SHA256SUMS`. Never edit the notes by hand.
+3. **GitHub Release**: published **directly** (no draft stage; the tag push
+   itself is the human checkpoint), with notes extracted from `CHANGELOG.md`,
+   all archives, and a `SHA256SUMS` — never edit the notes by hand.
 4. **GHCR**: publishes the multi-arch scratch image
    (`ghcr.io/niyueee/molehill:<tag>` and `:latest`) from the musl artifacts,
    then smoke-tests it.
@@ -259,11 +203,5 @@ measured axis.
 `.github/workflows/test-build.yml` builds **test artifacts** from any commit
 without creating a release: dispatch it manually from the Actions tab, choose
 a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
-`windows`).
-
-- Artifacts are ephemeral (7-day retention) and are never a Release — do not
-  hand out release links for them, and do not reference them in the
-  changelog.
-- Typical uses: verifying that a specific commit compiles on all platforms
-  before tagging, and reproducing platform-specific issues on an exact
-  commit.
+`windows`). Artifacts are ephemeral (7-day retention) and are never a Release;
+the usage rules and typical uses are in [AGENTS.md §6](../AGENTS.md).
