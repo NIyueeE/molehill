@@ -40,6 +40,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -149,6 +150,10 @@ class Shaper:
 
     DEFAULT = "1:999"
     MTU_PATH = "/sys/class/net/lo/mtu"
+    #: Consecutive empty-qdisc polls that count as "the senders drained". The
+    #: poll interval is 0.25 s, so this is ~0.5 s of a genuinely quiet queue
+    #: rather than one sample taken between two bursts.
+    DRAIN_QUIET_POLLS = 2
 
     def __init__(self, classes: list, log=print):
         self.classes = classes  # [(classid, band)]
@@ -190,6 +195,115 @@ class Shaper:
         r = subprocess.run(["tc", *args], capture_output=True, text=True, check=False)
         if r.returncode != 0:
             raise RuntimeError(f"tc {' '.join(args)}: {r.stderr.strip()[:400]}")
+
+    def _tc_out(self, *args) -> str:
+        r = subprocess.run(["tc", *args], capture_output=True, text=True, check=False)
+        return r.stdout if r.returncode == 0 else ""
+
+    def _backlog(self, handle: str) -> int | None:
+        """The queued bytes on one tool's netem qdisc, or None if unknown.
+
+        `tc -s qdisc show` renders each qdisc as a header line ("qdisc netem
+        20: parent 1:20 ...") followed by an indented stats line and a
+        `backlog <bytes>b <packets>p` line. The handle is the tool's own
+        (`<minor>0:`), so a batch's tools never read each other's queue.
+        """
+        lines = self._tc_out("-s", "qdisc", "show", "dev", "lo").splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith("qdisc netem ") or f" {handle} " not in line + " ":
+                continue
+            for follow in lines[i + 1 : i + 4]:
+                m = re.search(r"backlog\s+(\d+)b\s+(\d+)p", follow)
+                if m:
+                    return int(m.group(1))
+        return None
+
+    def _established(self, port: int) -> int | None:
+        """Established sockets on one port, or None when `ss` cannot say.
+
+        The qdisc can be empty *between* retransmissions of a killed client's
+        FIN, so an empty queue is not the same as a quiet stage: the teardown
+        of the previous stage's visitors lands on whatever the next stage
+        dials. This is the second half of the drain predicate.
+        """
+        out = subprocess.run(
+            [
+                "ss",
+                "-tan",
+                "state",
+                "established",
+                f"sport = :{port} or dport = :{port}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        if not out:
+            return 0
+        return max(0, len(out.splitlines()) - 1)  # the header row
+
+    def settle(self, cid: str, budget: float) -> float:
+        """Wait out a stage's in-flight bulk before the next stage reshapes it.
+
+        The stage boundary kills the bulk client, and a killed TCP socket does
+        not discard what its kernel side still holds: `close()` leaves the
+        remaining bytes to be delivered in the background. Switching the qdisc
+        to a slower shaper at that instant puts that drain and the *next*
+        stage's handshake into the same queue, and a SYN dropped behind
+        megabytes of retransmitted bulk costs the next stage its first tens of
+        seconds. Measured with no proxy in the path at all (htb + netem on
+        `lo`, exactly this harness's shape, 20 bulk streams killed as the
+        qdisc changed from `rate100` to `rate20`): a fresh connect timed out
+        after 10.5 s and the next round trip took 3.5-6.7 s, settling at the
+        steady-state 161 ms only ~15 s in. Draining *at the old shaper* for
+        10 s before the switch makes the very first round trip 164 ms.
+
+        That artifact is why the `rate20` cell read "spine produced no
+        intervals": the stall is the shaper's, not the tool's. Waiting here
+        (the previous stage's qdisc is still installed until `apply`) removes
+        it from the measurement instead of attributing it to the tool.
+
+        The predicate is two-part, because an empty queue is not a quiet
+        stage: the qdisc drains *between* retransmissions of a killed client's
+        FIN, so the previous stage's visitor connections are still open
+        ~10 s later. Measured on `rate100:120,rate20:120`: with only the
+        queue check the drain finished in 1.0-1.8 s and the bulk spine still
+        died reporting `control socket has closed unexpectedly` — the server
+        dropped the new visitor when the dying channel it had been paired with
+        ended. Waiting for the bulk port's own established sockets to reach
+        zero as well is what makes the next stage start from a quiet path.
+
+        Returns the seconds actually spent, so the cost is visible in the
+        results log. `budget` bounds the wait: a path that is still busy when
+        it expires is reported rather than silently absorbed.
+        """
+        minor = cid.split(":")[1]
+        handle = f"{minor}0:"
+        band = next(b for c, b in self.classes if c == cid)
+        bulk_port = band["iperf_exposed"]
+        started = time.time()
+        deadline = started + budget
+        quiet = 0
+        while time.time() < deadline:
+            backlog = self._backlog(handle)
+            if backlog is None:
+                # No such qdisc (an unshaped stage): nothing to drain.
+                return time.time() - started
+            live = self._established(bulk_port)
+            if backlog == 0 and live == 0:
+                quiet += 1
+                if quiet >= self.DRAIN_QUIET_POLLS:
+                    return time.time() - started
+            else:
+                quiet = 0
+            time.sleep(0.25)
+        self.log(
+            f"    {cid} drain budget of {budget:.0f}s expired with the path "
+            f"still busy (backlog={self._backlog(handle)}, "
+            f"bulk sockets={self._established(bulk_port)}); "
+            f"the next stage starts anyway"
+        )
+        return time.time() - started
 
     def _ports(self, band: dict) -> list:
         # The data-plane ports only: the TOOL's control channel stays in
@@ -1014,8 +1128,21 @@ def stage_spine(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> dict:
     single-test, so a spine this stage killed leaves it wedged for the
     next dial ("unable to receive cookie"/exit 1). One restart-and-retry
     per stage keeps one bad sample from becoming a dead axis.
+
+    A *fresh* server is started for every stage, before the first attempt
+    and not only after a failed one. Measured on the `rate100:120,rate20:120`
+    reproducer: the previous stage's killed 20-stream client finishes tearing
+    down ~10 s into the next stage (its FINs are retransmitted through the
+    newly-lowered shaper), and the single-test server answers a connection
+    aborted in that window with `Bad file descriptor` — after which every
+    later dial hangs. Restarting first means the teardown lands on a process
+    nobody will dial again, which is AGENTS.md §10's "one failure must not
+    poison the next sample" applied to a single-test external tool. The retry
+    below stays as the second line of defence.
     """
     target = lib.ThroughputTarget.from_band(tool.band)
+    with contextlib.suppress(Exception):
+        ctx.backend().restart_iperf()
     cmd = [
         "iperf3",
         "-c",
@@ -1049,9 +1176,17 @@ def stage_spine(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> dict:
 
 
 def _spine_once(cmd: list, entry: dict, t_end: float) -> dict:
-    """One iperf3 client attempt for a stage's bulk load."""
+    """One iperf3 client attempt for a stage's bulk load.
+
+    The client's own diagnosis is returned as `client_error`. iperf3 with
+    `--json-stream` reports a failure as an `error` event on stdout, and the
+    interval loop below skips everything that is not an interval — so before
+    this the harness recorded "exit 1" and threw away the reason, which is
+    exactly the bare failure AGENTS.md §10 forbids.
+    """
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
     intervals = 0
+    client_error = ""
     try:
         while time.time() < t_end and proc.poll() is None:
             line = proc.stdout.readline()
@@ -1060,6 +1195,8 @@ def _spine_once(cmd: list, entry: dict, t_end: float) -> dict:
             with contextlib.suppress(ValueError):
                 d = json.loads(line)
                 if d.get("event") != "interval":
+                    if d.get("event") == "error" or d.get("error"):
+                        client_error = str(d.get("data") or d.get("error"))[:200]
                     continue
                 s = (d.get("data") or {}).get("sum") or {}
                 if s and not s.get("omitted"):
@@ -1092,7 +1229,11 @@ def _spine_once(cmd: list, entry: dict, t_end: float) -> dict:
         proc.kill()
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
-    return {"intervals": intervals, "exit": proc.returncode}
+    return {
+        "intervals": intervals,
+        "exit": proc.returncode,
+        "client_error": client_error,
+    }
 
 
 def record_stage(entry: dict, mark: int) -> None:
@@ -1231,7 +1372,17 @@ def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int
     each stage's interactive p99 is measured against a visitor that is
     alive for exactly that window, and a visitor that fails is one stage's
     recorded state rather than a poisoned axis (AGENTS.md §10).
+
+    A stage after the first drains the previous stage's in-flight bulk
+    *before* the qdisc changes (`Shaper.settle`): the stage boundary kills
+    the bulk client, and reshaping under a still-draining socket puts the
+    next stage's handshake behind the old stage's bytes. The drain is not
+    part of the stage's window — `mark` is taken after it, so its probe
+    samples belong to no stage.
     """
+    if entry["stages"]:
+        drained = ctx.shaper.settle(tool.cid, ctx.knobs.stage_drain_budget)
+        log(f"    drained the previous stage in {drained:.1f}s")
     ctx.shaper.apply(tool.cid, stage.path)
     mark = len(entry["series"])
     entry["stages"].append(
@@ -1245,6 +1396,11 @@ def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int
         entry["stages"][-1]["bulk_error"] = (
             f"spine produced no intervals (exit {outcome['exit']})"
         )
+        # The client's own reason, when it gave one: "exit 1" alone is the
+        # bare failure §10 forbids.
+        if outcome.get("client_error"):
+            entry["stages"][-1]["bulk_client_error"] = outcome["client_error"]
+            log(f"    bulk client said: {outcome['client_error']}")
         log(f"    bulk spine produced nothing (exit {outcome['exit']})")
     record_stage(entry, mark)
     return mark
@@ -1796,6 +1952,11 @@ def build_meta(
         "cores_per_pair": knobs.cores_per_pair,
         "streams_max": args.streams_max or knobs.streams_max,
         "settle_s": knobs.settle_s,
+        # Instrument parameters are part of the method (§10): this bound is
+        # what keeps a stage's killed bulk from being measured as the next
+        # stage's handshake, so the value the verdict was taken against is
+        # recorded rather than implied.
+        "stage_drain_budget_s": knobs.stage_drain_budget,
         "interactive_ping_interval_ms": knobs.ping_interval_ms,
         "udp_ping_interval_ms": knobs.udp_interval_ms,
         "churn_connects_s": knobs.churn_connects_s,

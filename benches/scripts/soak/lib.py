@@ -253,6 +253,14 @@ class Knobs:
     # --- test-type parameters ---------------------------------------------
     # per load-step settle window and the interactive-stream sample rate
     settle_s: float = 6.0
+    #: Upper bound on the wait for a stage's in-flight bulk to drain before the
+    #: next stage reshapes the path (see `Shaper.settle` in the runner). It is
+    #: a budget, not a fixed delay: the wait ends as soon as the tool's netem
+    #: queue is empty, so an unshaped or light stage costs almost nothing. 30 s
+    #: covers the worst measured case — a `rate20` stage's killed 20-stream
+    #: client, whose kernel-side send buffers still hold megabytes that can
+    #: only leave at 20 Mbit/s.
+    stage_drain_budget: float = 30.0
     ping_interval_ms: int = 50
     # the operating point for `cost`: fraction of the configured max load
     cost_operating_point: float = 0.8
@@ -289,6 +297,7 @@ class Knobs:
             slo_rtt_p99_ms=_env_float("SOAK_SLO_RTT_P99_MS", 50.0),
             slo_error_rate=_env_float("SOAK_SLO_ERROR_RATE", 0.005),
             settle_s=_env_float("SOAK_SETTLE_S", 6.0),
+            stage_drain_budget=_env_float("SOAK_DRAIN_BUDGET", 30.0),
             ping_interval_ms=_env_int("SOAK_PING_INTERVAL_MS", 50),
             cost_operating_point=_env_float("SOAK_COST_OPERATING_POINT", 0.8),
             rrul_stream_factor=_env_int("SOAK_RRUL_STREAM_FACTOR", 1),

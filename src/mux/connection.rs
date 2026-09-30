@@ -223,6 +223,31 @@ struct Active<T> {
     /// waker registration when it wakes, so skipping the poll leaves the
     /// connection sleeping with no registered waker for later sends.
     pending_frames: VecDeque<Frame<()>>,
+    /// The part of the queue that is connection bookkeeping rather than
+    /// payload: a window update (the peer's send credit) or a stream close.
+    /// Both are bodyless, and either one stuck behind megabytes of bulk data
+    /// costs the peer progress it cannot recover from the payload side, so
+    /// they leave before any data frame. Data frames keep their own FIFO.
+    control_frames: VecDeque<Frame<()>>,
+    /// Body bytes currently queued in `pending_frames` (control frames are
+    /// bodyless, so they are free). This is what bounds how much one tunnel
+    /// can hold in userspace — see `Active::max_pending_bytes`.
+    pending_bytes: usize,
+    /// The bound `pending_bytes` is held under: `max_num_streams *
+    /// split_send_size`, i.e. one frame per stream of this connection's
+    /// maximum. Past it no receiver is polled, so the writers park on their
+    /// own per-stream channel and backpressure reaches the application that
+    /// produced the bytes — one hop earlier than `split_send_size` and the
+    /// per-stream window already put it.
+    ///
+    /// Deliberately a *queue* bound and not a BDP estimate: the engine has no
+    /// bandwidth sample, and an invented rate would be a knob nobody measured
+    /// (HANDOFF D15).
+    max_pending_bytes: usize,
+    /// Where the round-robin scan of `stream_receivers` resumes. A fixed scan
+    /// order hands every turn to the lowest-numbered ready stream, which is a
+    /// head-of-line delay for all the others.
+    recv_cursor: usize,
     new_outbound_stream_waker: Option<Waker>,
 
     rtt: rtt::Rtt,
@@ -291,6 +316,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
         let id = Id::next();
         tracing::debug!("new connection: {id} ({mode:?})");
         let socket = frame::Io::new(id, socket);
+        // One frame per stream of *this* connection's maximum: enough that a
+        // fair round over every stream is always in flight, small enough that
+        // a tunnel cannot park an unbounded queue ahead of a socket that is
+        // not draining. Derived from the config rather than fixed so a
+        // connection configured for more streams is not throttled below one
+        // frame each.
+        let max_pending_bytes = cfg.max_num_streams.saturating_mul(cfg.split_send_size);
         Active {
             id,
             mode,
@@ -305,6 +337,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             },
             pending_read_frame: None,
             pending_frames: VecDeque::new(),
+            control_frames: VecDeque::new(),
+            pending_bytes: 0,
+            max_pending_bytes,
+            recv_cursor: 0,
             new_outbound_stream_waker: None,
             rtt: rtt::Rtt::new(),
             accumulated_max_stream_windows: Arc::default(),
@@ -331,13 +367,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                     continue;
                 }
 
-                // Privilege pending `Pong` and `GoAway` `Frame`s
-                // over `Frame`s from the receivers.
-                if let Some(frame) = self
-                    .pending_read_frame
-                    .take()
-                    .or_else(|| self.pending_frames.pop_front())
-                {
+                // Privilege pending `Pong` and `GoAway` `Frame`s over
+                // `Frame`s from the receivers, then the bodyless bookkeeping
+                // frames — a window update is the peer's send credit and a
+                // close ends its stream — over payload.
+                if let Some(frame) = self.next_queued_frame() {
                     self.socket.start_frame(frame);
                     continue;
                 }
@@ -356,66 +390,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                     // whole tunnel. The cooperative budget eventually
                     // cuts a long drain short, and the resulting deferred
                     // wake resumes it.
-                    if !self.pending_frames.is_empty() || self.pending_read_frame.is_some() {
+                    if !self.pending_frames.is_empty()
+                        || !self.control_frames.is_empty()
+                        || self.pending_read_frame.is_some()
+                    {
                         continue;
                     }
                 }
                 Poll::Pending => {}
             }
 
-            {
-                let mut took_command = false;
-                for receiver in &mut self.stream_receivers {
-                    match receiver.poll_next(cx) {
-                        Poll::Ready(Some((id, Some(StreamCommand::SendFrame(frame))))) => {
-                            tracing::trace!(
-                                "{}/{}: sending: {}",
-                                self.id,
-                                frame.header().stream_id(),
-                                frame.header()
-                            );
-                            self.pending_frames.push_back(frame.into());
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
-                            tracing::trace!("{}/{}: sending close", self.id, id);
-                            self.pending_frames
-                                .push_back(Frame::close_stream(id, ack).into());
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(Some((id, None))) => {
-                            if let Some(frame) = self.on_drop_stream(id) {
-                                tracing::trace!("{}/{}: sending: {}", self.id, id, frame.header());
-                                self.pending_frames.push_back(frame);
-                            }
-                            self.wake_stream_writer(id);
-                            took_command = true;
-                            break;
-                        }
-                        Poll::Ready(None) | Poll::Pending => {}
-                    }
-                }
-                // A receiver that has reported its end (its stream was
-                // dropped) is finished: futures' `SelectAll` used to drop it
-                // for us, and a `Vec` grows without bound otherwise — the
-                // loop above is O(receivers) per poll, so a connection that
-                // serves many short-lived streams (connection churn) would
-                // poll thousands of dead receivers on every poll.
-                self.stream_receivers.retain(|r| !r.is_done());
-                if took_command {
-                    // Restart the loop so the queued frame is written in
-                    // this very poll: falling through to the socket read
-                    // would return Pending with the frame still unsent and
-                    // nothing left to wake the connection.
-                    continue;
-                }
-                if self.stream_receivers.iter().all(TaggedStream::is_done) {
-                    self.no_streams_waker = Some(cx.waker().clone());
-                }
+            if self.queue_receiver_frames(cx) {
+                continue;
+            }
+            if self.stream_receivers.iter().all(TaggedStream::is_done) {
+                self.no_streams_waker = Some(cx.waker().clone());
             }
 
             if self.pending_read_frame.is_none() {
@@ -448,6 +437,84 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             // If we make it this far, at least one of the above must have registered a waker.
             return Poll::Pending;
         }
+    }
+
+    /// Poll the stream receivers once, round-robin, and queue at most one
+    /// frame. Returns whether one was taken (the caller restarts its loop so
+    /// the queued frame is written in this same poll).
+    ///
+    /// A fixed scan order always finds the lowest-numbered ready stream first,
+    /// so with N bulk streams the first one fills the queue every turn and the
+    /// rest wait a full round — a head-of-line delay on every stream after the
+    /// first. The scan is also where the queue's byte bound is enforced: past
+    /// it no receiver is polled at all, so the writers park on their own
+    /// per-stream channel and one tunnel cannot buffer more than
+    /// `max_pending_bytes` in userspace.
+    fn queue_receiver_frames(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut took_command = false;
+        let receivers = self.stream_receivers.len();
+        if receivers > 0 && self.pending_bytes < self.max_pending_bytes {
+            let start = self.recv_cursor % receivers;
+            for offset in 0..receivers {
+                let i = (start + offset) % receivers;
+                match self.stream_receivers[i].poll_next(cx) {
+                    Poll::Ready(Some((id, Some(StreamCommand::SendFrame(frame))))) => {
+                        tracing::trace!(
+                            "{}/{}: sending: {}",
+                            self.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        let frame: Frame<()> = frame.into();
+                        self.pending_bytes += frame.body_size();
+                        if is_bookkeeping(&frame) {
+                            self.control_frames.push_back(frame);
+                        } else {
+                            self.pending_frames.push_back(frame);
+                        }
+                        self.recv_cursor = (i + 1) % receivers;
+                        self.wake_stream_writer(id);
+                        took_command = true;
+                        break;
+                    }
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                        tracing::trace!("{}/{}: sending close", self.id, id);
+                        // A close carries no payload and ends a
+                        // stream: it takes the priority queue.
+                        self.control_frames
+                            .push_back(Frame::close_stream(id, ack).into());
+                        self.recv_cursor = (i + 1) % receivers;
+                        self.wake_stream_writer(id);
+                        took_command = true;
+                        break;
+                    }
+                    Poll::Ready(Some((id, None))) => {
+                        if let Some(frame) = self.on_drop_stream(id) {
+                            tracing::trace!("{}/{}: sending: {}", self.id, id, frame.header());
+                            self.control_frames.push_back(frame);
+                        }
+                        self.recv_cursor = (i + 1) % receivers;
+                        self.wake_stream_writer(id);
+                        took_command = true;
+                        break;
+                    }
+                    Poll::Ready(None) | Poll::Pending => {}
+                }
+            }
+        }
+        // A receiver that has reported its end (its stream was
+        // dropped) is finished: futures' `SelectAll` used to drop it
+        // for us, and a `Vec` grows without bound otherwise — the
+        // loop above is O(receivers) per poll, so a connection that
+        // serves many short-lived streams (connection churn) would
+        // poll thousands of dead receivers on every poll.
+        self.stream_receivers.retain(|r| !r.is_done());
+        // Retaining shifts the indices the cursor referred to; one
+        // wrap to the new length is enough to keep it in range.
+        if !self.stream_receivers.is_empty() {
+            self.recv_cursor %= self.stream_receivers.len();
+        }
+        took_command
     }
 
     fn poll_new_outbound(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
@@ -929,7 +996,36 @@ fn wake_both(wakers: &(Option<Waker>, Option<Waker>)) {
     }
 }
 
+/// Whether a queued frame is connection bookkeeping rather than payload.
+///
+/// A window update carries the peer's send credit and a FIN-closed frame ends
+/// its stream; neither has a body. Delaying either behind queued payload costs
+/// the peer progress it cannot recover from the payload side, so both leave
+/// through [`Active::control_frames`] ahead of any data frame. Everything else
+/// (payload, and a stream's SYN) stays in its FIFO order.
+fn is_bookkeeping(frame: &Frame<()>) -> bool {
+    frame.header().tag() == Tag::WindowUpdate || frame.header().flags().contains(header::FIN)
+}
+
 impl<T> Active<T> {
+    /// The next frame to hand the socket writer, in priority order: a pending
+    /// pong/goaway reply, then the bodyless bookkeeping frames (window updates
+    /// and stream closes), then payload in its FIFO order.
+    ///
+    /// Split out from [`Self::poll`] so the ordering is testable without a
+    /// peer: it is the one place the three queues are read.
+    fn next_queued_frame(&mut self) -> Option<Frame<()>> {
+        if let Some(frame) = self.pending_read_frame.take() {
+            return Some(frame);
+        }
+        if let Some(frame) = self.control_frames.pop_front() {
+            return Some(frame);
+        }
+        let frame = self.pending_frames.pop_front()?;
+        self.pending_bytes = self.pending_bytes.saturating_sub(frame.body_size());
+        Some(frame)
+    }
+
     /// Close and drop all `Stream`s and wake any pending `Waker`s.
     fn drop_all_streams(&mut self) {
         for (id, s) in self.streams.drain() {
@@ -952,6 +1048,10 @@ mod tests {
     #![expect(
         clippy::panic,
         reason = "a malformed peer frame is a test failure, and an assert would bury it"
+    )]
+    #![expect(
+        clippy::unwrap_used,
+        reason = "the tests unwrap frames they just constructed"
     )]
 
     use super::*;
@@ -1015,6 +1115,106 @@ mod tests {
             "aimed at the new stream"
         );
         assert_eq!(active.streams.len(), cap, "the cap is still exactly full");
+    }
+
+    /// A window update is the peer's send credit and a close ends its stream:
+    /// both must leave before queued payload, or a tunnel that is carrying
+    /// bulk delays the bookkeeping its peer needs to make progress.
+    #[tokio::test]
+    async fn bookkeeping_leaves_ahead_of_queued_payload() {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let mut active = Active::new(io, Config::default(), Mode::Server);
+        let id = StreamId::new(1);
+
+        // Payload queued first, then the bookkeeping a receiver pushed while
+        // that payload was waiting for the socket.
+        let body = vec![7u8; 128];
+        active.pending_bytes = body.len();
+        active
+            .pending_frames
+            .push_back(Frame::data(id, body.clone()).unwrap().into());
+        active
+            .control_frames
+            .push_back(Frame::window_update(id, 4096).into());
+        active
+            .control_frames
+            .push_back(Frame::close_stream(id, false).into());
+
+        let first = active.next_queued_frame().expect("the window update");
+        assert_eq!(
+            first.header().tag(),
+            Tag::WindowUpdate,
+            "credit must not queue behind payload"
+        );
+        let second = active.next_queued_frame().expect("the close");
+        assert!(
+            second.header().flags().contains(header::FIN),
+            "a close must not queue behind payload either"
+        );
+        let third = active.next_queued_frame().expect("the payload");
+        assert_eq!(third.header().tag(), Tag::Data);
+        assert_eq!(third.body_size(), body.len());
+        assert_eq!(
+            active.pending_bytes, 0,
+            "payload bytes are released as they leave"
+        );
+        assert!(active.next_queued_frame().is_none());
+    }
+
+    /// Payload keeps its FIFO order: the priority only ever moves bodyless
+    /// bookkeeping, never reorders bytes.
+    #[tokio::test]
+    async fn payload_keeps_its_order_behind_the_bookkeeping() {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let mut active = Active::new(io, Config::default(), Mode::Server);
+        let id = StreamId::new(1);
+        for n in 0..3u8 {
+            active.pending_bytes += 16;
+            active
+                .pending_frames
+                .push_back(Frame::data(id, vec![n; 16]).unwrap().into());
+        }
+        for n in 0..3u8 {
+            let frame = active.next_queued_frame().expect("a payload frame");
+            let data = frame.into_data();
+            assert!(
+                data.body().iter().all(|b| *b == n),
+                "payload order changed at frame {n}"
+            );
+        }
+        assert_eq!(active.pending_bytes, 0);
+    }
+
+    /// The queue bound must leave room for one full round of the engine's own
+    /// maximum, or a single poll could not hand out even one frame per stream.
+    #[tokio::test]
+    async fn the_pending_bound_holds_one_frame_per_stream() {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let cfg = Config::default();
+        let streams = cfg.max_num_streams;
+        let split = cfg.split_send_size;
+        let active = Active::new(io, cfg, Mode::Server);
+        assert!(
+            active.max_pending_bytes >= streams * split,
+            "the bound ({}) is under one frame per stream ({streams} x {split})",
+            active.max_pending_bytes
+        );
+        assert!(
+            active.max_pending_bytes >= split,
+            "the bound can never be smaller than a single frame"
+        );
+    }
+
+    /// `is_bookkeeping` is the classification the ordering above depends on;
+    /// a regression here would silently send credit behind bulk again.
+    #[test]
+    fn bookkeeping_is_window_updates_and_closes() {
+        let id = StreamId::new(1);
+        assert!(is_bookkeeping(&Frame::window_update(id, 1).into()));
+        assert!(is_bookkeeping(&Frame::close_stream(id, false).into()));
+        assert!(!is_bookkeeping(
+            &Frame::data(id, vec![0; 4]).unwrap().into()
+        ));
     }
 
     /// A distinguishable waker, so a test can ask which task is parked.

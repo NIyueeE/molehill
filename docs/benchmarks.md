@@ -103,6 +103,25 @@ produced it. So is the shaping applied to each class — including the rate
 stages' queue depth (`rate`/`limit 2000`), which bounds how much traffic the
 shaper may hold and therefore what a burst through it can do.
 
+A stage does not start until the previous one has gone quiet. The boundary
+kills the bulk client, and a killed TCP socket keeps delivering what its
+kernel side still holds — and keeps retransmitting its FIN through whatever
+qdisc is installed. Reshaping at that instant puts the old stage's drain into
+the same queue as the new stage's handshake, and because a tool's data-plane
+ports share one netem class, a SYN dropped behind that drain costs the next
+stage its first tens of seconds. Measured with **no tool in the path at all**
+(htb + netem on `lo`, 20 bulk streams killed as the qdisc changed): a fresh
+connect timed out after 10.5 s and the next round trip took 3.5-6.7 s,
+reaching the steady state only ~15 s in. So the harness waits, at the *old*
+shaper, until the tool's netem queue has been empty **and** its bulk port has
+had no established connection, both for two consecutive polls, bounded by
+`SOAK_DRAIN_BUDGET` (30 s) — and only then applies the next stage's shaping.
+The wait is not part of any stage's window, and an expired budget is logged
+rather than absorbed. For the same reason the single-test `iperf3` backend is
+restarted before every stage's bulk attempt and not only after a failed one: a
+teardown that lands on it can leave it answering `Bad file descriptor`, after
+which every later dial hangs.
+
 Only the data plane is shaped. The tool's control channel stays on the
 unshaped path: shaping it kills the heartbeat and turns a capacity measurement
 into a wedge study.

@@ -1103,7 +1103,12 @@ impl TunnelPool {
                 } else {
                     if matches!(e, crate::mux::ConnectionError::Closed) {
                         // A tunnel died, so a retried growth is meaningful
-                        // again: cut the failed-growth hold short (D14).
+                        // again: cut the failed-growth hold short (D14). The
+                        // tunnel itself is marked dead here rather than left
+                        // for the maintenance tick: the driver task may be
+                        // parked on a socket that will never wake, and until
+                        // the reap runs, placement keeps choosing it.
+                        tunnel.mark_dead();
                         self.release_growth_hold();
                     }
                     "fallback"
@@ -1140,6 +1145,7 @@ impl TunnelPool {
                                 self.demand();
                             } else if matches!(e, crate::mux::ConnectionError::Closed) {
                                 // Another dead tunnel: same as above (D14).
+                                next.tunnel.mark_dead();
                                 self.release_growth_hold();
                             }
                             last = e;
@@ -1268,6 +1274,65 @@ impl TunnelPool {
 
     /// Remove one tunnel when the whole pool is idle, unpinned and past its
     /// idle timeout. Returns whether one was removed.
+    /// Remove every tunnel whose driver has ended.
+    ///
+    /// [`Self::shrink_if_idle`] is the pool's only other removal path, and it
+    /// needs the *whole* pool quiet: one stream that outlives its connection
+    /// keeps a dead tunnel — and its slot against `max_tunnels` — in the pool
+    /// for the life of the session. The measured shape is a stage transition
+    /// where the connection dies but its last stream is still held, so
+    /// `streams > 0` blocks the idle rule indefinitely while placement keeps
+    /// handing the corpse new opens, every one of which fails with `Closed`.
+    ///
+    /// Reaping is therefore not policy: it has no idle, warm or cooldown gate
+    /// and the dead tunnel's load is irrelevant (those streams are already
+    /// broken). What it owes the pool afterwards is a replacement, so a reap
+    /// raises `demand` when the dead tunnel was carrying something and the
+    /// next tick grows; D14's growth hold is released too, because a death is
+    /// the event that makes a retry meaningful.
+    fn reap_dead(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let (from, to) = {
+            let mut state = self.inner.state.lock();
+            if state.entries.iter().all(|e| e.tunnel.is_alive()) {
+                return false;
+            }
+            let from = state.entries.len();
+            let mut carried = false;
+            let mut index = 0;
+            while index < state.entries.len() {
+                if state.entries[index].tunnel.is_alive() {
+                    index += 1;
+                } else {
+                    // Dropping the entry drops the driver's shutdown sender:
+                    // whatever the task was still doing ends here.
+                    let entry = state.entries.remove(index);
+                    carried |= entry.load().total() > 0;
+                }
+            }
+            state.demand |= carried;
+            (from, state.entries.len())
+        };
+        self.release_growth_hold();
+        self.inner.shared.shrinks.fetch_add(1, Ordering::Relaxed);
+        self.inner.shared.push_event(PoolEvent {
+            grow: false,
+            reason: ShrinkReason::Dead.as_str(),
+            from,
+            to,
+        });
+        // A death is a lifecycle event: one INFO line per size change.
+        info!(
+            pool = %self.inner.shared.key,
+            carrier = self.inner.shared.carrier.as_str(),
+            reason = ShrinkReason::Dead.as_str(),
+            from,
+            to,
+            "pool-stats: tunnel pool reaped dead tunnels"
+        );
+        true
+    }
+
     fn shrink_if_idle(&self) -> bool {
         use std::sync::atomic::Ordering;
         let now = std::time::Instant::now();
@@ -1378,6 +1443,10 @@ impl TunnelPool {
     /// The maintenance tick: the growth and shrink rules of
     /// [`crate::transport::pool`], evaluated for one pool.
     async fn maintain(&self) {
+        // A dead tunnel leaves before any growth or shrink decision reads the
+        // pool: freeing its slot is what lets the replacement be dialed in
+        // this same tick. Unlike a shrink, the reap does not end the tick.
+        self.reap_dead();
         if self.shrink_if_idle() {
             return;
         }
@@ -1809,6 +1878,19 @@ impl TunnelPool {
     }
 }
 
+/// Clears a tunnel's `alive` flag when its driver task ends, however it ends.
+///
+/// A guard rather than a trailing store: the driver loop has several exits
+/// (shutdown, EOF, error) and a panic must clear the flag too, or the pool
+/// would keep a tunnel whose task has already unwound.
+struct AliveGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Handle to a client-side tunnel: opens data channels as streams of one
 /// yamux session, and carries the tunnel's own bookkeeping.
 #[derive(Clone)]
@@ -1818,6 +1900,10 @@ pub struct ClientTunnel {
     id: usize,
     /// The tunnel's bookkeeping, reached through this handle by the pool.
     pub(crate) counters: std::sync::Arc<TunnelCounters>,
+    /// True while the driver task is still running. The pool polls it: a
+    /// tunnel whose connection died must leave the pool even if it still
+    /// "holds" streams, or every later placement lands on a corpse.
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>,
 }
 
@@ -1837,8 +1923,12 @@ impl ClientTunnel {
         let (open_tx, mut open_rx) =
             mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
 
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let guard = AliveGuard(std::sync::Arc::clone(&alive));
+
         spawn_framing_stats();
         tokio::spawn(async move {
+            let _guard = guard;
             let mut conn = Connection::new(io, config, Mode::Client);
             let mut waiting: Option<
                 oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>,
@@ -1942,6 +2032,7 @@ impl ClientTunnel {
         ClientTunnel {
             id: next_tunnel_id(),
             counters: std::sync::Arc::new(TunnelCounters::default()),
+            alive,
             open_tx,
         }
     }
@@ -1949,6 +2040,23 @@ impl ClientTunnel {
     /// The tunnel's process-unique id (the client's pin accounting key).
     pub(crate) fn id(&self) -> usize {
         self.id
+    }
+
+    /// Whether the driver task is still running.
+    ///
+    /// A tunnel whose connection died answers `Closed` to every open and is
+    /// removed by `TunnelPool::reap_dead`; this is what "died" means, as
+    /// opposed to "has no streams right now".
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Mark the tunnel dead from the pool's side. An open that already saw
+    /// `Closed` is proof the connection is gone, and waiting for the driver
+    /// task to notice would leave the corpse placeable for a whole tick.
+    pub(crate) fn mark_dead(&self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Open a new data channel as a multiplexed stream.
@@ -2695,5 +2803,89 @@ mod tests {
 
     fn send_shutdown(tx: &tokio::sync::watch::Sender<bool>) {
         tx.send(true).unwrap();
+    }
+
+    /// A tunnel whose connection dies must leave the pool even while it still
+    /// "holds" a stream, and the pool must dial a replacement.
+    ///
+    /// `shrink_if_idle` requires the *whole* pool to be quiet, so before the
+    /// reap one stream that outlives its connection kept a corpse placeable
+    /// for the session's life. `max_tunnels = 1` makes the assertion sharp:
+    /// while the corpse occupies the only slot there is no room for a
+    /// replacement, so an open after the death can only succeed if the dead
+    /// tunnel was actually removed.
+    #[tokio::test]
+    async fn a_dead_tunnel_is_reaped_and_replaced() {
+        let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // The initial tunnel, plus the server task whose abort kills it.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx0, rx0) = mpsc::channel(8);
+        // Keep the receiver alive: a dropped one ends the server task.
+        std::mem::forget(rx0);
+        let server0 = tokio::spawn(run_server_tunnel(server_io, mux_config(), tx0));
+        let (shutdown0, shutdown0_rx) = tokio::sync::watch::channel(false);
+        let t0 = ClientTunnel::start(client_io, mux_config(), shutdown0_rx);
+
+        let dials_for_dialer = std::sync::Arc::clone(&dials);
+        let dialer: Dialer = std::sync::Arc::new(move || {
+            let dials = std::sync::Arc::clone(&dials_for_dialer);
+            Box::pin(async move {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let (tx, rx) = mpsc::channel(8);
+                // Keep the receiver: a dropped one ends the server task and
+                // would make the fresh tunnel die too, which is not what this
+                // test is about.
+                std::mem::forget(rx);
+                let server = tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
+                std::mem::forget(server);
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let tunnel = ClientTunnel::start(client_io, mux_config(), shutdown_rx);
+                Ok((tunnel, shutdown_tx))
+            })
+        });
+
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "test".to_owned(),
+            vec![(t0, shutdown0)],
+            1, // no room for a replacement until the dead one is gone
+            std::time::Duration::from_secs(60),
+            Some(dialer),
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+
+        // Hold a stream, so the tunnel is not "idle" and `may_shrink` can
+        // never be the path that removes it.
+        let held = pool.open_stream().await.unwrap();
+        assert_eq!(pool.size(), 1);
+        assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The peer goes away: the driver observes the closed duplex and ends.
+        server0.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut served = false;
+        while std::time::Instant::now() < deadline {
+            if pool.open_stream().await.is_ok() {
+                served = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(served, "the pool never replaced the dead tunnel");
+        assert!(
+            dials.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the replacement must be dialed, not conjured"
+        );
+        assert!(
+            pool.snapshot().shrinks >= 1,
+            "a reap is a recorded size change"
+        );
+
+        drop(held);
+        drop(pool);
     }
 }

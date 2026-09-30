@@ -47,6 +47,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `a_readers_channel_park_keeps_the_writers_waker` pins the slot discipline;
   the stripe livelock it produced is recorded in HANDOFF.md).
 
+- **A tunnel whose connection died leaves the client's pool.** The pool had
+  exactly one removal path — the idle shrink — and it requires the *whole*
+  pool to be quiet, so a single stream that outlived its connection kept the
+  dead tunnel, and its slot against `max_tunnels`, placeable for the rest of
+  the session: every later open that landed on it failed with `Closed` while
+  the pool kept reporting capacity. The pool now reaps a tunnel whose driver
+  has ended on the next maintenance tick, without any idle/warm/cooldown gate,
+  and dials a replacement when the dead tunnel was carrying something
+  (`ShrinkReason::Dead`; `a_dead_tunnel_is_reaped_and_replaced` fails without
+  the reap).
+- **A window update or a stream close no longer queues behind bulk data.** A
+  tunnel's frames all left through one FIFO, so the bodyless bookkeeping that
+  the peer needs to make progress — the credit a window update grants, the FIN
+  that ends a stream — sat behind however much payload the other streams had
+  queued. Those frames now leave through a priority queue ahead of any data
+  frame, the receiver scan round-robins instead of always serving the
+  lowest-numbered ready stream, and the queue is bounded in bytes so one
+  tunnel cannot hold an unbounded amount of payload ahead of a socket that is
+  not draining (`src/mux/connection.rs`; the ordering, the FIFO discipline of
+  payload and the bound are unit-tested).
+- **A visitor whose data channel dies before the forward command is
+  re-paired, not dropped.** The client dials the local service only *after* it
+  receives `StartForwardTcp` on the channel, so a channel whose backend leg is
+  already gone fails in exactly that window — and the server used to drop the
+  visitor on the spot, closing its socket. Measured on the
+  `rate100:120,rate20:120` reproducer: an iperf3 control connection paired with
+  such a channel died as `control socket has closed unexpectedly`, and because
+  every later dial of the stage inherited the failure the bulk spine recorded
+  nothing at all. The visitor now asks for another channel, under the same
+  `PAIR_ATTEMPTS` allowance a *missing* channel gets
+  (`src/core/server.rs::serve_tcp_visitor`).
+- **The Soak schedule drains a stage before reshaping the next one.** The
+  method's `rate20` cell published "spine produced no intervals" for every
+  tool, and the cause was in the harness: a stage boundary killed the bulk
+  client and immediately changed the qdisc, so the old stage's kernel-side
+  drain and FIN retransmissions shared the new, slower queue with the next
+  stage's handshake. Measured with no tool in the path at all, a fresh connect
+  timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
+  now waits at the *old* shaper until the netem queue is empty and the bulk
+  port has no established connection (bounded by `SOAK_DRAIN_BUDGET`, 30 s),
+  restarts the single-test `iperf3` backend before every stage's bulk attempt,
+  and records the client's own failure text instead of a bare exit code. See
+  `docs/benchmarks.md`, "The stage schedule".
+
 ## [0.10.0] - 2026-09-26
 
 ### Changed

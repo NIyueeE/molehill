@@ -2232,51 +2232,73 @@ async fn serve_tcp_visitor<C>(
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     if pool.stripe_count <= 1 {
-        // For this visitor, request to create a data channel.
-        if pool
-            .data_ch_req_tx
-            .send(true)
-            .with_context(|| "Failed to send data chan create request")
-            .is_err()
-        {
-            // An error indicates the control channel is broken.
-            return;
-        }
-        match pair_visitor(
-            &pool.data_ch_rx,
-            &pool.data_ch_req_tx,
-            &mut shutdown_rx,
-            &mut control_alive,
-        )
-        .await
-        {
-            PairOutcome::Channel(mut ch) => {
-                if write_and_flush(&mut ch, &pool.cmd).await.is_ok() {
-                    tokio::spawn(
-                        async move {
-                            // A stalled forward is closed by the watchdog: a
-                            // wedged visitor must not hold a tunnel stream for
-                            // the session's life (see `FORWARD_IDLE_TIMEOUT`).
-                            if let Err(e) = copy_bidirectional_with_idle(
-                                &mut ch,
-                                &mut incoming,
-                                TCP_COPY_BUFFER_SIZE,
-                                FORWARD_IDLE_TIMEOUT,
-                            )
-                            .await
-                            {
-                                debug!("Data channel closed: {e}");
-                            }
-                        }
-                        .instrument(Span::current()),
-                    );
-                }
+        // A channel that dies before it carries the forward command is a stale
+        // lease, not this visitor's fault — the client dials the local service
+        // *after* it receives that command, so a channel whose backend leg was
+        // already gone fails here and nowhere else. Dropping the visitor then
+        // is what the shaped-path measurement saw as `control socket has
+        // closed unexpectedly`: an iperf3 control connection was paired with a
+        // dying channel, the server closed the visitor's socket, and every
+        // later dial of the stage inherited the failure. Re-request instead,
+        // under the same allowance a *missing* channel gets.
+        let mut dead_channels = 0usize;
+        loop {
+            if pool
+                .data_ch_req_tx
+                .send(true)
+                .with_context(|| "Failed to send data chan create request")
+                .is_err()
+            {
+                // An error indicates the control channel is broken.
+                return;
             }
-            // Both ends leave nothing to release: `Shed` failed this visitor's
-            // request (the service keeps serving), and `Stop` means the pool's
-            // owning task has already ended. Dropping `incoming` closes the
-            // visitor's socket, which is the refusal it sees.
-            PairOutcome::Shed | PairOutcome::Stop => {}
+            match pair_visitor(
+                &pool.data_ch_rx,
+                &pool.data_ch_req_tx,
+                &mut shutdown_rx,
+                &mut control_alive,
+            )
+            .await
+            {
+                PairOutcome::Channel(mut ch) => {
+                    if write_and_flush(&mut ch, &pool.cmd).await.is_ok() {
+                        tokio::spawn(
+                            async move {
+                                // A stalled forward is closed by the watchdog: a
+                                // wedged visitor must not hold a tunnel stream
+                                // for the session's life (see
+                                // `FORWARD_IDLE_TIMEOUT`).
+                                if let Err(e) = copy_bidirectional_with_idle(
+                                    &mut ch,
+                                    &mut incoming,
+                                    TCP_COPY_BUFFER_SIZE,
+                                    FORWARD_IDLE_TIMEOUT,
+                                )
+                                .await
+                                {
+                                    debug!("Data channel closed: {e}");
+                                }
+                            }
+                            .instrument(Span::current()),
+                        );
+                        return;
+                    }
+                    dead_channels += 1;
+                    if dead_channels >= PAIR_ATTEMPTS {
+                        debug!(
+                            "A data channel died before the forward command \
+                             {dead_channels} times; dropping the visitor"
+                        );
+                        return;
+                    }
+                }
+                // Both ends leave nothing to release: `Shed` failed this
+                // visitor's request (the service keeps serving), and `Stop`
+                // means the pool's owning task has already ended. Dropping
+                // `incoming` closes the visitor's socket, which is the refusal
+                // it sees.
+                PairOutcome::Shed | PairOutcome::Stop => return,
+            }
         }
     } else {
         // The gather is atomic: hold the group lock for the whole attempt so

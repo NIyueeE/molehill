@@ -16,6 +16,14 @@
 > and the measurement records of this cycle. Per AGENTS.md §3 it is a
 > contributor page — user-facing facts belong in the docs pages, and anything
 > released belongs in CHANGELOG.md.
+>
+> **Update 2026-09-28.** The `rate20` bulk spine — the completeness failure
+> that has blocked the release ritual all cycle — now produces intervals on the
+> `rate100:120,rate20:120` reproducer. The tunnel-liveness diagnosis recorded
+> below was **falsified by the `ss -tin` probe it asked for**; the stall was the
+> harness's own stage transition, plus one server-side pairing gap. Three fixes
+> and the measurements are in "The `rate20` spine: the RTO hypothesis is
+> falsified", below the retracted paragraph.
 
 ## Fixed: striping with the elastic pool
 
@@ -932,15 +940,160 @@ spine while `rate20` gained intervals *is* worth watching: the shaped 20 Mbit
 uplink still costs molehill the test's own control connection, and which stage
 pays it moves between runs.
 
-**The `rate20` question, answered as far as this model can.** The bulk spine
-through the muxed tunnel is the last open engine defect, and this sweep shows
-its shape rather than fixing it: the spine produced five intervals, all zero,
-i.e. iperf3's control connection now survives the stage but carries no data. The
-structural answer is a per-visitor channel — the config surface already has it
-(`[client.services.<name>].mode = "direct"`, each visitor its own connection),
-and measuring that arm is the next cycle's work: it is a *method* change (one
-service in a different mode from the shipped default), so it needs its own run
-and its own docs section rather than a footnote here.
+**The `rate20` question: the failure is the *transition*, and it is
+molehill's.** Follow-up probes on this host, same harness, all with
+`--test=rrul` (each arm one stage or two back-to-back):
+
+| arm | `rate100` spine | `rate20` spine |
+|---|---|---|
+| molehill mux, `rate20` alone | — | **115 intervals** (all zero) |
+| molehill direct, `rate20` alone | — | **115 intervals** (all zero) |
+| molehill mux, `rate100` then `rate20` | 116 intervals | **0 — "spine produced no intervals (exit 1)"** |
+| molehill direct, `rate100` then `rate20` | 116 | **95 intervals** |
+| frp / rathole / nps, `rate100` then `rate20` | 116 each | **95 / 91 / 92 intervals** |
+
+So the stage in isolation is fine in *both* modes, the peers survive the same
+sequence, and a **per-visitor channel survives it where the shared muxed tunnel
+does not**. With `MOLEHILL_POOL_STATS=1` during a failing run the iperf service's
+pool holds `size=4 streams=21` (20 bulk + the control connection) steadily
+through the second stage, with no capacity refusal and no growth hold — the
+connections are placed and the bytes simply never move. That rules out
+placement, the ceiling and a stream leak, and points at the **shared long-lived
+TCP connection across a shaper transition**: the tunnel accumulated the
+`rate100` stage's loss/RTO state, and the next stage's 120 s window is not
+enough for it to recover, where a fresh per-visitor connection starts clean.
+The probe that would settle it is `ss -tin` on the tunnel sockets during the
+second stage (retransmits, `rto`, `cwnd`, `unacked`).
+
+Directions, ranked by cost and by what they would settle:
+
+1. **Per-visitor channels for a saturating service** — already measurable and
+   measured above (95 vs 0 intervals); the config key exists
+   (`[client.services.<name>].mode = "direct"`). Cost: the FD/NAT amortization
+   of the mux is given up for that service.
+2. **Tunnel liveness recovery** (small-medium, code): the mux already samples
+   RTT with ping/pong, and the pool already owns tunnel lifetime — a tunnel
+   whose ping goes unanswered for N intervals, or that carries streams with
+   zero bytes for T, is dropped and re-dialed. This is what makes the *shared*
+   shape survive a transition instead of needing per-visitor channels.
+3. **Spread bulk further** (config, free to measure): a lower per-tunnel growth
+   threshold or a higher `max_tunnels` puts fewer bulk streams behind one
+   connection, shrinking the blast radius of one connection's RTO state.
+4. **Stream scheduling inside the mux** (least-queued/DRR, small frames first):
+   fixes head-of-line *latency* inside a healthy tunnel — orthogonal to the
+   measured failure (an RTO-bound connection has nothing to schedule).
+5. **Aggregate in-flight cap per tunnel** (BDP-aware, medium): bound what one
+   tunnel's socket may hold so a transition cannot leave megabytes queued.
+6. **Method-side, for the zeros**: every tool records a zero bulk series on the
+   shaped cells because the shaper's queue (`limit 2000`) is ~1.2 s deep at
+   20 Mbit/s — the interval's bytes are still queued when the interval is
+   accounted. A smaller `limit`, longer intervals, or a per-stage cumulative
+   throughput would make the shaped bulk cells quotable instead of "zero for
+   everyone", independently of molehill.
+
+**What became of those directions (2026-09-28):** (1) is still the measured
+workaround; (2)'s premise did not survive its own probe, but the pool *did*
+have a real defect beside it — a tunnel whose driver had ended was never
+removed, and one stream that outlived its connection kept the corpse placeable
+(`TunnelPool::reap_dead`, with a test that fails without it); (3) was not
+needed; (4) and (5) landed in the mux (bookkeeping frames leave ahead of
+payload, the receiver scan round-robins, and the userspace queue is bounded in
+bytes); (6) was the actual fix, together with the one server-side pairing gap.
+The evidence is in the next subsection.
+
+**The `rate20` bulk spine is therefore a tunnel-liveness defect, not a
+placement or stripe one, and it has a measured workaround (per-visitor
+channels) plus a measured reproducer (`rate100:120,rate20:120`, ~4 minutes).**
+
+#### The `rate20` spine: the RTO hypothesis is falsified, and the shaper owned the stall (2026-09-28)
+
+The paragraph above is **retracted as a mechanism**. The probe it asked for —
+`ss -tin` on the tunnel sockets during the second stage — was run on the
+`rate100:120,rate20:120` reproducer (`--tools molehill --variants mux`), and it
+says the tunnel is healthy:
+
+| Sampled sockets | Result over the whole transition |
+|---|---|
+| the tunnel/control port (26001) | `retrans 0/0`, `rto` flat at 201-220 ms, `cwnd` climbing 20 -> 45, no `unacked` |
+| the same tunnels, rate20 window | each of the four bulk tunnels still moved 5.4-9.2 MB |
+| the *shaped* legs (visitor 26002, backend 26090) | `cwnd` pinned at 10 with `rto` 4.4-31.6 s on the visitor sockets |
+
+So the shared tunnel carried the rate100 stage's loss state nowhere: there was
+no RTO state on it. (The harness shapes the tool's seven data-plane ports and
+deliberately leaves the control/tunnel port in the unshaped default class —
+`soak.py`, `_ports` — so "the tunnel accumulated the RTO" was never available
+to begin with.)
+
+**The stall is the shaper's, and it reproduces with no tool in the path.**
+Replicating the harness's exact `htb` + `netem` shape on `lo` and killing 20
+bulk TCP streams at the instant the qdisc changes from `rate100` to `rate20`:
+
+| | first fresh round trip | second | steady state |
+|---|---|---|---|
+| switch immediately after the kill | **connect timed out after 10.5 s** | 3.5-6.7 s | 161 ms, reached ~15 s in |
+| drain 10 s at the *old* shaper, then switch | **164 ms** | 161 ms | immediately |
+
+A killed TCP socket keeps delivering what its kernel side still holds and keeps
+retransmitting its FIN; reshaping at that moment puts the old stage's drain and
+the new stage's handshake into the same one-class queue. Two controls bound the
+claim: `iperf3 -P 20` against the bare shaper completes (exit 0, 30 intervals,
+0.25/1.04 Gbit/s peak), so the shaper alone does not kill the bulk client; and
+the backend's `Bad file descriptor` lines — which looked like a wedged
+single-test server — are iperf3's benign answer to an *aborted* connection (20
+RST aborts reproduce them exactly, and a real test on the same server then
+exits 0), so they are a symptom, not the wedge.
+
+**Three fixes, all measured on the reproducer:**
+
+1. `Shaper.settle` (`benches/scripts/soak/soak.py`) drains at the **old**
+   shaper before the next stage's `apply`: the predicate is the tool's netem
+   queue empty **and** its bulk port free of established connections, both for
+   two consecutive polls, bounded by `SOAK_DRAIN_BUDGET` (30 s, recorded in the
+   results meta). The queue alone is not enough — it is empty *between*
+   retransmissions of a killed client's FIN, and with only that check the drain
+   finished in 1.0-1.8 s while the previous stage's visitors were still
+   tearing down ~10 s later.
+2. The single-test `iperf3` backend is restarted **before every stage's** bulk
+   attempt, not only after a failed one (`restart_iperf`), so a teardown lands
+   on a process nobody will dial again.
+3. The harness records the bulk client's own failure text
+   (`stage.bulk_client_error`) instead of a bare exit code. That is what
+   produced the actual client-side reason for the first time:
+   **`control socket has closed unexpectedly`** — i.e. the *server* closed the
+   iperf3 client's control connection.
+
+**And the server closed it for a real reason** (`src/core/server.rs`): a
+visitor paired with a data channel that died before it carried
+`StartForwardTcp` was dropped on the spot. The client dials the local service
+only *after* that command, so a channel whose backend leg is already gone fails
+in exactly that window, and every later dial of the stage inherited the
+failure. The pairing now re-requests instead of dropping the visitor, under the
+same `PAIR_ATTEMPTS` allowance a missing channel gets.
+
+**Effect on the reproducer** (six runs of `rate100:120,rate20:120`, molehill
+mux), `rate20` stage:
+
+| | before | after the drain (3 runs) | after all three (2 runs) |
+|---|---|---|---|
+| bulk intervals | 0-5, `bulk_error` set | 0-5, `bulk_error` set | **38 and 10, no `bulk_error`** |
+| bulk peak | — | — | **0.124 and 0.275 Gbit/s** |
+| interactive / churn samples | 3-4 / 3-14 | 3-112 / 3-128 | 3 / 3 |
+
+Two runs is still a small sample, but the axis moved the right way and the
+failure mode changed shape: the stage now *completes* instead of recording
+nothing. The interactive/churn columns are variance and are not a claim — and
+the low counts in the last two runs have a reading of their own: once the
+20-stream bulk actually runs, it competes for the one 20 Mbit class the probes
+share, which is exactly what the peers' shaped cells look like. Before the fix
+the bulk died early, so the probes had the class to themselves.
+
+**What is now ruled out, with the probe that ruled it out**: the tunnel's RTO
+state (no retransmits on 26001), the pool's placement and ceiling
+(`MOLEHILL_POOL_STATS` held `size=4` with capacity free throughout), a stream
+leak (streams returned to 0), a wedged single-test backend (aborted connections
+reproduce its `Bad file descriptor` verbatim and it serves a real test
+afterwards), and the shaper alone (`iperf3 -P 20` against the bare shaper is
+clean).
 
 ### The re-sweep on the post-review commit (2026-09-27, 19:12)
 
@@ -1145,11 +1298,18 @@ coverage, clippy clean in both.
 1. Freeze: `chore(release): prepare v0.10.0` — `version = "0.10.0"`, the
    `[Unreleased]` content moved under `## [0.10.0] - <date>`, and the withdrawn
    `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. ~~Re-sweep~~ **done** — see "The re-sweep on the post-review commit"
-   above: fresh binary on `8ba40ce`, peers re-fetched, 4 tools, 8/8 stages,
-   `just soak-check` `OK: no gate violation`, the same-host comparison
-   reported (5 molehill violations, all explained in that section), charts
-   re-rendered and the README pair refreshed in the same commit.
+2. ~~Re-sweep~~ **done, and now REQUIRED AGAIN** — see "The re-sweep on the
+   post-review commit" above: fresh binary on `8ba40ce`, peers re-fetched, 4
+   tools, 8/8 stages, `just soak-check` `OK: no gate violation`, the same-host
+   comparison reported (5 molehill violations, all explained in that section),
+   charts re-rendered and the README pair refreshed in the same commit.
+   **The 2026-09-28 method change invalidates it**: the stage drain, the
+   per-stage backend restart and the client-error recording all change what a
+   stage measures (`docs/benchmarks.md`, "The stage schedule"), so
+   `results-soak-v0.10.0.json`, the four charts and the README tables must be
+   regenerated on the frozen commit before the tag. The stored baselines are
+   not comparable to a run made with the new schedule — that is what
+   `meta`'s new `stage_drain_budget_s` key is for.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
    `just tag-check` must be run on the frozen commit.
 4. `just check`, `just interop`, then push the branch and open the PR.

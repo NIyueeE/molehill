@@ -182,12 +182,19 @@ impl GrowReason {
 pub(crate) enum ShrinkReason {
     /// No streams, no pending opens, no pinned peers, idle past the timeout.
     Idle,
+    /// The tunnel's driver ended: the connection is gone, whatever its load
+    /// says. Removal here is not a policy decision, so it bypasses every
+    /// idle/warm/cooldown gate — a dead tunnel that "holds" a stream is
+    /// exactly the state that used to be unreachable (`shrink_if_idle` needs
+    /// the whole pool empty, so one stuck stream kept a corpse forever).
+    Dead,
 }
 
 impl ShrinkReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Dead => "dead",
         }
     }
 }
