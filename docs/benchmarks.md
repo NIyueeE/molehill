@@ -336,6 +336,13 @@ Stated so a reader does not ask a chart for something it never measured:
   of either appears in the comparison. The opt-in `MOLEHILL_*` switches add
   molehill-only diagnostics to a run, and a run that inherits one records it in
   `meta.instrumentation`.
+- **Two arms at the loopback ceiling.** On one host the top of the range is the
+  loopback path itself, not the tool, so the arms that reach it cannot be
+  ordered by a run: the two that do here moved *together* across two sweeps of
+  unchanged code (20.2-22.2 and 20.3-20.4 Gbit/s in one, 18.8-20.5 and
+  17.6-18.0 in the other) while `frp` and `nps`, an order of magnitude below the
+  ceiling, were flat to 0.3 %. Read those two rows as one reading of the host's
+  state, and never carry their order as a standing claim.
 - **Which configuration a peer number describes.** The published four-tool
   table is molehill's **default configuration** (plain transport, `multiplex`
   mode, one pool per service). The shared elastic pool (`--variants shared`),

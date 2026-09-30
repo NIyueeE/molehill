@@ -75,10 +75,10 @@ the full reading rules: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 8.4 | ~6242‡ | ~1126 | ~3201‡ | ~1532 | ~7659‡ | ~5045‡ | 7.6 |
-| frp | 2.8 | ~5626‡ | ~1058 | ~3494 | ~1569 | ~7494‡ | ~8040‡ | 2.9 |
-| rathole | 77.4 | ~6107‡ | ~1133 | ~3687‡ | ~1573 | ~7893‡ | ~4477‡ | 77.7 |
-| nps | 66.4 | ~467 | ~1068 | ~2073 | ~1519 | ~7804‡ | ~5406‡ | 68.1 |
+| molehill (mux) | 7.7 | ~8870‡ | ~1132 | ~4137‡ | ~1493 | ~7765‡ | ~7479‡ | 7.5 |
+| frp | 3.0 | ~5795‡ | ~1077 | ~4138‡ | ~1566 | ~7655‡ | ~3764 | 2.8 |
+| rathole | 68.7 | ~6209‡ | ~1132 | ~4952‡ | ~1536 | ~7451‡ | ~8590‡ | 72.0 |
+| nps | 70.1 | ~472 | ~1071 | ~2469 | ~1496 | ~7918‡ | ~6662‡ | 68.7 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second). A `*` marks a cell read from the **receiver's** own
@@ -87,10 +87,10 @@ side a cell uses: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 18.830 | 5.224 | 9.717 | 5.265 | 0.100 | 0.019 | — † | 20.482 |
-| frp | 6.036 | 5.596 | 5.709 | 5.252 | 0.100 | 0.019 | — † | 6.058 |
-| rathole | 17.986 | 5.197 | 9.692 | 5.237 | 0.100 | 0.019 | — † | 17.585 |
-| nps | 0.133 | 0.152 | 0.139 | 0.160 | 0.100 | 0.019 | — † | 0.135 |
+| molehill (mux) | 20.176 | 5.216 | 9.713 | 5.266 | 0.100 | 0.019 | — † | 22.161 |
+| frp | 6.040 | 5.579 | 5.695 | 5.247 | 0.100 | 0.020 | — † | 6.059 |
+| rathole | 20.304 | 5.193 | 9.694 | 5.252 | 0.100 | 0.019 | — † | 20.383 |
+| nps | 0.133 | 0.151 | 0.146 | 0.157 | 0.100 | 0.019 | — † | 0.134 |
 
 **The run's own replicate.** `clean` is measured at both ends of every
 timeline, so each tool's two readings are two samples of one condition about
@@ -98,29 +98,32 @@ an hour apart — the scale every other cell is read against:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (mux) | 18.830 – 20.482 Gbit/s (**8.1 %** apart) | 7.6 – 8.4 ms |
-| frp | 6.036 – 6.058 Gbit/s (**0.4 %** apart) | 2.8 – 2.9 ms |
-| rathole | 17.585 – 17.986 Gbit/s (**2.2 %** apart) | 77.4 – 77.7 ms |
-| nps | 0.133 – 0.135 Gbit/s (**1.8 %** apart) | 66.4 – 68.1 ms |
+| molehill (mux) | 20.176 – 22.161 Gbit/s (**9.0 %** apart) | 7.5 – 7.7 ms |
+| frp | 6.040 – 6.059 Gbit/s (**0.3 %** apart) | 2.8 – 3.0 ms |
+| rathole | 20.304 – 20.383 Gbit/s (**0.4 %** apart) | 68.7 – 72.0 ms |
+| nps | 0.133 – 0.134 Gbit/s (**0.6 %** apart) | 68.7 – 70.1 ms |
 
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
 different instrument from the staged schedule
-([Benchmarks](./docs/benchmarks.md#test-types)); two arms carried its full 8
+([Benchmarks](./docs/benchmarks.md#test-types)); three arms carried its full 8
 streams, so 8 reads as a **floor** ("at least 8"), not a maximum:
 
 | tool | sustainable streams | ceiling | headroom | reason at the break |
 |---|---|---|---|---|
 | molehill (mux) | 8 | 8 | 0.0 | never broke |
 | frp | 8 | 8 | 0.0 | never broke |
-| rathole | 3 | 8 | 0.625 | interactive error rate 0.006 > 0.005 |
-| nps | 0 | 8 | 1.0 | interactive p99 205.035 > 50.0 |
+| rathole | 8 | 8 | 0.0 | never broke |
+| nps | 0 | 8 | 1.0 | interactive p99 205.06 > 50.0 |
 
 These are v0.10.0 numbers from one host, and only same-schema, same-method,
 same-host runs compare directly: every results file records the host, the
 method and two tool-free calibrations, and each run is gated on its own
 completeness, endpoint and SLO checks
-([Benchmarks](./docs/benchmarks.md#comparability)).
+([Benchmarks](./docs/benchmarks.md#comparability)). Note that **molehill and
+rathole both read at this host's loopback ceiling and move together with its
+state between runs**, so the order of those two rows is not a standing claim;
+`frp` and `nps` were flat across the same runs.
 
 The rest of the run's chart set is published beside these two:
 `soak-v0.10.0-drift.png` (open fds, RSS and CPU slopes over the run),

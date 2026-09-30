@@ -29,11 +29,12 @@
   and none of them blocks the release.
 - **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
   `## [0.10.0] - 2026-09-28` with `[Unreleased]` empty, and the benchmark
-  ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
-  the chart set in `assets/`).
-- **The order to finish**: re-sweep → refresh the README numbers and the
-  charts → `just tag-check` on the release commit → push → merge (merge
-  commit) → on `main`: `just tag` → push the tag.
+  ritual's artifacts are committed and freshly measured at this branch's tip
+  (`benches/scripts/soak/results-soak-v0.10.0.json`, the chart set in
+  `assets/`, both READMEs refilled; `just soak-check` green, no waiver).
+- **The order to finish**: `just tag-check` on the release commit → push →
+  merge (merge commit) → on `main`: set the changelog date to the tag day →
+  `just tag` → push the tag.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or `benches/scripts/soak/*.py` changed since — the
@@ -103,79 +104,73 @@ above is what would give it one).
 
 ## Release (v0.10.0)
 
-1. ~~Freeze~~ **done (2026-09-28)** — `b305394 chore(release): prepare
-   v0.10.0`: `version = "0.10.0"` set, the `[Unreleased]` content moved under
-   `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, the withdrawn
-   `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. ~~Re-sweep~~ **done (2026-09-30, at `fb2542a`)** — the sweep the artifact and
-   both READMEs were measured by: four tools, 8/8 stages each plus the capacity
-   ramp, `--test=rrul,capacity`, the bounded rate-class window, the pinned
-   loopback probe, `just soak-check` green with no waiver. Three earlier
-   attempts on the same day were refused and are recorded below (two of them
-   were my own instrumentation bugs, one a partial file the guard stopped at
-   rathole's baseline). `githooks/pre-tag` reads the results file's recorded
-   revision and now passes: docs, assets and the artifact itself may follow a
-   sweep, code may not.
-   **Superseded (2026-09-30):** the pre-merge triage below changed `src/`,
-   `Cargo.toml` and `Cargo.lock`, so that artifact no longer described the
-   release commit and the drift check would have failed the tag. **Re-swept on
-   the frozen commit** — `746a413`, `OK: no gate violation`, no waiver; the
-   record is "Release sweep on the frozen commit" below, and it is the artifact
-   the README and the charts now carry.
-3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
-   `just tag-check` must be run on the release commit. The sweep above is
-   measured at `746a413`; **only docs and assets may follow it** — the
-   changelog date and the README numbers do, anything under `src/`, `tests/`,
-   `Cargo.*` or `benches/scripts/soak/*.py` does not.
-4. `just check`, `just interop`, then push the branch and open the PR. (The PR
-   exists and is re-green after each push.)
+1. ~~Freeze~~ **done (2026-09-28)** — `version = "0.10.0"`, the `[Unreleased]`
+   content moved under a dated `## [0.10.0]` section, `[Unreleased]` left
+   empty, the withdrawn v0.9.1 artifacts deleted.
+2. ~~Sweep~~ **done (2026-09-30, at `bbe9664`)** — the artifact, the charts and
+   both READMEs now describe this commit: four tools, 8/8 stages each plus the
+   capacity ramp, `--test=rrul,capacity`, `shape_legs=visitor`, the bounded
+   rate-class window, `tree_clean: true`, and **`just soak-check`: `OK: no gate
+   violation`**, no waiver. The gate's own self-check is the verdict: the
+   v0.9.0 baseline is not a gate input (another host, and a method record
+   missing six keys), which is the documented behaviour for a fresh sweep.
+3. Before the tag: the `[0.10.0]` changelog date is the tag day (it still reads
+   2026-09-28), and `just tag-check` must be run on the release commit — it is
+   green on this one. The sweep is measured at `bbe9664`; **only docs and
+   assets may follow it** — the changelog date and the README numbers do,
+   anything under `src/`, `tests/`, `Cargo.*` or `benches/scripts/soak/*.py`
+   does not.
+4. ~~`just check`, `just interop`~~ **both green (2026-09-30)** — the full
+   chain in 4m22s, and the interop matrix's three cases (both cross-version
+   directions refuse, the refusing process keeps serving its own version).
+   Then push the branch.
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
 
-### Release sweep on the frozen commit (2026-09-30, `746a413`)
+### Release sweep (2026-09-30, `bbe9664`)
 
-`v0.9.0-131-g746a413`, tree clean, `stale: false`, binary sha256
-`1c1e3a6574a54803` (4 181 840 bytes), host `3f8b4508ab91` / host_id
-`d764f9da9c7e5b2a` (the same host as the `fb2542a` sweep), calibration
-416.9 MiB/s, loopback probe 21.46 Gbit/s, `shape_legs=visitor`,
-`rate_socket_window=256K`, four tools, 8/8 stages each plus the capacity ramp,
-`--test=rrul,capacity`, ~55 minutes. **`just soak-check`: `OK: no gate
-violation`**, no waiver. Charts re-rendered and both READMEs refilled from the
-plot's own tables.
+`v0.9.0-36-gbbe9664`, tree clean, `stale: false`, binary sha256
+`f10ea5350e78df6d` (4 181 840 bytes), host `3f8b4508ab91` / host_id
+`d764f9da9c7e5b2a`, calibration 412.1 MiB/s, loopback probe 21.85 Gbit/s,
+`shape_legs=visitor`, `rate_socket_window=256K`, `batch=2`, four tools, 8/8
+stages each plus the capacity ramp, `--test=rrul,capacity`, 76 minutes.
+**`just soak-check`: `OK: no gate violation`**, no waiver. Charts re-rendered
+and both READMEs refilled from the plot's own tables. The peers were
+re-downloaded from their release pages for this run (frp 0.71.0, rathole
+0.5.0, nps 0.26.10 — all still the latest).
 
 | tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | ramp |
 |---|---|---|---|---|---|---|---|
-| molehill | 18.830-20.482 | 8.1 % | 7.6-8.4 | 9.717 | 0.100 | 0.019 | 8/8, never broke |
-| frp | 6.036-6.058 | 0.4 % | 2.8-2.9 | 5.709 | 0.100 | 0.019 | 8/8, never broke |
-| rathole | 17.585-17.986 | 2.2 % | 77.4-77.7 | 9.692 | 0.100 | 0.019 | 3/8, broke at 4 (err 0.006 > 0.005) |
-| nps | 0.133-0.135 | 1.8 % | 66.4-68.1 | 0.139 | 0.100 | 0.019 | 0/8, broke at 1 (p99 205.0 > 50) |
+| molehill | 20.176-22.161 | 9.0 % | 7.5-7.7 | 9.713 | 0.100 | 0.019 | 8/8, never broke |
+| frp | 6.040-6.059 | 0.3 % | 2.8-3.0 | 5.695 | 0.100 | 0.020 | 8/8, never broke |
+| rathole | 20.304-20.383 | 0.4 % | 68.7-72.0 | 9.694 | 0.100 | 0.019 | 8/8, never broke |
+| nps | 0.133-0.134 | 0.6 % | 68.7-70.1 | 0.146 | 0.100 | 0.019 | 0/8, broke at 1 (p99 205.06 > 50) |
 
 Four things this run is worth reading for:
 
-- **It is the first sweep on the triage code**, so it also measures that the UDP
-  fix and the dependency bump cost nothing on the paths the schedule exercises.
-- **Molehill's replicate spread is 8.1 % this time** (0.7 % at `fb2542a`), which
-  is larger than the molehill-vs-rathole clean gap (4.5 %): the README now says
-  the two ranges do not overlap but that this run cannot separate them, instead
-  of the previous run's "27 % apart". That is what the replicate instrument is
-  for, and it is why no clean-throughput claim is published off one run.
-- **Rathole's ramp broke at load 4** (~20.1 Gbit/s offered, interactive error
-  rate 0.63 %) where the `fb2542a` sweep carried all 8 — the ramp's ceiling is 8
-  streams, and a peer that reaches it reads as a floor, not a maximum.
-- **All four arms' `jitter` stage carries no bulk reading** (96-100 % of its
-  intervals read zero bytes and the dial produced no receiver summary), so it is
-  printed as `— †` with the reason, as before; `rate20` reads the shaper's
-  0.019 Gbit/s on every arm.
-
-**Two provenance notes.** The first attempt of this sweep was **aborted by the
-harness's own warning** — `target/release/molehill` predated the triage commits,
-so its numbers would have described code that no longer exists; the binary was
-rebuilt (the sha256 above) and the run restarted, which is the §10 rule doing its
-job rather than a human catching it. And `just soak-peers` could not refresh the
-peers (GitHub API `403 rate limit exceeded`), so the run used the cached release
-binaries fetched 2026-09-27 — frp 0.71.0, rathole 0.5.0, nps 0.26.10, the same
-versions the previous sweeps of this cycle compared against, recorded in the
-results meta.
+- **It measures the host, not a code change.** Nothing under `src/`,
+  `tests/`, `Cargo.*` or the harness changed since the `746a413` sweep, and the
+  method record is identical — so the two runs are one instrument read twice.
+  The two arms at the loopback ceiling moved up together (molehill 18.830-20.482
+  -> 20.176-22.161, rathole 17.585-17.986 -> 20.304-20.383, +7 % and +14 %)
+  while `frp` and `nps`, an order of magnitude below the ceiling, were flat
+  (0.3 % and 0.6 % replicate spreads). That is why the method page now states
+  the limit and why the READMEs say the top two rows cannot be ordered by a
+  run; the earlier reading of a 4.5 % molehill-vs-rathole gap does not survive
+  the second sample and is no longer published.
+- **Rathole carried the ramp's full 8 streams this time** (it broke at load 4
+  in the `746a413` run, on its interactive error rate). A peer that reaches the
+  ramp's own ceiling reads as a floor, so the capacity table now has three arms
+  at "at least 8" and only `nps` below it.
+- **All four arms' `jitter` stage still carries no bulk reading** (95-97 % of
+  its intervals read zero bytes and the dial produced no receiver summary), so
+  it is printed as `— †` with the reason; `rate20` reads the shaper's 0.019-0.020
+  Gbit/s on every arm.
+- **Molehill's clean p99 is unchanged** (7.5-7.7 ms against 7.6-8.4 ms), and the
+  SLO gate is on those unshaped stages: the absolute SLO is the contract of the
+  tool this repository releases, and a peer that misses it is reported, not
+  gated (rathole 68.7-72.0 ms and nps 68.7-70.1 ms are reported as reference
+  peers).
 
 ## Open threads for the next cycle
 
