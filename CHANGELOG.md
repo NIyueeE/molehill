@@ -235,6 +235,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against 5.00) while the two are indistinguishable on throughput. The defaults
   do not change; the numbers behind them are in HANDOFF.md.
 
+- **UDP's capacity ceiling is documented and measured.** A UDP service's
+  datagram throughput is bounded **per pool**, not per worker: measured on one
+  host, `udp_workers` at 1, 2 and 4 carried 1.14, 1.00 and 0.98 Gbit/s of
+  1400-byte datagrams, unchanged by 16 or 64 visitors, and datagrams beyond it
+  are dropped (the design's deliberate choice over head-of-line blocking other
+  visitors, counted under `MOLEHILL_UDP_STATS` as `queue_full`). The
+  configuration page says so beside the knob, and the measurement also settles
+  the milestone row that asked for a shortest-queue assignment rule: there is no
+  imbalance to correct (visitors spread evenly in every configuration, and the
+  drop equals the excess over the ceiling to within 0.07 %).
+
+- **A configuration that cannot serve is refused out loud.** The instance was
+  spawned and its result only looked at when a later configuration change
+  arrived, so a failure at startup left the process alive, silent and serving
+  nothing — measured with the control port already held by another process:
+  four `INFO` lines, "Running as a server" among them, an empty log afterwards
+  and no listener. The failure now ends the process with the cause and a
+  non-zero exit (`the instance stopped: Failed to listen at
+  \`server.control.bind_addr\`: Address already in use`). A failure that arrives
+  with a reload is reported the same way.
+
+- **The comparability key measures the path, not just the CPU.** Every run
+  records two tool-free calibrations now: the existing CPU workload (state) and
+  a loopback-path probe (512 MiB through one socket pair, median of five,
+  pinned to one CPU *in a child process of its own*, Gbit/s). They answer different questions — two container
+  instances of one `host_id` measured 25-39 % apart on the clean cells of the
+  two arms that reach the loopback ceiling while the CPU probe read 1.7 % apart
+  — so a comparison is refused when either moves (the path within 15 %), and a
+  file that predates a probe is reported as unverifiable for it rather than read
+  as agreement. Unpinned, the probe read *bimodally* across processes (29.4-29.7
+  against 34.2-34.4 Gbit/s on an idle host), which no tolerance can carry;
+  pinned it repeats to ~1.5 % and drops ~5 % under four busy loops.
+
 - **The release sweep publishes the load axis too.** `--test` takes a comma
   list and the ritual runs `--test=rrul,capacity`, so
   `results-soak-vX.Y.Z.json` carries "how many bulk streams it sustains before
@@ -528,6 +561,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   have been red since the v4-only commit for exactly these two; `just powerset`
   (all 251 combinations) and `cargo build --profile minimal
   --no-default-features --features client` both pass now.
+
+- **A datagram over `udp_buffer_size` no longer ends the UDP service on
+  Windows.** The contract is that such a datagram arrives truncated to the
+  limit, and POSIX does that in the kernel and reports the buffer's length;
+  Windows fills the same buffer with the same prefix but reports
+  `WSAEMSGSIZE`, and that read error was taken for a dead socket — so one
+  oversized datagram ended the service's whole UDP pool, told the client the
+  service was no longer exposed, and, on the way back, broke the forwarder that
+  read the local service's oversized reply. The server now reads a
+  whole-datagram buffer and applies `udp_buffer_size` to what it read, because
+  a failed `recv_from` is also where the visitor's address is lost and the
+  datagram could then be neither truncated nor routed; the client's connected
+  socket reads the error as the full buffer it stands for.
+  `udp_buffer_size_bounds_a_datagram_without_breaking_the_channel` pins both
+  halves — it is the branch's Windows build job that caught this.
 
 ## [0.9.0] - 2026-09-25
 

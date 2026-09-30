@@ -116,7 +116,7 @@ surface both change.
 | M1 | One control session per endpoint (protocol v4) | **landed** | archived record, "M1" |
 | M2a | Shared elastic pool + S1 observation | **landed** | archived records, "M2a" and "S1" |
 | M2b | S2 placement + D28 spare selection | **not landed, on purpose** | the S1 spread is zero (archived, "S1") |
-| M2c | UDP shortest-queue assignment (D27) | not landed | gated on the drop counters, which stayed at zero |
+| M2c | UDP shortest-queue assignment (D27) | **not landed — premise falsified by measurement** | the counters fire only when the whole pool is saturated, with an even visitor spread and no dependence on `udp_workers` (below, "D27's evidence, measured") |
 | M3 | Transparent visibility (health check deleted) | landed (merged) | `CHANGELOG.md`, the dead-backend test |
 | M4 | IPv6 path MTU | landed (merged) | the `#[ignore]`d netns test |
 | M5 | Log model | landed (merged) | `tests/log_budget_test.rs` |
@@ -153,7 +153,7 @@ surface both change.
 | D24 | A stripe group's K streams must land on K distinct tunnels — **structural since the group request landed**: the server names the group before its channels are opened and the client reserves one tunnel per stripe (v4, extended in place) |
 | D25 | No RTT sampling; the algorithm may use stream count, pending opens, send credit, worker queue depth — nothing else (send credit is not exposed by the engine, so it is not used) |
 | D26 | Growth/shrink is a hysteretic, rate-limited state machine (≤ 1 tunnel per maintenance tick) |
-| D27 | UDP assigns a *new* peer to the shortest worker queue — gated on the drop counter, which has stayed at zero under every measured load |
+| D27 | UDP assigns a *new* peer to the shortest worker queue — **falsified by measurement** (2026-09-30): a single visitor never fills a queue (its own socket buffer throttles it), many visitors fill them evenly, and the drop equals the excess over a per-pool ceiling that `udp_workers` does not raise |
 | D28 | Waiting visitors stay FIFO; **spare** streams would be picked from the least-loaded tunnel — not landed (S1) |
 | D29 | Stripe pairing is atomic: K spares from K distinct tunnels, all or none — server-side today (a broken channel discards the whole group and re-requests it) |
 | D30 | Shrink requires `pinned_peers == 0`: a channel with pinned-but-idle peers is not idle |
@@ -239,14 +239,15 @@ below. What each archived record settled, so it can be navigated:
    v0.10.0`: `version = "0.10.0"` set, the `[Unreleased]` content moved under
    `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, the withdrawn
    `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. ~~Re-sweep~~ **done (2026-09-30, at `c265af3`)** — the sweep the artifact
-   and both READMEs in this commit were measured by: four tools, 8/8 stages
-   each plus the capacity ramp, `--test=rrul,capacity`, the bounded rate-class
-   window, `just soak-check` green with no waiver. It supersedes the
-   2026-09-29 sweep at `8ed32dd`, which described code two commits back.
-   `githooks/pre-tag` reads the results file's recorded revision and passes for
-   this commit: docs, assets and the artifact itself may follow a sweep, code
-   may not. The measurement record is the subsection below.
+2. ~~Re-sweep~~ **done (2026-09-30, at `fb2542a`)** — the sweep the artifact and
+   both READMEs were measured by: four tools, 8/8 stages each plus the capacity
+   ramp, `--test=rrul,capacity`, the bounded rate-class window, the pinned
+   loopback probe, `just soak-check` green with no waiver. Three earlier
+   attempts on the same day were refused and are recorded below (two of them
+   were my own instrumentation bugs, one a partial file the guard stopped at
+   rathole's baseline). `githooks/pre-tag` reads the results file's recorded
+   revision and now passes: docs, assets and the artifact itself may follow a
+   sweep, code may not.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
    `just tag-check` must be run on the release commit (it now passes — the
    artifact is measured at `c265af3` and only docs/assets followed).
@@ -302,6 +303,242 @@ budget expiry. The previous harness spent a flat 120 s on every one of them.
   schedule, suffix parsing), so this sweep is not comparable to earlier sweeps
   of this cycle either; `workload_version` stays 1 because the drain has never
   been in a released version (introduced in `e33ece3`, after v0.9.0).
+
+### Release sweep, finally (2026-09-30, `fb2542a`)
+
+`v0.9.0-122-gfb2542a`, tree clean, fresh release binary, host `3f8b4508ab91` /
+`host_id d764f9da9c7e5b2a`, calibration 421.3 MiB/s, loopback probe 22.28
+Gbit/s, `shape_legs=visitor`, `rate_socket_window=256K`, four tools, 8/8 stages
+each plus the capacity ramp, ~75 minutes. **`just soak-check`: `OK: no gate
+violation`.**
+
+| tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | jitter |
+|---|---|---|---|---|---|---|---|
+| molehill | 16.331-16.438 | 0.7 % | 9.6-10.0 | 9.70 | 0.100 | 0.020 | no reading |
+| rathole | 12.877-12.889 | 0.1 % | 96.9-102 | 9.68 | 0.100 | 0.019 | no reading |
+| frp | 6.050-6.059 | 0.1 % | 3.0-3.1 | 5.73 | 0.100 | 0.019 | no reading |
+| nps | 0.132-0.134 | 1.3 % | 57.7-64.6 | 0.142 | 0.100 | 0.020 | no reading |
+
+The load ramp: molehill, frp and rathole carry its full 8 streams without
+breaking the SLO (the ramp's own ceiling, so a floor), nps breaks at the first.
+Compared with the 05:56 sweep this replaces, nothing moved beyond the run's own
+replicate — which is the point: four sweeps of one day, three of them measuring
+something other than the tools.
+
+**What the three refused attempts cost and taught.**
+
+- **06:00 — the probe pinned the harness** (below, "One probe pinned the whole
+   harness"): the loopback probe's `sched_setaffinity` confined the runner, the
+   tools, their iperf3 clients and servers, the pingers and the samplers to one
+   core. Every fast number fell by a factor of three and the gate refused the
+   run after 75 minutes. Fixed by moving the pin into a child process, plus a
+   self-check that raises if the harness's own affinity changes.
+- **08:32 — the new clean-stage guard fired on a healthy sweep**: rathole's
+   clean p99 is ~100 ms by its own nature, and the guard applied the SLO to a
+   reference peer that the gate explicitly reports and does not gate. Fixed by
+   sharing one `SUBJECT` between the driver and the gate (`lib.SUBJECT`,
+   re-exported by `soak_check`). Cost: the 40 minutes of batch 1's work, and a
+   partial artifact (molehill + frp only) that was reverted rather than
+   committed — the gate would have read it as complete.
+- **07:15 — the same pin, seen before it was understood.** Listed here because
+   the *diagnosis* is the durable part: a hand-rolled client (the same binary,
+   an `iperf3` backend and an echo service beside it, 20 saturating streams)
+   read 16.60 Gbit/s and 0.58 ms median / 4.64 ms p99 while the harness read
+   5.2 Gbit/s and 163 ms at the same moment. That is how "the path is slow" was
+   separated from "the thing measuring the path is slow", and it is worth
+   reaching for first next time.
+
+### D27's evidence, measured (2026-09-30)
+
+D27 ("a new peer goes to the *shortest* worker queue") was the last milestone row
+whose status read "gated on the drop counters, which have stayed at zero". Zero
+under the soak schedule is not evidence — that schedule's UDP probe is a handful
+of datagrams per second — so the question was taken to the counters with load
+that can reach the queues: `benches/scripts/udp_stress.py`, a real pair
+(`udp_workers` configurable), visitors blasting paced or flat out, the server's
+`MOLEHILL_UDP_STATS` line read around every step, and **a control step that
+blasts the same visitors straight at the sink**, so "the tunnel is the limit" is
+a measurement instead of an assumption.
+
+| step | offered/s | absorbed/s | Gbit/s | `queue_full` | spread |
+|---|---|---|---|---|---|
+| 1 visitor @ 10,000/s | 9,999 | 9,999 | 0.11 | 0 | — |
+| 1 visitor @ 25,000/s | 20,115 | 20,115 | 0.23 | 0 | — |
+| 1 visitor @ 50,000/s | 25,864 | 25,864 | 0.29 | 0 | — |
+| 1 visitor @ 100,000/s | 29,837 | 29,837 | 0.33 | 0 | — |
+| 16 visitors, flat out, `udp_workers = 1` | 166,443 | 101,657 | 1.14 | 518,776 | 17 |
+| 16 visitors, flat out, `udp_workers = 2` | 162,015 | 89,474 | 1.00 | 580,730 | 10 / 10 |
+| 16 visitors, flat out, `udp_workers = 4` | 162,696 | 87,236 | 0.98 | 603,889 | 4 / 4 / 5 / 4 |
+| 64 visitors, flat out, `udp_workers = 4` | 154,261 | 88,674 | 0.99 | 526,900 | 16 / 16 / 17 / 16 |
+| control: 16 visitors straight at the sink | 183,749 | 183,749 | 2.06 | 0 | — |
+| control: 64 visitors straight at the sink | 188,570 | 188,562 | 2.11 | 0 | — |
+
+1400-byte datagrams throughout; `no_worker` stayed 0 in every step.
+
+**What it says.**
+
+1. **A single visitor never fills a queue.** Offered 10k, 25k, 50k and 100k
+   datagrams/s, the visitor's own socket buffer throttles it: the achieved rate
+   stops at ~29.8k/s (0.33 Gbit/s) and the counters stay at zero. This is the
+   case D27 was never about, and this is why.
+2. **Many visitors do, and the drop is exactly the excess.** 162,015 offered
+   against 89,474 delivered is a gap of **72,541/s**; the counter read 580,730
+   drops over 8.0 s, i.e. **72,591/s** — a 0.07 % closure. The server's counter
+   accounts for the whole gap, so nothing was lost in the visitors' kernels
+   first: the pool dropped precisely what it could not carry.
+3. **The spread is even, in every configuration.** Round-robin delivers 10/10
+   across two workers, 4/4/5/4 across four, 16/16/17/16 with 64 visitors. There
+   is no imbalance for a "shortest queue" rule to correct: any assignment of the
+   same aggregate load drops the same datagrams.
+4. **The ceiling is per pool, not per worker.** `udp_workers` at 1, 2 and 4
+   carries 1.14, 1.00 and 0.98 Gbit/s; 64 visitors instead of 16 changes nothing
+   either. The limit is shared, which matches the design's own comment on the
+   visitor-facing socket: one `recv_from` per datagram in a single task ("a
+   single reader also means one slow worker can never stall other peers").
+5. **The control rules out the instrument.** The same visitors blasting the sink
+   directly absorb 2.06-2.11 Gbit/s — twice what the tunnel carries — so the
+   ~1 Gbit/s is the forwarding path, not the sink.
+
+**Verdict: falsified, and the release is unaffected.** M2c does not land, with
+numbers instead of a shrug: no policy is justified by this, because the condition
+the policy addresses does not occur. The counters that measure it (`queue_full`,
+`no_worker`, and the per-worker `pinned` list) ship with 0.10.0, so a deployment
+that overloads a UDP service can tell, and `docs/configuration.md` now states the
+ceiling beside `udp_workers`.
+
+**The follow-up the measurement produced** (not needed for this release, not
+started): if that ~1 Gbit/s per-pool ceiling ever matters, the lever is the
+reader, not the fan-out — `transport::udp_batch`'s `recvmsg` batching already
+exists in the tree and is used by KCP's socket loop, while this reader takes one
+datagram per syscall. That is a capacity question with its own A/B, filed rather
+than guessed at.
+
+### One probe pinned the whole harness (2026-09-30)
+
+The fourth sweep of the day — the one the release artifact needs — came back
+with every fast number a third of its usual size, and **the bug was mine**, in
+that morning's "pin the loopback probe to one CPU" change:
+
+| | 05:56 sweep (healthy) | 06:00-07:15 sweep (pinned) |
+|---|---|---|
+| clean bulk, molehill | 16.42-16.63 Gbit/s | **5.16-5.68** |
+| clean bulk, rathole / frp | 12.91-13.01 / 6.03-6.05 | **5.54 / 2.65-2.70** |
+| clean bulk, nps | 0.13 | 0.13 (unchanged) |
+| clean interactive p99, molehill | 9.6-9.8 ms | **163-385 ms** |
+| clean interactive p99, frp | 3.0-3.2 ms | **205-216 ms** |
+| clean interactive p99, nps | 64.3-64.5 ms | 60.1-60.2 (unchanged) |
+| shaped stages | — | normal (`rate100` read 0.0997) |
+| CPU probe / loopback probe | 424.4 MiB/s / 22.4 Gbit/s | 410.5 / 22.17 |
+
+`host_loopback` pinned itself with `os.sched_setaffinity(0, ...)` — which sets
+the affinity of the **process**, is inherited by every child, and was never
+restored. So after the probe ran, the harness, the four tools under test, their
+iperf3 clients *and* their iperf3 servers, the pingers and the samplers all
+shared one core. Everything the sweep reported afterwards was a measurement of
+that one core; the gate refused it, correctly, 75 minutes later. The tells that
+should have been read sooner, all of them in the table above: a tool that is
+single-threaded by nature (nps) was untouched, the *shaper-bounded* stages were
+untouched (a rate class does not need a second core), and both calibration
+probes — each of which needs exactly one CPU — read normal, because nothing was
+wrong with the machine.
+
+The diagnosis that settled it was measurement outside the harness, and it is
+worth keeping as a technique: the same binary, configured by hand, with an
+`iperf3` backend and an echo service beside it, reads **16.60 Gbit/s** through
+the tunnel and **0.58 ms median / 4.64 ms p99** while 20 streams saturate it
+(idle: 0.07/0.10 ms) — against the harness's 5.2 Gbit/s and 163 ms at the same
+moment. A hand-rolled client with no harness in it is what separates "the path is
+slow" from "the thing measuring the path is slow".
+
+Fixed by moving the pinning into a **child process** (`_loopback_child`, spawned
+with `sys.executable`), which cannot leak it into the run, plus a self-check that
+raises when the harness's own affinity changes across the probe — an invariant
+that is silent everywhere else and cost an hour to find. Verified: affinity 20
+CPUs before and after, probe still 21.80-22.05 Gbit/s, and a 30 s clean stage
+back to **11.2 ms p99 / 16.70 Gbit/s** from 201-310 ms / 5.2.
+
+The artifact on disk was never touched: the failed sweep's file and charts were
+reverted rather than committed, so `pre-tag` stayed red and said the artifact
+still described `c265af3`. Two other things came out of it and are kept: a clean
+stage that breaks the SLO now ends the run instead of spending the shaped stages
+first, and the "scheduler-latency probe" idea is *withdrawn* — it was measured
+during this incident and read 10-18 us, i.e. it would not have caught this, and
+a probe that cannot catch the incident that motivated it does not belong in the
+comparability key.
+
+### A failed start is no longer silent (2026-09-30)
+
+The finding filed with the config-gap tests, fixed. `run` spawned the instance
+and only ever observed its `Result` when the *next* general configuration change
+arrived, so **every** failure before that point was swallowed: the process stayed
+up, logged nothing, and served nothing. Reproduced with the control port already
+held:
+
+```
+$ molehill server.toml      # port 24444 busy
+INFO  molehill v0.10.0 (...)
+INFO  Using config /tmp/bind.toml
+INFO  Running as a server
+INFO  config_watcher{...}: Start watching the config
+(no further output; process alive; nothing listening)
+```
+
+(The two cases the test-writing pass first reported — a key that is not valid
+base64, an `allow_ports` range with its start above its end — are *parser*
+failures, which `main` already turned into a message and a non-zero exit; the
+silent class is a failure inside `run_instance`, and a busy port is the one an
+operator actually meets.)
+
+The instance now reports its own end on a channel the watcher loop selects on,
+and any error is the process's error: `Error: the instance stopped: Failed to
+listen at \`server.control.bind_addr\`: Address already in use (os error 98)`,
+exit code 1. The restart path waits for that same report, so a failure arriving
+with a reload is a failure too. `tests/startup_failure_test.rs` pins it — and
+falsifies: with the old `run` restored it fails with "still running after 30s
+with nothing serving".
+
+### The comparability key gets a path probe (2026-09-30)
+
+The other finding from the 2026-09-30 sweep, fixed. Runs now record
+`host_loopback` beside `host_calibration`: 512 MiB through one loopback socket
+pair (median of five readings, one discarded warm-up, Gbit/s), measured with no
+tool in the path, and the gate refuses a comparison when it differs by more than
+15 % (`soak_check.HOST_LOOPBACK_TOLERANCE_PCT`). Two probes because they answer
+two questions: the CPU probe certifies *state* and is blind to the ceiling the
+fast cells ride, which is exactly what the two container instances moved by
+25-39 % while the CPU probe read 1.7 % apart.
+
+**The probe had to be pinned, and finding that out cost a sweep.** The first
+formulation — one socket pair per reading, unpinned, temperature and load as
+they came — read **28.14-28.67 Gbit/s across five invocations** in its first
+validation, and that validation was run while `just check` was using the host.
+On an idle machine, five separate processes then read 29.4-29.7 Gbit/s and two
+read 34.2-34.4: **bimodal**, not noisy — which cores the sender and reader
+threads land on decide which copy path they get. A key with a 17 % spread
+cannot certify anything the clean cells do (two sweeps an hour apart read
+16.3-16.8 Gbit/s on those cells with the CPU probe 414.0 against 424.4 MiB/s),
+and the sweep that had already been run with the unpinned probe was discarded.
+
+Pinned to one CPU (`sched_setaffinity`, recorded as `host_loopback.cpu`), with a
+pre-touched reused buffer so page faults stay out of the timed region: ten runs
+on an idle machine span **20.99-22.57 Gbit/s** (typically ~1.5 % apart, worst
+7 %), and four busy loops elsewhere on the host move it to 20.4 — the
+sensitivity the key exists for. The tolerance is 15 %
+(`soak_check.HOST_LOOPBACK_TOLERANCE_PCT`): an order of magnitude above the
+instrument's own noise, well under the 25-39 % it has to catch, and loose enough
+that the cost of a false refusal (one run) never becomes the reason a release
+comparison is skipped. The level also brackets the cells the way it should —
+12.9-16.7 Gbit/s of tool throughput under a ~22 Gbit/s per-core ceiling, with
+the unpinned 29-34 Gbit/s ceiling above both.
+
+Two implementation notes, both from getting it wrong first: `recv_into` needs a
+*writable* buffer (a `bytes` chunk raised inside the reader thread and left the
+sender blocked on a full socket — the probe became a hang, which is why both
+sockets now carry a 30 s timeout and the failure is recorded as the typed
+`{"ok": false, "reason": ...}` the gate already handles), and a probe that
+cannot run must never be read as agreement: `calibration_note` reports *which*
+probe did not run, so "the CPU probe ran" is no longer printed as if the path
+had been compared.
 
 ### Release sweep (2026-09-30)
 
@@ -1048,8 +1285,12 @@ budget, as the 2026-09-29 record explains.)
   and answered no**: from 15 streams up the shipped cap wins all six steps on
   interactive p99 by 42-61 %, and it never loses the whole ramp (below, "The
   pool-size and shared-pool questions, answered"). Nothing here lands: neither
-  a placement rule nor a larger cap. D27's UDP half stays gated on the drop
-  counters, which are still zero.
+  a placement rule nor a larger cap. **D27's UDP half is now measured and its
+  premise is falsified** (below, "D27's evidence, measured"): the drop counters
+  fire only under aggregate overload, the visitors are spread evenly, and
+  `udp_workers` does not move the ceiling — so there is no imbalance for an
+  assignment rule to fix. What the measurement did produce is a documented
+  per-pool ceiling and a named lever if it ever matters (a batched reader).
 - ~~**The v3 server path**~~ — **removed.** v0.10.0 is the first release that
   serves v4 only: the v3 handshake, its one-service-per-connection control
   path, the two-key registry (`MultiMap`) and `pool_size` on the wire are
@@ -1139,20 +1380,24 @@ budget, as the 2026-09-29 record explains.)
   measured resolution beside the tables. The per-class thresholds were
   deliberately **not** baked into the gate: a table of them would go stale with
   the next method change, and the measurement's home is the record.
-- **The host calibration certifies CPU state, not the loopback path** (found
-  2026-09-30, numbers in "Release sweep (2026-09-30)"). Two container instances
-  of the same `host_id` differed by 25-39 % on the clean bulk cells of the two
-  arms that reach the loopback ceiling, while frp and nps were flat and the
-  calibration probe read 414.0 against 421.2 MiB/s — 1.7 % apart, inside the
-  25 % the gate allows. Stable and blind at once: it catches a busy or throttled
-  CPU, not the machine property the fast cells are bounded by. Options, none
-  measured yet: a loopback-ceiling probe measured *outside* the tools (the
-  128 MiB socket pair drifts 18.7 % across median-of-five readings, which may be
-  too noisy to be a key); gating on the run's own first `clean` reading against
-  the baseline's (circular for a cross-tool claim, sound for cross-run
-  comparability); or stating that only same-instance runs compare and dropping
-  the calibration's claim to more than CPU state. Decide before the next sweep:
-  this one's numbers describe one instance.
+- ~~**A third probe: scheduler latency**~~ — **withdrawn, on measurement.** Filed
+  while the 06:00 sweep was being diagnosed as "the host is degrading", then
+  measured during that same incident: a two-process ping-pong over a socketpair
+  read 10-18 us median there, against 10.8 us after the fix — normal in both,
+  so it would not have caught anything. The incident turned out to be a
+  self-inflicted CPU pin (below, "One probe pinned the whole harness"), and what
+  caught it was a hand-rolled measurement outside the harness plus an invariant
+  check, not another probe. A probe that cannot catch the incident that
+  motivated it does not go into the comparability key.
+- ~~**The host calibration certifies CPU state, not the loopback path**~~ —
+  **fixed** (2026-09-30), by taking the first option: a loopback-ceiling probe
+  measured outside every tool, pinned to one CPU, at 20.99-22.57 Gbit/s across
+  ten runs (~1.5 % apart, against the 25-39 % it has to catch), gating a
+  comparison at 15 %
+  (below, "The comparability key gets a path probe"). The other two options are
+  recorded there and rejected: gating on a run's own `clean` reading is
+  circular for a cross-tool claim, and dropping the calibration's claim would
+  have left the gate unable to refuse the pair that started this.
 - ~~**The config-test gaps**~~ — **closed** (2026-09-30). `allow_ports`
   rejection and per-service `token` were already covered; the rest now are too:
   `udp_buffer_size` (which **truncates**, it does not drop — the docs were
@@ -1176,17 +1421,12 @@ budget, as the 2026-09-29 record explains.)
   `diag_env` illustration the note still pointed at is gone too (the list there
   is `MUX_STATS`/`KCP_STATS`/`POOL_STATS`/`PLACEMENT_STATS`/`UDP_STATS`/
   `STRIPE_COUNT`). Nothing survives anywhere in the tree.
-- **An instance that fails to start is silent** (found 2026-09-30 while writing
-  the config tests, **not fixed**). `src/lib.rs::run` spawns `run_instance` and
-  only ever observes its `Result` when a *later* general config change triggers
-  a restart, so a failure at startup leaves the process running with nothing
-  listening and **not one line of output**. Reproduced twice: a
-  `local_private_key` that is not valid base64, and an `allow_ports` range whose
-  start is above its end. The documented contract is the opposite ("refused
-  before the start"), so this is a code bug, not a doc one; the fix (observe the
-  first instance's early exit, log it at `ERROR`, exit non-zero) touches the
-  hot-reload loop, which is why it is filed rather than folded into a test
-  change.
+- ~~**An instance that fails to start is silent**~~ — **fixed** (2026-09-30).
+  The instance reports its own end on a channel the watcher loop selects on, and
+  any error ends the process with the cause and exit code 1; the busy-port
+  reproduction and the falsification are in "A failed start is no longer silent"
+  below, and `tests/startup_failure_test.rs` pins it. The restart path reports a
+  failure arriving with a reload the same way.
 
 ## Environment notes (this host, re-checked 2026-09-28)
 

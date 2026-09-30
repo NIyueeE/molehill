@@ -62,10 +62,18 @@ const SESSION_CONFIG: &str = "tests/for_tcp/session_v4.toml";
 /// The striped v4 fixture (`session_v4_striped.toml`): the same server as
 /// [`SESSION_CONFIG`] with `[server.data] stripe_count = 2`, on ports of its own
 /// — 2364 and below belong to the scenarios above, 2365 onwards is free.
+///
+/// `[server.data]` is part of the configuration surface only when the
+/// `multiplex` feature is compiled in (`ServerDataConfig` is feature-gated), so
+/// this fixture — and the scenario that reads it — belongs to that feature.
+#[cfg(feature = "multiplex")]
 const STRIPED_CONFIG: &str = "tests/for_tcp/session_v4_striped.toml";
+#[cfg(feature = "multiplex")]
 const STRIPED_CONTROL: &str = "127.0.0.1:2365";
+#[cfg(feature = "multiplex")]
 const STRIPED_EXPOSED: u16 = 2366;
 /// The service id the striped scenario registers.
+#[cfg(feature = "multiplex")]
 const STRIPE_SERVICE: u32 = 1;
 
 const DEFAULT_TOKEN: &str = "session_test_default_token";
@@ -634,6 +642,10 @@ async fn deregister_releases_the_port() -> Result<()> {
 /// what the server asks for cannot hide behind the client that reads it. The
 /// channels are never opened: this file's peer is a wire mirror, not a data
 /// plane.
+///
+/// `multiplex`-only, like the fixture it starts: a build without that feature
+/// has no `[server.data]` to put a stripe count in.
+#[cfg(feature = "multiplex")]
 #[tokio::test]
 async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     init();

@@ -61,10 +61,9 @@ SCREEN_ARGS = 2
 # The interactive error rate may rise by at most this much (percentage
 # points) before it counts as a regression.
 ERROR_RATE_RISE_PP = 5.0
-# The tool this repository releases. The SLO is *its* contract: the peer
-# tools are measured under the same workload for context, and a peer that
-# misses the SLO is a finding about the peer, not a block on this release.
-SUBJECT = "molehill"
+# The SLO gates this repository's own tool, not the reference peers; shared
+# with the driver (`lib.SUBJECT`) so the two cannot disagree about who is gated.
+SUBJECT = lib.SUBJECT
 # Every coverage axis a test claims, and the series that has to carry it.
 COVERAGE_SERIES = {
     "tcp_bulk": "throughput_bulk_gbps",
@@ -289,6 +288,7 @@ def comparability(base: dict, cur: dict) -> str | None:
             _comparability_visitor(base, cur),
             _comparability_method(base, cur),
             _comparability_calibration(base, cur),
+            _comparability_loopback(base, cur),
         )
         if r
     )
@@ -338,6 +338,50 @@ def _comparability_calibration(base: dict, cur: dict) -> str | None:
         "not see the same machine state (a different machine sharing the "
         f"identity, or one of them busy/throttled), and {bcal.get('probe')} is "
         "the measurement a host key alone cannot make"
+    )
+
+
+#: How far apart two runs' loopback probes may sit, in percent. Sized from both
+#: ends, like the CPU probe's: pinned to one CPU the probe reads within ~1.5 %
+#: across processes on an idle machine (worst of ten measured runs: 7 %), and
+#: four busy loops elsewhere on the host move it ~5 % — while the effect it has
+#: to catch is 25-39 % (the clean cells of two container instances of one
+#: `host_id`). Fifteen percent is therefore an order of magnitude above the
+#: instrument's own noise and well under the signal, and the unpinned
+#: formulation that measured *bimodally* across processes (29.4-29.7 against
+#: 34.2-34.4 Gbit/s on one idle host) is exactly what such a tolerance cannot
+#: survive — which is why the probe pins itself.
+HOST_LOOPBACK_TOLERANCE_PCT = 15.0
+
+
+def _comparability_loopback(base: dict, cur: dict) -> str | None:
+    """Refuse two runs whose *loopback path* was not in the same state.
+
+    The CPU probe above cannot answer this, which is why this one exists: two
+    container instances of the same `host_id` measured 25-39 % apart on the
+    clean bulk cells of the two arms that reach the loopback ceiling while the
+    CPU probe read 1.7 % apart (HANDOFF, "Release sweep (2026-09-30)").
+
+    A file that predates this probe — the v0.10.0 artifact among them — is
+    reported as unverifiable rather than read as agreement, exactly like the CPU
+    probe's first appearance.
+    """
+    bloop = base["meta"].get("host_loopback") or {}
+    cloop = cur["meta"].get("host_loopback") or {}
+    if not (bloop.get("ok") and cloop.get("ok")):
+        return None  # reported by the caller's own note; never read as equal
+    b, c = bloop.get("median"), cloop.get("median")
+    if not b or not c:
+        return None
+    delta = abs(c - b) / b * 100.0
+    if delta <= HOST_LOOPBACK_TOLERANCE_PCT:
+        return None
+    return (
+        f"the loopback paths measure differently with no tool in them "
+        f"({b} vs {c} Gbit/s, {delta:.1f}% apart, over the "
+        f"{HOST_LOOPBACK_TOLERANCE_PCT:.0f}% the gate allows): the two runs did "
+        "not ride the same path, which is the property the clean cells are "
+        "bounded by (the CPU probe is blind to it)"
     )
 
 
@@ -399,37 +443,59 @@ def _comparability_visitor(base: dict, cur: dict) -> str | None:
     return None
 
 
-def calibration_note(base: dict, cur: dict) -> str | None:
-    """What the host calibration could *not* verify about a comparison.
-
-    Printed when the pair is compared anyway, because a check that silently
-    does not run is the failure mode this whole function family exists to
-    prevent: a reader has to know whether "same host" was verified by a
-    measurement or only by a name. `None` when both files carried a probe —
-    the pair was checked, and `comparability` already refused it if the two
-    readings were too far apart to compare.
-    """
-    braw = base["meta"].get("host_calibration")
-    craw = cur["meta"].get("host_calibration")
+def _probe_unchecked(key: str, what: str, base: dict, cur: dict) -> str | None:
+    """One probe's "this pair could not be checked" line, or `None` when both
+    files ran it and the comparison was therefore made."""
+    braw = base["meta"].get(key)
+    craw = cur["meta"].get(key)
     if braw is not None and craw is not None:
         if braw.get("ok") and craw.get("ok"):
             return None
         who = "the baseline" if not braw.get("ok") else "this run"
-        return (
-            f"the host calibration probe did not run on {who}: 'same host' "
-            "rests on the identity key alone, which on a host without a "
-            "machine id is `cpu_model | nproc`"
-        )
-    who = [
+        return f"the {what} did not run on {who}"
+    absent = [
         label
         for label, raw in (("the baseline", braw), ("this run", craw))
         if raw is None
     ]
-    return (
-        f"{' and '.join(who)} carr{'ies' if len(who) == 1 else 'y'} no host "
-        "calibration: 'same host' rests on the identity key alone, which on a "
-        "host without a machine id is `cpu_model | nproc`"
-    )
+    if not absent:
+        return None
+    verb = "carries" if len(absent) == 1 else "carry"
+    return f"{' and '.join(absent)} {verb} no {what}"
+
+
+def calibration_note(base: dict, cur: dict) -> str | None:
+    """What the host checks could *not* verify about a comparison.
+
+    Printed when the pair is compared anyway, because a check that silently
+    does not run is the failure mode this whole function family exists to
+    prevent: a reader has to know whether "same host" was verified by a
+    measurement or only by a name. `None` when both files carried both probes —
+    the pair was checked, and `comparability` already refused it if either pair
+    of readings sat too far apart.
+
+    Two probes, two questions: the CPU one certifies *state*, the loopback one
+    certifies the *path* the fast cells ride. The second exists because the
+    first is blind to it — two container instances of one host measured 25-39 %
+    apart on the clean cells with the CPU probe reading 1.7 % apart (HANDOFF,
+    "Release sweep (2026-09-30)") — so "the CPU probe ran" must not be printed
+    as if the path had been compared.
+    """
+    parts = []
+    cpu = _probe_unchecked("host_calibration", "host calibration probe", base, cur)
+    if cpu:
+        parts.append(
+            f"{cpu}: 'same host' rests on the identity key alone, which on a "
+            "host without a machine id is `cpu_model | nproc`"
+        )
+    loop = _probe_unchecked("host_loopback", "loopback-path probe", base, cur)
+    if loop:
+        parts.append(
+            f"{loop}: the two runs' *path* was not compared, and that is the "
+            "property the clean cells are bounded by (the CPU probe cannot see "
+            "it move)"
+        )
+    return "; ".join(parts) if parts else None
 
 
 def metric_count(test: dict, metric: str) -> int:

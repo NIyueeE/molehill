@@ -1,4 +1,4 @@
-use crate::common::helper::udp_connect;
+use crate::common::helper::{datagram_len, udp_connect};
 #[cfg(feature = "notify")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
@@ -1842,7 +1842,14 @@ async fn run_udp_forwarder(
 
             // Receive from the service
             val = s.recv(&mut buf) => {
-                let Ok(len) = val else { break };
+                // A reply longer than `udp_buffer_size` is delivered as its
+                // prefix on both platforms; on Windows the kernel reports that
+                // as `WSAEMSGSIZE` instead of a short read (see `datagram_len`).
+                // The socket is connected, so no address is lost by reading the
+                // error that way.
+                let Ok(len) = datagram_len(val, buf.len()) else {
+                    break;
+                };
 
                 let t = UdpTraffic{
                     from,

@@ -1746,6 +1746,53 @@ def record_stage(entry: dict, mark: int) -> None:
     )
 
 
+def check_clean_stage_is_measurable(
+    stage: Stage, knobs: lib.Knobs, st: dict, tool: str
+) -> None:
+    """Stop the run when the *unshaped* path is already outside the SLO.
+
+    The clean stage is the harness's own baseline: nothing is shaped, so the
+    only way it can break the SLO is that the host is not in a state worth
+    measuring — another tenant, a throttled or contended machine — and the run
+    that follows is a measurement of that state, not of the tools. The gate
+    refuses such a run at the end; this refuses it at the start, because the
+    alternative is paying for an hour of shaped stages to learn it.
+
+    Measured, from the sweep that prompted this: the clean stage carried a
+    p99 of 163-385 ms against 9-10 ms on the same instance an hour earlier,
+    every tool's clean throughput fell by a factor of three (frp 6.03 -> 2.67,
+    molehill 16.4 -> 5.2, rathole 12.9 -> 5.5) — while **both calibration
+    probes read normal** (CPU 410 against 424 MiB/s, loopback 22.17 against
+    22.1-22.5 Gbit/s) and the shaped stages, which the shaper bounds, were
+    untouched (rate100 read the shaper's own 0.0997). Two single-threaded,
+    cache-resident probes cannot see a many-core, memory-path contention; the
+    clean stage can, because it is the path under test.
+    """
+    if stage.path != "clean" or not tool.startswith(lib.SUBJECT):
+        # The same distinction the gate makes: the SLO gates the tool this
+        # repository releases, and a reference peer over it is a finding about
+        # the peer — rathole's clean p99 is ~100 ms by its own nature — so
+        # aborting on that would refuse healthy sweeps.
+        return
+    p99 = st.get("rtt_p99")
+    err_rate = st.get("rtt_error_rate")
+    over_rtt = p99 is not None and p99 > knobs.slo_rtt_p99_ms
+    over_err = err_rate is not None and err_rate > knobs.slo_error_rate
+    if not (over_rtt or over_err):
+        return
+    sys.exit(
+        f"the clean stage measured a p99 of {p99} ms (error rate "
+        f"{err_rate}) against an SLO of {knobs.slo_rtt_p99_ms} ms / "
+        f"{knobs.slo_error_rate}: nothing is shaped here, so a run that "
+        "continues would measure the host, not the tools. Aborted at the "
+        "clean stage — re-run when the machine is quiet. The two calibration "
+        "probes are single-threaded and cache-resident and can read normal "
+        "while this happens (measured: 410 against 424 MiB/s of CPU and 22.17 "
+        "against 22.1-22.5 Gbit/s of loopback, on a clean stage whose own p99 "
+        "was 163-385 ms against 9-10 ms an hour earlier)."
+    )
+
+
 def run_capacity(tool: Tool, ctx: RunContext, entry: dict) -> None:
     """Ramp the bulk load until the interactive stream breaks the SLO.
 
@@ -1897,6 +1944,7 @@ def run_one_stage(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> int
             log(f"    bulk client said: {outcome['client_error']}")
         log(f"    bulk spine produced nothing (exit {outcome['exit']})")
     record_stage(entry, mark)
+    check_clean_stage_is_measurable(stage, ctx.knobs, entry["stages"][-1], tool.label)
     stage = entry["stages"][-1]
     # Logged, not stored: the reading is a derivation of the stage's recorded
     # evidence (`bulk_window_gbps`, `bulk_zero_share`, `receiver_gbps`,
@@ -2580,6 +2628,10 @@ def build_meta(
         # A fixed, tool-free workload is the measurement that closes it — same
         # id *and* same calibration, or the gate refuses to compare.
         "host_calibration": lib.host_calibration(),
+        # The path the fast cells ride, measured with no tool in it. Added
+        # after a pair of sweeps showed that the CPU probe above cannot see a
+        # 25-39 % move in it (HANDOFF, "Release sweep (2026-09-30)").
+        "host_loopback": lib.host_loopback(),
         "kernel": subprocess.run(
             ["uname", "-r"], capture_output=True, text=True, check=False
         ).stdout.strip(),

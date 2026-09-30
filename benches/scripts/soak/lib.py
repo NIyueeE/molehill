@@ -1798,6 +1798,30 @@ def host_identity() -> dict:
 #: drifts 18.7 % across median-of-five readings (it follows the CPU's power
 #: state), while this one repeats to 2.2 % — a calibration key has to be
 #: stabler than the differences it exists to detect.
+#: The tool label the SLO gates: this repository's own binary. A reference peer
+#: that misses the SLO is a finding about the peer — reported with its number,
+#: never a block — so anything that *aborts* on an SLO violation has to make the
+#: same distinction (measured: a driver that did not, aborted a healthy sweep at
+#: rathole's first clean stage, whose p99 is ~100 ms by its own nature). Shared
+#: with `soak_check.SUBJECT` so the two cannot drift apart.
+SUBJECT = "molehill"
+
+#: The loopback probe's transfer, per reading: MiB pushed through one socket
+#: pair, and how many readings the median is taken over. 512 MiB is ~0.2 s at
+#: this host's ceiling — long enough that the socket and the copies dominate
+#: the timer, short enough that the whole probe (one discarded warm-up plus
+#: the reps) stays under two seconds.
+LOOPBACK_MIB = 512
+LOOPBACK_REPS = 5
+LOOPBACK_CHUNK = 1 << 20
+#: Per-socket timeout for the probe. The whole transfer is ~0.2 s at this host's
+#: ceiling, so this is three orders of magnitude of slack — it exists to fail a
+#: stalled probe, not to time a slow one.
+LOOPBACK_TIMEOUT_S = 30.0
+#: The whole child (interpreter start, two warm-ups, five transfers), with room
+#: for a machine that is busy rather than broken.
+LOOPBACK_CHILD_TIMEOUT_S = 120.0
+
 CALIBRATION_MIB = 192
 #: Median of this many readings. Three is the smallest count with a median at
 #: all, and the probe is ~0.5 s per reading.
@@ -1818,6 +1842,200 @@ def _calibration_once(buffer: bytes) -> float:
     elapsed = time.perf_counter() - started
     digest.digest()
     return iterations / elapsed if elapsed > 0 else 0.0
+
+
+#: Pre-touched and reused for every transfer. A freshly allocated `bytearray`
+#: faults its pages *inside* the timed region, and where those pages land is a
+#: property of the process — one of the two sources of the variance that made
+#: the first formulation unusable (see `host_loopback`).
+_LOOPBACK_BUF = bytearray(LOOPBACK_CHUNK)
+for _i in range(0, LOOPBACK_CHUNK, 4096):
+    _LOOPBACK_BUF[_i] = 1
+
+
+def _one_cpu() -> int | None:
+    """The CPU the probe pins itself to, or `None` where that is not available
+    (not Linux, or a sandbox without `sched_setaffinity`)."""
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+    return allowed[0] if allowed else None
+
+
+def _affinity() -> frozenset:
+    """This process's CPU set, or an empty one where it cannot be read."""
+    try:
+        return frozenset(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return frozenset()
+
+
+def _loopback_once(total_bytes: int) -> float:
+    """One reading: MiB/s through a loopback socket pair, sender and reader live.
+
+    The reader runs in its own thread so the pair is pipelined the way the
+    benchmark's own streams are; the clock covers the whole transfer, because a
+    sender-only clock would miss the tail still queued when the last write
+    returns.
+    """
+    sender, reader = socket.socketpair()
+    received = []
+    try:
+        # A writable buffer for `recv_into` — a `bytes` chunk raises inside the
+        # reader thread and leaves the sender blocked on a full socket — and a
+        # timeout on both ends, so a stalled probe is the typed failure
+        # `host_loopback` records rather than a hang.
+        buf = _LOOPBACK_BUF
+        sender.settimeout(LOOPBACK_TIMEOUT_S)
+        reader.settimeout(LOOPBACK_TIMEOUT_S)
+        started = time.perf_counter()
+
+        def drain() -> None:
+            got = 0
+            try:
+                while got < total_bytes:
+                    n = reader.recv_into(buf)
+                    if not n:
+                        break
+                    got += n
+            except OSError:
+                pass  # recorded as a short read by the caller
+            received.append(got)
+
+        thread = threading.Thread(target=drain)
+        thread.start()
+        sent = 0
+        try:
+            while sent < total_bytes:
+                sent += sender.send(buf[: min(LOOPBACK_CHUNK, total_bytes - sent)])
+        except OSError:
+            pass  # the reader's own error is the one worth reporting
+        thread.join()
+        elapsed = time.perf_counter() - started
+    finally:
+        sender.close()
+        reader.close()
+    if received != [total_bytes] or elapsed <= 0:
+        raise OSError(f"loopback probe moved {received} of {total_bytes} bytes")
+    return total_bytes / elapsed / (1 << 20)
+
+
+def _loopback_child(cpu: int | None, total: int, reps: int) -> dict:
+    """The probe as a **child process**: pin, warm up, measure, report.
+
+    It runs in a child because `sched_setaffinity` is per-*process* and
+    inherited by every child that process spawns. An earlier version pinned
+    itself in the runner's own process and never restored it, so the whole
+    harness — the tools under test, their iperf3 clients and servers, the
+    pingers, everything — ran on one core for the rest of the run. Measured on
+    the resulting sweep: clean bulk 16.4 -> 5.2 Gbit/s, interactive p99
+    9.6 -> 163 ms, while a tool that is single-threaded by nature (nps) and the
+    two calibration probes were untouched, because each of them needs only one
+    CPU. A child cannot leak that into the run.
+    """
+    try:
+        if cpu is not None:
+            os.sched_setaffinity(0, {cpu})
+        for _ in range(2):  # cold: the socket buffers have not grown yet
+            _loopback_once(total)
+        values = [_loopback_once(total) for _ in range(max(1, reps))]
+    except (OSError, MemoryError, ValueError, AttributeError) as e:
+        return {"error": str(e)[:200]}
+    return {"cpu": cpu, "values": values}
+
+
+#: The child's whole program: import this module by path and print its result.
+#: Spawned with `sys.executable`, so a fresh interpreter does the pinning and
+#: the interpreter's own threads are none of its business.
+_LOOPBACK_CHILD = (
+    "import json, sys; sys.path.insert(0, {libdir!r}); import lib; "
+    "print(json.dumps(lib._loopback_child({cpu!r}, {total!r}, {reps!r})))"
+)
+
+
+def host_loopback(reps: int = LOOPBACK_REPS) -> dict:
+    """What this host's **loopback path** measures, with no tool in it.
+
+    `host_calibration` above certifies CPU state, and that is all it certifies.
+    Measured: two container instances of the same `host_id` — one hostname
+    apart, identity fields identical — differed by **25-39 %** on the clean bulk
+    cells of the two arms that reach the loopback ceiling, while the CPU probe
+    read 414.0 against 421.2 MiB/s, 1.7 % apart, inside the 25 % the gate
+    allows. It waved that pair through, because a CPU workload is not what those
+    cells are bounded by: they are bounded by this path — the copies, the
+    syscalls, the socket buffers, the memory behind them.
+
+    **Pinned to one CPU, and that is not a detail.** Unpinned, this probe is
+    bimodal *across processes* — five runs at 29.4-29.7 Gbit/s and two at
+    34.2-34.4 on an idle machine, the two threads' cores deciding which copy
+    path they get — a 17 % spread that would refuse comparable pairs, since the
+    cells it is meant to certify did not move with it (two sweeps an hour apart:
+    16.3-16.8 Gbit/s both times, CPU probe 414.0 against 424.4). Pinned, ten
+    runs on an idle machine span 20.99-22.57 Gbit/s (worst case 7 %, typically
+    3 %), and four busy loops elsewhere on the host drop it to 20.4 — which is
+    the sensitivity the key exists for. Its level also brackets the cells
+    correctly: 12.9-16.7 Gbit/s of tool throughput under a ~22 Gbit/s per-core
+    ceiling, with the unpinned 29-34 Gbit/s ceiling above both.
+
+    Never raises, like `host_calibration`: a host that cannot run it records the
+    typed failure and the gate reports the comparison as unchecked.
+    """
+    total = LOOPBACK_MIB * (1 << 20)
+    before = _affinity()
+    try:
+        script = _LOOPBACK_CHILD.format(
+            libdir=str(Path(__file__).parent), cpu=_one_cpu(), total=total, reps=reps
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=LOOPBACK_CHILD_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"probe": "loopback_socketpair", "ok": False, "reason": str(e)[:200]}
+    # The child may not have changed *this* process's affinity — that is the
+    # whole reason it exists — and a run whose harness is pinned measures one
+    # core forever. Checked rather than assumed, because the failure is silent
+    # everywhere else: it was found only after a sweep came back with every fast
+    # number a third of its usual size.
+    if _affinity() != before:
+        raise RuntimeError(
+            "the loopback probe changed the harness's own CPU affinity "
+            f"({before} -> {_affinity()}): it must run in a child process, or "
+            "every tool and client this run spawns inherits the pin"
+        )
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {
+            "probe": "loopback_socketpair",
+            "ok": False,
+            "reason": f"probe child said nothing usable: {proc.stderr.strip()[:200]}",
+        }
+    if "error" in payload:
+        return {"probe": "loopback_socketpair", "ok": False, "reason": payload["error"]}
+    values = payload["values"]
+    pinned = payload.get("cpu")
+    lo, hi = min(values), max(values)
+    return {
+        "probe": "loopback_socketpair",
+        "ok": True,
+        "unit": "Gbit/s",
+        "mib": LOOPBACK_MIB,
+        "reps": len(values),
+        # The CPU the probe pinned itself to, when it could: a reader comparing
+        # two runs of one host wants to know it was the same one.
+        "cpu": pinned,
+        # Gbit/s, the unit the bench's own cells are read in, so a reader can
+        # hold the two side by side without converting.
+        "median": round(statistics.median(values) * 8.0 / 1024.0, 2),
+        "min": round(lo * 8.0 / 1024.0, 2),
+        "max": round(hi * 8.0 / 1024.0, 2),
+        "spread_pct": round((hi - lo) / hi * 100.0, 1) if hi else None,
+    }
 
 
 def host_calibration(reps: int = CALIBRATION_REPS) -> dict:

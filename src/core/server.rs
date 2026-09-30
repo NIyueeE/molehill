@@ -2757,7 +2757,19 @@ where
     // One socket reader: `recv_from` is the single entry point for all
     // visitors, and the affinity table below decides the channel. A single
     // reader also means one slow worker can never stall other peers.
-    let mut buf = vec![0u8; buffer_size];
+    //
+    // The read buffer is a whole datagram wide, and `udp_buffer_size` is applied
+    // to what was read rather than to the buffer it was read into. Reading
+    // straight into a `buffer_size` buffer would save ~63 KiB per service, but
+    // that kernel-level truncation only happens on POSIX: Windows fills the
+    // buffer with the datagram's prefix and *fails* the read with
+    // `WSAEMSGSIZE`, and a failed `recv_from` is also where the visitor's
+    // address is lost — so the datagram could neither be truncated to the
+    // service's limit nor routed to its peer. One full-size buffer per UDP
+    // service buys one documented behaviour on every platform, and a datagram
+    // over the limit costs only the copy of its own bytes (the truncation
+    // below), not a lost datagram or a dead pool.
+    let mut buf = vec![0u8; usize::from(u16::MAX)];
 
     let mut sweep = time::interval(Duration::from_secs(UDP_ROUTE_TTL_SECS));
     // The first tick of an interval completes immediately; consume it.
@@ -2788,6 +2800,10 @@ where
             }
             recv = l.recv_from(&mut buf) => match recv {
                 Ok((n, from)) => {
+                    // The service's registered `udp_buffer_size`: a datagram
+                    // longer than it arrives as its prefix (see the buffer
+                    // comment above).
+                    let n = n.min(buffer_size);
                     match route_udp_datagram(
                         &workers,
                         &routes,

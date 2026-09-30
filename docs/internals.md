@@ -137,6 +137,17 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 
 ## UDP
 
+The visitor-facing socket has **one reader**: a single task takes one datagram per
+`recv_from` and the affinity table picks the channel, "so a single reader also
+means one slow worker can never stall other peers". Its capacity is therefore a
+property of the pool, not of the worker set — measured, `udp_workers` at 1, 2 and
+4 carried 1.14, 1.00 and 0.98 Gbit/s of 1400-byte datagrams, with 16 or 64
+visitors alike, and the datagrams beyond that are dropped rather than queued
+without bound (`MOLEHILL_UDP_STATS` counts them; the measurement is recorded in
+HANDOFF.md, "D27's evidence, measured"). `transport::udp_batch`'s `recvmmsg`
+batching — used by KCP's socket loop — is the lever if that ceiling ever needs to
+move; this reader takes one datagram per syscall.
+
 UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. Idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
 
 ### UDP drop counters (`MOLEHILL_UDP_STATS`)

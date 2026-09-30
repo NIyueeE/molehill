@@ -371,6 +371,22 @@ configuration only. Treat them as directional, and re-measure your own case.
 
 Which setting to pick, and why: [configuration.md](configuration.md#choosing-your-configuration-decision-tree).
 
+## The UDP queue question (not part of the soak model)
+
+A UDP service's datagram ceiling is a property of the *service*, not of the
+stage schedule, so it has its own instrument: `benches/scripts/udp_stress.py`
+starts a real pair with a configurable `udp_workers`, blasts paced or flat-out
+visitors at it, reads the server's `MOLEHILL_UDP_STATS` line around each step,
+and ends with a control step that blasts the same visitors **straight at the
+sink** — without that control a slow sink and a slow tunnel look identical from
+the counters. Measured on one host, 1400-byte datagrams: a single visitor never
+drops (its own socket buffer throttles it at ~29.8k datagrams/s), many visitors
+saturate the pool at ~1 Gbit/s regardless of `udp_workers` (1.14 / 1.00 / 0.98 at
+1 / 2 / 4) or visitor count, the spread stays even, and the drops equal the
+excess over that ceiling to within 0.07 %. The number a user needs is on the
+configuration page beside `udp_workers`; the full record is HANDOFF.md, "D27's
+evidence, measured".
+
 ## Comparability
 
 - **Same model, same method, same host.** Every results file records the method
@@ -386,24 +402,36 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
   that differ, and the keys a file does not record at all — rather than printed.
   An absent key is not read as a default: it means that file predates the
   instrument, and inventing a value for it would invent a method.
-- **Same host — and the same measured state.** The host is recorded three ways:
-  `hostname` (what a reader recognises), `host_id` — the machine id plus the CPU
-  model and core count, hashed — and `host_calibration`, a fixed, tool-free
-  workload the runner measures before every run (SHA-256 over a 192 MiB buffer,
-  median of three readings, MiB/s; its own spread travels with it). The path,
-  the CPU budget and the loopback ceiling are properties of the *machine*, so a
-  containerized bench host changing its hostname on every restart must not break
-  comparability — that is what `host_id` is for, and the rename it survived is
-  recorded in HANDOFF.md. But an identity key is a *name*, and on a host with no
-  readable machine id it reduces to `cpu_model | nproc`: two different machines
-  can then hash to the same host. The calibration is the measurement that closes
-  that hole — a run is comparable only if the identity matches **and** the fixed
-  workload measured within 25 %
-  (`soak_check.HOST_CALIBRATION_TOLERANCE_PCT`), which is also what catches one
-  machine measured in two different states (busy, throttled, or thermally
-  limited). A results file that predates the probe is reported as *unverifiable*
-  rather than read as agreement, and the comparison then rests on the identity
-  key alone; a file with no `host_id` at all falls back to the recorded
+- **Same host — the same measured state, riding the same path.** The host is
+  recorded as `hostname` (what a reader recognises), `host_id` (the machine id
+  plus the CPU model and core count, hashed) and **two** tool-free probes the
+  runner measures before every run, each carrying its own spread:
+  `host_calibration` for *state* (SHA-256 over a 192 MiB buffer, median of
+  three, MiB/s) and `host_loopback` for the *path* the fast cells ride (512 MiB
+  through one loopback socket pair, median of five, **pinned to one CPU in a
+  child process of its own**, Gbit/s — unpinned, the two threads' cores decide
+  which copy path they get and the probe reads bimodally across processes,
+  29.4-29.7 against 34.2-34.4 Gbit/s on one idle host, which a comparability key
+  cannot carry; and the pin lives in a child because `sched_setaffinity` is
+  inherited by everything the runner spawns, so pinning in place confines the
+  whole run — tools, clients and samplers — to one core). The CPU budget and
+  the loopback ceiling are properties of the *machine*, so a containerized bench
+  host changing its hostname on every restart must not break comparability —
+  that is what `host_id` is for. But an identity key is a *name*, and on a host
+  with no readable machine id it reduces to `cpu_model | nproc`: two different
+  machines can then hash to the same host, and one machine can be a different
+  machine's worth of busy between two runs. A run is therefore comparable only
+  if the identity matches **and** both probes agree: the CPU workload within
+  25 % (`soak_check.HOST_CALIBRATION_TOLERANCE_PCT`) and the loopback path
+  within 15 % (`soak_check.HOST_LOOPBACK_TOLERANCE_PCT` — the pinned probe
+  repeats to ~1.5 % across processes and drops ~5 % under four busy loops,
+  against the 25-39 % it has to catch). The two are not
+  redundant — the CPU probe repeats to ~2 % and is *blind* to the loopback
+  ceiling, which two container instances of one `host_id` moved by 25-39 % on
+  the clean cells of the two arms that reach it while the CPU probe read 1.7 %
+  apart — so neither one alone certifies a comparison. A results file that
+  predates a probe is reported as *unverifiable* for that probe rather than read
+  as agreement; a file with no `host_id` at all falls back to the recorded
   hostnames, which is conservative in the safe direction (refusing to compare).
 - **Every blocking reason is reported, not just the first.** A baseline can
   fail more than one test, and naming only the first would suggest that

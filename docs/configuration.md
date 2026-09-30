@@ -141,7 +141,7 @@ flowchart TD
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair; a sub-millisecond RTT cost and no CPU penalty under full load |
 | cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move — 2.0-3.2 ms on loopback (M2a), then it is warm again up to `max_tunnels` |
-| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity) |
+| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). **It does not raise the service's datagram ceiling**, which is per pool: measured, 1, 2 and 4 workers carried 1.14, 1.00 and 0.98 Gbit/s of 1400-byte datagrams on one host, with 16 or 64 visitors alike |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -202,7 +202,7 @@ transport = { type = "plain" } # Optional. Per-service transport override: `type
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2
+udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. This is a fan-out, not a capacity knob: the service's datagram ceiling is per pool (measured 0.98-1.14 Gbit/s of 1400-byte datagrams at 1, 2 and 4 workers), and datagrams beyond it are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`)
 udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
@@ -974,7 +974,7 @@ WantedBy=multi-user.target
 
 ### UDP services
 
-- The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535): a datagram larger than it is **truncated to that size** on the way in (the receiving socket's buffer is exactly this many bytes, so the kernel keeps the first `udp_buffer_size` bytes and discards the rest) and the truncated datagram is delivered — the channel stays usable, but the payload is short. Measured on a `udp_buffer_size = 1024` service: a 2000-byte datagram arrives at the backend as 1024 bytes and its reply reaches the visitor as 1024 bytes. Size it for the largest datagram the service sends, configure it identically on both ends, and remember that the server enforces its own copy received at registration time.
+- The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535): a datagram larger than it is **truncated to that size** on the way in — the first `udp_buffer_size` bytes are delivered and the rest is discarded — so the channel stays usable but the payload is short. Measured on a `udp_buffer_size = 1024` service: a 2000-byte datagram arrives at the backend as 1024 bytes and its reply reaches the visitor as 1024 bytes. Size it for the largest datagram the service sends, configure it identically on both ends, and remember that the server enforces its own copy received at registration time.
 - **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `udp_workers` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels, and the pool keeps at least the tunnels those channels need.
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 

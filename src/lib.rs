@@ -103,6 +103,28 @@ fn genkey(_curve: Option<KeypairType>) -> Result<()> {
     crate::common::helper::feature_not_compile("noise")
 }
 
+/// How a running instance ended: `None` when it stopped because the watcher
+/// asked it to (a restart is coming), `Some(error)` when it failed.
+type InstanceEnd = Option<anyhow::Error>;
+
+/// Turn a running instance's end into this process's result.
+///
+/// An error is fatal here: with no instance this process has nothing listening,
+/// and this is the only place anything looks. It used to be a `JoinHandle`
+/// awaited only when the *next* general configuration change arrived, so a
+/// failure during startup left the process alive, silent and serving nothing —
+/// measured with the control port already bound: four lines of `INFO`
+/// ("Running as a server" among them), no error, and no listener.
+fn instance_ended(end: Option<InstanceEnd>) -> Result<()> {
+    match end {
+        Some(None) => Ok(()),
+        Some(Some(e)) => Err(anyhow!("the instance stopped: {e:#}")),
+        // The reporter owns the sender, so a closed channel cannot happen while
+        // an instance runs: report it as the bug it is rather than as a stop.
+        None => Err(anyhow!("the instance stopped without reporting why")),
+    }
+}
+
 /// Run molehill until shutdown.
 ///
 /// Loads the configuration through the config watcher (hot-reload aware),
@@ -112,8 +134,9 @@ fn genkey(_curve: Option<KeypairType>) -> Result<()> {
 /// # Errors
 ///
 /// Fails when no config path is given, when the config watcher cannot be
-/// started, or when the previous instance errored while a general config
-/// change triggers a restart.
+/// started, or when an instance stops with an error — a startup failure or a
+/// failure that arrives with a restart, both of which are this process's
+/// failure, because it has nothing serving afterwards.
 pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()> {
     if let Some(curve) = args.genkey {
         return genkey(curve);
@@ -133,36 +156,64 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     // shutdown_tx owns the instance
     let (shutdown_tx, _) = broadcast::channel(1);
 
-    // (The join handle of the last instance, The service update channel sender)
-    let mut last_instance: Option<(tokio::task::JoinHandle<_>, mpsc::Sender<ConfigChange>)> = None;
+    // Every instance reports its own end here; the service update channel
+    // sender of the running one travels beside it.
+    let (end_tx, mut end_rx) = mpsc::unbounded_channel::<InstanceEnd>();
+    // The service-update sender of the running instance. Only the `notify`
+    // feature sends on it, but both builds have to keep it *alive*: the
+    // instance selects on the receiving end, and a closed channel would wake it
+    // with `None` on every iteration — a spin, not an error.
+    let mut service_update: Option<mpsc::Sender<ConfigChange>> = None;
+    let mut running = false;
 
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
-        match e {
+    loop {
+        // While an instance runs, its end is an event like any other: this
+        // process has to notice that it has nothing serving, whether or not a
+        // configuration change ever arrives.
+        let event = if running {
+            tokio::select! {
+                event = cfg_watcher.event_rx.recv() => event,
+                end = end_rx.recv() => return instance_ended(end),
+            }
+        } else {
+            cfg_watcher.event_rx.recv().await
+        };
+        let Some(event) = event else {
+            break;
+        };
+
+        match event {
             ConfigChange::General(config) => {
-                if let Some((i, _)) = last_instance {
+                if running {
                     info!("General configuration change detected. Restarting...");
                     shutdown_tx.send(true)?;
-                    i.await??;
+                    // The end of the instance just asked to stop orders the
+                    // restart, and a failure that arrived with the signal is
+                    // still a failure.
+                    instance_ended(end_rx.recv().await)?;
                 }
 
                 debug!("{:?}", config);
 
                 let (service_update_tx, service_update_rx) = mpsc::channel(1024);
-
-                last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        args.clone(),
-                        shutdown_tx.subscribe(),
-                        service_update_rx,
-                    )),
-                    service_update_tx,
-                ));
+                let end = end_tx.clone();
+                let instance_args = args.clone();
+                let instance_shutdown = shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let outcome =
+                        run_instance(*config, instance_args, instance_shutdown, service_update_rx)
+                            .await;
+                    // Reported, never swallowed: this is the only place the
+                    // process learns that its instance is gone.
+                    let _ = end.send(outcome.err());
+                });
+                service_update = Some(service_update_tx);
+                running = true;
             }
             #[cfg(feature = "notify")]
             ev => {
                 info!("Service change detected. {:?}", ev);
-                if let Some((_, service_update_tx)) = &last_instance {
+                if let Some(service_update_tx) = &service_update {
                     let _ = service_update_tx.send(ev).await;
                 }
             }
@@ -170,6 +221,9 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
     }
 
     let _ = shutdown_tx.send(true);
+    // Released with the loop: nothing is left to forward a service update to,
+    // and (without the `notify` feature) this is what reads the sender at all.
+    drop(service_update);
 
     Ok(())
 }

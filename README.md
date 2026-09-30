@@ -115,10 +115,10 @@ number.
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 9.0 | ~5694‡ | ~1142 | ~5121‡ | ~1572 | ~7604‡ | ~8761‡ | 9.6 |
-| frp | 3.1 | ~5209‡ | ~1069 | ~4393‡ | ~1581 | ~7157‡ | ~6833‡ | 3.0 |
-| rathole | 100 | ~6103‡ | ~1130 | ~4210‡ | ~1508 | ~7910‡ | ~4586‡ | 101 |
-| nps | 64.8 | ~470 | ~1075 | ~2059 | ~1485 | ~7691‡ | ~9485‡ | 58.6 |
+| molehill (mux) | 10.0 | ~6242‡ | ~1135 | ~3629 | ~1490 | ~8010‡ | ~8184‡ | 9.6 |
+| frp | 3.0 | ~8231‡ | ~1066 | ~4498‡ | ~1521 | ~7604‡ | ~7479‡ | 3.1 |
+| rathole | 96.9 | ~6701‡ | ~1163 | ~4102 | ~1555 | ~7554‡ | ~6993‡ | 102 |
+| nps | 64.6 | ~477 | ~1091 | ~2453 | ~1536 | ~7488‡ | ~6276‡ | 57.7 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second: netem releases a shaped burst into whichever interval it
@@ -136,10 +136,10 @@ construction, and this table says so instead of ranking arms on it.
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 16.749 | 5.257 | 9.696 | 5.319 | 0.100 | 0.019 | — † | 16.289 |
-| frp | 6.083 | 5.586 | 5.694 | 5.293 | 0.100 | 0.020 | — † | 6.034 |
-| rathole | 12.811 | 5.191 | 9.681 | 5.246 | 0.100 | 0.019 | — † | 12.810 |
-| nps | 0.134 | 0.147 | 0.147 | 0.165 | 0.100 | 0.020 | — † | 0.132 |
+| molehill (mux) | 16.331 | 5.224 | 9.702 | 5.270 | 0.100 | 0.020 | — † | 16.438 |
+| frp | 6.050 | 5.579 | 5.727 | 5.241 | 0.100 | 0.019 | — † | 6.059 |
+| rathole | 12.877 | 5.189 | 9.680 | 5.295 | 0.100 | 0.019 | — † | 12.889 |
+| nps | 0.132 | 0.152 | 0.142 | 0.165 | 0.100 | 0.020 | — † | 0.134 |
 
 **The noise these numbers have to clear.** The schedule measures `clean` at
 both ends of every timeline, so each tool's two clean readings are two samples
@@ -148,10 +148,10 @@ every other cell has to be read against. `just soak-check` reports it:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (mux) | 16.289 – 16.749 Gbit/s (**2.7 %** apart) | 9.0 – 9.6 ms |
-| frp | 6.034 – 6.083 Gbit/s (**0.8 %** apart) | 3.0 – 3.1 ms |
-| rathole | 12.810 – 12.811 Gbit/s (**0.0 %** apart) | 100 – 101 ms |
-| nps | 0.132 – 0.134 Gbit/s (**1.4 %** apart) | 58.6 – 64.8 ms |
+| molehill (mux) | 16.331 – 16.438 Gbit/s (**0.7 %** apart) | 9.6 – 10.0 ms |
+| frp | 6.050 – 6.059 Gbit/s (**0.1 %** apart) | 3.0 – 3.1 ms |
+| rathole | 12.877 – 12.889 Gbit/s (**0.1 %** apart) | 96.9 – 102 ms |
+| nps | 0.132 – 0.134 Gbit/s (**1.3 %** apart) | 57.7 – 64.6 ms |
 
 **How much it carries.** The same artifact carries the load ramp: the first
 bulk load level at which a fresh interactive connection breaks the SLO (p99
@@ -164,7 +164,7 @@ ceiling is — and neither cross-checks the other.
 | molehill (mux) | 8 | 8 | 0.0 | never broke |
 | frp | 8 | 8 | 0.0 | never broke |
 | rathole | 8 | 8 | 0.0 | never broke |
-| nps | 0 | 8 | 1.0 | interactive p99 204.909 > 50.0 |
+| nps | 0 | 8 | 1.0 | interactive p99 201.156 > 50.0 |
 
 Three arms carried the ramp's full 8 streams, which is the ramp's own ceiling,
 so that reads as a **floor** ("at least 8"), not as a measured maximum; nps
@@ -173,12 +173,12 @@ breaks the SLO at the first stream it is offered.
 **What these shapes say.** Every tool degrades under a bad path and every tool
 recovers on the return to clean — that recovery is what the last column
 measures, and a tool that stayed wedged would be a finding. On the clean path
-molehill carries 16.3-16.7 Gbit/s against rathole's 12.8 (28 % apart, with both
-replicates under 3 %), frp 6.0 and nps 0.13; on latency the order inverts at the
-top — frp answers in 3.0 ms, molehill 9.0, nps 59-65, rathole 100-101 — so
+molehill carries 16.3-16.4 Gbit/s against rathole's 12.9 (27 % apart, with both
+replicates under 1 %), frp 6.1 and nps 0.13; on latency the order inverts at the
+top — frp answers in 3.0 ms, molehill 9.6-10.0, nps 58-65, rathole 97-102 — so
 molehill and frp are the two arms inside the SLO on both axes. `loss1` (10 ms
 delay, 1 % loss) separates the throughput pair from frp: 9.70 and 9.68 Gbit/s
-against 5.69, with nps at 0.15. The shaped interactives are *context*: they are
+against 5.73, with nps at 0.14. The shaped interactives are *context*: they are
 dominated by the queue the harness installed, they swing by more than any
 between-tool gap in them between runs of unchanged code, and every arm wedges on
 `rate20` and `jitter` — that is the path, not one tool. The honest losses are
@@ -198,8 +198,9 @@ the loopback ceiling lost a quarter to a third of their clean throughput between
 the container instances this work ran on (molehill 21.8 -> 16.7, rathole
 21.2 -> 12.8 Gbit/s) while frp and nps were flat, so the top pair's ordering is
 a fact about that run and does not travel as a standing claim. Every results
-file records the host, the method and a CPU calibration, and `just soak-check`
-refuses to compare runs that disagree on them; only same-schema, same-method,
+file records the host, the method and two tool-free calibrations (CPU state and
+the loopback path), and `just soak-check` refuses to compare runs that disagree on
+them; only same-schema, same-method,
 same-host runs compare directly, and each run is gated on its own completeness,
 endpoint and SLO checks.
 The per-stage numbers carry their sample count in the results file
