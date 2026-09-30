@@ -48,20 +48,28 @@ jobs:
       - name: Verify CHANGELOG section exists (single source of release notes)
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          # The same invariant githooks/pre-tag enforces locally: a *dated*
-          # `## [x.y.z] - YYYY-MM-DD` heading with a non-empty body. A laxer
-          # check here would let a hookless tag push ship an undated section.
-          if ! grep -qE "^## \\[$VERSION\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no dated '## [$VERSION] - YYYY-MM-DD' section (Keep a Changelog format)."
+          # The same invariants githooks/pre-tag enforces locally: *exactly one*
+          # dated `## [x.y.z] - YYYY-MM-DD` heading, a body that contains prose,
+          # and an empty `## [Unreleased]`. A laxer check here would let a
+          # hookless tag push ship an undated section — or, as one real defect
+          # did, publish a stray empty duplicate that the extractor picks first.
+          SECTIONS="$(grep -cE "^## \\[$VERSION\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md || true)"
+          if [ "$SECTIONS" -ne 1 ]; then
+            echo "::error::CHANGELOG.md needs exactly one dated '## [$VERSION] - YYYY-MM-DD' section (found $SECTIONS)."
             exit 1
           fi
           awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" {insec=1; next}
+            $0 ~ "^## \\[" ver "\\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$" {insec=1; next}
             insec && /^## / {exit}
             insec {print}
           ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error::The '## [$VERSION]' section is empty."
+          if ! grep -qE '^[^#[:space:]]' release-notes.md; then
+            echo "::error::The '## [$VERSION]' section has no prose (headings only)."
+            exit 1
+          fi
+          if awk '/^## \[Unreleased\]/{f=1;next} f&&/^## /{exit} f{print}' CHANGELOG.md \
+              | grep -qE '^[^[:space:]]'; then
+            echo "::error::'## [Unreleased]' still has content; move it into the dated section before tagging."
             exit 1
           fi
 
@@ -229,13 +237,16 @@ jobs:
       - name: Extract release notes from CHANGELOG.md
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          # Same selection as the verification step: the *dated* heading, so a
+          # stray duplicate cannot be picked, and prose, so a headings-only
+          # section cannot be published as the notes.
           awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" {insec=1; next}
+            $0 ~ "^## \\[" ver "\\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$" {insec=1; next}
             insec && /^## / {exit}
             insec {print}
           ' CHANGELOG.md > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "::error::CHANGELOG.md has no '## [$VERSION]' section."
+          if ! grep -qE '^[^#[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no dated '## [$VERSION]' section with prose."
             exit 1
           fi
 

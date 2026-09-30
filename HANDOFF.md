@@ -1095,6 +1095,82 @@ reproduce its `Bad file descriptor` verbatim and it serves a real test
 afterwards), and the shaper alone (`iperf3 -P 20` against the bare shaper is
 clean).
 
+### The release sweep on the frozen commit (2026-09-28, 13:13)
+
+The sweep the release plan asked for, on the frozen tree, with the new method:
+`ca4ab4a` (clean, fresh release binary sha256 `0ab4072667c30498`, `stale false`,
+`stage_drain_budget_s 30.0`, `workload_version 1`, host `d764f9da9c7e5b2a`),
+`just soak --test=rrul --tools molehill,frp,rathole,nps --out
+benches/scripts/soak/results-soak-v0.10.0.json`, ~76 minutes,
+`soak complete: 4 test(s)`.
+
+**`just soak-check`: `OK: no gate violation`.** molehill complete (95 660
+samples, 8 stages), the throughput endpoint invariant holds, and both clean
+stages sit inside the SLO (6.482 and 6.039 ms against 50 ms). The comparison
+half was skipped again: the gate's baseline is `results-soak-v0.9.0.json`, which
+predates `host_id`, so it falls back to hostnames and refuses
+(`98c48ea3fa68` vs `a093c5fbe0dc`).
+
+**The `rate20` hole is closed; `jitter` is not.** molehill's per-stage bulk
+series this run, as intervals / peak Gbit/s / share of intervals reading zero:
+
+| stage | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
+|---|---|---|---|---|---|---|---|---|
+| intervals | 294 | 111 | 115 | 111 | 115 | **91** | **0** | 294 |
+| peak | 22.82 | 3.03 | 5.39 | 2.41 | 0.343 | **0.236** | — | 22.82 |
+| zero share | 0 % | 0 % | 0 % | 0 % | 28 % | 64 % | — | 0 % |
+
+The delay and loss cells have **no zero-byte interval at all** (also true for
+frp and rathole), so they are quotable; the rate cells are quotable as *peaks*
+only, because the shaper still holds most intervals' bytes past their own
+accounting window — flagged in the README rather than smoothed. `jitter` is
+still a hole, now with its reason captured by `bulk_client_error`: the client
+could not dial the exposed port (`Connection timed out`). The previous baseline
+had the same hole, so nothing regressed, but the cell is missing.
+
+**Same-host delta, and why only part of it reads as a delta.** The previous
+`results-soak-v0.10.0.json` (before this commit) was made on the *same*
+`host_id`, so it is comparable as a host — but it was measured with the **old
+method**, and the method is part of comparability:
+
+| cell | old method | this sweep |
+|---|---|---|
+| clean p99 / clean (return) p99 | 6.567 / 6.929 ms | 6.482 / 6.039 ms |
+| rtt100 p99 | 8082 ms | 7567 ms |
+| loss1 p99 | 1324 ms | 1335 ms |
+| loss5 p99 | 6032 ms | 2847 ms |
+| rate100 p99 | 6412 ms | 7686 ms |
+| rate20 p99 | 4876 ms | 6335 ms |
+| jitter p99 | 6427 ms | 6369 ms |
+| rate20 bulk | 5 intervals, all zero | **91 intervals, 0.236 peak** |
+
+The shaped-cell moves are not a claim in either direction: the old file's
+`rate20` stage carried no bulk load at all (its spine was dead or all-zero), so
+its 4876 ms interactive was measured against an idle path, while this run's
+6335 ms is measured with the 20 bulk streams the stage exists to impose. The
+one qualitative change is the `rate20` bulk row, which went from unmeasurable to
+measured. The old file's shaped *bulk peaks* (e.g. `rate100` 2.35 Gbit/s) are
+not comparable either — the drain changes what a peak interval contains — so
+they are not quoted as a delta.
+
+**Two known imperfections, recorded rather than hidden:**
+
+1. **Two drains spent their full 30 s budget going nowhere**: `drain budget of
+   30s expired with the path still busy (backlog=498, bulk sockets=0)`. The
+   predicate demands an exactly empty netem queue for two consecutive polls,
+   and a shaped path with the probes running always has a few hundred bytes in
+   flight, so the wait can never succeed — it just costs its budget. Nothing
+   was left to drain (`bulk sockets=0`), and the next stage started with a
+   sub-frame backlog, so no measurement is affected; the follow-up is to treat
+   a backlog below one frame as empty. The budget cost ~30 s per occurrence.
+2. **`jitter`'s dead spine** (above). The likely cause is the same artifact the
+   drain exists for, one step further out: the drain's socket predicate counts
+   only `ESTABLISHED` sockets, and a previous stage's visitors linger in
+   `CLOSING` / `FIN-WAIT-2` — measured at ~10 s in the rate100 -> rate20 case —
+   so their retransmissions can still meet the next stage's handshake. Next
+   iteration: count any non-`TIME-WAIT` socket on the bulk port, and consider
+   requiring one successful connect before the spine starts.
+
 ### The re-sweep on the post-review commit (2026-09-27, 19:12)
 
 The sweep the release plan asked for, on the commit that carries the
@@ -1293,11 +1369,43 @@ Verified in both configurations: `--no-default-features --features server,client
 82 passed (2 fixtures reported skipped), default build keeps full fixture
 coverage, clippy clean in both.
 
+#### The same well, again: two attribute/cfg orphans from the v3 removal (2026-09-28)
+
+CI had been red since `e4b8bb1a` (2026-09-28 04:36) — four runs, two jobs,
+never caught locally — and the cause is the mirror image of the fixture
+problem above: `just check` and CI's feature legs compile different feature
+sets, so a gate that only the legs exercise can stay red through a green local
+chain.
+
+Both failures are deletions that left an attribute behind:
+
+| where | what happened |
+|---|---|
+| `src/protocol.rs` | `df4f2e5` removed the v3 `read_registration`, and its doc comment plus `#[cfg(feature = "server")]` stayed where they were — stacked on top of `read_register_result`, which is the *client's* reader. The two cfgs AND-ed, so a `client`-only build lost a function its own session loop calls (`E0432`). |
+| `src/common.rs` | the same commit deleted `pub mod multi_map;` from under `#[cfg(feature = "server")]`, and the attribute attached itself to `pub mod owned_write;` — which the noise *and* KCP transports use, on either side. `client,kcp` then could not compile (`E0433`). |
+
+Fixed in both places: `owned_write` is gated `any(feature = "noise", feature =
+"kcp")` — exactly its two users, neither of which implies a side — and the
+orphan doc/cfg above `read_register_result` is gone, leaving the `client` gate
+its doc describes.
+
+Verified with the two failing CI jobs' own commands: `just powerset` — **all
+251 feature combinations**, `POWERSET=0` — and `cargo build --profile minimal
+--no-default-features --features client` (`MINIMAL=0`). The lesson is the one
+the fixture section already states: the local chain never compiles every
+feature set a deletion can break, so a release-shaped change is not verified
+until the powerset and the minimal profile have both run.
+
 ## Release (v0.10.0)
 
-1. Freeze: `chore(release): prepare v0.10.0` — `version = "0.10.0"`, the
-   `[Unreleased]` content moved under `## [0.10.0] - <date>`, and the withdrawn
-   `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
+1. ~~Freeze~~ **done (2026-09-28)** — `b305394 chore(release): prepare
+   v0.10.0`: `version = "0.10.0"` was already set, the `[Unreleased]` content
+   moved under `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, and the
+   withdrawn `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` were
+   already deleted. Merging the two sections exposed a contradiction inside
+   the release notes (the `health_check` bullet still promised a
+   warning-then-error path the same release had replaced with a refusal), fixed
+   in the same commit.
 2. ~~Re-sweep~~ **done, and now REQUIRED AGAIN** — see "The re-sweep on the
    post-review commit" above: fresh binary on `8ba40ce`, peers re-fetched, 4
    tools, 8/8 stages, `just soak-check` `OK: no gate violation`, the same-host
@@ -1309,12 +1417,45 @@ coverage, clippy clean in both.
    `results-soak-v0.10.0.json`, the four charts and the README tables must be
    regenerated on the frozen commit before the tag. The stored baselines are
    not comparable to a run made with the new schedule — that is what
-   `meta`'s new `stage_drain_budget_s` key is for.
+   `meta`'s new `stage_drain_budget_s` key is for. **Re-run on `ca4ab4a` and
+   done** — `OK: no gate violation`, the `rate20` bulk spine now carries 91
+   intervals, and the charts and both READMEs are refreshed in the same commit;
+   see "The release sweep on the frozen commit" above for the record and for the
+   two imperfections it left open (a drain budget that expires with nothing to
+   drain, and molehill's still-dead `jitter` spine).
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
    `just tag-check` must be run on the frozen commit.
 4. `just check`, `just interop`, then push the branch and open the PR.
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
+
+### The freeze found a gate that would have shipped empty release notes (2026-09-28)
+
+Checking the freeze preconditions turned up a duplicated, **empty**
+`## [0.10.0] - 2026-09-26` section sitting in front of the real one, and that
+combination defeated every check at once:
+
+- all three extractors (`githooks/pre-tag`, `release.yml`'s verification step
+  and `release.yml`'s extraction step) take the **first** match, so the
+  published notes would have been a bare `### Changed`;
+- pre-tag's "non-empty" check counted *lines between headings*, and the empty
+  duplicate still had its `### Changed`, so it passed;
+- and nothing checked that `[Unreleased]` was empty, so this cycle's four fixes
+  would have been left out of the notes entirely while the review stayed green.
+
+The duplicate was an artifact of a changelog-editing script used earlier in the
+same session (the last bullet's scan ran past the bullet into the following
+heading); it is removed, and the notes extraction is verified against the real
+section. The gate now requires **exactly one** dated section for the version,
+**prose** in it, and an empty `[Unreleased]` — implemented in `githooks/pre-tag`
+and in both `release.yml` sites, with the extractors anchored on the *dated*
+heading, and exercised against five synthetic changelogs (good, duplicate,
+headings-only, unreleased-not-moved, undated) plus this tree.
+
+The transferable lesson, worth the line: a check that counts lines is not a
+check that reads content, and "the release notes come from CHANGELOG.md" is
+only true when the *right* section is the one selected. A duplicate heading is
+not a cosmetic problem when every consumer resolves it by first match.
 
 **Non-code items to review before/after the tag** (found 2026-09-26):
 `main` has no branch protection (a repo-settings change for a human; the

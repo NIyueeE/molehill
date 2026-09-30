@@ -121,58 +121,64 @@ reads without a table:
 
 ![Interactive RTT per stage, per tool](assets/soak-v0.10.0-stages.png)
 
-**Interactive stream RTT p99, per stage** (ms; a dagger marks a stage whose
-bulk spine produced no intervals, so its interactive number was measured
-*without* the bulk load):
+**Interactive stream RTT p99, per stage** (ms). A shaped stage of a saturated
+run carries tens of samples, and a stage under a hundred reports its *worst
+observation* rather than a p99 — the sample counts are in the results file
+beside these numbers. `‡` marks a stage that also recorded a wedge (a silent
+stretch, drawn as a flat segment in the chart); `†` marks a stage whose bulk
+spine produced no intervals at all, so its interactive number was measured
+*without* the bulk load.
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | 6.6 | 8082 | 1324 | 6032 | **6412** | 4876 | 6427 | 6.9 |
-| frp 0.71.0 | **2.8** | 7162 | 3620 | 5290 | 7171 | 5741 | 3568 | **2.9** |
-| rathole 0.5.0 | 73 | 8617 | **1311** | **4386** | 6638 | 5371 | **2069** | 71 |
-| nps 0.26.10 | 68 | **1201** | 1134 | 2190 | 7091 | 6504 | 4338 | 70 |
+| **molehill (mux)** | 6.5 | ‡7567 | 1335 | 2847 | ‡7686 | 6335 | †6369 | 6.0 |
+| frp 0.71.0 | **2.7** | ‡5638 | 4045 | ‡5966 | ‡8451 | 1940 | 3061 | **2.8** |
+| rathole 0.5.0 | 51 | ‡6755 | **1327** | ‡6270 | ‡7280 | 2367 | **2654** | 54 |
+| nps 0.26.10 | 104 | **874** | 1136 | 2431 | ‡7713 | **322** | 6419 | 106 |
 
-**Bulk throughput per stage** (Gbit/s, per stage's peak): molehill **24.5** on
-clean -> 3.1 at rtt100 -> 5.5 at loss1 -> 1.8 at loss5 -> **2.35 at rate100** ->
-**25.8 on the return to clean**; frp 7.0 -> 2.7 -> 5.4 -> 3.2 -> 0.62 -> 6.7;
-rathole 23.6 -> 2.9 -> 5.5 -> 3.3 -> 0.62 -> 23.4; nps 0.7 -> 1.3 -> 0.8 -> 1.8
--> 0.44 -> 0.5. The rate- and jitter-limited cells record a bulk series of zero
-for *every* tool — the shaped path holds each interval's bytes past the
-interval's own accounting — so those cells are not quotable and are not quoted.
-† molehill's `jitter` spine produced no intervals at all: the harness waited the
-stage out and the interactive number above is the load-free one. Its `rate20`
-spine produced five intervals this run, all of them zero — the shaped 20 Mbit
-uplink still loses the test's own control connection, recorded as a known defect
-rather than a result.
+**Bulk throughput per stage** (Gbit/s, the stage's peak interval): molehill
+**22.8** on clean -> 3.03 at rtt100 -> 5.39 at loss1 -> 2.41 at loss5 ->
+**0.343 at rate100** -> **0.236 at rate20** -> no sample at jitter -> **22.8 on
+the return to clean**; frp 6.28 -> 3.03 -> 5.22 -> 3.54 -> 0.459 -> 0.296 ->
+0.212 -> 6.28; rathole 23.9 -> 3.04 -> 5.30 -> 3.27 -> 0.461 -> 0.127 -> 0.097
+-> 23.9; nps 0.414 -> 1.50 -> 0.823 -> 1.86 -> 0.425 -> 0.124 -> 0.200 -> 0.414.
+
+The delay- and loss-shaped cells are quotable: **not one zero-byte interval**
+for molehill, frp or rathole across `rtt100`, `loss1` and `loss5`. The rate
+cells are the degenerate side, and they are flagged rather than hidden — the
+shaper holds each interval's bytes past the interval's own accounting window,
+so 28 % of molehill's `rate100` intervals read zero (34 % frp, 47 % rathole,
+49 % nps) and 64 % of its `rate20` ones (81 %, 81 %, 85 %). There the *peak* is
+the measurement and the median is 0; the paragraph above quotes the peak and
+says so. † molehill's `jitter` spine never connected at all — its client
+reported `Connection timed out` dialing the tool's exposed port, the harness
+waited the stage out, and the interactive number in the table is the load-free
+one. That cell is a hole, not a result.
 
 **What these shapes say.** Every tool degrades under a bad path, and every
 tool recovers on the return to clean — that recovery is what the last band
-measures, and a tool that stayed wedged would be a finding. The bulk axis and
-the interactive axis answer different questions and the table reads them
-separately: on the clean stage molehill and rathole carry the same bulk
-(24.5 against 23.6 Gbit/s, frp 7.0 and nps 0.7) while a fresh interactive
-connection costs 6.6 ms for molehill against 2.8 ms for frp, 73 ms for rathole
-and 68 ms for nps. Among the shaped cells molehill leads the rate-limited one
-(6412 ms against 6638, 7091 and 7171), is level with rathole on the 1 %-loss
-cell (1324 against 1311 ms), and is behind nps on the 100 ms latency cell (8082
-against 1201 ms) and behind rathole on jitter (6427 against 2069). **The
-shaped-stage interactives move between runs of unchanged binaries by more than
-the code moves them** — in this run's own same-host comparison against the
-previous sweep, rathole's `rate100` went 162 -> 6638 ms and nps's `rate20`
-3124 -> 6504 ms, neither binary having changed — so those cells are context, not
-a verdict, and the two quotable axes are the clean stage and the run's own
-gate. The honest losses are carried in the table rather than smoothed over: the
-clean-stage interactive cost against frp, and the shaped bulk spines (molehill's
-`jitter` produced no intervals, its `rate20` five zero-byte ones, and frp's,
-rathole's and nps's rate20/jitter spines zero for the same reason).
+measures, and a tool that stayed wedged would be a finding. On the clean stage
+molehill and rathole carry the same bulk (22.8 against 23.9 Gbit/s, frp 6.3 and
+nps 0.4) while a fresh interactive connection costs 6.5 ms for molehill against
+frp's 2.7, rathole's 51 and nps's 104. The shaped interactives are worst
+observations from tens of samples, and they move between runs of unchanged
+binaries by more than the code moves them, so they are context rather than a
+verdict: molehill is level with rathole on `loss1` (1335 against 1327 ms),
+ahead of frp on `loss5` (2847 against 5966) and behind nps on `rtt100` (7567
+against 874) and on `rate20` (6335 against 322). All four tools wedge on
+`rate100` (molehill's 5 flat segments, longest 54 s) and three of the four on
+`rtt100` — that is the shaped path, not one tool. The honest losses are carried
+in the table rather than smoothed over: frp's clean-stage interactive cost is
+2.7 ms against molehill's 6.5, and molehill's `jitter` cell has no bulk sample
+at all.
 
 The peers are driven by the same workload and charted in the same panels; the
 drift axis (open fds, RSS and CPU slopes over the run) is in
 `soak-v0.10.0-drift.png` and the UDP session's RTT/loss in
 `soak-v0.10.0-udp.png` (a sliding loss *rate*, not a count of loss events).
 
-These are v0.10.0 numbers from one host. Only runs of the same model on the
-same host compare directly, and every results file records the host it was
+These are v0.10.0 numbers from one host. Only runs of the same model, method
+and host compare directly, and every results file records the host it was
 measured on: `just soak-check` reads it, refuses to gate one host's run against
 another's, and gates each run on its own completeness, endpoint and SLO checks.
 The per-stage numbers carry their sample count in the results file

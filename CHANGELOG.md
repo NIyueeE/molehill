@@ -7,91 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **BREAKING (protocol): v3 is no longer served.** A v0.10.0 server refuses a
-  client that still speaks protocol v3 — the connection it happens on is
-  closed with no answer, exactly the way a *newer* client against an older
-  server has always been refused — and the server keeps its listener. The v3
-  path (one service per control connection, a registration carrying a
-  requested channel count) is gone with it, together with the two-key service
-  registry that indexed it. Both ends of a molehill deployment are the same
-  binary, so a wire break is a fact to announce rather than a state to serve:
-  upgrade both ends together, in either order, and the refused connection
-  names the version it expected. The interop matrix's new-server/old-client
-  case now pins the refusal, and
-  `tests/integration_test.rs::a_v3_hello_is_refused_on_its_own_connection`
-  pins it on this tree without the old binary.
-
-- **BREAKING (configuration): a removed key no longer starts.** The keys the
-  0.10 configuration surface removed — `[client.data].default_count`, a
-  service's `count`, `pool_size` and `heartbeat_timeout`,
-  `[server].max_pool_size`, a service's `health_check` — were stripped with
-  a warning for one release. They are refused now, in one message naming
-  every key found and what to write instead, because a key that secretes a
-  compatibility path for one release is a key that never gets removed. The
-  upgrade instruction in `docs/configuration.md`, "Migrating to 0.10" is the
-  same table, now as an error.
-
-### Fixed
-
-- **A stalled tunnel writer is woken again.** A stream's reader and writer
-  both park on the connection's per-stream command channel, and both stored
-  their waker in the same slot. A reader that parked last — queueing a window
-  update, which is what returns send credit to the other side — erased the
-  writer's waker, so the credit that came back afterwards woke nobody: the
-  stream's send direction slept until some unrelated resize happened to
-  notify, and every visitor on that tunnel stalled for the rest of the
-  session. The reader now parks in its own slot and the connection wakes both
-  when a command leaves the channel (`src/mux/connection.rs`,
-  `a_readers_channel_park_keeps_the_writers_waker` pins the slot discipline;
-  the stripe livelock it produced is recorded in HANDOFF.md).
-
-- **A tunnel whose connection died leaves the client's pool.** The pool had
-  exactly one removal path — the idle shrink — and it requires the *whole*
-  pool to be quiet, so a single stream that outlived its connection kept the
-  dead tunnel, and its slot against `max_tunnels`, placeable for the rest of
-  the session: every later open that landed on it failed with `Closed` while
-  the pool kept reporting capacity. The pool now reaps a tunnel whose driver
-  has ended on the next maintenance tick, without any idle/warm/cooldown gate,
-  and dials a replacement when the dead tunnel was carrying something
-  (`ShrinkReason::Dead`; `a_dead_tunnel_is_reaped_and_replaced` fails without
-  the reap).
-- **A window update or a stream close no longer queues behind bulk data.** A
-  tunnel's frames all left through one FIFO, so the bodyless bookkeeping that
-  the peer needs to make progress — the credit a window update grants, the FIN
-  that ends a stream — sat behind however much payload the other streams had
-  queued. Those frames now leave through a priority queue ahead of any data
-  frame, the receiver scan round-robins instead of always serving the
-  lowest-numbered ready stream, and the queue is bounded in bytes so one
-  tunnel cannot hold an unbounded amount of payload ahead of a socket that is
-  not draining (`src/mux/connection.rs`; the ordering, the FIFO discipline of
-  payload and the bound are unit-tested).
-- **A visitor whose data channel dies before the forward command is
-  re-paired, not dropped.** The client dials the local service only *after* it
-  receives `StartForwardTcp` on the channel, so a channel whose backend leg is
-  already gone fails in exactly that window — and the server used to drop the
-  visitor on the spot, closing its socket. Measured on the
-  `rate100:120,rate20:120` reproducer: an iperf3 control connection paired with
-  such a channel died as `control socket has closed unexpectedly`, and because
-  every later dial of the stage inherited the failure the bulk spine recorded
-  nothing at all. The visitor now asks for another channel, under the same
-  `PAIR_ATTEMPTS` allowance a *missing* channel gets
-  (`src/core/server.rs::serve_tcp_visitor`).
-- **The Soak schedule drains a stage before reshaping the next one.** The
-  method's `rate20` cell published "spine produced no intervals" for every
-  tool, and the cause was in the harness: a stage boundary killed the bulk
-  client and immediately changed the qdisc, so the old stage's kernel-side
-  drain and FIN retransmissions shared the new, slower queue with the next
-  stage's handshake. Measured with no tool in the path at all, a fresh connect
-  timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
-  now waits at the *old* shaper until the netem queue is empty and the bulk
-  port has no established connection (bounded by `SOAK_DRAIN_BUDGET`, 30 s),
-  restarts the single-test `iperf3` backend before every stage's bulk attempt,
-  and records the client's own failure text instead of a bare exit code. See
-  `docs/benchmarks.md`, "The stage schedule".
-
-## [0.10.0] - 2026-09-26
+## [0.10.0] - 2026-09-28
 
 ### Changed
 
@@ -216,6 +132,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery axis — is judged against the baseline's *return* stage instead of
   against its fresh start.
 
+- **BREAKING (protocol): v3 is no longer served.** A v0.10.0 server refuses a
+  client that still speaks protocol v3 — the connection it happens on is
+  closed with no answer, exactly the way a *newer* client against an older
+  server has always been refused — and the server keeps its listener. The v3
+  path (one service per control connection, a registration carrying a
+  requested channel count) is gone with it, together with the two-key service
+  registry that indexed it. Both ends of a molehill deployment are the same
+  binary, so a wire break is a fact to announce rather than a state to serve:
+  upgrade both ends together, in either order, and the refused connection
+  names the version it expected. The interop matrix's new-server/old-client
+  case now pins the refusal, and
+  `tests/integration_test.rs::a_v3_hello_is_refused_on_its_own_connection`
+  pins it on this tree without the old binary.
+
+- **BREAKING (configuration): a removed key no longer starts.** The keys the
+  0.10 configuration surface removed — `[client.data].default_count`, a
+  service's `count`, `pool_size` and `heartbeat_timeout`,
+  `[server].max_pool_size`, a service's `health_check` — were stripped with
+  a warning for one release. They are refused now, in one message naming
+  every key found and what to write instead, because a key that secretes a
+  compatibility path for one release is a key that never gets removed. The
+  upgrade instruction in `docs/configuration.md`, "Migrating to 0.10" is the
+  same table, now as an error.
+
 ### Removed
 
 - **`health_check` (the per-service health probe) is gone, and a service is no
@@ -230,8 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed request now goes to the client's log, where an operator can see it.
   Operationally nothing needs to be done to recover a backend: it is enough to
   start it, and the service that was never deregistered forwards again. A config
-  that still carries `health_check` starts and logs a warning; the key becomes
-  an error in the next release. See `docs/configuration.md`, "A local service
+  that still carries `health_check` is refused, in the one message that names
+  every removed key and what to write instead (see "BREAKING
+  (configuration)" above). See `docs/configuration.md`, "A local service
   that is down".
 
 ### Fixed
@@ -340,6 +281,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1 — a finished measurement reported as a failed one. The boundary is
   measured: 8, 16 and 32 MiB all finish with exit 0 on the same path, 64 MiB
   does not, and the smaller window costs no throughput.
+
+- **A stalled tunnel writer is woken again.** A stream's reader and writer
+  both park on the connection's per-stream command channel, and both stored
+  their waker in the same slot. A reader that parked last — queueing a window
+  update, which is what returns send credit to the other side — erased the
+  writer's waker, so the credit that came back afterwards woke nobody: the
+  stream's send direction slept until some unrelated resize happened to
+  notify, and every visitor on that tunnel stalled for the rest of the
+  session. The reader now parks in its own slot and the connection wakes both
+  when a command leaves the channel (`src/mux/connection.rs`,
+  `a_readers_channel_park_keeps_the_writers_waker` pins the slot discipline;
+  the stripe livelock it produced is recorded in HANDOFF.md).
+
+- **A tunnel whose connection died leaves the client's pool.** The pool had
+  exactly one removal path — the idle shrink — and it requires the *whole*
+  pool to be quiet, so a single stream that outlived its connection kept the
+  dead tunnel, and its slot against `max_tunnels`, placeable for the rest of
+  the session: every later open that landed on it failed with `Closed` while
+  the pool kept reporting capacity. The pool now reaps a tunnel whose driver
+  has ended on the next maintenance tick, without any idle/warm/cooldown gate,
+  and dials a replacement when the dead tunnel was carrying something
+  (`ShrinkReason::Dead`; `a_dead_tunnel_is_reaped_and_replaced` fails without
+  the reap).
+- **A window update or a stream close no longer queues behind bulk data.** A
+  tunnel's frames all left through one FIFO, so the bodyless bookkeeping that
+  the peer needs to make progress — the credit a window update grants, the FIN
+  that ends a stream — sat behind however much payload the other streams had
+  queued. Those frames now leave through a priority queue ahead of any data
+  frame, the receiver scan round-robins instead of always serving the
+  lowest-numbered ready stream, and the queue is bounded in bytes so one
+  tunnel cannot hold an unbounded amount of payload ahead of a socket that is
+  not draining (`src/mux/connection.rs`; the ordering, the FIFO discipline of
+  payload and the bound are unit-tested).
+- **A visitor whose data channel dies before the forward command is
+  re-paired, not dropped.** The client dials the local service only *after* it
+  receives `StartForwardTcp` on the channel, so a channel whose backend leg is
+  already gone fails in exactly that window — and the server used to drop the
+  visitor on the spot, closing its socket. Measured on the
+  `rate100:120,rate20:120` reproducer: an iperf3 control connection paired with
+  such a channel died as `control socket has closed unexpectedly`, and because
+  every later dial of the stage inherited the failure the bulk spine recorded
+  nothing at all. The visitor now asks for another channel, under the same
+  `PAIR_ATTEMPTS` allowance a *missing* channel gets
+  (`src/core/server.rs::serve_tcp_visitor`).
+- **The Soak schedule drains a stage before reshaping the next one.** The
+  method's `rate20` cell published "spine produced no intervals" for every
+  tool, and the cause was in the harness: a stage boundary killed the bulk
+  client and immediately changed the qdisc, so the old stage's kernel-side
+  drain and FIN retransmissions shared the new, slower queue with the next
+  stage's handshake. Measured with no tool in the path at all, a fresh connect
+  timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
+  now waits at the *old* shaper until the netem queue is empty and the bulk
+  port has no established connection (bounded by `SOAK_DRAIN_BUDGET`, 30 s),
+  restarts the single-test `iperf3` backend before every stage's bulk attempt,
+  and records the client's own failure text instead of a bare exit code. See
+  `docs/benchmarks.md`, "The stage schedule".
+
+- **A `client`-only build compiles again, and so does `client,kcp`.** Two
+  `#[cfg]` gates were left behind when the v3 path was deleted, both by
+  removing the line *under* an attribute and leaving the attribute to attach
+  itself to the next item: `read_register_result` became gated on `server` as
+  well as `client`, so a `client`-only build could not find the reader its own
+  session loop calls, and `common::owned_write` — which the noise and the KCP
+  transports both use on either side — became `server`-gated, so `client,kcp`
+  could not compile. CI's feature-powerset job and the `minimal` profile build
+  have been red since the v4-only commit for exactly these two; `just powerset`
+  (all 251 combinations) and `cargo build --profile minimal
+  --no-default-features --features client` both pass now.
 
 ## [0.9.0] - 2026-09-25
 

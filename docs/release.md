@@ -21,7 +21,10 @@ that line.
 - During development, record notable changes under `## [Unreleased]`.
 - Before tagging, move that content into a dated section:
   `## [x.y.z] - YYYY-MM-DD` (the git tag is the same version with a `v`
-  prefix, e.g. `v0.7.1`).
+  prefix, e.g. `v0.7.1`), leaving `## [Unreleased]` empty. The section must be
+  the only one for that version and must contain prose, not just headings:
+  every extractor takes the first match, so a stray duplicate in front of the
+  real section would be published as the notes.
 - A missing or empty changelog section **fails the release** — the workflow
   errors out before building anything. Fix: add the section, delete the tag,
   re-push. Never hand-edit release notes on GitHub.
@@ -55,7 +58,8 @@ the two tag moments (responsibilities of the three hooks are split in
   before the heavy gates — a violation fails the push.
 
 The review mechanically verifies tag↔version match (including `Cargo.lock`),
-a dated non-empty changelog section, the committed bench results/chart, and
+exactly one dated non-empty changelog section with an empty `[Unreleased]`,
+the committed bench results/chart, and
 the container job structure (GHCR job, image tags, `--help` smoke test),
 then prints an advisory checklist — CHANGELOG and docs audit, container
 build review, benchmark gate, deliberate-release confirmation — that only a

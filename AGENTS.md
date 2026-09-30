@@ -204,7 +204,10 @@ code-level.**
   1. an explicit human request (agents must never create release tags on
      their own initiative);
   2. `version` in `Cargo.toml` equals the tag version;
-  3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`;
+  3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`, is the
+     only section for that version, contains prose, and `[Unreleased]` is
+     empty (every extractor takes the first match, so a stray duplicate in
+     front of the real section would be published as the notes);
   4. `just check` is green on the tagged commit;
   5. the benchmark ritual is done (docs/release.md):
      `results-soak-vX.Y.Z.json`, the new chart, and the README benchmark

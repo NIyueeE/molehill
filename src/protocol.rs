@@ -610,8 +610,6 @@ pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result
     postcard::from_bytes(&bytes).with_context(|| "Failed to deserialize ack")
 }
 
-/// Read a framed [`ServiceRegistration`] sent by a v3 client.
-#[cfg(feature = "server")]
 /// Read the framed registration result ack sent by the server after a
 /// `SessionCmd::Register`.
 ///
