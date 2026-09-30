@@ -66,7 +66,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | Path | Purpose |
 |------|---------|
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports and the session contract |
-| `tests/pool_test.rs` | the tunnel pool end to end: a shared pool serving two services, the per-service default, UDP source-port stickiness across a grow/shrink, the first visitor after the pool shrank, and the opt-in telemetry lines from a real binary |
+| `tests/pool_test.rs` | the tunnel pool end to end: a shared pool serving two services, the per-service default, UDP source-port stickiness across a grow/shrink, the first visitor after the pool shrank, a burst spreading over tunnels while it is placed, an unanswerable visitor not parking the service, the valve refusing growth without killing the tunnel, and the opt-in telemetry lines from a real binary |
 | `tests/session_test.rs` | the v4 server contract driven by a hand-written v4 client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
 | `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
 | `tests/interop_test.rs` | this build against the previous release's binary: the old client still forwards, the old server refuses the new dialect and the new client says why, an unknown dialect is refused on that connection alone (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |

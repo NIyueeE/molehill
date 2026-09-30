@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-26.** The v0.10.0 theme is implemented on
+> **State as of 2026-09-27.** The v0.10.0 theme is implemented on
 > `feat/session-and-pool`: **M1** (one control session per endpoint, protocol
 > v4), **M2a** (one shared elastic pool per carrier, plus the S1 observation),
 > **M6** (the configuration surface) and **M7** (`direct`'s role, measured) are
@@ -731,7 +731,175 @@ negative on a single-tunnel pool (mean −1.0 slots on the first run). The
 candidate snapshot is what the spread must be measured against; fixed before the
 recorded run (the numbers above are from the corrected instrument).
 
+### Post-review fixes (2026-09-27): burst spreading, per-visitor pairing, the host key
+
+A design review of this branch (asked for before the PR) found four things
+worth changing, three of them in code and one in the bench model. All landed
+here, each with a test that fails without it, plus a same-host screen A/B of
+the pre-review binary (`8d3d440`) against the post-review one.
+
+**A1 — a burst stacked on one tunnel while it was placed.** Growth was read
+only on the 50 ms maintenance tick, so a back-to-back burst (a 20-stream bulk
+test) placed every stream on the same tunnel before the tick could see it; the
+tick then fixed the *next* burst. `open_stream` now grows first and places
+second when its chosen tunnel is already at the per-tunnel growth threshold,
+with every guard a no-op when growing is wrong (in flight, held off after a
+refusal, at `max_tunnels`, cold). Pinned by
+`a_burst_spreads_over_tunnels_while_it_is_placed`: without the in-path growth
+the burst reads `[10]` on one tunnel — verified by disabling the call.
+
+**A3 — one unanswerable visitor parked the service.** The accept loop paired
+one visitor at a time, so a request the client could not answer (a pool at its
+ceiling, whose refusal the client reported to nobody) held the accept loop for
+the visitor's whole 25 s budget; the k-th unanswerable visitor was shed one
+budget after the first. Pairing is per visitor now, in flight bounded by
+`MAX_CONCURRENT_VISITORS` (128), with the stripe gather still atomic under a
+lock. Pinned by `one_unanswerable_visitor_does_not_park_the_service`: the
+serial loop sheds the second visitor 49 s after the first.
+
+**The test that caught it had a defect of its own**:
+`a_refused_growth_still_never_reaches_the_stream_cap` checked the *timeout's*
+result and never the *read's*, so a shed visitor's closed socket read as four
+zero bytes of "garbage". The new assertion distinguishes an ended connection
+from a still-waiting one; the old guard would have failed on any run where a
+shed fell inside the read window. **This is the second latent guard defect the
+suite has grown** (the first was the `# requires:` fixture directive); both
+were guarded by "it passes on this host", not by the assertion's meaning.
+
+**A6** — `MOLEHILL_TCP_BUFFER_BYTES` removed from `diag_env`'s illustration: a
+switch that does not exist, kept alive only by a docstring.
+
+**B1 — the host key made the gate's comparison half runnable.** Results
+carried the container hostname as the host identity, which changes on every
+container restart while the hardware does not: `soak_check.comparability`
+refuses different hosts, so same-machine runs were refused and the stored
+baselines (three runs, three containers) were never comparable — the release
+verdict was the self-check alone. Runs now record `host_id` (machine-id + CPU
+model + core count, hashed); files that predate the field fall back to the
+hostname and the gate says which key it used. **B3** — per-stage comparisons
+are matched by occurrence, so the return-to-`clean` stage (the recovery axis)
+is judged against the baseline's *return* stage instead of against its fresh
+start; a regression there was previously compared against the wrong cell and
+masked.
+
+**Verification (same host, same batch, interleaved).** `just soak
+--test=screen --path=clean --streams-max=8 --ab <pre-fix>,<post-fix>`, 8 load
+steps, one run:
+
+| step | streams | pre-fix Gbit/s | post-fix Gbit/s | pre p99 ms | post p99 ms |
+|---|---|---|---|---|---|
+| 1 | 1 | 10.68 | 9.79 | 5.03 | 4.55 |
+| 2 | 2 | 12.93 | **16.64** | 2.27 | 2.87 |
+| 3 | 3 | 13.32 | 12.97 | 1.88 | 2.39 |
+| 4 | 4 | 13.06 | **15.38** | 1.99 | 1.84 |
+| 5 | 5 | 13.66 | 15.51 | 2.54 | 1.87 |
+| 6 | 6 | 13.07 | 13.04 | 1.89 | 1.87 |
+| 7 | 7 | 19.17 | 18.44 | 2.19 | 2.59 |
+| 8 | 8 | 14.06 | **26.54** | 2.26 | 2.94 |
+
+Reading: the interactive p99 (the SLO instrument) is inside the same 1.8-3.0 ms
+band on both sides — no regression — and the post-fix arm is ahead on every
+multi-stream step (claims on 2, 4, 8; directional on 5), which is the burst
+spreading's signature: single-stream steps are unchanged because the rule
+fires at 7 streams. The aggregate verdict is DIRECTIONAL (three steps ahead,
+not all eight), so this is evidence of no harm with a throughput lean, not a
+claim.
+
+The same pair on the shaped path (`--path=rate100`, the cell where the burst
+spreading was found), same method:
+
+| step | streams | pre-fix Gbit/s | post-fix Gbit/s | pre p99 ms | post p99 ms |
+|---|---|---|---|---|---|
+| 1 | 1 | **0.071** | 0.045 | 1014 | 1065 |
+| 2 | 2 | 0.059 | 0.059 | 1031 | 1084 |
+| 3 | 3 | 0.044 | 0.044 | 1850 | 1928 |
+| 4 | 4 | 0.044 | **0.054** | 2318 | 2207 |
+| 5 | 5 | 0.035 | **0.044** | 2616 | 2545 |
+| 6 | 6 | 0.056 | **0.069** | 2752 | 2952 |
+| 7 | 7 | 0.058 | 0.058 | 3484 | 3320 |
+| 8 | 8 | 0.058 | 0.055 | 3560 | 3628 |
+
+Reading: the throughputs are shaped to a fraction of a Gbit/s, so the deltas
+are small in absolute terms; the interactive p99 sits in the same 1.0-3.6 s
+band on both sides (that band is the path, not the tool), the post-fix arm is
+again ahead on the multi-stream steps (4-6), and the one pre-fix win is the
+single-stream step 1 at the noise floor. Same verdict as the clean run: no
+harm, a directional throughput lean on the steps the rule fires at.
+
+**Still open, unchanged by this round**: the striping deadlock (A2's fix is a
+documented "not supported on v4" in both configuration mirrors — the
+`CreateStripedGroupFor` command and the deadlock itself remain the next
+cycle's), the rate20 bulk spine (the shaped-path control connection; the
+structural answer is a per-visitor channel, i.e. `direct`, which is a design
+change with its own measurement), and the re-sweep: **the published
+`results-soak-v0.10.0.json` predates these three code changes**, so it may not
+be quoted as the shipped binary's numbers. Re-running the four-tool sweep is a
+release-gate step before the tag (`just soak-peers` first — `~/tmp` was
+cleared); a molehill-only screen is not a substitute, because the batch
+composition (peers sharing the machine) is part of the method.
+
+### The re-sweep on the post-review commit (2026-09-27, 19:12)
+
+The sweep the release plan asked for, on the commit that carries the
+post-review fixes (`v0.9.0-59-g8ba40ce`, tree clean, fresh release binary):
+`just soak-peers` (the `~/tmp` peer cache was cleared), `cargo build --release`,
+then `just soak --test=rrul --tools molehill,frp,rathole,nps --out
+benches/scripts/soak/results-soak-v0.10.0.json`, ~70 min, `soak complete: 4
+test(s)`.
+
+**`just soak-check`: `OK: no gate violation`.** Completeness, the endpoint
+invariant and the absolute SLO pass for all four tools; the shaped stages are
+recorded as the degradation curve.
+
+**The same-host pre/post comparison ran for the first time on this host** — the
+`host_id` key (or its hostname fallback for the older file) makes the committed
+run comparable — and it reports **6 violations**, five of them molehill's, which
+is the honest headline of this round:
+
+| cell | pre-fix | post-fix | delta |
+|---|---|---|---|
+| clean p99 | 2.287 ms | 8.129 ms | +255 % |
+| clean worst 1 s | 2.140 ms | 4.958 ms | +132 % |
+| loss1 worst 1 s | 945.9 ms | 4596.7 ms | +386 % |
+| loss5 p99 / worst 1 s | 1908 ms | 4943 ms | +159 % |
+| clean (return) worst 1 s | 84.1 ms | 220.3 ms | +162 % |
+| jitter p99 | 7094.5 ms | 2652.9 ms | **-63 %** |
+
+**The clean-cell move is the fix working, not a regression.** The pre-fix
+initial `clean` stage carried **15.0 Gbit/s** of bulk (server/client CPU 2.0 %)
+while every other clean window in the same run carried 23-25 Gbit/s — the
+20-stream burst stacked on one tunnel, exactly the head-of-line blocking A1
+removes. The post-fix initial clean carries **21.2 Gbit/s** at 6.4 % CPU from
+the first interval, and the interactive median moves 1.49 -> 3.03 ms *because
+the stage now carries ~40 % more traffic through the tool*: the return-to-clean
+window, where both runs carry the same load, is unchanged (median 2.64 vs 2.72,
+p99 7.49 vs 7.42). The interleaved screen A/B on the same pair measured the same
+property without the load confound (+0.2 ms, not +1.5 ms). All of it stays
+inside the 50 ms SLO with 6x headroom.
+
+**The shaped-cell moves (loss1 worst-1s +386 %, loss5 +159 %) are inside the
+known variance, and the peers prove it**: between two runs of the *same*
+unchanged binaries on the same host, frp's jitter p99 moved 219 -> 4296 ms,
+nps's loss5 -28 %, rathole's rate100 collapsed to 161 ms — because rathole's
+`rate100` bulk spine produced no intervals in this run (exit 1), so that cell
+carried no load. molehill's `rate20` spine also produced nothing (exit -9), the
+known blocker this cycle has not closed.
+
+**What the sweep says overall** (all numbers quoted in the README pair):
+molehill's jitter cell is now the *best* of the four (2653 against 4296 / 3034
+/ 5063); on the clean stage molehill and rathole carry the same bulk (23.7 vs
+23.6 Gbit/s) while a fresh interactive connection costs 8.1 ms against frp's
+2.8; molehill leads the rate-limited cell (6537 against 7078 and 8120, 80
+samples against 12 and 13); and the two honest losses are carried in the table
+rather than smoothed over — the clean interactive cost against frp, and the
+`rate20` spine. The re-sweep is committed with the charts and the refreshed
+README pair, so the published numbers describe this commit's binary.
+
 ### The v0.10.0 release sweep
+
+**Superseded by the re-sweep above** (measured on `8d3d440`, i.e. before the
+post-review fixes; kept as the record of the frozen commit's run). The published
+numbers, charts and README pair now come from the re-sweep.
 
 **Run (2026-09-27).** `revision v0.9.0-45-g8d3d440`, `tree_clean true`,
 `stale false`, binary `target/release/molehill` sha256 `df3b341b9e010449`
@@ -873,11 +1041,13 @@ coverage, clippy clean in both.
 1. Freeze: `chore(release): prepare v0.10.0` — `version = "0.10.0"`, the
    `[Unreleased]` content moved under `## [0.10.0] - <date>`, and the withdrawn
    `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. Fresh sweep on the frozen commit, quiet machine, `cargo build --release`
-   first: `just soak --test=rrul --tools molehill,frp,rathole,nps --out
-   benches/scripts/soak/results-soak-v0.10.0.json` (~80 min).
-3. `just soak-plot` → `assets/soak-v0.10.0*.png`; README (+zh) numbers;
-   `just soak-check`.
+2. ~~Re-sweep~~ **done** — see "The re-sweep on the post-review commit"
+   above: fresh binary on `8ba40ce`, peers re-fetched, 4 tools, 8/8 stages,
+   `just soak-check` `OK: no gate violation`, the same-host comparison
+   reported (5 molehill violations, all explained in that section), charts
+   re-rendered and the README pair refreshed in the same commit.
+3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
+   `just tag-check` must be run on the frozen commit.
 4. `just check`, `just interop`, then push the branch and open the PR.
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
    the release workflow publishes.
@@ -968,7 +1138,8 @@ Everything below is verified as of `899eb6f`; the two `[ ]` items need a human.
 ## Open threads for the next cycle
 
 - **Striping** — the deadlock above, and the group command that would make D24
-  structural (first item in this file).
+  structural (first item in this file). The configuration page (both mirrors)
+  now states plainly that `stripe_count > 1` is not served on a v4 session.
 - **M2b/M2c (S2, D28, D27)** — do not land on this data: the spread is zero and
   the UDP drop counters stayed at zero. Re-open with a *pool-size* question
   (does growing earlier help a mixed workload?) rather than a

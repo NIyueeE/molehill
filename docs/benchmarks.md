@@ -194,7 +194,42 @@ has to raise `RUST_LOG` to see never reaches a results file. The server's UDP
 line (`MOLEHILL_UDP_STATS=1`) is a fourth switch and carries the affinity
 table's size, its evictions and each worker's pinned peers.
 
+### What this model cannot answer
+
+Stated so a reader does not ask a chart for something it never measured:
+
+- **One sample per stage.** A stage's numbers come from one walk of that
+  schedule. The within-run spread of a shaped stage is large (a saturated
+  `rtt100` stage's p99 can move by hundreds of milliseconds between runs), so a
+  cross-run difference smaller than that spread is not resolvable by a single
+  pair of runs — that is what the `screen` interleave is for, and it is why
+  `soak-check`'s cross-run verdicts use percentage limits rather than a
+  difference test.
+- **The control plane under degradation.** Only the data plane is shaped; the
+  tool's own control channel stays on the unshaped path, because shaping it
+  turns a capacity measurement into a wedge study. Anything the control channel
+  does *under* loss (heartbeat survival, reconnection behaviour) is outside
+  this model's reach.
+- **A tool's own internals.** Everything measured is externally observable, so
+  a peer tool and molehill are measured identically — and no internal counter
+  of either appears in the comparison. The opt-in `MOLEHILL_*` switches add
+  molehill-only diagnostics to a run, and a run that inherits one records it in
+  `meta.instrumentation` so it is never mistaken for a clean one.
+- **Which configuration a peer number describes.** The published four-tool
+  table is molehill's **default configuration** (plain transport, `multiplex`
+  mode, one pool per service). The shared elastic pool (`--variants shared`),
+  the Noise transport, the KCP carrier and `direct` mode are separate arms, and
+  the per-decision measurements below are the only recorded basis for choosing
+  between them.
+
 ## What each configuration choice costs (per-decision measurements)
+
+The elastic pool's own thresholds — grow at 12 % of a tunnel's stream capacity
+(7 of 64), refuse placement at 56, reap a forward that moves nothing for 5
+minutes — are internal constants, not settings: their calibration (the
+two-stage reproduction that found the growth rule's threshold, and the sweep
+records) is in HANDOFF.md, and they change only with a measurement behind
+them.
 
 These figures are from the **retired per-cell model** (the v0.8.x method: one
 cold-started average per tool per network condition, reported as a median over
