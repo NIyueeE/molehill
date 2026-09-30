@@ -399,10 +399,17 @@ async fn direct_round_trip(session: &mut Session, id: u32, exposed: u16, backend
 
 /// Poll until binding `port` succeeds (the previous owner released it), then
 /// release it again.
+///
+/// The probe binds the **wildcard** address, because that is what the server
+/// binds for a registered service: a `127.0.0.1` probe is not evidence of
+/// occupancy on a BSD-derived host, where `SO_REUSEADDR` (which
+/// `TcpListener::bind` sets) lets a specific-address bind coexist with a
+/// wildcard one. macOS caught exactly that — `a registered service must hold
+/// its port` passed on Linux and failed there.
 async fn wait_for_free_port(port: u16) -> Result<()> {
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
-        match TcpListener::bind(("127.0.0.1", port)).await {
+        match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(l) => {
                 drop(l);
                 return Ok(());
@@ -545,7 +552,7 @@ async fn a_wrong_service_token_rejects_only_that_service() -> Result<()> {
     }
     // The rejected service was never bound.
     assert!(
-        TcpListener::bind(("127.0.0.1", EXPOSED_A)).await.is_ok(),
+        TcpListener::bind(("0.0.0.0", EXPOSED_A)).await.is_ok(),
         "a rejected service must not hold its port"
     );
 
@@ -574,7 +581,7 @@ async fn deregister_releases_the_port() -> Result<()> {
         Ack::Ok
     ));
     assert!(
-        TcpListener::bind(("127.0.0.1", EXPOSED_A)).await.is_err(),
+        TcpListener::bind(("0.0.0.0", EXPOSED_A)).await.is_err(),
         "a registered service must hold its port"
     );
 

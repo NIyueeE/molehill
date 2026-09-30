@@ -219,9 +219,16 @@ mod tests {
     /// deadline measures *silence*, not age.
     ///
     /// Two independent tasks move bytes for many deadlines: one dribbles into
-    /// the copy's `b` side, one drains its `a` side. With a 100 ms deadline and
-    /// a byte every 50 ms, a watchdog that measured age rather than silence
-    /// would have reaped this copy several times over.
+    /// the copy's `b` side, one drains its `a` side. With a 500 ms deadline and
+    /// a byte every 25 ms, a watchdog that measured age rather than silence
+    /// would have reaped this copy dozens of times over.
+    ///
+    /// The margins are wide on purpose. This clock is real (`test-util` is not
+    /// in the feature set) and the test runs beside 140 others, so a scheduling
+    /// delay on a loaded runner must not be readable as silence: a 100 ms
+    /// deadline with a byte every 50 ms left only 2× headroom and failed on
+    /// macOS CI with `no bytes moved in either direction for 100ms` while the
+    /// dribbler was still writing.
     #[tokio::test]
     async fn a_stream_that_keeps_moving_is_not_reaped() {
         let (mut drain, mut a) = tokio::io::duplex(64 * 1024);
@@ -236,9 +243,10 @@ mod tests {
             }
         });
         let dribbler = tokio::spawn(async move {
-            // Several deadlines' worth of movement at half the deadline.
-            for _ in 0..20 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            // Four deadlines' worth of movement, 20× faster than the deadline
+            // and twice as fast as the watchdog's own tick.
+            for _ in 0..80 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
                 if feeder.write_all(b"x").await.is_err() {
                     return;
                 }
@@ -246,7 +254,7 @@ mod tests {
             let _ = feeder.shutdown().await;
         });
         let copy =
-            copy_bidirectional_with_idle(&mut a, &mut b, 1024, Duration::from_millis(100)).await;
+            copy_bidirectional_with_idle(&mut a, &mut b, 1024, Duration::from_millis(500)).await;
         dribbler.await.unwrap();
         drainer.abort();
         assert!(

@@ -477,13 +477,21 @@ fn every_removed_key_warns_and_is_otherwise_quiet() {
         ("client.services.*.health_check", "registered"),
         ("server.max_pool_size", "max_tunnels_per_client"),
     ];
+    // `[client.data]` (and so the removed `default_count`) exists only with the
+    // `multiplex` feature; the other five removed keys live in tables every
+    // build has, so they are asserted everywhere.
+    let client_data_extra = if cfg!(feature = "multiplex") {
+        "default_count = 4\n"
+    } else {
+        ""
+    };
     let mut scenario = Scenario::start_with(
         "removed-key",
         "count = 2\n\
          pool_size = 8\n\
          heartbeat_timeout = 90\n\
          health_check = { type = \"tcp\", interval = 10 }\n",
-        "default_count = 4\n",
+        client_data_extra,
         "max_pool_size = 16\n",
     );
     let visitors = scenario.visitors;
@@ -502,6 +510,9 @@ fn every_removed_key_warns_and_is_otherwise_quiet() {
         "the removed keys must warn — they are ignored, not silently obeyed:\n{client_log}"
     );
     for (pattern, replacement) in REMOVED {
+        if pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
+            continue;
+        }
         let quoted = format!("`{pattern}`");
         let mentions: Vec<&&str> = warnings.iter().filter(|l| l.contains(&quoted)).collect();
         assert!(

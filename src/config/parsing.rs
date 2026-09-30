@@ -1038,6 +1038,13 @@ mod tests {
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
+    // A fixture that names a feature the directive does not know is a typo,
+    // and retiring a fixture silently is the failure mode the directive exists
+    // to prevent — the test's failure path is a panic (AGENTS.md §2).
+    #![expect(
+        clippy::panic,
+        reason = "a malformed `# requires:` directive must fail the test"
+    )]
     use super::*;
     // Only the defaults-pinning test needs these (and the tunnels/streams
     // group exists only with the multiplex feature); at file scope the
@@ -1048,6 +1055,42 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     use anyhow::Result;
+
+    /// Whether a fixture's declared feature is compiled in.
+    ///
+    /// A fixture exercises the schema of the build it is run in, and parts of
+    /// that schema are feature-gated: `[client.data]` and `[server.data]` need
+    /// `multiplex`, so a fixture carrying them is meaningless — and parses as
+    /// *unknown field* — in the `--no-default-features --features server,client`
+    /// leg CI runs (AGENTS.md §12). Such a fixture says so on a leading comment
+    /// line, the way an invalid fixture declares `# expect:`:
+    ///
+    /// ```toml
+    /// # requires: multiplex
+    /// ```
+    ///
+    /// The skip is reported rather than silent, and an unknown feature name is
+    /// a hard failure: a typo in the directive must not quietly retire a
+    /// fixture.
+    fn fixture_is_available(text: &str, name: &str) -> bool {
+        let Some(required) = text
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .find_map(|l| l.strip_prefix("# requires: "))
+        else {
+            return true;
+        };
+        match required.trim() {
+            "multiplex" => {
+                let available = cfg!(feature = "multiplex");
+                if !available {
+                    println!("  skip {name}: needs the `multiplex` feature");
+                }
+                available
+            }
+            other => panic!("{name}: unknown feature {other:?} in `# requires:`"),
+        }
+    }
 
     fn list_config_files<T: AsRef<Path>>(root: T) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
@@ -1129,8 +1172,13 @@ mod tests {
     fn test_valid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/valid_config")?;
         for p in paths {
-            let s = fs::read_to_string(p)?;
-            Config::from_str(&s)?;
+            let name = p.display().to_string();
+            let s = fs::read_to_string(&p)?;
+            if !fixture_is_available(&s, &name) {
+                continue;
+            }
+            Config::from_str(&s)
+                .with_context(|| format!("{name} is a valid fixture but was rejected"))?;
         }
         Ok(())
     }
@@ -1209,6 +1257,9 @@ max_tunnels_per_client = 6
         for p in paths {
             let name = p.display();
             let s = fs::read_to_string(&p)?;
+            if !fixture_is_available(&s, &name.to_string()) {
+                continue;
+            }
             let expected = s.lines().find_map(|l| l.strip_prefix("# expect: "));
             let Err(err) = Config::from_str(&s) else {
                 anyhow::bail!("{name} parsed, but it is an invalid fixture");
@@ -1554,16 +1605,26 @@ health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3 }
     /// removals is not stopped by them (it is warned about, once per key).
     #[test]
     fn test_every_removed_key_is_stripped() {
-        let config = r#"
+        // Assembled by concatenation, not `format!`: the TOML carries literal
+        // braces (`health_check = { ... }`) that a format string would read as
+        // placeholders. `[client.data]` is included only where it exists —
+        // without `multiplex` the section is an unknown field — and the removal
+        // assertions below are feature-independent either way.
+        let mut config = String::from(
+            r#"
 [client]
 default_token = "t"
 
 [client.control]
 default_remote_addr = "example.com:2333"
 
-[client.data]
-default_count = 4
-
+"#,
+        );
+        if cfg!(feature = "multiplex") {
+            config.push_str("[client.data]\ndefault_count = 4\n");
+        }
+        config.push_str(
+            r#"
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
@@ -1578,14 +1639,18 @@ max_pool_size = 16
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
-"#;
-        let mut doc: toml::Value = toml::from_str(config).unwrap();
+"#,
+        );
+        let mut doc: toml::Value = toml::from_str(&config).unwrap();
         strip_removed_keys(&mut doc);
+        // The `[client.data]` clause only applies where the section exists.
+        let default_count_stripped =
+            !cfg!(feature = "multiplex") || doc["client"]["data"].get("default_count").is_none();
         assert!(
             doc.get("server")
                 .and_then(|s| s.get("max_pool_size"))
                 .is_none()
-                && doc["client"]["data"].get("default_count").is_none()
+                && default_count_stripped
                 && ["count", "pool_size", "heartbeat_timeout", "health_check"]
                     .iter()
                     .all(|k| doc["client"]["services"]["test"].get(*k).is_none()),
@@ -1593,7 +1658,7 @@ bind_addr = "0.0.0.0:2333"
         );
         // A current config with none of them still comes out unchanged (the
         // mirror of the check above): the strip removes exactly those keys.
-        assert!(Config::from_str(config).is_ok());
+        assert!(Config::from_str(&config).is_ok());
     }
 
     #[test]
@@ -1710,7 +1775,12 @@ remote_bind_addr = "0.0.0.0:6080"
         // `[client.data]` acts as defaults; a service's own mode/carrier win.
         // The runtime merge lives in `DataOpts::for_service` (client code);
         // here we pin that the keys parse and validate per service.
-        let config = r#"
+        // `default_carrier = "kcp"` (and `[client.data.kcp]`) need the `kcp`
+        // feature; the CI legs build this test with and without it, so the
+        // override is exercised with whatever carrier the build has — the
+        // property under test is that the service's own value wins.
+        let mut config = String::from(
+            r#"
 [client]
 default_token = "t"
 
@@ -1719,11 +1789,15 @@ default_remote_addr = "example.com:2333"
 
 [client.data]
 default_mode = "multiplex"
-default_carrier = "kcp"
-
-[client.data.kcp]
-max_tunnels = 6
-
+"#,
+        );
+        config.push_str(if cfg!(feature = "kcp") {
+            "default_carrier = \"kcp\"\n\n[client.data.kcp]\nmax_tunnels = 6\n"
+        } else {
+            "default_carrier = \"tcp\"\n"
+        });
+        config.push_str(
+            r#"
 [client.services.muxed]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
@@ -1733,8 +1807,9 @@ mode = "direct"
 local_addr = "127.0.0.1:81"
 remote_bind_addr = "0.0.0.0:6081"
 carrier = "tcp"
-"#;
-        let cfg = Config::from_str(config).unwrap();
+"#,
+        );
+        let cfg = Config::from_str(&config).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(services["muxed"].mode, Some(DataMode::Direct));
         assert_eq!(services["muxed"].carrier, None);

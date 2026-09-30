@@ -799,6 +799,73 @@ clean (frp 6.5 / 2.9 / 0.7 / 6.5; rathole 23.5 / 3.0 / 0.5 / 22.7; nps 0.5 /
 flat segment, 5.3 s) against frp's five (37.2 s) and nps's seven (41.1 s). The
 two honest losses are carried in the README table rather than smoothed over.
 
+### CI caught what `just check` cannot
+
+The PR's `test server+client lib only` leg went red on the first push: `cargo
+test --lib --no-default-features --features server,client` failed three config
+tests. `[client.data]` and `[server.data]` exist only with the `multiplex`
+feature (they are `#[cfg(feature = "multiplex")]` fields on the config structs),
+and two fixtures this cycle added — `valid_config/full.toml` and
+`invalid_config/max_tunnels_zero.toml` — carry them, so in that leg they parse as
+*unknown field `data`*.
+
+The local chain never sees it: `just check` compiles the minimal build only for
+clippy, and clippy does not run `#[test]` bodies. CI's feature-powerset leg is
+the only thing that runs them, which is exactly why it is there. **Three more
+legs' worth came out of the same well** once it was looked for, so the whole
+matrix was run locally afterwards:
+
+| leg | before | after |
+|---|---|---|
+| `--lib --no-default-features --features server,client` | 3 failed | 82 passed (2 fixtures skipped) |
+| `--no-default-features --features server,client,noise,hot-reload` | `log_budget_test` failed | 100 + 14 + 2 + 7 passed |
+| `--no-default-features --features server,client,noise,hot-reload,multiplex` | `test_per_service_data_overrides_parse` failed | 129 + 17 + 2 + 9 + 7 passed |
+
+The other two, both the same shape — a test assuming the default feature set:
+
+- `tests/log_budget_test.rs::every_removed_key_warns_and_is_otherwise_quiet`
+  injects `default_count = 4` into `[client.data]`, which the `multiplex`-less
+  leg does not have; the section is now included (and its expectation asserted)
+  only where it exists. The migration contract still holds for the five keys
+  every build has.
+- `tests/session_test.rs` proved port occupancy by binding `127.0.0.1:<port>`
+  while the server holds `0.0.0.0:<port>`. That is evidence on Linux and not on
+  a BSD-derived host, where `SO_REUSEADDR` (set by `TcpListener::bind`) lets a
+  specific-address bind coexist with a wildcard one — macOS failed
+  `a registered service must hold its port` for exactly that reason. The probes
+  bind the wildcard now, which is what the server binds.
+- `test_per_service_data_overrides_parse` used `default_carrier = "kcp"`, which
+  needs the `kcp` feature the noise legs do not build; it picks the carrier the
+  build has, because the property under test is that a service's own value wins.
+
+Then macOS CI failed a test from *this* cycle, and it was a real flake rather
+than a gating bug: `common::forward::tests::a_stream_that_keeps_moving_is_not_reaped`
+ran a 100 ms idle deadline against a byte every 50 ms — 2× headroom on a real
+clock, beside 140 other tests — and the runner's scheduling delay was read as
+silence. Margins are now 500 ms against 25 ms (20×, and twice the watchdog's own
+50 ms tick) for four deadlines' worth of movement, which is still far more than
+an age-based watchdog would tolerate, so the test keeps its power.
+
+The fix for the fixtures is a directive mirroring the existing `# expect:`
+convention:
+
+```toml
+# requires: multiplex
+```
+
+The fixture-driven tests skip a fixture whose declared feature is not compiled
+in, **reporting** the skip rather than dropping it silently, and an unknown
+feature name in the directive fails the test — a typo must not quietly retire a
+fixture. `test_every_removed_key_is_stripped` assembles its config by
+concatenation now (a `format!` string read the TOML's literal
+`health_check = { ... }` braces as placeholders) and only asserts on
+`[client.data]` where the section exists. The `clippy::panic` waiver for the
+directive sits on the test module, per AGENTS.md §2's test-module exception.
+
+Verified in both configurations: `--no-default-features --features server,client`
+82 passed (2 fixtures reported skipped), default build keeps full fixture
+coverage, clippy clean in both.
+
 ## Release (v0.10.0)
 
 1. Freeze: `chore(release): prepare v0.10.0` — `version = "0.10.0"`, the

@@ -1,4 +1,5 @@
 # expect: `[client.data.tcp].max_tunnels` must be at least 1
+# requires: multiplex
 
 # The cap is what the elastic pool may grow to, so `0` would mean "a pool
 # that may never hold a tunnel". It is refused with the carrier's name

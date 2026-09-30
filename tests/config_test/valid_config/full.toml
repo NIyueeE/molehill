@@ -1,3 +1,4 @@
+# requires: multiplex
 [client]
 default_token = "default_token_if_not_specify" # Necessary. Must match `[server].default_token`
 
