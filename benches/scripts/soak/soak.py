@@ -41,7 +41,6 @@ import contextlib
 import json
 import os
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -1810,7 +1809,12 @@ def build_meta(
         # longer exists. `stale` says the binary predates the newest source file.
         "molehill_bin_fingerprint": lib.binary_fingerprint(knobs.molehill_bin),
         "molehill_version": lib.tool_version(knobs),
-        "hostname": socket.gethostname(),
+        # The host, as a *stable* identity rather than a name: a container
+        # hostname changes on every restart while the hardware does not, and a
+        # comparison keyed on it refused same-machine runs (and would have
+        # accepted a different machine that happens to reuse a hostname).
+        # `host_id` is machine-id + CPU model + core count, hashed.
+        **lib.host_identity(),
         "kernel": subprocess.run(
             ["uname", "-r"], capture_output=True, text=True, check=False
         ).stdout.strip(),

@@ -2211,24 +2211,26 @@ enum PairOutcome<C> {
 
 /// Wait for a data channel for one visitor, asking for more when none arrives.
 ///
-/// This is the accept loop's critical section, so its bound is load bearing: as
-/// long as it waits for one visitor the service accepts no other. A request the
-/// client cannot answer — the pool is at its placement ceiling and refuses the
-/// open, which the client reports to nobody — would otherwise park the whole
-/// service for the rest of the session. Measured: a saturated pool left the
-/// service unable to serve a *fresh* visitor even with every stream released
+/// This used to be the accept loop's critical section — as long as it waited
+/// for one visitor the service accepted no other. A request the client cannot
+/// answer — the pool is at its placement ceiling and refuses the open, which
+/// the client reports to nobody — would otherwise park the whole service for
+/// the rest of the session. Measured: a saturated pool left the service unable
+/// to serve a *fresh* visitor even with every stream released
 /// (`tests/pool_test.rs`, `a_saturated_pool_still_serves_the_next_visitor`).
 ///
-/// So the wait is a budget, and its expiry re-requests rather than giving up:
-/// capacity usually comes back (a stream retires, a tunnel grows) and at most
-/// this one visitor is waiting, so a re-request is cheap. Only a visitor the
-/// client refuses `PAIR_ATTEMPTS` times in a row is shed — a typed failure for
-/// that visitor and nothing for the service.
+/// The wait is now per visitor, so its bound protects one visitor instead of
+/// the service, and `MAX_CONCURRENT_VISITORS` bounds how many can wait at once.
+/// The wait itself is still a budget, and its expiry re-requests rather than
+/// giving up: capacity usually comes back (a stream retires, a tunnel grows)
+/// and at most this one visitor is waiting, so a re-request is cheap. Only a
+/// visitor the client refuses `PAIR_ATTEMPTS` times in a row is shed — a typed
+/// failure for that visitor and nothing for the service.
 async fn pair_visitor<C>(
-    data_ch_rx: &mut mpsc::Receiver<C>,
+    data_ch_rx: &SharedChannels<C>,
     data_ch_req_tx: &mpsc::UnboundedSender<bool>,
     shutdown_rx: &mut broadcast::Receiver<bool>,
-    control_task: &mut tokio::task::JoinHandle<()>,
+    control_alive: &mut tokio::sync::watch::Receiver<bool>,
 ) -> PairOutcome<C>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2240,8 +2242,8 @@ where
         // too.
         let next = tokio::select! {
             _ = shutdown_rx.recv() => None,
-            _ = &mut *control_task => None,
-            ch = data_ch_rx.recv() => ch,
+            _ = control_alive.changed() => None,
+            ch = take_channel(data_ch_rx) => ch,
             () = time::sleep(PAIR_WAIT_BUDGET) => {
                 // Nothing arrived in the budget: ask again, unless this
                 // visitor has waited out its whole allowance.
@@ -2263,11 +2265,43 @@ where
     }
 }
 
+/// The visitor pairings one TCP service pool allows at once.
+///
+/// The pairing wait is the accept loop's critical section only while pairing is
+/// serial: a visitor whose channel request the client cannot answer used to
+/// hold the accept loop for the whole wait, and every visitor behind it queued
+/// in the kernel backlog (measured: a saturated pool left a *fresh* visitor
+/// waiting even after the pool had drained). Pairing is per visitor now, so this
+/// bound is what keeps a wedged service from spawning unbounded tasks — each
+/// in-flight pairing owns one visitor socket and one data channel, and the
+/// backlog keeps the rest.
+const MAX_CONCURRENT_VISITORS: usize = 128;
+
+/// The data channels a service pool hands out, shared by every visitor pairing
+/// in flight.
+///
+/// A channel is interchangeable between the service's visitors — the queue
+/// belongs to one service and every channel on it carries that service's
+/// prologue — so the mutex serializes only the *take*, never the wait.
+type SharedChannels<C> = std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<C>>>;
+
+/// Take one data channel from the shared queue, or `None` when the pool's
+/// channel source ended (the control channel did).
+///
+/// The guard is dropped with the future, so a pairing that loses the race to its
+/// own timeout budget releases the queue for the other visitors.
+async fn take_channel<C>(rx: &SharedChannels<C>) -> Option<C>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    rx.lock().await.recv().await
+}
+
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<C>(
     l: TcpListener,
     sock_opts: SocketOpts,
-    mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_rx: mpsc::Receiver<C>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
@@ -2277,12 +2311,40 @@ where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     info!("Listening at {}", l.local_addr()?);
-    let cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)?;
 
     // Retry at least every 1s
     let backoff_builder = ExponentialBuilder::default().with_max_delay(Duration::from_secs(1));
     let mut backoff = backoff_builder.build();
     let listen_notice = RepeatNotice::new();
+
+    let data_ch_rx: SharedChannels<C> = std::sync::Arc::new(tokio::sync::Mutex::new(data_ch_rx));
+    // A striped gather is atomic by construction: K channels consumed by one
+    // visitor, all or none. Concurrent unstriped pairings take channels one by
+    // one from the shared queue and cannot interfere with each other, but a
+    // gather in flight must not steal the channel a waiting unstriped visitor
+    // was promised — so the striped path holds this lock for the whole group.
+    let stripe_gather = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let pool = VisitorPool {
+        data_ch_rx,
+        data_ch_req_tx: data_ch_req_tx.clone(),
+        cmd: std::sync::Arc::new(postcard::to_stdvec(&DataChannelCmd::StartForwardTcp)?),
+        stripe_gather,
+        stripe_count,
+    };
+    let visitor_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_VISITORS));
+    // The control task's liveness as a shareable signal. A `JoinHandle` cannot
+    // be cloned and polling one from several tasks is not allowed, so one
+    // watcher task owns it and every consumer — the accept loop and each
+    // pairing in flight — reads the same channel: the value flips, or the
+    // sender is dropped with the watcher, and both end the wait.
+    let (control_alive_tx, control_alive_rx) = tokio::sync::watch::channel(true);
+    tokio::spawn(async move {
+        let _ = (&mut control_task).await;
+        let _ = control_alive_tx.send(false);
+    });
+    // The accept loop's own view of that signal, bound before the loop: the
+    // loop re-arms `changed()` on every iteration.
+    let mut control_alive = control_alive_rx.clone();
 
     'pool: loop {
         tokio::select! {
@@ -2290,9 +2352,30 @@ where
             // The control channel ended without a replacement registration:
             // release the listener instead of holding the port for a service
             // nobody drives any more.
-            _ = &mut control_task => break,
-            val = l.accept() => match val {
-                Err(e) => {
+            _ = control_alive.changed() => break,
+            // Take a pairing slot before accepting: the bound is on pairings
+            // in flight, not on connections, so a service whose client cannot
+            // answer stops *inside* the bound instead of parking the accept
+            // loop behind one visitor.
+            permit = visitor_slots.clone().acquire_owned() => {
+                let Ok(permit) = permit else { break };
+                // Accept under the same two stop signals as the loop itself: a
+                // shutdown that arrives while the listener is idle must release
+                // the listener, not wait for the next connection.
+                let mut control_alive = control_alive_rx.clone();
+                let accepted = tokio::select! {
+                    _ = shutdown_rx.recv() => None,
+                    _ = control_alive.changed() => None,
+                    val = l.accept() => Some(val),
+                };
+                match accepted {
+                    // Shutdown, or the control channel ended.
+                    None => break 'pool,
+                    Some(Err(e)) => {
+                    // Give the slot back before sleeping: a listener error is
+                    // not this visitor's doing, and the retry must not hold a
+                    // pairing slot while it waits.
+                    drop(permit);
                     // `l` is a TCP listener so this must be an IO error —
                     // possibly EMFILE, which is the operator's problem and
                     // therefore loud once, then debug while it retries.
@@ -2311,76 +2394,26 @@ where
                         bail!("Too many retries. Aborting...");
                     }
                 }
-                Ok((mut incoming, addr)) => {
-                    listen_notice.clear();
-                    // For every visitor, request to create a data channel:
-                    // one per stripe when the visitor connection is striped.
-                    for _ in 0..stripe_count {
-                        if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                            // An error indicates the control channel is broken
-                            // So break the loop
-                            break 'pool;
-                        }
+                    Some(Ok((incoming, addr))) => {
+                        listen_notice.clear();
+                        debug!("New visitor from {}", addr);
+                        // The visitor socket gets the same latency-friendly
+                        // defaults as the rest of the forwarding path.
+                        sock_opts.apply(&incoming);
+                        backoff = backoff_builder.build();
+                        tokio::spawn(
+                            serve_tcp_visitor(
+                                incoming,
+                                pool.clone(),
+                                shutdown_rx.resubscribe(),
+                                control_alive_rx.clone(),
+                                permit,
+                            )
+                            .instrument(Span::current()),
+                        );
                     }
-
-                    backoff = backoff_builder.build();
-
-                    debug!("New visitor from {}", addr);
-
-                    // The visitor socket gets the same latency-friendly
-                    // defaults as the rest of the forwarding path
-                    sock_opts.apply(&incoming);
-
-                    if stripe_count <= 1 {
-                        match pair_visitor(
-                            &mut data_ch_rx,
-                            &data_ch_req_tx,
-                            &mut shutdown_rx,
-                            &mut control_task,
-                        )
-                        .await
-                        {
-                            PairOutcome::Channel(mut ch) => {
-                                if write_and_flush(&mut ch, &cmd).await.is_ok() {
-                                    tokio::spawn(async move {
-                                        // A stalled forward is closed by the
-                                        // watchdog: a wedged visitor must not
-                                        // hold a tunnel stream for the
-                                        // session's life (see
-                                        // `FORWARD_IDLE_TIMEOUT`).
-                                        if let Err(e) = copy_bidirectional_with_idle(
-                                            &mut ch,
-                                            &mut incoming,
-                                            TCP_COPY_BUFFER_SIZE,
-                                            FORWARD_IDLE_TIMEOUT,
-                                        )
-                                        .await
-                                        {
-                                            debug!("Data channel closed: {e}");
-                                        }
-                                    });
-                                }
-                            }
-                            // The visitor waited out its whole allowance: a
-                            // failed request for it, nothing for the service.
-                            PairOutcome::Shed => {}
-                            PairOutcome::Stop => break 'pool,
-                        }
-                    } else if pair_striped_group(
-                        incoming,
-                        stripe_count,
-                        &mut data_ch_rx,
-                        &data_ch_req_tx,
-                        &mut shutdown_rx,
-                        &mut control_task,
-                    )
-                    .await?
-                    {
-                        // The control channel is gone; stop the pool.
-                        break 'pool;
-                    }
-                }
-            },
+            }
+            }
         }
     }
 
@@ -2388,12 +2421,130 @@ where
     Ok(())
 }
 
+/// Everything a visitor pairing needs from its service pool, shared by every
+/// visitor in flight (the arcs clone per visitor; only the arriving socket and
+/// the stop signals are per-visitor).
+struct VisitorPool<C> {
+    /// Channels to pair visitors with, one take at a time.
+    data_ch_rx: SharedChannels<C>,
+    /// How to ask the client for one more (or K more) data channels.
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    /// The `StartForwardTcp` command, serialized once for the pool.
+    cmd: std::sync::Arc<Vec<u8>>,
+    /// Held for the whole gather, so a striped group's K channels stay atomic.
+    stripe_gather: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Channels per visitor: 1 is the classic shape, K is a stripe group.
+    stripe_count: usize,
+}
+
+impl<C> Clone for VisitorPool<C> {
+    fn clone(&self) -> Self {
+        Self {
+            data_ch_rx: std::sync::Arc::clone(&self.data_ch_rx),
+            data_ch_req_tx: self.data_ch_req_tx.clone(),
+            cmd: std::sync::Arc::clone(&self.cmd),
+            stripe_gather: std::sync::Arc::clone(&self.stripe_gather),
+            stripe_count: self.stripe_count,
+        }
+    }
+}
+
+/// Pair one accepted visitor with its data channels and start the forward.
+///
+/// Everything that used to run inside the accept loop runs per visitor here, so
+/// one visitor's pairing wait — bounded by `PAIR_ATTEMPTS × PAIR_WAIT_BUDGET`
+/// — costs that visitor and nothing else. The visitor slot (`permit`) lives for
+/// exactly the pairing: the copy task it spawns ends with the connection, and
+/// holding a slot for it would turn a long-lived connection into a missing
+/// slot.
+async fn serve_tcp_visitor<C>(
+    mut incoming: TcpStream,
+    pool: VisitorPool<C>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+    mut control_alive: tokio::sync::watch::Receiver<bool>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    if pool.stripe_count <= 1 {
+        // For this visitor, request to create a data channel.
+        if pool
+            .data_ch_req_tx
+            .send(true)
+            .with_context(|| "Failed to send data chan create request")
+            .is_err()
+        {
+            // An error indicates the control channel is broken.
+            return;
+        }
+        match pair_visitor(
+            &pool.data_ch_rx,
+            &pool.data_ch_req_tx,
+            &mut shutdown_rx,
+            &mut control_alive,
+        )
+        .await
+        {
+            PairOutcome::Channel(mut ch) => {
+                if write_and_flush(&mut ch, &pool.cmd).await.is_ok() {
+                    tokio::spawn(
+                        async move {
+                            // A stalled forward is closed by the watchdog: a
+                            // wedged visitor must not hold a tunnel stream for
+                            // the session's life (see `FORWARD_IDLE_TIMEOUT`).
+                            if let Err(e) = copy_bidirectional_with_idle(
+                                &mut ch,
+                                &mut incoming,
+                                TCP_COPY_BUFFER_SIZE,
+                                FORWARD_IDLE_TIMEOUT,
+                            )
+                            .await
+                            {
+                                debug!("Data channel closed: {e}");
+                            }
+                        }
+                        .instrument(Span::current()),
+                    );
+                }
+            }
+            // Both ends leave nothing to release: `Shed` failed this visitor's
+            // request (the service keeps serving), and `Stop` means the pool's
+            // owning task has already ended. Dropping `incoming` closes the
+            // visitor's socket, which is the refusal it sees.
+            PairOutcome::Shed | PairOutcome::Stop => {}
+        }
+    } else {
+        // The gather is atomic: hold the group lock for the whole attempt so
+        // concurrent visitors cannot interleave their K channels.
+        let _gather = pool.stripe_gather.lock().await;
+        // The boolean told the accept loop to stop; for one visitor both
+        // outcomes are "nothing left to do here".
+        if let Err(e) = pair_striped_group(
+            incoming,
+            pool.stripe_count,
+            &pool.data_ch_rx,
+            &pool.data_ch_req_tx,
+            &mut shutdown_rx,
+            &mut control_alive,
+        )
+        .await
+        {
+            debug!("Striped pairing failed: {e:#}");
+        }
+    }
+}
+
 /// Pair one visitor connection with a stripe group: gather `stripe_count`
 /// healthy data channels, announce each one as a stripe of the group, and
 /// spawn the group's forwarding.
 ///
-/// Returns `Ok(true)` when the control channel ended mid-gather (the pool
-/// must stop) and `Ok(false)` once the group is forwarding. A broken pooled
+/// The caller holds the stripe-gather lock for the whole call, which is what
+/// keeps a gather atomic: concurrent unstriped pairings take channels one by
+/// one and cannot interfere with each other, but two gathers in flight would
+/// interleave their K channels and produce two broken groups.
+///
+/// Returns `Ok(true)` when the control channel ended mid-gather (the pool must
+/// stop) and `Ok(false)` once the group is forwarding. A broken pooled
 /// channel discards the whole attempt — the client already parked the
 /// group's stripes, and a retry under a fresh group id is the only way to
 /// keep the indices consistent.
@@ -2401,10 +2552,10 @@ where
 async fn pair_striped_group<C>(
     incoming: TcpStream,
     stripe_count: usize,
-    data_ch_rx: &mut mpsc::Receiver<C>,
+    data_ch_rx: &SharedChannels<C>,
     data_ch_req_tx: &mpsc::UnboundedSender<bool>,
     shutdown_rx: &mut broadcast::Receiver<bool>,
-    mut control_task: &mut tokio::task::JoinHandle<()>,
+    control_alive: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2417,8 +2568,8 @@ where
         loop {
             let next = tokio::select! {
                 _ = shutdown_rx.recv() => None,
-                _ = &mut control_task => None,
-                ch = data_ch_rx.recv() => ch,
+                _ = control_alive.changed() => None,
+                ch = take_channel(data_ch_rx) => ch,
             };
             let Some(mut ch) = next else {
                 return Ok(true);

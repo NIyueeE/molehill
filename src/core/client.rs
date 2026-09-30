@@ -100,6 +100,13 @@ struct DataOpts {
 #[cfg(not(feature = "multiplex"))]
 struct Tunnels;
 
+/// A data-channel open the elastic pool refused. Reported once per process,
+/// then DEBUG: the visitor's failure is per-connection, the condition behind it
+/// is the operator's to see (the pool at its ceiling, or a growth the server's
+/// valve refuses).
+#[cfg(feature = "multiplex")]
+static OPEN_REFUSED: RepeatNotice = RepeatNotice::new();
+
 /// The client's UDP pin accounting, as the hub sees it. Without tunnels there
 /// is nothing to pin a peer to, so the handle is a unit: the plumbing keeps
 /// one shape and the feature only decides whether it does anything.
@@ -748,7 +755,22 @@ impl Tunnels {
                 .open_stream()
                 .await
                 .map(TunnelStream::Yamux)
-                .map_err(|e| anyhow!("Failed to open a multiplexed data channel: {e}")),
+                .map_err(|e| {
+                    // The visitor whose open this was fails either way — and a
+                    // failed request is DEBUG the way any per-connection
+                    // failure is. The *condition* behind it is what an operator
+                    // must be able to see, though: a pool at its ceiling, or a
+                    // growth the server's valve refuses, is a state of the
+                    // deployment and not a property of one visitor. So it is
+                    // reported once per process and then demoted to the
+                    // per-connection DEBUG (AGENTS.md §9's log contract, and
+                    // the same shape the pool's own refused-growth line uses).
+                    OPEN_REFUSED.report(
+                        || info!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
+                        || debug!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
+                    );
+                    anyhow!("Failed to open a multiplexed data channel: {e}")
+                }),
         }
     }
 

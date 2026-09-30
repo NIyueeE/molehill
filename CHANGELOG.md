@@ -119,6 +119,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a reference peer's swing is reported with its numbers instead of blocking
   this release. Anyone reading a `soak-check` verdict, or reproducing one, is
   affected; the reasoning each fix rests on is in HANDOFF.md.
+- **The host key is now stable, so the comparison half of the gate can run.**
+  Results carried the container hostname as the host identity, which changes on
+  every container restart while the hardware does not — so two runs on the same
+  machine were *refused* as different hosts, and every stored baseline was from
+  a differently-named container. Every run now records `host_id` (machine-id +
+  CPU model + core count, hashed) beside the hostname, and the gate compares
+  that; files that predate the field fall back to the hostname and the gate
+  says which key it used. Per-stage comparisons are also matched by
+  **occurrence** rather than by name, so the return-to-`clean` stage — the
+  recovery axis — is judged against the baseline's *return* stage instead of
+  against its fresh start.
 
 ### Removed
 
@@ -139,6 +150,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that is down".
 
 ### Fixed
+
+- **One visitor's unanswerable channel request no longer parks the whole
+  service.** The server's accept loop paired visitors one at a time, so a
+  request the client could not answer — a pool at its placement ceiling, which
+  the client reports to nobody — held the accept loop for the visitor's whole
+  25-second budget, every visitor behind it queued unanswered, and the k-th
+  one was shed a full budget after the first. Pairing is per visitor now, with
+  the number of pairings in flight bounded (128): a shed visitor costs that
+  visitor and the service keeps accepting and forwarding. A stripe group's
+  gather stays atomic (all-or-none under a lock), and a data-channel open the
+  pool refuses is reported once per process on the client — INFO the first
+  time, then DEBUG — so an out-of-capacity pool is visible instead of a stream
+  of indistinguishable per-connection failures. Pinned by
+  `one_unanswerable_visitor_does_not_park_the_service`, which fails with the
+  serial loop (the second visitor shed 49 s after the first); it also caught a
+  latent test defect — a read whose result was never checked, so a shed
+  visitor's closed socket read as four zero bytes of "garbage".
+
+- **A burst of new streams no longer stacks on one tunnel.** Growth used to be
+  sampled only on the pool's 50 ms maintenance tick, so a burst that opened its
+  streams back to back — a 20-stream `iperf3` bulk test — finished placing every
+  one of them on the same tunnel before the first tick could see it, and that
+  tunnel's interactive and control streams then queued behind the bulk. An open
+  whose chosen tunnel is already at the growth threshold now grows first and
+  places second, so the burst spreads over the tunnels it will use. The in-path
+  growth skips itself when growing is wrong (a growth in flight, a refused
+  growth holding the pool back, the pool at `max_tunnels`, a cold pool), and the
+  maintenance tick keeps its role. Pinned by a test that fails with the whole
+  burst on one tunnel when the in-path growth is removed.
 
 - **A KCP data channel on an IPv6 path no longer fragments either.** The
   path-MTU clamp shipped in v0.9.0 read the kernel's MTU through `IP_MTU`, which

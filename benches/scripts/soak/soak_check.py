@@ -140,11 +140,15 @@ def comparability(base: dict, cur: dict) -> str | None:
     docs/release.md and docs/benchmarks.md both state the boundary: only
     same-schema, same-host runs are comparable. This is that sentence as a
     function, so the gate refuses an invalid comparison instead of printing
-    verdicts nobody may act on. The host key is the recorded hostname, which is
-    what the results carry today; a containerized bench host changes it on
-    every container restart, which is conservative in the safe direction
-    (refusing to compare) and is recorded in HANDOFF.md as the next method
-    fix — a stable host identity is a calibration measurement, not a name.
+    verdicts nobody may act on. The host key is `meta.host_id` — machine id +
+    CPU model + core count, because the path, the CPU budget and the loopback
+    ceiling are properties of the *machine*, and a container hostname (what
+    the records carried before) changes on every restart while the hardware
+    does not: keying on it refused same-host runs and would admit a different
+    host that happened to reuse the name. Runs that predate the field fall
+    back to the recorded hostname, which is conservative in the safe direction
+    (refusing to compare) and recorded in HANDOFF.md as the method fix — a
+    stable host identity is a calibration measurement, not a name.
     """
     if base["meta"].get("workload_version") != cur["meta"].get("workload_version"):
         return (
@@ -152,13 +156,29 @@ def comparability(base: dict, cur: dict) -> str | None:
             f"({base['meta'].get('workload_version')} vs "
             f"{cur['meta'].get('workload_version')}): different method"
         )
-    bh, ch = base["meta"].get("hostname"), cur["meta"].get("hostname")
-    if bh and ch and bh != ch:
+    bh, ch = base["meta"].get("host_id"), cur["meta"].get("host_id")
+    if not (bh and ch):
+        # One of the runs predates `host_id`: compare the recorded hostnames,
+        # which is what the older files have, and say which key was used.
+        bh, ch = base["meta"].get("hostname"), cur["meta"].get("hostname")
+        if bh and ch and bh != ch:
+            return (
+                f"the runs were made on different hosts ({bh} vs {ch}): the path, "
+                "the CPU budget and the loopback ceiling are properties of where a "
+                "run happens, and the peers' clean-tool spread shows it"
+            )
+        return None
+    if bh != ch:
         return (
-            f"the runs were made on different hosts ({bh} vs {ch}): the path, "
-            "the CPU budget and the loopback ceiling are properties of where a "
-            "run happens, and the peers' clean-tool spread shows it"
+            f"the runs were made on different hosts (host_id {bh} vs {ch}, "
+            f"{base['meta'].get('hostname')} vs {cur['meta'].get('hostname')}): "
+            "the path, the CPU budget and the loopback ceiling are properties of "
+            "the machine, and the peers' clean-tool spread shows it"
         )
+    return _comparability_visitor(base, cur)
+
+
+def _comparability_visitor(base: dict, cur: dict) -> str | None:
     # The injected slow visitor is part of the workload, not a viewer of it:
     # two runs that throttled it differently measured different paths. The
     # workload-version check above already separates "off" from "on" (an
@@ -332,16 +352,40 @@ def check_capacity(tool: str, rep: Report, c: dict, b: dict) -> None:
 
 
 def check_stages(tool: str, rep: Report, c: dict, b: dict) -> None:
-    """Per-stage verdicts: the interactive distribution and the worst second."""
+    """Per-stage verdicts: the interactive distribution and the worst second.
+
+    Stages are matched by **occurrence**, not by name. The default schedule
+    opens and closes with the same `clean` condition (the recovery axis), so a
+    name-keyed lookup pairs the *return* clean stage with the baseline's
+    *initial* clean stage — comparing a recovered tool against a fresh one and
+    calling the recovery axis silent. Both walks are the same schedule, so the
+    k-th stage of a name in one run is the k-th of that name in the other; a
+    name that appears a different number of times is reported, not guessed at.
+    """
     p99_lim = env_pct("rrul_rtt_p99_pct")
     worst_lim = env_pct("rrul_worst_1s_pct")
+
+    # Bucket both runs' stages by name, in order: [clean, rtt100, ..., clean].
+    def by_name(t: dict) -> dict:
+        buckets: dict = {}
+        for s in t.get("stages", []):
+            buckets.setdefault(s.get("stage"), []).append(s)
+        return buckets
+
+    base_stages = by_name(b)
+    cur_seen: dict = {}
     for stage_c in c.get("stages", []):
-        stage_b = next(
-            (s for s in b.get("stages", []) if s.get("stage") == stage_c.get("stage")),
-            None,
-        )
-        if stage_b is None:
+        name = stage_c.get("stage")
+        index = cur_seen.get(name, 0)
+        cur_seen[name] = index + 1
+        candidates = base_stages.get(name, [])
+        if index >= len(candidates):
+            rep.note(
+                f"{tool} {name}: the baseline has no stage #{index + 1} of that "
+                "name — the schedules differ, so that stage is not compared"
+            )
             continue
+        stage_b = candidates[index]
         rep.limit(
             stage_c.get("rtt_p99"),
             stage_b.get("rtt_p99"),

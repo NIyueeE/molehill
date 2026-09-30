@@ -755,7 +755,6 @@ impl TunnelPool {
     }
 
     /// The pool's key within its session (`session`, or `service:<name>`).
-    #[cfg(test)]
     #[must_use]
     pub fn key(&self) -> &str {
         &self.inner.shared.key
@@ -872,6 +871,11 @@ impl TunnelPool {
                     .await;
         }
         let ceiling = self.ceiling();
+        // Grow *before* placing, not (only) after: a burst that arrives while
+        // every tunnel already sits at the growth threshold must spread over
+        // the tunnels it will use, not land all of it on one and queue its
+        // interactive and control streams behind that bulk.
+        self.grow_before_placing().await;
         let Some(reservation) = self.reserve(&[], ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
             // from a full one — the dialer could not bring a tunnel up — and
@@ -910,6 +914,41 @@ impl TunnelPool {
     /// must make it unreachable.
     fn ceiling(&self) -> usize {
         crate::transport::pool::tunnel_ceiling(self.inner.shared.stream_cap)
+    }
+
+    /// Grow one tunnel when the next open would add to a tunnel that is already
+    /// at the growth threshold, so the burst spreads *before* it is placed.
+    ///
+    /// The maintenance tick grows too, but it samples at 50 ms intervals: a
+    /// burst of K back-to-back opens (a 20-stream bulk test) completes long
+    /// before the first tick sees it, so every one of them places on the same
+    /// tunnel and the tick can only fix the *next* burst. Growing in the open
+    /// path is what makes the spreading synchronous, at the cost of one dial
+    /// for the opens that trip the rule — the same dial the cold path already
+    /// pays, and never one for an open that does not need it.
+    ///
+    /// Every guard turns this into a no-op, and they are all conditions under
+    /// which growing is wrong or already happening: a growth is in flight, a
+    /// refused growth is still holding the pool back (D14), the pool is at its
+    /// own `max_tunnels`, or the pool is cold (which [`Self::open_stream`]
+    /// grew synchronously above). The dial is bounded by the carrier's own
+    /// establish timeout, exactly like the cold path's.
+    async fn grow_before_placing(&self) {
+        use std::sync::atomic::Ordering;
+        if self.inner.shared.resizing.load(Ordering::Acquire) || self.growth_held_off() {
+            return;
+        }
+        let grow_at = crate::transport::pool::tunnel_grow_at(self.inner.shared.stream_cap);
+        let busy = {
+            let state = self.inner.state.lock();
+            let size = state.entries.len();
+            size > 0
+                && size < state.max_tunnels
+                && state.entries.iter().any(|e| e.load().total() >= grow_at)
+        };
+        if busy {
+            self.grow(GrowReason::Load).await;
+        }
     }
 
     /// Wait for the growth in flight to end, or for there to be none any more.
@@ -2372,6 +2411,87 @@ mod tests {
             pool.size(),
             "the dialer is called once per tunnel"
         );
+    }
+
+    /// A burst spreads *while it is placed*, not on the next maintenance tick.
+    ///
+    /// The rule this pins: an open that would add to a tunnel already at the
+    /// growth threshold grows first, so a K-open burst (a 20-stream bulk test)
+    /// lands on the tunnels it will use instead of stacking all of it on one —
+    /// the head-of-line blocking that queue a shared tunnel's interactive and
+    /// control streams behind the bulk. The maintenance tick would fix the
+    /// *next* burst 50 ms later; this makes the first one spread too.
+    ///
+    /// Falsified by reverting to place-then-grow: the whole burst stacks on
+    /// the one cold tunnel (10 streams on one tunnel against a threshold of
+    /// 7), which is the shape the two-stage rate reproduction measured.
+    #[tokio::test]
+    async fn a_burst_spreads_over_tunnels_while_it_is_placed() {
+        const OPENS: usize = 10;
+        // One live duplex tunnel to start from, its inbound drained so every
+        // stream the pool opens is accepted by the tunnel's server side.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx, mut first_rx) = mpsc::channel::<MuxStream>(8);
+        tokio::spawn(async move { while first_rx.recv().await.is_some() {} });
+        tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(shutdown_tx);
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        // A dialer that mints a live duplex tunnel per call: the burst's growth
+        // is a real dial, drained so the tunnel can accept every stream.
+        let dial: Dialer = std::sync::Arc::new(move || {
+            let counter = std::sync::Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let (tx, mut rx) = mpsc::channel::<MuxStream>(8);
+                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                std::mem::forget(shutdown_tx);
+                Ok((
+                    ClientTunnel::start(client_io, mux_config(), shutdown_rx),
+                    tokio::sync::watch::channel(false).0,
+                ))
+            })
+        });
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "burst".to_owned(),
+            vec![(
+                ClientTunnel::start(client_io, mux_config(), shutdown_rx),
+                tokio::sync::watch::channel(false).0,
+            )],
+            4,
+            std::time::Duration::from_secs(60),
+            Some(dial),
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+
+        let mut live = Vec::new();
+        for _ in 0..OPENS {
+            live.push(pool.open_stream().await.expect("burst open"));
+        }
+        // Read immediately: the maintenance tick (50 ms) would grow the pool
+        // anyway, so a *late* read cannot distinguish the two rules.
+        let snap = pool.snapshot();
+        let streams: Vec<usize> = snap.tunnels.iter().map(|(s, _, _)| *s).collect();
+        assert!(
+            snap.size >= 2,
+            "the burst must grow the pool while it is placed, not on the next tick: {streams:?}"
+        );
+        assert!(
+            streams.iter().copied().max().unwrap_or(0) < OPENS,
+            "no tunnel may carry the whole burst: {streams:?}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            snap.size - 1,
+            "one dial per tunnel the burst added"
+        );
+        drop(live);
     }
 
     /// The client's pin count is what gates the shrink (D30): a tunnel with a

@@ -1153,8 +1153,9 @@ def diag_env() -> dict:
     """The opt-in instrumentation the run was started with.
 
     Everything a tool spawns inherits the parent environment, so an explicit
-    `MOLEHILL_MUX_STATS=1` (or `MOLEHILL_KCP_STATS`, `MOLEHILL_STRIPE_COUNT`,
-    `MOLEHILL_TCP_BUFFER_BYTES`) reaches the tool unchanged. The runner used
+    `MOLEHILL_MUX_STATS=1` (or `MOLEHILL_KCP_STATS`, `MOLEHILL_POOL_STATS`,
+    `MOLEHILL_PLACEMENT_STATS`, `MOLEHILL_UDP_STATS`, `MOLEHILL_STRIPE_COUNT`)
+    reaches the tool unchanged. The runner used
     to force the mux framing counters ON for every molehill spawn: that is
     molehill-only work inside the measured path, the peers have no equivalent,
     and nothing in the Soak model parses the lines — an asymmetric instrument
@@ -1520,6 +1521,69 @@ def binary_fingerprint(path) -> dict:
         "bytes": len(data),
         "mtime": round(mtime, 3),
         "stale": bool(newest_src and mtime < newest_src),
+    }
+
+
+#: Identity files, most authoritative first. A container hostname changes on
+#: every container restart, which is what made the drift gate unusable here:
+#: stored runs on the *same hardware* carried different hostnames, so
+#: `soak_check` refused to compare them and the comparison half of the gate
+#: had never once run. `/etc/machine-id` is stable for the machine (it
+#: survives container recreation, because it is the host's).
+_HOST_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+
+
+def _read_first(paths: tuple) -> str:
+    for p in paths:
+        try:
+            return Path(p).read_text().strip()
+        except OSError:
+            continue
+    return ""
+
+
+def host_identity() -> dict:
+    """The host this run happened on: a *stable* identity, not a name.
+
+    `hostname` is kept (it is what a reader recognises), but it is not the
+    comparison key: in a containerized bench host it changes on every restart
+    while the hardware does not, so comparing by hostname compares two
+    differently-named runs of the same machine and — the actual failure —
+    refuses two runs of the same machine because the container was recreated
+    between them.
+
+    `host_id` is the calibration-grade key: the machine id (survives container
+    recreation) plus the CPU model and the core count (what actually bounds the
+    loopback ceiling), hashed so the file stays readable and two hosts cannot
+    be confused by a shared component. `None` when nothing can be read, which
+    is the honest answer rather than a guess: the gate then falls back to the
+    hostname and says so.
+
+    The CPU budget and the loopback ceiling are properties of the *machine*,
+    so this is the field two runs must agree on before any cross-run claim is
+    made (soak_check.comparability; AGENTS.md §10, "same model, same host").
+    """
+    machine_id = _read_first(_HOST_ID_FILES)
+    cpu_model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    nproc = str(os.cpu_count() or 0)
+    if not (machine_id or cpu_model):
+        return {"hostname": socket.gethostname(), "host_id": None}
+    basis = f"{machine_id}|{cpu_model}|{nproc}"
+    return {
+        "hostname": socket.gethostname(),
+        "host_id": hashlib.sha256(basis.encode()).hexdigest()[:16],
+        "host_id_basis": {
+            "machine_id": bool(machine_id),
+            "cpu_model": cpu_model,
+            "cpu_count": nproc,
+        },
     }
 
 

@@ -223,7 +223,16 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
 
 - **Same model, same host.** Every results file records the method version, the
   host and the harness revision; a number from another host or another model is
-  context, not a baseline.
+  context, not a baseline. The host is recorded twice: `hostname` (what a reader
+  recognises) and `host_id` — the machine id plus the CPU model and core count,
+  hashed — because the path, the CPU budget and the loopback ceiling are
+  properties of the *machine*. A containerized bench host changes its hostname
+  on every restart while the hardware does not, so the comparison key is
+  `host_id`: keying on the name refused two runs of the same machine (the
+  container was recreated between them) and would have admitted a different
+  machine that reused the name. A results file that predates the field carries
+  no `host_id`, and the gate then compares the recorded hostnames instead —
+  conservative in the safe direction (refusing to compare).
 - **Older releases are a different instrument.** Releases up to v0.8.x measured
   one average per tool per network condition, in a cold-started process, and
   reported a median over repetitions. Those tables cannot be compared with these
@@ -233,6 +242,18 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
 - **Variance is stated, not smoothed.** If a difference sits inside the spread
   of the runs being compared, it is reported as directional and no claim is
   made from it.
+- **The per-stage numbers carry their sample count.** A stage's `rtt_p99` is a
+  nearest-rank percentile of that stage's interactive samples, so with fewer
+  than a hundred samples the "p99" *is* the worst observation — a stage that
+  wedged for most of its window (the shaped stages of a saturated run often
+  carry tens of samples) reports its worst single measurement, not a tail
+  estimate. The charts mark it with the worst-second tick; the results file
+  carries `rtt_n` per stage so a reader can tell which kind of number a cell is.
+- **Stages are compared by occurrence, not by name.** The schedule opens and
+  closes with the same `clean` condition, so the k-th `clean` of one run is
+  compared against the k-th `clean` of the other: the return stage — the
+  recovery axis — is judged against the baseline's *return*, not against its
+  fresh start.
 - **The tunnel pool is elastic, so the pool's size is a *result*, not a
   setting.** A build with the shared elastic pool (`[client.data].shared_pool`,
   `[client.data].idle_timeout`, `[client.data.tcp|kcp].max_tunnels`) starts

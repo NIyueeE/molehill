@@ -27,6 +27,10 @@
 /// stream behind bulk traffic. The pool's own `max_tunnels` bounds the result
 /// (4 tunnels by default, ~32 concurrent streams per service — the same order
 /// as the four pre-opened channels v0.9.1 used to get this property for free).
+///
+/// The threshold is read in two places: the maintenance tick, and the open
+/// path (`grow_before_placing`, which is what makes a *burst* spread while it
+/// is placed rather than on the tick that follows it).
 pub(crate) const GROW_PERCENT: usize = 12;
 
 /// How long the pool stays warm after a growth before a shrink may remove a

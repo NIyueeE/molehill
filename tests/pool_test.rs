@@ -737,15 +737,34 @@ async fn a_refused_growth_still_never_reaches_the_stream_cap() -> Result<()> {
     for conn in &mut held {
         conn.write_all(PING.as_bytes()).await?;
     }
+    // Three outcomes, and only the first is an answer: a shed visitor's socket
+    // is closed by the server (`Ok(Err(_))` — the read *ends*, and its buffer
+    // is still zero-initialized, which is why the read's own result has to be
+    // checked rather than the timeout's: `timeout(..).is_ok()` is also true
+    // for a read that failed, and a failed read of an untouched buffer would
+    // otherwise read as garbage). A still-waiting visitor is `Elapsed`.
     let mut answered = 0;
     for conn in &mut held {
         let mut rd = [0u8; 4];
-        if time::timeout(Duration::from_secs(2), conn.read_exact(&mut rd))
-            .await
-            .is_ok()
-        {
-            assert_eq!(&rd, PING.as_bytes(), "a visitor was answered with garbage");
-            answered += 1;
+        // `Ok` here is anyhow's function (imported above), so the two layers
+        // are spelled out: the timeout's, then the read's.
+        match time::timeout(Duration::from_secs(2), conn.read_exact(&mut rd)).await {
+            std::result::Result::Ok(std::result::Result::Ok(_)) => {
+                assert_eq!(&rd, PING.as_bytes(), "a visitor was answered with garbage");
+                answered += 1;
+            }
+            // Refused and shed: the server closed the socket, and the read
+            // *ends* rather than failing the timeout. Its buffer was never
+            // written, which is why the read's own result matters: checking
+            // only the timeout's would read an untouched (zero) buffer as
+            // an answer.
+            std::result::Result::Ok(std::result::Result::Err(e)) => {
+                eprintln!("valve: visitor connection ended: {e}");
+            }
+            // Refused, still inside its pairing budget.
+            std::result::Result::Err(_) => {
+                eprintln!("valve: visitor still unanswered after 2s");
+            }
         }
     }
     assert!(
@@ -1045,4 +1064,107 @@ async fn run_binary_pair(stats: bool) -> Result<(String, String)> {
         let _ = std::fs::remove_dir_all(&dir);
     }
     Ok((log, pool_key))
+}
+
+/// One unanswerable visitor must not park the accept loop behind its budget.
+///
+/// Pairing is per visitor (`MAX_CONCURRENT_VISITORS` in flight), so three
+/// visitors the client cannot answer are shed *together*, when their own
+/// budgets run out. The old accept loop paired one visitor at a time: the
+/// first held it for its whole budget, the second was not even accepted until
+/// the first was shed, so the k-th unanswerable visitor waited `k ×` the
+/// budget — the service really was parked behind one visitor.
+///
+/// The assertion is the timing: every connection ends within one budget of the
+/// first, and none of them waits for another visitor's budget to elapse.
+#[tokio::test]
+async fn one_unanswerable_visitor_does_not_park_the_service() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tunnel_valve.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/tunnel_valve.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    wait_for_tcp(VALVE_EXPOSED).await?;
+    // Hold the pool at its placement ceiling, so the visitors below have
+    // nothing to be paired with and the valve keeps the pool from growing.
+    let mut held = Vec::with_capacity(56);
+    for _ in 0..56 {
+        held.push(TcpStream::connect(VALVE_EXPOSED).await?);
+    }
+    for conn in &mut held {
+        conn.write_all(PING.as_bytes()).await?;
+    }
+    let mut answered_held = 0;
+    for conn in &mut held {
+        let mut rd = [0u8; 4];
+        if matches!(
+            time::timeout(Duration::from_secs(5), conn.read_exact(&mut rd)).await,
+            std::result::Result::Ok(std::result::Result::Ok(_))
+        ) {
+            assert_eq!(&rd, PING.as_bytes(), "a visitor was answered with garbage");
+            answered_held += 1;
+        }
+    }
+    assert_eq!(
+        answered_held, 56,
+        "the ceiling visitors (TUNNEL_STREAM_CEILING) must all be served          before the pool is full"
+    );
+
+    // Three visitors the client cannot answer, each waiting for an echo that
+    // will never come until its own budget expires and it is shed.
+    let mut waiting = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let mut conn = TcpStream::connect(VALVE_EXPOSED).await?;
+        conn.write_all(PING.as_bytes()).await?;
+        waiting.push(conn);
+    }
+    settle(1.0).await;
+
+    // A shed visitor is a closed socket: the read *ends* rather than timing
+    // out, which is the signal this records (an unanswered visitor inside its
+    // budget still hangs instead).
+    let t0 = Instant::now();
+    let mut shed_after: Vec<f64> = Vec::with_capacity(3);
+    for conn in &mut waiting {
+        let mut rd = [0u8; 4];
+        let ended = matches!(
+            time::timeout(Duration::from_secs(40), conn.read_exact(&mut rd)).await,
+            std::result::Result::Ok(std::result::Result::Err(_))
+        );
+        shed_after.push(t0.elapsed().as_secs_f64());
+        assert!(
+            ended,
+            "an unanswerable visitor must be shed (closed), not left hanging"
+        );
+    }
+    // The pairing budget is five attempts of five seconds. Three visitors shed
+    // by the same rule land within a few seconds of each other; one visitor
+    // parked behind another's budget lands 25 s apart.
+    let budget = Duration::from_secs(25).as_secs_f64();
+    for (i, at) in shed_after.iter().enumerate() {
+        assert!(
+            *at <= budget + 10.0,
+            "visitor {i} waited {at:.1}s to be shed: the accept loop was parked \
+             behind an earlier visitor's budget (the serial loop would shed \
+             them {budget:.0}s apart)"
+        );
+    }
+
+    drop(held);
+    drop(waiting);
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
 }
