@@ -117,6 +117,22 @@ pays the one-way delay twice: handshake and request). `SOAK_SHAPE_LEGS=both`
 restores the old scope for reproducing a run measured under it; the value a run
 used is in its `meta.shape_legs`.
 
+**A rate class bounds the bulk client's socket window** (`SOAK_RATE_SOCKET_WINDOW`,
+default `256K`; `off` reproduces a run measured before it). An unbounded sender
+defeats its own accounting against a rate shaper: its writes complete into a
+socket buffer far larger than the shaped path can drain, the measured intervals
+then read zero bytes while the path keeps carrying them, and at `rate20` the
+client is still blocked past the stage boundary, so its summary never arrives at
+all. The bounded window keeps the writes tracking the path. Measured on one
+host, `rate20`: the zero-byte share of the stage's intervals falls from 72-79 %
+to 13-14 %, and the cell reads **0.0196 Gbit/s — 98 % of the 20 Mbit the class
+applies** — where the unbounded client read 0.0334 (70 % *above* nominal,
+because the transfer outlived the stage it was measured in); `rate100` reads
+0.1000 against 0.0935-0.1081. It is applied to rate classes alone: a window is
+meaningful only where the path's rate is known, and on a delay-only or clean
+stage it would cap the bandwidth-delay product and change the measurement it
+exists to serve.
+
 A stage does not start until the previous one has gone quiet. The boundary
 kills the bulk client, and a killed TCP socket keeps delivering what its
 kernel side still holds — and keeps retransmitting its FIN through whatever
@@ -236,6 +252,15 @@ never used to decide anything.
   build axis riding along. The axis is recorded in the results file
   (`meta.builds.axis`), and the verdict tool prints it, so a reader cannot
   mistake a configuration pair for a build pair.
+
+**Both metrics get their own table and their own verdict** — throughput and
+interactive p99 — whenever the run carries both. One metric used to be chosen
+for the whole run (throughput whenever any step had it), and that choice can
+hide the answer: measured, a screen whose throughput was pure noise while the
+p99 favoured one arm on nineteen of its twenty steps, and a screen whose bulk
+probe died on every step and flipped to response time without the columns saying
+so. A claim is still "every step agrees in sign *and* by at least 15 %", per
+metric.
 
 Both are refused where they cannot apply rather than silently ignored: the
 variant pair only makes sense for `screen` (the staged types run one
@@ -387,15 +412,17 @@ Which setting to pick, and why: [configuration.md](configuration.md#choosing-you
   measured it is named.** The reading is the sender's bytes over the stage's
   measured window, span-weighted — not its best second, because netem releases a
   shaped burst into whichever interval it likes, so the peak is a property of the
-  shaper's schedule. On a **rate** class the sender's accounting is structurally
-  defeated: the client's socket buffer absorbs megabytes, the measured intervals
-  read zero bytes while the path drains, and at `rate20` the client is still
-  blocked 30 s past the stage boundary, so its own summary never arrives. There
-  the reading is the **receiver's own window**, and the plot and README mark it
-  (`*`); when a rate stage's dial produced no receiver summary at all the cell
-  carries **no** reading and says why, rather than reporting the defeated side.
-  Which side a cell used is recorded with it (`bulk_gbps_source`), so the choice
-  is auditable and never varies between runs of one cell.
+  shaper's schedule. The **measurement**, not the class, decides which side
+  speaks: when the sender's accounting is defeated — the client's `end` event
+  says so, or at least half the stage's intervals read zero bytes, which is what
+  a socket buffer absorbing a stage looks like — the reading is the
+  **receiver's own window**, which the plot and README mark (`*`); when there is
+  no receiver summary either, the cell carries **no** reading and says why,
+  rather than reporting the defeated side. Which side a cell used travels with
+  it (`bulk_gbps_source`). The rate classes used to be treated as defeated by
+  construction, which was true while their sender was unbounded; now that their
+  window is bounded (above) they are read from the sender like every other
+  class, and the fallback is left for the cells that still need it (`jitter`).
 - **A shaped stage's interactive cell is context, not a verdict.** The netem
   queue the harness installed dominates it, and a single run does not repeat it:
   three runs of one unchanged method on this host moved the shaped p99 cells by

@@ -115,30 +115,31 @@ number.
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 7.3 | ~7466‡ | ~1131 | ~3104‡ | ~3225 | ~9308‡ | ~5820‡ | 7.3 |
-| frp | 2.8 | ~7150‡ | ~1066 | ~5011‡ | ~3195 | ~8722‡ | ~9381‡ | 2.8 |
-| rathole | 70.5 | ~8232‡ | ~1136 | ~3890‡ | ~3218 | ~7088‡ | ~5174‡ | 77.3 |
-| nps | 67.0 | ~471 | ~1080 | ~3520 | ~3294 | ~9214‡ | ~7437‡ | 67.9 |
+| molehill (mux) | 9.0 | ~5694‡ | ~1142 | ~5121‡ | ~1572 | ~7604‡ | ~8761‡ | 9.6 |
+| frp | 3.1 | ~5209‡ | ~1069 | ~4393‡ | ~1581 | ~7157‡ | ~6833‡ | 3.0 |
+| rathole | 100 | ~6103‡ | ~1130 | ~4210‡ | ~1508 | ~7910‡ | ~4586‡ | 101 |
+| nps | 64.8 | ~470 | ~1075 | ~2059 | ~1485 | ~7691‡ | ~9485‡ | 58.6 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second: netem releases a shaped burst into whichever interval it
-likes, so the peak is the shaper's schedule, not the path). `*` marks a cell
-read from the **receiver's** own window — on a rate class the client's socket
-buffer absorbs megabytes, the sender's intervals read zero bytes while the path
-drains, and the receiver is the only side that can speak for it. `— †` is a
-stage with **no reading at all**: the sender's accounting is defeated (90-100 %
-zero-byte intervals here) and the dial produced no receiver summary, because
-the client was still blocked past the stage boundary. `rate100` reading
-0.100 Gbit/s on every arm is the shaper's own number — that cell has no contrast
-by construction — and `rate20`/`jitter` carry no reading at all, which is a
-limit of the model and not a result about any tool.
+likes, so the peak is the shaper's schedule, not the path). The **measurement**
+decides which side speaks: the sender, unless its `end` event or a stage with at
+least half its intervals at zero bytes says its writes did not track the path —
+then the reading is the **receiver's** own window, marked `*`. `— †` is a stage
+with no reading at all, with the reason why (all four arms' `jitter`, whose
+zeros are congestion collapse rather than a buffered sender). The rate cells
+read the shaper's own numbers — 0.100 and 0.020 Gbit/s on every arm — because
+the client's window is bounded on a rate class: without that bound the same cell
+read 0.033 Gbit/s on a 20 Mbit path, *above* nominal, because the transfer
+outlived the stage it was measured in. A rate cell has no contrast by
+construction, and this table says so instead of ranking arms on it.
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 21.783 | 5.224 | 9.703 | 5.266 | 0.100 * | — † | — † | 22.160 |
-| frp | 6.057 | 5.566 | 5.657 | 5.276 | 0.100 * | — † | — † | 6.085 |
-| rathole | 21.184 | 5.234 | 9.694 | 5.239 | 0.100 * | — † | — † | 21.057 |
-| nps | 0.134 | 0.156 | 0.143 | 0.166 | 0.100 * | — † | — † | 0.132 |
+| molehill (mux) | 16.749 | 5.257 | 9.696 | 5.319 | 0.100 | 0.019 | — † | 16.289 |
+| frp | 6.083 | 5.586 | 5.694 | 5.293 | 0.100 | 0.020 | — † | 6.034 |
+| rathole | 12.811 | 5.191 | 9.681 | 5.246 | 0.100 | 0.019 | — † | 12.810 |
+| nps | 0.134 | 0.147 | 0.147 | 0.165 | 0.100 | 0.020 | — † | 0.132 |
 
 **The noise these numbers have to clear.** The schedule measures `clean` at
 both ends of every timeline, so each tool's two clean readings are two samples
@@ -147,10 +148,10 @@ every other cell has to be read against. `just soak-check` reports it:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (mux) | 21.783 – 22.160 Gbit/s (**1.7 %** apart) | 7.3 – 7.3 ms |
-| frp | 6.057 – 6.085 Gbit/s (**0.5 %** apart) | 2.8 – 2.8 ms |
-| rathole | 21.057 – 21.184 Gbit/s (**0.6 %** apart) | 70.5 – 77.3 ms |
-| nps | 0.132 – 0.134 Gbit/s (**1.0 %** apart) | 67.0 – 67.9 ms |
+| molehill (mux) | 16.289 – 16.749 Gbit/s (**2.7 %** apart) | 9.0 – 9.6 ms |
+| frp | 6.034 – 6.083 Gbit/s (**0.8 %** apart) | 3.0 – 3.1 ms |
+| rathole | 12.810 – 12.811 Gbit/s (**0.0 %** apart) | 100 – 101 ms |
+| nps | 0.132 – 0.134 Gbit/s (**1.4 %** apart) | 58.6 – 64.8 ms |
 
 **How much it carries.** The same artifact carries the load ramp: the first
 bulk load level at which a fresh interactive connection breaks the SLO (p99
@@ -163,9 +164,7 @@ ceiling is — and neither cross-checks the other.
 | molehill (mux) | 8 | 8 | 0.0 | never broke |
 | frp | 8 | 8 | 0.0 | never broke |
 | rathole | 8 | 8 | 0.0 | never broke |
-| nps | 0 | 8 | 1.0 | interactive p99 204.916 > 50.0 |
-
-![Sustainable load: the first bulk load level that breaks the SLO](assets/soak-v0.10.0-capacity.png)
+| nps | 0 | 8 | 1.0 | interactive p99 204.909 > 50.0 |
 
 Three arms carried the ramp's full 8 streams, which is the ramp's own ceiling,
 so that reads as a **floor** ("at least 8"), not as a measured maximum; nps
@@ -174,20 +173,18 @@ breaks the SLO at the first stream it is offered.
 **What these shapes say.** Every tool degrades under a bad path and every tool
 recovers on the return to clean — that recovery is what the last column
 measures, and a tool that stayed wedged would be a finding. On the clean path
-**molehill and rathole are the throughput pair** (21.1-22.2 Gbit/s against
-21.1-21.2; the ~3 % gap is inside twice the run's own replicate, so this run
-does not separate them) at very different latency: 7.3 ms against 70.5-77.3 ms.
-frp carries 3.6x less bulk (6.06) but answers in 2.8 ms, and it is the only arm
-inside the SLO on both axes with molehill. nps is 160x behind on clean bulk
-(0.13 Gbit/s) and 67 ms on latency. `loss1` (10 ms delay, 1 % loss) separates
-the throughput pair from frp: 9.7 Gbit/s for molehill and rathole against 5.7
-for frp, with nps at 0.14. On the shaped stages the interactives are *context*:
-they are dominated by the queue the harness installed, they swing by more than
-any between-tool gap in them between runs of unchanged code, and every arm
-wedges on `rate20` and `jitter` — that is the path, not one tool. The honest
-losses are carried rather than smoothed over: frp's clean-stage interactive cost
-is 2.8 ms against molehill's 7.3, and nps again reads zero bytes on a share of
-its intervals in *every* stage including the clean ones, which no other arm does.
+molehill carries 16.3-16.7 Gbit/s against rathole's 12.8 (28 % apart, with both
+replicates under 3 %), frp 6.0 and nps 0.13; on latency the order inverts at the
+top — frp answers in 3.0 ms, molehill 9.0, nps 59-65, rathole 100-101 — so
+molehill and frp are the two arms inside the SLO on both axes. `loss1` (10 ms
+delay, 1 % loss) separates the throughput pair from frp: 9.70 and 9.68 Gbit/s
+against 5.69, with nps at 0.15. The shaped interactives are *context*: they are
+dominated by the queue the harness installed, they swing by more than any
+between-tool gap in them between runs of unchanged code, and every arm wedges on
+`rate20` and `jitter` — that is the path, not one tool. The honest losses are
+carried rather than smoothed over: frp's clean-stage interactive cost is 3.0 ms
+against molehill's 9.0, and nps reads zero bytes on a share of its intervals in
+*every* stage including the clean ones, which no other arm does.
 
 The peers are driven by the same workload and charted in the same panels; the
 drift axis (open fds, RSS and CPU slopes over the run) is in
@@ -196,10 +193,15 @@ drift axis (open fds, RSS and CPU slopes over the run) is in
 the load ramp in `soak-v0.10.0-capacity.png`.
 
 These are v0.10.0 numbers from one host, measured with the method this page
-describes. Only runs of the same model, method and host compare directly, and
-every results file records the host and the method it used: `just soak-check`
-reads both, refuses to gate one host's or one method's run against another's,
-and gates each run on its own completeness, endpoint and SLO checks.
+describes. **The host's *instance* is not the method**: the two arms that reach
+the loopback ceiling lost a quarter to a third of their clean throughput between
+the container instances this work ran on (molehill 21.8 -> 16.7, rathole
+21.2 -> 12.8 Gbit/s) while frp and nps were flat, so the top pair's ordering is
+a fact about that run and does not travel as a standing claim. Every results
+file records the host, the method and a CPU calibration, and `just soak-check`
+refuses to compare runs that disagree on them; only same-schema, same-method,
+same-host runs compare directly, and each run is gated on its own completeness,
+endpoint and SLO checks.
 The per-stage numbers carry their sample count in the results file
 (`rtt_n`): a stage that carried fewer than a hundred interactive samples
 reports its *worst observation* as the p99, which is what a shaped stage of a

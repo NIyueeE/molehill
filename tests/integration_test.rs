@@ -45,6 +45,25 @@ const AFFINITY_LOCAL_SERVICE: &str = "127.0.0.1:8082";
 const AFFINITY_EXPOSED_ADDR: &str = "127.0.0.1:2340";
 const AFFINITY_PACKETS: usize = 64;
 
+// Ports for the two UDP-knob scenarios (`tests/for_udp/knob_effects.toml`):
+// the fixture owns control 2352 and the exposed 2353/2354, with its backends
+// on 8102/8103. The block 2352-2359 is free in the suite (2333-2351 belong to
+// the transport fixtures, 2360-2366 to the session tests).
+const UDP_KNOBS_CONFIG: &str = "tests/for_udp/knob_effects.toml";
+const KNOB_SMALL_LOCAL: &str = "127.0.0.1:8102";
+const KNOB_IDLE_LOCAL: &str = "127.0.0.1:8103";
+const KNOB_SMALL_EXPOSED: &str = "127.0.0.1:2353";
+const KNOB_IDLE_EXPOSED: &str = "127.0.0.1:2354";
+/// The fixture's `udp_buffer_size`; the assertions below are written in terms
+/// of it so a changed fixture fails loudly instead of drifting.
+const KNOB_BUFFER_SIZE: usize = 1024;
+/// The fixture's `udp_idle_timeout`, and the silence the test waits out before
+/// expecting the mapping (and its local socket) to be gone.
+const KNOB_IDLE_TIMEOUT_SECS: u64 = 2;
+const KNOB_IDLE_SILENCE: f64 = 3.5;
+/// Datagrams sent inside one idle window before the silence starts.
+const KNOB_IDLE_BURST: usize = 4;
+
 // Ports for the transparent-visibility regression
 // (`dead_backend_fails_one_visitor_and_stays_registered`): one service whose
 // backend is not running, and one healthy service on the same client.
@@ -402,29 +421,43 @@ async fn per_service_data_modes() -> Result<()> {
 #[cfg(feature = "multiplex")]
 const STRIPE_BULK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Push a deterministic pattern through the echo service and verify the
-/// reply is the same bytes in the same order: the striped group's
-/// reassembly contract, in both directions at once (the echo service
-/// mirrors the stream).
+/// The deterministic payload the striped bulk assertions write: a pattern
+/// rather than a constant, so a reordered or duplicated chunk cannot pass for
+/// a match.
 #[cfg(feature = "multiplex")]
-async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
-    let conn = TcpStream::connect(addr).await?;
-    let (mut rd, mut wr) = conn.into_split();
-
-    let mut expected = vec![0u8; len];
-    for (i, b) in expected.iter_mut().enumerate() {
+fn bulk_pattern(len: usize) -> Vec<u8> {
+    let mut pattern = vec![0u8; len];
+    for (i, b) in pattern.iter_mut().enumerate() {
         *b = u8::try_from((i.wrapping_mul(0x9E37_79B1) >> 24) & 0xff).unwrap();
     }
+    pattern
+}
 
-    let write_pattern = expected.clone();
-    let writer = tokio::spawn(async move {
-        for chunk in write_pattern.chunks(64 * 1024) {
+/// Start writing `pattern` on an owned write half without waiting for it: the
+/// striped path's own backpressure is what leaves a large write in flight,
+/// which is the state the placement observation below needs.
+#[cfg(feature = "multiplex")]
+fn spawn_bulk_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    mut wr: W,
+    pattern: Vec<u8>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    tokio::spawn(async move {
+        for chunk in pattern.chunks(64 * 1024) {
             wr.write_all(chunk).await?;
         }
         wr.flush().await?;
-        Ok(())
-    });
+        // `Ok` is anyhow's in this file; name the standard one explicitly.
+        std::result::Result::Ok(())
+    })
+}
 
+/// Read exactly `pattern.len()` bytes back and verify they are `pattern`: the
+/// striped group's reassembly contract (in sequence, no byte lost, none
+/// duplicated), in both directions at once because the echo service mirrors
+/// the stream.
+#[cfg(feature = "multiplex")]
+async fn read_bulk_echo<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, pattern: &[u8]) -> Result<()> {
+    let len = pattern.len();
     let mut got = vec![0u8; len];
     let mut read = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -439,12 +472,61 @@ async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
         anyhow::ensure!(n > 0, "echo service closed after {read}/{len} bytes");
         read += n;
     }
-    assert_eq!(got, expected, "the striped path corrupted the byte stream");
+    assert_eq!(got, pattern, "the striped path corrupted the byte stream");
+    Ok(())
+}
+
+/// Push a deterministic pattern through the echo service and verify the
+/// reply is the same bytes in the same order.
+#[cfg(feature = "multiplex")]
+async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
+    let conn = TcpStream::connect(addr).await?;
+    let (mut rd, wr) = conn.into_split();
+    let pattern = bulk_pattern(len);
+    let writer = spawn_bulk_writer(wr, pattern.clone());
+    read_bulk_echo(&mut rd, &pattern).await?;
     writer
         .await
         .context("bulk writer task failed")?
         .context("bulk writer returned an error")?;
     Ok(())
+}
+
+/// One live pool as the placement poll reads it: its size, and the
+/// `(streams, pending, pinned)` of each of its tunnels.
+#[cfg(feature = "multiplex")]
+type PoolShape = (usize, Vec<(usize, usize, usize)>);
+
+/// Wait until one live pool carries a stream on **every** one of its four
+/// tunnels — the per-instant half of D24, which the pool-size assertion after
+/// a transfer cannot see: four streams on three tunnels (with the fourth
+/// empty) is the same pool size as the spread.
+///
+/// Bounded by a deadline rather than a fixed sleep, so the assertion is on a
+/// state that is polled for, not on a guess about how long a placement takes;
+/// the observed `(size, per-tunnel streams)` vectors travel in the failure
+/// message, because "the spread never happened" and "the pool never grew" are
+/// different defects.
+#[cfg(feature = "multiplex")]
+async fn wait_for_a_stream_on_every_stripe_tunnel(deadline: Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let observed: Vec<PoolShape> = molehill_rathole::live_pools()
+            .iter()
+            .map(|pool| (pool.size, pool.tunnels.clone()))
+            .collect();
+        let spread = observed.iter().any(|(size, tunnels)| {
+            *size == 4 && tunnels.len() == 4 && tunnels.iter().all(|(streams, _, _)| *streams >= 1)
+        });
+        if spread {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            start.elapsed() < deadline,
+            "no pool carried a stream on each of its four tunnels within {deadline:?}: {observed:?}"
+        );
+        time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Data-channel striping: `[server.data] stripe_count = 4` spreads every
@@ -483,7 +565,45 @@ async fn striped_data_channels() -> Result<()> {
     wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
 
     info!("bulk round trip through a striped visitor connection");
-    bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
+    // One visitor, held open across the placement observation: a group's four
+    // channels are gathered when the connection is accepted and live exactly
+    // as long as it does. The write is started first and its echo read only
+    // after the assertion, so the transfer is in flight *by construction*
+    // rather than by timing luck — and the connection is still open when the
+    // pool is read, which is what makes this an instant during the transfer
+    // and not the warm pool an earlier one left behind.
+    let visitor = TcpStream::connect(exposed_addrs(Type::Tcp).0).await?;
+    let (mut visitor_rd, visitor_wr) = visitor.into_split();
+    let pattern = bulk_pattern(STRIPE_BULK_BYTES);
+    let writer = spawn_bulk_writer(visitor_wr, pattern.clone());
+
+    info!("watching the four stripe channels' placement while the transfer runs");
+    wait_for_a_stream_on_every_stripe_tunnel(Duration::from_secs(15)).await?;
+
+    read_bulk_echo(&mut visitor_rd, &pattern).await?;
+    writer
+        .await
+        .context("bulk writer task failed")?
+        .context("bulk writer returned an error")?;
+    // The visitor's end: the group's four channels are released with it.
+    drop(visitor_rd);
+
+    // The structural half of the claim (D24), on the real client and a real
+    // cold pool: the group's four channels grew the pool to four tunnels.
+    // Before the group was named on the wire the pool stayed at *one* — four
+    // concurrent streams sit below the growth rule's per-tunnel threshold (7 on
+    // the shipped cap), so no other rule could have asked for the second
+    // tunnel, and placement can only spread over tunnels that exist. The pool
+    // stays warm for `idle_timeout` (60 s by default), so this reads the state
+    // the group left rather than racing a shrink.
+    let sizes: Vec<usize> = molehill_rathole::live_pools()
+        .iter()
+        .map(|pool| pool.size)
+        .collect();
+    assert!(
+        sizes.contains(&4),
+        "the stripe group must have grown the client's pool to its 4 stripes: {sizes:?}"
+    );
 
     info!("a second visitor gets its own stripe group");
     bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
@@ -911,6 +1031,288 @@ async fn sticky_echo_server(seen_srcs: Arc<Mutex<HashSet<SocketAddr>>>) -> Resul
     loop {
         let (n, from) = l.recv_from(&mut buf).await?;
         seen_srcs.lock().unwrap().insert(from);
+        l.send_to(&buf[..n], from).await?;
+    }
+}
+
+/// The running `knob_effects` pair, with the handles a scenario needs to stop
+/// it. A struct rather than a tuple so the two senders cannot be swapped at a
+/// call site.
+struct UdpKnobPair {
+    client_shutdown: broadcast::Sender<bool>,
+    server_shutdown: broadcast::Sender<bool>,
+    client: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl UdpKnobPair {
+    /// Stop both sides and wait for their instances to end, so a leaked
+    /// listener cannot hold this fixture's ports for the next scenario.
+    async fn stop(self) {
+        let _ = self.server_shutdown.send(true);
+        let _ = self.client_shutdown.send(true);
+        let _ = tokio::join!(self.server, self.client);
+    }
+}
+
+/// Start the `knob_effects` fixture's client and server, in that order (the
+/// client retries until the server is up), and wait until `wait_for` answers.
+/// Only the service under test is probed: the fixture defines both UDP
+/// services, but each scenario starts one backend, and probing the other
+/// would wait for a service whose local address nothing serves.
+async fn start_udp_knob_pair(wait_for: &'static str) -> Result<UdpKnobPair> {
+    let (client_shutdown, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client(UDP_KNOBS_CONFIG, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server(UDP_KNOBS_CONFIG, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let probe = UdpSocket::bind("127.0.0.1:0").await?;
+    probe.connect(wait_for).await?;
+    wait_for_udp_socket(&probe).await?;
+    Ok(UdpKnobPair {
+        client_shutdown,
+        server_shutdown,
+        client,
+        server,
+    })
+}
+
+/// A UDP backend that records the length of every datagram it receives and
+/// answers: `b"reply-big"` gets a `KNOB_BUFFER_SIZE * 2`-byte reply, anything
+/// else is echoed. Both halves exist because `udp_buffer_size` is enforced on
+/// two different legs — the visitor's datagram is read into the server's
+/// buffer, and the local service's reply is read into the client's — and each
+/// has to be observable on its own.
+async fn length_recording_server(addr: &'static str, lens: Arc<Mutex<Vec<usize>>>) -> Result<()> {
+    let l = UdpSocket::bind(addr).await?;
+    // Larger than either buffer under test: the truncation this fixture is
+    // about must happen in molehill, not in the test's own recv. On the heap,
+    // so the server task's future stays small.
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, from) = l.recv_from(&mut buf).await?;
+        lens.lock().unwrap().push(n);
+        if &buf[..n] == b"reply-big" {
+            let big = vec![0x5au8; KNOB_BUFFER_SIZE * 2];
+            l.send_to(&big, from).await?;
+        } else {
+            l.send_to(&buf[..n], from).await?;
+        }
+    }
+}
+
+/// `udp_buffer_size`: a datagram larger than the configured buffer does not
+/// arrive intact, and the data channel survives it.
+///
+/// The shipped code **truncates** such a datagram to `udp_buffer_size` on the
+/// reading leg (`recv_from` into a `buffer_size` buffer) rather than dropping
+/// it — `docs/configuration.md` says "dropped", and the in-stream drop in
+/// `UdpTraffic::read` only fires for a payload longer than the *receiver's*
+/// buffer, which a consistently configured pair never produces because the
+/// sender already truncated. This pins the behaviour that exists: a visitor's
+/// 2 KiB datagram reaches the backend as 1 KiB, and a backend's 2 KiB reply
+/// reaches the visitor as 1 KiB; a small datagram still round-trips, which is
+/// the "the channel stays usable" half. If the drop ever becomes deliberate,
+/// the two `== KNOB_BUFFER_SIZE` assertions below are the ones to change.
+#[tokio::test]
+async fn udp_buffer_size_bounds_a_datagram_without_breaking_the_channel() -> Result<()> {
+    init();
+
+    let lens = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&lens);
+    tokio::spawn(async move {
+        if let Err(e) = length_recording_server(KNOB_SMALL_LOCAL, recorded).await {
+            panic!("Failed to run the length-recording UDP server for testing: {e:?}");
+        }
+    });
+
+    let pair = start_udp_knob_pair(KNOB_SMALL_EXPOSED).await?;
+
+    // A visitor socket of its own: the readiness probe above is a different
+    // peer, and this one is the peer the assertions are about.
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(KNOB_SMALL_EXPOSED).await?;
+    wait_for_udp_socket(&conn).await?;
+    // Everything the readiness probe sent is behind this index; the datagrams
+    // the assertions below name are the ones this test sends itself.
+    let settled = lens.lock().unwrap().len();
+
+    // A visitor datagram over the limit: read into the *server's* buffer (the
+    // client's registered `udp_buffer_size`), so the backend must see exactly
+    // the limit and the visitor must get that shorter echo back.
+    let oversized = vec![0xa5u8; KNOB_BUFFER_SIZE * 2];
+    conn.send(&oversized).await?;
+    let mut buf = vec![0u8; KNOB_BUFFER_SIZE * 4];
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("no echo of the oversized datagram")??;
+    assert_eq!(
+        n, KNOB_BUFFER_SIZE,
+        "a datagram over udp_buffer_size must not arrive intact"
+    );
+    assert_eq!(
+        &buf[..n],
+        &oversized[..KNOB_BUFFER_SIZE],
+        "the delivered bytes must be the datagram's prefix"
+    );
+
+    // A backend reply over the limit: read into the *client's* forwarder
+    // buffer on the way back, so it reaches the visitor shortened too.
+    conn.send(b"reply-big").await?;
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("no reply to the big-reply request")??;
+    assert_eq!(
+        n, KNOB_BUFFER_SIZE,
+        "the local service's oversized reply must be bounded by udp_buffer_size too"
+    );
+
+    // And the channel is still usable after both: the costs of an oversized
+    // datagram are its own bytes, not the connection.
+    conn.send(b"small-after-oversized").await?;
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("the channel stopped carrying datagrams after an oversized one")??;
+    assert_eq!(
+        &buf[..n],
+        b"small-after-oversized",
+        "the datagram after the oversized ones must arrive intact"
+    );
+
+    let seen = lens.lock().unwrap().clone();
+    assert!(
+        seen.len() > settled + 1,
+        "the backend must have received the test's datagrams: {seen:?}"
+    );
+    assert_eq!(
+        seen[settled], KNOB_BUFFER_SIZE,
+        "the backend sees the visitor's oversized datagram truncated to udp_buffer_size: {seen:?}"
+    );
+    assert_eq!(
+        seen[settled + 1],
+        b"reply-big".len(),
+        "the big-reply request itself is small; only the reply is oversized: {seen:?}"
+    );
+
+    pair.stop().await;
+    Ok(())
+}
+
+/// `udp_idle_timeout`: a peer mapping (and the local socket it owns) is
+/// recycled after the configured silence, and the *next* datagram from the
+/// same peer reaches the backend from a different source port — exactly the
+/// consequence `docs/configuration.md` documents, and the reason a stateful
+/// UDP session has to keep talking or raise the timeout.
+///
+/// Within the window the port must be stable instead: the first half is the
+/// existing affinity guarantee, observed here because the second half is
+/// meaningless without it.
+///
+/// The one assumption in the second half is that the kernel does not hand the
+/// very same ephemeral port back to the fresh socket; with the whole range in
+/// play that is a draw of one in tens of thousands, and it is the same
+/// assumption the affinity test above rests on in the other direction.
+#[tokio::test]
+async fn udp_idle_timeout_rebinds_the_peer_to_a_fresh_local_socket() -> Result<()> {
+    init();
+
+    // Every datagram's source address, in arrival order: the ports the backend
+    // observes are the only place the client's per-peer socket is visible.
+    let seen_srcs: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen_srcs);
+    tokio::spawn(async move {
+        if let Err(e) = port_recording_echo_server(KNOB_IDLE_LOCAL, recorded).await {
+            panic!("Failed to run the port-recording UDP server for testing: {e:?}");
+        }
+    });
+
+    let pair = start_udp_knob_pair(KNOB_IDLE_EXPOSED).await?;
+
+    // One peer for the whole scenario: the mapping under test is this
+    // socket's, and re-binding the visitor would create a second peer whose
+    // ports say nothing about the first one.
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(KNOB_IDLE_EXPOSED).await?;
+    wait_for_udp_socket(&conn).await?;
+    // The readiness probes (the fixture helper's and this socket's) are behind
+    // this index, so the window below is exactly this test's own datagrams.
+    let settled = seen_srcs.lock().unwrap().len();
+
+    // A burst well inside the timeout: one peer, one socket, one port.
+    for i in 0..KNOB_IDLE_BURST {
+        conn.send(format!("inside-{i}").as_bytes()).await?;
+    }
+    let mut buf = [0u8; 64];
+    for _ in 0..KNOB_IDLE_BURST {
+        time::timeout(Duration::from_secs(5), conn.recv(&mut buf))
+            .await
+            .context("a datagram of the within-timeout burst went missing")??;
+    }
+    let within = {
+        let seen = seen_srcs.lock().unwrap();
+        seen[settled..].to_vec()
+    };
+    assert_eq!(
+        within.len(),
+        KNOB_IDLE_BURST,
+        "every datagram of the burst must have arrived: {within:?}"
+    );
+    let first_port = within[0].port();
+    assert!(
+        within.iter().all(|src| src.port() == first_port),
+        "every datagram inside udp_idle_timeout must leave one local socket: {within:?}"
+    );
+
+    // Now go quiet for longer than the timeout. Nothing in either direction
+    // resets the client's idle timer, so the forwarder (and its socket) is
+    // gone by the time the next datagram arrives; that datagram re-binds, and
+    // the backend sees the new bind.
+    settle(KNOB_IDLE_SILENCE).await;
+    conn.send(b"after-idle").await?;
+    time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("the datagram after the idle timeout was never echoed")??;
+
+    let after = {
+        let seen = seen_srcs.lock().unwrap();
+        seen[settled..].to_vec()
+    };
+    assert_eq!(
+        after.len(),
+        KNOB_IDLE_BURST + 1,
+        "the post-timeout datagram must have arrived: {after:?}"
+    );
+    let rebound_port = after.last().unwrap().port();
+    assert_ne!(
+        rebound_port, first_port,
+        "a peer idle for {KNOB_IDLE_TIMEOUT_SECS} s must be re-bound to a fresh local socket, \
+         so the backend sees a new source port; the observed addresses were {after:?}"
+    );
+
+    pair.stop().await;
+    Ok(())
+}
+
+/// Echo server for the idle-timeout scenario: records the source address of
+/// every datagram, in order (the affinity test's set is unordered and cannot
+/// show *which* datagram came from where).
+async fn port_recording_echo_server(
+    addr: &'static str,
+    seen: Arc<Mutex<Vec<SocketAddr>>>,
+) -> Result<()> {
+    let l = UdpSocket::bind(addr).await?;
+    let mut buf = [0u8; 2048];
+    loop {
+        let (n, from) = l.recv_from(&mut buf).await?;
+        seen.lock().unwrap().push(from);
         l.send_to(&buf[..n], from).await?;
     }
 }

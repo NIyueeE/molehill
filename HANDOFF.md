@@ -82,12 +82,22 @@ lifted: the test runs in the suite now and the server serves
 consecutive runs (it is in the suite now), the waker unit test above, and a
 stress run of repeated 8 MiB striped round trips.
 
-**Still open, unchanged**: a stripe group's K channels land on K distinct
-tunnels only while the pool has K; a group assembled from a cold pool shares
-one tunnel and loses the spread (it still works). Making the guarantee
-structural needs the wire command that names a group (D24/D29: the server
-names the group once, the client reserves K tunnels) — the natural next
-step, and the reason the placement rule alone was never the guarantee.
+**Closed (2026-09-29)**: the guarantee is now structural. The open thread's
+design landed as one command in the dialect this branch already has —
+`ControlChannelCmd::CreateDataChannelForStripe(service, group, index, count)`,
+part of **v4**, which is extended in place — so the server names the group
+before its channels are opened, and the client (a) grows the pool to
+the group's own count first, bounded by `max_tunnels`, and (b) reserves, per
+stripe, a tunnel the group does not already hold, falling back to the ordinary
+least-loaded rule when the pool cannot spread. A real cold pool is the evidence:
+the client's `pool-stats` log during `striped_data_channels` reads
+`reason="stripe" from=0 to=1 … 3 to=4` (it stayed at 1-2 before), and the test
+asserts the pool reached its four stripes. The request vocabulary — one
+`CreateDataChannelForStripe` per stripe, same group, index order, the group's
+own count — is pinned against a hand-written peer by
+`a_striped_gather_names_its_group_on_every_request`, so a change to what the
+server asks for cannot hide behind the client that reads it. The placement rule
+alone was never the guarantee, which is why this needed the wire.
 
 
 ## The v0.10.0 theme
@@ -140,7 +150,7 @@ surface both change.
 | D21 | Scheduling is two layers: pool placement (client) and pairing/assignment (server); the server does not choose tunnels |
 | D22 | Instrument before policy (falsifiable): S1 adds only read-only accessors + telemetry; if the state spread is inside the noise, S2 does not land — **it was zero, so it does not** |
 | D23 | Placement policy = eligibility + rotation + hysteresis (never a weighted score) |
-| D24 | A stripe group's K streams must land on K distinct tunnels — achieved today by back-to-back reservation; the wire cannot express a group yet (see the open thread) |
+| D24 | A stripe group's K streams must land on K distinct tunnels — **structural since the group request landed**: the server names the group before its channels are opened and the client reserves one tunnel per stripe (v4, extended in place) |
 | D25 | No RTT sampling; the algorithm may use stream count, pending opens, send credit, worker queue depth — nothing else (send credit is not exposed by the engine, so it is not used) |
 | D26 | Growth/shrink is a hysteretic, rate-limited state machine (≤ 1 tunnel per maintenance tick) |
 | D27 | UDP assigns a *new* peer to the shortest worker queue — gated on the drop counter, which has stayed at zero under every measured load |
@@ -229,12 +239,17 @@ below. What each archived record settled, so it can be navigated:
    v0.10.0`: `version = "0.10.0"` set, the `[Unreleased]` content moved under
    `## [0.10.0] - 2026-09-28`, `[Unreleased]` left empty, the withdrawn
    `results-soak-v0.9.1.json` + `assets/soak-v0.9.1*.png` deleted.
-2. ~~Re-sweep~~ **done (2026-09-29)** — a fresh binary on the release commit,
-   four tools, 8/8 stages of all four, `just soak-check` **green with no
-   waiver**; charts and both READMEs refreshed in the same commit as the results
-   file. The record is the subsection below.
+2. ~~Re-sweep~~ **done (2026-09-30, at `c265af3`)** — the sweep the artifact
+   and both READMEs in this commit were measured by: four tools, 8/8 stages
+   each plus the capacity ramp, `--test=rrul,capacity`, the bounded rate-class
+   window, `just soak-check` green with no waiver. It supersedes the
+   2026-09-29 sweep at `8ed32dd`, which described code two commits back.
+   `githooks/pre-tag` reads the results file's recorded revision and passes for
+   this commit: docs, assets and the artifact itself may follow a sweep, code
+   may not. The measurement record is the subsection below.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day, and
-   `just tag-check` must be run on the release commit.
+   `just tag-check` must be run on the release commit (it now passes — the
+   artifact is measured at `c265af3` and only docs/assets followed).
 4. `just check`, `just interop`, then push the branch and open the PR. (The PR
    exists and is re-green after each push.)
 5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
@@ -287,6 +302,49 @@ budget expiry. The previous harness spent a flat 120 s on every one of them.
   schedule, suffix parsing), so this sweep is not comparable to earlier sweeps
   of this cycle either; `workload_version` stays 1 because the drain has never
   been in a released version (introduced in `e33ece3`, after v0.9.0).
+
+### Release sweep (2026-09-30)
+
+`v0.9.0-115-gc265af3`, tree clean, fresh release binary, host `3f8b4508ab91` /
+`host_id d764f9da9c7e5b2a`, calibration 414.0 MiB/s, `shape_legs=visitor`,
+`rate_socket_window=256K`, four tools, 8/8 stages each plus the capacity ramp,
+`--test=rrul,capacity`, ~76 minutes.
+
+**`just soak-check`: `OK: no gate violation`.** What the new method changed in
+the artifact: **`rate20` now carries a reading and every arm reads 0.020 Gbit/s**
+(98 % of the rate the class applies, 4 % zero-byte intervals) where the previous
+sweep had no reading at all, and `rate100` reads 0.100 from the sender. The
+bounded window also removed a measurement artefact from the interactive side:
+`rate100`'s p99 fell from 3195-3294 ms to 1485-1581 ms, because an unbounded
+bulk sender had been filling the shaper's queue with a socket buffer's worth of
+bytes. `jitter` still carries no reading (all four arms, 89-97 % zero-byte
+intervals): its zeros are congestion collapse, not a buffered sender, and a
+window is only meaningful where the path's rate is known.
+
+Clean path: molehill 16.29-16.75 Gbit/s at 9.0-9.6 ms p99, rathole 12.81 at
+100-101 ms, frp 6.03-6.08 at 3.0-3.1 ms, nps 0.13 at 58.6-64.8 ms; the run's own
+replicates are 0.0-2.7 %. `loss1` separates the throughput pair from frp (9.70 /
+9.68 against 5.69 Gbit/s). The load ramp: molehill, frp and rathole carry its
+full 8 streams without breaking the SLO — the ramp's own ceiling, so a floor —
+and nps breaks at the first one.
+
+**A finding this sweep paid for: the container instance moved, and the
+calibration did not see it.** The hostname changed again
+(`2967a5748835` -> `3f8b4508ab91`) while `host_id` stayed `d764f9da9c7e5b2a` —
+`host_identity` working as designed — and the two arms that reach the loopback
+ceiling lost a quarter to a third of their clean throughput between the two
+instances (molehill 21.78 -> 16.75, rathole 21.18 -> 12.81 Gbit/s) while frp
+(6.06 -> 6.08) and nps (0.134 -> 0.134) were flat. The **CPU calibration read
+421.2 against 414.0 MiB/s (1.7 %)** — well inside its own tolerance — so the
+probe that exists to catch "these two runs did not see the same machine state"
+would have waved this pair through. It certifies CPU state; the bench's fast
+cells are bounded by the loopback path (memory, cache, the kernel's copy path,
+whatever else that container instance shared), and nothing in the run measures
+that independently of the tools under test. Filed as an open thread below, with
+these numbers. The practical consequence for this release is nil — the artifact
+was replaced and every cross-sweep comparison is refused on the method change
+anyway — but the next cycle has to decide what the comparability key should
+measure.
 
 ### The dead bulk spine: four defects, one retraction (2026-09-29)
 
@@ -453,6 +511,172 @@ of the same code exceeds the between-tool differences, so they are context and
 the README says so; the release artifact still carries no capacity number (the
 README delegates it to the reader's own path); and the rate-shaped cells stay
 unmeasurable under this method rather than merely unreported.
+
+### The rate cells get a bounded sender (2026-09-30)
+
+The rate classes were the one place the model could not measure: the client's
+writes completed into a socket buffer far larger than the shaped path could
+drain, the measured intervals read zero bytes while the path kept carrying them,
+and at `rate20` the client was still blocked 30 s past the stage boundary, so its
+summary never arrived. The thread's follow-up was to bound the sender's window;
+the A/B (one binary, one host, `SOAK_RATE_SOCKET_WINDOW` the only variable,
+timeline `clean:45,rate100:60,rate20:90`, balanced off/on/on/off) says it works
+and that the old reading was not merely unreadable but **wrong**:
+
+| stage | window | zero-byte intervals | reading (Gbit/s) | of nominal |
+|---|---|---|---|---|
+| `rate100` | 256K | 0 %, 0 % | **0.1000, 0.0999** | 100 % |
+| `rate100` | off | 1.8 %, 5.3 % | 0.1081, 0.0984 | 98-108 % |
+| `rate20` | 256K | 12.8 %, 14.0 % | **0.0196, 0.0195** | 98 % |
+| `rate20` | off | 78.8 %, 72.1 % | 0.0334, 0.0333 | **167 %** |
+| `clean` (control) | either | 0 % | 17.00-17.07 | (unchanged) |
+
+The `off` arm's `rate20` number is 70 % above the rate the class applies, because
+the transfer outlived the stage: the sender was still delivering inside the next
+stage's window. So the window is now the method's default, and the reading rule
+follows the *measurement* rather than the class — the sender speaks unless its
+`end` event or its zero-byte share says it cannot — which also restores the
+stated convention (sender's bytes over the measured window) on the rate cells.
+The window is applied to rate classes alone: it is meaningful only where the
+path's rate is known, and on a delay-only or clean stage it would cap the
+bandwidth-delay product and change the measurement it exists to serve, which is
+why `jitter` still carries no reading (its zeros are congestion collapse, not a
+buffered sender). `SOAK_RATE_SOCKET_WINDOW=off` reproduces a pre-window run, and
+the value travels in the meta and in `METHOD_KEYS`.
+
+### The pool-size and shared-pool questions, answered (2026-09-30)
+
+Two `screen` runs, one binary, interleaved arms inside one epoch, `--path=clean`,
+1..20 bulk streams, `--ab-variants`. The screen tool used to print one metric's
+verdict per run (throughput whenever any step had it), which hid the first of
+these completely; it now prints one table and one verdict **per metric**.
+
+**`mux` (cap 4) against `mux8` (cap 8)** — the pool-size question the M2b thread
+re-opened: throughput A 9/20, B 2/20, 9 inside the threshold (noise); interactive
+p99 A 9/20, B 3/20, 8 inside — mixed overall, but **load-dependent and
+unanimous where it matters**: from 15 streams up, cap 4 wins all six steps by
+42-61 % (median p99 5.56 against 6.16 ms over the whole ramp). So growing the
+pool larger does not help the mixed workload, and under real load it hurts.
+Verdict: directional, no claim by the screen's own rule (the low-load steps
+disagree), and the *shipped* default is the better arm.
+
+**`mux` (per-service pool) against `shared` (one pool per session)** — the
+observation that started this thread (49.979 ms against 7.3 ms, single samples
+on different schedules): here, matched, **the shared pool loses on interactive
+p99 in nineteen of twenty steps and never wins one** (median 8.15 against
+5.00 ms; step 4 alone is 7.99 against 1.85 ms), while the two are
+indistinguishable on throughput (A 3/20, B 11/20, 6 inside — pure noise). The
+earlier observation was not a fluke; `[client.data].shared_pool = true` costs
+interactive latency at every load level, and the shipped default
+(`shared_pool = false`) is the right one for a latency-sensitive service.
+
+### The stripe group's cold-pool cost, measured (2026-09-30)
+
+The last unverified half of the B1 change, on a real run
+(`MOLEHILL_STRIPE_COUNT=4 MOLEHILL_POOL_STATS=1`, mixed workload): every pool
+grows `0->1`, `1->2`, `2->3`, `3->4` with `reason="stripe"`, all four events
+inside **0.5 ms** of each other, and the whole run records `grows=4` — the
+`K-1` extra dials are paid once, at the first striped visitor to a cold pool,
+and the pool then stays warm for `idle_timeout`. The spread holds under load,
+not just in a test: the closing snapshot is `size=4 … streams=12
+tunnels=3/0/0,3/0/0,3/0/0,3/0/0` (three concurrent visitors, four stripes each,
+three streams on every tunnel). A pool test with a counting dialer pins the same
+count without the wire (`src/transport/multiplex.rs`).
+
+### The stripe group command, landed (2026-09-29)
+
+One command, and it is **v4's**: `ControlChannelCmd::
+CreateDataChannelForStripe(service, group, index, count)`, a fixed 11-byte
+session command (tag 4, the group id as four raw bytes so the tag alone still
+decides the length). `CURRENT_PROTO_VERSION` and `SUPPORTED_PROTO_VERSIONS` are
+unchanged: the release this work belongs to is not tagged yet, so its dialect is
+still being defined and the command is part of it (AGENTS.md §5). The
+request-to-command mapping stays in one pure function (`data_channel_cmd`), so
+"only a group request names a group" is a unit test rather than a reading of two
+call sites.
+
+The client side is where the guarantee lives. `open_stream_on_distinct(used,
+stripes)` grows the pool to `min(stripes, max_tunnels)` **first** — one dial at
+a time through the pool's own resize flag, terminating because every iteration
+either returns or leaves the pool bigger — and then reserves, per stripe, a
+tunnel whose id the group does not already hold. The exclusion is a
+*preference with a floor* (`order_candidates_for`): when every candidate is
+taken, the ordinary least-loaded order comes back, so a pool that cannot spread
+still forwards. The group's used-ids map is per service and keyed by group,
+bounded at 64 entries with oldest-first eviction; an entry is dropped once
+`count` stripes are placed.
+
+**Evidence.** `just check` green end to end (`pre-commit checks passed`,
+`pre-push checks passed`); `cargo test --lib` 157 passed; the whole serial suite
+green (integration 20, pool 10, session 8, log-budget 2); `just interop` 3/3
+against the cached v0.9.0 binary. The defect is visible on a real cold pool: the
+client's `pool-stats` log during `striped_data_channels` reads
+`reason="stripe" from=0 to=1 … 3 to=4` (it stayed at 1-2 before the change), and
+the test now asserts the pool reached its four stripes. Two falsifications were
+run and reverted, and both bit: sending the group request for a plain visitor
+fails the vocabulary test at the point where the hand-written peer expects the
+plain command, and replacing the client's stripe open with the ordinary
+`open_stream()` fails `striped_data_channels` with
+`the stripe group must have grown the client's pool to its 4 stripes: [2]`.
+
+**Design delta from the thread's sketch, with the reason.** The command rides on
+the *control* channel rather than in the stream prologue: that is where the fact
+already is — the server knows the group when it *asks* for the channel, and the
+client needs it before it *places* the open, which is when it reads the request
+— and it leaves the prologue and the whole data plane untouched, so
+`StartForwardStripedTcp` stays the only place a stripe index is assigned and an
+out-of-order gather stays correct.
+
+**Both gaps this record left open are closed (2026-09-30).** (1)
+`striped_data_channels` now holds a transfer in flight and polls the client's
+live pool until one pool carries a stream on **every** one of its four tunnels,
+so the per-instant half of D24 is checked end to end and not only by a pool unit
+test. (2) The eager growth's cost is measured: `K-1` extra dials, all four
+growth events inside 0.5 ms of each other, paid once at the first striped
+visitor to a cold pool (`grows=4` for a whole run), with the spread holding
+under load (`streams=12` over `3/0/0,3/0/0,3/0/0,3/0/0`). What remains
+unverified is unchanged and unworrying: a *previous* binary's striped data
+plane cannot be exercised, because the only previous binary is v0.9.0 (v3,
+refused).
+
+### The pool-size question, re-opened (2026-09-29)
+
+The M2b/M2c thread said "do not land on this data: re-open with a *pool-size*
+question (does growing earlier help a mixed workload?)". Taken instrument-first,
+with the instrumentation D22 already built and **no code change**:
+
+```
+SOAK_KEEP=1 MOLEHILL_POOL_STATS=1 MOLEHILL_PLACEMENT_STATS=1 \
+  just soak --test=rrul --tools molehill --variants shared \
+  --timeline clean:60,rate100:90,rate20:90      # 20 bulk + interactive + churn + UDP
+```
+
+The pool's own timeline (client log, `pool-stats`): `+cold:0->1`,
+`+udp_floor:1->2`, `+load:2->3`, `+load:3->4`, then `growth refused, holding
+off: already at max_tunnels (4)`. Final state: size 4, 23 streams spread
+7/6/5/5, one peer pinned. Placement over the same run: 4-8 candidates per
+placement, `mean_spread` 0-2 stream slots, 0 fallbacks, open latency mean
+18-73 us (max 20.8 ms — the cold dial, once).
+
+**What this settles:** "growing earlier" is not the lever. The pool grew twice
+*during* the burst under its own load rule and finished at its cap with the
+placement spread at 0-2 slots, so S1's conclusion ("placement policy is not the
+axis") now holds under the current in-path growth rule rather than the one S1
+measured — and what is left is not *when* the pool grows but *how large it may
+grow*. S2/D28 stay unlanded, on evidence rather than on the old instrument.
+
+**What it does not settle:** whether a bigger cap helps. That is a different
+question with a different instrument: a `screen` A/B of
+`[client.data.tcp].max_tunnels = 4` against `8` under the same mixed workload
+(the variants list already has the `mux1`/`kcp4` pattern to copy). It would have
+to come first if anyone wants to move that default.
+
+One observation recorded without being a claim: the `shared` variant's clean
+interactive p99 read 49.979 ms here (803 samples) against the default
+per-service pool's 7.3 ms in the same day's sweep. Two single samples on
+different timelines (60 s against 150 s) settle nothing — but the gap is the
+size that would matter, and it is the reason to A/B `shared` against the
+default at a matched schedule before trusting either number.
 
 ### Shaping scope, the rate cells, and the shaped-cell rule (2026-09-29)
 
@@ -802,17 +1026,30 @@ budget, as the 2026-09-29 record explains.)
 
 ## Open threads for the next cycle
 
-- **The stripe group command** — a group's K channels land on K distinct
-  tunnels only while the pool has K; from a cold pool they share one tunnel
-  and the group works but loses the spread. The wire command that names a
-  group (the server names it once, the client reserves K tunnels and answers
-  with K prologues carrying `StartForwardStripedTcp(group, i, K)`) would make
-  D24 structural; it needs the stream prologue to carry the command, not just
-  the service id (see "Fixed: striping with the elastic pool").
-- **M2b/M2c (S2, D28, D27)** — do not land on this data: the spread is zero and
-  the UDP drop counters stayed at zero. Re-open with a *pool-size* question
-  (does growing earlier help a mixed workload?) rather than a
-  placement question.
+- ~~**The stripe group command**~~ — **landed** (`CreateDataChannelForStripe`,
+  part of v4, whose release is still in development, so the dialect is still
+  being defined — AGENTS.md §5). One design
+  detail came out differently from this thread's sketch: the command rides on
+  the **control** channel, not in the stream prologue. That is where the fact
+  already is — the server knows the group when it *asks* for the channel, and
+  the client needs it before it *places* the open, which is when it reads the
+  request — and it leaves the prologue and the whole data plane untouched, so
+  the striped command the server still writes on each gathered channel
+  (`StartForwardStripedTcp`) stays the only place an index is assigned: arrival
+  order can still decide which stripe is which, which is what makes an
+  out-of-order gather correct.
+- ~~**M2b/M2c (S2, D28, D27)**~~ — **the placement half stays unlanded, now on
+  current evidence.** Re-opened as the *pool-size* question the thread asked
+  for and measured instrument-first (below, "The pool-size question,
+  re-opened"): under the mixed workload the pool grows twice during the burst
+  and finishes at its cap with a placement spread of 0-2 slots, so a smarter or
+  earlier growth rule has nothing to win. The *cap* question the thread left
+  open — `max_tunnels = 4` against `8` at a matched schedule — is **measured
+  and answered no**: from 15 streams up the shipped cap wins all six steps on
+  interactive p99 by 42-61 %, and it never loses the whole ramp (below, "The
+  pool-size and shared-pool questions, answered"). Nothing here lands: neither
+  a placement rule nor a larger cap. D27's UDP half stays gated on the drop
+  counters, which are still zero.
 - ~~**The v3 server path**~~ — **removed.** v0.10.0 is the first release that
   serves v4 only: the v3 handshake, its one-service-per-connection control
   path, the two-key registry (`MultiMap`) and `pool_size` on the wire are
@@ -834,78 +1071,99 @@ budget, as the 2026-09-29 record explains.)
   sized above the measured worst case. It is also **cheaper**: the transitions
   in the shipped sweep total 197 s per tool against the 840 s the fitted timer
   spent expiring on all seven.
-- **The rate cells still carry no comparison.** Fixing the spine did not make
-  `rate20`/`jitter` quotable: every arm's peak interval is `0.000` because the
-  shaper holds each interval's bytes past that interval's own accounting
-  window, and `rate100` runs 63-74 % zero-byte intervals. The gate checks that
-  a spine *ran*, which is now true; it does not make the numbers comparable,
-  and no amount of harness fixing will. Making those cells measurable is a
-  model question (a longer interval, or accounting on the receiver's window),
-  not a defect.
-- **The transition is long because the harness shapes both legs at once.** The
-  ~159 s flush exists because `_ports` puts the tool's backend leg in the same
-  rate class as its visitor leg, so the tool backpressures and the iperf3
-  client's kernel accumulates tens of MB before the stage boundary kills it.
-  That is a deliberate shaping choice (both legs are "the path under test"),
-  but it is worth re-deriving: shaping only the visitor leg would shorten every
-  rate transition by an order of magnitude. Untested — it changes what the rate
-  cells measure, so it needs its own A/B.
-- **The host key is stable, but it is a *name*, not a calibration.** The old
-  form of this thread said "the host key is the container hostname, so two runs
-  on the same hardware never compare" — that was **fixed** by `host_identity()`,
-  which keys on `machine_id | cpu_model | nproc` and keeps `hostname` only for a
-  reader to recognise. The evidence it works is the rename it survived: the
-  `16b4dc8db68b` → `a093c5fbe0dc` container change did **not** break
-  comparability (both runs carry `host_id d764f9da9c7e5b2a`). What is still open
-  is smaller and sharper: on a host with **no** `/etc/machine-id` — this one —
-  the key reduces to `cpu_model | nproc`, so two *different* machines with the
-  same CPU model and core count would be called the same host and the gate would
-  compare them. The original note proposed a calibration measurement (a
-  fixed-workload throughput probe) rather than more identity fields; that was
-  never implemented.
-- **One sample per stage, and the shaped cells are the ones that pay.** The
-  figure this thread used to quote — "the model's own within-run spread on
-  clean stages is 40-70 %", sourced to `9.334 vs 5.389 ms p99` in one older
-  run — is stale **in its attribution**, and the shipped sweep's own replicate
-  says so: its two `clean` stages agree to 8.7 % on bulk peak and 6.122 vs
-  6.731 ms on p99 for molehill, 1.2 % and 2.877 vs 2.890 ms for frp, 1.8 % and
-  70.022 vs 71.376 ms for rathole (`just soak-check` reports this per run now,
-  so it cannot go stale again). The *magnitude*, though, is real — it just
-  belongs to the shaped cells, and three repetitions of one *unchanged* method
-  measure it directly — same revision (`401aeda`), budget, tolerance and retry
-  schedule, from `just soak --test=rrul --tools molehill --timeline
-  rtt100:120,loss1:120,loss5:120,rate100:120,rate20:120,jitter:120` run three
-  times. (Those files are scratch and uncommitted, so the command is the
-  source, not a path.) molehill's `loss1` repeats to 3.2 % (1301-1345 ms) while
-  `rate100` spans 2534-9782 ms (**74 %** apart) and `jitter` 551-4045 ms
-  (**86 %**), against between-tool differences of ~2x in the same stages. So
-  the shaped cells are published as context and never as a comparison — a limit
-  on the claim, not a fix.
-- **The load axis is absent from the release artifact.** The full open form of
-  the "64-stream scale point" clause below: that scale point belonged to the
-  **retired per-cell matrix** (single-rep by construction, and bimodal on both
-  binaries across its 13 rounds), and it went out with the matrix. What the
-  current model has instead is `--test=capacity` — a ramp to the first load
-  level that breaks the SLO — and the release sweep does **not** run it, so
-  `results-soak-vX.Y.Z.json` carries no "how much can it carry" number at all.
-  The README delegates that to the reader's own path, which is honest but leaves
-  the release's headline claim at "here is a chart". Adding it is cheap to run
-  (~1 min/tool: `ceiling` = `--streams-max`, 8 steps × `settle_s`) and
-  expensive to plumb: a second artifact needs a name of its own (the plot and
-  the gate resolve only `results-soak-vX.Y.Z.json`), plus ritual text, both
-  READMEs and `docs/benchmarks.md`, and the two curves must be stated as two
-  different instruments rather than cross-checked.
-- **The shaped interactive cells are published without a rule.** They are
-  labelled "context, not a verdict" in the README, and they are still printed to
-  one decimal as if they were measurements. Either give them a rule (an interval
-  over R runs, and a stated minimum difference the run can resolve) or stop
-  printing them as numbers; the present state is neither, and §10's "a metric
-  without contrast is not a measurement" applies to a cell whose spread between
-  runs of unchanged code exceeds every between-tool difference in it.
-- **The config-test gaps** still open from the v0.9.0 audit: `allow_ports`
-  rejection end to end, per-service `token` resolution, the UDP knobs'
-  documented effects, a PSK handshake, hot-reload add/delete/modify, and
-  `--genkey` curve behaviour.
+- ~~**The rate cells still carry no comparison.**~~ — **closed, both halves.**
+  The reading is no longer the peak interval (a property of the shaper's
+  schedule) but the load over the stage's whole measured window, and a rate
+  class is read from the **receiver's own window**: `rate100` now reads
+  **0.100 Gbit/s on all four arms** — the shaper's own number, which is what a
+  rate cell *is*, and the docs say so instead of implying a tool comparison.
+  `rate20` and `jitter` carry **no reading** and say why (the sender's
+  accounting is defeated, 90-100 % zero-byte intervals, and the dial never
+  produces a receiver summary because the client is still blocked past the
+  boundary) — a hole with a reason, not a defeated number. **The follow-up is
+  done**: a bounded socket window on the rate classes gives them a live sender
+  (zero-byte share 72-79 % -> 13-14 %), `rate20` reads 0.0196 (98 % of nominal)
+  where the unbounded client read 0.0334 — 70 % *above* nominal — and the
+  reading rule now follows the measurement rather than the class. It is the
+  default; `SOAK_RATE_SOCKET_WINDOW=off` reproduces a pre-window run (below,
+  "The rate cells get a bounded sender").
+- ~~**The transition is long because the harness shapes both legs at once.**~~
+  — **fixed, and the fix is now the default** (`SOAK_SHAPE_LEGS=visitor`). The
+  A/B in "Shaping scope, the rate cells, and the shaped-cell rule" measured it
+  on one binary: the worst transition of the shipped timeline drops from
+  25.0-27.8 s to 7.2 s, the injected delay is paid once (a `rtt100` floor of
+  401 ms instead of 802), and a rate class carries its nominal rate. `both`
+  stays selectable for reproducing runs measured under it, and `shape_legs` is
+  in `METHOD_KEYS`, so the gate refuses a comparison across the change.
+- ~~**The host key is stable, but it is a *name*, not a calibration.**~~ —
+  **closed.** The identity half was already fixed by `host_identity()`
+  (`machine_id | cpu_model | nproc`, with `hostname` kept only for a reader);
+  the measurement the thread asked for is now implemented as
+  `host_calibration` — SHA-256 over a fixed 192 MiB buffer, median of three,
+  1.0-2.2 % repeatable on this host, recorded before every run — and
+  `soak_check` refuses a comparison whose two runs measured more than 25 %
+  apart, while *reporting* a file that predates the probe as unverifiable
+  rather than reading its silence as agreement. The probe was chosen by
+  measurement: a 128 MiB loopback socket pair drifts 18.7 % across median-of-
+  five readings (it follows the CPU's power state) and was rejected.
+- ~~**One sample per stage, and the shaped cells are the ones that pay.**~~ —
+  **closed, and re-measured on the current method.** The one-sample limit is
+  permanent (a stage is one walk of the schedule), so the resolution has to come
+  from repetitions *outside* the run: three runs of one unchanged method under
+  the visitor-leg scope give a shaped p99 spread of 5.4-24.0 % and a bulk-reading
+  spread of 0.2-3.1 %, against the 25 % limit the gate applies per stage. The
+  figure this thread used to quote (74-86 %) belonged to the retired
+  peak-interval reading under the two-leg scope; the two-leg scope's own p99
+  spread measured here is up to 48 %. Every surface now states the resolution
+  and refuses to conclude inside it (see "Shaping scope, the rate cells, and the
+  shaped-cell rule", item 3). The files are scratch and uncommitted, so the
+  command in that record is the source, not a path.
+- ~~**The load axis is absent from the release artifact.**~~ — **closed.** The
+  ritual runs `--test=rrul,capacity`, and `--test` takes a comma list, so the
+  staged schedule and the load ramp travel in **one** artifact (one `meta`, one
+  host, one revision). The second-artifact plumbing the thread priced was
+  avoided after checking what it would cost: the plot and the gate already
+  render and compare every test entry in a file, so a second file would have
+  meant a second naming scheme and a second pairing in three tools for no gain.
+  The two curves are declared two different instruments and never cross-checked;
+  the gate keys each comparison by (tool, test type). See
+  "Shaping scope, the rate cells, and the shaped-cell rule", item 5.
+- ~~**The shaped interactive cells are published without a rule.**~~ —
+  **closed, with the rule the thread named.** Three runs of one unchanged
+  method measured the interval (shaped p99 cells move 5-24 %, bulk cells
+  0.2-3 %; the two-leg scope's p99 by up to 48 %), the numbers are recorded in
+  "Shaping scope, the rate cells, and the shaped-cell rule", and every surface
+  now applies one rule: the gate *reports* a shaped stage's p99 and fails only
+  a blow-up (3x), the plot prefixes those cells with `~`, the README marks the
+  columns as context and picks no winner in them, and both pages state the
+  measured resolution beside the tables. The per-class thresholds were
+  deliberately **not** baked into the gate: a table of them would go stale with
+  the next method change, and the measurement's home is the record.
+- **The host calibration certifies CPU state, not the loopback path** (found
+  2026-09-30, numbers in "Release sweep (2026-09-30)"). Two container instances
+  of the same `host_id` differed by 25-39 % on the clean bulk cells of the two
+  arms that reach the loopback ceiling, while frp and nps were flat and the
+  calibration probe read 414.0 against 421.2 MiB/s — 1.7 % apart, inside the
+  25 % the gate allows. Stable and blind at once: it catches a busy or throttled
+  CPU, not the machine property the fast cells are bounded by. Options, none
+  measured yet: a loopback-ceiling probe measured *outside* the tools (the
+  128 MiB socket pair drifts 18.7 % across median-of-five readings, which may be
+  too noisy to be a key); gating on the run's own first `clean` reading against
+  the baseline's (circular for a cross-tool claim, sound for cross-run
+  comparability); or stating that only same-instance runs compare and dropping
+  the calibration's claim to more than CPU state. Decide before the next sweep:
+  this one's numbers describe one instance.
+- ~~**The config-test gaps**~~ — **closed** (2026-09-30). `allow_ports`
+  rejection and per-service `token` were already covered; the rest now are too:
+  `udp_buffer_size` (which **truncates**, it does not drop — the docs were
+  wrong and are fixed), `udp_idle_timeout` (the source port really does change
+  after the timeout), `udp_send_queue_size` (pinned at the queue; no
+  deterministic end-to-end version exists), a PSK handshake (matching, wrong
+  and missing), hot reload add/modify/delete (the deleted service's port is
+  provably released, the untouched one keeps answering, one session
+  throughout), and `--genkey` (default and x25519 keys, a real handshake driven
+  by a generated pair, and x448 refused with a message that names the curve and
+  the resolver instead of `GetDhImpl`).
 - **Privileged ports** are documented as *not* implemented (the whitelist admits
   any port it contains; the OS decides whether the bind succeeds). Enforcing
   `<1024` would be a behaviour decision for the human.
@@ -913,10 +1171,22 @@ budget, as the 2026-09-29 record explains.)
   replacing the python bench/test entries with `cargo-script` once it is stable,
   and QUIC (implemented and measured, parked in the `archive/transport-test`
   tag; revisit only for a UDP-only path or multi-stream loss isolation).
-- **`MOLEHILL_TCP_BUFFER_BYTES`** does not exist as a switch: its doc-comment
-  reference in `src/stripe.rs` is removed, and the name now survives only as an
-  illustration in the soak runner's `diag_env` list
-  (`benches/scripts/soak/lib.py`).
+- ~~**`MOLEHILL_TCP_BUFFER_BYTES`**~~ — **closed, and the note was stale.** The
+  switch never existed; its doc-comment reference went with `d405360`, and the
+  `diag_env` illustration the note still pointed at is gone too (the list there
+  is `MUX_STATS`/`KCP_STATS`/`POOL_STATS`/`PLACEMENT_STATS`/`UDP_STATS`/
+  `STRIPE_COUNT`). Nothing survives anywhere in the tree.
+- **An instance that fails to start is silent** (found 2026-09-30 while writing
+  the config tests, **not fixed**). `src/lib.rs::run` spawns `run_instance` and
+  only ever observes its `Result` when a *later* general config change triggers
+  a restart, so a failure at startup leaves the process running with nothing
+  listening and **not one line of output**. Reproduced twice: a
+  `local_private_key` that is not valid base64, and an `allow_ports` range whose
+  start is above its end. The documented contract is the opposite ("refused
+  before the start"), so this is a code bug, not a doc one; the fix (observe the
+  first instance's early exit, log it at `ERROR`, exit non-zero) touches the
+  hot-reload loop, which is why it is filed rather than folded into a test
+  change.
 
 ## Environment notes (this host, re-checked 2026-09-28)
 

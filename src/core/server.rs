@@ -7,8 +7,8 @@ use crate::config::{Config, ServerConfig, ServiceType};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 use crate::protocol::{
-    self, Ack, Carrier, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES, Hello,
-    MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, PROTO_V4_VERSION, ServiceId,
+    self, Ack, CURRENT_PROTO_VERSION, Carrier, ControlChannelCmd, DataChannelCmd,
+    HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, ServiceId,
     ServiceRegistration, SessionCmd, SessionRegistration, UdpTraffic, read_auth, read_hello,
     read_session_cmd, read_stream_prologue, write_register_result,
 };
@@ -678,10 +678,9 @@ async fn handle_connection(
     server_config: Arc<ServerConfig>,
     shared: Arc<ServerShared>,
 ) -> Result<()> {
-    // Read hello. `read_hello` has already refused every dialect this
-    // server does not serve (protocol v4, and nothing else), so the version
-    // it read is the one below; what the hello *variant* says is which kind
-    // of connection this is.
+    // Read hello. `read_hello` has already refused every dialect this server
+    // does not serve (protocol v4, and nothing else), so what the hello
+    // *variant* says is which kind of connection this is.
     let (_version, hello) = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, _tag) => {
@@ -837,7 +836,7 @@ async fn do_session_handshake(
     let mut rng = rand::rngs::SysRng;
     rng.try_fill_bytes(&mut nonce)?;
 
-    let hello = Hello::ControlChannelHello(PROTO_V4_VERSION, nonce);
+    let hello = Hello::ControlChannelHello(CURRENT_PROTO_VERSION, nonce);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
 
@@ -1218,7 +1217,7 @@ async fn do_v4_tunnel(
             // its session. The cap is named so the operator who set it reads
             // the reason in the log, and the client reads it in the ack.
             debug!(
-                "Refused a v{PROTO_V4_VERSION} data tunnel for session {}: it already holds \
+                "Refused a data tunnel for session {}: it already holds \
                  {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
                  {max_tunnels_per_client}",
                 hex::encode(nonce)
@@ -1317,14 +1316,12 @@ fn report_tunnel_violation(service_id: ServiceId, why: &str) {
     TUNNEL_VIOLATIONS.report(
         || {
             warn!(
-                "Dropped a v{PROTO_V4_VERSION} tunnel stream naming service {service_id}: {why}. \
+                "Dropped a tunnel stream naming service {service_id}: {why}. \
                  Further violations are logged at debug level."
             );
         },
         || {
-            debug!(
-                "Dropped a v{PROTO_V4_VERSION} tunnel stream naming service {service_id}: {why}"
-            );
+            debug!("Dropped a tunnel stream naming service {service_id}: {why}");
         },
     );
 }
@@ -1430,7 +1427,7 @@ where
     let Ok(service_id) = read_stream_prologue(stream).await else {
         // The stream ended before naming a service (a client that opened it
         // and hung up): nothing to route it to.
-        debug!("Dropped a v{PROTO_V4_VERSION} tunnel stream with no prologue");
+        debug!("Dropped a tunnel stream with no prologue");
         return None;
     };
     let queue = sessions
@@ -1547,7 +1544,7 @@ async fn handle_kcp_tunnel_session(
         TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
         TunnelSlot::OverCap { held } => {
             debug!(
-                "Refused a v{PROTO_V4_VERSION} KCP data tunnel for session {}: it already \
+                "Refused a KCP data tunnel for session {}: it already \
                  holds {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
                  {max_tunnels_per_client}",
                 hex::encode(nonce)
@@ -1601,7 +1598,7 @@ pub struct ControlChannelHandle {
     data_channel: mpsc::Sender<DataChannel>,
     // Keeps the data-channel request channel alive for as long as the handle
     // exists: the control channel loop exits when every sender is gone.
-    data_ch_req: mpsc::UnboundedSender<bool>,
+    data_ch_req: mpsc::UnboundedSender<DataChannelRequest>,
 }
 
 impl ControlChannelHandle {
@@ -1703,10 +1700,31 @@ fn stripe_count(server_config: &ServerConfig) -> usize {
     }
 }
 
+/// Why a service's pool wants a data channel.
+///
+/// The pool knows *what* it needs, not *how* to say it: turning a request into
+/// a command is the control channel's job (see [`data_channel_cmd`]). The
+/// distinction matters for a stripe group — its K requests must reach the
+/// client as one group, so it can reserve one tunnel per stripe (D24) — and
+/// every other request stays the plain one.
+enum DataChannelRequest {
+    /// One visitor arrived: an ordinary channel, placed by the client's own
+    /// least-loaded rule.
+    Plain,
+    /// One stripe of a striped visitor connection: the group's id, the stripe's
+    /// index and the group's stripe count.
+    Stripe {
+        group: [u8; 4],
+        index: u8,
+        count: u8,
+    },
+}
+
 /// Where a service's control commands go.
 ///
-/// A v3 service owns its control connection; a v4 service shares the session's,
-/// so its commands are framed into the session's single writer instead.
+/// A v3 service owns its control connection; a v4 service shares the
+/// session's, so its commands are framed into the session's single writer
+/// instead.
 enum ControlSink {
     Session {
         service_id: ServiceId,
@@ -1733,6 +1751,23 @@ impl ControlSink {
     }
 }
 
+/// The command one data-channel request becomes.
+///
+/// One function, so "the group request is the only one that carries a group"
+/// stays checkable in a unit test rather than by reading two call sites: every
+/// other request keeps the plain four-byte form, which is what a visitor whose
+/// service is not striped sends.
+fn data_channel_cmd(service_id: ServiceId, request: &DataChannelRequest) -> ControlChannelCmd {
+    match request {
+        DataChannelRequest::Stripe {
+            group,
+            index,
+            count,
+        } => ControlChannelCmd::CreateDataChannelForStripe(service_id, *group, *index, *count),
+        DataChannelRequest::Plain => ControlChannelCmd::CreateDataChannelFor(service_id),
+    }
+}
+
 impl ControlChannelHandle {
     // Create a control channel handle for an already-bound service: spawn
     // the connection pool task and the control channel handling task.
@@ -1756,7 +1791,7 @@ impl ControlChannelHandle {
 
         // Cache some data channels for later use
         for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
+            if let Err(e) = data_ch_req_tx.send(DataChannelRequest::Plain) {
                 debug!("Failed to request data channel {}", e);
             }
         }
@@ -1884,11 +1919,11 @@ async fn recv_pool_death(rx: &mut mpsc::UnboundedReceiver<()>) -> Option<()> {
 /// connection, so this task only translates the pool's requests into
 /// service-tagged commands for the session's writer.
 struct ControlChannel {
-    sink: ControlSink,                             // Where the commands go
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
-    pool_died_rx: mpsc::UnboundedReceiver<()>,     // the pool's death notice
+    sink: ControlSink,                      // Where the commands go
+    shutdown_rx: broadcast::Receiver<bool>, // Receives the shutdown signal
+    data_ch_req_rx: mpsc::UnboundedReceiver<DataChannelRequest>, // Receives visitor connections
+    heartbeat_interval: u64,                // Application-layer heartbeat interval in secs
+    pool_died_rx: mpsc::UnboundedReceiver<()>, // the pool's death notice
 }
 
 impl ControlChannel {
@@ -1896,6 +1931,9 @@ impl ControlChannel {
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
         let service_id = self.sink.service_id();
+        // The ordinary request's command, framed once: it is the same bytes for
+        // every visitor. The striped one cannot be cached like this — its
+        // payload differs per stripe — so it is framed per request below.
         let create_ch_cmd =
             postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelFor(service_id))?;
         let heartbeat = postcard::to_stdvec(&ControlChannelCmd::HeartBeat)?;
@@ -1908,8 +1946,20 @@ impl ControlChannel {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
                     match val {
-                        Some(_) => {
-                            if let Err(e) = self.sink.send(&create_ch_cmd) {
+                        Some(request) => {
+                            // The plain request is the common case and its frame
+                            // is byte-identical every time, so it is cached; the
+                            // striped one carries its group and is framed per
+                            // request.
+                            let striped;
+                            let framed: &[u8] = match data_channel_cmd(service_id, &request) {
+                                ControlChannelCmd::CreateDataChannelFor(_) => &create_ch_cmd,
+                                cmd => {
+                                    striped = postcard::to_stdvec(&cmd)?;
+                                    &striped
+                                }
+                            };
+                            if let Err(e) = self.sink.send(framed) {
                                 // The client is gone: one session's end. Its
                                 // own log says why.
                                 debug!("{:#}", e);
@@ -1993,7 +2043,7 @@ enum PairOutcome<C> {
 /// failure for that visitor and nothing for the service.
 async fn pair_visitor<C>(
     data_ch_rx: &SharedChannels<C>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: &mpsc::UnboundedSender<DataChannelRequest>,
     shutdown_rx: &mut broadcast::Receiver<bool>,
     control_alive: &mut tokio::sync::watch::Receiver<bool>,
 ) -> PairOutcome<C>
@@ -2017,7 +2067,7 @@ where
                     debug!("No data channel after {attempts} requests; dropping the visitor");
                     return PairOutcome::Shed;
                 }
-                if data_ch_req_tx.send(true).is_err() {
+                if data_ch_req_tx.send(DataChannelRequest::Plain).is_err() {
                     return PairOutcome::Stop;
                 }
                 continue;
@@ -2067,7 +2117,7 @@ async fn run_tcp_connection_pool<C>(
     l: TcpListener,
     sock_opts: SocketOpts,
     data_ch_rx: mpsc::Receiver<C>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
     stripe_count: usize,
@@ -2192,8 +2242,9 @@ where
 struct VisitorPool<C> {
     /// Channels to pair visitors with, one take at a time.
     data_ch_rx: SharedChannels<C>,
-    /// How to ask the client for one more (or K more) data channels.
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    /// How to ask the client for one more (or K more) data channels, named as
+    /// a group when they are a visitor's stripes.
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     /// The `StartForwardTcp` command, serialized once for the pool.
     cmd: std::sync::Arc<Vec<u8>>,
     /// Held for the whole gather, so a striped group's K channels stay atomic.
@@ -2245,7 +2296,7 @@ async fn serve_tcp_visitor<C>(
         loop {
             if pool
                 .data_ch_req_tx
-                .send(true)
+                .send(DataChannelRequest::Plain)
                 .with_context(|| "Failed to send data chan create request")
                 .is_err()
             {
@@ -2330,6 +2381,13 @@ async fn serve_tcp_visitor<C>(
 /// one and cannot interfere with each other, but two gathers in flight would
 /// interleave their K channels and produce two broken groups.
 ///
+/// The requests name the group (see [`DataChannelRequest::Stripe`]), so the
+/// client can place the K channels on K distinct tunnels. The index a request
+/// carries is the slot the stripe will take *when it arrives*: the gather
+/// labels channels in arrival order, and the client learns its real index from
+/// `StartForwardStripedTcp` — nothing about the pairing depends on a request's
+/// index coming back with it.
+///
 /// Returns `Ok(true)` when the control channel ended mid-gather (the pool must
 /// stop) and `Ok(false)` once the group is forwarding. A broken pooled
 /// channel discards the whole attempt — the client already parked the
@@ -2340,26 +2398,31 @@ async fn pair_striped_group<C>(
     incoming: TcpStream,
     stripe_count: usize,
     data_ch_rx: &SharedChannels<C>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: &mpsc::UnboundedSender<DataChannelRequest>,
     shutdown_rx: &mut broadcast::Receiver<bool>,
     control_alive: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<bool>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let stripes = u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?;
     // Each iteration is one gather attempt under a fresh group id.
     'gather: loop {
         let group = GROUP_IDS.fetch_add(1, Ordering::Relaxed);
-        let cmds = stripe_cmds(group, stripe_count)?;
-        // One `CreateDataChannelFor` per stripe, before the first wait: the
+        let group_bytes = group.to_be_bytes();
+        let cmds = stripe_cmds(group_bytes, stripes)?;
+        // One striped request per stripe, before the first wait: the
         // unstriped path asks for its channel this way, and a striped gather
         // that does not ask simply waits for channels nobody was told to
         // open — the shape of the original defect (a cold pool never
         // pre-opened anything, so the gather hung until the visitor's own
         // read timed out). A request the client refuses is answered with
         // nothing at all, which is why the wait below re-asks.
-        for _ in 0..stripe_count {
-            if data_ch_req_tx.send(true).is_err() {
+        for index in 0..stripes {
+            if data_ch_req_tx
+                .send(stripe_request(group_bytes, index, stripes))
+                .is_err()
+            {
                 return Ok(true);
             }
         }
@@ -2384,9 +2447,17 @@ where
                         // them there.
                         return Ok(false);
                     }
-                    let missing = stripe_count - gathered.len();
-                    for _ in 0..missing {
-                        if data_ch_req_tx.send(true).is_err() {
+                    // The stripes still missing are the slots from the next
+                    // arrival on: the channels already gathered took the slots
+                    // before them.
+                    let next = u8::try_from(gathered.len())
+                        .with_context(|| "stripe index exceeds u8")?
+                        .min(stripes);
+                    for index in next..stripes {
+                        if data_ch_req_tx
+                            .send(stripe_request(group_bytes, index, stripes))
+                            .is_err()
+                        {
                             return Ok(true);
                         }
                     }
@@ -2424,17 +2495,27 @@ where
 /// transient, and the client prunes abandoned ones by age.
 static GROUP_IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The striped request for one stripe slot of a gather.
+///
+/// The index and the count are `u8`s on the wire (`DataChannelCmd` fixes the
+/// same width for the group's own `StartForwardStripedTcp`), and `count` is the
+/// gather's real stripe count, so the client's growth target and the group's
+/// shape cannot disagree.
+fn stripe_request(group: [u8; 4], index: u8, count: u8) -> DataChannelRequest {
+    DataChannelRequest::Stripe {
+        group,
+        index,
+        count,
+    }
+}
+
 /// The per-stripe `StartForwardStripedTcp` commands of one gather attempt,
 /// in arrival order. Each is 7 bytes (tag + fixed-width group id + index +
 /// count), so `write_and_flush` emits it as a single frame.
-fn stripe_cmds(group: u32, stripe_count: usize) -> Result<Vec<Vec<u8>>> {
-    (0..stripe_count)
-        .map(|i| {
-            let cmd = DataChannelCmd::StartForwardStripedTcp(
-                group.to_be_bytes(),
-                u8::try_from(i).with_context(|| "stripe index exceeds u8")?,
-                u8::try_from(stripe_count).with_context(|| "stripe count exceeds u8")?,
-            );
+fn stripe_cmds(group: [u8; 4], stripes: u8) -> Result<Vec<Vec<u8>>> {
+    (0..stripes)
+        .map(|index| {
+            let cmd = DataChannelCmd::StartForwardStripedTcp(group, index, stripes);
             let bytes = postcard::to_stdvec(&cmd)?;
             Ok::<Vec<u8>, anyhow::Error>(bytes)
         })
@@ -2544,7 +2625,7 @@ fn register_udp_pool(shared: &Arc<UdpPoolShared>) {
 struct UdpWorkerGuard {
     id: usize,
     workers: Arc<UdpWorkerMap>,
-    req_tx: mpsc::UnboundedSender<bool>,
+    req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -2563,7 +2644,7 @@ impl Drop for UdpWorkerGuard {
             );
             // Fails only when the control channel is gone; the pool loop
             // breaks on its own in that case.
-            let _ = self.req_tx.send(true);
+            let _ = self.req_tx.send(DataChannelRequest::Plain);
         }
     }
 }
@@ -2580,7 +2661,7 @@ struct UdpWorkerSet {
     /// size for the session's lifetime.
     workers: Arc<UdpWorkerMap>,
     /// Asks the control channel for a replacement channel when a worker exits.
-    req_tx: mpsc::UnboundedSender<bool>,
+    req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     /// Set while the pool shuts down, so an exit asks for nothing.
     shutting_down: Arc<AtomicBool>,
     /// The next worker id, and the round-robin cursor a route starts from.
@@ -2642,7 +2723,7 @@ async fn run_udp_connection_pool<C>(
     l: Arc<UdpSocket>,
     buffer_size: usize,
     mut data_ch_rx: mpsc::Receiver<C>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
 ) -> Result<()>
@@ -3355,5 +3436,32 @@ mod tests {
         let (workers, routes, _rxs, mut next) = setup(0);
         route(&workers, &routes, &mut next, peer(5000));
         assert!(routes.lock().unwrap().is_empty());
+    }
+
+    /// A group request is the *only* one that carries a group, and an ordinary
+    /// visitor keeps the plain four-byte command. It matters because the
+    /// client's tag dispatch is what makes a mistake fatal rather than merely
+    /// unhelpful: an unknown tag closes the session, and a plain request that
+    /// grew a group would be a frame no peer expects.
+    #[test]
+    fn only_a_group_request_names_a_group() {
+        let service = ServiceId::new(0xdead_beef);
+        let stripe = DataChannelRequest::Stripe {
+            group: [0x01, 0x02, 0x03, 0x04],
+            index: 2,
+            count: 4,
+        };
+        assert!(
+            matches!(
+                data_channel_cmd(service, &stripe),
+                ControlChannelCmd::CreateDataChannelForStripe(id, group, 2, 4)
+                    if id == service && group == [0x01, 0x02, 0x03, 0x04]
+            ),
+            "a stripe request must name its group, index and count"
+        );
+        assert!(matches!(
+            data_channel_cmd(service, &DataChannelRequest::Plain),
+            ControlChannelCmd::CreateDataChannelFor(id) if id == service
+        ));
     }
 }

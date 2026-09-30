@@ -1,0 +1,16 @@
+[server]
+default_token = "session_test_default_token" # security-scan:allow dummy fixture token, same value as the sibling session fixtures
+allow_ports = ["2366"]
+
+[server.control]
+bind_addr = "127.0.0.1:2365"
+# Declared to the client in `Ack::SessionOk`, exactly as the plain session
+# fixture does; the hand-spoken v4 client below only needs it to be set.
+heartbeat_interval = 5
+
+# The same server as `session_v4.toml`, but striped: every visitor connection is
+# gathered over 2 data channels, and the gather asks for them with
+# `CreateDataChannelForStripe` — the group and the stripe's place in it — so the
+# client can reserve one tunnel per stripe.
+[server.data]
+stripe_count = 2

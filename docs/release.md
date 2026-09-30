@@ -13,6 +13,11 @@ v0.5.0 — and has been numbered independently since.
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) applies within
 that line.
 
+The **wire protocol** has its own number, and it moves with the release line:
+it changes with the tag that introduces it, and no two tags are compatible. The
+rule, the current dialect and the release line are in AGENTS.md §5; the wire
+consequences are in [internals.md](internals.md), "Protocol versions".
+
 ## Release notes: CHANGELOG.md is the single source
 
 `CHANGELOG.md` is maintained in
@@ -131,6 +136,13 @@ writes the tests it completed.
    (the fitted slopes) and `-cost.png` (only for a `cost` run). Update the
    README Benchmarks section with them and their numbers, then delete the
    previous tag's charts from `assets/`.
+   The release review enforces the provenance half of this step: the results
+   file records the revision it was measured at, and `githooks/pre-tag` fails
+   the tag if `src/`, `tests/`, `Cargo.*`, `build.rs` or the runner changed
+   between that revision and the reviewed commit — a chart whose numbers
+   describe code that is no longer here is the one thing a reader cannot see.
+   Doc and asset commits after the sweep are fine; that is how the ritual lands
+   it.
 5. `just soak-check` — the gate, in two steps. First the run is checked
    against itself: every coverage axis a test claims must have carried
    samples, **every stage that claims a bulk spine must have carried intervals

@@ -855,10 +855,42 @@ impl TunnelPool {
     /// A cold pool grows synchronously here, so the first open of a cold pool
     /// answers with a fresh tunnel instead of failing; every other growth
     /// happens on the maintenance tick. The reservation is charged before the
-    /// first `await`, which is what makes back-to-back opens (the server asks
-    /// for a stripe group one `CreateDataChannelFor` at a time) land on
-    /// distinct tunnels while the pool has them (D24).
+    /// first `await`, which is what makes back-to-back opens land on distinct
+    /// tunnels while the pool has them.
     pub(crate) async fn open_stream(&self) -> Result<StreamLease, OpenError> {
+        self.open_avoiding(&[]).await
+    }
+
+    /// Open one stream for a stripe of a group, on a tunnel the group does not
+    /// already occupy (D24 structural).
+    ///
+    /// `used` are the process-unique tunnel ids the group's earlier stripes
+    /// took and `stripes` is the group's K — the server names the group before
+    /// its channels are opened, which is what lets the client do what the
+    /// placement rule alone never could.
+    ///
+    /// The pool grows to `min(stripes, max_tunnels)` *first*: a pool with fewer
+    /// tunnels than the group has stripes cannot place two of them apart
+    /// however placement chooses, and a cold pool — the elastic pool's default
+    /// state — has *none*, while a group's K streams sit below the growth
+    /// rule's per-tunnel threshold (7 on the shipped cap), so nothing else in
+    /// this path would ever have asked for a second tunnel. The growth is
+    /// bounded by the group's own K and by `max_tunnels`, and a refusal (D14) or
+    /// a pool that cannot grow stops it; the placement below then shares what
+    /// there is.
+    pub(crate) async fn open_stream_on_distinct(
+        &self,
+        used: &[usize],
+        stripes: usize,
+    ) -> Result<StreamLease, OpenError> {
+        self.grow_for_stripes(stripes).await;
+        self.open_avoiding(used).await
+    }
+
+    /// The body of every open: `avoid` names tunnels this request must not
+    /// take while it can take another (only a stripe group passes a non-empty
+    /// list — see [`Self::open_stream_on_distinct`]).
+    async fn open_avoiding(&self, avoid: &[usize]) -> Result<StreamLease, OpenError> {
         if self.size() == 0 {
             self.grow(GrowReason::Cold).await;
             // The growth above is a no-op when another task already holds the
@@ -867,7 +899,7 @@ impl TunnelPool {
             // dialing the very tunnel it needs. Wait for that attempt instead;
             // the timeout is only a backstop for a dialer that never returns.
             let _ =
-                tokio::time::timeout(crate::transport::pool::COLD_GROW_WAIT, self.await_growth())
+                tokio::time::timeout(crate::transport::pool::COLD_GROW_WAIT, self.await_growth(1))
                     .await;
         }
         let ceiling = self.ceiling();
@@ -876,7 +908,8 @@ impl TunnelPool {
         // the tunnels it will use, not land all of it on one and queue its
         // interactive and control streams behind that bulk.
         self.grow_before_placing().await;
-        let Some(reservation) = self.reserve(&[], ceiling) else {
+        let avoid = self.indices_of(avoid);
+        let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
             // from a full one — the dialer could not bring a tunnel up — and
             // reporting it as `AtCapacity` would blame the load for the
@@ -895,15 +928,15 @@ impl TunnelPool {
             // Register before the second look, or a retirement landing in
             // between would be lost and this open would sleep out the budget.
             freed.as_mut().enable();
-            if self.reserve(&[], ceiling).is_none() {
+            if self.reserve(&[], &avoid, ceiling).is_none() {
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
             }
-            let Some(reservation) = self.reserve(&[], ceiling) else {
+            let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
                 return Err(OpenError::AtCapacity);
             };
-            return self.complete(reservation).await;
+            return self.complete(reservation, &avoid).await;
         };
-        self.complete(reservation).await
+        self.complete(reservation, &avoid).await
     }
 
     /// The concurrent streams one tunnel of this pool may carry.
@@ -951,13 +984,72 @@ impl TunnelPool {
         }
     }
 
-    /// Wait for the growth in flight to end, or for there to be none any more.
+    /// Grow until the pool can place `target` tunnels apart, one dial at a
+    /// time and never past `max_tunnels`.
+    ///
+    /// Every stripe group pays this once: K stripes need K tunnels to be spread
+    /// over, and the pool's other growth rules are load-based, so a group whose
+    /// K streams sit below the per-tunnel threshold would never trigger one
+    /// (that is exactly how a cold pool ended up carrying a whole group on one
+    /// tunnel). The one-at-a-time shape is the pool's own: `grow` is guarded by
+    /// a resize flag, so K concurrent stripe placements take turns dialing
+    /// instead of racing, and each turn is one dial rather than a storm.
+    ///
+    /// Terminating by construction: every iteration either returns or leaves
+    /// the pool bigger, and the target is capped by `max_tunnels`. A refused
+    /// growth holds the loop off for its cooldown (D14), and a pool whose dialer
+    /// cannot add a tunnel returns instead of spinning.
+    async fn grow_for_stripes(&self, target: usize) {
+        let target = target.max(1);
+        loop {
+            let (size, cap) = {
+                let state = self.inner.state.lock();
+                (state.entries.len(), state.max_tunnels)
+            };
+            let target = target.min(cap);
+            if size >= target || self.growth_held_off() {
+                return;
+            }
+            self.grow(GrowReason::Stripe).await;
+            // Wait for the growth in flight — someone else's as much as ours —
+            // before re-reading the size: placing against the still-small pool
+            // is the very thing this loop exists to avoid.
+            self.await_growth(target).await;
+            if self.size() <= size {
+                // No tunnel was added and none is being dialed any more: the
+                // pool cannot grow (no dialer, or a refusal that now holds it
+                // back). The placement that follows shares what there is.
+                return;
+            }
+        }
+    }
+
+    /// The pool indices of the tunnels named by `ids`, as of now.
+    ///
+    /// Ids are process-unique and survive a removal while indices shift with
+    /// one, so the mapping is taken fresh for every placement rather than
+    /// cached. An id whose tunnel is gone simply drops out.
+    fn indices_of(&self, ids: &[usize]) -> Vec<usize> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let state = self.inner.state.lock();
+        state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| ids.contains(&entry.tunnel.id()))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Wait for the growth in flight to end, or for the pool to reach `target`.
     ///
     /// Raced deliberately: the caller re-reads the size after every wake-up,
     /// and a growth that finished between the check and the registration is
     /// caught by the second check (`Notify::notify_waiters` does not remember
     /// a signal).
-    async fn await_growth(&self) {
+    async fn await_growth(&self, target: usize) {
         use std::sync::atomic::Ordering;
         let resizing = &self.inner.shared.resizing;
         // The budget is a backstop: a growth either finishes or fails, and a
@@ -965,7 +1057,7 @@ impl TunnelPool {
         // ever. On timeout the caller sees the pool's real state.
         let _ = tokio::time::timeout(crate::transport::pool::GROW_WAIT_BUDGET, async {
             loop {
-                if self.size() > 0 || !resizing.load(Ordering::Acquire) {
+                if self.size() >= target || !resizing.load(Ordering::Acquire) {
                     return;
                 }
                 let grown = self.inner.shared.grown.notified();
@@ -975,7 +1067,7 @@ impl TunnelPool {
                 // poll would otherwise be lost and the caller would sleep until
                 // some later resize happened to notify.
                 grown.as_mut().enable();
-                if self.size() > 0 || !resizing.load(Ordering::Acquire) {
+                if self.size() >= target || !resizing.load(Ordering::Acquire) {
                     return;
                 }
                 grown.await;
@@ -985,17 +1077,25 @@ impl TunnelPool {
     }
 
     /// Reserve the least-loaded tunnel for one open, skipping the tunnels this
-    /// request has already tried (the fall-through after a refusal).
+    /// request has already tried (the fall-through after a refusal) and — for a
+    /// stripe — the ones its group already occupies.
     ///
     /// Synchronous, and the only place placement reads the tunnel list: the
     /// reservation is charged before the first `await` of an open, which is
-    /// what makes back-to-back opens land on distinct tunnels.
-    fn reserve(&self, tried: &[usize], ceiling: usize) -> Option<Reservation> {
+    /// what makes back-to-back opens land on distinct tunnels — and what makes
+    /// a stripe group's concurrent placements spread even when a sibling has
+    /// not recorded its tunnel yet.
+    fn reserve(&self, tried: &[usize], avoid: &[usize], ceiling: usize) -> Option<Reservation> {
         let mut state = self.inner.state.lock();
         let loads = state.loads();
         let cursor = state.next_cursor;
         state.next_cursor = cursor.wrapping_add(1);
         let order = crate::transport::pool::order_candidates(&loads, cursor);
+        // The group's own tunnels first: a stripe takes one its siblings do not
+        // have yet, and only when every tunnel is already part of the group (a
+        // pool the group cannot spread over) does the exclusion give way — the
+        // group must still forward, exactly as it did before it had a name.
+        let candidates = crate::transport::pool::order_candidates_for(&order, tried, avoid);
         // The least-loaded untried tunnel with pending budget left; when every
         // candidate is at its budget, the least-loaded untried one still takes
         // the open — refusing a visitor outright is worse, and a full budget is
@@ -1010,7 +1110,7 @@ impl TunnelPool {
         // sweep.
         let mut over_budget = None;
         let mut chosen = None;
-        for index in order.iter().copied().filter(|i| !tried.contains(i)) {
+        for index in candidates.iter().copied() {
             let Some(load) = loads.get(index) else {
                 continue;
             };
@@ -1053,13 +1153,21 @@ impl TunnelPool {
     /// Complete one reserved open: the actual `open_stream` on the reserved
     /// tunnel, with the pool's fall-through when it refuses.
     ///
+    /// `avoid` is the caller's stripe exclusion, carried into the fall-through
+    /// so a refused stripe still prefers a tunnel its group does not have (see
+    /// [`Self::open_stream_on_distinct`]).
+    ///
     /// `TooManyStreams` means "the pool should grow", never "the tunnel is
     /// dead": it is counted as a refusal, the reservation is released, and the
     /// demand flag makes the next maintenance tick add a tunnel. The growth
     /// rule keeps every tunnel strictly below its cap precisely so this path
     /// stays rare — the vendored engine logs an unguarded `error!` on a cap
     /// hit, and `tests/log_budget_test.rs` fails a healthy run with one ERROR.
-    async fn complete(&self, reservation: Reservation) -> Result<StreamLease, OpenError> {
+    async fn complete(
+        &self,
+        reservation: Reservation,
+        avoid: &[usize],
+    ) -> Result<StreamLease, OpenError> {
         let started = std::time::Instant::now();
         let Reservation {
             index,
@@ -1118,7 +1226,7 @@ impl TunnelPool {
                 let mut last = e;
                 let mut tried = vec![index];
                 let ceiling = self.ceiling();
-                while let Some(mut next) = self.reserve(&tried, ceiling) {
+                while let Some(mut next) = self.reserve(&tried, avoid, ceiling) {
                     tried.push(next.index);
                     next.placement.fallback = true;
                     match next.tunnel.open_stream().await {
@@ -2378,6 +2486,157 @@ mod tests {
         (pool, rxs)
     }
 
+    /// One in-memory tunnel whose server side drains every stream it is sent:
+    /// the unit these pool fixtures are built from, and the unit a *growth*
+    /// dials.
+    fn duplex_tunnel() -> ClientTunnel {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel::<MuxStream>(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        std::mem::forget(tokio::spawn(run_server_tunnel(server_io, mux_config(), tx)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        std::mem::forget(shutdown_tx);
+        ClientTunnel::start(client_io, mux_config(), shutdown_rx)
+    }
+
+    /// A pool that starts with `n` in-memory tunnels and can grow up to
+    /// `max_tunnels`: every growth dials one more.
+    fn growable_pool(n: usize, max_tunnels: usize) -> TunnelPool {
+        let dial: Dialer = std::sync::Arc::new(|| {
+            Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
+        });
+        let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
+            .map(|_| (duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            .collect();
+        TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "stripes".to_owned(),
+            initial,
+            max_tunnels,
+            std::time::Duration::from_secs(60),
+            Some(dial),
+            std::sync::Arc::new(PinRegistry::new()),
+        )
+    }
+
+    /// The same, with the dialer counted: how many times the pool grew, as a
+    /// number a test can assert on.
+    fn counting_pool(
+        n: usize,
+        max_tunnels: usize,
+        dials: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> TunnelPool {
+        let dial: Dialer = std::sync::Arc::new(move || {
+            let dials = std::sync::Arc::clone(&dials);
+            Box::pin(async move {
+                dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            })
+        });
+        let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
+            .map(|_| (duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            .collect();
+        TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "stripes".to_owned(),
+            initial,
+            max_tunnels,
+            std::time::Duration::from_secs(60),
+            Some(dial),
+            std::sync::Arc::new(PinRegistry::new()),
+        )
+    }
+
+    /// Open one stripe group of `stripes` streams the way the client does —
+    /// each stripe avoiding the tunnels the group already holds — and return
+    /// the tunnel ids the group landed on.
+    async fn open_one_stripe_group(pool: &TunnelPool, stripes: usize) -> Vec<usize> {
+        let mut used = Vec::with_capacity(stripes);
+        let mut streams = Vec::with_capacity(stripes);
+        for _ in 0..stripes {
+            let stream = pool
+                .open_stream_on_distinct(&used, stripes)
+                .await
+                .expect("a stripe of the group must open");
+            used.push(stream.tunnel_id());
+            streams.push(stream);
+        }
+        // Hold the streams until the whole group is placed, so a lease cannot
+        // retire mid-group and change what the next stripe avoids.
+        drop(streams);
+        used
+    }
+
+    /// The eager stripe growth's price, which HANDOFF recorded as a cost with
+    /// no test behind it: the *first* group to meet a pool with fewer tunnels
+    /// than the group has stripes dials the difference, and it is `K-1` extra
+    /// dials on a pool that already has one — the cold dial a plain visitor
+    /// would have paid anyway is the K-th.
+    ///
+    /// Exact, because the dialer is this test's: between the opens below, only
+    /// the pool's own growth rules can call it, and the count is what they
+    /// cost. It would catch the guarantee being dropped (the group then places
+    /// on the tunnels that exist, and no dial happens) and the growth being
+    /// paid per *stripe request* instead of once per pool (K² dials).
+    #[tokio::test]
+    async fn a_stripe_group_dials_a_cold_pool_up_to_its_stripe_count_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        // A cold pool: no tunnels at all, the elastic pool's default state.
+        let cold_dials = Arc::new(AtomicUsize::new(0));
+        let pool = counting_pool(0, 4, Arc::clone(&cold_dials));
+        assert_eq!(pool.size(), 0, "the pool starts cold");
+
+        let used = open_one_stripe_group(&pool, 4).await;
+        assert_eq!(
+            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "a cold pool must dial once per stripe: K dials, of which K-1 are the group's own"
+        );
+        assert_eq!(
+            pool.snapshot().grows,
+            4,
+            "the same number through the counter the telemetry and the suite read"
+        );
+        assert_eq!(pool.size(), 4, "the group grew the pool to its own count");
+        assert_eq!(
+            used.iter().collect::<std::collections::HashSet<_>>().len(),
+            4,
+            "the four stripes must be on four distinct tunnels: {used:?}"
+        );
+
+        // A second group of the same pool: warm for `idle_timeout`, so the
+        // growth is once per pool, not once per group.
+        let used2 = open_one_stripe_group(&pool, 4).await;
+        assert_eq!(
+            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "a warm pool's second group must dial nothing"
+        );
+        assert_eq!(
+            used2.iter().collect::<std::collections::HashSet<_>>().len(),
+            4,
+            "the second group must also be spread over four tunnels: {used2:?}"
+        );
+
+        // The same growth on a pool that already has one tunnel: three dials,
+        // which is the K-1 every operator pays on the first striped visitor.
+        let warm_dials = Arc::new(AtomicUsize::new(0));
+        let warm = counting_pool(1, 4, Arc::clone(&warm_dials));
+        let used3 = open_one_stripe_group(&warm, 4).await;
+        assert_eq!(
+            warm_dials.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one existing tunnel plus a group of K costs K-1 dials"
+        );
+        assert_eq!(
+            used3.iter().collect::<std::collections::HashSet<_>>().len(),
+            4,
+            "K-1 dials must have left K tunnels to spread over: {used3:?}"
+        );
+    }
+
     /// D14's other half: a refused growth *stops* growth. The maintenance tick
     /// runs every 50 ms, so without the hold a client at the server's
     /// `max_tunnels_per_client` cap would dial-and-be-refused twenty times a
@@ -2454,6 +2713,90 @@ mod tests {
             .map(|(streams, _, _)| *streams)
             .collect();
         assert_eq!(used, vec![2, 2], "the pool reuses both tunnels: {used:?}");
+        drop(streams);
+    }
+
+    /// D24 structural, at the pool's own level: a stripe group's K opens land
+    /// on K *distinct* tunnels even from a pool that has fewer — one, here,
+    /// which is the state a cold pool reaches after its first visitor. The
+    /// group-aware open grows the pool to its K first and then avoids the
+    /// tunnels its earlier stripes took; the load rule alone could not have
+    /// done it, because K concurrent streams sit below the growth threshold.
+    #[tokio::test]
+    async fn a_stripe_group_grows_the_pool_and_spreads_over_distinct_tunnels() {
+        const STRIPES: usize = 3;
+        let pool = growable_pool(1, 4);
+        let mut used: Vec<usize> = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..STRIPES {
+            let lease = pool
+                .open_stream_on_distinct(&used, STRIPES)
+                .await
+                .expect("a stripe open");
+            used.push(lease.tunnel_id());
+            streams.push(lease);
+        }
+        assert_eq!(
+            pool.size(),
+            STRIPES,
+            "the group must have grown the pool to one tunnel per stripe"
+        );
+        let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            STRIPES,
+            "{STRIPES} stripes must occupy {STRIPES} distinct tunnels: {used:?}"
+        );
+        let per_tunnel: Vec<usize> = pool
+            .snapshot()
+            .tunnels
+            .iter()
+            .map(|(streams, _, _)| *streams)
+            .collect();
+        assert_eq!(
+            per_tunnel,
+            vec![1; STRIPES],
+            "one stripe per tunnel, none doubled up: {per_tunnel:?}"
+        );
+        drop(streams);
+    }
+
+    /// Correctness first: a group the pool cannot spread over still opens
+    /// every stripe. `max_tunnels` is the cap, so the third and fourth stripe
+    /// reuse the two tunnels — exactly the behaviour a striped visitor had
+    /// before the group had a name, and the reason the exclusion is a
+    /// preference rather than a constraint.
+    #[tokio::test]
+    async fn a_stripe_group_the_pool_cannot_spread_over_still_opens() {
+        let pool = growable_pool(2, 2);
+        let mut used: Vec<usize> = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..4 {
+            let lease = pool
+                .open_stream_on_distinct(&used, 4)
+                .await
+                .expect("every stripe must still open");
+            used.push(lease.tunnel_id());
+            streams.push(lease);
+        }
+        assert_eq!(pool.size(), 2, "the cap bounds the growth");
+        let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "the group can only spread as far as the cap allows: {used:?}"
+        );
+        let per_tunnel: Vec<usize> = pool
+            .snapshot()
+            .tunnels
+            .iter()
+            .map(|(streams, _, _)| *streams)
+            .collect();
+        assert_eq!(
+            per_tunnel,
+            vec![2, 2],
+            "both tunnels are reused, evenly: {per_tunnel:?}"
+        );
         drop(streams);
     }
 

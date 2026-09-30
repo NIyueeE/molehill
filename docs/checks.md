@@ -125,7 +125,7 @@ commit; nothing here is a heavy gate.
 |---|-------|---------|
 | 13 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
 | 14 | exactly one dated `## [x.y.z] - YYYY-MM-DD` section in `CHANGELOG.md`, with prose in it and an empty `## [Unreleased]` | release notes single source |
-| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed | benchmark ritual deliverables |
+| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
 | 16 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
 | 17 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 

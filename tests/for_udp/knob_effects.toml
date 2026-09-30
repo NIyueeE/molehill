@@ -1,0 +1,40 @@
+# The two UDP knobs whose documented effect needs real traffic to observe:
+# `udp_buffer_size` (the datagram limit) and `udp_idle_timeout` (the peer
+# mapping's lifetime, and with it the local source port the backend sees).
+#
+# Both are deliberately small so one scenario can reach them: a datagram of a
+# few KiB exercises the 1 KiB limit, and a mapping expires inside a test's
+# patience instead of after the 60 s default. Ports are this fixture's own
+# (the suite's neighbours own 2333-2351, 2360-2366 and 2370-2396; the backends
+# live on 8102/8103 beside the other suites' 8080-8101).
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+
+[client.control]
+default_remote_addr = "127.0.0.1:2352"
+
+[client.transport]
+type = "plain"
+
+[client.services.small]
+protocol = "udp"
+local_addr = "127.0.0.1:8102"
+remote_bind_addr = "127.0.0.1:2353"
+# A datagram larger than this does not arrive intact (see the test for what
+# the shipped code actually does with it).
+udp_buffer_size = 1024
+
+[client.services.idle]
+protocol = "udp"
+local_addr = "127.0.0.1:8103"
+remote_bind_addr = "127.0.0.1:2354"
+# Seconds without traffic before the peer's local socket is recycled.
+udp_idle_timeout = 2
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
+allow_ports = ["2353-2354"]
+
+[server.control]
+bind_addr = "127.0.0.1:2352"

@@ -28,6 +28,18 @@ const PROTO_V4: u8 = 4u8;
 /// service id; the server declares its heartbeat cadence in the session ack.
 /// A v4 registration drops `pool_size` — the tunnel pool is a client-side,
 /// per-carrier concern by then.
+///
+/// v4 also **names a stripe group on the control channel**: the server asks for
+/// each of a striped visitor connection's channels with
+/// [`ControlChannelCmd::CreateDataChannelForStripe`], carrying the group's
+/// fixed 4-byte id and the stripe's index and count, so the client knows which
+/// opens belong together and reserves one tunnel per stripe. Before this the K
+/// requests were indistinguishable from K separate visitors, and a cold pool —
+/// the elastic pool's default state is *zero* tunnels — placed the whole group
+/// on one tunnel: the group still worked, but the spread D24 asks for was gone.
+/// The data plane (hellos, prologue, the striping frames) is unchanged.
+///
+/// Which dialect a release speaks, and when the number moves: AGENTS.md §5.
 pub const PROTO_V4_VERSION: ProtocolVersion = PROTO_V4;
 
 /// The dialect this build *speaks*: the version it puts in the hellos it
@@ -164,7 +176,7 @@ pub const MAX_SESSION_CMD_LEN: usize = MAX_REGISTRATION_LEN + 64;
 /// A v4 session carries acks and commands on one stream, and the client tells
 /// them apart from the first byte: a framed ack starts with its length's *high*
 /// byte, which is `0` while the frame stays under 256 bytes, whereas every
-/// command tag a session can receive is `1..=3` (the v3-only tag `0` is never
+/// command tag a session can receive is `1..=4` (the v3-only tag `0` is never
 /// sent in a session). A longer reason would move that high byte into the
 /// command-tag range and make the two frames indistinguishable, so the writer
 /// shortens the reason instead: the ack frame is `2 + 1 (tag) + varint(len) +
@@ -266,7 +278,7 @@ pub enum ControlChannelCmd {
     /// order, and the session reader tells an ack frame from a command by the
     /// first byte — an ack's is its length's high byte, which is `0` as long
     /// as the frame stays under 256 bytes. Keeping a variant at tag 0 is what
-    /// makes every command this build does speak sit at 1..=3, where that
+    /// makes every command this build does speak sit at 1..=4, where that
     /// disambiguation holds.
     CreateDataChannel,
     HeartBeat,
@@ -279,6 +291,22 @@ pub enum ControlChannelCmd {
     /// port was taken over). The client is told so it can re-register, instead
     /// of believing a service is still exposed.
     ServiceDropped(ServiceId),
+    /// One stripe of a striped visitor connection needs a data channel.
+    /// The service the channel is for, the group's id (the same fixed 4-byte
+    /// form [`DataChannelCmd::StartForwardStripedTcp`] carries, big-endian
+    /// `u32`), the stripe's index and the group's stripe count.
+    ///
+    /// The point of the command is that the client learns *which opens belong
+    /// together* before it places them, so it can reserve one tunnel per stripe
+    /// instead of letting a cold pool put the whole group on one tunnel (D24).
+    /// A plain visitor's request keeps the 4-byte form: only a stripe group
+    /// carries the group and its index.
+    ///
+    /// Fixed width on purpose, like every other session command: the group id
+    /// is raw bytes rather than a `u32` (postcard varints integers) and the
+    /// index and count are `u8`s, so the tag alone still decides that exactly
+    /// 10 bytes follow.
+    CreateDataChannelForStripe(ServiceId, [u8; 4], u8, u8),
 }
 
 /// Variant names mirror the wire contract and stay stable across versions.
@@ -531,10 +559,10 @@ static PACKET_LEN: LazyLock<PacketLength> = LazyLock::new(PacketLength::new);
 ///
 /// The version is *returned* rather than only checked because a server has to
 /// serve more than one dialect: it branches on what it read, while the client
-/// checks that the answer came back in the dialect it asked for. The accepted
+/// checks that the answer came back in a dialect it accepts. The accepted
 /// set is [`SUPPORTED_PROTO_VERSIONS`]; a peer outside it is refused loudly, and
-/// — this is what an old server does to a v4 client — by closing without a
-/// reply, which the v4 client turns into a typed "server is too old" error
+/// — this is what an old server does to a newer client — by closing without a
+/// reply, which that client turns into a typed "server is too old" error
 /// instead of a retry loop.
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
@@ -669,12 +697,13 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
 /// Read one control-channel command.
 ///
 /// Tag-dispatched: the tag alone decides how many bytes follow, which is what
-/// keeps every v4 command value-independent in length. Read-only for the same
-/// reason as [`read_register_result`].
+/// keeps every session command value-independent in length. Read-only for the
+/// same reason as [`read_register_result`].
 #[cfg(feature = "client")]
 pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
-    // 1 tag byte + the largest suffix below (a 4-byte service id).
-    let mut buf = [0u8; 5];
+    // 1 tag byte + the largest suffix below (a service id, a group id, an
+    // index and a count: the stripe request's 10 bytes).
+    let mut buf = [0u8; 11];
     conn.read_exact(&mut buf[..1])
         .await
         .with_context(|| "Failed to read cmd")?;
@@ -682,17 +711,33 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
         0 => return Ok(ControlChannelCmd::CreateDataChannel),
         1 => return Ok(ControlChannelCmd::HeartBeat),
         2 | 3 => 4,
+        4 => 10,
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
         .await
         .with_context(|| "Failed to read cmd")?;
-    let service_id: ServiceId =
-        postcard::from_bytes(&buf[1..=suffix]).with_context(|| "Failed to deserialize cmd")?;
-    Ok(if buf[0] == 2 {
-        ControlChannelCmd::CreateDataChannelFor(service_id)
-    } else {
-        ControlChannelCmd::ServiceDropped(service_id)
+    Ok(match buf[0] {
+        2 | 3 => {
+            let service_id: ServiceId = postcard::from_bytes(&buf[1..=suffix])
+                .with_context(|| "Failed to deserialize cmd")?;
+            if buf[0] == 2 {
+                ControlChannelCmd::CreateDataChannelFor(service_id)
+            } else {
+                ControlChannelCmd::ServiceDropped(service_id)
+            }
+        }
+        // The only tag left is 4, the stripe request: the dispatch above
+        // returned on 0 and 1 and bailed on everything but 2, 3 and 4. Parsed
+        // with postcard as one tuple rather than field by field, so the reader
+        // and the writer agree on the layout by construction: a reordered or
+        // resized field fails here instead of silently reading the next
+        // frame's bytes as an index.
+        _ => {
+            let (service_id, group, index, count): (ServiceId, [u8; 4], u8, u8) =
+                postcard::from_bytes(&buf[1..11]).with_context(|| "Failed to deserialize cmd")?;
+            ControlChannelCmd::CreateDataChannelForStripe(service_id, group, index, count)
+        }
     })
 }
 
@@ -1046,6 +1091,23 @@ mod tests {
                 "control command changed on the wire"
             );
         }
+
+        // The stripe request: the group id is raw bytes, the index and the
+        // count are single bytes, and the round trip has to preserve all of
+        // them in place — the client's placement keys on exactly these.
+        let cmd = ControlChannelCmd::CreateDataChannelForStripe(
+            ServiceId::new(0xdead_beef),
+            0x0102_0304u32.to_be_bytes(),
+            2,
+            4,
+        );
+        let bytes = postcard::to_stdvec(&cmd).unwrap();
+        let back: ControlChannelCmd = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            format!("{back:?}"),
+            format!("{cmd:?}"),
+            "the stripe request changed on the wire"
+        );
     }
 
     /// Every command's length is value-independent, and the two that carry a
@@ -1072,6 +1134,30 @@ mod tests {
             assert_ne!(for_service[0], reserved[0]);
             assert_ne!(for_service[0], beat[0]);
             assert_ne!(for_service[0], dropped[0]);
+        }
+
+        // The stripe request is the widest session command, and it stays at
+        // tag + 4 + 4 + 1 + 1 bytes whatever the group, index and count are:
+        // that is what lets `read_control_cmd` consume exactly its suffix.
+        for raw in [0u32, 0x80, u32::MAX] {
+            for index in [0u8, 1, 0xff] {
+                for count in [1u8, 0x80, 0xff] {
+                    let bytes =
+                        postcard::to_stdvec(&ControlChannelCmd::CreateDataChannelForStripe(
+                            ServiceId::new(raw),
+                            raw.to_be_bytes(),
+                            index,
+                            count,
+                        ))
+                        .unwrap();
+                    assert_eq!(
+                        bytes.len(),
+                        11,
+                        "stripe request {raw:#x}/{index}/{count} changed the length"
+                    );
+                    assert_eq!(bytes[0], 4, "the stripe request's tag moved");
+                }
+            }
         }
     }
 
@@ -1136,6 +1222,17 @@ mod tests {
             tag(&ControlChannelCmd::ServiceDropped(ServiceId::new(0))),
             3
         );
+        assert_eq!(
+            tag(&ControlChannelCmd::CreateDataChannelForStripe(
+                ServiceId::new(0),
+                [0; 4],
+                0,
+                1
+            )),
+            4,
+            "the stripe request must keep tag 4: a new variant inserted before \
+             it would move every later command's tag"
+        );
     }
 
     #[cfg(feature = "client")]
@@ -1148,6 +1245,12 @@ mod tests {
             ControlChannelCmd::HeartBeat,
             ControlChannelCmd::CreateDataChannelFor(ServiceId::new(0xdead_beef)),
             ControlChannelCmd::ServiceDropped(ServiceId::new(0)),
+            ControlChannelCmd::CreateDataChannelForStripe(
+                ServiceId::new(0xdead_beef),
+                [0xde, 0xad, 0xbe, 0xef],
+                3,
+                4,
+            ),
         ] {
             let (mut tx, mut rx) = duplex(64);
             tx.write_all(&postcard::to_stdvec(&cmd).unwrap())
@@ -1195,7 +1298,7 @@ mod tests {
     async fn read_hello_rejects_an_unsupported_version() {
         use tokio::io::duplex;
 
-        for version in [0u8, 2, 5, 99] {
+        for version in [0u8, 2, 6, 99] {
             let (mut tx, mut rx) = duplex(64);
             let hello = Hello::ControlChannelHello(version, sample_digest(1));
             tx.write_all(&postcard::to_stdvec(&hello).unwrap())

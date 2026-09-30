@@ -28,7 +28,18 @@ A session uses two credentials, which is what lets one connection carry services
 
 **Service credential.** Every `Register` carries `sha256(service_token || nonce)`, where `service_token` is the service's own `token` when it declares one, else the client's `default_token`. The server owns no per-service token table — it compares the digest against the session key it derived above — so a service whose token differs from the server's default is refused **on its own**: one denied service costs that service, not the session, and the reason names the credential.
 
-The protocol version rides in every hello, and this build speaks and serves one dialect: **v4**. A server that does not support the client's version closes the connection instead of answering, and the client turns that into a terminal error naming the likely cause (a server older than the client) rather than a retry loop. A *client* older than the server is refused the same way — v0.10.0 removed the v3 server path, because both ends of a molehill deployment are the same binary and a wire break is announced on the connection it happens on — so upgrading means upgrading both ends, in either order, with one refused connection telling you which side is behind.
+### Protocol versions
+
+The protocol version rides in every hello, and this build speaks and serves one
+dialect: **v4** (0.8–0.9 spoke v3, which v0.10 removed outright). The rule — a
+dialect is defined by a release, its number moves with the tag that introduces
+it, and no two tags are compatible — lives in AGENTS.md §5; what it means on the
+wire is here: a server that does not serve the client's version closes the
+connection instead of answering, and the client turns that into a terminal error
+naming the likely cause (a server older than the client) rather than a retry
+loop. A *client* older than the server is refused the same way, so upgrading
+means upgrading both ends, in either order, with one refused connection telling
+you which side is behind.
 
 ## Forwarding
 
@@ -36,7 +47,7 @@ When a visitor connects to a registered service's endpoint, the server asks the 
 
 **The service prologue.** A v4 channel opens with the service's four-byte id before anything else: the session nonce identifies the *session*, not a service, so a channel has to say which one it is for. A direct channel writes it right after its hello; a stream of a multiplexed tunnel writes it right after the stream is opened, because a tunnel belongs to the session. Routing is per **stream**: one tunnel may carry streams of several services (which is what a shared pool produces), and each stream's prologue is what decides the queue it lands in. The server reads the prologue before routing, so a stream naming a service that is not registered on that session is dropped on its own, without touching the tunnel or the session.
 
-A v4 registration carries no channel count, so the client owns its channels: a UDP service opens its configured `udp_workers` (default 2) as soon as the registration is accepted, a TCP service opens none, and either opens one more for every `CreateDataChannelFor`. New channels are also requested on demand: per visitor for TCP, and whenever a UDP channel dies so the worker set keeps its size (a replacement never grows the set past the configured count; see "The tunnel pool").
+A v4 registration carries no channel count, so the client owns its channels: a UDP service opens its configured `udp_workers` (default 2) as soon as the registration is accepted, a TCP service opens none, and either opens one more for every `CreateDataChannelFor` — or, for a striped visitor, for every `CreateDataChannelForStripe`, which names the stripe group and the stripe's place in it. New channels are also requested on demand: per visitor for TCP, and whenever a UDP channel dies so the worker set keeps its size (a replacement never grows the set past the configured count; see "The tunnel pool").
 
 **Pairing is per visitor, never serial.** The server's accept loop hands every visitor to its own pairing task: one visitor's wait for a data channel therefore costs that visitor and nothing else, and the accept loop keeps accepting. The pairing wait is a budget that re-requests rather than giving up, and a visitor the client refuses for the whole budget is shed — its socket closed, one failed request — while the service and its other visitors keep going. The number of pairings in flight at once is bounded (`MAX_CONCURRENT_VISITORS`, 128), which is what keeps a wedged service from growing unbounded tasks: each in-flight pairing owns one visitor socket and one data channel, and the listeners' backlog keeps the rest. A visitor whose channel request the client cannot answer — the pool at its placement ceiling — used to hold the accept loop for the whole 25-second budget, so every visitor behind it queued unanswered and the k-th one was shed a full budget after the first; measured, that is a service parked behind one visitor (`tests/pool_test.rs`, `one_unanswerable_visitor_does_not_park_the_service`). A stripe group's gather is the one pairing that stays atomic: its K channels are consumed all-or-none under a lock, so concurrent visitors cannot interleave two gathers' channels.
 
@@ -52,7 +63,21 @@ With `[server.data]stripe_count = K` (default `1`), the server pairs every visit
 - The receiving side reassembles by sequence number: out-of-order chunks wait in a bounded reorder map, contiguous ones are written to the destination. A frame always travels whole on one channel (a half-written frame cannot move — it would corrupt that channel's framing); a channel that refuses a frame *before* any byte of it is committed is skipped for that frame, so one backpressured channel does not stall the group.
 - A channel that ends mid-frame (not at a frame boundary) breaks the group instead of leaving the reassembler waiting for a sequence number that will never arrive.
 
-The gather asks for its channels the way the unstriped pairing asks for its one — a `CreateDataChannelFor` per stripe, before the first wait — because a v4 registration opens none itself: the tunnel pool starts cold, so a gather that waited for channels nobody was told to open would simply time out. The wait is a budget that re-requests only the stripes still missing, and a gather the client refuses for the whole budget is shed like any other visitor, which is the one pairing that stays atomic: its K channels are consumed all-or-none under a lock, so concurrent visitors cannot interleave two gathers' channels.
+The gather asks for its channels *before* its first wait, because a
+registration opens none itself: the tunnel pool starts cold, so a gather that
+waited for channels nobody was told to open would simply time out. What it asks *with* is the
+whole of the stripe-group change: instead of K plain `CreateDataChannelFor`
+requests (which the client cannot tell from K unrelated visitors, so their
+placement is whatever the pool happens to have) it sends one
+`CreateDataChannelForStripe(service, group, index, count)` per stripe, so the
+client knows which opens belong together and reserves one tunnel per stripe —
+growing the pool to the group's own count first, bounded by `max_tunnels`, and
+falling back to sharing when it cannot reach that many. That is what makes D24
+structural rather than a property of arrival timing. The wait is a budget that
+re-requests only the stripes still missing, and a gather the client refuses for
+the whole budget is shed like any other visitor, which is the one pairing that
+stays atomic: its K channels are consumed all-or-none under a lock, so
+concurrent visitors cannot interleave two gathers' channels.
 
 Three things follow from the arithmetic: the visitor's throughput ceiling is the sum of its channels' ceilings (a single stream is no longer capped by one tunnel), its in-flight window is the sum of the channels' windows, and each channel's framing work is driven by its own task. The cost is the reorder buffering (bounded by the engine's per-stream window plus one reorder queue per direction) and one data-channel wire addition — the striped command rides *after* the unchanged `StartForward*` commands, and channels that do not carry it keep the unstriped path's bytes, so the yamux wire format is untouched. Striping applies to TCP services; UDP keeps its one-channel-per-peer shape, where session affinity is the stronger constraint.
 
@@ -67,7 +92,7 @@ A pool is the client's unit of connection management. Its **ownership** is one s
 
 Both are the same code path; only the key differs, and the session owns the pools (a shared pool must outlive any single service). A service joins the pool its key names, creating it if this is the first service of that key to become active, and dropping a service never tears the pool down. The carrier and the data endpoint are part of the key because two carriers cannot share a physical connection and two endpoints cannot share a tunnel.
 
-**Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests, and a placement reserves its tunnel *before* the open's first `await`, so a group of K lands on K distinct tunnels whenever the pool has K; when the pool has fewer, the group reuses tunnels — it still works, it just loses the spread, and the demand that leaves behind is what the growth rule reads. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
+**Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests that *name the group*: the client grows the pool to the group's count first (bounded by `max_tunnels`) and then reserves, for each stripe, a tunnel the group does not already hold — a preference with a floor, so a pool that cannot spread still forwards. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
 
 **Growth and shrink** are the client's own decisions; the server is not consulted. The pool grows by one tunnel when
 

@@ -119,6 +119,30 @@ elif [ "$passed_commit" -eq 1 ]; then
 else
   fail "assets/soak-v${version}.png missing — run 'just soak-plot' and commit the chart"
 fi
+# The numbers must describe *this* state (AGENTS.md §10, "prove provenance").
+# The results file records the revision it was measured at, and the ritual
+# commits it after the run, so that revision is an ancestor. What must not have
+# happened is a *code* change in between: the artifact would then describe code
+# that is no longer here, which no reader of the chart can see. Doc and asset
+# commits after the sweep are fine — that is how the ritual lands it.
+if exists_at "benches/scripts/soak/results-soak-v${version}.json"; then
+  measured="$(at "benches/scripts/soak/results-soak-v${version}.json" \
+    | python3 -c 'import json,sys; print((json.load(sys.stdin).get("meta") or {}).get("revision") or "")' \
+    2>/dev/null || true)"
+  if [ -z "$measured" ]; then
+    echo "  note  the results file records no revision to check"
+  elif ! git rev-parse --verify --quiet "${measured}^{commit}" >/dev/null; then
+    echo "  note  the results file was measured at '${measured}', not a commit here"
+  else
+    drift="$(git diff --name-only "${measured}..${commit}" -- src tests build.rs \
+      Cargo.toml Cargo.lock 'benches/scripts/soak/*.py' 2>/dev/null || true)"
+    if [ -n "$drift" ]; then
+      fail "the results file was measured at ${measured}, but code changed since — re-run the sweep on the release commit (docs/release.md, step 3): $(printf '%s ' $drift)"
+    else
+      echo "  ok    results measured at ${measured}; no code changed since"
+    fi
+  fi
+fi
 
 # --- container image build review (mechanical part) -------------------------
 echo "[container image]"

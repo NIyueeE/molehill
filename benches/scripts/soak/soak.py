@@ -1257,6 +1257,10 @@ class RunContext:
         return max(1, round(self.ceiling * fraction))
 
 
+#: The shape of an `iperf3 -w` value: a byte count or a K/M/G suffix. Checked
+#: so a typo is refused at startup rather than aborting every rate stage.
+_SOCKET_WINDOW_RE = re.compile(r"^\d+[KMG]?$")
+
 #: The shortest bulk dial worth starting: below this a stage cannot carry the
 #: floor the completeness gate asks for (`min_bulk_intervals`), so a retry
 #: that could not leave this much of the stage is not attempted at all.
@@ -1344,12 +1348,14 @@ def stage_spine(tool: Tool, ctx: RunContext, entry: dict, stage: Stage) -> dict:
             time.sleep(t_start + gap - time.time())
         attempts += 1
         remaining = max(MIN_SPINE_SECS, int(t_end - time.time()))
-        cmd = [
-            "iperf3",
-            "-c",
-            "127.0.0.1",
-            "-p",
-            str(target.exposed),
+        cmd = ["iperf3", "-c", "127.0.0.1", "-p", str(target.exposed)]
+        # A rate class is the one place the sender cannot account for what the
+        # path carried, so it is the one place the instrument bounds the
+        # sender's buffer (`rate_socket_window`); every other class is measured
+        # with the client's own window, as it always was.
+        if ctx.knobs.rate_socket_window and stage_is_rate_limited(stage.path):
+            cmd += ["-w", ctx.knobs.rate_socket_window]
+        cmd += [
             "-t",
             str(remaining),
             "-O",
@@ -1672,20 +1678,19 @@ def bulk_reading(st: dict) -> tuple:
     if not st.get("bulk_intervals"):
         return None, "no bulk intervals"
     zero_share = st.get("bulk_zero_share") or 0.0
-    # Which side measures this cell is decided by the *class* first: a rate
-    # shaper defeats the sender's accounting by construction, and letting a run
-    # pick the sender's window when its zero-share happened to land just under a
-    # threshold (measured: 46 % in one run, 65 % in the next, on one cell) would
-    # make one cell two instruments reading a few percent apart. The `end`
-    # event's own degeneracy flag is the second detector, because it is evidence
-    # rather than a rule; the zero-share is the third, and it only ever
-    # *withholds* a reading — a cell whose sender wrote nothing it could account
-    # for (`jitter` reads 86-100 % zero-byte intervals on every arm) has no
-    # sender-side number to publish, whether or not a rate shaper put it there.
-    degenerate = (
-        stage_is_rate_limited(st.get("stage") or "")
-        or bool(st.get("sender_accounting_degenerate"))
-        or zero_share >= BULK_ZERO_SHARE_DEGENERATE
+    # The *measurement* decides which side speaks, never the class: the sender's
+    # accounting is defeated when its writes did not track the path, and that is
+    # what the zero-byte share reads (with the `end` event's own flag as
+    # corroboration). A rate class used to be treated as defeated by
+    # construction — true for a client whose socket buffer absorbs the whole
+    # stage, which is what a rate shaper does to an unbounded sender — but the
+    # rate classes now bound the client's window (`rate_socket_window`), and
+    # with it their zero-share reads 0-14 % instead of 72-100 %. A class rule
+    # would then withhold a reading the instrument can now take; the threshold
+    # stays as the rule that *withholds* one (at or over it, the sender wrote
+    # nothing it could account for, and the cell says so).
+    degenerate = bool(st.get("sender_accounting_degenerate")) or (
+        zero_share >= BULK_ZERO_SHARE_DEGENERATE
     )
     if degenerate:
         recv = st.get("receiver_gbps")
@@ -2529,6 +2534,11 @@ def build_meta(
         # stage's number means, so both are method (§10).
         "spine_summary_grace_s": knobs.spine_summary_grace_s,
         "shape_legs": knobs.shape_legs,
+        # The rate classes' bulk-client socket window: empty means the
+        # client's own default, which is what every sweep before this key
+        # measured. Part of the method — it decides whether those cells have a
+        # readable window at all.
+        "rate_socket_window": knobs.rate_socket_window,
         "interactive_ping_interval_ms": knobs.ping_interval_ms,
         "udp_ping_interval_ms": knobs.udp_interval_ms,
         "churn_connects_s": knobs.churn_connects_s,
@@ -2653,6 +2663,16 @@ def refuse_inapplicable_knobs(args: argparse.Namespace, knobs: lib.Knobs) -> Non
     restart cadence. A knob that is accepted but not applied is a method
     claim the run cannot back (`lib.Knobs`).
     """
+    if knobs.rate_socket_window and not _SOCKET_WINDOW_RE.match(
+        knobs.rate_socket_window
+    ):
+        # Refused, not ignored: a malformed window would either abort every
+        # rate stage (an iperf3 usage error) or silently measure the default,
+        # and both would be recorded as the window the run asked for.
+        sys.exit(
+            f"SOAK_RATE_SOCKET_WINDOW={knobs.rate_socket_window!r} is not a "
+            "size iperf3 accepts: write bytes or a K/M/G suffix, e.g. 256K"
+        )
     if knobs.slow_visitor_bps and "reconnect" in args.tests:
         sys.exit(
             f"SOAK_SLOW_VISITOR_BPS={knobs.slow_visitor_bps} is not applied to "

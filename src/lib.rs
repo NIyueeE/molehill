@@ -75,7 +75,17 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
         )
         .parse()?,
     );
-    let keypair = builder.generate_keypair()?;
+    // snow's own message for a curve its resolver cannot do is
+    // "initialization error: GetDhImpl", which names neither the curve nor the
+    // reason, while the CLI offers the value (--help lists it). Say what is
+    // wrong: this build resolves Diffie-Hellman through ring, which provides
+    // x25519 alone.
+    let keypair = builder.generate_keypair().map_err(|e| {
+        anyhow!(
+            "cannot generate a {curve:?} keypair: {e}. This build's Noise resolver (ring) \
+             provides x25519 only — use `--genkey x25519`."
+        )
+    })?;
 
     println!(
         "Private Key:\n{}\n",

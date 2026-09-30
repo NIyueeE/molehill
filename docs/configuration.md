@@ -72,8 +72,9 @@ A typical setup:
 > is a hard error.
 >
 > **Upgrading to 0.10 (protocol v4)**: the client speaks v4 — one control
-> session per endpoint, carrying every service that dials it — and 0.10.0 is
-> the first release that serves **v4 only**: a v3 client's connection is
+> session per endpoint, carrying every service that dials it, with the server
+> naming a stripe group before its channels are opened — and 0.10.0 is the
+> first release that serves **v4 only**: a v3 client's connection is
 > refused on the connection it happens on, with nothing sent back. Upgrade
 > both ends together, then; either order works, because each side refuses the
 > other's dialect instead of continuing, and the refused connection names the
@@ -973,7 +974,7 @@ WantedBy=multi-user.target
 
 ### UDP services
 
-- The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535); larger datagrams are dropped while the channel stays usable. Configure it identically on the service and remember that the server enforces its own copy received at registration time.
+- The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535): a datagram larger than it is **truncated to that size** on the way in (the receiving socket's buffer is exactly this many bytes, so the kernel keeps the first `udp_buffer_size` bytes and discards the rest) and the truncated datagram is delivered — the channel stays usable, but the payload is short. Measured on a `udp_buffer_size = 1024` service: a 2000-byte datagram arrives at the backend as 1024 bytes and its reply reaches the visitor as 1024 bytes. Size it for the largest datagram the service sends, configure it identically on both ends, and remember that the server enforces its own copy received at registration time.
 - **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact. `udp_workers` shards *distinct visitors* across channels for parallelism; it never splits one visitor across channels, and the pool keeps at least the tunnels those channels need.
 - A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
 
@@ -1012,6 +1013,6 @@ above and follow that guide.
 | Repeated `Heartbeat timed out` | The network path drops the connection, or the server stalls. A configured timeout *below* the derived floor does not appear here — it is refused at startup. |
 | Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
 | `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |
-| UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are dropped; idle mappings time out after `udp_idle_timeout` seconds. |
+| UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; idle mappings time out after `udp_idle_timeout` seconds. |
 | Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |

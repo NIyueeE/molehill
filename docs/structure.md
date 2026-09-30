@@ -50,7 +50,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `src/main.rs` | binary entry point: CLI parsing, signals, logging setup |
 | `src/lib.rs` | library root: run-mode detection, main event loop, config-watcher lifecycle |
 | `src/cli.rs` | clap-derive CLI definitions |
-| `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands, the v4 session commands and per-service prologue), postcard serialization, protocol version |
+| `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands, the session commands and per-service prologue), postcard serialization, protocol version |
 | `src/common.rs` + `src/common/` | constants, DNS/keepalive/retry helpers, `MultiMap`, the `AsyncWriteOwned` owned-write capability boundary (`owned_write.rs`), the idle-reaping forward wrapper (`forward.rs`) |
 | `src/config.rs` + `src/config/` | TOML parsing/validation (`Config`, `ClientConfig`, …, `MaskedString`), hot-reload watcher |
 | `src/core/client.rs` | client mode: one control session per endpoint (auth, per-service registration, per-service state), data-channel requests, the UDP hub |

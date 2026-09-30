@@ -122,8 +122,10 @@ impl NoiseKeys {
             builder = builder.remote_public_key(x)?;
         }
         if let Some((loc, key)) = &self.psk {
-            // snow 0.10 takes a fixed-size PSK slice and validates the
-            // length; the config parser already enforced 32 bytes.
+            // snow 0.10 takes a fixed-size PSK slice; a key of another length
+            // fails here, which is where the length is really checked. The
+            // parser only stores the decoded string, so this is the first
+            // place that can refuse it (docs/configuration.md says the same).
             builder = builder.psk(*loc, key.as_slice().try_into()?)?;
         }
         Ok(builder)

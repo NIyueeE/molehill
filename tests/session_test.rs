@@ -56,6 +56,18 @@ const EXPOSED_PROBE: u16 = 2363;
 /// Deliberately *outside* the fixture's `allow_ports` whitelist.
 const DISALLOWED_PORT: u16 = 2364;
 
+/// The fixture the other scenarios start (`session_v4.toml`).
+const SESSION_CONFIG: &str = "tests/for_tcp/session_v4.toml";
+
+/// The striped v4 fixture (`session_v4_striped.toml`): the same server as
+/// [`SESSION_CONFIG`] with `[server.data] stripe_count = 2`, on ports of its own
+/// — 2364 and below belong to the scenarios above, 2365 onwards is free.
+const STRIPED_CONFIG: &str = "tests/for_tcp/session_v4_striped.toml";
+const STRIPED_CONTROL: &str = "127.0.0.1:2365";
+const STRIPED_EXPOSED: u16 = 2366;
+/// The service id the striped scenario registers.
+const STRIPE_SERVICE: u32 = 1;
+
 const DEFAULT_TOKEN: &str = "session_test_default_token";
 const WRONG_TOKEN: &str = "not_the_server_token";
 
@@ -134,6 +146,8 @@ enum ControlCmd {
     HeartBeat,
     CreateDataChannelFor(u32),
     ServiceDropped(u32),
+    /// The group request: service id, group id, stripe index, stripe count.
+    CreateDataChannelForStripe(u32, [u8; 4], u8, u8),
 }
 
 // --- fixtures --------------------------------------------------------------
@@ -165,17 +179,25 @@ fn spawn_backends() {
 /// failed hello read — cheaper than racing every scenario against a fixed
 /// startup sleep.
 async fn start_server() -> Result<broadcast::Sender<bool>> {
+    start_server_at(SESSION_CONFIG, CONTROL_ADDR).await
+}
+
+/// The same for a fixture with its own control port: the striped v4 scenario
+/// runs its own server so that `stripe_count` cannot change what every other
+/// scenario in this file exercises.
+async fn start_server_at(config: &str, control_addr: &str) -> Result<broadcast::Sender<bool>> {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let config = config.to_owned();
     tokio::spawn(async move {
-        if let Err(e) = run_molehill_server("tests/for_tcp/session_v4.toml", shutdown_rx).await {
+        if let Err(e) = run_molehill_server(&config, shutdown_rx).await {
             panic!("the session fixture server failed: {e:#}");
         }
     });
 
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    while TcpStream::connect(CONTROL_ADDR).await.is_err() {
+    while TcpStream::connect(control_addr).await.is_err() {
         if Instant::now() > deadline {
-            bail!("the control listener at {CONTROL_ADDR} never came up");
+            bail!("the control listener at {control_addr} never came up");
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -220,6 +242,16 @@ async fn read_control_cmd(conn: &mut TcpStream) -> Result<ControlCmd> {
             } else {
                 ControlCmd::ServiceDropped(id)
             })
+        }
+        4 => {
+            let mut raw = [0u8; 10];
+            conn.read_exact(&mut raw).await?;
+            Ok(ControlCmd::CreateDataChannelForStripe(
+                u32::from_be_bytes(raw[0..4].try_into()?),
+                raw[4..8].try_into()?,
+                raw[8],
+                raw[9],
+            ))
         }
         other => bail!("unknown control channel command tag {other:#x}"),
     }
@@ -590,6 +622,89 @@ async fn deregister_releases_the_port() -> Result<()> {
 
     // The session itself never noticed.
     session.assert_alive(2, EXPOSED_B).await?;
+    Ok(())
+}
+
+/// A striped visitor's channels are asked for **by group**: a hand-written peer
+/// sees one `CreateDataChannelForStripe` per stripe, all naming the same group,
+/// with the stripe's own index and the group's count.
+///
+/// The client is covered by `integration_test.rs::striped_data_channels`; this
+/// is the request vocabulary on its own, against a real server, so a change to
+/// what the server asks for cannot hide behind the client that reads it. The
+/// channels are never opened: this file's peer is a wire mirror, not a data
+/// plane.
+#[tokio::test]
+async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
+    init();
+    let _server = start_server_at(STRIPED_CONFIG, STRIPED_CONTROL).await?;
+
+    // The hello exchange, by hand, on the striped fixture's port.
+    let mut conn = TcpStream::connect(STRIPED_CONTROL).await?;
+    conn.write_u8(PLAIN_SELECTOR).await?;
+    let hello = Hello::ControlChannelHello(PROTO_V4, [0x42; 32]);
+    conn.write_all(&postcard::to_stdvec(&hello)?).await?;
+    conn.flush().await?;
+    let mut buf = [0u8; 34];
+    timeout(HANDSHAKE_TIMEOUT, conn.read_exact(&mut buf)).await??;
+    let Hello::ControlChannelHello(version, nonce) =
+        postcard::from_bytes::<Hello>(&buf).context("failed to parse the server hello")?
+    else {
+        bail!("the server answered a control hello with another hello variant");
+    };
+    assert_eq!(version, PROTO_V4, "the server speaks protocol v4");
+
+    // Authenticate, then register one service — the same frames `Session`
+    // writes, and the same session key for a default-token service.
+    let key = key_for(DEFAULT_TOKEN, &nonce);
+    conn.write_all(&postcard::to_stdvec(&Auth(key))?).await?;
+    conn.flush().await?;
+    let ack: Ack = postcard::from_bytes(&read_frame(&mut conn).await?)?;
+    assert!(matches!(ack, Ack::SessionOk { .. }), "got {ack:?}");
+    let cmd = SessionCmd::Register(SessionRegistration {
+        service_id: STRIPE_SERVICE.to_be_bytes(),
+        auth: key,
+        reg: ServiceRegistrationV4 {
+            name: "striped".to_owned(),
+            service_type: ServiceType::Tcp,
+            bind_addr: format!("0.0.0.0:{STRIPED_EXPOSED}").parse()?,
+            carrier: Carrier::Tcp,
+            udp_buffer_size: 2048,
+        },
+    });
+    write_frame(&mut conn, &postcard::to_stdvec(&cmd)?).await?;
+    let ack: Ack = postcard::from_bytes(&read_frame(&mut conn).await?)?;
+    assert!(matches!(ack, Ack::Ok), "registration refused: {ack:?}");
+
+    // One visitor makes the server gather the fixture's 2-stripe group, and the
+    // gather asks for every stripe before its first wait.
+    let visitor = TcpStream::connect(("127.0.0.1", STRIPED_EXPOSED)).await?;
+    let mut requests = Vec::new();
+    while requests.len() < 2 {
+        match timeout(PROBE_TIMEOUT, read_control_cmd(&mut conn)).await?? {
+            ControlCmd::CreateDataChannelForStripe(id, group, index, count) => {
+                requests.push((id, group, index, count));
+            }
+            // The session's declared cadence is not this test's business.
+            ControlCmd::HeartBeat => {}
+            other => bail!("a stripe was asked for with {other:?}, which names no group"),
+        }
+    }
+    let (id0, group0, index0, count0) = requests[0];
+    let (id1, group1, index1, count1) = requests[1];
+    assert_eq!(
+        (id0, id1),
+        (STRIPE_SERVICE, STRIPE_SERVICE),
+        "each request names the service the group serves"
+    );
+    assert_eq!(group0, group1, "one gather is one group");
+    assert_eq!(
+        (index0, index1),
+        (0, 1),
+        "the stripes are asked for in index order"
+    );
+    assert_eq!((count0, count1), (2, 2), "the count is the fixture's own");
+    drop(visitor);
     Ok(())
 }
 

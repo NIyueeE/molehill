@@ -11,16 +11,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Data-channel striping works on a v4 session.** `[server.data]`
-  `stripe_count > 1` spreads every visitor connection over that many data
-  channels (a stripe group) on the elastic tunnel pool: the gather asks the
-  client for one channel per stripe — a v4 registration opens none itself, so
-  a gather that merely waited for channels nobody was told to open timed out —
-  and re-requests only the stripes still missing when a budget expires. A
-  group's channels land on distinct tunnels whenever the pool has that many,
-  and share them when it does not, so a group assembled from a cold pool loses
-  the spread but works. `tests/integration_test.rs::striped_data_channels`
-  runs in the suite again.
+- **Data-channel striping works, and a group's channels land on distinct
+  tunnels by construction.** `[server.data]` `stripe_count > 1` spreads every
+  visitor connection over that many data channels (a stripe group) on the
+  elastic tunnel pool: the gather asks the client for one channel per stripe —
+  a registration opens none itself, so a gather that merely waited for channels
+  nobody was told to open timed out — and re-requests only the stripes still
+  missing when a budget expires. The gather now **names the group** before its
+  channels are opened (`CreateDataChannelForStripe`: service, group, stripe
+  index and count), so the
+  client knows which opens belong together: it grows the pool to the group's
+  own count first (bounded by `max_tunnels`) and reserves one tunnel per stripe,
+  falling back to sharing when the pool cannot grow that far — a group that
+  cannot spread still works, exactly as before. Until this the K requests were
+  indistinguishable from K unrelated visitors, and a cold pool — the elastic
+  pool's default state is *zero* tunnels — put the whole group on one tunnel.
+  `tests/integration_test.rs::striped_data_channels` now also asserts the
+  client's pool reached its four stripes, and
+  `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
+  pins the request vocabulary against a hand-written peer.
 
 - **The tunnel pool can be shared and is elastic.** Three new client settings
   decide what a pool is, how large it may get and how long it lives; the
@@ -200,6 +209,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1-2 % repeatable), and the gate refuses to compare two runs whose calibrations
   differ by more than 25 % — closing the hole that on a host without
   `/etc/machine-id` the identity key is only `cpu_model | nproc`.
+
+- **The rate-shaped cells are measured with a bounded sender.** A rate shaper
+  made the bulk client's socket buffer absorb the whole stage: its measured
+  intervals then read zero bytes while the path kept carrying them, `rate20`
+  never produced a summary at all, and the number it left was not merely
+  unreadable but wrong — 0.0334 Gbit/s on a 20 Mbit path, 70 % above nominal,
+  because the transfer outlived the stage it was measured in. The client's
+  window on a **rate** class is now bounded (`SOAK_RATE_SOCKET_WINDOW`, default
+  `256K`; `off` reproduces a run measured before it): the zero-byte share falls
+  from 72-79 % to 13-14 %, `rate20` reads 0.0196 (98 % of nominal) and
+  `rate100` 0.1000 against 0.0935-0.1081. The reading rule follows the
+  measurement rather than the class, so a cell whose sender can speak is read
+  from the sender again, and the receiver's window is left for the cells that
+  still need it. `just soak-check --screen` also reports one verdict per metric
+  now (throughput *and* interactive p99) instead of choosing one for the run —
+  which is how the two A/Bs below were read.
+
+- **The pool-size and shared-pool questions are answered.** Measured
+  interleaved, one binary, matched load: raising `max_tunnels` from 4 to 8 does
+  not help a mixed workload (at 15 or more streams the shipped cap wins all six
+  steps on interactive p99, by 42-61 %), and a **shared** pool
+  (`[client.data].shared_pool = true`) costs interactive latency against the
+  shipped per-service default at nineteen of twenty steps (median p99 8.15 ms
+  against 5.00) while the two are indistinguishable on throughput. The defaults
+  do not change; the numbers behind them are in HANDOFF.md.
 
 - **The release sweep publishes the load axis too.** `--test` takes a comma
   list and the ritual runs `--test=rrul,capacity`, so

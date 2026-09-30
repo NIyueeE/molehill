@@ -47,6 +47,12 @@
 //! running mixed versions sees *why* the connection died rather than a retry
 //! loop.
 //!
+//! The matrix's peer is the previous *release*, and that binary speaks the v3
+//! dialect this server no longer serves, so there is no binary here that speaks
+//! v4 minus the stripe-group request: what a v4 peer receives is pinned by
+//! `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
+//! instead.
+//!
 //! The configs below deliberately use only keys that exist in both versions —
 //! a key this cycle renames would make the old binary fail to start, and the
 //! test would report a config error as an interop failure.
@@ -357,9 +363,10 @@ fn wait_for_forwarding(case: &mut Case) -> std::io::Result<()> {
 /// Wait until the process at `case.procs[index]` has written `needle`.
 ///
 /// A log line is the observable when the thing being asserted *is* a message:
-/// case 1 exists because a v4 client meeting a v3 server must say what happened
-/// ("this server is older than me") rather than retry into the void, and the
-/// client's own output is the only place that statement exists.
+/// case 1 exists because a client meeting a server that cannot serve its
+/// dialect must say what happened ("this server is older than me") rather than
+/// retry into the void, and the client's own output is the only place that
+/// statement exists.
 fn wait_for_log(case: &mut Case, index: usize, needle: &str) -> Result<(), String> {
     let deadline = Instant::now() + STARTUP;
     while Instant::now() < deadline {
@@ -447,8 +454,9 @@ fn old_server_refuses_new_client_and_says_so() {
 /// a v3 serving path alive only for an old peer is exactly the kind of
 /// compatibility that has to be *announced* rather than assumed, so the case
 /// now pins the refusal and the listener's survival. What is asserted is the
-/// refusal's shape — no answer, and a v4 client still served by the same
-/// process — which is what a reader of this matrix needs to know.
+/// refusal's shape — no answer to the dialect it does not serve, and a client of
+/// its own version still served by the same process — which is what a reader of
+/// this matrix needs to know.
 #[test]
 #[ignore = "interop: needs MOLEHILL_OLD_BIN (run: just interop)"]
 fn new_server_refuses_old_client_and_keeps_serving() {

@@ -163,6 +163,13 @@ pub(crate) enum GrowReason {
     /// tunnel. A stream-cap hit arrives here too — it is a growth signal, never
     /// a tunnel's death.
     Demand,
+    /// A stripe group asked for one more tunnel so its stripes can land apart
+    /// (D24). The only growth a *request* triggers by itself rather than
+    /// through load or demand: a group of K needs K tunnels to be spread over,
+    /// and its K streams sit below the load threshold, so no other rule would
+    /// ever have added the second tunnel. Bounded by the group's own K and by
+    /// `max_tunnels`.
+    Stripe,
 }
 
 impl GrowReason {
@@ -173,6 +180,7 @@ impl GrowReason {
             Self::Wait => "wait",
             Self::UdpFloor => "udp_floor",
             Self::Demand => "demand",
+            Self::Stripe => "stripe",
         }
     }
 }
@@ -255,6 +263,40 @@ pub(crate) fn order_candidates(loads: &[TunnelLoad], start: usize) -> Vec<usize>
         (loads[*i].total(), offset)
     });
     order
+}
+
+/// The candidate order for one placement, given what it must skip.
+///
+/// Two kinds of skip, deliberately different:
+///
+/// - `tried` — tunnels this open already tried and that refused the stream.
+///   They are never revisited, or the fall-through loop would retry a tunnel it
+///   knows is dead or full;
+/// - `avoid` — the tunnels a stripe group already occupies. That one is a
+///   *preference*, not a constraint: when every candidate is in it (a pool
+///   smaller than the group's stripe count, or one whose growth was refused),
+///   the unfiltered order answers instead. A group that cannot spread must
+///   still forward — correctness first, exactly as before the group had a name
+///   (D24).
+///
+/// Pure on purpose: the exclusion rule is the part of stripe placement that can
+/// be checked without a socket, and the pool's own state lock is the only other
+/// input the caller has to supply.
+pub(crate) fn order_candidates_for(
+    order: &[usize],
+    tried: &[usize],
+    avoid: &[usize],
+) -> Vec<usize> {
+    let eligible = |i: &usize| !tried.contains(i) && !avoid.contains(i);
+    let candidates: Vec<usize> = order.iter().copied().filter(eligible).collect();
+    if candidates.is_empty() && !avoid.is_empty() {
+        return order
+            .iter()
+            .copied()
+            .filter(|i| !tried.contains(i))
+            .collect();
+    }
+    candidates
 }
 
 /// The stream-cap headroom the grow rule uses: `size * cap * fraction`.
@@ -475,5 +517,38 @@ mod tests {
         assert_eq!(grow_threshold(1, 64), 7);
         assert_eq!(grow_threshold(4, 64), 30);
         assert_eq!(grow_threshold(0, 64), 0);
+    }
+
+    /// The stripe exclusion is a preference with a floor: a group's next stripe
+    /// skips the tunnels its siblings took, and when there is nothing left to
+    /// skip to, the ordinary least-loaded order comes back rather than a
+    /// refusal.
+    #[test]
+    fn stripe_candidates_avoid_the_groups_tunnels_until_none_are_left() {
+        let order = vec![2, 0, 1];
+
+        // Nothing excluded: the ordinary order, unchanged.
+        assert_eq!(order_candidates_for(&order, &[], &[]), order);
+        // The group's own tunnels are skipped, in the best-first order.
+        assert_eq!(order_candidates_for(&order, &[], &[2]), vec![0, 1]);
+        assert_eq!(order_candidates_for(&order, &[], &[2, 0]), vec![1]);
+        // Every tunnel is the group's: the exclusion gives way, so the group
+        // still forwards (the fallback the brief calls correctness first).
+        assert_eq!(order_candidates_for(&order, &[], &[0, 1, 2]), order);
+        // A tried tunnel stays excluded even when the exclusion is dropped:
+        // that one is a refusal, not a preference.
+        assert_eq!(order_candidates_for(&order, &[1], &[0, 1, 2]), vec![2, 0]);
+        // Tried and avoided together leave the third candidate.
+        assert_eq!(order_candidates_for(&order, &[2], &[0]), vec![1]);
+        // Nothing eligible at all (everything tried): empty, so the caller
+        // reports the refusal it has rather than reserving a dead tunnel.
+        assert_eq!(
+            order_candidates_for(&order, &[0, 1, 2], &[]),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            order_candidates_for(&order, &[0, 1, 2], &[0]),
+            Vec::<usize>::new()
+        );
     }
 }

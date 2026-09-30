@@ -290,6 +290,19 @@ class Knobs:
     #: table in docs/benchmarks.md has always said the classes do.
     SHAPE_LEGS: ClassVar[tuple] = ("visitor", "both")
     shape_legs: str = "visitor"
+    #: Socket window (`iperf3 -w`) for the bulk client on a **rate** class,
+    #: empty for none. The rate classes are where the sender's interval
+    #: accounting is defeated: the client's writes complete into a socket
+    #: buffer far larger than the shaped path can drain, every measured
+    #: interval then reads zero bytes while the path keeps carrying them, and
+    #: at `rate20` the client is still blocked 30 s past the stage boundary, so
+    #: its own summary never arrives and the cell has no reading at all. A
+    #: bounded window keeps the writes tracking the path; it is an instrument
+    #: parameter, so the value travels in the results meta and in
+    #: `soak_check.METHOD_KEYS`, and it is applied to rate classes only —
+    #: nothing else has the problem, and a window on a clean stage would cap
+    #: its bandwidth-delay product.
+    rate_socket_window: str = "256K"
     ping_interval_ms: int = 50
     # the operating point for `cost`: fraction of the configured max load
     cost_operating_point: float = 0.8
@@ -330,6 +343,7 @@ class Knobs:
             spine_retry_s=_env_seconds("SOAK_SPINE_RETRY_S", (0, 25, 50, 80)),
             spine_summary_grace_s=_env_float("SOAK_SPINE_SUMMARY_GRACE_S", 5.0),
             shape_legs=_env_choice("SOAK_SHAPE_LEGS", "visitor", cls.SHAPE_LEGS),
+            rate_socket_window=_env_window("SOAK_RATE_SOCKET_WINDOW", "256K"),
             ping_interval_ms=_env_int("SOAK_PING_INTERVAL_MS", 50),
             cost_operating_point=_env_float("SOAK_COST_OPERATING_POINT", 0.8),
             rrul_stream_factor=_env_int("SOAK_RRUL_STREAM_FACTOR", 1),
@@ -355,6 +369,25 @@ def _env_float(name: str, default: float) -> float:
         return float(v) if v else default
     except ValueError:
         return default
+
+
+#: Values that switch the rate-class socket window off, for reproducing a run
+#: measured before it existed.
+WINDOW_OFF = ("", "off", "none", "0")
+
+
+def _env_window(name: str, default: str) -> str:
+    """The rate-class socket window: a size, or one of [`WINDOW_OFF`].
+
+    Unset keeps the measured default; an explicit off value is how a stored run
+    measured without a window is reproduced, and it is recorded as empty in the
+    results meta, which is what tells the two apart.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return "" if value.lower() in WINDOW_OFF else value
 
 
 def _env_choice(name: str, default: str, allowed: tuple) -> str:
@@ -1186,7 +1219,8 @@ MOLEHILL_VARIANTS = (
     "mux-off",  # the historical name for that same configuration
     "noise",  # transport axis
     "noise-direct",  # transport x mode grid
-    "mux1",  # tunnel-count axis
+    "mux1",  # tunnel-count axis (cap 1)
+    "mux8",  # tunnel-count axis (cap 8), the pool-size question
     "kcp4",  # data-plane carrier axis
 )
 
@@ -1230,6 +1264,9 @@ def molehill_config(
     elif variant == "mux1":  # cap axis: plain, one tunnel
         transport = "plain"
         caps = "[client.data.tcp]\nmax_tunnels = 1\n"
+    elif variant == "mux8":  # cap axis: plain, eight tunnels
+        transport = "plain"
+        caps = "[client.data.tcp]\nmax_tunnels = 8\n"
     elif variant == "kcp4":  # carrier axis: noise + KCP-over-UDP
         transport = "noise"
         data_c = (

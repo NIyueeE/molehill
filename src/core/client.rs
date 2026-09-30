@@ -14,7 +14,7 @@ use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
-    MAX_UDP_HEADER_LEN, PROTO_V4_VERSION, ServiceId, ServiceRegistration, SessionCmd,
+    MAX_UDP_HEADER_LEN, SUPPORTED_PROTO_VERSIONS, ServiceId, ServiceRegistration, SessionCmd,
     SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
     read_register_result, write_session_cmd, write_stream_prologue,
 };
@@ -656,6 +656,162 @@ struct RunDataChannelArgs {
     /// here until the group is complete (see [`crate::stripe`]).
     #[cfg(feature = "multiplex")]
     stripes: Arc<crate::stripe::StripeGroups<ClientDataChannel>>,
+    /// Placement state of this service's stripe groups, by group id (D24).
+    #[cfg(feature = "multiplex")]
+    stripe_placements: StripePlacements,
+}
+
+/// What the server's `CreateDataChannelForStripe` said about one data channel:
+/// which group it belongs to and how many stripes the group has.
+///
+/// The stripe *index* is deliberately not kept. The gather labels a channel
+/// when it arrives (`StartForwardStripedTcp`), so the index a request carries
+/// is the slot the sender expects, not a fact about this channel — and the
+/// client's placement needs only the group and its K.
+#[cfg(feature = "multiplex")]
+#[derive(Clone, Copy)]
+struct StripeOpen {
+    /// The wire's four big-endian group bytes, read back as the `u32` the
+    /// server's own group counter and the stripe commands use.
+    group: u32,
+    /// The group's stripe count, from the request.
+    count: u8,
+}
+
+/// Placeholder so the open path keeps one shape without the `multiplex`
+/// feature: there is no pool for a group's identity to steer, and the request
+/// simply opens the channel it asks for.
+#[cfg(not(feature = "multiplex"))]
+type StripeOpen = ();
+
+/// The client-side bound on tracked stripe groups per service.
+///
+/// A group's entry lives only while its stripes are being placed (it is dropped
+/// as soon as the last one is), so the ordinary case is one entry per *live*
+/// gather. The bound is a leak guard for the abnormal one: a gather that dies
+/// server-side never places its last stripe, and a service may serve striped
+/// visitors for the whole session.
+#[cfg(feature = "multiplex")]
+const MAX_TRACKED_STRIPE_GROUPS: usize = 64;
+
+/// The placement state of one service's stripe groups (D24 structural).
+///
+/// The server names the group in every `CreateDataChannelForStripe`, so the
+/// client knows what the placement rule alone never could: which of its opens
+/// belong together. It remembers the tunnels a group's stripes already took and
+/// hands the list to the pool, which grows to the group's K and avoids them —
+/// so the group's K data channels land on K distinct tunnels, a cold pool
+/// included. Without it, K requests were K indistinguishable opens and a cold
+/// pool (whose default state is *zero* tunnels) put the whole group on one.
+///
+/// The map is per service (`RunDataChannelArgs` is one service's), so the group
+/// id alone is the key: a group belongs to one service of one session.
+#[cfg(feature = "multiplex")]
+#[derive(Default)]
+struct StripePlacements {
+    groups: std::sync::Mutex<HashMap<u32, Arc<StripePlacement>>>,
+}
+
+#[cfg(feature = "multiplex")]
+impl StripePlacements {
+    /// The state of one group, created on its first stripe request.
+    fn entry(&self, group: u32, count: u8) -> Arc<StripePlacement> {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(known) = groups.get(&group) {
+            return Arc::clone(known);
+        }
+        // Bounded: the oldest entry is the one least likely to still be placing
+        // stripes, and evicting it only narrows a later stripe's choice (it
+        // falls back to the ordinary least-loaded rule) — never correctness.
+        if groups.len() >= MAX_TRACKED_STRIPE_GROUPS
+            && let Some(oldest) = groups
+                .iter()
+                .min_by_key(|(_, place)| place.started)
+                .map(|(id, _)| *id)
+        {
+            groups.remove(&oldest);
+        }
+        let place = Arc::new(StripePlacement::new(count));
+        groups.insert(group, Arc::clone(&place));
+        place
+    }
+
+    /// Forget one group whose stripes are all placed, so the map tracks only
+    /// live gathers.
+    ///
+    /// Only the entry this placement came from is removed: a request that
+    /// arrived after an eviction created a fresh one, and dropping *that* would
+    /// throw away the tunnels its stripes already took.
+    fn finish(&self, group: u32, placed: &Arc<StripePlacement>) {
+        let mut groups = self
+            .groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if groups
+            .get(&group)
+            .is_some_and(|known| Arc::ptr_eq(known, placed))
+        {
+            groups.remove(&group);
+        }
+    }
+}
+
+/// One group's placement state: the tunnels its stripes took, and how many
+/// stripes are placed.
+#[cfg(feature = "multiplex")]
+struct StripePlacement {
+    /// The group's stripe count, from the server's request.
+    count: u8,
+    /// The tunnels this group's stripes were placed on, in placement order.
+    used: std::sync::Mutex<Vec<usize>>,
+    /// Stripes placed so far.
+    placed: std::sync::atomic::AtomicU8,
+    /// When the entry was created: the eviction order of the bounded map.
+    started: Instant,
+}
+
+#[cfg(feature = "multiplex")]
+impl StripePlacement {
+    fn new(count: u8) -> Self {
+        Self {
+            count,
+            used: std::sync::Mutex::new(Vec::new()),
+            placed: std::sync::atomic::AtomicU8::new(0),
+            started: Instant::now(),
+        }
+    }
+
+    /// The tunnels the group already occupies.
+    fn used(&self) -> Vec<usize> {
+        self.used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record one placed stripe and report whether the group is now complete.
+    ///
+    /// The read above and this append are not one atomic step, and they do not
+    /// have to be: the group's stripes are placed concurrently, and the pool's
+    /// reservation is charged before its first `await`, so a stripe that missed
+    /// a sibling's tunnel here is still steered onto a free one by the
+    /// placement rule. This list is what makes the exclusion explicit and
+    /// carries it to the stripes that arrive later.
+    fn record(&self, tunnel: usize) -> bool {
+        {
+            let mut used = self
+                .used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !used.contains(&tunnel) {
+                used.push(tunnel);
+            }
+        }
+        self.placed.fetch_add(1, Ordering::Relaxed) + 1 >= self.count
+    }
 }
 
 /// The service session's stripe-group registry type (a no-op stand-in
@@ -755,23 +911,40 @@ impl Tunnels {
                 .open_stream()
                 .await
                 .map(TunnelStream::Yamux)
-                .map_err(|e| {
-                    // The visitor whose open this was fails either way — and a
-                    // failed request is DEBUG the way any per-connection
-                    // failure is. The *condition* behind it is what an operator
-                    // must be able to see, though: a pool at its ceiling, or a
-                    // growth the server's valve refuses, is a state of the
-                    // deployment and not a property of one visitor. So it is
-                    // reported once per process and then demoted to the
-                    // per-connection DEBUG (AGENTS.md §9's log contract, and
-                    // the same shape the pool's own refused-growth line uses).
-                    OPEN_REFUSED.report(
-                        || info!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
-                        || debug!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
-                    );
-                    anyhow!("Failed to open a multiplexed data channel: {e}")
-                }),
+                .map_err(|e| self.refused(&e)),
         }
+    }
+
+    /// Open one stripe's data channel: a stream on a tunnel the group does not
+    /// already occupy, growing the pool to the group's K first when it has
+    /// fewer (see [`TunnelPool::open_stream_on_distinct`]).
+    async fn open_stream_on_distinct(
+        &self,
+        used: &[usize],
+        stripes: usize,
+    ) -> Result<TunnelStream> {
+        match self {
+            Tunnels::Yamux(pool) => pool
+                .open_stream_on_distinct(used, stripes)
+                .await
+                .map(TunnelStream::Yamux)
+                .map_err(|e| self.refused(&e)),
+        }
+    }
+
+    /// The visitor whose open this was fails either way — and a failed request
+    /// is DEBUG the way any per-connection failure is. The *condition* behind
+    /// it is what an operator must be able to see, though: a pool at its
+    /// ceiling, or a growth the server's valve refuses, is a state of the
+    /// deployment and not a property of one visitor. So it is reported once per
+    /// process and then demoted to the per-connection DEBUG (AGENTS.md §9's log
+    /// contract, and the same shape the pool's own refused-growth line uses).
+    fn refused(&self, e: &crate::transport::multiplex::OpenError) -> anyhow::Error {
+        OPEN_REFUSED.report(
+            || info!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
+            || debug!(pool = %self.pool().key(), "the pool refused a data channel: {e}"),
+        );
+        anyhow!("Failed to open a multiplexed data channel: {e}")
     }
 
     /// The pool itself, for the session that owns it: sharing it with another
@@ -849,8 +1022,15 @@ impl tokio::io::AsyncWrite for TunnelStream {
 
 /// Run a data channel as one stream of the multiplexed tunnels.
 #[cfg(feature = "multiplex")]
-async fn run_mux_data_channel(args: &Arc<RunDataChannelArgs>, tunnel: &Tunnels) -> Result<()> {
-    let mut stream = tunnel.open_stream().await?;
+async fn run_mux_data_channel(
+    args: &Arc<RunDataChannelArgs>,
+    tunnel: &Tunnels,
+    stripe: Option<StripeOpen>,
+) -> Result<()> {
+    let mut stream = match stripe {
+        Some(request) => open_stripe_stream(args, tunnel, request).await?,
+        None => tunnel.open_stream().await?,
+    };
     trace!("Multiplexed data channel opened");
     // A v4 tunnel belongs to the session, so each of its streams names the
     // service it carries: the server reads these four bytes before its
@@ -876,6 +1056,31 @@ async fn run_mux_data_channel(args: &Arc<RunDataChannelArgs>, tunnel: &Tunnels) 
         udp.unbind_channel(channel);
     }
     result
+}
+
+/// Open one stripe's stream, on a tunnel the group does not already occupy
+/// (D24 structural).
+///
+/// The group's placement state is taken from this service's map, its tunnel
+/// list handed to the pool, and the tunnel the pool chose recorded back — so
+/// the group's next stripe (which the server has usually already requested)
+/// avoids it. The record's return value is what lets an abandoned entry be
+/// dropped instead of tracked for the session's life.
+#[cfg(feature = "multiplex")]
+async fn open_stripe_stream(
+    args: &Arc<RunDataChannelArgs>,
+    tunnel: &Tunnels,
+    stripe: StripeOpen,
+) -> Result<TunnelStream> {
+    let placement = args.stripe_placements.entry(stripe.group, stripe.count);
+    let used = placement.used();
+    let stream = tunnel
+        .open_stream_on_distinct(&used, usize::from(stripe.count))
+        .await?;
+    if placement.record(stream.tunnel_id()) {
+        args.stripe_placements.finish(stripe.group, &placement);
+    }
+    Ok(stream)
 }
 
 /// One opened data channel, as one concrete type so a stripe group's
@@ -1699,8 +1904,10 @@ fn build_udp_hub(
 
 /// Spawn one requested data channel: a stream off the tunnel pool when the
 /// service multiplexes its data plane, a fresh transport connection
-/// otherwise. Each one joins its stripe group if the server labels it as a
-/// stripe (see [`crate::stripe`]).
+/// otherwise. `stripe` is `Some` only for a channel the server asked for as one
+/// stripe of a named group (`CreateDataChannelForStripe`); each channel
+/// then joins its stripe group when the server labels it with
+/// `StartForwardStripedTcp` (see [`crate::stripe`]).
 fn spawn_data_channel(
     args: Arc<RunDataChannelArgs>,
     #[cfg_attr(
@@ -1711,6 +1918,14 @@ fn spawn_data_channel(
         )
     )]
     tunnel: Option<&Tunnels>,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without the multiplex feature no pool exists to place a stripe on"
+        )
+    )]
+    stripe: Option<StripeOpen>,
 ) {
     #[cfg(feature = "multiplex")]
     let tunnel = tunnel.cloned();
@@ -1719,7 +1934,7 @@ fn spawn_data_channel(
             let res = {
                 #[cfg(feature = "multiplex")]
                 match tunnel {
-                    Some(t) => run_mux_data_channel(&args, &t).await,
+                    Some(t) => run_mux_data_channel(&args, &t, stripe).await,
                     None => run_data_channel(args).await,
                 }
                 #[cfg(not(feature = "multiplex"))]
@@ -1828,12 +2043,12 @@ fn resolve_heartbeat_timeout(interval: u64, default: Option<u64>) -> Result<Opti
 /// byte, fails its own check and closes without a reply. Naming the dialect
 /// and the likely cause is the whole point — the alternative is a client that
 /// looks healthy while none of its services are reachable. The interop matrix
-/// greps the client's log for exactly this "protocol v4" statement.
+/// greps the client's log for exactly this statement.
 fn unanswered_hello_error(remote_addr: &str, cause: &anyhow::Error) -> anyhow::Error {
     SessionFatal(format!(
         "{cause:#}. The server at {remote_addr} closed the connection before answering the hello: \
-         this client speaks protocol v{PROTO_V4_VERSION}, so the server is likely older than this \
-         client. Upgrade the server first, or run a client of the server's version."
+         this client speaks protocol v{CURRENT_PROTO_VERSION}, so the server is likely older than \
+         this client. Upgrade the server first, or run a client of the server's version."
     ))
     .into()
 }
@@ -1893,17 +2108,23 @@ struct ActiveService {
 fn open_channels(active: &ActiveService, count: usize) {
     // One request per channel; each takes the least-loaded tunnel, and the
     // reservation is charged before the first await, so back-to-back requests
-    // land on distinct tunnels while the pool has them (D24). The server asks
-    // for a stripe group exactly this way — one `CreateDataChannelFor` at a
-    // time — which is why there is no whole-group entry point: the guarantee
-    // lives in the placement rule, not in a batched call.
+    // land on distinct tunnels while the pool has them. A *stripe group* is
+    // asked for one `CreateDataChannelForStripe` per stripe instead, which is
+    // what makes that spread structural rather than a property of the pool's
+    // current size (D24).
     for _ in 0..count {
-        #[cfg(feature = "multiplex")]
-        let tunnel = active.tunnel.as_ref();
-        #[cfg(not(feature = "multiplex"))]
-        let tunnel = None;
-        spawn_data_channel(active.args.clone(), tunnel);
+        open_data_channel(active, None);
     }
+}
+
+/// Open one data channel for a service, as a stripe of a named group when the
+/// server asked for one.
+fn open_data_channel(active: &ActiveService, stripe: Option<StripeOpen>) {
+    #[cfg(feature = "multiplex")]
+    let tunnel = active.tunnel.as_ref();
+    #[cfg(not(feature = "multiplex"))]
+    let tunnel = None;
+    spawn_data_channel(active.args.clone(), tunnel, stripe);
 }
 
 /// One endpoint's control session: the connection, its command loop, and every
@@ -2090,6 +2311,11 @@ impl ClientSession {
                 cmd = read_control_cmd(&mut rd) => match cmd? {
                     // A visitor needs a channel for that service.
                     ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
+                    // A visitor's stripe group: the group is known, so the
+                    // channel can be placed on a tunnel of its own (D24).
+                    ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
+                        self.open_stripe_channel(id, group, index, count);
+                    }
                     ControlChannelCmd::HeartBeat => (),
                     // The server lost that service's listener; re-register it.
                     ControlChannelCmd::ServiceDropped(id) => {
@@ -2145,24 +2371,25 @@ impl ClientSession {
         let mut tag = [0u8; HASH_WIDTH_IN_BYTES];
         rand::rngs::SysRng.try_fill_bytes(&mut tag)?;
         debug!("Sending hello");
-        let hello_send = ControlChannelHello(PROTO_V4_VERSION, tag);
+        let hello_send = ControlChannelHello(CURRENT_PROTO_VERSION, tag);
         conn.write_all(&postcard::to_stdvec(&hello_send)?).await?;
         conn.flush().await?;
 
         // Read hello. A server older than this client fails its version check
         // and closes without a reply, which surfaces here as a read error; the
-        // version is checked as well, because a peer that answers in *another*
-        // supported dialect would otherwise be discovered halfway through the
-        // session, or not at all.
+        // version is checked as well, because a peer that answers in another
+        // dialect would otherwise be discovered halfway through the session, or
+        // not at all.
         debug!("Reading hello");
         let (version, hello) = read_hello(conn)
             .await
             .map_err(|e| unanswered_hello_error(&self.remote_addr, &e))?;
-        if version != PROTO_V4_VERSION {
+        if !SUPPORTED_PROTO_VERSIONS.contains(&version) {
             return Err(SessionFatal(format!(
-                "The server answered in protocol v{version}, but this client speaks protocol \
-                 v{PROTO_V4_VERSION}: the two ends speak different dialects. Upgrade the server \
-                 to this version, or run a client that matches it."
+                "The server answered in protocol v{version}, which this client does not accept: \
+                 this build speaks protocol v{CURRENT_PROTO_VERSION} and accepts \
+                 {SUPPORTED_PROTO_VERSIONS:?}. Upgrade the server to this version, or run a client \
+                 that matches it."
             ))
             .into());
         }
@@ -2339,6 +2566,9 @@ impl ClientSession {
             }
             match read_control_cmd(rd).await? {
                 ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
+                ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
+                    self.open_stripe_channel(id, group, index, count);
+                }
                 ControlChannelCmd::HeartBeat => (),
                 ControlChannelCmd::ServiceDropped(id) => self.pending_drops.push(id),
                 ControlChannelCmd::CreateDataChannel => bail!(
@@ -2458,6 +2688,8 @@ impl ClientSession {
                 channels: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "multiplex")]
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
+                #[cfg(feature = "multiplex")]
+                stripe_placements: StripePlacements::default(),
             }),
             #[cfg(feature = "multiplex")]
             tunnel,
@@ -2516,12 +2748,43 @@ impl ClientSession {
 
     /// One visitor arrived: hand the server one more channel for that service.
     fn open_channel(&self, id: ServiceId) {
+        self.open_placed_channel(id, None);
+    }
+
+    /// The server asked for one stripe of a named group
+    /// (`CreateDataChannelForStripe`): open a channel, reserving a tunnel
+    /// this group does not already occupy (D24).
+    ///
+    /// A command whose metadata contradicts itself is a wire error, not a
+    /// channel to open: it is refused here, where nothing has been placed yet.
+    fn open_stripe_channel(&self, id: ServiceId, group: [u8; 4], index: u8, count: u8) {
+        if count == 0 || index >= count {
+            debug!(
+                "Ignoring a stripe request for group {group:02x?} that claims stripe {index} of \
+                 {count}"
+            );
+            return;
+        }
+        // Without the `multiplex` feature the request still opens a channel;
+        // the group's identity has no pool to steer there (see `StripeOpen`).
+        #[cfg(feature = "multiplex")]
+        let stripe = Some(StripeOpen {
+            group: u32::from_be_bytes(group),
+            count,
+        });
+        #[cfg(not(feature = "multiplex"))]
+        let stripe = None;
+        self.open_placed_channel(id, stripe);
+    }
+
+    /// Open one data channel for a service the server asked about.
+    fn open_placed_channel(&self, id: ServiceId, stripe: Option<StripeOpen>) {
         let Some(entry) = self.services.get(&id) else {
             debug!("The server asked for a data channel for unknown service {id}");
             return;
         };
         match &entry.state {
-            ServiceState::Active(active) => open_channels(active, 1),
+            ServiceState::Active(active) => open_data_channel(active, stripe),
             ServiceState::Rejected => {
                 debug!("Ignoring a data channel request for rejected service {id}");
             }
@@ -2586,15 +2849,16 @@ mod tests {
     // The failure these tests assert on *is* the assertion; a per-call
     // `.expect()` would bury it under noise.
     #![expect(
+        clippy::expect_used,
         clippy::unwrap_used,
-        reason = "tests unwrap values they just constructed"
+        reason = "tests unwrap and expect on values they just constructed"
     )]
     use super::*;
 
     /// The literal the interop matrix greps for: a client that meets a server
     /// too old to answer has to *say* which dialect it speaks, and stop.
     #[test]
-    fn a_server_that_never_answers_is_reported_as_a_protocol_v4_mismatch() {
+    fn a_server_that_never_answers_is_reported_as_a_protocol_mismatch() {
         let cause = anyhow!("Failed to read hello: failed to fill whole buffer");
         let err = unanswered_hello_error("127.0.0.1:2333", &cause);
         assert!(
@@ -2609,6 +2873,129 @@ mod tests {
         assert!(
             msg.contains("older"),
             "the likely cause must be named: {msg}"
+        );
+    }
+
+    /// The client-side stripe bookkeeping (D24): a group's tunnels are
+    /// remembered while its stripes are placed, the entry goes as soon as the
+    /// last stripe is placed, and a group whose gather died server-side cannot
+    /// grow the map without bound.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn a_stripe_groups_placement_state_lives_exactly_as_long_as_its_stripes() {
+        let placements = StripePlacements::default();
+        let place = placements.entry(7, 2);
+        assert!(
+            !place.record(10),
+            "the first of two stripes is not the last"
+        );
+        assert_eq!(place.used(), vec![10], "the tunnel is remembered");
+        // A repeated tunnel is not a second entry: `used` is what the pool
+        // avoids, and it is a set of tunnels, not a count of stripes.
+        assert!(place.record(10), "the second stripe completes the group");
+        assert_eq!(place.used(), vec![10]);
+        placements.finish(7, &place);
+        assert!(
+            placements.groups.lock().unwrap().is_empty(),
+            "a completed group must be forgotten"
+        );
+
+        // An evicted entry does not take a replacement's state with it.
+        let fresh = placements.entry(7, 2);
+        assert!(fresh.used().is_empty(), "a fresh group starts over");
+        placements.finish(7, &place);
+        assert!(
+            placements.groups.lock().unwrap().contains_key(&7),
+            "finishing an old entry must not remove the live one"
+        );
+
+        // The bound: the oldest entry gives way, so an abandoned group (whose
+        // last stripe is never placed) cannot leak for the session's life.
+        let bounded = StripePlacements::default();
+        let oldest = bounded.entry(0, 4);
+        std::thread::sleep(Duration::from_millis(2));
+        for id in 1..u32::try_from(MAX_TRACKED_STRIPE_GROUPS).unwrap() {
+            bounded.entry(id, 4);
+        }
+        assert_eq!(
+            bounded.groups.lock().unwrap().len(),
+            MAX_TRACKED_STRIPE_GROUPS
+        );
+        bounded.entry(999, 4);
+        let groups = bounded.groups.lock().unwrap();
+        assert_eq!(groups.len(), MAX_TRACKED_STRIPE_GROUPS, "the cap holds");
+        assert!(
+            !groups.contains_key(&0),
+            "the oldest entry is the one evicted"
+        );
+        assert!(groups.contains_key(&999), "the new group is tracked");
+        assert!(
+            oldest.used().is_empty(),
+            "the evicted entry keeps its own (empty) state, it does not alias the new one"
+        );
+    }
+
+    /// `udp_send_queue_size` is the bound the peer's outbound queue actually
+    /// enforces, and a full queue *drops*: the local service's replies go to
+    /// the visitor through a data channel whose writer can park (a mux
+    /// stream's window closes on a slow path), and a parked writer must cost
+    /// datagrams rather than stall the peer's socket — which is why
+    /// `send_outbound` only ever uses `try_send`.
+    ///
+    /// This is a unit test on purpose. The queue-full state is not reachable
+    /// end to end on a loopback pair: the server's UDP worker reads the data
+    /// channel continuously, so a real run never keeps the writer parked long
+    /// enough to overflow the queue, and a test that tried would assert on
+    /// scheduling rather than on the bound. Here the bound is driven where it
+    /// lives — nothing drains the queue the hub writes to — so the number of
+    /// datagrams that fit is exact.
+    #[tokio::test]
+    async fn the_udp_send_queue_holds_exactly_its_configured_size() {
+        let service = ClientServiceConfig {
+            name: "game".to_owned(),
+            service_type: ServiceType::Udp,
+            local_addr: "127.0.0.1:8103".to_owned(),
+            remote_bind_addr: "127.0.0.1:2354".to_owned(),
+            udp_send_queue_size: Some(2),
+            ..Default::default()
+        };
+        // The session's pin registry: a real one with tunnels, the unit handle
+        // without them. `Default` is the one spelling that fits both builds
+        // (and the one the `unit_arg` lint accepts).
+        let pins: Arc<Pins> = Arc::default();
+        let hub = build_udp_hub(&service, pins).expect("a UDP service must build a hub");
+        assert_eq!(
+            hub.params.sendq_size, 2,
+            "the configured queue size must reach the runtime"
+        );
+
+        // The queue `run_data_channel_for_udp` creates for one channel's
+        // writer, with nobody draining it: a writer parked on a closed window.
+        let (tx, mut rx) = mpsc::channel::<UdpTraffic>(hub.params.sendq_size);
+        hub.register_channel(tx).await;
+
+        let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let traffic = |i: u8| UdpTraffic {
+            from: peer,
+            data: Bytes::from(vec![i]),
+        };
+        // Four sends into a queue of two. A blocking send would park here for
+        // ever, so the timeout is the assertion that the path never waits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for i in 0..4 {
+                hub.send_outbound(peer, traffic(i), 0).await;
+            }
+        })
+        .await
+        .expect("a full UDP send queue must drop, never park the sender");
+
+        let queued: Vec<u8> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|t| t.data[0])
+            .collect();
+        assert_eq!(
+            queued,
+            vec![0, 1],
+            "exactly sendq_size datagrams are queued (in order); the rest are dropped"
         );
     }
 

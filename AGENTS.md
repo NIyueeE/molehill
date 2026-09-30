@@ -180,6 +180,17 @@ code-level.**
   v0.6.0, where molehill forked from
   [rathole](https://github.com/rapiz1/rathole) (upstream's last release was
   v0.5.0), and has been numbered independently since. Never renumber.
+- **The wire protocol version moves with the release line, and no two tags are
+  compatible.** A dialect is defined by a release: the number changes when the
+  wire changes, it changes *with* the tag that introduces it, and
+  `SUPPORTED_PROTO_VERSIONS` is the current dialect alone — a peer from another
+  tag is refused on the connection it happens on, in both directions, and
+  upgrading means upgrading both ends. Two releases share a number when their
+  wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
+  still in development it is still being defined, so commands may be extended
+  **in place** under that number; once the tag exists, the next change to the
+  wire is the next number. The line so far: 0.6–0.7 v2, 0.8–0.9 v3, 0.10 v4
+  (verified from each tag's `CURRENT_PROTO_VERSION`).
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -425,12 +436,14 @@ Details that agents need constantly:
   default set, see HANDOFF.md); `embedded` (minimal). Clippy runs twice in
   the pre-commit gate: the second pass covers the minimal no-default-features
   `server,client` build that the default-feature pass never compiles.
-- **Protocol**: v4 — one control session per endpoint (the session authenticates
-  once, then carries every service that dials it, each registering dynamically
-  with its own credential and data-plane carrier; the server enforces
-  `allow_ports`), with v3 still served for old clients. Every connection starts
-  with a one-byte transport selector (0x00 plain / 0x01 noise); protocol
-  mismatch is a hard error. See docs/internals.md.
+- **Protocol**: v4 (0.8-0.9 spoke v3, which v0.10 removed) — one control session
+  per endpoint (the session authenticates once, then carries every service that
+  dials it, each registering dynamically with its own credential and data-plane
+  carrier; the server enforces `allow_ports`); a striped visitor's group is
+  named on the control channel before its channels are opened, so the client
+  reserves one tunnel per stripe. Every connection starts with a one-byte
+  transport selector (0x00 plain / 0x01 noise); protocol mismatch is a hard
+  error, and no two tags are compatible (§5). See docs/internals.md.
 - **Build profiles**: `release` (lto, strip, panic=abort), `minimal`
   (opt-level "z", ~500KiB), `bench`. Container image: static musl binary on
   scratch.

@@ -204,6 +204,10 @@ METHOD_KEYS = (
     # receiver half at all.
     "shape_legs",
     "spine_summary_grace_s",
+    # The bulk client's socket window on a rate class: empty for the client's
+    # own default. It decides whether those cells have a sender the path can
+    # keep up with, so a run measured with a window is a different instrument.
+    "rate_socket_window",
     "interactive_ping_interval_ms",
     "udp_ping_interval_ms",
     "churn_connects_s",
@@ -1034,10 +1038,18 @@ def screen(data: dict) -> int:
     printing a version and a path on both sides of a variant run would
     present a config comparison as a build comparison.
 
-    Four steps, one function each: what was compared, the slow visitor, which
-    metric the table shows, then the table and the verdict. The split is what
-    keeps each piece readable (the whole thing measured C901 12 as one
-    function).
+    Every metric the run carries gets its own table and its own verdict, in
+    `SCREEN_METRICS` order. One metric used to be chosen for the whole run —
+    throughput whenever any step had it — and that decision can hide the
+    answer: a run whose throughput was pure noise reported "not a claim" while
+    the interactive p99 favoured one arm on every one of its twenty steps
+    (measured: the shared-pool screen, HANDOFF "The pool-size question,
+    re-opened"), and a run whose bulk probe died on the first step flipped to
+    response time without the columns saying so.
+
+    Four steps, one function each: what was compared, the slow visitor, the
+    tables, then a verdict per table. The split is what keeps each piece
+    readable (the whole thing measured C901 12 as one function).
     """
     t = next((t for t in data["tests"] if t["test"] == "screen"), None)
     if t is None:
@@ -1047,10 +1059,14 @@ def screen(data: dict) -> int:
     screen_slow_visitor(rounds)
     if not rounds:
         sys.exit("no rounds recorded")
-    key, better = screen_metric(rounds)
-    steps, a_ahead, b_ahead = screen_table(rounds, key, better)
-    print()
-    return screen_verdict(steps, a_ahead, b_ahead)
+    metrics = screen_metrics(rounds)
+    if not metrics:
+        sys.exit("no step carried a comparable metric")
+    for key, better, unit in metrics:
+        steps, a_ahead, b_ahead = screen_table(rounds, key, better, unit)
+        print()
+        screen_verdict(steps, a_ahead, b_ahead, unit)
+    return 0
 
 
 def screen_header(builds: dict) -> None:
@@ -1068,36 +1084,43 @@ def screen_header(builds: dict) -> None:
         )
 
 
-def screen_metric(rounds: list) -> tuple:
-    """Decide which metric the table shows, and print that decision.
+#: The metrics a screen reports, in order: `(key, sign that favours A, unit)`.
+#: A higher throughput is better, a lower response time is. Both are reported
+#: when the run carries both, because "the effect is in the metric nobody
+#: printed" is a trap this instrument has already fallen into.
+SCREEN_METRICS = (
+    ("gbps", 1.0, "Gbit/s"),
+    ("rtt_p99", -1.0, "ms (p99)"),
+)
 
-    Decided by what the run actually produced — not by its first step. A cell
-    hostile enough to kill the bulk probe on step 1 (the MTU/fragmentation
-    cell does exactly that) used to flip the whole verdict to response time
-    while the columns still read like throughput, so a "claim B" could be
-    about milliseconds and look like Gbit/s. Throughput is the primary
-    metric: use it whenever any step has it, and label the table so the units
-    are never in doubt.
 
-    Returns `(key, better)` where `better` is the sign that favours A: for
-    throughput a higher value is better, for a response time a lower one is.
+def screen_metrics(rounds: list) -> list:
+    """The metrics this run produced, with the sign that favours A.
+
+    Decided by what the run actually carried — not by its first step, and not
+    by a preference: a cell hostile enough to kill the bulk probe (the
+    MTU/fragmentation cell does that) simply has no throughput column, and the
+    response-time table stands alone with its units in the header.
     """
-    have_gbps = any(p.get("gbps") is not None for r in rounds for p in r["pair"])
-    key = "gbps" if have_gbps else "rtt_p99"
-    unit = "Gbit/s" if key == "gbps" else "ms (p99)"
-    if not have_gbps:
+    present = [
+        (key, better, unit)
+        for key, better, unit in SCREEN_METRICS
+        if any(p.get(key) is not None for r in rounds for p in r["pair"])
+    ]
+    if not any(key == "gbps" for key, _, _ in present) and present:
         print(
             "\nnote: no step produced a throughput sample (the bulk probe "
-            "failed on every step); comparing response time instead"
+            "failed on every step); response time is the only table"
         )
-    print(f"\n{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading  [{unit}]")
-    return key, 1.0 if key == "gbps" else -1.0
+    return present
 
 
-def screen_table(rounds: list, key: str, better: float) -> tuple:
-    """Print one row per step; return `(usable, a_ahead, b_ahead)`."""
+def screen_table(rounds: list, key: str, better: float, unit: str) -> tuple:
+    """Print one table for one metric; return `(usable, a_ahead, b_ahead)`."""
     steps = 0
     a_ahead = b_ahead = 0
+    print(f"\n--- {unit} ---")
+    print(f"{'streams':>8}{'A':>10}{'B':>10}{'delta':>9}   reading  [{unit}]")
     for r in rounds:
         a = next((p for p in r["pair"] if p["build"] == "A"), {}).get(key)
         b = next((p for p in r["pair"] if p["build"] == "B"), {}).get(key)
@@ -1120,30 +1143,35 @@ def screen_table(rounds: list, key: str, better: float) -> tuple:
     return steps, a_ahead, b_ahead
 
 
-def screen_verdict(steps: int, a_ahead: int, b_ahead: int) -> int:
-    """The verdict line, and the exit code `main` propagates."""
+def screen_verdict(steps: int, a_ahead: int, b_ahead: int, unit: str) -> None:
+    """One metric's verdict line. The exit code is `screen`'s, always 0."""
     if steps < SCREEN_MIN_STEPS:
         print(
-            f"NO CLAIM: {steps} usable step(s) — a verdict needs "
+            f"NO CLAIM [{unit}]: {steps} usable step(s) — a verdict needs "
             f"{SCREEN_MIN_STEPS} at least"
         )
-        return 0
+        return
     for label, wins in (("A", a_ahead), ("B", b_ahead)):
         if wins == steps:
             other = "B" if label == "A" else "A"
             print(
-                f"CLAIM: {label} ahead on every step by >= "
+                f"CLAIM [{unit}]: {label} ahead on every step by >= "
                 f"{SCREEN_CLAIM_PCT:.0f}% ({steps} steps) — pursue the "
                 f"direction (the metric favours {label} over {other})"
             )
-            return 0
+            return
+    # The steps neither arm won were inside the threshold. Naming them keeps a
+    # lopsided result readable: "A on 19/20, B on 0/20, 1 inside" is not a
+    # claim by the rule, but it is plainly not noise either, and a reader who
+    # sees only the word DIRECTIONAL would miss that.
+    inside = steps - a_ahead - b_ahead
+    tail = f", {inside} inside the threshold" if inside else ""
     print(
-        f"DIRECTIONAL: A ahead on {a_ahead}/{steps} steps and B on "
-        f"{b_ahead}/{steps}; not a claim at the "
+        f"DIRECTIONAL [{unit}]: A ahead on {a_ahead}/{steps} steps and B on "
+        f"{b_ahead}/{steps}{tail}; not a claim at the "
         f"{SCREEN_CLAIM_PCT:.0f}% threshold — the effect is inside the "
         "noise or the host is noisy today"
     )
-    return 0
 
 
 def resolve_paths(args: list) -> tuple:
