@@ -28,10 +28,12 @@
   in; the open threads at the freeze are the three at the bottom of this page,
   and none of them blocks the release.
 - **The branch is merged and v0.10.0 is ready to re-tag.** PR #4 merged as
-  `dffd7d8`. Two tag pushes have failed — the emulated legs, then the musl leg —
-  each on a test defect, with nothing published either time; both are fixed, the
-  sweep is re-run on the fixed commit (`96bda00`), and the tag is deleted so the
-  next push is the deliberate re-tag. See "Release (v0.10.0)" below.
+  `dffd7d8`. Three tag pushes have failed with nothing published: the emulated
+  cross legs, then the musl leg (both test defects), then the `aarch64` cross
+  leg on the release matrix's shared cache. All three are fixed — the first two
+  in `tests/`, which forced the sweep to be re-run on `96bda00`; the third in
+  `release.yml`, which does not touch the artifact's provenance. The tag is
+  deleted, so the next push is the deliberate re-tag.
 - **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
   `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the benchmark
   ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
@@ -145,8 +147,20 @@ above is what would give it one).
      x86_64-unknown-linux-musl` + `musl-tools`, then the matrix's own command),
      fixed to match what every spelling shares, and verified by running the
      whole suite on both targets.
-   Each failure was fixed, the sweep re-run, the tag deleted and re-pushed —
-   which is what AGENTS.md §5 allows, and the reason the rule exists.
+   - **The `aarch64` cross leg, on the cache this cycle added.** With both
+     fixes in, `aarch64-unknown-linux-musl` died before compiling anything:
+     `libc`'s and `generic-array`'s build scripts, restored from a 347 MB cache
+     entry, could not run in the `cross` container (`GLIBC_2.28 not found`).
+     `Swatinem/rust-cache` keys on the job, not on the matrix value, so every
+     leg shared one entry — and the legs do not build in the same environment:
+     the native legs compile host binaries with the runner's glibc, the `cross`
+     legs execute them inside a container with an older one. `ci.yml` already
+     keys its matrices per target; `release.yml` was the outlier and now does
+     the same (`key: ${{ matrix.target }}-release`). This one is a workflow
+     change, so it does not touch the sweep's provenance.
+   Each failure was fixed, the sweep re-run where the rule demanded it, and the
+   tag deleted and re-pushed — which is what AGENTS.md §5 allows, and the
+   reason the rule exists.
 6. **Next**: push the tag → the release workflow publishes (GitHub Release,
    GHCR, crates.io).
 7. **Open, for the next cycle**: nothing mechanically stops the next
