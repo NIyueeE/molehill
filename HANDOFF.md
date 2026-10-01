@@ -1,13 +1,15 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-09-30.** The v0.10.0 theme is implemented on
-> `feat/session-and-pool`: **M1** (one control session per endpoint, protocol
-> v4), **M2a** (one shared elastic pool per carrier, plus the S1 observation),
-> **M6** (the configuration surface) and **M7** (`direct`'s role, measured).
-> `main` is at `ab0bf11` (v0.9.0 released, with the withdrawn v0.9.1 cycle
-> folded back into development). **Nothing here is merged yet.** PR #4 is open
-> and re-green after each push; what is left is the human checklist: the
-> repo-settings items and the tag itself.
+> **State as of 2026-10-01.** **v0.10.0 is released.** PR #4 merged into
+> `main` (merge commit `dffd7d8`), the tag `v0.10.0` published a GitHub
+> Release, the GHCR image and crates.io, and the branch that carried the work
+> (`feat/session-and-pool`) is deleted — `main` is the only line now. The theme
+> is **M1** (one control session per endpoint, protocol v4), **M2a** (one
+> shared elastic pool per carrier, plus the S1 observation), **M6** (the
+> configuration surface) and **M7** (`direct`'s role, measured).
+>
+> What is left is not code: the repository-settings items a human has to make,
+> and the three open threads at the bottom of this page.
 >
 > **This file owns the working state**: what is open, what was decided and why,
 > and the release checklist. Per AGENTS.md §3 it is a contributor page —
@@ -24,20 +26,21 @@
 
 ## Where this stands
 
-- **The branch is feature-complete.** Every milestone of the v0.10.0 theme is
-  in; the open threads at the freeze are the three at the bottom of this page,
-  and none of them blocks the release.
-- **The branch is merged and v0.10.0 is ready to re-tag.** PR #4 merged as
-  `dffd7d8`. Three tag pushes have failed with nothing published: the emulated
-  cross legs, then the musl leg (both test defects), then the `aarch64` cross
-  leg on the release matrix's shared cache. All three are fixed — the first two
-  in `tests/`, which forced the sweep to be re-run on `96bda00`; the third in
-  `release.yml`, which does not touch the artifact's provenance. The tag is
-  deleted, so the next push is the deliberate re-tag.
-- **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
-  `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the benchmark
-  ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
-  the chart set in `assets/`, both READMEs refilled).
+- **v0.10.0 shipped on 2026-10-01**: the release run is green on all thirteen
+  jobs (nine platform builds, GitHub Release, GHCR, crates.io), and the
+  released artifact is `benches/scripts/soak/results-soak-v0.10.0.json` —
+  measured at `96bda00`, gated by `just soak-check` with no waiver.
+- **The release cost four tag pushes, and the three failures are worth
+  remembering**: the emulated cross legs (`native_target` guard missing on a
+  new spawn-based test), the musl leg (an assertion pinned to glibc's wording),
+  and the `aarch64` cross leg (the release matrix's cache shared across legs
+  with different glibc). The first two are in `tests/` — which forced the sweep
+  to be re-run on the commit that carries them — and the third is in
+  `release.yml`. All three are fixed; the open thread at the bottom of this
+  page proposes the check that would catch the next one mechanically.
+- **The repository state**: `version = "0.10.0"`, `CHANGELOG.md` carries
+  `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the release tag
+  `v0.10.0` names `104626f`.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or `benches/scripts/soak/*.py` changed since — the
