@@ -27,12 +27,13 @@
 - **The branch is feature-complete.** Every milestone of the v0.10.0 theme is
   in; the open threads at the freeze are the three at the bottom of this page,
   and none of them blocks the release.
-- **The branch is merged and v0.10.0 is mid-release.** PR #4 merged as
+- **The branch is merged and v0.10.0 is ready to re-tag.** PR #4 merged as
   `dffd7d8`; the changelog section is dated 2026-10-01 (the tag day) and the
   first tag push failed on one emulated build leg with nothing published —
   see "Release (v0.10.0)" below. The fix is a `tests/` change, which by the
-  pre-tag rule invalidates the committed artifact, so the sweep is being re-run
-  on the fixed commit before the tag is re-pushed.
+  pre-tag rule invalidates the committed artifact, so the sweep was re-run on
+  the fixed commit; the tag is deleted and the next push is the deliberate
+  re-tag.
 - **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
   `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the benchmark
   ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
@@ -109,13 +110,15 @@ above is what would give it one).
 1. ~~Freeze~~ **done (2026-09-28)** — `version = "0.10.0"`, the `[Unreleased]`
    content moved under a dated `## [0.10.0]` section, `[Unreleased]` left
    empty, the withdrawn v0.9.1 artifacts deleted.
-2. ~~Sweep~~ **done (2026-09-30, at `bbe9664`)** — the artifact, the charts and
-   both READMEs now describe this commit: four tools, 8/8 stages each plus the
+2. ~~Sweep~~ **done (2026-10-01, at `f34788d`)** — the artifact, the charts and
+   both READMEs describe this commit: four tools, 8/8 stages each plus the
    capacity ramp, `--test=rrul,capacity`, `shape_legs=visitor`, the bounded
    rate-class window, `tree_clean: true`, and **`just soak-check`: `OK: no gate
    violation`**, no waiver. The gate's own self-check is the verdict: the
    v0.9.0 baseline is not a gate input (another host, and a method record
-   missing six keys), which is the documented behaviour for a fresh sweep.
+   missing six keys), which is the documented behaviour for a fresh sweep. An
+   earlier sweep at `bbe9664` is superseded — the tag failure below changed
+   `tests/`, which is exactly what the pre-tag rule treats as invalidating.
 3. Before the tag: the `[0.10.0]` changelog date is the tag day (it still reads
    2026-09-28), and `just tag-check` must be run on the release commit — it is
    green on this one. The sweep is measured at `bbe9664`; **only docs and
@@ -152,50 +155,56 @@ above is what would give it one).
    `native_target` or `#[ignore]`) would close it; it needs a home in the check
    chain and the docs that go with it, so it was not added mid-release.
 
-### Release sweep (2026-09-30, `bbe9664`)
+### Release sweep (2026-10-01, `f34788d`)
 
-`v0.9.0-36-gbbe9664`, tree clean, `stale: false`, binary sha256
-`f10ea5350e78df6d` (4 181 840 bytes), host `3f8b4508ab91` / host_id
-`d764f9da9c7e5b2a`, calibration 412.1 MiB/s, loopback probe 21.85 Gbit/s,
+`v0.9.0-40-gf34788d`, tree clean, `stale: false`, binary sha256
+`978824f29c17ff5e` (4 181 840 bytes), host `99919695eec2` / host_id
+`d764f9da9c7e5b2a`, calibration 418.9 MiB/s, loopback probe 21.76 Gbit/s,
 `shape_legs=visitor`, `rate_socket_window=256K`, `batch=2`, four tools, 8/8
-stages each plus the capacity ramp, `--test=rrul,capacity`, 76 minutes.
-**`just soak-check`: `OK: no gate violation`**, no waiver. Charts re-rendered
-and both READMEs refilled from the plot's own tables. The peers were
-re-downloaded from their release pages for this run (frp 0.71.0, rathole
-0.5.0, nps 0.26.10 — all still the latest).
+stages each plus the capacity ramp, `--test=rrul,capacity`. **`just soak-check`:
+`OK: no gate violation`**, no waiver. Charts re-rendered and both READMEs
+refilled from the plot's own tables. The peers are the ones re-downloaded for
+this release (frp 0.71.0, rathole 0.5.0, nps 0.26.10 — all still the latest).
 
 | tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | ramp |
 |---|---|---|---|---|---|---|---|
-| molehill | 20.176-22.161 | 9.0 % | 7.5-7.7 | 9.713 | 0.100 | 0.019 | 8/8, never broke |
-| frp | 6.040-6.059 | 0.3 % | 2.8-3.0 | 5.695 | 0.100 | 0.020 | 8/8, never broke |
-| rathole | 20.304-20.383 | 0.4 % | 68.7-72.0 | 9.694 | 0.100 | 0.019 | 8/8, never broke |
-| nps | 0.133-0.134 | 0.6 % | 68.7-70.1 | 0.146 | 0.100 | 0.019 | 0/8, broke at 1 (p99 205.06 > 50) |
+| molehill | 17.312-17.563 | 1.4 % | 8.0-8.2 | 9.707 | 0.100 | 0.020 | 8/8, never broke |
+| frp | 6.149-6.153 | 0.1 % | 2.7 | 5.821 | 0.100 | 0.019 | 4/8, broke at 5 (err 0.006 > 0.005) |
+| rathole | 14.297-14.308 | 0.1 % | 75.6-80.2 | 9.686 | 0.099 | 0.019 | 1/8, **no reading** — the iperf3 backend died at load 2 |
+| nps | 0.136-0.136 | 0.1 % | 57.1-66.2 | 0.137 | 0.100 | 0.020 | 0/8, broke at 1 (p99 205.105 > 50) |
 
-Four things this run is worth reading for:
+What this run is worth reading for:
 
-- **It measures the host, not a code change.** Nothing under `src/`,
-  `tests/`, `Cargo.*` or the harness changed since the `746a413` sweep, and the
-  method record is identical — so the two runs are one instrument read twice.
-  The two arms at the loopback ceiling moved up together (molehill 18.830-20.482
-  -> 20.176-22.161, rathole 17.585-17.986 -> 20.304-20.383, +7 % and +14 %)
-  while `frp` and `nps`, an order of magnitude below the ceiling, were flat
-  (0.3 % and 0.6 % replicate spreads). That is why the method page now states
-  the limit and why the READMEs say the top two rows cannot be ordered by a
-  run; the earlier reading of a 4.5 % molehill-vs-rathole gap does not survive
-  the second sample and is no longer published.
-- **Rathole carried the ramp's full 8 streams this time** (it broke at load 4
-  in the `746a413` run, on its interactive error rate). A peer that reaches the
-  ramp's own ceiling reads as a floor, so the capacity table now has three arms
-  at "at least 8" and only `nps` below it.
-- **All four arms' `jitter` stage still carries no bulk reading** (95-97 % of
-  its intervals read zero bytes and the dial produced no receiver summary), so
-  it is printed as `— †` with the reason; `rate20` reads the shaper's 0.019-0.020
-  Gbit/s on every arm.
-- **Molehill's clean p99 is unchanged** (7.5-7.7 ms against 7.6-8.4 ms), and the
-  SLO gate is on those unshaped stages: the absolute SLO is the contract of the
-  tool this repository releases, and a peer that misses it is reported, not
-  gated (rathole 68.7-72.0 ms and nps 68.7-70.1 ms are reported as reference
-  peers).
+- **It is the third sample of the top pair, and it is what closed the question.**
+  The two arms at the loopback ceiling read 17.3-22.2 and 14.3-20.4 Gbit/s
+  across three sweeps of identical code, swinging widely enough to reverse their
+  order, while `frp` (6.04-6.15) and `nps` (0.133-0.136) moved by under 2 % and
+  the host's own loopback probe stayed inside 21.5-21.9 Gbit/s. The READMEs no
+  longer publish an ordering for those two rows, and `docs/benchmarks.md` states
+  the limit with all three samples behind it.
+- **Molehill is the only arm that carried the ramp's full 8 streams**, and its
+  clean-stage SLO is met on both visits (8.0 and 8.2 ms against the 50 ms
+  limit, zero errors).
+- **`rathole`'s ramp cell is an instrument failure, not a tool result.** The
+  ramp stops at the first level it cannot measure, and level 2 died with
+  `iperf3 error: ... Connection reset by peer` after 14 interactive samples —
+  the reason is recorded in the artifact and printed in the README's reason
+  column, so the cell reads as "no reading" rather than as a rathole weakness.
+  The gate reports a peer's cells and does not gate on them.
+- **`frp`'s break at load 5 is a real SLO break** (interactive error rate
+  0.006 > 0.005), the same threshold that stopped `rathole` in the `746a413`
+  run.
+
+**Environment incident on the way here.** The first attempt at this sweep
+produced a complete-looking artifact in 14 seconds: `iperf3` was no longer on
+the machine (a container restart had reset the filesystem and taken the
+runtime-installed package with it), so every test recorded a typed
+`No such file or directory: 'iperf3'` failure. The gate refused it — two
+violations on the subject — the superseded artifact was restored from git
+rather than published, `iperf3` was reinstalled, and the run was repeated. This
+is the failure mode the environment notes below warn about, now with the
+mechanism named: **the package is installed at runtime, so a container restart
+drops it**, and a pre-flight `command -v iperf3` is the cheap guard.
 
 ## Open threads for the next cycle
 
@@ -226,11 +235,15 @@ Four things this run is worth reading for:
   and QUIC (implemented and measured, parked in the `archive/transport-test`
   tag; revisit only for a UDP-only path or multi-stream loss isolation).
 
-## Environment notes (this host, re-checked 2026-09-30)
+## Environment notes (this host, re-checked 2026-10-01)
 
-- **Verify `iperf3` before a long run.** The container's apt layer has dropped
-  the package mid-session before; the bench then fails cleanly (every test
-  records a typed error) but spends an hour producing nothing.
+- **Verify `iperf3` before a long run** (`command -v iperf3`). It is installed
+  at runtime rather than baked into the image, so a container restart drops it:
+  measured on 2026-10-01, when a restart (new hostname, uptime reset) left the
+  binary gone and a sweep produced an artifact of typed failures in 14 seconds.
+  The bench fails cleanly — every test records `No such file or directory:
+  'iperf3'` and the gate refuses the file — but it looks like a finished
+  artifact until someone reads it.
 - **`/tmp` is periodically wiped.** Keep `--out` and logs under `~/tmp` or the
   repo. The Soak harness's own work directories (`/tmp/molehill-bench.*`) are
   normal residue and are never deleted by the harness.
