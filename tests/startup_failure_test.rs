@@ -121,8 +121,14 @@ fn a_server_whose_control_port_is_taken_exits_with_the_reason() {
         "a server that could not bind its control port must not exit successfully; \
          output was:\n{output}"
     );
+    // The cause is the OS's own wording, and the C libraries do not agree on
+    // it: glibc and macOS say "Address already in use", musl says "Address in
+    // use" (measured on the release matrix's musl leg, which is the only place
+    // these tests meet musl). Assert on what every spelling shares plus the
+    // project's own prefix, so the test keeps meaning "the operator is told
+    // why" without pinning one libc's phrasing.
     assert!(
-        output.contains("Address already in use"),
+        output.contains("Failed to listen at") && output.contains("in use"),
         "the failure must name the cause; output was:\n{output}"
     );
     assert!(
