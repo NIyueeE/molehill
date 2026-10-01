@@ -101,7 +101,7 @@ def install_frp(ver: str, blob: bytes, frp_arch: str) -> None:
     link.symlink_to(f"frp_{ver}_linux_{frp_arch}")
 
 
-def install_rathole(ver: str, blob: bytes) -> None:
+def install_rathole(_ver: str, blob: bytes) -> None:
     """`rathole-<arch>-unknown-linux-{gnu,musl}.zip`: one binary at the root."""
     zp = PEER_DIR / "rathole.zip"
     zp.write_bytes(blob)
@@ -169,13 +169,16 @@ def print_versions() -> None:
 def main() -> None:
     PEER_DIR.mkdir(parents=True, exist_ok=True)
     arch = platform.machine()
-    frp_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
+    # The vendor spellings differ per project: frp and nps say amd64/arm64,
+    # rathole's Rust target says x86_64/aarch64. One check covers all three,
+    # so a new architecture fails loudly for every peer instead of silently
+    # for the two whose map was left unchecked.
+    go_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
     rust_arch = {"x86_64": "x86_64", "aarch64": "aarch64"}.get(arch)
-    nps_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(arch)
-    if frp_arch is None:
-        sys.exit(f"unsupported arch: {arch}")
-    if nps_arch is None:
-        sys.exit(f"unsupported arch for nps: {arch}")
+    for name, a in (("frp", go_arch), ("nps", go_arch), ("rathole", rust_arch)):
+        if a is None:
+            sys.exit(f"unsupported arch for {name}: {arch}")
+    frp_arch = nps_arch = go_arch
 
     fetch_release(
         "frp",
@@ -187,7 +190,7 @@ def main() -> None:
     fetch_release(
         "rathole",
         "rathole-org/rathole",
-        lambda v: [
+        lambda _v: [
             f"rathole-{rust_arch}-unknown-linux-gnu.zip",
             f"rathole-{rust_arch}-unknown-linux-musl.zip",
         ],

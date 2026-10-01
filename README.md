@@ -27,14 +27,10 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - [molehill](#molehill)
   - [Features](#features)
   - [Benchmarks](#benchmarks)
-    - [Choosing a configuration](#choosing-a-configuration)
-    - [molehill vs the plain-TCP peers](#molehill-vs-the-plain-tcp-peers)
+    - [The v0.10.0 run](#the-v0100-run)
   - [Quickstart](#quickstart)
-  - [Deployment](#deployment)
-    - [Binary](#binary)
-    - [systemd](#systemd)
-    - [Container](#container)
   - [Configuration](#configuration)
+  - [Deployment](#deployment)
   - [Documentation](#documentation)
   - [Development](#development)
 
@@ -45,121 +41,94 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Client-Authoritative Services** Since v0.7 the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
-- **Multiplexing** Every data channel rides as a yamux stream over one of N parallel tunnel connections by default (`[client.data].default_count = 4`) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The optional `default_carrier = "kcp"` (feature `kcp`) moves the data plane onto KCP-over-UDP sessions. The `[client.data]` default knobs and the `mode = "direct"` fallback are covered in [Configuration](./docs/configuration.md).
+- **Multiplexing** Every data channel rides as a yamux stream over one of an elastic pool of tunnel connections (up to `[client.data.tcp|kcp].max_tunnels`, default 4) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The pool starts cold and grows on demand, so a client that is idle holds nothing; the optional `default_carrier = "kcp"` (feature `kcp`) moves the data plane onto KCP-over-UDP sessions. The `[client.data]` knobs and the `mode = "direct"` fallback are covered in [Configuration](./docs/configuration.md).
 - **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The optional Noise Protocol encrypts the wire with a single pre-shared X25519 keypair — no PKI, no CA — and, with `resume = true`, proves a reconnect with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 -> 38.5 us per pair). `plain` forwards unencrypted.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
 
 ## Benchmarks
 
 Single-machine comparison (`visitor -> server -> client -> backend`, all four
-hops on one machine). Everything is measured **through the tunnel**: the probes
-dial each tool's exposed port, never the backend it forwards to. The peers are
-the latest GitHub release builds (frp, rathole upstream, nps, versions recorded
-with each run). Every tool is driven through the identical workload while the
-network condition follows a scripted stage schedule, changed in place, so a
-tool's session is never rebuilt — how it adapts to a degrading and then
-recovering path is part of the measurement.
+hops on one host), measured **through the tunnel**: the probes dial each tool's
+exposed port, never the backend it forwards to. Method, chart reading and
+reproduction: [Benchmarks](./docs/benchmarks.md); the decision tree behind the
+settings, and the two numbers worth measuring on your own path:
+[Configuration](./docs/configuration.md#choosing-your-configuration-decision-tree).
 
-### Choosing a configuration
+### The v0.10.0 run
 
-The defaults — `mode = "multiplex"`, `count = 4`, `carrier = "tcp"`, plain
-transport — are the right starting point for almost everyone. Deviate only
-when the tree says so. How to apply each choice: the `[client.data]` block
-holds the per-client defaults, and every service can override `mode` /
-`count` / `carrier` on its own `[client.services.<name>]` block — one client
-can mix a multiplexed interactive service with a `direct` bulk service, and
-can even point individual services at different molehill servers via
-`remote_addr`. The `[transport]` block is in
-[Configuration](docs/configuration.md); Noise keypairs in
-[Transport](docs/transport.md).
+Every tool is driven through the identical workload while the path follows the
+stage schedule, changed in place so a session is never rebuilt — this is the
+v0.10.0 run on one host, with the released binary's defaults (`multiplex`, plain
+transport); the chart legend and the schedule are in
+[Benchmarks](./docs/benchmarks.md#how-to-read-the-charts).
 
-**How to choose, step by step.** Start from the defaults and answer three
-questions about your workload; change one thing at a time and re-test:
+![Soak: molehill and the peers over the stage schedule](assets/soak-v0.10.0.png)
 
-1. **Do you need encryption?** Yes → set `[client.transport] type =
-   "noise"` and place the keys. No → keep `"plain"`.
-2. **One user or many, and how many concurrent connections?** A single
-   long-lived session (SSH, one Minecraft player) → `direct` or the default
-   mux both work; mux saves NAT mappings at low concurrency too. When that
-   one stream must not be bounded by a single tunnel flow (bulk over one
-   session), set `[server.data] stripe_count` (K=4) — the connection then
-   rides K parallel data channels, at K× channels per visitor and a bounded
-   reorder buffer. Many users / churn / multiple services → keep or raise
-   `count` (each tunnel carries ~64 concurrent connections before the yamux
-   ceiling — `count = 8` ≈ 512).
-3. **What does the path look like, and do you forward UDP?** If TCP data
-   tunnels are blocked or throttled, or you need latency-first UDP at high
-   delay, A/B `carrier = "kcp"`. Otherwise keep the TCP carrier. For
-   lossy/wifi paths keep `count >= 4` — it aggregates and isolates
-   head-of-line blocking — and pick `count` for the per-tunnel connection
-   ceiling (`count = 1 -> 64` connections, `count = 4 -> 256`).
+The same run as small multiples — one panel per stage, a lollipop per tool:
 
-Two numbers decide between these options, and they are best measured on your
-own path rather than read off a table: the **sustainable load** (how many bulk
-streams the tool carries while a fresh interactive connection still meets the
-50 ms and 0.5 % errors) and the **cost at the operating point** (CPU-seconds per carried
-Gbit/s). What the published runs measured, and how to run the same comparison
-on your own hardware, is in [Benchmarks](docs/benchmarks.md); the settings
-themselves are in [Configuration](docs/configuration.md#choosing-your-configuration-decision-tree).
+![Interactive RTT per stage, per tool](assets/soak-v0.10.0-stages.png)
 
-### molehill vs the plain-TCP peers
+**Interactive stream RTT p99, per stage** (ms). `~` marks a **shaped** class —
+the harness installed the queue that dominates it, so no winner is marked in
+those columns; `‡` marks a stage that also recorded a wedge. Sample counts and
+the full reading rules: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
-Every tool is driven through the identical workload — one interactive stream
-(the SLO instrument), N = 20 bulk TCP streams, 16 short connections per
-second and one UDP session — while the path follows the stage schedule
-(netem on `lo`, the control plane left unshaped). The chart below is the
-v0.9.1 run on one host (molehill's default `multiplex`, `count = 4`, plain
-transport): the orange line is the bulk throughput, the blue points the
-interactive stream's RTT, the shaded bands the path classes, the dashed
-line the SLO (p99 <= 50 ms).
-
-![Soak: molehill and the peers over the stage schedule](assets/soak-v0.9.1.png)
-
-The same run as small multiples — one panel per stage, a lollipop per tool
-(dot = p50, bar = p99, tick = worst second), so "who wins which condition"
-reads without a table:
-
-![Interactive RTT per stage, per tool](assets/soak-v0.9.1-stages.png)
-
-**Interactive stream RTT p99, per stage** (ms; "wedge" = the stream produced
-no response for > 5 s):
-
-| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (return) |
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| **molehill (mux)** | **9.3** | wedge | 1305 | 3050 | 683 | 4870 | 3440 | **5.4** |
-| frp 0.71.0 | **2.9** | wedge | 4819 | 6110 | wedge | 2703 | 1818 | **3.4** |
-| rathole 0.5.0 | 99 | wedge | 1324 | 4421 | wedge | 6820 | 4688 | 108 |
-| nps 0.26.10 | 66 | 861 | 1124 | 2933 | 6263 | 323 | 3037 | 65 |
+| molehill (mux) | 7.7 | ~8870‡ | ~1132 | ~4137‡ | ~1493 | ~7765‡ | ~7479‡ | 7.5 |
+| frp | 3.0 | ~5795‡ | ~1077 | ~4138‡ | ~1566 | ~7655‡ | ~3764 | 2.8 |
+| rathole | 68.7 | ~6209‡ | ~1132 | ~4952‡ | ~1536 | ~7451‡ | ~8590‡ | 72.0 |
+| nps | 70.1 | ~472 | ~1071 | ~2469 | ~1496 | ~7918‡ | ~6662‡ | 68.7 |
 
-**Bulk throughput per stage** (Gbit/s): molehill 12.7 on clean -> 2.4 at
-rtt100 -> 0.03 at rate100 -> **16.2 on the return to clean**; frp 6.0 -> 2.1 ->
-5.9; rathole 12.4 -> 2.5 -> 12.4; nps 0.1 throughout.
+**Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
+not its best second). A `*` marks a cell read from the **receiver's** own
+window; `— †` marks a stage with no reading at all, with the reason why. Which
+side a cell uses: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
-**What these shapes say.** Every tool degrades under a bad path and every
-tool recovers on the return to clean — that recovery is what the last band
-measures, and a tool that stayed wedged would be a finding. The interactive
-stream's p99 is what a new visitor actually feels: under saturation it is
-the number that separates tools, and it is where the throughput axis is
-blind — molehill and rathole carry the same bulk on the clean stage (12.7
-vs 12.4 Gbit/s) while a fresh interactive connection costs 9.3 ms versus
-99 ms, and on the 1%-loss cell both carry ~4.9 Gbit/s but the interactive
-stream sits at 1305 ms versus 1324 ms. The peers are driven by the same
-workload and charted in the same panels; the drift axis (open fds, RSS and
-CPU slopes over the run) is in `soak-v0.9.1-drift.png` and the UDP session's
-RTT/loss in `soak-v0.9.1-udp.png` (a sliding loss *rate*, not a count of
-loss events).
+| tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
+|---|---|---|---|---|---|---|---|---|
+| molehill (mux) | 20.176 | 5.216 | 9.713 | 5.266 | 0.100 | 0.019 | — † | 22.161 |
+| frp | 6.040 | 5.579 | 5.695 | 5.247 | 0.100 | 0.020 | — † | 6.059 |
+| rathole | 20.304 | 5.193 | 9.694 | 5.252 | 0.100 | 0.019 | — † | 20.383 |
+| nps | 0.133 | 0.151 | 0.146 | 0.157 | 0.100 | 0.019 | — † | 0.134 |
 
-These are v0.9.1 numbers from one host, and only runs of the same model on the
-same host compare directly. The clean-stage bulk is lower than the v0.9.0
-sweep's 18.9/20.6 Gbit/s on the same hardware: an interleaved A/B of the two
-*binaries* (the `screen` mode, both builds in one run) refuses to claim a
-difference in either direction, and the v0.9.0 binary measured in it reaches
-the same 7.6-24.5 Gbit/s spread, so the ceiling moved with the host, not with
-the code. The comparability boundary is in
-[Benchmarks](docs/benchmarks.md). How to read a chart in detail (the log axis, the
-step lines, the wedge bars, what each band means), the stage schedule, the test
-types and how to reproduce a run on your own hardware:
-[Benchmarks](docs/benchmarks.md).
+**The run's own replicate.** `clean` is measured at both ends of every
+timeline, so each tool's two readings are two samples of one condition about
+an hour apart — the scale every other cell is read against:
+
+| tool | clean bulk reading | clean interactive p99 |
+|---|---|---|
+| molehill (mux) | 20.176 – 22.161 Gbit/s (**9.0 %** apart) | 7.5 – 7.7 ms |
+| frp | 6.040 – 6.059 Gbit/s (**0.3 %** apart) | 2.8 – 3.0 ms |
+| rathole | 20.304 – 20.383 Gbit/s (**0.4 %** apart) | 68.7 – 72.0 ms |
+| nps | 0.133 – 0.134 Gbit/s (**0.6 %** apart) | 68.7 – 70.1 ms |
+
+**How much it carries.** The same artifact carries the load ramp — the first
+bulk load level at which a fresh interactive connection breaks the SLO — a
+different instrument from the staged schedule
+([Benchmarks](./docs/benchmarks.md#test-types)); three arms carried its full 8
+streams, so 8 reads as a **floor** ("at least 8"), not a maximum:
+
+| tool | sustainable streams | ceiling | headroom | reason at the break |
+|---|---|---|---|---|
+| molehill (mux) | 8 | 8 | 0.0 | never broke |
+| frp | 8 | 8 | 0.0 | never broke |
+| rathole | 8 | 8 | 0.0 | never broke |
+| nps | 0 | 8 | 1.0 | interactive p99 205.06 > 50.0 |
+
+These are v0.10.0 numbers from one host, and only same-schema, same-method,
+same-host runs compare directly: every results file records the host, the
+method and two tool-free calibrations, and each run is gated on its own
+completeness, endpoint and SLO checks
+([Benchmarks](./docs/benchmarks.md#comparability)). Note that **molehill and
+rathole both read at this host's loopback ceiling and move together with its
+state between runs**, so the order of those two rows is not a standing claim;
+`frp` and `nps` were flat across the same runs.
+
+The rest of the run's chart set is published beside these two:
+`soak-v0.10.0-drift.png` (open fds, RSS and CPU slopes over the run),
+`soak-v0.10.0-udp.png` (the UDP session's RTT and sliding loss *rate*) and
+`soak-v0.10.0-capacity.png` (the load ramp).
 
 ## Quickstart
 
@@ -226,8 +195,8 @@ Then run:
 So you can `ssh -p 5202 myserver.com` to ssh to your NAS.
 
 To run `molehill` as a background service on Linux, checkout the
-[systemd units](./docs/configuration.md#systemd) or the
-[container deployments](./docs/configuration.md#container).
+[systemd units](./docs/deployment.md#systemd) or the
+[container deployments](./docs/deployment.md#container).
 
 ## Configuration
 
@@ -235,60 +204,29 @@ To run `molehill` as a background service on Linux, checkout the
 automatically, or you can force it with `--server` / `--client`. The full
 configuration specification, logging and tuning options are documented in
 [Configuration](./docs/configuration.md), which also includes
-[complete examples](./docs/configuration.md#complete-examples) for various
-scenarios.
+[worked examples](./docs/deployment.md#worked-examples) for various scenarios.
 
 ## Deployment
 
-### Binary
-
-Download a pre-built binary for your platform from the
-[release page](https://github.com/NIyueeE/molehill/releases), or
-[build from source](./docs/build-guide.md) for other platforms and
-minimal-sized binaries.
+The same binary runs on both ends; the mode comes from the config file:
 
 ```bash
 ./molehill server.toml   # on the public server
 ./molehill client.toml   # on the device behind NAT
 ```
 
-### systemd
-
-The [systemd units](./docs/configuration.md#systemd) show how to run molehill as a
-systemd service, both as root and rootless, including multiple instances.
-
-### Container
-
-Official multi-arch images (linux/amd64, linux/arm64) are published to
-`ghcr.io/niyueee/molehill`. The image is a single static musl binary on
-`scratch` (~1.2 MiB), runs as non-root UID 1000, and includes the same default
-feature set as the regular release builds (multiplexing and the `kcp` carrier
-included).
-
-```bash
-docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
-  ghcr.io/niyueee/molehill:latest server.toml
-```
-
-The image contains no configuration — mount your config file and pass its
-name as the argument. Two container-specific notes: the process runs as UID
-1000 (so mount the config world-readable, and prefer ports ≥ 1024), and under
-bridge networking a `carrier = "kcp"` service needs its data-plane port
-published over **UDP** as well. See the [container deployments](./docs/configuration.md#container)
-for Docker Compose (`compose.yaml` / `compose.bridge.yaml`) and Podman
-Quadlet (`molehill-server.container` / `molehill-client.container`)
-deployments.
+Ready-to-run configuration examples, systemd units and container recipes are
+in [Deployment](./docs/deployment.md), which also covers the network
+requirements and the deployment security notes.
 
 ## Documentation
 
 For people running molehill:
 
 - [Configuration](./docs/configuration.md) — full configuration specification, logging, tuning
+- [Deployment](./docs/deployment.md) — ready-to-run configs, systemd units and container recipes
 - [Transport](./docs/transport.md) — Noise Protocol setup
 - [Benchmarks](./docs/benchmarks.md) — how the published numbers are produced, how to read them, how to reproduce them
-- [Build guide](./docs/build-guide.md) — build customization, minimal binary
-- [Internals](./docs/internals.md) — how control/data channels work
-- [Configuration examples](./docs/configuration.md#complete-examples) — configs for common scenarios (systemd & container deployments included)
 
 For people changing it (contributor and governance docs are English-only by
 decision — see [AGENTS.md](./AGENTS.md) §3):
@@ -297,6 +235,8 @@ decision — see [AGENTS.md](./AGENTS.md) §3):
 - [Lint policy](./docs/lint-policy.md) — lint levels and waiver rules
 - [Release](./docs/release.md) — release mechanics, versioning, test builds
 - [Structure](./docs/structure.md) — what every file in this repo is for
+- [Build guide](./docs/build-guide.md) — build customization, minimal binary
+- [Internals](./docs/internals.md) — how control/data channels work
 - [Contributing](./CONTRIBUTING.md) — setup and workflow
 - [Security](./SECURITY.md) — reporting vulnerabilities
 - [`HANDOFF.md`](./HANDOFF.md) — current working state; planned work and future design documents
@@ -305,9 +245,8 @@ decision — see [AGENTS.md](./AGENTS.md) §3):
 
 molehill is written in Rust (2024 edition); `rust-toolchain.toml` declares
 `channel = "stable"` with clippy and rustfmt components — never hardcode a
-version. Layered git hooks guard every commit, push, and release tag, and CI
-runs the identical chain for anything that touches code — a docs-only change
-runs just the docs-alignment check (`docs.yml`) instead:
+version. What each gate runs, and how to handle a block, is in
+[Checks](./docs/checks.md).
 
 ```bash
 just setup   # activate git hooks (core.hooksPath githooks) + install check tools
@@ -315,9 +254,7 @@ just check   # fmt / secrets / machete / docs / ruff (check + format) / clippy +
 just tag     # release review (githooks/pre-tag) + create the local v* tag
 ```
 
-molehill began as a fork of [rathole](https://github.com/rapiz1/rathole)
-(Apache-2.0) and has been developed independently since; the upstream
-history is preserved below the fork point and the version line continues
-from there (upstream's last release was v0.5.0). See
-[docs/release.md](./docs/release.md) for release mechanics and
+molehill is an independent project that began as a fork of
+[rathole](https://github.com/rapiz1/rathole); see
+[CHANGELOG.md](./CHANGELOG.md) for what each release changed and
 [AGENTS.md](./AGENTS.md) for the repository rules.

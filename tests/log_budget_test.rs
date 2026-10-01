@@ -148,6 +148,25 @@ impl Scenario {
     /// `client_extra` is appended to the `[client.services.echo]` table, which
     /// is how a test asks for a config that is not clean.
     fn start(label: &str, client_extra: &str) -> Scenario {
+        Scenario::start_with(label, client_extra, "", "")
+    }
+
+    /// The same, with extra keys in `[client.services.echo]`, `[client.data]`
+    /// and `[server]` — a removed key has to be strippable wherever it lived,
+    /// so the scenario that proves it has to be wrong in every section at
+    /// once. An empty `client_data_extra` omits the `[client.data]` table
+    /// entirely, so a clean scenario stays clean.
+    fn start_with(
+        label: &str,
+        client_extra: &str,
+        client_data_extra: &str,
+        server_extra: &str,
+    ) -> Scenario {
+        let data_block = if client_data_extra.is_empty() {
+            String::new()
+        } else {
+            format!("[client.data]\n{client_data_extra}\n")
+        };
         let dir = std::env::temp_dir().join(format!(
             "molehill-log-budget-{label}-{}",
             std::process::id()
@@ -168,7 +187,7 @@ impl Scenario {
                 "[server]\n\
                  default_token = \"{TOKEN}\"\n\
                  allow_ports = [\"{exposed}\"]\n\
-                 \n\
+                 {server_extra}\n\
                  [server.control]\n\
                  bind_addr = \"127.0.0.1:{control}\"\n"
             ),
@@ -183,6 +202,7 @@ impl Scenario {
                  [client.control]\n\
                  default_remote_addr = \"127.0.0.1:{control}\"\n\
                  \n\
+                 {data_block}\
                  [client.transport]\n\
                  type = \"plain\"\n\
                  \n\
@@ -425,42 +445,138 @@ fn a_healthy_run_stays_within_the_log_budget() {
     assert!(visitors >= 1, "the scenario never forwarded a visitor");
 }
 
-/// The migration wart, measured the same way: a config that still carries the
-/// removed `health_check` key starts, **warns** about it (rather than obeying
-/// it silently or refusing to start), and that warning is the *only* one.
+/// The migration wart, measured the same way: a config that still carries a
+/// key v0.10.0 removed does **not start**, and the refusal names the key and
+/// what to write instead — the operator runs the binary once and gets the
+/// whole list.
 ///
-/// The count is deliberately not pinned: the warning is emitted per config
-/// parse, and the config watcher parses the file once more when its initial
-/// event arrives. Whether that lands inside this test's lifetime depends on the
-/// platform's notify backend — macOS delivered it before shutdown and Linux did
-/// not — so pinning "exactly one" made the test measure the watcher's timing.
-/// What matters is platform-independent: it warns at all, it names the key,
-/// everything it warns about is that key, and it is not yet an error.
+/// This case used to start and warn. It is a refusal now, because a key that
+/// secretes a compatibility path for one release is a key that never gets
+/// removed; the upgrade instruction is what matters, and it is worth as much
+/// on a refusal as on a warning. What is measured here is the shape: each end
+/// refuses its own file (every end parses the file it was given), the exit is
+/// non-zero, and the log carries no WARN — the condition is an error the
+/// operator has to act on, not a handled condition worth one line.
 #[test]
-fn a_removed_key_warns_and_is_otherwise_quiet() {
-    let mut scenario = Scenario::start(
-        "removed-key",
-        "health_check = { type = \"tcp\", interval = 10 }\n",
-    );
-    let (_, client_log) = scenario.stop();
+fn every_removed_key_refuses_the_start_with_its_replacement() {
+    // (the removed key's pattern, a fragment of the replacement its refusal
+    // must name). The pattern is matched as the message writes it —
+    // backticked — so `count` cannot be satisfied by the `default_count`
+    // line's text. Each end gets the keys that lived in *its* file: a server
+    // config has no `[client]` tables to carry the client's keys.
+    const CLIENT_KEYS: [(&str, &str); 5] = [
+        ("client.data.default_count", "max_tunnels"),
+        ("client.services.*.count", "max_tunnels"),
+        ("client.services.*.pool_size", "udp_workers"),
+        (
+            "client.services.*.heartbeat_timeout",
+            "default_heartbeat_timeout",
+        ),
+        ("client.services.*.health_check", "registered"),
+    ];
+    const SERVER_KEYS: [(&str, &str); 1] = [("server.max_pool_size", "max_tunnels_per_client")];
+    // `[client.data]` (and so the removed `default_count`) exists only with the
+    // `multiplex` feature; the other client keys live in tables every build
+    // has, so they are asserted everywhere.
+    let client_data_extra = if cfg!(feature = "multiplex") {
+        "[client.data]\ndefault_count = 4\n"
+    } else {
+        ""
+    };
+    let control = free_port();
+    let exposed = free_port();
+    let backend = free_port();
+    let dir = std::env::temp_dir().join(format!(
+        "molehill-log-budget-removed-key-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
 
-    let warnings: Vec<&str> = client_log
-        .lines()
-        .filter(|l| l.contains(" WARN "))
-        .collect();
+    let client_cfg = dir.join("client.toml");
+    fs::write(
+        &client_cfg,
+        format!(
+            "[client]\n\
+             default_token = \"{TOKEN}\"\n\
+             [client.control]\n\
+             default_remote_addr = \"127.0.0.1:{control}\"\n\
+             [client.services.echo]\n\
+             local_addr = \"127.0.0.1:{backend}\"\n\
+             remote_bind_addr = \"0.0.0.0:{exposed}\"\n\
+             count = 2\n\
+             pool_size = 8\n\
+             heartbeat_timeout = 90\n\
+             health_check = {{ type = \"tcp\", interval = 10 }}\n\
+             {client_data_extra}",
+        ),
+    )
+    .unwrap();
+    let server_cfg = dir.join("server.toml");
+    fs::write(
+        &server_cfg,
+        format!(
+            "[server]\n\
+             default_token = \"{TOKEN}\"\n\
+             max_pool_size = 16\n\
+             allow_ports = [\"{exposed}\"]\n\
+             [server.control]\n\
+             bind_addr = \"127.0.0.1:{control}\"\n"
+        ),
+    )
+    .unwrap();
+
+    for (who, cfg, keys) in [
+        ("client", &client_cfg, &CLIENT_KEYS[..]),
+        ("server", &server_cfg, &SERVER_KEYS[..]),
+    ] {
+        assert_refused(who, cfg, keys);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// One end refuses its own config file, non-zero, with every key it carried
+/// and each one's replacement named in the message — and with no WARN: the
+/// refusal is the message.
+fn assert_refused(who: &str, cfg: &Path, keys: &[(&str, &str)]) {
+    let mut out = Command::new(NEW_BIN)
+        .arg(if who == "client" {
+            "--client"
+        } else {
+            "--server"
+        })
+        .arg(cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("could not run {who}: {e}"));
     assert!(
-        !warnings.is_empty(),
-        "the removed key must warn — it is ignored, not silently obeyed:\n{client_log}"
+        wait_for_exit(&mut out, Duration::from_secs(10)),
+        "the {who} did not exit on its own: it hung instead of refusing"
     );
-    for line in &warnings {
+    let mut stderr = String::new();
+    out.stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let code = out.wait().unwrap().code().unwrap_or(-1);
+    assert_ne!(code, 0, "a config with removed keys must fail the {who}");
+    assert!(
+        !stderr.contains(" WARN "),
+        "a refused config must not warn — the refusal is the message ({who}):\n{stderr}"
+    );
+    for (pattern, replacement) in keys {
+        if *pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
+            continue;
+        }
         assert!(
-            line.contains("health_check"),
-            "the removed key is the only thing this path may warn about, got: {line}"
+            stderr.contains(&format!("`{pattern}`")),
+            "the {who}'s refusal must name `{pattern}`:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(replacement),
+            "the {who}'s refusal must name what to write instead ({replacement}):\n{stderr}"
         );
     }
-    assert_eq!(
-        count_level(&client_log, "ERROR"),
-        0,
-        "the removed key must not be an error yet:\n{client_log}"
-    );
 }

@@ -8,6 +8,8 @@ line-length = 88
 [lint]
 extend-select = [
     "E402",   # sys.path.insert before imports is the bench-lib pattern
+    "E501",   # line length: the formatter wraps code, but a docstring or URL
+              # can still run long, and one of them had (lib.py, 94 chars)
     "I",      # import sorting
     "UP",     # pyupgrade
     "SIM",    # simplify
@@ -18,6 +20,24 @@ extend-select = [
     "ISC",    # implicit string concat
     "FURB",   # refurb
     "S",      # bandit
+    "B",      # bugbear (mutable defaults, zip(strict=), ...)
+    "E7",     # ambiguous names (l/O/I) -- invisible to the rest of the set
+    "ARG",    # unused arguments: a dead parameter is a smell, not a signature
+    "PTH",    # prefer pathlib: these scripts build and read paths constantly
+    "RET",    # return-statement consistency
+    "C4",     # comprehensions
+    "N",      # naming conventions
+    "FA",     # from __future__ placement
+    "FLY",    # f-string join instead of a str.join call
+    "PERF",   # perflint's loop-invariant checks
+    "C901",   # cyclomatic complexity (default limit 10): the two functions
+              # over it were split rather than waived, and each split was
+              # checked to leave stdout and exit codes byte-identical
+    "DTZ",    # naive datetimes: these scripts timestamp runs and compare them
+    "TID",    # a relative import would break the `uv run <script>` entry shape
+    "PIE",    # misc dead code (useless `pass`, unnecessary `map`, ...)
+    "PGH",    # blanket `# type: ignore` (waive per code, never per file)
+    "LOG",    # logging misuse in the shared bench lib
 ]
 
 # Waivers — repo-wide only for the one property that is genuinely true of
@@ -27,4 +47,23 @@ extend-select = [
 # - S602/S603/S607: these scripts measure tools that ARE external binaries
 #   reached through PATH (iperf3, tc, ss, vegeta, the peers). Resolving them
 #   differently would measure a different program than the one documented.
+#
+# Deliberately NOT selected, and why (checked, not guessed):
+# - TRY/EM: 18 of TRY's 21 findings are TRY003 ("long message outside the
+#   exception class"), which fights this codebase's house style: the message
+#   *is* the instruction ("restore it with: ip link set dev lo mtu 1280").
+#   Adopting it would mean inventing an exception class per site.
+# - ANN: the scripts annotate where the type carries information and leave the
+#   rest to inference; ANN001-003 would demand annotations on every parameter.
+# - T20: every `print` here is deliberate output (the runner logs live, the
+#   plotter emits markdown, the gate emits verdicts).
+# - COM812 (trailing comma): ruff's own formatter documents it as a conflicting
+#   rule and prints a warning when both are enabled; it rewrites exactly the
+#   files `ruff format` owns, so the lint gate and the format gate fight over
+#   the tree. The formatter already inserts a trailing comma where its own
+#   style wants one (magic trailing comma), so nothing is lost.
+# - BLE001's five waivers live inline at their sites, including three inside
+#   the `PROBE_SRC` string that ruff cannot see (soak.py) -- that code is
+#   exec'd in a separate process on purpose (GIL isolation) and its blind
+#   excepts are the same deliberate shape as the reviewed ones.
 ignore = ["S602", "S603", "S607"]

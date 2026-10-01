@@ -7,7 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-28
+
 ### Changed
+
+- **Data-channel striping works, and a group's channels land on distinct
+  tunnels by construction.** `[server.data]` `stripe_count > 1` spreads every
+  visitor connection over that many data channels (a stripe group) on the
+  elastic tunnel pool: the gather asks the client for one channel per stripe —
+  a registration opens none itself, so a gather that merely waited for channels
+  nobody was told to open timed out — and re-requests only the stripes still
+  missing when a budget expires. The gather now **names the group** before its
+  channels are opened (`CreateDataChannelForStripe`: service, group, stripe
+  index and count), so the
+  client knows which opens belong together: it grows the pool to the group's
+  own count first (bounded by `max_tunnels`) and reserves one tunnel per stripe,
+  falling back to sharing when the pool cannot grow that far — a group that
+  cannot spread still works, exactly as before. Until this the K requests were
+  indistinguishable from K unrelated visitors, and a cold pool — the elastic
+  pool's default state is *zero* tunnels — put the whole group on one tunnel.
+  `tests/integration_test.rs::striped_data_channels` now also asserts the
+  client's pool reached its four stripes, and
+  `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
+  pins the request vocabulary against a hand-written peer.
+
+- **The tunnel pool can be shared and is elastic.** Three new client settings
+  decide what a pool is, how large it may get and how long it lives; the
+  shipped defaults keep today's shape. `[client.data].shared_pool` (default `false`)
+  serves every service of a control session from **one** tunnel pool per
+  carrier instead of one pool per service — the streams name their service on
+  the wire already, so nothing else changes, and a session with several
+  services pays for one set of tunnels instead of one set per service.
+  `[client.data].idle_timeout` (default 60 s) is how long a pool with no
+  streams, no pending opens and no pinned UDP peers must stay idle before it
+  gives one tunnel back, and `[client.data.tcp|kcp].max_tunnels` (default 4,
+  validated `>= 1`) is the cap it may grow to. Growth is the client's own
+  decision — an open that would queue, a pool at 12 % of a tunnel's stream
+  capacity, or a UDP service whose configured workers need more tunnels —
+  and shrink is
+  deliberately conservative: a tunnel carrying a live UDP peer is never
+  removed, so a stateful UDP session keeps the source port its service sees.
+  Two opt-in switches make the policy measurable rather than asserted:
+  `MOLEHILL_POOL_STATS=1` prints one line per live pool per second (size,
+  per-tunnel streams/pending/pinned, and the reason for each size change) and
+  `MOLEHILL_PLACEMENT_STATS=1` aggregates each second's placements and their
+  open latency. The server's `MOLEHILL_UDP_STATS=1` line now carries the
+  affinity table's size, its evictions and each worker's pinned peers. See
+  `docs/internals.md`, "The tunnel pool".
+
+
+- **BREAKING (configuration)**: the pool has no initial size any more, so the
+  keys that described one are gone — **`[client.data].default_count`, a
+  service's `count`, a service's `pool_size` and a service's
+  `heartbeat_timeout`, plus `[server].max_pool_size`**. A config that still
+  carries one is refused before the start, naming every key and its
+  replacement. What to write instead
+  (the full table is in `docs/configuration.md`, "Migrating to 0.10"):
+  per-service `udp_workers` (default 2) replaces the UDP `pool_size`; a TCP
+  service's channels are opened on demand, one per visitor; the heartbeat
+  timeout is no longer per service because one session carries one timer; and
+  the server's valve is `[server.data].max_tunnels_per_client` (default 0 =
+  unlimited). UDP-only
+  keys on a TCP service (`udp_buffer_size`, `udp_idle_timeout`,
+  `udp_send_queue_size`, `udp_forwarder_ipv6`, `udp_workers`) are **errors**
+  now instead of being accepted and silently ignored, which is the defect this
+  closes. See `docs/configuration.md` for every key's meaning.
+
+- **The tunnel pool starts cold, and the first visitor pays for it.** With no
+  initial size to configure, a service's pool is empty until something needs a
+  tunnel: that first open grows the pool synchronously, so the first visitor
+  after an idle period waits for one tunnel setup before its bytes move —
+  2.0-3.2 ms on loopback (the M2a measurement). Nothing else changes: every
+  later visitor finds a warm tunnel, the pool still grows on demand up to
+  `max_tunnels`, and an idle pool still gives tunnels back after
+  `idle_timeout` (never below one). A client with many rarely used services
+  pays the setup per service on first use instead of holding a tunnel for each
+  one for its whole lifetime.
+
+- **BREAKING (protocol v4)**: the client speaks protocol v4 and the server
+  serves v4 only, so **upgrade both ends together** — there is no compatibility
+  window in either direction: a v0.9.0 server cannot serve a v0.10.0 client,
+  and a v0.10.0 server refuses a v0.9.0 client's hello. Each side refuses the
+  other's dialect on the connection it happens on and sends nothing back, the
+  side that refused names the version it expected, and the client stops instead
+  of retrying into the void. Both directions are pinned against the released
+  v0.9.0 binary by `just interop`; the migration note is in
+  `docs/configuration.md`, "Upgrading to 0.10 (protocol v4)". What the dialect
+  buys: one
+  control session per endpoint carries *every* service that dials it, each
+  service proving its own credential, so a service the server refuses — a port
+  outside `allow_ports`, a token that is not the server's — is rejected on its
+  own instead of taking the connection and its siblings down with it, and a
+  service whose listener died is re-registered on the same session. The
+  heartbeat timeout is no longer a 40 s value the client guesses with: the
+  server declares its cadence in the session ack, the client derives
+  `max(10 s, 2 × interval + 5 s)` from it, and a configured
+  `client.control.default_heartbeat_timeout` below that floor is refused the
+  moment the session establishes — with both numbers in the message, and
+  without retrying — rather than timing out a healthy server. (It cannot be
+  checked earlier: the cadence is the server's to declare.) Existing
+  configurations keep working unchanged; leaving that key unset now means
+  "derive from the server", and `0` still disables the check. See
+  `docs/configuration.md`, "Upgrading to 0.10 (protocol v4)", and
+  `docs/internals.md`.
 
 - **The log has a level contract, and a healthy run is quiet.** `ERROR` now
   means a human has to act, `WARN` something the tool handled and is worth one
@@ -32,6 +134,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a reference peer's swing is reported with its numbers instead of blocking
   this release. Anyone reading a `soak-check` verdict, or reproducing one, is
   affected; the reasoning each fix rests on is in HANDOFF.md.
+- **The gate checks the bulk spine per stage, not per run.** `just soak-check`
+  used to ask only that a stage-scheduled run carry *some* throughput samples
+  somewhere; a stage whose bulk probe never connected reported "complete"
+  because the other stages had plenty. Completeness now counts each stage's
+  intervals inside its own window against a floor of one per 30 s (minimum
+  one), and reports the recorded reason for a stage that carried none. The
+  clean-tree verdict in a results file is fixed in the same pass: the pathspec
+  that excludes the run's own output from `git status` never matched, so every
+  artifact recorded `tree_clean: false` whatever the tree looked like — a field
+  that had quietly stopped meaning anything.
+- **The host key is now stable, so the comparison half of the gate can run.**
+  Results carried the container hostname as the host identity, which changes on
+  every container restart while the hardware does not — so two runs on the same
+  machine were *refused* as different hosts, and every stored baseline was from
+  a differently-named container. Every run now records `host_id` (machine-id +
+  CPU model + core count, hashed) beside the hostname, and the gate compares
+  that; files that predate the field fall back to the hostname and the gate
+  says which key it used. Per-stage comparisons are also matched by
+  **occurrence** rather than by name, so the return-to-`clean` stage — the
+  recovery axis — is judged against the baseline's *return* stage instead of
+  against its fresh start.
+
+- **BREAKING (protocol): v3 is no longer served.** A v0.10.0 server refuses a
+  client that still speaks protocol v3 — the connection it happens on is
+  closed with no answer, exactly the way a *newer* client against an older
+  server has always been refused — and the server keeps its listener. The v3
+  path (one service per control connection, a registration carrying a
+  requested channel count) is gone with it, together with the two-key service
+  registry that indexed it. Both ends of a molehill deployment are the same
+  binary, so a wire break is a fact to announce rather than a state to serve:
+  upgrade both ends together, in either order, and the refused connection
+  names the version it expected. The interop matrix's new-server/old-client
+  case now pins the refusal, and
+  `tests/integration_test.rs::a_v3_hello_is_refused_on_its_own_connection`
+  pins it on this tree without the old binary.
+
+- **BREAKING (configuration): a removed key no longer starts.** The keys the
+  0.10 configuration surface removed — `[client.data].default_count`, a
+  service's `count`, `pool_size` and `heartbeat_timeout`,
+  `[server].max_pool_size`, a service's `health_check` — were stripped with
+  a warning for one release. They are refused now, in one message naming
+  every key found and what to write instead, because a key that secretes a
+  compatibility path for one release is a key that never gets removed. The
+  upgrade instruction in `docs/configuration.md`, "Migrating to 0.10" is the
+  - **The Soak method was re-derived: the path is shaped once, the cells say how
+  they were measured, and the release artifact carries the load axis.** Four
+  changes to what a published benchmark number means, each with its A/B in
+  HANDOFF.md ("Shaping scope, the rate cells, and the shaped-cell rule"):
+
+  *The stage classes apply to the visitor's leg only.* Until now one HTB class
+  shaped both the visitor leg and the tool's backend leg, so every injected
+  delay was paid twice (a `rtt100` stage's interactive floor read 802 ms) and a
+  `rate100` class carried 100 Mbit *in total* — around 42 % of nominal end to
+  end on every arm. Measured on one binary, one method, only the scope changed:
+  floors halve (802 -> 401 ms, 162 -> 82 ms), the rate classes read 91-100 % of
+  nominal, the worst stage transition drops from 25-28 s to 7 s, and a saturated
+  20 Mbit link's real queueing becomes visible (p99 7.4-8.3 s against the 2.0-3.8
+  s the old scope hid by halving the offered load). `SOAK_SHAPE_LEGS=both`
+  reproduces the old scope; the value used is in `meta.shape_legs` and in the
+  gate's method keys, so runs across the change are refused, not compared.
+
+  *A stage's bulk cell is the load over its whole window, and the cell names the
+  side that measured it.* The peak interval was a property of the shaper's
+  schedule; the reading is now span-weighted over the stage, and on a rate class
+  — where the client's socket buffer defeats the sender's accounting by
+  construction — it is the receiver's own window, marked `*` in the tables. A
+  rate stage whose dial produced no receiver summary carries no reading and says
+  why (`rate20`, whose client is still blocked 30 s past the boundary, is such a
+  cell) instead of publishing the defeated side's zero.
+
+  *A shaped stage's interactive cell is reported as context, not judged.* Three
+  runs of one unchanged method move a shaped p99 cell by 5-24 % against the 25 %
+  limit the gate applies per stage, so the gate now fails only a blow-up (3x)
+  there and the README marks those columns and picks no winner in them.
+
+  *The host key is a measurement as well as a name.* Every run records
+  `host_calibration` (SHA-256 over a fixed 192 MiB buffer, median of three,
+  1-2 % repeatable), and the gate refuses to compare two runs whose calibrations
+  differ by more than 25 % — closing the hole that on a host without
+  `/etc/machine-id` the identity key is only `cpu_model | nproc`.
+
+- **The rate-shaped cells are measured with a bounded sender.** A rate shaper
+  made the bulk client's socket buffer absorb the whole stage: its measured
+  intervals then read zero bytes while the path kept carrying them, `rate20`
+  never produced a summary at all, and the number it left was not merely
+  unreadable but wrong — 0.0334 Gbit/s on a 20 Mbit path, 70 % above nominal,
+  because the transfer outlived the stage it was measured in. The client's
+  window on a **rate** class is now bounded (`SOAK_RATE_SOCKET_WINDOW`, default
+  `256K`; `off` reproduces a run measured before it): the zero-byte share falls
+  from 72-79 % to 13-14 %, `rate20` reads 0.0196 (98 % of nominal) and
+  `rate100` 0.1000 against 0.0935-0.1081. The reading rule follows the
+  measurement rather than the class, so a cell whose sender can speak is read
+  from the sender again, and the receiver's window is left for the cells that
+  still need it. `just soak-check --screen` also reports one verdict per metric
+  now (throughput *and* interactive p99) instead of choosing one for the run —
+  which is how the two A/Bs below were read.
+
+- **The pool-size and shared-pool questions are answered.** Measured
+  interleaved, one binary, matched load: raising `max_tunnels` from 4 to 8 does
+  not help a mixed workload (at 15 or more streams the shipped cap wins all six
+  steps on interactive p99, by 42-61 %), and a **shared** pool
+  (`[client.data].shared_pool = true`) costs interactive latency against the
+  shipped per-service default at nineteen of twenty steps (median p99 8.15 ms
+  against 5.00) while the two are indistinguishable on throughput. The defaults
+  do not change; the numbers behind them are in HANDOFF.md.
+
+- **UDP's capacity ceiling is documented and measured.** A UDP service's
+  datagram throughput is bounded **per pool**, not per worker: measured on one
+  host, `udp_workers` at 1, 2 and 4 carried 1.14, 1.00 and 0.98 Gbit/s of
+  1400-byte datagrams, unchanged by 16 or 64 visitors, and datagrams beyond it
+  are dropped (the design's deliberate choice over head-of-line blocking other
+  visitors, counted under `MOLEHILL_UDP_STATS` as `queue_full`). The
+  configuration page says so beside the knob, and the measurement also settles
+  the milestone row that asked for a shortest-queue assignment rule: there is no
+  imbalance to correct (visitors spread evenly in every configuration, and the
+  drop equals the excess over the ceiling to within 0.07 %).
+
+- **A configuration that cannot serve is refused out loud.** The instance was
+  spawned and its result only looked at when a later configuration change
+  arrived, so a failure at startup left the process alive, silent and serving
+  nothing — measured with the control port already held by another process:
+  four `INFO` lines, "Running as a server" among them, an empty log afterwards
+  and no listener. The failure now ends the process with the cause and a
+  non-zero exit (`the instance stopped: Failed to listen at
+  \`server.control.bind_addr\`: Address already in use`). A failure that arrives
+  with a reload is reported the same way.
+
+- **The comparability key measures the path, not just the CPU.** Every run
+  records two tool-free calibrations now: the existing CPU workload (state) and
+  a loopback-path probe (512 MiB through one socket pair, median of five,
+  pinned to one CPU *in a child process of its own*, Gbit/s). They answer different questions — two container
+  instances of one `host_id` measured 25-39 % apart on the clean cells of the
+  two arms that reach the loopback ceiling while the CPU probe read 1.7 % apart
+  — so a comparison is refused when either moves (the path within 15 %), and a
+  file that predates a probe is reported as unverifiable for it rather than read
+  as agreement. Unpinned, the probe read *bimodally* across processes (29.4-29.7
+  against 34.2-34.4 Gbit/s on an idle host), which no tolerance can carry;
+  pinned it repeats to ~1.5 % and drops ~5 % under four busy loops.
+
+- **The release sweep publishes the load axis too.** `--test` takes a comma
+  list and the ritual runs `--test=rrul,capacity`, so
+  `results-soak-vX.Y.Z.json` carries "how many bulk streams it sustains before
+  the SLO breaks" beside the staged schedule, measured on the same host at the
+  same revision. The two are separate instruments and are never cross-checked.
+  See `docs/release.md`, "Benchmarks", and `docs/benchmarks.md`, "Test types".
 
 ### Removed
 
@@ -47,11 +294,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed request now goes to the client's log, where an operator can see it.
   Operationally nothing needs to be done to recover a backend: it is enough to
   start it, and the service that was never deregistered forwards again. A config
-  that still carries `health_check` starts and logs a warning; the key becomes
-  an error in the next release. See `docs/configuration.md`, "A local service
+  that still carries `health_check` is refused, in the one message that names
+  every removed key and what to write instead (see "BREAKING
+  (configuration)" above). See `docs/configuration.md`, "A local service
   that is down".
 
 ### Fixed
+
+- **One visitor's unanswerable channel request no longer parks the whole
+  service.** The server's accept loop paired visitors one at a time, so a
+  request the client could not answer — a pool at its placement ceiling, which
+  the client reports to nobody — held the accept loop for the visitor's whole
+  25-second budget, every visitor behind it queued unanswered, and the k-th
+  one was shed a full budget after the first. Pairing is per visitor now, with
+  the number of pairings in flight bounded (128): a shed visitor costs that
+  visitor and the service keeps accepting and forwarding. A stripe group's
+  gather stays atomic (all-or-none under a lock), and a data-channel open the
+  pool refuses is reported once per process on the client — INFO the first
+  time, then DEBUG — so an out-of-capacity pool is visible instead of a stream
+  of indistinguishable per-connection failures. Pinned by
+  `one_unanswerable_visitor_does_not_park_the_service`, which fails with the
+  serial loop (the second visitor shed 49 s after the first); it also caught a
+  latent test defect — a read whose result was never checked, so a shed
+  visitor's closed socket read as four zero bytes of "garbage".
+
+- **A burst of new streams no longer stacks on one tunnel.** Growth used to be
+  sampled only on the pool's 50 ms maintenance tick, so a burst that opened its
+  streams back to back — a 20-stream `iperf3` bulk test — finished placing every
+  one of them on the same tunnel before the first tick could see it, and that
+  tunnel's interactive and control streams then queued behind the bulk. An open
+  whose chosen tunnel is already at the growth threshold now grows first and
+  places second, so the burst spreads over the tunnels it will use. The in-path
+  growth skips itself when growing is wrong (a growth in flight, a refused
+  growth holding the pool back, the pool at `max_tunnels`, a cold pool), and the
+  maintenance tick keeps its role. Pinned by a test that fails with the whole
+  burst on one tunnel when the in-path growth is removed.
 
 - **A KCP data channel on an IPv6 path no longer fragments either.** The
   path-MTU clamp shipped in v0.9.0 read the kernel's MTU through `IP_MTU`, which
@@ -62,6 +339,249 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option macros, so the crate still adds no `unsafe`), and the session shrinks to
   the path minus the 40-byte IPv6 header and the UDP header. The arithmetic and
   the shrink-only contract are unchanged.
+
+- **A graceful server shutdown now ends the connections it was serving.** The
+  listeners stopped, but a live control session — and every service listener it
+  had bound, and every multiplex tunnel it owned — kept running until the
+  process exited; the lazily-bound KCP listener was not stopped either, so its
+  UDP port stayed bound for the life of the process. On a restart the old
+  session could therefore keep answering on the ports the new server was about
+  to bind (most visibly in a deployment that restarts in place), a restarted
+  server could not bind a KCP port its predecessor still held, and a public
+  port stayed held for as long as the shutdown took. Dropping the registrations
+  ends each session, its services and its tunnels together, and the KCP
+  listener is signalled with the same shutdown; the client sees the closed
+  control channel and reconnects, which is what a restart is supposed to look
+  like from its side.
+
+- **A client that reconnects starts with fresh tunnel pools.** The pools used
+  to survive a reconnect, but their tunnels carried the *previous* session's
+  nonce: the new server refuses them as stale, so every open on a reused pool
+  failed and the pool's own growth was refused too — forwarding stayed down
+  until something else rebuilt the session. The pools are dropped with the
+  connection now (the reconnect path re-registers and re-activates every
+  service, each of which builds the pool it needs).
+
+- **One stream past a tunnel's cap no longer takes the tunnel down.** A
+  multiplex tunnel carries at most 64 concurrent streams, and the 65th used to
+  be answered with a protocol error that terminated the whole connection: a
+  burst that crossed the cap destroyed every service sharing that tunnel —
+  every visitor on it failed at once — and the pool rebuilt from nothing. The
+  one stream is refused now (the engine queues a reset for it, at `ERROR` once
+  and then quietly) while the tunnel keeps serving the streams it already had.
+  The refusal is a failure for the visitor that arrived at the wrong moment and
+  nothing for anyone else. The placement ceiling — 56 of those 64 streams —
+  keeps the case rare; this is what makes it survivable when it happens.
+
+- **A service can no longer be parked for good by one unanswerable request.**
+  The visitor accept loop pairs one connection at a time: it takes a visitor,
+  asks the client for a data channel, waits, forwards, and only then accepts
+  the next one. That wait had no bound, and a request the client cannot answer
+  never comes back at all — a pool at its placement ceiling refuses the open
+  and reports the refusal to nobody. One such visitor therefore stopped the
+  service from accepting anything, permanently, even after every stream had
+  been released and the pool was empty. It is reproducible without a
+  benchmark: saturate a pool, drain it completely, then connect — the fresh
+  visitor hung. The wait is a budget now (5 s) that asks again on expiry,
+  because capacity usually comes back and at most one visitor is waiting, and
+  only a visitor the client refuses five times in a row is dropped.
+
+- **The pool grows before it has to refuse.** Growth needed 80 % of a tunnel's
+  stream capacity — 51 of 64 — which a workload has to be shaped deliberately
+  to reach: the benchmark's own peak is 20-21 concurrent streams per service,
+  so the pool stayed at a single tunnel and everything queued behind it. It
+  grows at 12 % instead, once a tunnel carries seven streams, which is where
+  head-of-line blocking starts to show in the interactive stream.
+
+- **A forwarded connection that moves nothing in either direction is closed.**
+  A visitor whose stream wedged — the path recovered, the connection never did
+  — held that stream for the life of the session, because nothing released it,
+  and the pool had one less place to put a working visitor. A forward that
+  moves no bytes either way for 300 s is closed now, which releases the stream.
+
+- **The multiplex receive window is 32 MiB, not 64.** At 64 MiB a saturating
+  bulk transfer starved the engine's own window accounting, so `iperf3` ended
+  a completed transfer with `error - idle timeout for receiving data` and exit
+  1 — a finished measurement reported as a failed one. The boundary is
+  measured: 8, 16 and 32 MiB all finish with exit 0 on the same path, 64 MiB
+  does not, and the smaller window costs no throughput.
+
+- **A stalled tunnel writer is woken again.** A stream's reader and writer
+  both park on the connection's per-stream command channel, and both stored
+  their waker in the same slot. A reader that parked last — queueing a window
+  update, which is what returns send credit to the other side — erased the
+  writer's waker, so the credit that came back afterwards woke nobody: the
+  stream's send direction slept until some unrelated resize happened to
+  notify, and every visitor on that tunnel stalled for the rest of the
+  session. The reader now parks in its own slot and the connection wakes both
+  when a command leaves the channel (`src/mux/connection.rs`,
+  `a_readers_channel_park_keeps_the_writers_waker` pins the slot discipline;
+  the stripe livelock it produced is recorded in HANDOFF.md).
+
+- **A tunnel whose connection died leaves the client's pool.** The pool had
+  exactly one removal path — the idle shrink — and it requires the *whole*
+  pool to be quiet, so a single stream that outlived its connection kept the
+  dead tunnel, and its slot against `max_tunnels`, placeable for the rest of
+  the session: every later open that landed on it failed with `Closed` while
+  the pool kept reporting capacity. The pool now reaps a tunnel whose driver
+  has ended on the next maintenance tick, without any idle/warm/cooldown gate,
+  and dials a replacement when the dead tunnel was carrying something
+  (`ShrinkReason::Dead`; `a_dead_tunnel_is_reaped_and_replaced` fails without
+  the reap).
+- **A window update or a stream close no longer queues behind bulk data.** A
+  tunnel's frames all left through one FIFO, so the bodyless bookkeeping that
+  the peer needs to make progress — the credit a window update grants, the FIN
+  that ends a stream — sat behind however much payload the other streams had
+  queued. Those frames now leave through a priority queue ahead of any data
+  frame, the receiver scan round-robins instead of always serving the
+  lowest-numbered ready stream, and the queue is bounded in bytes so one
+  tunnel cannot hold an unbounded amount of payload ahead of a socket that is
+  not draining (`src/mux/connection.rs`; the ordering, the FIFO discipline of
+  payload and the bound are unit-tested).
+- **A visitor whose data channel dies before the forward command is
+  re-paired, not dropped.** The client dials the local service only *after* it
+  receives `StartForwardTcp` on the channel, so a channel whose backend leg is
+  already gone fails in exactly that window — and the server used to drop the
+  visitor on the spot, closing its socket. Measured on the
+  `rate100:120,rate20:120` reproducer: an iperf3 control connection paired with
+  such a channel died as `control socket has closed unexpectedly`, and because
+  every later dial of the stage inherited the failure the bulk spine recorded
+  nothing at all. The visitor now asks for another channel, under the same
+  `PAIR_ATTEMPTS` allowance a *missing* channel gets
+  (`src/core/server.rs::serve_tcp_visitor`).
+- **The Soak schedule drains a stage before reshaping the next one.** The
+  method's `rate20` cell published "spine produced no intervals" for every
+  tool, and the cause was in the harness: a stage boundary killed the bulk
+  client and immediately changed the qdisc, so the old stage's kernel-side
+  drain and FIN retransmissions shared the new, slower queue with the next
+  stage's handshake. Measured with no tool in the path at all, a fresh connect
+  timed out after 10.5 s and the next round trip took 3.5-6.7 s. The harness
+  now waits at the *old* shaper until the netem queue is empty and the
+  throughput port has no established connection (bounded by
+  `SOAK_DRAIN_BUDGET`; both halves of that predicate were later widened, see
+  the two bullets below), restarts the single-test `iperf3` backend
+  before every stage's bulk attempt, and records the client's own failure text
+  instead of a bare exit code. See `docs/benchmarks.md`, "The stage schedule".
+
+- **The Soak drain reads the queue it claims to drain.** That wait had a hole
+  in it: `tc` renders a `backlog` with a unit suffix (`b`, `Kb`, `Mb`, `Gb`)
+  and the drain's pattern accepted only the bare `b`, so any queue large enough
+  to print as `Kb` — which is every backlog at a rate-shaped transition — was
+  read as *no qdisc at all*, and the drain returned without waiting for
+  anything. It was a silent no-op at exactly the transitions whose queued bulk
+  it exists to absorb, which is where every empty bulk cell of this cycle's
+  sweeps was (`molehill`'s `rate20`, `nps`'s `jitter`): reproduced
+  deterministically on the `rate100:20,rate20:20` transition, 3 of 3 runs dead
+  before the change and 3 of 3 carrying their spine after it, with the suffix
+  scale (KiB) checked against `tc -s -j` on the same instant. The drain and the
+  transition now also record what they left behind, per stage
+  (`drain_s`, `drain_expired`, `drain_final_backlog`, `drain_busy_sockets`,
+  `spine_sockets`, `backend_restart`, `spine_attempts`,
+  `spine_first_interval_s`), so a stage that starts on a busy path says so
+  rather than leaving it to be guessed. No schedule, port set, load fraction or
+  SLO changed. See `docs/benchmarks.md`, "The stage schedule".
+
+- **A stage transition ends when the path is quiet, not when a timer runs
+  out, and the bulk spine is redialed if it has to be.** Three things were
+  wrong with the wait between stages, and all three are fixed together because
+  they are one behaviour:
+
+  *The wait could not be satisfied.* Its predicate was "the netem queue is
+  exactly empty **and** the throughput port has no established connection", and
+  neither half was decidable: the interactive, churn and UDP probes share the
+  tool's class and leave ~1.2 KB queued permanently (measured with a 400 s
+  budget — the queue settled at 1.2 KB and never reached zero), and
+  `established` alone reads **0** from ~t+20 s while the killed client's
+  `FIN-WAIT-1` sockets are still retransmitting megabytes. So the wait could
+  only ever end by expiring, which made every transition timer-driven: whether
+  the next stage's dial survived depended on whether the clock happened to
+  allow enough time. It now waits for a queue *tolerance* (no more than one
+  `lo` frame, 64 KiB) **and** for no socket in a state that can still send —
+  `ESTAB`, `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`, and not the
+  teardown states, which linger for minutes carrying nothing.
+
+  *`SOAK_DRAIN_BUDGET` is a safety net, not the mechanism*, sized above the
+  measured worst case (180 s against ~159 s: that is how long a `rate20`
+  stage's killed 20-stream client takes to retransmit what its kernel holds at
+  that stage's own 20 Mbit/s). A net that fires is recorded per stage, and both
+  the tolerance and the state set travel in `meta`.
+
+  *The spine is dialed at `SOAK_SPINE_RETRY_S` seconds into the stage* (default
+  `0,25,50,80`) and stops at the first dial that carries intervals; a dial that
+  has carried nothing is abandoned at the next offset, so a stuck one cannot
+  eat the retry it exists to leave room for. A healthy stage never notices —
+  its first dial runs the stage out — and a recovered stage is visible rather
+  than silent: `spine_attempts` counts the dials and `spine_first_interval_s`
+  records when bulk started.
+
+  The result is a measurement whose start state is controlled rather than
+  fitted: in the release sweep every one of the 32 tool-stages dialed on its
+  first attempt, and the transitions cost less than the fixed budget they
+  replaced (197 s per tool in total, against 840 s of budget expiry). See
+  `docs/benchmarks.md`, "The stage schedule".
+
+- **`just soak-check` compares the method, and refuses a cell the method
+  cannot measure.** Two things the release gate stated too weakly:
+
+  *Comparability was checked as one integer.* `workload_version` is a single
+  number for the whole model, and this cycle changed five method keys while it
+  stayed `1` — the stage transition, the drain's predicate and budget, the
+  spine's retry schedule — so the gate would have called two different
+  instruments comparable and printed verdicts from the comparison. It now
+  compares the runs' method records (`soak_check.METHOD_KEYS`: the schedule,
+  the shaper classes, the load, the SLO, the probe rates and the transition
+  settings) and refuses, naming every key that differs **and** every key one
+  file does not record at all — an absent key is an instrument that file cannot
+  describe, not a default to be assumed. Every blocking reason is reported, not
+  just the first, because a baseline can fail more than one and naming only one
+  would suggest that clearing it makes the pair comparable.
+
+  *A degenerate cell was still published as a number.* At or over half of a
+  stage's bulk intervals reading zero bytes — which is every rate-shaped stage,
+  because netem holds each interval's bytes past that interval's own accounting
+  window — the peak that remains is not a throughput measurement, and both the
+  plot's tables and the README now print that share instead of a figure. The
+  per-stage bulk table is generated by `just soak-plot` for the first time, so
+  the README's bulk numbers and the tool cannot drift apart.
+
+  *And the run now states its own noise.* The schedule measures `clean` at both
+  ends of every timeline, so every run contains a replicate of one condition
+  about an hour apart. `just soak-check` reports that spread per tool — 18.83 to
+  20.48 Gbit/s for molehill, 0.4 % for frp — and it is the scale a between-tool
+  difference has to clear. It is reported, never judged: variance is data, and
+  a threshold on it would be invented. Applied to this release's numbers, the
+  clean path reads molehill 18.8-20.5 Gbit/s against rathole's 17.6-18.0:
+  ranges that do not overlap, but a gap inside molehill's own replicate spread,
+  so this run does not separate them either; frp is 3.1-3.4x behind, and
+  molehill's clean latency (7.6-8.4 ms) is an order of magnitude better than
+  rathole's (77.4-77.7 ms). See `docs/benchmarks.md`, "Comparability".
+
+- **A `client`-only build compiles again, and so does `client,kcp`.** Two
+  `#[cfg]` gates were left behind when the v3 path was deleted, both by
+  removing the line *under* an attribute and leaving the attribute to attach
+  itself to the next item: `read_register_result` became gated on `server` as
+  well as `client`, so a `client`-only build could not find the reader its own
+  session loop calls, and `common::owned_write` — which the noise and the KCP
+  transports both use on either side — became `server`-gated, so `client,kcp`
+  could not compile. CI's feature-powerset job and the `minimal` profile build
+  have been red since the v4-only commit for exactly these two; `just powerset`
+  (all 251 combinations) and `cargo build --profile minimal
+  --no-default-features --features client` both pass now.
+
+- **A datagram over `udp_buffer_size` no longer ends the UDP service on
+  Windows.** The contract is that such a datagram arrives truncated to the
+  limit, and POSIX does that in the kernel and reports the buffer's length;
+  Windows fills the same buffer with the same prefix but reports
+  `WSAEMSGSIZE`, and that read error was taken for a dead socket — so one
+  oversized datagram ended the service's whole UDP pool, told the client the
+  service was no longer exposed, and, on the way back, broke the forwarder that
+  read the local service's oversized reply. The server now reads a
+  whole-datagram buffer and applies `udp_buffer_size` to what it read, because
+  a failed `recv_from` is also where the visitor's address is lost and the
+  datagram could then be neither truncated nor routed; the client's connected
+  socket reads the error as the full buffer it stands for.
+  `udp_buffer_size_bounds_a_datagram_without_breaking_the_channel` pins both
+  halves — it is the branch's Windows build job that caught this.
 
 ## [0.9.0] - 2026-09-25
 

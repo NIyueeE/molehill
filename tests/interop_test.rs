@@ -24,13 +24,34 @@
 //!
 //! Three cases, in the order a break would be caught:
 //!
-//! 1. old server + new client forwards traffic (the new client did not change
-//!    what it says on the wire);
-//! 2. new server + old client forwards traffic (the new server still accepts
-//!    what it used to);
+//! 1. an old server **refuses** the new client's dialect and says nothing else
+//!    — and the refusal is local to that connection: the same old server
+//!    process still forwards for a client of its own version, and the new
+//!    client reports *why* instead of retrying forever;
+//! 2. the new server **refuses** the old client's dialect (v0.10.0 dropped the
+//!    v3 server path, so there is nothing on the other side to serve it) —
+//!    and the refusal is local: the same server process still forwards for a
+//!    client of its own version;
 //! 3. an old server rejects an *unknown dialect* cleanly and keeps serving
 //!    (it closes that one connection instead of hanging, crashing, or taking
 //!    the listener down with it).
+//!
+//! Only case 2 is a forwarding case now: v0.10.0 changed the dialect the client
+//! speaks *and* dropped the dialect the server used to serve, so a matrix that
+//! claimed old-to-new forwarding in either direction would hide exactly the
+//! break it exists to catch. Case 2 therefore proves the direction that
+//! changed — the new server refuses the dialect it no longer serves, says so on
+//! the connection it happens on, and keeps its listener — while cases 1 and 3
+//! prove that the old server's own refusals are local. Both halves of the
+//! break being announced is what makes the upgrade path visible: an operator
+//! running mixed versions sees *why* the connection died rather than a retry
+//! loop.
+//!
+//! The matrix's peer is the previous *release*, and that binary speaks the v3
+//! dialect this server no longer serves, so there is no binary here that speaks
+//! v4 minus the stripe-group request: what a v4 peer receives is pinned by
+//! `tests/session_test.rs::a_striped_gather_names_its_group_on_every_request`
+//! instead.
 //!
 //! The configs below deliberately use only keys that exist in both versions —
 //! a key this cycle renames would make the old binary fail to start, and the
@@ -77,6 +98,10 @@ const CONTROL_HELLO_LEN: usize = 1 + 1 + 32;
 /// An old peer must reject a dialect it does not know. Nothing has a
 /// `u8` version 99.
 const UNKNOWN_VERSION: u8 = 99;
+
+/// The dialect a 0.9.0 peer speaks and this build does not serve, written raw
+/// because this build can no longer produce such a hello.
+const PROTO_V3_BYTE: u8 = 3;
 
 /// The old release binary, or `None` when the environment did not provide one.
 fn old_bin() -> Option<PathBuf> {
@@ -205,6 +230,13 @@ impl Proc {
         lines[start..].join("\n")
     }
 
+    /// The whole log. A case that asserts on a line (rather than on a round
+    /// trip) cannot use `tail`: the line it wants may be older than the last
+    /// twenty by the time the wait ends.
+    fn log_text(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
     /// Non-empty only when the process died on its own: a clean shutdown at the
     /// end of a case is not an error.
     fn died(&mut self) -> Option<String> {
@@ -328,10 +360,51 @@ fn wait_for_forwarding(case: &mut Case) -> std::io::Result<()> {
     )))
 }
 
-/// Both directions of the forwarding matrix: `server_bin` serves, `client_bin`
-/// registers a service through it, and a visitor's bytes must come back.
-fn forwarding_case(label: &str, server_bin: &Path, client_bin: &Path) -> Case {
-    let mut case = Case::new(label);
+/// Wait until the process at `case.procs[index]` has written `needle`.
+///
+/// A log line is the observable when the thing being asserted *is* a message:
+/// case 1 exists because a client meeting a server that cannot serve its
+/// dialect must say what happened ("this server is older than me") rather than
+/// retry into the void, and the client's own output is the only place that
+/// statement exists.
+fn wait_for_log(case: &mut Case, index: usize, needle: &str) -> Result<(), String> {
+    let deadline = Instant::now() + STARTUP;
+    while Instant::now() < deadline {
+        if case.procs[index].log_text().contains(needle) {
+            return Ok(());
+        }
+        case.assert_alive();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!(
+        "no line containing {needle:?} within {STARTUP:?}\n--- {} log ---\n{}",
+        case.procs[index].name,
+        case.procs[index].log_text()
+    ))
+}
+
+/// 1. An old server cannot serve the new client's dialect — and says so by
+///    closing, while the new client reports the mismatch instead of retrying.
+///
+/// This case inverted when v0.10.0 moved the client to protocol v4: the old
+/// server reads version 4, fails its version check and closes without a reply.
+/// A silent retry loop against it would be the dangerous shape (the client
+/// looks healthy while its services are invisible), so the assertion is on the
+/// *message*: the client must name the version mismatch. The refusal also has
+/// to be local: the same server process then serves a client of its own
+/// version, which is the strongest statement that the dialect broke and not the
+/// listener.
+#[test]
+#[ignore = "interop: needs MOLEHILL_OLD_BIN (run: just interop)"]
+fn old_server_refuses_new_client_and_says_so() {
+    let Some(old) = skip("old_server_refuses_new_client_and_says_so") else {
+        return;
+    };
+    println!(
+        "matrix: old server ({}) + new client ({NEW_BIN})",
+        old.display()
+    );
+    let mut case = Case::new("old-server-new-client");
     let control = free_port();
     case.exposed = free_port();
     let backend = free_port();
@@ -342,48 +415,138 @@ fn forwarding_case(label: &str, server_bin: &Path, client_bin: &Path) -> Case {
         "client.toml",
         &client_config(control, case.exposed, backend),
     );
-    case.spawn("server", server_bin, "--server", &server_cfg);
-    case.spawn("client", client_bin, "--client", &client_cfg);
+    case.spawn("server", &old, "--server", &server_cfg);
+    case.spawn("client", Path::new(NEW_BIN), "--client", &client_cfg);
 
-    if let Err(e) = wait_for_forwarding(&mut case) {
+    // The client is process 1. It must not need the exposed port to exist: the
+    // registration never happens, so this waits on the message alone.
+    if let Err(e) = wait_for_log(&mut case, 1, "protocol v4") {
         let msg = format!(
-            "{label}: {e}\n--- server log (tail) ---\n{}\n--- client log (tail) ---\n{}",
-            case.procs[0].tail(),
-            case.procs[1].tail()
+            "the new client never reported the protocol mismatch: {e}\n\
+             --- server log (tail) ---\n{}",
+            case.procs[0].tail()
         );
         case.fail(&msg);
     }
     case.assert_alive();
-    case
-}
 
-/// 1. The new client still says what yesterday's server expects.
-#[test]
-#[ignore = "interop: needs MOLEHILL_OLD_BIN (run: just interop)"]
-fn old_server_accepts_new_client() {
-    let Some(old) = skip("old_server_accepts_new_client") else {
-        return;
-    };
-    println!(
-        "matrix: old server ({}) + new client ({NEW_BIN})",
-        old.display()
-    );
-    let case = forwarding_case("old-server-new-client", &old, Path::new(NEW_BIN));
+    // Local to that connection: the same old server still forwards for a client
+    // of the version it knows. The old binary is both ends here, which is why
+    // this half needs no new-client cooperation at all.
+    case.spawn("old-client", &old, "--client", &client_cfg);
+    if let Err(e) = wait_for_forwarding(&mut case) {
+        let msg = format!(
+            "one refused dialect took the old server's service down: {e}\n\
+             --- server log (tail) ---\n{}\n--- old client log (tail) ---\n{}",
+            case.procs[0].tail(),
+            case.procs[2].tail()
+        );
+        case.fail(&msg);
+    }
     case.cleanup();
 }
 
-/// 2. The new server still accepts what yesterday's client says.
+/// 2. The new server refuses what yesterday's client says — v0.10.0 dropped
+///    the v3 server path, so the refusal is the contract, and it has to be
+///    local: the same process then forwards for a client of its own version.
+///
+/// This case inverted from "new server + old client forwards traffic": keeping
+/// a v3 serving path alive only for an old peer is exactly the kind of
+/// compatibility that has to be *announced* rather than assumed, so the case
+/// now pins the refusal and the listener's survival. What is asserted is the
+/// refusal's shape — no answer to the dialect it does not serve, and a client of
+/// its own version still served by the same process — which is what a reader of
+/// this matrix needs to know.
 #[test]
 #[ignore = "interop: needs MOLEHILL_OLD_BIN (run: just interop)"]
-fn new_server_accepts_old_client() {
-    let Some(old) = skip("new_server_accepts_old_client") else {
+fn new_server_refuses_old_client_and_keeps_serving() {
+    let Some(old) = skip("new_server_refuses_old_client_and_keeps_serving") else {
         return;
     };
     println!(
         "matrix: new server ({NEW_BIN}) + old client ({})",
         old.display()
     );
-    let case = forwarding_case("new-server-old-client", Path::new(NEW_BIN), &old);
+    let mut case = Case::new("new-server-old-client");
+    let control = free_port();
+    case.exposed = free_port();
+    let backend = free_port();
+    spawn_echo_backend(backend);
+
+    let server_cfg = case.write("server.toml", &server_config(control, case.exposed));
+    let client_cfg = case.write(
+        "client.toml",
+        &client_config(control, case.exposed, backend),
+    );
+    // The new server first.
+    case.spawn("server", Path::new(NEW_BIN), "--server", &server_cfg);
+
+    // Wait for the control listener before speaking to it, then drive it with
+    // a well-formed v3 control hello — the dialect a 0.9.0 client speaks and
+    // this server no longer serves.
+    let control_addr = SocketAddr::from(([127, 0, 0, 1], control));
+    let deadline = Instant::now() + STARTUP;
+    let mut conn = loop {
+        if let Ok(c) = TcpStream::connect_timeout(&control_addr, Duration::from_secs(2)) {
+            break c;
+        }
+        case.assert_alive();
+        if Instant::now() >= deadline {
+            let msg = format!(
+                "the new server never listened on {control_addr}\n--- server log (tail) ---\n{}",
+                case.procs[0].tail()
+            );
+            case.fail(&msg);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let mut hello = Vec::with_capacity(1 + CONTROL_HELLO_LEN);
+    hello.push(PLAIN_SELECTOR);
+    hello.push(0); // variant tag: ControlChannelHello
+    hello.push(PROTO_V3_BYTE); // the dialect this server does not serve
+    hello.extend([0x42u8; 32]); // the digest that dialect would authenticate
+    assert_eq!(hello.len(), 1 + CONTROL_HELLO_LEN, "the hello layout moved");
+    conn.write_all(&hello).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    // The refusal is a closed connection with no answer: the reader cannot
+    // parse a hello whose version it does not serve, so nothing comes back.
+    let mut buf = [0u8; 64];
+    match conn.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => {
+            let msg = format!(
+                "the new server answered a v3 hello with {n} bytes: {:?}",
+                &buf[..n]
+            );
+            case.fail(&msg);
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Err(e) => {
+            let msg =
+                format!("the new server left a v3 hello hanging ({e:?}) instead of refusing it");
+            case.fail(&msg);
+        }
+    }
+
+    // The refusal was local: a client of the server's own version forwards
+    // through the same process.
+    case.assert_alive();
+    case.spawn("new-client", Path::new(NEW_BIN), "--client", &client_cfg);
+    if let Err(e) = wait_for_forwarding(&mut case) {
+        let msg = format!(
+            "one refused dialect took the new server's service down: {e}\n\
+             --- server log (tail) ---\n{}",
+            case.procs[0].tail()
+        );
+        case.fail(&msg);
+    }
     case.cleanup();
 }
 
@@ -470,9 +633,11 @@ fn old_server_rejects_unknown_dialect_and_survives() {
     }
 
     // The refusal must be local to that connection: the same process still
-    // has to serve a client that speaks the dialect it knows.
+    // has to serve a client that speaks the dialect it knows. That client is
+    // the old binary itself — the new client speaks v4, which this server has
+    // just been shown to refuse (case 1), so it cannot be the witness here.
     case.assert_alive();
-    case.spawn("client", Path::new(NEW_BIN), "--client", &client_cfg);
+    case.spawn("old-client", &old, "--client", &client_cfg);
     if let Err(e) = wait_for_forwarding(&mut case) {
         let msg = format!(
             "one unknown dialect took the old server's service down: {e}\n\

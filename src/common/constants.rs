@@ -17,32 +17,43 @@ pub const DEFAULT_UDP_BUFFER_SIZE: usize = 2048;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const TCP_COPY_BUFFER_SIZE: usize = 32 * 1024;
 
-/// Default number of pre-established data channels per TCP service.
-pub const DEFAULT_TCP_POOL_SIZE: u16 = 8;
-/// Default number of pre-established data channels per UDP service.
-pub const DEFAULT_UDP_POOL_SIZE: u16 = 2;
+/// How long a forwarded connection may move **no bytes in either direction**
+/// before the proxy gives up on it and closes it.
+///
+/// A stalled forward is not a rare edge: under loss a visitor's socket stops
+/// draining, the copy task blocks on its write, stops polling its reader, and
+/// the peer's flow-control window closes behind it. Nothing in TCP ends that
+/// by itself — an application waiting for a reply that can never arrive has no
+/// timeout of its own — and a v0.10.0 data channel is a *stream of a shared
+/// tunnel*, so every stalled visitor holds a slice of the tunnel's stream
+/// budget. Measured on 2026-09-27: a shaped bulk run wedged one tunnel's 64
+/// streams this way until the engine's cap killed the whole tunnel, taking
+/// every visitor on it (see HANDOFF.md, "the engine's stream cap is still
+/// reachable").
+///
+/// Five minutes is chosen to be far above any legitimate quiet period in the
+/// workloads this project measures (the longest single `iperf3` run is 2 min)
+/// while still bounding a wedge in a way an operator can reason about: a
+/// connection that has moved nothing for five minutes is reported as failed
+/// and its budget returned. It is deliberately not a configuration key yet —
+/// the number has one measurement behind it, and the S1-style rule is that a
+/// knob arrives with the evidence to tune it.
+#[cfg(any(feature = "client", feature = "server"))]
+pub const FORWARD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Default number of data channels a UDP service's worker set uses
+/// (`[client.services.<name>].udp_workers`).
+///
+/// A UDP service's channels are its *workers*: the server shards distinct
+/// visitors across them (session affinity) and the pool keeps at least as many
+/// tunnels as the workers need, so this is the one per-service channel count
+/// that survives. A TCP service has no worker set — one data channel is opened
+/// per visitor, on demand.
+pub const DEFAULT_UDP_WORKERS: u16 = 2;
 
 /// Queue size for visitor-bound UDP datagrams per data channel, on both the
 /// server (affinity routing queue) and the client (channel writer queue).
 pub const DEFAULT_UDP_SENDQ_SIZE: usize = 1024;
-
-/// Default number of parallel multiplex tunnels per control session.
-///
-/// 4 is the measured sweet spot of the transport comparison: it aggregates
-/// throughput beyond a single TCP flow (loopback 8-stream 4.3 -> 12 Gbps,
-/// 1% loss 3.7 -> 7.1 Gbps in the bench matrix) and cuts head-of-line
-/// latency (`rtt10` `HoL` max 101 -> 81 ms) while keeping connection overhead
-/// modest. Each tunnel is a full physical connection (TCP handshake +
-/// transport crypto + yamux session); `[client.data].default_count = 1` reproduces
-/// the single-tunnel behavior.
-#[cfg(feature = "multiplex")]
-pub const DEFAULT_MUX_TUNNELS: usize = 4;
-
-/// Upper bound for `[client.data].default_count`; larger values are clamped. Each
-/// tunnel is a full physical connection (TCP handshake + transport crypto +
-/// yamux session), so the sane range is small by construction.
-#[cfg(feature = "multiplex")]
-pub const MAX_MUX_TUNNELS: usize = 64;
 
 /// Default total yamux receive window (bytes) advertised per tunnel, on both
 /// ends.
@@ -50,15 +61,21 @@ pub const MAX_MUX_TUNNELS: usize = 64;
 /// yamux's own default is 1 GiB per connection: under loss the receiver's
 /// credit lets the peer keep unbounded data in flight, so the backlog grows
 /// without bound (measured: 211 MiB avg / 620 MiB peak at 1% loss on the
-/// client end). The cap must still be generous, because yamux's auto-tuner
-/// never decreases a stream window and a single stream's steady throughput
-/// is roughly `window / (2 * RTT)` — 16 MiB with 32 streams (8 MiB
-/// allocatable) measured 30-65% slower on delayed links. With 32 streams
-/// reserving 8 MiB, a 64 MiB window leaves 56 MiB allocatable: the full
-/// bench matrix keeps its throughput (peak per-tunnel need ~13.8 MiB at
-/// 100 ms RTT) and loss backlog stays bounded near `count * 64 MiB`.
+/// client end). The window has to be generous because yamux's auto-tuner never
+/// decreases a stream window, but it also has to be *bounded enough that a
+/// finished test can finish*: on a shaped path the sender keeps filling the
+/// credit, so the last control exchange of a run (an `iperf3` test's results)
+/// queues behind whatever bulk data is still in flight. At 64 MiB that queue
+/// outlived `iperf3`'s own patience — it exited 1 with
+/// `unable to receive results` after 121 good intervals, which reads as "the
+/// bulk spine produced nothing" to the harness (see HANDOFF.md).
+///
+/// 32 MiB is the measured compromise on the `rate100` path class: the run
+/// completes (client exit 0) at 0.24 Gbit/s against 64 MiB's 0.26 Gbit/s and
+/// exit 1 — correctness bought for ~8 % of a rate-limited cell, not the 30-65 %
+/// a window that is too small costs on an unshaped delayed link.
 #[cfg(feature = "multiplex")]
-pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 32 * 1024 * 1024;
 
 /// Default maximum concurrent streams per tunnel connection.
 ///
@@ -68,13 +85,30 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 64 * 1024 * 1024;
 /// window pins every stream at 256 KiB — measured 0.1 Gbps at 10 ms RTT,
 /// a ~30x drop — so the pairing with `DEFAULT_MUX_RECEIVE_WINDOW` is
 /// guarded by a unit test (the reservation must stay under half the
-/// window). 32 streams reserve 8 MiB of the 64 MiB window; 64 reserve
-/// 16 MiB and still leave 48 MiB (75%) auto-tunable, while doubling the
-/// per-client connection ceiling at the default `count = 4` (128 -> 256).
+/// window). 64 streams reserve 16 MiB of the 32 MiB window and still
+/// leave 16 MiB (50%) auto-tunable, while doubling the per-client
+/// connection ceiling at the default `max_tunnels = 4` (128 -> 256).
 /// Measured on the `mux1` arm across the full matrix: see HANDOFF.md,
 /// "Phase 4: L2 landed".
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
+
+/// Upper bound for `[client.data.tcp|kcp].max_tunnels`.
+///
+/// `max_tunnels` is the cap the elastic pool may grow to, so it is validated
+/// (`>= 1`) and clamped, never silently obeyed with an absurd value.
+#[cfg(feature = "multiplex")]
+pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
+
+/// Default cap for `[client.data.tcp|kcp].max_tunnels`.
+#[cfg(feature = "multiplex")]
+pub const DEFAULT_MAX_TUNNELS: u16 = 4;
+
+/// Default `[client.data].idle_timeout` (seconds): how long a client tunnel
+/// pool with no streams, no pending opens and no pinned UDP peers must stay
+/// that way before the elastic pool removes one tunnel.
+#[cfg(feature = "multiplex")]
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// Default idle timeout (seconds) after which an inactive UDP peer mapping is
 /// cleaned up on the client side.

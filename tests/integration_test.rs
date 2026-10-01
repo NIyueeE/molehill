@@ -45,12 +45,43 @@ const AFFINITY_LOCAL_SERVICE: &str = "127.0.0.1:8082";
 const AFFINITY_EXPOSED_ADDR: &str = "127.0.0.1:2340";
 const AFFINITY_PACKETS: usize = 64;
 
+// Ports for the two UDP-knob scenarios (`tests/for_udp/knob_effects.toml`):
+// the fixture owns control 2352 and the exposed 2353/2354, with its backends
+// on 8102/8103. The block 2352-2359 is free in the suite (2333-2351 belong to
+// the transport fixtures, 2360-2366 to the session tests).
+const UDP_KNOBS_CONFIG: &str = "tests/for_udp/knob_effects.toml";
+const KNOB_SMALL_LOCAL: &str = "127.0.0.1:8102";
+const KNOB_IDLE_LOCAL: &str = "127.0.0.1:8103";
+const KNOB_SMALL_EXPOSED: &str = "127.0.0.1:2353";
+const KNOB_IDLE_EXPOSED: &str = "127.0.0.1:2354";
+/// The fixture's `udp_buffer_size`; the assertions below are written in terms
+/// of it so a changed fixture fails loudly instead of drifting.
+const KNOB_BUFFER_SIZE: usize = 1024;
+/// The fixture's `udp_idle_timeout`, and the silence the test waits out before
+/// expecting the mapping (and its local socket) to be gone.
+const KNOB_IDLE_TIMEOUT_SECS: u64 = 2;
+const KNOB_IDLE_SILENCE: f64 = 3.5;
+/// Datagrams sent inside one idle window before the silence starts.
+const KNOB_IDLE_BURST: usize = 4;
+
 // Ports for the transparent-visibility regression
 // (`dead_backend_fails_one_visitor_and_stays_registered`): one service whose
 // backend is not running, and one healthy service on the same client.
 const DEAD_BACKEND: &str = "127.0.0.1:8099";
 const DEAD_EXPOSED: &str = "127.0.0.1:2350";
 const DEAD_NEIGHBOUR_EXPOSED: &str = "127.0.0.1:2351";
+
+// Ports for the session-scoped scenarios (`one_control_session_*`,
+// `a_rejected_service_*`, `a_foreign_service_token_*`,
+// `a_timeout_below_the_heartbeat_floor_*`). Each fixture owns a control port
+// and two exposed ones: the fixtures above own 2333-2351, `session_test` owns
+// 2360-2364, and these are the free block between them.
+const SESSION_REJECT_OK: &str = "127.0.0.1:2373";
+const SESSION_REJECT_BAD: &str = "127.0.0.1:2374";
+const SESSION_TOKEN_OK: &str = "127.0.0.1:2376";
+const SESSION_TOKEN_BAD: &str = "127.0.0.1:2377";
+const SESSION_HEARTBEAT_ADDR: &str = "127.0.0.1:2378";
+const SESSION_HEARTBEAT_EXPOSED: &str = "127.0.0.1:2379";
 
 #[cfg(feature = "multiplex")]
 static MUX_CONFIG_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -190,14 +221,16 @@ async fn settle(secs: f64) {
     time::sleep(Duration::from_secs_f64(secs)).await;
 }
 
-/// Per-run overrides of `[client.data]` default fields, materialized into a
-/// temp copy of a fixture.
+/// Per-run overrides of `[client.data]` fields, materialized into a temp copy
+/// of a fixture.
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Default)]
 struct ClientOverrides {
     /// `"multiplex"` or `"direct"`.
     mode: Option<&'static str>,
-    count: Option<usize>,
+    /// `[client.data.tcp].max_tunnels`: the elastic pool's cap (it starts
+    /// cold, so this is a ceiling, not an initial size).
+    max_tunnels: Option<u16>,
 }
 
 /// Placeholder so `test()` keeps its signature without the `multiplex`
@@ -207,12 +240,12 @@ struct ClientOverrides {
 struct ClientOverrides;
 
 /// Materialize a copy of `config_path` with the requested `[client.data]`
-/// default fields applied.
+/// fields applied.
 ///
 /// Fixtures intentionally omit `[client.data]` so they follow the
-/// compiled-in defaults (`mode = "multiplex"`, four tunnels, with the
+/// compiled-in defaults (`mode = "multiplex"`, `max_tunnels = 4`, with the
 /// `multiplex` feature). Explicit copies are what give the integration
-/// matrix its non-multiplexed and multi-tunnel legs. The copy lives in the
+/// matrix its non-multiplexed and wider-cap legs. The copy lives in the
 /// system temp dir and is removed after the scenario.
 #[cfg(feature = "multiplex")]
 fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Result<PathBuf> {
@@ -223,7 +256,7 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
         .get_mut("client")
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| anyhow::anyhow!("Test fixture {config_path} has no [client] table"))?;
-    if overrides.mode.is_some() || overrides.count.is_some() {
+    if overrides.mode.is_some() || overrides.max_tunnels.is_some() {
         if !client.contains_key("data") {
             client.insert("data".to_owned(), toml::Value::Table(toml::map::Map::new()));
         }
@@ -239,10 +272,17 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
                 toml::Value::String(mode.to_owned()),
             );
         }
-        if let Some(count) = overrides.count {
-            data.insert(
-                "default_count".to_owned(),
-                toml::Value::Integer(i64::try_from(count).unwrap()),
+        if let Some(max) = overrides.max_tunnels {
+            let tcp = data
+                .entry("tcp".to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Test fixture {config_path} has a non-table [client.data.tcp]")
+                })?;
+            tcp.insert(
+                "max_tunnels".to_owned(),
+                toml::Value::Integer(i64::from(max)),
             );
         }
     }
@@ -280,9 +320,10 @@ async fn test_transport(config_path: &'static str, t: Type) -> Result<()> {
     Ok(())
 }
 
-/// Arm 1 of the transport comparison: N parallel tunnels per control session
-/// (streams round-robin across them), full lifecycle including client/server
-/// restarts and concurrent load.
+/// Arm 1 of the transport comparison: a multiplexed pool whose cap is 3
+/// tunnels per control session (a stream takes the least-loaded one), full
+/// lifecycle including client/server restarts and concurrent load. The pool
+/// itself starts cold and grows on demand up to the cap.
 #[cfg(feature = "multiplex")]
 #[tokio::test]
 async fn multiplex_tunnel_pool() -> Result<()> {
@@ -295,7 +336,7 @@ async fn multiplex_tunnel_pool() -> Result<()> {
         Type::Tcp,
         Some(ClientOverrides {
             mode: Some("multiplex"),
-            count: Some(3),
+            max_tunnels: Some(3),
         }),
     )
     .await?;
@@ -380,29 +421,43 @@ async fn per_service_data_modes() -> Result<()> {
 #[cfg(feature = "multiplex")]
 const STRIPE_BULK_BYTES: usize = 8 * 1024 * 1024;
 
-/// Push a deterministic pattern through the echo service and verify the
-/// reply is the same bytes in the same order: the striped group's
-/// reassembly contract, in both directions at once (the echo service
-/// mirrors the stream).
+/// The deterministic payload the striped bulk assertions write: a pattern
+/// rather than a constant, so a reordered or duplicated chunk cannot pass for
+/// a match.
 #[cfg(feature = "multiplex")]
-async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
-    let conn = TcpStream::connect(addr).await?;
-    let (mut rd, mut wr) = conn.into_split();
-
-    let mut expected = vec![0u8; len];
-    for (i, b) in expected.iter_mut().enumerate() {
+fn bulk_pattern(len: usize) -> Vec<u8> {
+    let mut pattern = vec![0u8; len];
+    for (i, b) in pattern.iter_mut().enumerate() {
         *b = u8::try_from((i.wrapping_mul(0x9E37_79B1) >> 24) & 0xff).unwrap();
     }
+    pattern
+}
 
-    let write_pattern = expected.clone();
-    let writer = tokio::spawn(async move {
-        for chunk in write_pattern.chunks(64 * 1024) {
+/// Start writing `pattern` on an owned write half without waiting for it: the
+/// striped path's own backpressure is what leaves a large write in flight,
+/// which is the state the placement observation below needs.
+#[cfg(feature = "multiplex")]
+fn spawn_bulk_writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    mut wr: W,
+    pattern: Vec<u8>,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    tokio::spawn(async move {
+        for chunk in pattern.chunks(64 * 1024) {
             wr.write_all(chunk).await?;
         }
         wr.flush().await?;
-        Ok(())
-    });
+        // `Ok` is anyhow's in this file; name the standard one explicitly.
+        std::result::Result::Ok(())
+    })
+}
 
+/// Read exactly `pattern.len()` bytes back and verify they are `pattern`: the
+/// striped group's reassembly contract (in sequence, no byte lost, none
+/// duplicated), in both directions at once because the echo service mirrors
+/// the stream.
+#[cfg(feature = "multiplex")]
+async fn read_bulk_echo<R: tokio::io::AsyncRead + Unpin>(rd: &mut R, pattern: &[u8]) -> Result<()> {
+    let len = pattern.len();
     let mut got = vec![0u8; len];
     let mut read = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -417,12 +472,61 @@ async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
         anyhow::ensure!(n > 0, "echo service closed after {read}/{len} bytes");
         read += n;
     }
-    assert_eq!(got, expected, "the striped path corrupted the byte stream");
+    assert_eq!(got, pattern, "the striped path corrupted the byte stream");
+    Ok(())
+}
+
+/// Push a deterministic pattern through the echo service and verify the
+/// reply is the same bytes in the same order.
+#[cfg(feature = "multiplex")]
+async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
+    let conn = TcpStream::connect(addr).await?;
+    let (mut rd, wr) = conn.into_split();
+    let pattern = bulk_pattern(len);
+    let writer = spawn_bulk_writer(wr, pattern.clone());
+    read_bulk_echo(&mut rd, &pattern).await?;
     writer
         .await
         .context("bulk writer task failed")?
         .context("bulk writer returned an error")?;
     Ok(())
+}
+
+/// One live pool as the placement poll reads it: its size, and the
+/// `(streams, pending, pinned)` of each of its tunnels.
+#[cfg(feature = "multiplex")]
+type PoolShape = (usize, Vec<(usize, usize, usize)>);
+
+/// Wait until one live pool carries a stream on **every** one of its four
+/// tunnels — the per-instant half of D24, which the pool-size assertion after
+/// a transfer cannot see: four streams on three tunnels (with the fourth
+/// empty) is the same pool size as the spread.
+///
+/// Bounded by a deadline rather than a fixed sleep, so the assertion is on a
+/// state that is polled for, not on a guess about how long a placement takes;
+/// the observed `(size, per-tunnel streams)` vectors travel in the failure
+/// message, because "the spread never happened" and "the pool never grew" are
+/// different defects.
+#[cfg(feature = "multiplex")]
+async fn wait_for_a_stream_on_every_stripe_tunnel(deadline: Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let observed: Vec<PoolShape> = molehill_rathole::live_pools()
+            .iter()
+            .map(|pool| (pool.size, pool.tunnels.clone()))
+            .collect();
+        let spread = observed.iter().any(|(size, tunnels)| {
+            *size == 4 && tunnels.len() == 4 && tunnels.iter().all(|(streams, _, _)| *streams >= 1)
+        });
+        if spread {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            start.elapsed() < deadline,
+            "no pool carried a stream on each of its four tunnels within {deadline:?}: {observed:?}"
+        );
+        time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// Data-channel striping: `[server.data] stripe_count = 4` spreads every
@@ -461,7 +565,45 @@ async fn striped_data_channels() -> Result<()> {
     wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
 
     info!("bulk round trip through a striped visitor connection");
-    bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
+    // One visitor, held open across the placement observation: a group's four
+    // channels are gathered when the connection is accepted and live exactly
+    // as long as it does. The write is started first and its echo read only
+    // after the assertion, so the transfer is in flight *by construction*
+    // rather than by timing luck — and the connection is still open when the
+    // pool is read, which is what makes this an instant during the transfer
+    // and not the warm pool an earlier one left behind.
+    let visitor = TcpStream::connect(exposed_addrs(Type::Tcp).0).await?;
+    let (mut visitor_rd, visitor_wr) = visitor.into_split();
+    let pattern = bulk_pattern(STRIPE_BULK_BYTES);
+    let writer = spawn_bulk_writer(visitor_wr, pattern.clone());
+
+    info!("watching the four stripe channels' placement while the transfer runs");
+    wait_for_a_stream_on_every_stripe_tunnel(Duration::from_secs(15)).await?;
+
+    read_bulk_echo(&mut visitor_rd, &pattern).await?;
+    writer
+        .await
+        .context("bulk writer task failed")?
+        .context("bulk writer returned an error")?;
+    // The visitor's end: the group's four channels are released with it.
+    drop(visitor_rd);
+
+    // The structural half of the claim (D24), on the real client and a real
+    // cold pool: the group's four channels grew the pool to four tunnels.
+    // Before the group was named on the wire the pool stayed at *one* — four
+    // concurrent streams sit below the growth rule's per-tunnel threshold (7 on
+    // the shipped cap), so no other rule could have asked for the second
+    // tunnel, and placement can only spread over tunnels that exist. The pool
+    // stays warm for `idle_timeout` (60 s by default), so this reads the state
+    // the group left rather than racing a shrink.
+    let sizes: Vec<usize> = molehill_rathole::live_pools()
+        .iter()
+        .map(|pool| pool.size)
+        .collect();
+    assert!(
+        sizes.contains(&4),
+        "the stripe group must have grown the client's pool to its 4 stripes: {sizes:?}"
+    );
 
     info!("a second visitor gets its own stripe group");
     bulk_echo_roundtrip(exposed_addrs(Type::Tcp).0, STRIPE_BULK_BYTES).await?;
@@ -734,7 +876,8 @@ async fn mixed_transports() -> Result<()> {
 }
 
 /// Arm 2 of the transport comparison: data tunnels are KCP-over-UDP sessions
-/// (Noise-wrapped with the control transport's keys, 2 parallel sessions);
+/// (Noise-wrapped with the control transport's keys, capped by
+/// `[client.data.kcp].max_tunnels` and dialed on demand from a cold pool);
 /// the control channel stays TCP+Noise. Full lifecycle.
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 #[tokio::test]
@@ -888,6 +1031,288 @@ async fn sticky_echo_server(seen_srcs: Arc<Mutex<HashSet<SocketAddr>>>) -> Resul
     loop {
         let (n, from) = l.recv_from(&mut buf).await?;
         seen_srcs.lock().unwrap().insert(from);
+        l.send_to(&buf[..n], from).await?;
+    }
+}
+
+/// The running `knob_effects` pair, with the handles a scenario needs to stop
+/// it. A struct rather than a tuple so the two senders cannot be swapped at a
+/// call site.
+struct UdpKnobPair {
+    client_shutdown: broadcast::Sender<bool>,
+    server_shutdown: broadcast::Sender<bool>,
+    client: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl UdpKnobPair {
+    /// Stop both sides and wait for their instances to end, so a leaked
+    /// listener cannot hold this fixture's ports for the next scenario.
+    async fn stop(self) {
+        let _ = self.server_shutdown.send(true);
+        let _ = self.client_shutdown.send(true);
+        let _ = tokio::join!(self.server, self.client);
+    }
+}
+
+/// Start the `knob_effects` fixture's client and server, in that order (the
+/// client retries until the server is up), and wait until `wait_for` answers.
+/// Only the service under test is probed: the fixture defines both UDP
+/// services, but each scenario starts one backend, and probing the other
+/// would wait for a service whose local address nothing serves.
+async fn start_udp_knob_pair(wait_for: &'static str) -> Result<UdpKnobPair> {
+    let (client_shutdown, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown, server_shutdown_rx) = broadcast::channel(1);
+    let client = tokio::spawn(async move {
+        run_molehill_client(UDP_KNOBS_CONFIG, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server(UDP_KNOBS_CONFIG, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let probe = UdpSocket::bind("127.0.0.1:0").await?;
+    probe.connect(wait_for).await?;
+    wait_for_udp_socket(&probe).await?;
+    Ok(UdpKnobPair {
+        client_shutdown,
+        server_shutdown,
+        client,
+        server,
+    })
+}
+
+/// A UDP backend that records the length of every datagram it receives and
+/// answers: `b"reply-big"` gets a `KNOB_BUFFER_SIZE * 2`-byte reply, anything
+/// else is echoed. Both halves exist because `udp_buffer_size` is enforced on
+/// two different legs — the visitor's datagram is read into the server's
+/// buffer, and the local service's reply is read into the client's — and each
+/// has to be observable on its own.
+async fn length_recording_server(addr: &'static str, lens: Arc<Mutex<Vec<usize>>>) -> Result<()> {
+    let l = UdpSocket::bind(addr).await?;
+    // Larger than either buffer under test: the truncation this fixture is
+    // about must happen in molehill, not in the test's own recv. On the heap,
+    // so the server task's future stays small.
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, from) = l.recv_from(&mut buf).await?;
+        lens.lock().unwrap().push(n);
+        if &buf[..n] == b"reply-big" {
+            let big = vec![0x5au8; KNOB_BUFFER_SIZE * 2];
+            l.send_to(&big, from).await?;
+        } else {
+            l.send_to(&buf[..n], from).await?;
+        }
+    }
+}
+
+/// `udp_buffer_size`: a datagram larger than the configured buffer does not
+/// arrive intact, and the data channel survives it.
+///
+/// The shipped code **truncates** such a datagram to `udp_buffer_size` on the
+/// reading leg (`recv_from` into a `buffer_size` buffer) rather than dropping
+/// it — `docs/configuration.md` says "dropped", and the in-stream drop in
+/// `UdpTraffic::read` only fires for a payload longer than the *receiver's*
+/// buffer, which a consistently configured pair never produces because the
+/// sender already truncated. This pins the behaviour that exists: a visitor's
+/// 2 KiB datagram reaches the backend as 1 KiB, and a backend's 2 KiB reply
+/// reaches the visitor as 1 KiB; a small datagram still round-trips, which is
+/// the "the channel stays usable" half. If the drop ever becomes deliberate,
+/// the two `== KNOB_BUFFER_SIZE` assertions below are the ones to change.
+#[tokio::test]
+async fn udp_buffer_size_bounds_a_datagram_without_breaking_the_channel() -> Result<()> {
+    init();
+
+    let lens = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&lens);
+    tokio::spawn(async move {
+        if let Err(e) = length_recording_server(KNOB_SMALL_LOCAL, recorded).await {
+            panic!("Failed to run the length-recording UDP server for testing: {e:?}");
+        }
+    });
+
+    let pair = start_udp_knob_pair(KNOB_SMALL_EXPOSED).await?;
+
+    // A visitor socket of its own: the readiness probe above is a different
+    // peer, and this one is the peer the assertions are about.
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(KNOB_SMALL_EXPOSED).await?;
+    wait_for_udp_socket(&conn).await?;
+    // Everything the readiness probe sent is behind this index; the datagrams
+    // the assertions below name are the ones this test sends itself.
+    let settled = lens.lock().unwrap().len();
+
+    // A visitor datagram over the limit: read into the *server's* buffer (the
+    // client's registered `udp_buffer_size`), so the backend must see exactly
+    // the limit and the visitor must get that shorter echo back.
+    let oversized = vec![0xa5u8; KNOB_BUFFER_SIZE * 2];
+    conn.send(&oversized).await?;
+    let mut buf = vec![0u8; KNOB_BUFFER_SIZE * 4];
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("no echo of the oversized datagram")??;
+    assert_eq!(
+        n, KNOB_BUFFER_SIZE,
+        "a datagram over udp_buffer_size must not arrive intact"
+    );
+    assert_eq!(
+        &buf[..n],
+        &oversized[..KNOB_BUFFER_SIZE],
+        "the delivered bytes must be the datagram's prefix"
+    );
+
+    // A backend reply over the limit: read into the *client's* forwarder
+    // buffer on the way back, so it reaches the visitor shortened too.
+    conn.send(b"reply-big").await?;
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("no reply to the big-reply request")??;
+    assert_eq!(
+        n, KNOB_BUFFER_SIZE,
+        "the local service's oversized reply must be bounded by udp_buffer_size too"
+    );
+
+    // And the channel is still usable after both: the costs of an oversized
+    // datagram are its own bytes, not the connection.
+    conn.send(b"small-after-oversized").await?;
+    let n = time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("the channel stopped carrying datagrams after an oversized one")??;
+    assert_eq!(
+        &buf[..n],
+        b"small-after-oversized",
+        "the datagram after the oversized ones must arrive intact"
+    );
+
+    let seen = lens.lock().unwrap().clone();
+    assert!(
+        seen.len() > settled + 1,
+        "the backend must have received the test's datagrams: {seen:?}"
+    );
+    assert_eq!(
+        seen[settled], KNOB_BUFFER_SIZE,
+        "the backend sees the visitor's oversized datagram truncated to udp_buffer_size: {seen:?}"
+    );
+    assert_eq!(
+        seen[settled + 1],
+        b"reply-big".len(),
+        "the big-reply request itself is small; only the reply is oversized: {seen:?}"
+    );
+
+    pair.stop().await;
+    Ok(())
+}
+
+/// `udp_idle_timeout`: a peer mapping (and the local socket it owns) is
+/// recycled after the configured silence, and the *next* datagram from the
+/// same peer reaches the backend from a different source port — exactly the
+/// consequence `docs/configuration.md` documents, and the reason a stateful
+/// UDP session has to keep talking or raise the timeout.
+///
+/// Within the window the port must be stable instead: the first half is the
+/// existing affinity guarantee, observed here because the second half is
+/// meaningless without it.
+///
+/// The one assumption in the second half is that the kernel does not hand the
+/// very same ephemeral port back to the fresh socket; with the whole range in
+/// play that is a draw of one in tens of thousands, and it is the same
+/// assumption the affinity test above rests on in the other direction.
+#[tokio::test]
+async fn udp_idle_timeout_rebinds_the_peer_to_a_fresh_local_socket() -> Result<()> {
+    init();
+
+    // Every datagram's source address, in arrival order: the ports the backend
+    // observes are the only place the client's per-peer socket is visible.
+    let seen_srcs: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen_srcs);
+    tokio::spawn(async move {
+        if let Err(e) = port_recording_echo_server(KNOB_IDLE_LOCAL, recorded).await {
+            panic!("Failed to run the port-recording UDP server for testing: {e:?}");
+        }
+    });
+
+    let pair = start_udp_knob_pair(KNOB_IDLE_EXPOSED).await?;
+
+    // One peer for the whole scenario: the mapping under test is this
+    // socket's, and re-binding the visitor would create a second peer whose
+    // ports say nothing about the first one.
+    let conn = UdpSocket::bind("127.0.0.1:0").await?;
+    conn.connect(KNOB_IDLE_EXPOSED).await?;
+    wait_for_udp_socket(&conn).await?;
+    // The readiness probes (the fixture helper's and this socket's) are behind
+    // this index, so the window below is exactly this test's own datagrams.
+    let settled = seen_srcs.lock().unwrap().len();
+
+    // A burst well inside the timeout: one peer, one socket, one port.
+    for i in 0..KNOB_IDLE_BURST {
+        conn.send(format!("inside-{i}").as_bytes()).await?;
+    }
+    let mut buf = [0u8; 64];
+    for _ in 0..KNOB_IDLE_BURST {
+        time::timeout(Duration::from_secs(5), conn.recv(&mut buf))
+            .await
+            .context("a datagram of the within-timeout burst went missing")??;
+    }
+    let within = {
+        let seen = seen_srcs.lock().unwrap();
+        seen[settled..].to_vec()
+    };
+    assert_eq!(
+        within.len(),
+        KNOB_IDLE_BURST,
+        "every datagram of the burst must have arrived: {within:?}"
+    );
+    let first_port = within[0].port();
+    assert!(
+        within.iter().all(|src| src.port() == first_port),
+        "every datagram inside udp_idle_timeout must leave one local socket: {within:?}"
+    );
+
+    // Now go quiet for longer than the timeout. Nothing in either direction
+    // resets the client's idle timer, so the forwarder (and its socket) is
+    // gone by the time the next datagram arrives; that datagram re-binds, and
+    // the backend sees the new bind.
+    settle(KNOB_IDLE_SILENCE).await;
+    conn.send(b"after-idle").await?;
+    time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+        .await
+        .context("the datagram after the idle timeout was never echoed")??;
+
+    let after = {
+        let seen = seen_srcs.lock().unwrap();
+        seen[settled..].to_vec()
+    };
+    assert_eq!(
+        after.len(),
+        KNOB_IDLE_BURST + 1,
+        "the post-timeout datagram must have arrived: {after:?}"
+    );
+    let rebound_port = after.last().unwrap().port();
+    assert_ne!(
+        rebound_port, first_port,
+        "a peer idle for {KNOB_IDLE_TIMEOUT_SECS} s must be re-bound to a fresh local socket, \
+         so the backend sees a new source port; the observed addresses were {after:?}"
+    );
+
+    pair.stop().await;
+    Ok(())
+}
+
+/// Echo server for the idle-timeout scenario: records the source address of
+/// every datagram, in order (the affinity test's set is unordered and cannot
+/// show *which* datagram came from where).
+async fn port_recording_echo_server(
+    addr: &'static str,
+    seen: Arc<Mutex<Vec<SocketAddr>>>,
+) -> Result<()> {
+    let l = UdpSocket::bind(addr).await?;
+    let mut buf = [0u8; 2048];
+    loop {
+        let (n, from) = l.recv_from(&mut buf).await?;
+        seen.lock().unwrap().push(from);
         l.send_to(&buf[..n], from).await?;
     }
 }
@@ -1298,4 +1723,304 @@ async fn wait_for_port_release(addr: &str) -> Result<()> {
             }
         }
     }
+}
+
+// --- protocol v4 sessions -------------------------------------------------
+//
+// The four scenarios below pin what one control *session* per endpoint bought:
+// one connection for every service that dials it, a service-level failure that
+// stays a service-level failure, and a heartbeat contract the client cannot
+// silently misconfigure.
+
+/// Wait until something accepts on `addr`, then drop the probe.
+///
+/// The control listener is the only thing up before a client registers
+/// anything, so this is what an "assert the client connects exactly once"
+/// scenario has to wait on.
+async fn wait_for_listener(addr: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("nothing listened on {addr} within 15 s");
+        }
+        time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Assert that nothing is exposed at `addr` — the server never bound it.
+async fn assert_not_exposed(addr: &str) -> Result<()> {
+    match TcpStream::connect(addr).await {
+        std::result::Result::Ok(_) => {
+            anyhow::bail!("{addr} accepted a connection, but no service should be exposed")
+        }
+        std::result::Result::Err(_) => Ok(()),
+    }
+}
+
+/// D1: two services on one endpoint share **one** control connection, and both
+/// forward through it.
+///
+/// The count is the server's own (`control_sessions_accepted`), not a log line:
+/// a client that opened a connection per service would look identical in every
+/// forwarding assertion, and only the session count can tell the difference.
+#[cfg(all(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn one_control_session_carries_every_service() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let before = molehill_rathole::control_sessions_accepted();
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    // Both services are registered and forwarding — over one connection, or
+    // the delta below would be 2.
+    wait_for_echo(exposed_addrs(Type::Tcp).0, Type::Tcp).await?;
+    wait_for_echo(exposed_addrs(Type::Tcp).1, Type::Tcp).await?;
+    assert_eq!(
+        molehill_rathole::control_sessions_accepted() - before,
+        1,
+        "two services that dial one endpoint must share one control session"
+    );
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// D2: a service the server refuses (here: a port outside `allow_ports`) is
+/// rejected on its own — its sibling keeps forwarding and the session stays up.
+#[cfg(all(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn a_rejected_service_leaves_its_session_and_siblings_running() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let before = molehill_rathole::control_sessions_accepted();
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client(
+            "tests/for_tcp/session_partial_reject.toml",
+            client_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server(
+            "tests/for_tcp/session_partial_reject.toml",
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    // The service inside `allow_ports` forwards…
+    wait_for_echo(SESSION_REJECT_OK, Type::Tcp).await?;
+    // …and the refusal cost exactly nothing else: one session, still one.
+    assert_eq!(
+        molehill_rathole::control_sessions_accepted() - before,
+        1,
+        "a refused service must not take the session (or its sibling) down"
+    );
+    // The refused service was never exposed at all. The verdicts of the two
+    // registrations can arrive in either order (the client walks a HashMap),
+    // so let the second one land before looking for a listener that must not
+    // exist.
+    settle(0.5).await;
+    assert_not_exposed(SESSION_REJECT_BAD).await?;
+    // The sibling is still forwarding after both verdicts.
+    wait_for_echo(SESSION_REJECT_OK, Type::Tcp).await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// D2, the credential half: a service whose own `token` is the server's is
+/// accepted, and one whose token differs is refused **alone**.
+///
+/// The server owns no per-service token table, so the accepted service names
+/// the same value `[server].default_token` holds; the foreign one proves a
+/// different digest and is answered with its own `RegisterRejected`.
+#[cfg(all(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn a_foreign_service_token_rejects_only_that_service() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    let before = molehill_rathole::control_sessions_accepted();
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client(
+            "tests/for_tcp/session_service_token.toml",
+            client_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    settle(1.0).await;
+    let server = tokio::spawn(async move {
+        run_molehill_server(
+            "tests/for_tcp/session_service_token.toml",
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+
+    wait_for_echo(SESSION_TOKEN_OK, Type::Tcp).await?;
+    assert_eq!(
+        molehill_rathole::control_sessions_accepted() - before,
+        1,
+        "a refused service credential must not cost the session"
+    );
+    settle(0.5).await;
+    assert_not_exposed(SESSION_TOKEN_BAD).await?;
+    wait_for_echo(SESSION_TOKEN_OK, Type::Tcp).await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// Protocol v3 is not served: a **v3** control hello is refused on its own
+/// connection, without an answer, and the listener keeps working.
+///
+/// v0.10.0 changed the dialect the client speaks, so a server of this release
+/// has one dialect to serve. The interop matrix's new-server/old-client case
+/// is the witness that needs the previous release's binary; this one needs
+/// nothing but the server, and pins the two halves that matter on this tree —
+/// the refused connection gets no reply (the reader cannot parse a hello whose
+/// version it does not serve), and the same process then serves a v4 client
+/// through the same listener.
+#[cfg(all(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn a_v3_hello_is_refused_on_its_own_connection() -> Result<()> {
+    init();
+
+    spawn_tcp_backends();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    let client = tokio::spawn(async move {
+        run_molehill_client("tests/for_tcp/tcp_transport.toml", client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    let server = tokio::spawn(async move {
+        run_molehill_server("tests/for_tcp/tcp_transport.toml", server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    // `[server.control].bind_addr` of `tcp_transport.toml`.
+    wait_for_listener("127.0.0.1:2333").await?;
+
+    // The v4 half first: the refused connection below must not be confused
+    // with a listener that never came up.
+    wait_for_echo("127.0.0.1:2334", Type::Tcp).await?;
+
+    let mut conn = TcpStream::connect("127.0.0.1:2333").await?;
+    // The plain selector, then a v3 control hello: variant tag 0, version 3,
+    // and the 32 bytes a v3 client derives from its service name.
+    let mut hello = vec![0x00u8, 0x00, 3u8];
+    hello.extend([0x42u8; 32]);
+    conn.write_all(&hello).await?;
+    conn.flush().await?;
+
+    // No answer at all: the version this server does not serve is refused by
+    // `read_hello`, which ends that connection.
+    let mut reply = [0u8; 1];
+    let read = time::timeout(Duration::from_secs(10), conn.read(&mut reply)).await??;
+    assert_eq!(read, 0, "a v3 hello must be answered with nothing");
+
+    // The refusal was local: that same v4 session is still forwarding.
+    wait_for_echo("127.0.0.1:2334", Type::Tcp).await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(server, client);
+    Ok(())
+}
+
+/// D11: the client derives its heartbeat timeout from the cadence the server
+/// declares, and a configured value *below* that floor ends the session once
+/// instead of reconnecting forever.
+///
+/// The message itself — both numbers in one typed, terminal error — is pinned
+/// by the `resolve_heartbeat_timeout` unit tests in `src/core/client.rs`; what
+/// this scenario adds is the observable half: one authenticated connection and
+/// no service exposed.
+#[cfg(all(feature = "client", feature = "server"))]
+#[tokio::test]
+async fn a_timeout_below_the_heartbeat_floor_is_refused_once() -> Result<()> {
+    init();
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+
+    // The server first, its control listener confirmed before the client
+    // starts: the count below measures *authenticated* sessions, and a client
+    // that had to retry into a server that was not up yet would blur "refused
+    // once" into "connected once".
+    let server = tokio::spawn(async move {
+        run_molehill_server(
+            "tests/for_tcp/session_heartbeat_floor.toml",
+            server_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    wait_for_listener(SESSION_HEARTBEAT_ADDR).await?;
+    let before = molehill_rathole::control_sessions_accepted();
+
+    let client = tokio::spawn(async move {
+        run_molehill_client(
+            "tests/for_tcp/session_heartbeat_floor.toml",
+            client_shutdown_rx,
+        )
+        .await
+        .unwrap();
+    });
+    settle(3.0).await;
+
+    // The server declares 30 s, so the floor is 65 s and the configured 20 s
+    // cannot survive it. The session authenticated once and stopped: a retry
+    // loop would have opened a second authenticated connection by now.
+    assert_eq!(
+        molehill_rathole::control_sessions_accepted() - before,
+        1,
+        "a timeout below the derived floor must end the session after one try"
+    );
+    // The session ended before any registration: nothing is exposed.
+    assert_not_exposed(SESSION_HEARTBEAT_EXPOSED).await?;
+
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
 }

@@ -2,21 +2,22 @@
 
 默认情况下,`molehill` 按原样转发流量(明文 TCP)。客户端的
 `[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
-决定**:每条连接以 v3 传输选择器字节开头,服务端接受客户端说的任何一种
+决定**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
 语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
-`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见 README 的
-配置指南。本文只讲 `noise`;`plain` 除默认值外无需任何配置。
+`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见
+[benchmarks.md](benchmarks.md)的「每个配置选择的代价」。本文只讲
+`noise`;`plain` 除默认值外无需任何配置。
 
 ## Noise 协议
 
 [Noise 协议](http://noiseprotocol.org/noise.html)是轻量、易配置的传输加密
 方式:一对 X25519 密钥对,不需要 PKI。
 
-`molehill` 自带合理的默认配置;见[noise 示例](./configuration.zh.md#noise加密传输)。默认
+`molehill` 自带合理的默认配置;见[noise 示例](./deployment.zh.md#noise加密传输)。默认
 pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不再有
 中间人(MITM)问题。
 
-> **ring-accelerated 改变了什么?** 默认构建链接了 `snow` 的
+> **ring-accelerated 带来了什么。** 默认构建链接了 `snow` 的
 > **ring-accelerated** resolver,于是 ChaCha20-Poly1305 数据路径——每个
 > 加密字节的热路径——走 ring 的硬件分派实现:x86-64 上传输层实测约为
 > 纯 Rust resolver 的 1.5 倍,端到端约 1.3 倍。pattern 的哈希(默认
@@ -82,7 +83,7 @@ transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" }
 `transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
 Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
 (`carrier = "kcp"` 时的)Noise-over-KCP 包裹都用该服务的有效密钥。服务端
-只需要放置自己的密钥(v3 选择器:它接受每条连接所说的语言)。
+只需要放置自己的密钥(传输选择器:它接受每条连接所说的语言)。
 
 ### 指定 pattern
 
@@ -148,7 +149,7 @@ nonce 和证明自己持有该摘要的 MAC;服务端校验通过后,双方用�
 客户端随即回退到完整握手(并重新取得票据)。
 
 在本机测量(release 构建,双工管道上的进程内配对,默认 pattern):完整握手
-加票据交换每对约 451 us,恢复交换约 39 us——握手的密钥交换占建连 CPU 的
+加票据交换每对 442.7 us,恢复交换 38.5 us——握手的密钥交换占建连 CPU 的
 约 97%,而恢复正好去掉它们。剩余开销是对称加密加两个往返。
 
 代价是前向保密:原始会话保留其 DH 派生密钥,但恢复会话的密钥由缓存摘要

@@ -6,10 +6,10 @@
 """Shared infrastructure for the Soak benchmark model.
 
 The model measures *workloads under staged network conditions* as time
-series — not one average per tool per network condition. This module carries only the reusable
-primitives (process bookkeeping, the lock, the local backends, the
-samplers, the individual probes); the model itself — test types, the
-timeline, the claim rules, per-tool shaping — lives in `soak.py`.
+series — not one average per tool per network condition. This module carries
+only the reusable primitives (process bookkeeping, the lock, the local
+backends, the samplers, the individual probes); the model itself — test
+types, the timeline, the claim rules, per-tool shaping — lives in `soak.py`.
 
 Design principles:
 - every metric is externally observable (peers are black boxes): the
@@ -32,6 +32,7 @@ import re
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 # The runner that owns the lock ledger and the process groups. Identified by
 # its own name so the liveness guards below can never drift from the file
@@ -48,6 +50,46 @@ from pathlib import Path
 # stale sweep could kill a live run's processes).
 RUNNER_NAME = "soak.py"
 WORK_PREFIX = "molehill-bench."
+
+
+# --- release results files ---------------------------------------------------
+# A published results file's name carries its version, and the gate and the plot
+# both need "the newest one" and "the one before it". A LEXICAL sort answers
+# both wrongly the moment the version passes 0.9.x: "results-soak-v0.10.0.json"
+# sorts BEFORE "results-soak-v0.9.0.json" ("1" < "9"), so the gate would compare
+# the wrong pair and the plot would render an older file as the current release
+# — a silent failure in both directions. Parse the dotted version instead, and
+# keep the non-release files (`dev`, a screen output) out of the ordering
+# entirely: they are scratch, never a baseline.
+RESULTS_RE = re.compile(r"^results-soak-v(\d+)\.(\d+)\.(\d+)\.json$")
+
+
+def release_version(path: Path) -> tuple | None:
+    """`(major, minor, patch)` for a published results file, else `None`."""
+    m = RESULTS_RE.match(path.name)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def release_files(directory: Path) -> list:
+    """Every `results-soak-vX.Y.Z.json` in `directory`, oldest version first."""
+    found = [(release_version(p), p) for p in directory.glob("results-soak-*.json")]
+    found = [(v, p) for v, p in found if v is not None]
+    return [p for _, p in sorted(found, key=lambda item: item[0])]
+
+
+def newest_results(directory: Path) -> Path | None:
+    """The newest results file, or `None` when the directory holds none.
+
+    A published file wins over a scratch one, which is what both consumers did
+    before this helper existed and what a release reviewer expects; the scratch
+    fallback keeps `just soak-plot` usable on a directory that holds nothing
+    else (a quick `just soak` writes `results-soak-dev.json` and nothing more).
+    """
+    releases = release_files(directory)
+    if releases:
+        return releases[-1]
+    scratch = sorted(directory.glob("results-soak-*.json"), key=lambda p: p.name)
+    return scratch[-1] if scratch else None
 
 
 # --- stale-run pid ledger ----------------------------------------------------
@@ -85,7 +127,7 @@ def reap_pids(pids: list) -> int:
         if probe not in cmd:
             continue
         try:
-            with open(f"/proc/{pid}/stat") as fh:
+            with Path(f"/proc/{pid}/stat").open() as fh:
                 stat = fh.read().split(") ", 1)[1]
             ppid = int(stat.split()[1])
             parent_cmd = _proc_cmdline(ppid)
@@ -190,6 +232,14 @@ class Knobs:
     churn_connects_s: int = 16
     # the UDP session's ping interval
     udp_interval_ms: int = 20
+    # --- the M7 slow-visitor probe (opt-in, 0 = off) ------------------------
+    # One extra connection to the tool's echo service, read back at this rate
+    # (bit/s): the visitor whose slowness can block the streams that share its
+    # pool. Off by default — an injected visitor is part of the workload, so a
+    # run that has one changes the method (see `soak.build_meta`'s workload
+    # version note), and the runner applies it stage by stage (screen,
+    # capacity, rrul, soak, cost) rather than accepting it where it cannot.
+    slow_visitor_bps: int = 0
     # --- SLO (method constant) --------------------------------------------
     # the interactive stream must stay under this p99 AND under this error
     # rate for a load level to count as sustainable (`capacity`)
@@ -205,6 +255,54 @@ class Knobs:
     # --- test-type parameters ---------------------------------------------
     # per load-step settle window and the interactive-stream sample rate
     settle_s: float = 6.0
+    #: **Safety net, not the mechanism**: a stage transition ends when the path
+    #: is quiet by the drain's predicate (`Shaper.settle`), and this only
+    #: bounds how long that may take. Sized above the measured worst case —
+    #: after a `rate20` stage's bulk client is killed, the tens of MB its
+    #: kernel still holds take ~159 s to clear at that stage's own 20 Mbit/s,
+    #: because the harness shapes the *backend* leg at the same rate, so the
+    #: tool applies backpressure and the client's kernel accumulates. At 120 s
+    #: the net fired mid-flush and the next stage's dial was closed; a net that
+    #: fires is logged and recorded (`drain_expired`), never absorbed.
+    stage_drain_budget: float = 180.0
+    #: Seconds into a stage at which its bulk spine is dialed. The first entry
+    #: is the design point and a *healthy* dial runs the stage out from there;
+    #: the later ones are second chances, used only after a dial has already
+    #: given up, so they cost a healthy stage nothing. They exist because a
+    #: drain cannot always make the path quiet in bounded time: measured on the
+    #: `rate20 -> jitter` transition, the killed 20-stream client's teardown
+    #: holds ~33 MB and retransmits it for ~106 s at that stage's 20 Mbit/s, so
+    #: the next stage's dial lands on a busy path through no fault of its own
+    #: (see docs/benchmarks.md, "The stage schedule").
+    spine_retry_s: tuple = (0, 25, 50, 80)
+    #: How long past a stage's boundary its bulk client keeps reading for the
+    #: `end` event that carries the receiver's own window. Part of the method:
+    #: a dial that gets no summary records no receiver half.
+    spine_summary_grace_s: float = 5.0
+    #: Which legs of the path the shaper applies a stage's class to. `visitor`
+    #: shapes the workload's own access link (and the KCP tunnel port, the one
+    #: tunnel the harness can name); `both` adds the tool's backend leg, which
+    #: is what every run before 2026-09-29 measured. See `Shaper.PATH_PORTS`.
+    #:
+    #: The default is `visitor` on the A/B recorded in HANDOFF.md ("Shaping
+    #: scope"): the two legs share one HTB class, so `both` halves every rate
+    #: class and doubles every injected delay, and `visitor` is what the stage
+    #: table in docs/benchmarks.md has always said the classes do.
+    SHAPE_LEGS: ClassVar[tuple] = ("visitor", "both")
+    shape_legs: str = "visitor"
+    #: Socket window (`iperf3 -w`) for the bulk client on a **rate** class,
+    #: empty for none. The rate classes are where the sender's interval
+    #: accounting is defeated: the client's writes complete into a socket
+    #: buffer far larger than the shaped path can drain, every measured
+    #: interval then reads zero bytes while the path keeps carrying them, and
+    #: at `rate20` the client is still blocked 30 s past the stage boundary, so
+    #: its own summary never arrives and the cell has no reading at all. A
+    #: bounded window keeps the writes tracking the path; it is an instrument
+    #: parameter, so the value travels in the results meta and in
+    #: `soak_check.METHOD_KEYS`, and it is applied to rate classes only —
+    #: nothing else has the problem, and a window on a clean stage would cap
+    #: its bandwidth-delay product.
+    rate_socket_window: str = "256K"
     ping_interval_ms: int = 50
     # the operating point for `cost`: fraction of the configured max load
     cost_operating_point: float = 0.8
@@ -217,7 +315,6 @@ class Knobs:
     cores_per_pair: float = 7.0
     max_batch: int = 8
     # --- process / misc ----------------------------------------------------
-    pool_size: int = 8
     allow_port_hi: int = 26999  # server-side allow_ports upper bound
 
     @classmethod
@@ -238,16 +335,21 @@ class Knobs:
             streams_max=_env_int("SOAK_STREAMS_MAX", 8),
             churn_connects_s=_env_int("SOAK_CHURN_CONNECTS_S", 16),
             udp_interval_ms=_env_int("SOAK_UDP_INTERVAL_MS", 20),
+            slow_visitor_bps=_env_int("SOAK_SLOW_VISITOR_BPS", 0),
             slo_rtt_p99_ms=_env_float("SOAK_SLO_RTT_P99_MS", 50.0),
             slo_error_rate=_env_float("SOAK_SLO_ERROR_RATE", 0.005),
             settle_s=_env_float("SOAK_SETTLE_S", 6.0),
+            stage_drain_budget=_env_float("SOAK_DRAIN_BUDGET", 180.0),
+            spine_retry_s=_env_seconds("SOAK_SPINE_RETRY_S", (0, 25, 50, 80)),
+            spine_summary_grace_s=_env_float("SOAK_SPINE_SUMMARY_GRACE_S", 5.0),
+            shape_legs=_env_choice("SOAK_SHAPE_LEGS", "visitor", cls.SHAPE_LEGS),
+            rate_socket_window=_env_window("SOAK_RATE_SOCKET_WINDOW", "256K"),
             ping_interval_ms=_env_int("SOAK_PING_INTERVAL_MS", 50),
             cost_operating_point=_env_float("SOAK_COST_OPERATING_POINT", 0.8),
             rrul_stream_factor=_env_int("SOAK_RRUL_STREAM_FACTOR", 1),
             soak_load_fraction=_env_float("SOAK_SOAK_LOAD_FRACTION", 0.5),
             cores_per_pair=_env_float("SOAK_CORES_PER_PAIR", 7.0),
             max_batch=_env_int("SOAK_MAX_BATCH", 8),
-            pool_size=_env_int("POOL_SIZE", 8),
         )
 
 
@@ -267,6 +369,106 @@ def _env_float(name: str, default: float) -> float:
         return float(v) if v else default
     except ValueError:
         return default
+
+
+#: Values that switch the rate-class socket window off, for reproducing a run
+#: measured before it existed.
+WINDOW_OFF = ("", "off", "none", "0")
+
+
+def _env_window(name: str, default: str) -> str:
+    """The rate-class socket window: a size, or one of [`WINDOW_OFF`].
+
+    Unset keeps the measured default; an explicit off value is how a stored run
+    measured without a window is reproduced, and it is recorded as empty in the
+    results meta, which is what tells the two apart.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return "" if value.lower() in WINDOW_OFF else value
+
+
+def _env_choice(name: str, default: str, allowed: tuple) -> str:
+    """Environment override of a string knob, restricted to `allowed`.
+
+    A value outside the set keeps the default *and* the runner reports it:
+    the alternative — accepting whatever was typed — is how a run measures a
+    configuration nobody asked for and records it under a name that says
+    otherwise. (The variant A/B's list has the same rule for the same reason.)
+    """
+    v = (os.environ.get(name) or "").strip()
+    return v if v in allowed else default
+
+
+def _env_seconds(name: str, default: tuple) -> tuple:
+    """Environment override of a list of offsets in seconds, e.g. "0,25,50,80".
+
+    Unset, blank or unparsable keeps the default: a malformed retry schedule
+    must not be able to leave the spine with no dial at all, which is the
+    failure a schedule exists to prevent.
+    """
+    v = os.environ.get(name)
+    if not v:
+        return default
+    try:
+        out = tuple(float(p) for p in v.split(","))
+    except ValueError:
+        return default
+    return out or default
+
+
+# --- TCP socket state observation --------------------------------------------
+#: The columns `ss -tan` prints for a socket row: state, Recv-Q, Send-Q, local
+#: address, peer address. A line with fewer is the header or a variant.
+SS_MIN_COLUMNS = 5
+
+
+def tcp_state_counts(ports: dict) -> dict:
+    """Live TCP socket counts per named port, by `ss` state, in one call.
+
+    The drain at a stage transition watches the throughput port alone, while
+    the shaped set also carries the backend leg: a transition can therefore
+    leave teardown sockets on a port nothing is waiting for, and the next
+    visitor's dial then races them. Recording the states puts that in the
+    stage record instead of leaving it to be re-derived by guess.
+
+    `ports` maps a label to a port number; the result maps each label that
+    had sockets to `{state: count}`. LISTEN is counted too -- the caller
+    decides what to ignore. `{}` when `ss` is missing or answers nothing:
+    this is evidence collected beside a measurement, so it must never be
+    able to fail a run.
+    """
+    wanted = {label: p for label, p in ports.items() if p}
+    if not wanted:
+        return {}
+    try:
+        out = subprocess.run(
+            ["ss", "-tan"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except Exception:  # noqa: BLE001 — diagnostics must not fail the run
+        return {}
+    counts: dict = {}
+    for line in out.splitlines():
+        f = line.split()
+        # `ss -tan` renders `State Recv-Q Send-Q Local Peer`. Anything with a
+        # different column count is the header or a variant we must not parse,
+        # so the test is on the numeric columns rather than on the state name,
+        # which differs between iproute2 versions.
+        if len(f) < SS_MIN_COLUMNS or not (f[1].isdigit() and f[2].isdigit()):
+            continue
+        for label, port in wanted.items():
+            # Match the port with its colon so 5201 cannot match 15201.
+            if f[3].endswith(f":{port}") or f[4].endswith(f":{port}"):
+                by_state = counts.setdefault(label, {})
+                by_state[f[0]] = by_state.get(f[0], 0) + 1
+                break
+    return counts
 
 
 # --- local backends ----------------------------------------------------------
@@ -309,6 +511,10 @@ class Backends:
         self._socks = []
         self._work = None
         self.ports = BackendPorts(0, 0, 0)
+        #: What the throughput port held before the last `restart_iperf`,
+        #: as `{"sockets_before", "states_before", "wait_s", "timed_out"}`.
+        #: `None` until a restart happens.
+        self.restart_report = None
 
     @property
     def iperf_port(self) -> int:
@@ -471,9 +677,24 @@ class Backends:
         clean state; the TCP/UDP echo servers are unaffected. Called by
         `run_throughput` after every failed rep; the old wedged process is
         killed and the new one re-recorded for crash reaping.
+
+        `self.restart_report` records what the port held *before* the kill.
+        The rrul spine restarts this server at every stage boundary, and one
+        candidate mechanism for a dead spine is that the rebind races the
+        previous stage's dying visitor connection -- which is state on the
+        port, not state in the server. Recorded, not yet waited on.
         """
         if not self._procs:
             raise RuntimeError("restart_iperf: no backend server running")
+        counts = tcp_state_counts({"iperf_backend": self.iperf_port}).get(
+            "iperf_backend", {}
+        )
+        self.restart_report = {
+            "sockets_before": sum(n for s, n in counts.items() if s != "LISTEN"),
+            "states_before": counts,
+            "wait_s": 0.0,
+            "timed_out": False,
+        }
         proc = self._procs.pop(0)  # index 0 is always the iperf3 server
         with contextlib.suppress(OSError):
             proc.kill()
@@ -788,6 +1009,10 @@ WEDGE_SILENCE_S = 5.0
 # attempt stream is the denominator, so a shaped stage's loss is a rate and
 # not a count of 1s).
 LOSS_WINDOW_S = 5.0
+# The slow-visitor probe owns a per-stage budget; the stage boundary waits
+# this long for it to close itself before killing it and recording that it
+# had to (a killed probe is a state in the stage line, not a silent gap).
+SLOW_VISITOR_JOIN_S = 5.0
 
 
 # --- series statistics ------------------------------------------------------
@@ -842,18 +1067,25 @@ def slope_per_min(rows: list, metric: str):
 
 def worst_window(rows: list, metric: str, window_s: float = 1.0):
     """The worst `window_s` slice's mean: the stability axis. A stage whose
-    worst second sits far above its mean is not a stable configuration."""
+    worst second sits far above its mean is not a stable configuration.
+
+    The window walks by index rather than slicing: `pts[i:]` copies the whole
+    tail on every iteration, which is O(n^2) on the long interactive series
+    (measured: 0.99 s at 18 000 points against 0.045 s here), and it runs a few
+    times per test on the harness's critical path.
+    """
     pts = points(rows, metric)
     if len(pts) < MIN_WINDOW_POINTS:
         return None
     best = None
-    for i, (t0, _) in enumerate(pts):
-        acc, n = 0.0, 0
-        for t1, v in pts[i:]:
-            if t1 - t0 > window_s:
-                break
-            acc += v
+    total = len(pts)
+    for i in range(total):
+        t0 = pts[i][0]
+        acc, n, j = 0.0, 0, i
+        while j < total and pts[j][0] - t0 <= window_s:
+            acc += pts[j][1]
             n += 1
+            j += 1
         if n:
             mean = acc / n
             if best is None or mean > best["mean"]:
@@ -937,7 +1169,7 @@ class ArmProcs:
         if role:
             name = f"{name}.{role}"
         log = self.work / f"{name}.log"
-        with open(log, "ab") as f:
+        with log.open("ab") as f:
             pid = subprocess.Popen(cmd, stdout=f, stderr=f, cwd=cwd, env=env).pid
         record_pid(self.work, pid)
         self.pids.append(pid)
@@ -975,40 +1207,80 @@ def noise_keys(binary: str) -> tuple[str, str]:
     return (priv, pub)
 
 
+#: The variants `molehill_config` gives a configuration of their own — the
+#: single source for the runner's `--variants` help and for the variant A/B's
+#: validation. Any other name falls through to the default control, so the
+#: list has to be explicit: a typo in a variant A/B would otherwise measure
+#: mux against mux and report it as "no effect".
+MOLEHILL_VARIANTS = (
+    "mux",  # control: plain transport, multiplex
+    "shared",  # pool axis: multiplex with one pool for every service
+    "direct",  # the docs' name for direct mode (same config as `mux-off`)
+    "mux-off",  # the historical name for that same configuration
+    "noise",  # transport axis
+    "noise-direct",  # transport x mode grid
+    "mux1",  # tunnel-count axis (cap 1)
+    "mux8",  # tunnel-count axis (cap 8), the pool-size question
+    "kcp4",  # data-plane carrier axis
+)
+
+
 def molehill_config(
     work: Path, variant: str, knobs: Knobs, p: dict, binary: str = ""
 ) -> Path:
     """Write server/client tomls for one molehill variant; returns config dir."""
     d = work / "molehill"
     d.mkdir(exist_ok=True)
-    mode = "direct" if variant in ("mux-off", "noise-direct") else "multiplex"
+    # The mode axis has two spellings for the same configuration: `direct` is
+    # the docs' word for the mode and the variant A/B's name for this arm,
+    # `mux-off` is the historical name carried by existing records and docs
+    # (both stay valid — retiring either would silently reinterpret a stored
+    # result file).
+    mode = "direct" if variant in ("direct", "mux-off", "noise-direct") else "multiplex"
     # Single-variable variants. `mux` is the default control (plain transport,
     # multiplex, count = 4): `noise` changes only the transport, `mux1` only
     # the tunnel count, `kcp4` only the data-plane carrier (on top of the
-    # noise variant). `noise-direct` is the noise transport in direct mode: a
-    # new point on the transport x mode grid, and the variant that isolates the
-    # record-stream cost with no mux framing in the way (the mux frame
-    # reader asks for less than a record, so a record staged in the wrapper
-    # is structural there — compare `mux-off` for the transport axis and
-    # `noise` for the mode axis).
+    # noise variant), `shared` only who owns the pool (one pool for every
+    # service of the session instead of one pool per service — the axis M7
+    # measures against `direct`). `noise-direct` is the noise transport in
+    # direct mode: a new point on the transport x mode grid, and the variant
+    # that isolates the record-stream cost with no mux framing in the way (the
+    # mux frame reader asks for less than a record, so a record staged in the
+    # wrapper is structural there — compare `mux-off`/`direct` for the transport
+    # axis and `noise` for the mode axis).
     data_c = data_s = ""
+    # The pool's cap, stated explicitly so each arm's shape is recorded in the
+    # config it emitted: the `mux` control arm keeps 4 (the default), `mux1`
+    # caps it at 1, and `kcp4` moves the cap onto the KCP carrier. The pool
+    # itself starts cold and grows to the cap on demand, which is the same
+    # shape as the previous release's initial `count` under the arms' load. A
+    # `direct` arm has no pool and states no cap.
+    caps = ""
     if variant == "noise":
         transport = "noise"
-    elif variant == "mux1":  # count axis: plain, one tunnel
+    elif variant == "shared":  # pool axis: one pool for the whole session
         transport = "plain"
-        data_c = "default_count = 1\n"
+        data_c = "shared_pool = true\n"
+    elif variant == "mux1":  # cap axis: plain, one tunnel
+        transport = "plain"
+        caps = "[client.data.tcp]\nmax_tunnels = 1\n"
+    elif variant == "mux8":  # cap axis: plain, eight tunnels
+        transport = "plain"
+        caps = "[client.data.tcp]\nmax_tunnels = 8\n"
     elif variant == "kcp4":  # carrier axis: noise + KCP-over-UDP
         transport = "noise"
         data_c = (
             f'default_carrier = "kcp"\n'
             f'default_data_addr = "127.0.0.1:{p["kcp_bind"]}"\n'
-            f"default_count = 4\n"
         )
+        caps = "[client.data.kcp]\nmax_tunnels = 4\n"
         data_s = f'bind_addr = "127.0.0.1:{p["kcp_bind"]}"\n'
     elif variant == "noise-direct":  # transport axis, no mux layer
         transport = "noise"
     else:
         transport = "plain"
+    if mode == "multiplex" and not caps:
+        caps = "[client.data.tcp]\nmax_tunnels = 4\n"
     noise_s = noise_c = ""
     if transport == "noise":
         priv, pub = noise_keys(binary or knobs.molehill_bin)
@@ -1034,24 +1306,22 @@ default_remote_addr = "127.0.0.1:{p["client_dial"]}"
 
 [client.data]
 default_mode = "{mode}"
-{data_c}[client.transport]
+{data_c}{caps}[client.transport]
 type = "{transport}"
 {noise_c}
 [client.services.iperf]
 local_addr = "127.0.0.1:{p["iperf_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["iperf_exposed"]}"
-pool_size = {knobs.pool_size}
 
 [client.services.echo]
 local_addr = "127.0.0.1:{p["echo_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["echo_exposed"]}"
-pool_size = {knobs.pool_size}
 
 [client.services.udpecho]
 protocol = "udp"
 local_addr = "127.0.0.1:{p["udp_backend"]}"
 remote_bind_addr = "127.0.0.1:{p["udp_exposed"]}"
-pool_size = 2
+udp_workers = 2
 udp_buffer_size = 2048
 udp_idle_timeout = 60
 udp_send_queue_size = 1024
@@ -1068,8 +1338,9 @@ def diag_env() -> dict:
     """The opt-in instrumentation the run was started with.
 
     Everything a tool spawns inherits the parent environment, so an explicit
-    `MOLEHILL_MUX_STATS=1` (or `MOLEHILL_KCP_STATS`, `MOLEHILL_STRIPE_COUNT`,
-    `MOLEHILL_TCP_BUFFER_BYTES`) reaches the tool unchanged. The runner used
+    `MOLEHILL_MUX_STATS=1` (or `MOLEHILL_KCP_STATS`, `MOLEHILL_POOL_STATS`,
+    `MOLEHILL_PLACEMENT_STATS`, `MOLEHILL_UDP_STATS`, `MOLEHILL_STRIPE_COUNT`)
+    reaches the tool unchanged. The runner used
     to force the mux framing counters ON for every molehill spawn: that is
     molehill-only work inside the measured path, the peers have no equivalent,
     and nothing in the Soak model parses the lines — an asymmetric instrument
@@ -1190,6 +1461,27 @@ token = "bench"
     s.procs.spawn([str(peer), "--client", str(d / "client.toml")])
 
 
+def hardlink_or_copy(src: Path, target: Path) -> None:
+    """Materialize `src` at `target` by hard link, falling back to a copy.
+
+    A hard link keeps the peer's ~24 MB of binaries on one inode, and
+    `/proc/self/exe` resolves to the linked path. The copy is the fallback for
+    a peer cache on another filesystem — measured: EXDEV from `/home` to
+    `/tmp`, which failed the whole nps test while the binaries' own link had a
+    fallback and quietly worked.
+    """
+    try:
+        os.link(src, target)
+    except OSError:
+        shutil.copy2(src, target)
+
+
+def await_port(port: int, failure: str) -> None:
+    """Wait for `port` to open, raising `failure` when it does not."""
+    if not wait_port(port, 10):
+        raise TimeoutError(failure)
+
+
 def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     """nps: one server (`nps`) plus one client (`npc`) holding all proxies.
 
@@ -1212,10 +1504,7 @@ def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     for binary in ("nps", "npc"):
         target = d / binary
         if not target.exists():
-            try:
-                os.link(peer / binary, target)
-            except OSError:  # different filesystem: fall back to a copy
-                shutil.copy2(peer / binary, target)
+            hardlink_or_copy(peer / binary, target)
         target.chmod(0o755)
     conf = d / "conf"
     conf.mkdir(exist_ok=True)
@@ -1224,15 +1513,7 @@ def setup_nps(s: ToolSetup, knobs: Knobs) -> None:
     # shipped file that is not the config itself.
     for shipped in (peer / "conf").iterdir():
         if shipped.name != "nps.conf" and not (conf / shipped.name).exists():
-            target = conf / shipped.name
-            try:
-                os.link(shipped, target)
-            except OSError:
-                # Different filesystem — the peer cache is not required to
-                # live on the same mount as the work dir (measured: EXDEV
-                # from /home to /tmp, which failed the whole nps test while
-                # the binaries' own link had a fallback and quietly worked).
-                shutil.copy2(shipped, target)
+            hardlink_or_copy(shipped, conf / shipped.name)
     # The web UI is mandatory in nps.conf; it takes a free slot in the
     # test's port band, and the http/https proxy ports stay empty so
     # nothing privileged is opened.
@@ -1296,14 +1577,12 @@ target_addr=127.0.0.1:{p["udp_backend"]}
 server_port={p["udp_exposed"]}
 """)
     s.procs.spawn([str(d / "nps")], cwd=d)
-    if not wait_port(p["control"], 10):
-        raise TimeoutError("nps bridge port did not open")
+    await_port(p["control"], "nps bridge port did not open")
     s.procs.spawn([str(d / "npc"), "-config", str(d / "npc.conf")], cwd=d)
     # The TCP tunnels only: a UDP task has no listening TCP port to wait
     # for (the bench's own UDP probe is what exercises it).
     for port in (p["iperf_exposed"], p["echo_exposed"]):
-        if not wait_port(port, 10):
-            raise TimeoutError(f"nps tunnel {port} not ready")
+        await_port(port, f"nps tunnel {port} not ready")
 
 
 def tool_band(base: int, off: int) -> dict:
@@ -1336,7 +1615,11 @@ def tool_version(knobs: Knobs) -> str:
             timeout=15,
         ).stdout
         return next(
-            (l.split()[2] for l in out.splitlines() if l.startswith("Build Version:")),
+            (
+                line.split()[2]
+                for line in out.splitlines()
+                if line.startswith("Build Version:")
+            ),
             "dev",
         )
     except OSError:
@@ -1438,6 +1721,359 @@ def binary_fingerprint(path) -> dict:
     }
 
 
+#: Identity files, most authoritative first. A container hostname changes on
+#: every container restart, which is what made the drift gate unusable here:
+#: stored runs on the *same hardware* carried different hostnames, so
+#: `soak_check` refused to compare them and the comparison half of the gate
+#: had never once run. `/etc/machine-id` is stable for the machine (it
+#: survives container recreation, because it is the host's).
+_HOST_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+
+
+def _read_first(paths: tuple) -> str:
+    for p in paths:
+        try:
+            return Path(p).read_text().strip()
+        except OSError:
+            continue
+    return ""
+
+
+def host_identity() -> dict:
+    """The host this run happened on: a *stable* identity, not a name.
+
+    `hostname` is kept (it is what a reader recognises), but it is not the
+    comparison key: in a containerized bench host it changes on every restart
+    while the hardware does not, so comparing by hostname compares two
+    differently-named runs of the same machine and — the actual failure —
+    refuses two runs of the same machine because the container was recreated
+    between them.
+
+    `host_id` is the calibration-grade key: the machine id (survives container
+    recreation) plus the CPU model and the core count (what actually bounds the
+    loopback ceiling), hashed so the file stays readable and two hosts cannot
+    be confused by a shared component. `None` when nothing can be read, which
+    is the honest answer rather than a guess: the gate then falls back to the
+    hostname and says so.
+
+    The CPU budget and the loopback ceiling are properties of the *machine*,
+    so this is the field two runs must agree on before any cross-run claim is
+    made (soak_check.comparability; AGENTS.md §10, "same model, same host").
+    """
+    machine_id = _read_first(_HOST_ID_FILES)
+    cpu_model = ""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    nproc = str(os.cpu_count() or 0)
+    if not (machine_id or cpu_model):
+        return {"hostname": socket.gethostname(), "host_id": None}
+    basis = f"{machine_id}|{cpu_model}|{nproc}"
+    return {
+        "hostname": socket.gethostname(),
+        "host_id": hashlib.sha256(basis.encode()).hexdigest()[:16],
+        "host_id_basis": {
+            "machine_id": bool(machine_id),
+            "cpu_model": cpu_model,
+            "cpu_count": nproc,
+        },
+    }
+
+
+#: The host calibration probe: a fixed CPU-bound workload (SHA-256 over a fixed
+#: buffer), reported as MiB/s.
+#:
+#: `host_id` answers "which machine is this?", and on a host *without*
+#: `/etc/machine-id` — this one, see HANDOFF.md — it reduces to
+#: `cpu_model | nproc`, so two different machines can hash to the same id.
+#: A name cannot close that hole; a measurement can: two runs are comparable
+#: only if the machine was in the same *state*, and the state (turbo, thermal,
+#: steal, a neighbour's load) is exactly what moves a fixed workload's
+#: throughput. The probe is deliberately CPU-bound rather than a loopback
+#: throughput measurement: measured on this host, a 128 MiB socketpair probe
+#: drifts 18.7 % across median-of-five readings (it follows the CPU's power
+#: state), while this one repeats to 2.2 % — a calibration key has to be
+#: stabler than the differences it exists to detect.
+#: The tool label the SLO gates: this repository's own binary. A reference peer
+#: that misses the SLO is a finding about the peer — reported with its number,
+#: never a block — so anything that *aborts* on an SLO violation has to make the
+#: same distinction (measured: a driver that did not, aborted a healthy sweep at
+#: rathole's first clean stage, whose p99 is ~100 ms by its own nature). Shared
+#: with `soak_check.SUBJECT` so the two cannot drift apart.
+SUBJECT = "molehill"
+
+#: The loopback probe's transfer, per reading: MiB pushed through one socket
+#: pair, and how many readings the median is taken over. 512 MiB is ~0.2 s at
+#: this host's ceiling — long enough that the socket and the copies dominate
+#: the timer, short enough that the whole probe (one discarded warm-up plus
+#: the reps) stays under two seconds.
+LOOPBACK_MIB = 512
+LOOPBACK_REPS = 5
+LOOPBACK_CHUNK = 1 << 20
+#: Per-socket timeout for the probe. The whole transfer is ~0.2 s at this host's
+#: ceiling, so this is three orders of magnitude of slack — it exists to fail a
+#: stalled probe, not to time a slow one.
+LOOPBACK_TIMEOUT_S = 30.0
+#: The whole child (interpreter start, two warm-ups, five transfers), with room
+#: for a machine that is busy rather than broken.
+LOOPBACK_CHILD_TIMEOUT_S = 120.0
+
+CALIBRATION_MIB = 192
+#: Median of this many readings. Three is the smallest count with a median at
+#: all, and the probe is ~0.5 s per reading.
+CALIBRATION_REPS = 3
+#: The buffer hashed per iteration. 1 MiB keeps `hashlib` on its bulk path (it
+#: releases the GIL above ~2 KiB), so the number is a CPU measurement rather
+#: than a Python-loop measurement.
+CALIBRATION_CHUNK = 1 << 20
+
+
+def _calibration_once(buffer: bytes) -> float:
+    """One reading: MiB/s of SHA-256 over `buffer`, repeated to `CALIBRATION_MIB`."""
+    digest = hashlib.sha256()
+    iterations = CALIBRATION_MIB
+    started = time.perf_counter()
+    for _ in range(iterations):
+        digest.update(buffer)
+    elapsed = time.perf_counter() - started
+    digest.digest()
+    return iterations / elapsed if elapsed > 0 else 0.0
+
+
+#: Pre-touched and reused for every transfer. A freshly allocated `bytearray`
+#: faults its pages *inside* the timed region, and where those pages land is a
+#: property of the process — one of the two sources of the variance that made
+#: the first formulation unusable (see `host_loopback`).
+_LOOPBACK_BUF = bytearray(LOOPBACK_CHUNK)
+for _i in range(0, LOOPBACK_CHUNK, 4096):
+    _LOOPBACK_BUF[_i] = 1
+
+
+def _one_cpu() -> int | None:
+    """The CPU the probe pins itself to, or `None` where that is not available
+    (not Linux, or a sandbox without `sched_setaffinity`)."""
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+    return allowed[0] if allowed else None
+
+
+def _affinity() -> frozenset:
+    """This process's CPU set, or an empty one where it cannot be read."""
+    try:
+        return frozenset(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return frozenset()
+
+
+def _loopback_once(total_bytes: int) -> float:
+    """One reading: MiB/s through a loopback socket pair, sender and reader live.
+
+    The reader runs in its own thread so the pair is pipelined the way the
+    benchmark's own streams are; the clock covers the whole transfer, because a
+    sender-only clock would miss the tail still queued when the last write
+    returns.
+    """
+    sender, reader = socket.socketpair()
+    received = []
+    try:
+        # A writable buffer for `recv_into` — a `bytes` chunk raises inside the
+        # reader thread and leaves the sender blocked on a full socket — and a
+        # timeout on both ends, so a stalled probe is the typed failure
+        # `host_loopback` records rather than a hang.
+        buf = _LOOPBACK_BUF
+        sender.settimeout(LOOPBACK_TIMEOUT_S)
+        reader.settimeout(LOOPBACK_TIMEOUT_S)
+        started = time.perf_counter()
+
+        def drain() -> None:
+            got = 0
+            try:
+                while got < total_bytes:
+                    n = reader.recv_into(buf)
+                    if not n:
+                        break
+                    got += n
+            except OSError:
+                pass  # recorded as a short read by the caller
+            received.append(got)
+
+        thread = threading.Thread(target=drain)
+        thread.start()
+        sent = 0
+        try:
+            while sent < total_bytes:
+                sent += sender.send(buf[: min(LOOPBACK_CHUNK, total_bytes - sent)])
+        except OSError:
+            pass  # the reader's own error is the one worth reporting
+        thread.join()
+        elapsed = time.perf_counter() - started
+    finally:
+        sender.close()
+        reader.close()
+    if received != [total_bytes] or elapsed <= 0:
+        raise OSError(f"loopback probe moved {received} of {total_bytes} bytes")
+    return total_bytes / elapsed / (1 << 20)
+
+
+def _loopback_child(cpu: int | None, total: int, reps: int) -> dict:
+    """The probe as a **child process**: pin, warm up, measure, report.
+
+    It runs in a child because `sched_setaffinity` is per-*process* and
+    inherited by every child that process spawns. An earlier version pinned
+    itself in the runner's own process and never restored it, so the whole
+    harness — the tools under test, their iperf3 clients and servers, the
+    pingers, everything — ran on one core for the rest of the run. Measured on
+    the resulting sweep: clean bulk 16.4 -> 5.2 Gbit/s, interactive p99
+    9.6 -> 163 ms, while a tool that is single-threaded by nature (nps) and the
+    two calibration probes were untouched, because each of them needs only one
+    CPU. A child cannot leak that into the run.
+    """
+    try:
+        if cpu is not None:
+            os.sched_setaffinity(0, {cpu})
+        for _ in range(2):  # cold: the socket buffers have not grown yet
+            _loopback_once(total)
+        values = [_loopback_once(total) for _ in range(max(1, reps))]
+    except (OSError, MemoryError, ValueError, AttributeError) as e:
+        return {"error": str(e)[:200]}
+    return {"cpu": cpu, "values": values}
+
+
+#: The child's whole program: import this module by path and print its result.
+#: Spawned with `sys.executable`, so a fresh interpreter does the pinning and
+#: the interpreter's own threads are none of its business.
+_LOOPBACK_CHILD = (
+    "import json, sys; sys.path.insert(0, {libdir!r}); import lib; "
+    "print(json.dumps(lib._loopback_child({cpu!r}, {total!r}, {reps!r})))"
+)
+
+
+def host_loopback(reps: int = LOOPBACK_REPS) -> dict:
+    """What this host's **loopback path** measures, with no tool in it.
+
+    `host_calibration` above certifies CPU state, and that is all it certifies.
+    Measured: two container instances of the same `host_id` — one hostname
+    apart, identity fields identical — differed by **25-39 %** on the clean bulk
+    cells of the two arms that reach the loopback ceiling, while the CPU probe
+    read 414.0 against 421.2 MiB/s, 1.7 % apart, inside the 25 % the gate
+    allows. It waved that pair through, because a CPU workload is not what those
+    cells are bounded by: they are bounded by this path — the copies, the
+    syscalls, the socket buffers, the memory behind them.
+
+    **Pinned to one CPU, and that is not a detail.** Unpinned, this probe is
+    bimodal *across processes* — five runs at 29.4-29.7 Gbit/s and two at
+    34.2-34.4 on an idle machine, the two threads' cores deciding which copy
+    path they get — a 17 % spread that would refuse comparable pairs, since the
+    cells it is meant to certify did not move with it (two sweeps an hour apart:
+    16.3-16.8 Gbit/s both times, CPU probe 414.0 against 424.4). Pinned, ten
+    runs on an idle machine span 20.99-22.57 Gbit/s (worst case 7 %, typically
+    3 %), and four busy loops elsewhere on the host drop it to 20.4 — which is
+    the sensitivity the key exists for. Its level also brackets the cells
+    correctly: 12.9-16.7 Gbit/s of tool throughput under a ~22 Gbit/s per-core
+    ceiling, with the unpinned 29-34 Gbit/s ceiling above both.
+
+    Never raises, like `host_calibration`: a host that cannot run it records the
+    typed failure and the gate reports the comparison as unchecked.
+    """
+    total = LOOPBACK_MIB * (1 << 20)
+    before = _affinity()
+    try:
+        script = _LOOPBACK_CHILD.format(
+            libdir=str(Path(__file__).parent), cpu=_one_cpu(), total=total, reps=reps
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=LOOPBACK_CHILD_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"probe": "loopback_socketpair", "ok": False, "reason": str(e)[:200]}
+    # The child may not have changed *this* process's affinity — that is the
+    # whole reason it exists — and a run whose harness is pinned measures one
+    # core forever. Checked rather than assumed, because the failure is silent
+    # everywhere else: it was found only after a sweep came back with every fast
+    # number a third of its usual size.
+    if _affinity() != before:
+        raise RuntimeError(
+            "the loopback probe changed the harness's own CPU affinity "
+            f"({before} -> {_affinity()}): it must run in a child process, or "
+            "every tool and client this run spawns inherits the pin"
+        )
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {
+            "probe": "loopback_socketpair",
+            "ok": False,
+            "reason": f"probe child said nothing usable: {proc.stderr.strip()[:200]}",
+        }
+    if "error" in payload:
+        return {"probe": "loopback_socketpair", "ok": False, "reason": payload["error"]}
+    values = payload["values"]
+    pinned = payload.get("cpu")
+    lo, hi = min(values), max(values)
+    return {
+        "probe": "loopback_socketpair",
+        "ok": True,
+        "unit": "Gbit/s",
+        "mib": LOOPBACK_MIB,
+        "reps": len(values),
+        # The CPU the probe pinned itself to, when it could: a reader comparing
+        # two runs of one host wants to know it was the same one.
+        "cpu": pinned,
+        # Gbit/s, the unit the bench's own cells are read in, so a reader can
+        # hold the two side by side without converting.
+        "median": round(statistics.median(values) * 8.0 / 1024.0, 2),
+        "min": round(lo * 8.0 / 1024.0, 2),
+        "max": round(hi * 8.0 / 1024.0, 2),
+        "spread_pct": round((hi - lo) / hi * 100.0, 1) if hi else None,
+    }
+
+
+def host_calibration(reps: int = CALIBRATION_REPS) -> dict:
+    """What this host measures at a fixed, tool-free workload — the *state* key.
+
+    `host_identity`'s `host_id` is stable but it is a name: it cannot tell two
+    machines with the same CPU model and core count apart, and on a host with
+    no machine id that is all it has. This is the measurement the original note
+    asked for instead of more identity fields, and it is recorded beside the
+    identity rather than hashed into it — a noisy reading folded into a key
+    would make the key as noisy as the reading and impossible to diagnose.
+
+    Never raises: a host that cannot run the probe (a sandbox without the
+    cycles, a platform where it is meaningless) records the typed failure, and
+    the gate then reports that the comparison could not be checked rather than
+    reading a missing value as agreement.
+    """
+    try:
+        buffer = bytes(CALIBRATION_CHUNK)  # zeroes: hashing does not care
+        values = [_calibration_once(buffer) for _ in range(max(1, reps))]
+    except (OSError, MemoryError, ValueError) as e:
+        return {"probe": "sha256_fixed_buffer", "ok": False, "reason": str(e)[:200]}
+    lo, hi = min(values), max(values)
+    return {
+        "probe": "sha256_fixed_buffer",
+        "ok": True,
+        "unit": "MiB/s",
+        "mib": CALIBRATION_MIB,
+        "reps": len(values),
+        "median": round(statistics.median(values), 1),
+        "min": round(lo, 1),
+        "max": round(hi, 1),
+        # The probe's own spread, recorded so a reader can hold a between-run
+        # difference against the instrument's repeatability instead of guessing.
+        "spread_pct": round((hi - lo) / hi * 100.0, 1) if hi else None,
+    }
+
+
 def git_revision(exclude: Path | None = None) -> tuple:
     """The commit this run's harness came from, and whether the tree is clean.
 
@@ -1475,9 +2111,42 @@ def git_revision(exclude: Path | None = None) -> tuple:
     clean = None
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         args = ["git", "status", "--porcelain"]
+        # `:(exclude)` pathspec: everything except the run's own output. Two
+        # facts make this subtle, both measured rather than assumed:
+        #
+        # * the pathspec is interpreted from `here`, the cwd of this call, so a
+        #   repo-relative path (or an absolute one) never matches and the run's
+        #   own results file would mark every artifact dirty;
+        # * a path *outside* the repository cannot be excluded at all — git
+        #   exits 128 with "outside repository", which would turn the whole
+        #   verdict into `None` (an honest "cannot answer", but a worse one than
+        #   the truth).
+        #
+        # An output file outside the tree cannot make the tree dirty either, so
+        # the exclusion is simply not needed there and the plain verdict is the
+        # right answer.
+        exclude_in_tree = False
         if exclude is not None:
-            # `:(exclude)` pathspec: everything except the run's own output.
-            args += ["--", ".", f":(exclude){exclude}"]
+            try:
+                root = subprocess.run(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    cwd=here,
+                ).stdout.strip()
+                resolved = Path(exclude).resolve()
+                if root and resolved.is_relative_to(Path(root)):
+                    exclude_in_tree = True
+                    spec = Path(os.path.relpath(resolved, here.resolve()))
+                    args += ["--", ".", f":(exclude){spec}"]
+            except (OSError, ValueError, subprocess.SubprocessError):
+                exclude_in_tree = False
+        if exclude is not None and not exclude_in_tree:
+            # Keep the `-- .` scope (repo files only): an outside output path
+            # needs no exclusion, and the caller's intent is still "the tree".
+            args += ["--", "."]
         r = subprocess.run(
             args, capture_output=True, text=True, check=False, timeout=20, cwd=here
         )

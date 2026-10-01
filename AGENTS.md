@@ -52,48 +52,22 @@ Principle: **fix the code first; a waiver is the last resort, and only
 code-level.**
 
 - Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
-  `githooks/pre-commit`, or any check command.
-- When a waiver is truly needed, relax **in code only**:
-  - prefer `#[expect(clippy::lint_name)]` (it starts producing a compile
-    warning once the lint stops firing, preventing stale allows), fall back to
-    `#[allow(clippy::lint_name)]`;
-  - minimal scope: a single statement or one function; never function groups,
-    module-level `#![allow(...)]`, or crate-level relaxation. One exception is
-    sanctioned: a `#[cfg(test)] mod tests` may carry a module-level
-    `#![expect(clippy::unwrap_used, reason = "...")]` (and `expect_used` /
-    `panic` / `assertions_on_constants` where a test needs them), because a
-    test's failure path *is* a panic — waiving it per call would bury the
-    assertion under `.expect()` noise. Production modules get no such
-    exception;
-  - feature-gated dead code: prefer real `#[cfg(feature = "...")]` gating
-    over `allow(dead_code)` when the item's only consumer is feature-gated —
-    gate the whole item (struct, function, parameter, trait method) when the
-    non-gated build would leave it empty; the `allow` stays only for the
-    narrow case where gating would cascade;
-  - `unsafe` items with an expect: put the `// SAFETY:` comment directly
-    above the unsafe item and the `#[expect(...)]` attribute above the
-    comment — `undocumented_unsafe_blocks` requires the comment to be
-    adjacent to the unsafe item, and an attribute in between silently breaks
-    it;
-  - a one-line reason comment at the waiver point is mandatory (plus a linked
-    issue, if any).
-- Only two legitimate scenarios:
-  1. **genuinely unavoidable** — the business need demands it and no equally
-     reasonable alternative exists;
-  2. **upstream problems** — false positives, macro/derive-generated code, or
-     audit noise from dependencies themselves (e.g. RustSec unmaintained
-     notices).
-- All other audits and extra checks (machete, audit, deny, outdated,
-  docs-sync, secret scan, and anything added later) follow the **same
-  discipline**: fix if fixable; waive only as above when truly unfixable.
-  Never delete, comment out, or bypass a check.
-- The chain has two layers — **fast gates** (`githooks/pre-commit`: fmt /
-  secrets / machete / docs / python lint+format (ruff) / clippy) run on commit,
-  **heavy gates** (`githooks/pre-push`: audit / deny / outdated / test) run
-  on push; CI runs the whole chain via `just check` (§8). Tag pushes additionally
-  run the light release review `githooks/pre-tag` (§5) before the heavy
-  gates. All of these are "the checks" and bound by this discipline. Levels
-  and the declared lint set: [docs/lint-policy.md](docs/lint-policy.md).
+  `ruff.toml`, `githooks/pre-commit`, or any check command. Never delete,
+  comment out, or bypass a check.
+- Every check follows the **same discipline** — the Rust lints, the two ruff
+  gates, and all the audits and extra checks (machete, audit, deny, outdated,
+  docs-sync, secret scan, and anything added later): fix if fixable, waive
+  only when genuinely unfixable, in code, at the narrowest scope, with a
+  reason.
+- The waiver *forms* — which attribute, what scope counts as minimal, the one
+  sanctioned module-level exception, the `unsafe` rule and the python policy —
+  and the declared lint set are owned by
+  [docs/lint-policy.md](docs/lint-policy.md): read it before writing a waiver.
+  What each gate runs, and what to do when one blocks you, is
+  [docs/checks.md](docs/checks.md).
+- "The checks" are the two hook layers plus the tag review: fast gates
+  (`githooks/pre-commit`) on commit, heavy gates (`githooks/pre-push`) on push,
+  the light release review (`githooks/pre-tag`) on a `v*` tag — §5, §8.
 
 ## 3. Before every commit: docs ↔ code alignment (every commit)
 
@@ -106,31 +80,20 @@ code-level.**
   - toolchain description ↔ `rust-toolchain.toml`; layout ↔
     docs/structure.md; command examples; version numbers;
   - source doc comments (`//!` / `///`) ↔ actual behavior.
-- User-facing docs (README, configuration, transport, benchmarks) keep
-  Chinese mirrors (`*.zh.md`) and must change together; never update one
+- User-facing docs (README, configuration, transport, benchmarks, deployment)
+  keep Chinese mirrors (`*.zh.md`) and must change together; never update one
   language only. Governance and contributor docs (checks, lint-policy,
   release, structure, internals, build-guide, AGENTS.md, HANDOFF.md) are
   English-only by decision — do not create `*.zh.md` for them. When touching
   any page, at minimum keep it truthful.
 - **One topic, one home.** Every fact is written once, in the page that owns
   it; every other page links to it. Putting a fact in two places guarantees
-  that one of them goes stale. Route by what you are about to write:
-
-  | You are about to write… | Write it in |
-  |---|---|
-  | what a setting does, its default, its allowed values | docs/configuration.md (+ `.zh.md`) |
-  | how to set the Noise transport up | docs/transport.md (+ `.zh.md`) |
-  | how a number was produced, how to read a chart, how to reproduce a run, what a configuration choice cost | docs/benchmarks.md (+ `.zh.md`) |
-  | what a gate runs, and how to handle a block | docs/checks.md |
-  | a lint level or a waiver rule | docs/lint-policy.md |
-  | release mechanics, versioning, the tag ritual and its gate | docs/release.md |
-  | what a file is for, or which page owns a topic | docs/structure.md |
-  | the wire protocol or the forwarding design | docs/internals.md |
-  | how to build, or which features exist | docs/build-guide.md |
-  | what changed for a user, in one release | CHANGELOG.md |
-  | a decision, an incident write-up, a measurement record, an open thread | HANDOFF.md |
-  | a rule that binds future changes (this file's §2, §5, §10) | AGENTS.md |
-
+  that one of them goes stale. **The routing table is
+  [docs/structure.md](docs/structure.md), "Documentation responsibilities"** —
+  it names the owning page for every topic, the audience for every page, and
+  what each page does *not* own. It is the single copy of that contract: route
+  by it before you write, and add a row to it in the same commit as a new
+  page.
 - Two consequences worth stating, because both have been violated:
   - **A user-facing page never explains the repository's own history.** "What
     replaced the old tables", "the previous harness measured X", why a model
@@ -180,23 +143,28 @@ code-level.**
   v0.6.0, where molehill forked from
   [rathole](https://github.com/rapiz1/rathole) (upstream's last release was
   v0.5.0), and has been numbered independently since. Never renumber.
+- **The wire protocol version moves with the release line, and no two tags are
+  compatible.** A dialect is defined by a release: the number changes when the
+  wire changes, it changes *with* the tag that introduces it, and
+  `SUPPORTED_PROTO_VERSIONS` is the current dialect alone — a peer from another
+  tag is refused on the connection it happens on, in both directions, and
+  upgrading means upgrading both ends. Two releases share a number when their
+  wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
+  still in development it is still being defined, so commands may be extended
+  **in place** under that number; once the tag exists, the next change to the
+  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
+  — the first three read off each tag's `CURRENT_PROTO_VERSION`, 0.10 off
+  `src/protocol.rs` at HEAD, because the tag that would confirm it does not
+  exist yet.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-- During development, record notable changes under `## [Unreleased]`.
-- Before tagging, move that content into a dated section:
-  `## [x.y.z] - YYYY-MM-DD` (the git tag is the same version with a `v`
-  prefix, e.g. `v0.7.1`).
-- Pushing a `v*` tag triggers `.github/workflows/release.yml`, which verifies
-  the version ↔ tag match and the changelog section, then builds and
-  publishes directly (GitHub Release — no draft stage —, GHCR image,
-  crates.io). A missing or empty changelog section **fails the release**;
-  never hand-edit release notes on GitHub — the changelog is the source.
-  Before the tag exists, `just tag` runs the light release review
-  (`githooks/pre-tag`: tag↔version match, dated changelog section,
-  committed bench results/chart, container-job greps, advisory review
-  checklist); pre-push repeats it on every `v*` tag push (git has no native
-  tag hook). Step-by-step mechanics: [docs/release.md](docs/release.md).
+  During development, record notable changes under `## [Unreleased]`; before
+  tagging, that content moves into exactly one dated
+  `## [x.y.z] - YYYY-MM-DD` section (`v` prefix on the git tag) and
+  `[Unreleased]` is left empty. A missing, empty or duplicated section
+  **fails the release**; never hand-edit release notes on GitHub — the
+  changelog is the source.
 - **Tag-push policy: no casual release pushes.** Commits are always allowed —
   the fast gates guard them and they trigger nothing public. Pushing a `v*`
   tag is a deliberate release act; **all** of the following must hold before
@@ -204,7 +172,10 @@ code-level.**
   1. an explicit human request (agents must never create release tags on
      their own initiative);
   2. `version` in `Cargo.toml` equals the tag version;
-  3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`;
+  3. a dated `## [x.y.z] - YYYY-MM-DD` section exists in `CHANGELOG.md`, is the
+     only section for that version, contains prose, and `[Unreleased]` is
+     empty (every extractor takes the first match, so a stray duplicate in
+     front of the real section would be published as the notes);
   4. `just check` is green on the tagged commit;
   5. the benchmark ritual is done (docs/release.md):
      `results-soak-vX.Y.Z.json`, the new chart, and the README benchmark
@@ -213,6 +184,10 @@ code-level.**
      regress.
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
+- **Mechanics live in [docs/release.md](docs/release.md)**: the exact changelog
+  steps, what `githooks/pre-tag` verifies (before the tag exists via
+  `just tag`, and again on a tag push, since git has no native tag hook), and
+  what `.github/workflows/release.yml` builds and publishes.
 
 ## 6. CD test builds: per-commit, per-platform artifacts
 
@@ -390,26 +365,10 @@ revision) and are as binding as the lint discipline in §2.
   conclusions is worse than no table. This section (§10) owns the *rules* that
   bind future measurements, not the description of any one run.
 
-## 11. Documentation map
+## 11. Project facts (appendix)
 
-| Question | Where |
-|----------|-------|
-| How to build, run, and configure molehill | README.md / docs/configuration.md |
-| How the benchmark numbers are produced, read and reproduced | docs/benchmarks.md |
-| Which page owns which topic | docs/structure.md, "Documentation responsibilities" |
-| What each gate runs, how to handle a block | docs/checks.md |
-| Lint levels and waiver rules | docs/lint-policy.md |
-| Release mechanics, test builds, versioning | docs/release.md |
-| What every file in this repo is for | docs/structure.md |
-| Noise transport setup | docs/transport.md |
-| Control/data channel design | docs/internals.md |
-| Current working state, decisions, open threads | HANDOFF.md |
-| How to measure, and what makes a benchmark number trustworthy | AGENTS.md §10 (this file) |
-
-
-## 12. Project facts (appendix)
-
-Details that agents need constantly:
+Details that agents need constantly — the ones with a single home elsewhere are
+pointers, not copies:
 
 - **What it is**: a secure, stable, high-performance reverse proxy for NAT
   traversal (a Rust alternative to frp / ngrok). Server runs on a public
@@ -418,41 +377,29 @@ Details that agents need constantly:
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
   `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels — arm 2 of the transport comparison, in the
-  default set, see HANDOFF.md); `embedded` (minimal). Clippy runs twice in
-  the pre-commit gate: the second pass covers the minimal no-default-features
-  `server,client` build that the default-feature pass never compiles.
-- **Protocol**: v3 — client registers services dynamically after auth
-  (`RegisterService`, carrying the data-plane carrier), server enforces
-  `allow_ports`; every connection starts with a one-byte transport selector
-  (0x00 plain / 0x01 noise); protocol mismatch is a hard error. See
-  docs/internals.md.
-- **Build profiles**: `release` (lto, strip, panic=abort), `minimal`
-  (opt-level "z", ~500KiB), `bench`. Container image: static musl binary on
-  scratch.
+  KCP-over-UDP data tunnels, in the default set); `embedded` (minimal).
+  Clippy runs twice in the pre-commit gate: the second pass covers the
+  minimal no-default-features `server,client` build that the default-feature
+  pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Unsafe is denied crate-wide** (`unsafe_code = "deny"`): the one module
-  that needs it — `src/transport/udp_batch.rs`, the `recvmmsg`/`sendmmsg`
-  batching FFI — opts in per item with `#[expect(unsafe_code, reason = ...)]`
-  and a `// SAFETY:` comment, and `src/mux.rs` forbids it outright. Every other
-  waiver in the tree is an `#[expect]`, so `-D warnings` (which denies
-  `unfulfilled_lint_expectations`) fails the build on a stale one — verified,
-  not assumed.
-- **Bench/test entries are PEP 723 python scripts run via `uv run`** (no
-  shell test entries; see docs/release.md). They are linted *and*
-  format-checked by ruff (`ruff.toml`) in the pre-commit gate — fix the code,
-  never disable a check. Waivers follow the same discipline as the Rust lints:
-  repo-wide only for a property that is true of every script (today: they
-  measure PATH binaries, S602/S603/S607), everything else inline at its own
-  site with a named reason. `just py-lint` runs both checks, `just py-fmt`
-  auto-fixes.
-- **Full architecture guidance** (module layout, design patterns, protocol
-  flow) lives in [docs/structure.md](docs/structure.md) and
+- **Protocol**: v4, one control session per endpoint; the rule and the
+  release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
+- **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
+  `opt-level = "z"`, `bench`) and the scratch container image are
+  [docs/build-guide.md](docs/build-guide.md).
+- **Unsafe** is denied crate-wide; the one module that opts in per item, the
+  `src/mux.rs` forbid and the single surviving `#[allow]` are
+  [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
+- **Bench/test entries are PEP 723 python scripts run via `uv run`**; their
+  lint and format gates and the waiver rule are
+  [docs/lint-policy.md](docs/lint-policy.md) ("Python (ruff)").
+- **Where everything lives**: [docs/structure.md](docs/structure.md) — the
+  file map and the topic-ownership contract (§3).
 
-## 13. One-line summary
+## 12. One-line summary
 
 > Self-check the environment on entry; when a check blocks you, fix the code —
 > waive only as a last resort, locally, with a named reason; keep docs and

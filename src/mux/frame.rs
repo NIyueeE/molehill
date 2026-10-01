@@ -50,6 +50,12 @@ impl<T> Frame<T> {
         &mut self.header
     }
 
+    /// The body's length in bytes, for the erased `Frame<()>` the connection
+    /// queues (a body-carrying [`Frame<Data>`] has `body_len` for the wire).
+    pub(crate) fn body_size(&self) -> usize {
+        self.body.len()
+    }
+
     /// Introduce this frame to the right of a binary frame type.
     pub(crate) fn right<U>(self) -> Frame<Either<U, T>> {
         Frame {
@@ -165,13 +171,6 @@ impl Frame<GoAway> {
     pub fn protocol_error() -> Self {
         Frame {
             header: Header::protocol_error(),
-            body: Vec::new(),
-        }
-    }
-
-    pub fn internal_error() -> Self {
-        Frame {
-            header: Header::internal_error(),
             body: Vec::new(),
         }
     }

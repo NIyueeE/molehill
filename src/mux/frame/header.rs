@@ -184,11 +184,6 @@ impl Header<GoAway> {
         Self::go_away(1)
     }
 
-    /// Terminate the session indicating an internal error to the remote.
-    pub fn internal_error() -> Self {
-        Self::go_away(2)
-    }
-
     fn go_away(code: u32) -> Self {
         Header {
             version: Version(0),

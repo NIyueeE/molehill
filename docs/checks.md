@@ -24,49 +24,19 @@ a second workflow, `docs.yml`, runs the doc gates for them instead — the
 docs-alignment check, which is precisely what a docs edit can break. A commit
 mixing docs and code paths runs both workflows.
 
-Beyond that chain, CI's other jobs cover what `just check` cannot: the feature
-powerset (`cargo hack`), the alternative feature-set test matrix, the
-cross-platform builds, and a musl check of the exact target and feature set
-`release.yml` ships (without it, a glibc-only assumption in Linux-only code
-survives to the tag — `release.yml` itself only runs once a tag is pushed).
+Beyond that chain, CI runs jobs this page does not cover — the feature powerset,
+the alternative feature-set test matrix, the cross-platform builds and the musl
+check of what `release.yml` ships. Their roster, and what each one guards, is
+owned by the "Automation" table in [structure.md](structure.md).
 
 ## Tools
 
-The cargo gates use four external tools; `just setup` installs any that are
-missing, activates the git hooks, and reports `uvx` / `cargo-hack` when they
-are absent:
+The cargo gates need `cargo-machete`, `cargo-audit`, `cargo-outdated` and
+`cargo-deny`, and the python gates need `uv`/`uvx`; `just setup` installs what is
+missing and activates the git hooks. The setup routine — which tools must be on
+PATH, and `cargo-hack` for `just powerset` — is in [AGENTS.md §1](../AGENTS.md).
 
-```bash
-cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
-```
-
-`cargo fmt` and `cargo clippy` come with the toolchain declared in
-`rust-toolchain.toml` (`channel = "stable"` + clippy/rustfmt components).
-The python bench/test entries and the two ruff gates (lint + format) run
-through `uv` / `uvx` (PEP 723 scripts, see docs/release.md); install uv with
-`curl -LsSf https://astral.sh/uv/install.sh | sh`. `just powerset` needs
-`cargo-hack` (CI's `features` job installs it; locally:
-`cargo install cargo-hack --locked`).
-
-## On every commit — `githooks/pre-commit`
-
-| # | Gate | Command | Purpose |
-|---|------|---------|---------|
-| 1 | fmt | `cargo fmt --all -- --check` | code style |
-| 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
-| 3 | machete | `cargo machete` | unused dependencies |
-| 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
-| 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
-| 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
-| 7 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
-| 8 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
-
-Note the template difference: clippy runs twice (default features, then
-`server,client` only) instead of once with `--all-features`, because the
-second pass covers the minimal no-default-features build that the
-default-feature pass never compiles. `just check` runs the identical chain.
-
-### The docs-only path (both fast and heavy gates)
+## The docs-only path (both fast and heavy gates)
 
 A change whose paths are all markdown, `docs/**` or `assets/**` cannot move
 the code gates, so both hooks classify it with `githooks/docs-only` before
@@ -97,6 +67,24 @@ is the safe direction.
 Lines that must carry a secret-shaped string (e.g. key-format documentation)
 take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 
+## On every commit — `githooks/pre-commit`
+
+| # | Gate | Command | Purpose |
+|---|------|---------|---------|
+| 1 | fmt | `cargo fmt --all -- --check` | code style |
+| 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
+| 3 | machete | `cargo machete` | unused dependencies |
+| 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
+| 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
+| 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
+| 7 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
+| 8 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
+
+Note the template difference: clippy runs twice (default features, then
+`server,client` only) instead of once with `--all-features`, because the
+second pass covers the minimal no-default-features build that the
+default-feature pass never compiles. `just check` runs the identical chain.
+
 ## On every push — `githooks/pre-push`
 
 | # | Gate | Command | Purpose |
@@ -124,8 +112,8 @@ commit; nothing here is a heavy gate.
 | # | Check | Purpose |
 |---|-------|---------|
 | 13 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
-| 14 | dated, non-empty `## [x.y.z] - YYYY-MM-DD` in `CHANGELOG.md` | release notes single source |
-| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed | benchmark ritual deliverables |
+| 14 | exactly one dated `## [x.y.z] - YYYY-MM-DD` section in `CHANGELOG.md`, with prose in it and an empty `## [Unreleased]` | release notes single source |
+| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
 | 16 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
 | 17 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 
@@ -168,9 +156,11 @@ yesterday's protocol.
 `benches/scripts/interop/fetch_old.py` downloads the newest release (asset for
 this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
 release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
-`cargo test --test interop_test`. Three cases: old server + new client forwards
-traffic, new server + old client forwards traffic, and an old server refuses an
-unknown dialect on that one connection yet keeps serving valid clients.
+`cargo test --test interop_test`. Three cases, all of them about a refusal
+being *local*: an old server refuses the new client's dialect, a new server
+refuses the old client's dialect (v0.10 serves v4 only), and an old server
+refuses an unknown dialect — each on that connection alone, while the same
+process keeps serving a client of its own version.
 
 It is **not** part of `just check` or CI: it needs network access and a GitHub
 release asset, and a CI runner has neither the previous release nor a reason to
@@ -181,7 +171,6 @@ what it did not check.
 
 ## When a gate blocks you
 
-Fix the code first. A waiver is the last resort: code-level only
-(`#[expect(...)]` preferred over `#[allow]`), minimal scope, with a reason
-comment. Never weaken `[lints]`, the hooks, or CI. See
+Fix the code first; a waiver is the last resort. The discipline that governs one
+— code-level only, minimal scope, with a reason — is owned by
 [Lint policy](lint-policy.md) and [AGENTS.md](../AGENTS.md).

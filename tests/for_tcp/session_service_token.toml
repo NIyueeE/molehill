@@ -1,0 +1,36 @@
+# Fixture for `a_foreign_service_token_rejects_only_that_service`.
+#
+# A v4 session authenticates once with `[client].default_token`; every service
+# then proves its own credential. `same` names the server's token explicitly,
+# `foreign` names another one — the server owns no per-service token table, so
+# the first is accepted and the second is refused on its own.
+
+[client]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.control]
+default_remote_addr = "127.0.0.1:2375"
+
+[client.transport]
+type = "plain"
+
+[client.services.same]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2376"
+# Same value as `[server].default_token`: accepted.
+token = "default_token_if_not_specify"  # security-scan:allow fixture token
+
+[client.services.foreign]
+local_addr = "127.0.0.1:8081"
+remote_bind_addr = "0.0.0.0:2377"
+# Never the server's token: this service alone is refused.
+token = "not_the_server_token"  # security-scan:allow fixture token, deliberately wrong
+
+[server]
+# the token is shared with every other fixture and is not a credential
+default_token = "default_token_if_not_specify"  # security-scan:allow fixture token
+allow_ports = ["2376-2377"]
+
+[server.control]
+bind_addr = "127.0.0.1:2375"

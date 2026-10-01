@@ -1,0 +1,36 @@
+# The operator's valve (`[server.data].max_tunnels_per_client`) against a
+# client that wants more: the client's own cap is 2, the server's is 1, so the
+# pool's growth attempt is refused while the tunnel it already holds keeps
+# forwarding. `tests/pool_test.rs` asserts the pool never reaches 2 and that
+# the session survives the refusal.
+
+[client]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+
+[client.control]
+default_remote_addr = "127.0.0.1:2370"
+
+[client.transport]
+type = "plain"
+
+[client.data]
+default_mode = "multiplex"
+default_carrier = "tcp"
+idle_timeout = 2
+
+[client.data.tcp]
+max_tunnels = 2
+
+[client.services.valve]
+local_addr = "127.0.0.1:8090"
+remote_bind_addr = "127.0.0.1:2371"
+
+[server]
+default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
+allow_ports = ["2371"]
+
+[server.control]
+bind_addr = "127.0.0.1:2370"
+
+[server.data]
+max_tunnels_per_client = 1

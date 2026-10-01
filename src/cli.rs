@@ -58,7 +58,9 @@ pub struct Cli {
 
     /// Generate a keypair for the use of the noise protocol
     ///
-    /// The DH function to use is x25519
+    /// x25519 is the curve this build can generate (the Noise resolver is
+    /// ring); `x448` is accepted by the parser and refused with the reason,
+    /// rather than silently producing a keypair for another curve.
     #[arg(long, value_enum, value_name = "CURVE")]
     pub genkey: Option<Option<KeypairType>>,
 }

@@ -1,6 +1,8 @@
-# Arm 2 fixture: data tunnels are 2 parallel KCP-over-UDP sessions wrapped
-# in Noise (same keys as the TCP+Noise control channel); the control channel
-# itself stays TCP+Noise. Requires a binary built with the `kcp` feature.
+# Arm 2 fixture: the data tunnels are KCP-over-UDP sessions wrapped in Noise
+# (same keys as the TCP+Noise control channel); the control channel itself
+# stays TCP+Noise. The pool starts cold, so the tunnel count is not
+# configured — `[client.data.kcp].max_tunnels` caps it, default 4. Requires a
+# binary built with the `kcp` feature.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
@@ -11,7 +13,6 @@ default_remote_addr = "127.0.0.1:2333"
 [client.data]
 default_carrier = "kcp"
 default_data_addr = "127.0.0.1:2343"
-default_count = 2
 
 [client.transport]
 type = "noise"

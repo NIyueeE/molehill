@@ -7,15 +7,15 @@ default_remote_addr = "127.0.0.1:2339"
 [client.transport]
 type = "plain"
 
-# One UDP service with an explicit pool: the session-affinity regression
-# test sends one peer's datagrams through this pool and requires them to
-# surface at the local service from a single source port.
+# One UDP service with an explicit worker set: the session-affinity
+# regression test sends one peer's datagrams through these channels and
+# requires them to surface at the local service from a single source port.
 
 [client.services.game]
 protocol = "udp"
 local_addr = "127.0.0.1:8082"
 remote_bind_addr = "0.0.0.0:2340"
-pool_size = 2
+udp_workers = 2
 
 [server]
 default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential

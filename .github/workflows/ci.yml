@@ -127,7 +127,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target || matrix.args }}-test
+          # `matrix.name`, not `matrix.args`: a cache key may not contain a
+          # comma, and every `args` entry has one — which is why this leg's
+          # cache restore failed with a validation error instead of caching.
+          key: ${{ matrix.name }}-test
 
       - name: Run tests (serial — the integration suite binds fixed ports)
         run: cargo test --verbose ${{ matrix.args }} -- --test-threads=1
@@ -156,6 +159,11 @@ jobs:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      # A failing platform must not cancel the others: with the default
+      # fail-fast a Windows failure left the Linux and macOS legs "cancelled",
+      # which reads like a platform verdict and is not one — the release
+      # question is whether *every* platform builds.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest

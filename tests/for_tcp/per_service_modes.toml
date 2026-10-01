@@ -1,8 +1,8 @@
 # Per-service data-plane overrides: `[client.data]` provides the defaults,
-# `[client.services.*]` can override mode/count/carrier individually. Here
-# the echo service inherits the default `mode = "multiplex"` (count 1),
-# while pingpong forces `mode = "direct"` — one client, both data paths at
-# once, no server-side configuration beyond the usual policy.
+# `[client.services.*]` can override mode/carrier individually. Here the echo
+# service inherits the default `mode = "multiplex"`, while pingpong forces
+# `mode = "direct"` — one client, both data paths at once, no server-side
+# configuration beyond the usual policy.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
@@ -11,7 +11,6 @@ default_token = "default_token_if_not_specify" # security-scan:allow dummy fixtu
 default_remote_addr = "127.0.0.1:2345"
 
 [client.data]
-default_count = 1
 
 [client.services.echo]
 local_addr = "127.0.0.1:8080"

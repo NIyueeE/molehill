@@ -118,6 +118,16 @@ pub(crate) mod udp_batch;
 pub(crate) mod multiplex;
 #[cfg(feature = "multiplex")]
 pub(crate) use multiplex::MuxStream;
+// The elastic pool's *policy*: internal constants, placement arithmetic and
+// the shrink predicate. Pure, so the rules are unit-tested without a socket.
+#[cfg(feature = "multiplex")]
+pub(crate) mod pool;
+// The client's tunnel pool and its per-session/per-service keys are re-exported
+// for the integration suite, which asserts on the pool's own state instead of
+// guessing it from the telemetry text.
+#[cfg(feature = "multiplex")]
+#[doc(hidden)]
+pub use multiplex::{Carrier, PoolSnapshot, TunnelPool};
 
 #[derive(Debug, Clone, Copy)]
 struct Keepalive {

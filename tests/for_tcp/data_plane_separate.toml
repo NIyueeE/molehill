@@ -11,7 +11,6 @@ default_remote_addr = "127.0.0.1:2338"
 [client.data]
 default_data_addr = "127.0.0.1:2344"
 default_mode = "multiplex"
-default_count = 2
 
 [client.transport]
 type = "plain"
