@@ -339,11 +339,11 @@ Stated so a reader does not ask a chart for something it never measured:
 - **Two arms at the loopback ceiling.** On one host the top of the range is the
   loopback path itself, not the tool, so the arms that reach it cannot be
   ordered by a run. Across three sweeps of identical code (only tests and docs
-  changed between them) the two that do here read 17.3-22.2 and 14.3-20.4
-  Gbit/s — a swing large enough to *reverse* their order — while `frp`
-  (6.04-6.15) and `nps` (0.133-0.136), an order of magnitude below the ceiling,
-  moved by under 2 %. The host's own loopback probe stayed inside 21.5-21.9
-  Gbit/s across the same runs, so the swing is not the path. Read those two rows
+  changed between them) the two that do here read 15.9-22.2 and 12.8-20.4
+  Gbit/s — swings of 39 % and 59 %, wide enough to *reverse* their order — while
+  `frp` (6.04-6.19) and `nps` (0.133-0.136), an order of magnitude below the
+  ceiling, moved by under 3 %. The host's own loopback probe stayed inside
+  21.6-21.9 Gbit/s across the same runs, so the swing is not the path. Read those two rows
   as one reading of the host's state, never carry their order as a standing
   claim, and never read a run-to-run difference between them as a code change.
 - **Which configuration a peer number describes.** The published four-tool

@@ -75,10 +75,10 @@ the full reading rules: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 8.0 | ~8691‡ | ~1126 | ~2552‡ | ~1500 | ~7753‡ | ~6823‡ | 8.2 |
-| frp | 2.7 | ~5133‡ | ~1072 | ~5184‡ | ~1564 | ~7499‡ | ~7433‡ | 2.7 |
-| rathole | 80.2 | ~6695‡ | ~1136 | ~4002‡ | ~1516 | ~7531‡ | ~4518‡ | 75.6 |
-| nps | 66.2 | ~501 | ~1076 | ~1487 | ~1573 | ~7601‡ | ~6298‡ | 57.1 |
+| molehill (mux) | 8.4 | ~5749‡ | ~1136 | ~3378 | ~1544 | ~7633‡ | ~6120‡ | 9.4 |
+| frp | 2.9 | ~4904 | ~1084 | ~3558 | ~2917 | ~7670‡ | ~6297‡ | 3.0 |
+| rathole | 102.3 | ~7186‡ | ~1147 | ~3716‡ | ~1595 | ~7360‡ | ~4522‡ | 104.5 |
+| nps | 64.4 | ~466 | ~1096 | ~1690 | ~1543 | ~7158‡ | ~8086‡ | 66.9 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second). A `*` marks a cell read from the **receiver's** own
@@ -87,10 +87,10 @@ side a cell uses: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 17.312 | 5.272 | 9.707 | 5.077 | 0.100 | 0.020 | — † | 17.563 |
-| frp | 6.153 | 5.574 | 5.821 | 5.297 | 0.100 | 0.019 | — † | 6.149 |
-| rathole | 14.308 | 5.235 | 9.686 | 5.196 | 0.099 | 0.019 | — † | 14.297 |
-| nps | 0.136 | 0.161 | 0.137 | 0.164 | 0.100 | 0.020 | — † | 0.136 |
+| molehill (mux) | 16.830 | 5.261 | 9.727 | 5.272 | 0.100 | 0.019 | — † | 15.921 |
+| frp | 6.191 | 5.540 | 5.862 | 5.306 | 0.099 | 0.019 | — † | 6.181 |
+| rathole | 12.822 | 5.191 | 9.679 | 5.222 | 0.100 | 0.020 | — † | 12.867 |
+| nps | 0.134 | 0.150 | 0.142 | 0.167 | 0.100 | 0.020 | — † | 0.135 |
 
 **The run's own replicate.** `clean` is measured at both ends of every
 timeline, so each tool's two readings are two samples of one condition about
@@ -98,26 +98,23 @@ an hour apart — the scale every other cell is read against:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (mux) | 17.312 – 17.563 Gbit/s (**1.4 %** apart) | 8.0 – 8.2 ms |
-| frp | 6.149 – 6.153 Gbit/s (**0.1 %** apart) | 2.7 – 2.7 ms |
-| rathole | 14.297 – 14.308 Gbit/s (**0.1 %** apart) | 75.6 – 80.2 ms |
-| nps | 0.136 – 0.136 Gbit/s (**0.1 %** apart) | 57.1 – 66.2 ms |
+| molehill (mux) | 15.921 – 16.830 Gbit/s (**5.4 %** apart) | 8.4 – 9.4 ms |
+| frp | 6.181 – 6.191 Gbit/s (**0.2 %** apart) | 2.9 – 3.0 ms |
+| rathole | 12.822 – 12.867 Gbit/s (**0.3 %** apart) | 102.3 – 104.5 ms |
+| nps | 0.134 – 0.135 Gbit/s (**0.5 %** apart) | 64.4 – 66.9 ms |
 
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
 different instrument from the staged schedule
-([Benchmarks](./docs/benchmarks.md#test-types)); one arm carried its full 8
-streams, so 8 reads as a **floor** ("at least 8"), not a maximum. A load level
-the instrument could not measure counts as not sustainable — that is what
-`rathole`'s row records: its ramp stopped at load 2 because the iperf3 backend
-died, which is a statement about the harness, not about `rathole`:
+([Benchmarks](./docs/benchmarks.md#test-types)); three arms carried its full 8
+streams, so 8 reads as a **floor** ("at least 8"), not a maximum:
 
 | tool | sustainable streams | ceiling | headroom | reason at the break |
 |---|---|---|---|---|
 | molehill (mux) | 8 | 8 | 0.0 | never broke |
-| frp | 4 | 8 | 0.5 | interactive error rate 0.006 > 0.005 |
-| rathole | 1 | 8 | 0.875 | no reading: the iperf3 backend died at load 2 |
-| nps | 0 | 8 | 1.0 | interactive p99 205.105 > 50.0 |
+| frp | 8 | 8 | 0.0 | never broke |
+| rathole | 8 | 8 | 0.0 | never broke |
+| nps | 0 | 8 | 1.0 | interactive p99 204.84 > 50.0 |
 
 These are v0.10.0 numbers from one host, and only same-schema, same-method,
 same-host runs compare directly: every results file records the host, the
@@ -126,9 +123,9 @@ completeness, endpoint and SLO checks
 ([Benchmarks](./docs/benchmarks.md#comparability)). Note that **molehill and
 rathole both read at this host's loopback ceiling and move with its state
 between runs**: across three sweeps of identical code their clean readings span
-17.3-22.2 and 14.3-20.4 Gbit/s — a swing that even reverses their order — while
-`frp` (6.04-6.15) and `nps` (0.133-0.136), an order of magnitude below the
-ceiling, moved by under 2 %.
+15.9-22.2 and 12.8-20.4 Gbit/s — swings of 39 % and 59 % that reverse their
+order — while `frp` (6.04-6.19) and `nps` (0.133-0.136), an order of magnitude
+below the ceiling, moved by under 3 %.
 
 The rest of the run's chart set is published beside these two:
 `soak-v0.10.0-drift.png` (open fds, RSS and CPU slopes over the run),

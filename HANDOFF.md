@@ -28,12 +28,10 @@
   in; the open threads at the freeze are the three at the bottom of this page,
   and none of them blocks the release.
 - **The branch is merged and v0.10.0 is ready to re-tag.** PR #4 merged as
-  `dffd7d8`; the changelog section is dated 2026-10-01 (the tag day) and the
-  first tag push failed on one emulated build leg with nothing published —
-  see "Release (v0.10.0)" below. The fix is a `tests/` change, which by the
-  pre-tag rule invalidates the committed artifact, so the sweep was re-run on
-  the fixed commit; the tag is deleted and the next push is the deliberate
-  re-tag.
+  `dffd7d8`. Two tag pushes have failed — the emulated legs, then the musl leg —
+  each on a test defect, with nothing published either time; both are fixed, the
+  sweep is re-run on the fixed commit (`96bda00`), and the tag is deleted so the
+  next push is the deliberate re-tag. See "Release (v0.10.0)" below.
 - **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
   `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the benchmark
   ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
@@ -108,58 +106,62 @@ above is what would give it one).
 ## Release (v0.10.0)
 
 1. ~~Freeze~~ **done (2026-09-28)** — `version = "0.10.0"`, the `[Unreleased]`
-   content moved under a dated `## [0.10.0]` section, `[Unreleased]` left
-   empty, the withdrawn v0.9.1 artifacts deleted.
-2. ~~Sweep~~ **done (2026-10-01, at `f34788d`)** — the artifact, the charts and
+   content moved under a dated `## [0.10.0]` section (now dated 2026-10-01, the
+   tag day), `[Unreleased]` left empty, the withdrawn v0.9.1 artifacts deleted.
+2. ~~Sweep~~ **done (2026-10-01, at `96bda00`)** — the artifact, the charts and
    both READMEs describe this commit: four tools, 8/8 stages each plus the
    capacity ramp, `--test=rrul,capacity`, `shape_legs=visitor`, the bounded
    rate-class window, `tree_clean: true`, and **`just soak-check`: `OK: no gate
    violation`**, no waiver. The gate's own self-check is the verdict: the
    v0.9.0 baseline is not a gate input (another host, and a method record
-   missing six keys), which is the documented behaviour for a fresh sweep. An
-   earlier sweep at `bbe9664` is superseded — the tag failure below changed
-   `tests/`, which is exactly what the pre-tag rule treats as invalidating.
-3. Before the tag: the `[0.10.0]` changelog date is the tag day (it still reads
-   2026-09-28), and `just tag-check` must be run on the release commit — it is
-   green on this one. The sweep is measured at `bbe9664`; **only docs and
-   assets may follow it** — the changelog date and the README numbers do,
+   missing six keys), which is the documented behaviour for a fresh sweep.
+   Two earlier sweeps are superseded — `bbe9664` and `f34788d` — both because a
+   `tests/` change landed after them, which is exactly what the pre-tag rule
+   treats as invalidating the artifact.
+3. Before the tag: `just tag-check` must be green on the release commit (it is,
+   and its provenance line reads `results measured at v0.10.0-1-g96bda00; no
+   code changed since`). **Only docs and assets may follow the sweep** —
    anything under `src/`, `tests/`, `Cargo.*` or `benches/scripts/soak/*.py`
-   does not.
+   invalidates it, and that cost this release two extra sweeps.
 4. ~~`just check`, `just interop`~~ **both green (2026-09-30)** — the full
-   chain in 4m22s, and the interop matrix's three cases (both cross-version
-   directions refuse, the refusing process keeps serving its own version).
-   Then push the branch.
-5. ~~CI green, merge, changelog date, `just tag`, push the tag~~ **done, and the
-   first tag push failed on one emulated build leg** (2026-10-01): the release
-   workflow tests every target it publishes, and the cycle's new
-   `tests/noise_keys_test.rs` spawns the freshly built binary — a child cannot
-   be exec'd from inside an emulated test binary, so `arm-unknown-linux-musleabi`
-   died with `Exec format error` and cancelled the rest of the matrix. **Nothing
-   was published** (every publish job was skipped). This is the second time this
-   class has failed a release, and the fix is the guard the first incident
-   introduced: `tests/log_budget_test.rs` and `tests/startup_failure_test.rs`
-   carry `#![cfg(all(unix, native_target))]`, and the new spawners now carry
-   `native_target` too — the file-level gate on `noise_keys_test.rs`, and the
-   one spawning scenario plus its two helpers on `pool_test.rs` (the other nine
-   pool scenarios drive the pool in-process and keep running under emulation).
-   Verified by falsification: with the cfg forced off, `noise_keys_test` reports
-   0 tests and `pool_test` 9 — matching the precedent's behaviour — and the
-   native build still runs 4 and 10. The incident is also why the sweep below
-   was re-run: a `tests/` change invalidates the artifact's provenance by the
-   pre-tag rule, deliberately and without a waiver path.
-6. Re-sweep on the fixed commit (below) → `just check` → `just tag-check` →
-   `just tag` → push → the release workflow publishes.
-7. **Open, for the next cycle**: nothing mechanically stops the next spawn-based
-   test from missing the guard — this is the second release it has broken. A
-   cheap check (fail when a `tests/*.rs` contains `CARGO_BIN_EXE` without
-   `native_target` or `#[ignore]`) would close it; it needs a home in the check
-   chain and the docs that go with it, so it was not added mid-release.
+   chain, and the interop matrix's three cases (both cross-version directions
+   refuse, the refusing process keeps serving its own version).
+5. ~~CI green, merge, changelog date, `just tag`, push the tag~~ **the first two
+   tag pushes failed, and nothing was published either time** (2026-10-01):
+   - **The emulated legs.** The release workflow tests every target it
+     publishes, and the cycle's new `tests/noise_keys_test.rs` spawns the
+     freshly built binary — which cannot be exec'd from inside an emulated test
+     binary, so `arm-unknown-linux-musleabi` died with `Exec format error` and
+     cancelled the matrix. Second time this class has failed a release; the fix
+     is the guard the first incident introduced (`native_target`, file-level on
+     `noise_keys_test.rs`, site-level on `pool_test.rs`'s one spawning
+     scenario), verified by falsification rather than assumed.
+   - **The musl leg.** With the cross legs green, `x86_64-unknown-linux-musl`
+     stopped on `startup_failure_test`'s `Address already in use` — musl spells
+     EADDRINUSE `Address in use`. The binary was right in both; the assertion
+     was pinned to glibc's phrasing, and only the release matrix ever runs
+     these tests under musl (the native legs are glibc, the cross legs are the
+     guarded ones). Reproduced locally (`rustup target add
+     x86_64-unknown-linux-musl` + `musl-tools`, then the matrix's own command),
+     fixed to match what every spelling shares, and verified by running the
+     whole suite on both targets.
+   Each failure was fixed, the sweep re-run, the tag deleted and re-pushed —
+   which is what AGENTS.md §5 allows, and the reason the rule exists.
+6. **Next**: push the tag → the release workflow publishes (GitHub Release,
+   GHCR, crates.io).
+7. **Open, for the next cycle**: nothing mechanically stops the next
+   spawn-based test from missing the `native_target` guard, or the next
+   assertion from pinning one libc's wording — these two failures were the
+   second and third of their kind. A cheap check would close both (fail when a
+   `tests/*.rs` contains `CARGO_BIN_EXE` without `native_target`, and when a
+   test asserts a bare libc phrase); it needs a home in the check chain and the
+   docs that go with it, so it was not added mid-release.
 
-### Release sweep (2026-10-01, `f34788d`)
+### Release sweep (2026-10-01, `96bda00`)
 
-`v0.9.0-40-gf34788d`, tree clean, `stale: false`, binary sha256
-`978824f29c17ff5e` (4 181 840 bytes), host `99919695eec2` / host_id
-`d764f9da9c7e5b2a`, calibration 418.9 MiB/s, loopback probe 21.76 Gbit/s,
+`v0.10.0-1-g96bda00`, tree clean, `stale: false`, binary sha256
+`228cb43cc2c1e493` (4 181 840 bytes), host `99919695eec2` / host_id
+`d764f9da9c7e5b2a`, calibration 417.8 MiB/s, loopback probe 21.59 Gbit/s,
 `shape_legs=visitor`, `rate_socket_window=256K`, `batch=2`, four tools, 8/8
 stages each plus the capacity ramp, `--test=rrul,capacity`. **`just soak-check`:
 `OK: no gate violation`**, no waiver. Charts re-rendered and both READMEs
@@ -168,43 +170,38 @@ this release (frp 0.71.0, rathole 0.5.0, nps 0.26.10 — all still the latest).
 
 | tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | ramp |
 |---|---|---|---|---|---|---|---|
-| molehill | 17.312-17.563 | 1.4 % | 8.0-8.2 | 9.707 | 0.100 | 0.020 | 8/8, never broke |
-| frp | 6.149-6.153 | 0.1 % | 2.7 | 5.821 | 0.100 | 0.019 | 4/8, broke at 5 (err 0.006 > 0.005) |
-| rathole | 14.297-14.308 | 0.1 % | 75.6-80.2 | 9.686 | 0.099 | 0.019 | 1/8, **no reading** — the iperf3 backend died at load 2 |
-| nps | 0.136-0.136 | 0.1 % | 57.1-66.2 | 0.137 | 0.100 | 0.020 | 0/8, broke at 1 (p99 205.105 > 50) |
+| molehill | 15.921-16.830 | 5.4 % | 8.4-9.4 | 9.727 | 0.100 | 0.019 | 8/8, never broke |
+| frp | 6.181-6.191 | 0.2 % | 2.9-3.0 | 5.862 | 0.099 | 0.019 | 8/8, never broke |
+| rathole | 12.822-12.867 | 0.3 % | 102.3-104.5 | 9.679 | 0.100 | 0.020 | 8/8, never broke |
+| nps | 0.134-0.135 | 0.5 % | 64.4-66.9 | 0.142 | 0.100 | 0.020 | 0/8, broke at 1 (p99 204.84) |
 
 What this run is worth reading for:
 
-- **It is the third sample of the top pair, and it is what closed the question.**
-  The two arms at the loopback ceiling read 17.3-22.2 and 14.3-20.4 Gbit/s
-  across three sweeps of identical code, swinging widely enough to reverse their
-  order, while `frp` (6.04-6.15) and `nps` (0.133-0.136) moved by under 2 % and
-  the host's own loopback probe stayed inside 21.5-21.9 Gbit/s. The READMEs no
-  longer publish an ordering for those two rows, and `docs/benchmarks.md` states
-  the limit with all three samples behind it.
-- **Molehill is the only arm that carried the ramp's full 8 streams**, and its
-  clean-stage SLO is met on both visits (8.0 and 8.2 ms against the 50 ms
-  limit, zero errors).
-- **`rathole`'s ramp cell is an instrument failure, not a tool result.** The
-  ramp stops at the first level it cannot measure, and level 2 died with
-  `iperf3 error: ... Connection reset by peer` after 14 interactive samples —
-  the reason is recorded in the artifact and printed in the README's reason
-  column, so the cell reads as "no reading" rather than as a rathole weakness.
-  The gate reports a peer's cells and does not gate on them.
-- **`frp`'s break at load 5 is a real SLO break** (interactive error rate
-  0.006 > 0.005), the same threshold that stopped `rathole` in the `746a413`
-  run.
+- **Every cell is a measurement this time**, including all four ramps: three
+  arms carry the ramp's full 8 streams (the subject and both TCP peers), and
+  only `nps` breaks, at its first load level — the same shape the `bbe9664`
+  sweep had, and unlike the `f34788d` attempt whose `rathole` ramp stopped on a
+  dead iperf3 backend.
+- **The subject's SLO is met on both clean visits** (8.4 and 9.4 ms against the
+  50 ms limit, zero errors), and its completeness, endpoint invariant and drift
+  checks all pass.
+- **It is the third sample of the top pair of arms**, and the one that settled
+  what a run can say about them: across three sweeps of identical code their
+  clean readings span 15.9-22.2 and 12.8-20.4 Gbit/s — swings of 39 % and 59 %
+  that reverse their order — while `frp` (6.04-6.19) and `nps` (0.133-0.136),
+  an order of magnitude below this host's loopback ceiling, moved by under 3 %,
+  and the host's own loopback probe stayed inside 21.6-21.9 Gbit/s throughout.
+  The READMEs publish no ordering for those two rows and `docs/benchmarks.md`
+  states the limit with all three samples behind it.
 
-**Environment incident on the way here.** The first attempt at this sweep
-produced a complete-looking artifact in 14 seconds: `iperf3` was no longer on
-the machine (a container restart had reset the filesystem and taken the
-runtime-installed package with it), so every test recorded a typed
-`No such file or directory: 'iperf3'` failure. The gate refused it — two
-violations on the subject — the superseded artifact was restored from git
-rather than published, `iperf3` was reinstalled, and the run was repeated. This
-is the failure mode the environment notes below warn about, now with the
-mechanism named: **the package is installed at runtime, so a container restart
-drops it**, and a pre-flight `command -v iperf3` is the cheap guard.
+**Environment incident on the way here.** One attempt at this sweep produced a
+complete-looking artifact in 14 seconds: `iperf3` was no longer installed (a
+container restart had reset the filesystem and taken the runtime-installed
+package with it), so every test recorded a typed
+`No such file or directory: 'iperf3'` failure. The gate refused it, the
+superseded artifact was restored from git rather than published, `iperf3` was
+reinstalled, and the run repeated. The environment notes below now name the
+mechanism; `command -v iperf3` before a long run is the cheap guard.
 
 ## Open threads for the next cycle
 
