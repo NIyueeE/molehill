@@ -885,6 +885,11 @@ async fn sticky_echo_server(seen_srcs: Arc<Mutex<HashSet<SocketAddr>>>) -> Resul
 /// and `MOLEHILL_PLACEMENT_STATS=1`, a healthy run's output carries the pool
 /// timeline and the aggregated placement line. Both are opt-in, so the same
 /// run without them stays silent — which the second half of the test checks.
+/// Gated on `native_target`: this is the one scenario here that runs the
+/// compiled binary as a child process, and a child cannot be exec'd from
+/// inside an emulated test binary (the release workflow's `cross` targets).
+/// The other scenarios drive the pool in-process and run everywhere.
+#[cfg(native_target)]
 #[tokio::test]
 async fn the_pool_and_placement_lines_are_opt_in() -> Result<()> {
     // The real binary forwards to the same in-process echo backend the other
@@ -941,6 +946,7 @@ async fn the_pool_and_placement_lines_are_opt_in() -> Result<()> {
 /// Stop a child: `SIGINT` (the signal the binary turns into a clean exit),
 /// then `SIGKILL` if it is still alive. A leaked child would hold the
 /// scenario's ports for the whole test session.
+#[cfg(native_target)]
 fn stop(child: &mut std::process::Child) {
     use std::process::Command;
     let _ = Command::new("kill")
@@ -958,6 +964,7 @@ fn stop(child: &mut std::process::Child) {
 
 /// Run the compiled binary as a server+client pair over its own ports, force a
 /// visitor through it, and return everything the client printed.
+#[cfg(native_target)]
 async fn run_binary_pair(stats: bool) -> Result<(String, String)> {
     use std::process::{Command, Stdio};
 

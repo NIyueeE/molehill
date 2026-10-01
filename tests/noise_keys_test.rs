@@ -18,7 +18,19 @@
 //! helpers because the diagnosis *is* the assertion: the client retries a
 //! failed handshake for ever, so its log is the only place the reason appears,
 //! and a child's captured stderr is exactly what an operator would see.
-#![cfg(all(feature = "noise", feature = "client", feature = "server"))]
+//!
+//! Every case here therefore needs a target that can execute its own
+//! artifacts — hence the `native_target` gate. The release workflow tests every
+//! target it publishes, the `cross` targets run under qemu, and a child process
+//! cannot be exec'd from inside an emulated test binary: without the gate those
+//! targets fail with `Exec format error`, which says nothing about the code.
+//! The same rule and the same cfg are in `tests/log_budget_test.rs`.
+#![cfg(all(
+    feature = "noise",
+    feature = "client",
+    feature = "server",
+    native_target
+))]
 #![expect(
     clippy::expect_used,
     clippy::panic,

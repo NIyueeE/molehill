@@ -27,14 +27,16 @@
 - **The branch is feature-complete.** Every milestone of the v0.10.0 theme is
   in; the open threads at the freeze are the three at the bottom of this page,
   and none of them blocks the release.
+- **The branch is merged and v0.10.0 is mid-release.** PR #4 merged as
+  `dffd7d8`; the changelog section is dated 2026-10-01 (the tag day) and the
+  first tag push failed on one emulated build leg with nothing published —
+  see "Release (v0.10.0)" below. The fix is a `tests/` change, which by the
+  pre-tag rule invalidates the committed artifact, so the sweep is being re-run
+  on the fixed commit before the tag is re-pushed.
 - **The release state is set**: `version = "0.10.0"`, `CHANGELOG.md` carries
-  `## [0.10.0] - 2026-09-28` with `[Unreleased]` empty, and the benchmark
-  ritual's artifacts are committed and freshly measured at this branch's tip
-  (`benches/scripts/soak/results-soak-v0.10.0.json`, the chart set in
-  `assets/`, both READMEs refilled; `just soak-check` green, no waiver).
-- **The order to finish**: `just tag-check` on the release commit → push →
-  merge (merge commit) → on `main`: set the changelog date to the tag day →
-  `just tag` → push the tag.
+  `## [0.10.0] - 2026-10-01` with `[Unreleased]` empty, and the benchmark
+  ritual's artifacts are committed (`benches/scripts/soak/results-soak-v0.10.0.json`,
+  the chart set in `assets/`, both READMEs refilled).
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or `benches/scripts/soak/*.py` changed since — the
@@ -124,8 +126,31 @@ above is what would give it one).
    chain in 4m22s, and the interop matrix's three cases (both cross-version
    directions refuse, the refusing process keeps serving its own version).
    Then push the branch.
-5. CI green → merge (merge commit) → on `main`: `just tag` → push the tag →
-   the release workflow publishes.
+5. ~~CI green, merge, changelog date, `just tag`, push the tag~~ **done, and the
+   first tag push failed on one emulated build leg** (2026-10-01): the release
+   workflow tests every target it publishes, and the cycle's new
+   `tests/noise_keys_test.rs` spawns the freshly built binary — a child cannot
+   be exec'd from inside an emulated test binary, so `arm-unknown-linux-musleabi`
+   died with `Exec format error` and cancelled the rest of the matrix. **Nothing
+   was published** (every publish job was skipped). This is the second time this
+   class has failed a release, and the fix is the guard the first incident
+   introduced: `tests/log_budget_test.rs` and `tests/startup_failure_test.rs`
+   carry `#![cfg(all(unix, native_target))]`, and the new spawners now carry
+   `native_target` too — the file-level gate on `noise_keys_test.rs`, and the
+   one spawning scenario plus its two helpers on `pool_test.rs` (the other nine
+   pool scenarios drive the pool in-process and keep running under emulation).
+   Verified by falsification: with the cfg forced off, `noise_keys_test` reports
+   0 tests and `pool_test` 9 — matching the precedent's behaviour — and the
+   native build still runs 4 and 10. The incident is also why the sweep below
+   was re-run: a `tests/` change invalidates the artifact's provenance by the
+   pre-tag rule, deliberately and without a waiver path.
+6. Re-sweep on the fixed commit (below) → `just check` → `just tag-check` →
+   `just tag` → push → the release workflow publishes.
+7. **Open, for the next cycle**: nothing mechanically stops the next spawn-based
+   test from missing the guard — this is the second release it has broken. A
+   cheap check (fail when a `tests/*.rs` contains `CARGO_BIN_EXE` without
+   `native_target` or `#[ignore]`) would close it; it needs a home in the check
+   chain and the docs that go with it, so it was not added mid-release.
 
 ### Release sweep (2026-09-30, `bbe9664`)
 
