@@ -709,7 +709,10 @@ mod tests {
         drop(fut);
         // The refusing stripe never saw a byte; the frame is whole on the
         // accepting one.
-        assert!(sender.streams[0].written.is_empty());
+        assert!(
+            sender.streams[0].written.is_empty(),
+            "the refusing stripe was written to"
+        );
         assert_eq!(sender.streams[1].written, frame_bytes(7, &payload).to_vec());
     }
 

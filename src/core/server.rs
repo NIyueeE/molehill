@@ -2351,24 +2351,24 @@ async fn serve_tcp_visitor<C>(
                 PairOutcome::Shed | PairOutcome::Stop => return,
             }
         }
-    } else {
-        // The gather is atomic: hold the group lock for the whole attempt so
-        // concurrent visitors cannot interleave their K channels.
-        let _gather = pool.stripe_gather.lock().await;
-        // The boolean told the accept loop to stop; for one visitor both
-        // outcomes are "nothing left to do here".
-        if let Err(e) = pair_striped_group(
-            incoming,
-            pool.stripe_count,
-            &pool.data_ch_rx,
-            &pool.data_ch_req_tx,
-            &mut shutdown_rx,
-            &mut control_alive,
-        )
-        .await
-        {
-            debug!("Striped pairing failed: {e:#}");
-        }
+    }
+
+    // The gather is atomic: hold the group lock for the whole attempt so
+    // concurrent visitors cannot interleave their K channels.
+    let _gather = pool.stripe_gather.lock().await;
+    // The boolean told the accept loop to stop; for one visitor both
+    // outcomes are "nothing left to do here".
+    if let Err(e) = pair_striped_group(
+        incoming,
+        pool.stripe_count,
+        &pool.data_ch_rx,
+        &pool.data_ch_req_tx,
+        &mut shutdown_rx,
+        &mut control_alive,
+    )
+    .await
+    {
+        debug!("Striped pairing failed: {e:#}");
     }
 }
 

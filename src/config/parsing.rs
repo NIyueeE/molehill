@@ -1533,7 +1533,10 @@ default_token = "t"
 bind_addr = "0.0.0.0:2333"
 "#;
         let cfg = Config::from_str(config).unwrap();
-        assert!(cfg.server.unwrap().allow_ports.is_empty());
+        assert!(
+            cfg.server.unwrap().allow_ports.is_empty(),
+            "a config that declares no allow_ports must parse with an empty whitelist"
+        );
 
         // Malformed ranges fail validation
         let bad = r#"
