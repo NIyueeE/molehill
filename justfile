@@ -107,14 +107,38 @@ l3-accept:
     cd "$(git rev-parse --show-toplevel)"
     bash benches/scripts/l3/run.sh
 
-# L3 against L4 as a measurement, not a check: the acceptance harness's three
-# namespaces with the control, L4 (default pool, capped pool, direct) and L3
-# arms interleaved over one backend, one port set and one binary. Root-only and
-# outside the check chain; the results file lands outside the tree by default.
-# Method: docs/benchmarks.md, "The L3-versus-L4 comparison".
-# Example: sudo -n just l3-compare --rounds 4
-l3-compare *ARGS:
-    uv run benches/scripts/l3/compare.py {{ARGS}}
+# The performance model: one topology, a declared metric registry, a control
+# arm in every scenario and a noise floor the run measures itself. Root-only
+# (three network namespaces) and outside the check chain; results land outside
+# the tree. Method: docs/benchmarks.md, "The bench model".
+# Examples:
+#   sudo -n just bench                      # the smoke profile, about a minute
+#   sudo -n just bench --profile dev --aa   # the default for an optimization
+#   sudo -n just bench --arm id=l3,txqueuelen=10000
+#   sudo -n just bench --ab-arm l3 --binary-b /path/to/other/build
+bench *ARGS:
+    uv run benches/scripts/bench/bench.py run {{ARGS}}
+
+# What this host can and cannot measure, before a run finds out.
+bench-doctor *ARGS:
+    uv run benches/scripts/bench/bench.py doctor {{ARGS}}
+
+# The registry: every metric, scenario, arm and profile the model declares.
+bench-list:
+    uv run benches/scripts/bench/bench.py list
+
+# Render a stored results file (tables, floors, verdicts) as markdown.
+bench-report FILE:
+    uv run benches/scripts/bench/bench.py report {{FILE}} --markdown
+
+# A/B two results files, or refuse: comparability first, then the verdicts.
+bench-compare A B:
+    uv run benches/scripts/bench/bench.py compare {{A}} {{B}}
+
+# The model's own checks (metric registry, verdict rules, comparability rules,
+# probe syntax): no root, no topology, seconds. Also in the pre-commit gate.
+bench-selfcheck:
+    uv run benches/scripts/bench/bench.py selfcheck
 
 # Run the soak benchmark: a tool (or a batch of them) through the scripted
 # workload under the stage schedule. Test types: capacity / rrul / soak /

@@ -859,7 +859,7 @@ class IperfDial:
 
     The host-loopback model dials `127.0.0.1:<port>` from this process, which is
     what passing a plain port to `iperf_result` still means. An arm that does
-    not run on host loopback — the L3 comparison, whose visitor dials a
+    not run on host loopback — the bench model, whose visitor dials a
     tool-exposed address from inside a network namespace — needs a target other
     than the loopback and an `ip netns exec <ns>` prefix. Carrying both in one
     value keeps the parsing (the `-O` warm-up, the measured-window convention,
@@ -880,11 +880,12 @@ class IperfDial:
     bitrate: str = ""
     length: int = 0
     #: Seconds iperf3 omits from its accounting (`-O`): the Soak model's
-    #: convention on a shaped path whose slow start is seconds long. Left at 2
-    #: by the L3 comparison as well, which does *not* take its byte ratios from
-    #: this run's payload counters — around the `-O` boundary iperf3's interval
-    #: list can lose a whole measured interval, so those ratios come from
-    #: interface counters instead (see `benches/scripts/l3/compare.py`).
+    #: convention on a shaped path whose slow start is seconds long. The bench
+    #: model's bulk scenarios carry it too, and they do *not* take their byte
+    #: ratios from this run's payload counters — around the `-O` boundary
+    #: iperf3's interval list can lose a whole measured interval, so those
+    #: ratios come from interface counters instead
+    #: (`benches/scripts/bench/workloads.py`).
     omit: int = 2
 
 

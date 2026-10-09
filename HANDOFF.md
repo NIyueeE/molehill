@@ -160,25 +160,73 @@ configuration surface is free to change — and this cycle changes it.
    packets instead of 1400 measured **3579 Mbit/s** at half the CPU per byte, so
    the TUN MTU (an operator setting, with a link MTU to match) is worth more than
    any remaining code change, and the deployment recipes now say so.
-6. **The L3-versus-L4 instrument exists; its campaigns are being analyzed
-   outside the tree.** `benches/scripts/l3/compare.py` (`just l3-compare`) runs
-   the acceptance harness's three-namespace topology as a *measurement*: control,
-   L4 (default pool, capped pool, `direct`) and L3 arms interleaved over one
-   backend, one port set and one binary, with a two-claim arm, a paced UDP probe
-   and UDP rate ladder, and `--shape` for a netem condition on either leg
-   (`f9c3750`, `1bc4093`). The method is documented on
-   [docs/benchmarks.md](docs/benchmarks.md#the-l3-versus-l4-comparison-not-part-of-the-soak-model),
-   which also states its conventions (receiver's-own-window rates, counter-based
-   byte ratios, loss as its own evidence).
-   Its campaigns have been run on this host (a head-to-head, a replication, an
-   MTU-lever run, a pool sweep, a UDP ladder and one shaped run); their artifacts
-   are held **outside** the repository while the analysis is settled, and the
-   numbers move onto the benchmarks page only when that analysis is published.
-   What is still open after it: the shaped conditions beyond the one run
-   (`rtt100`, `rate20`), and the two findings that look like product questions
-   rather than measurements — the multiplexer's single-flow cost and the
-   transparent path's packet-rate ceiling — which the next cycle should decide
-   whether to attack.
+6. **The measurement model is the standard (2026-10-10, unreleased).**
+   `benches/scripts/bench/` replaces the per-question instruments as the way a
+   performance claim about a change is made: a declared metric registry
+   (`model.py`: unit, direction, denominator, which workloads can produce it,
+   the materiality floor), one topology for every arm (the acceptance harness's
+   three namespaces, plus a control arm with no tool in the path), scenarios
+   that each state the claim they support, campaigns that interleave the arms
+   with a rotating order, and verdicts that clear *both* the metric's
+   materiality floor and the run's own measured noise before they claim
+   anything.
+   Its rules, metric registry, scenario catalog and profiles are on
+   [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard);
+   `just bench-selfcheck` gates the rules themselves in the fast pre-commit
+   chain (`githooks/check-docs` also fails a metric or scenario that is not in
+   the registry's published table, in both languages).
+   Three things beyond the rules are worth recording, because they are method
+   and not taste:
+   - **the run measures its own resolution.** `--aa` (default on in `dev` and
+     `full`) measures one arm twice under two names; the paired difference
+     between the two halves is the smallest difference the run can believe, and
+     every verdict raises that metric's floor to it. The first smoke run
+     resolved bulk throughput to 16.3 %, round-trip p99 to 13.4 % and the
+     syscall rate to 320 % — i.e. it said out loud that a 3-second bulk arm and
+     a 3000-request round-trip arm cannot support a 10 % claim. This is the
+     feature the ad-hoc instruments never had: they reported a difference
+     inside their own scatter as a result.
+   - **the floors are in the results and on screen**, per cell and per metric
+     (A/A difference, A/A scatter, control drift, and the largest of the three),
+     with the worst cell named, so a reader can see where to spend more time.
+   - **records are typed absences, never zeros.** A metric no arm could produce
+     is listed with the instrument's reason; the control arm has no CPU or
+     process-footprint metrics at all (a zero would read as "free").
+   - **a comparison without an A/A twin is directional, never a claim.** Two
+     smoke runs of one unchanged binary claimed -11.6 % on bulk throughput and
+     -26.4 % on setup p50 before this rule existed: with no twin in either file
+     nothing measured the run-to-run scatter, so the metric's materiality floor
+     was all that stood between a difference and a claim. `compare` now reports
+     every difference as `directional` and says why.
+   What was retired into it: `benches/scripts/l3/compare.py` and `udp_probe.py`
+   (the L3-versus-L4 measurement — its scenarios, plus a two-service pair and a
+   UDP ladder, are the model's `bulk-pair` and `udp-ladder`), `mem/mem.py`
+   (RSS/fds/threads are peaks on every cell now) and `http/latency.py`
+   (request/response latency is `rr-*`, against a control, with provenance).
+   The L3 *acceptance* harness (`just l3-accept`, `run.sh` + `visitor.py` +
+   `echo_service.py` + `wire_report.py`) stays: it asserts, it does not measure,
+   and it is the PMTU/reorder/policy-order canary.
+   Its own resolution at the `dev` profile, after two fixes the first runs
+   demanded (a churn arm too short for the 100 Hz CPU counters, and a
+   round-trip arm too short to resolve its own rate): throughput ~16 %, round
+   trips ~15 %, rate ~14 %, CPU per Gbit ~13 %, UDP receive ~5 %, UDP loss
+   ~0.6 points, wire per visitor byte ~5 %, round-trip p50 ~10 %. Making those
+   smaller is a matter of longer workloads and more rounds - the floors say
+   which cell is worst.
+   **The campaigns from before the model are still held outside the tree** (the
+   head-to-head, the replication, the MTU lever, the pool sweep, the UDP ladder
+   and one shaped run); the model reproduces their headline findings on the same
+   host, and their numbers move onto the benchmarks page only when that analysis
+   is published. What the model has *not* answered yet: the shaped conditions
+   beyond `clean` (`rtt100`, `rate20`), the multiplexer's single-flow cost and
+   the L3 packet-rate ceiling — the same two product questions, now with a
+   standard instrument to decide them with.
+   Deliberately left outside the model, with the reason: the soak sweep (peers,
+   a scripted degradation timeline, drift over hours — a different question, and
+   the release ritual's), `udp_stress.py` (it reads molehill's *internal* UDP
+   queue counters to answer a molehill-only design question, which the model's
+   "externally observable only" rule forbids in a comparison) and
+   `mux/repro_e2e.py` (a functional smoke, no numbers).
 
 **Pre-registered criteria (kept as written, for the record).** Small packets
 (≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
@@ -189,18 +237,20 @@ alone, so the other arms were not run for the verdict.
 
 ### Open threads
 
-- **The soak bench has no namespace support** — every arm runs on host loopback
-  — so an L3 arm cannot be expressed as a config variant there. The decision
-  taken (2026-10-09) is a **sibling instrument** rather than netns plumbing
-  inside `soak.py`: the stage-schedule runner shapes `lo`, owns per-tool HTB
-  classes and a loopback-bound backend/probe set, so an L3 arm there would mean
-  a second topology, a second backend and a second probe under the same results
-  schema — for a question (one host, one topology, no peers) the stage schedule
-  does not ask. `benches/scripts/l3/compare.py` reuses the soak model's `lib`
-  primitives (`iperf_result` and its measured-window convention, the host
-  identity, the revision verdict) so the two cannot drift apart on what a
-  reading means. Folding L3 into the *stage schedule* stays open, and would
-  start from a namespace-aware backend/probe layer rather than from the arms.
+- **Two instruments, one boundary (closed 2026-10-10).** The soak sweep and
+  the bench model answer different questions and share no numbers: the sweep is
+  a tool against its peers over a scripted degradation timeline, one sample per
+  stage; the model is a change's cost, repeated with a control in every round.
+  The earlier plan for a "sibling instrument" for L3 was a symptom of the model
+  not existing: L3 is an *arm* in the model now, because the model's one
+  topology has the namespaces an L3 arm needs. What stays open is whether the
+  sweep's peer adapters and stage schedule should be ported onto the model's
+  engine (one runner, two profiles) — not attempted, because the sweep's
+  timeline, drain logic, chart rendering and release gate are a working
+  instrument and porting them is a change to the release ritual, not to the
+  measurement standard. The model deliberately reuses `soak/lib.py`'s
+  `iperf_result`, its measured-window convention, its host identity and its two
+  calibration probes, so the two cannot drift apart on what a reading means.
 - The benchmark comparison against v0.10.0 must build that state (worktree at
   the tag): there is no released asset that speaks v5, and no two tags are
   compatible, so each side runs as a complete pair.

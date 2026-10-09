@@ -355,6 +355,21 @@ revision) and are as binding as the lint discipline in §2.
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that
   way, and its numbers would have described code that no longer existed).
+- **A performance claim about a change is made with the bench model.**
+  `benches/scripts/bench/` is the standard: a metric exists only as a
+  declaration in `model.METRICS` (unit, direction, denominator, the workloads
+  that can produce it, the smallest difference worth calling a claim), every
+  scenario runs against a control arm with no tool in the path, a run records
+  its whole method as a fingerprint before its first sample, and a difference
+  is only a claim when it clears both the metric's materiality floor and the
+  run's *own measured noise* (`--aa`; the floors are printed with the tables).
+  A number produced any other way is context, not evidence — including one from
+  the soak sweep, which answers a different question (peers, a scripted
+  timeline) and shares no numbers with the model. Adding a metric means adding
+  its declaration, its scenario support and its row on the benchmarks page
+  (both languages): `githooks/check-docs` fails a registry entry that is not
+  documented, and `just bench-selfcheck` — a fast gate — fails a declaration
+  the code contradicts.
 - **Docs move with the data.** The method's public home is
   `docs/benchmarks.md` (+ `.zh.md`): it owns what is measured, how to read a
   chart, the stage schedule, the test types, the per-decision measurements and

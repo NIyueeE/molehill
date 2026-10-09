@@ -207,6 +207,27 @@ else
   errors=$((errors + 1))
 fi
 
+# 15) the bench model's registry is documented. Every metric and scenario the
+#     model declares must appear on the method's page in both languages: a
+#     metric added to model.py without a row in benchmarks.md is a metric no
+#     reader can look up, and the model's whole claim is that a number without a
+#     definition does not exist.
+while IFS= read -r metric; do
+  [ -n "$metric" ] || continue
+  expect "bench metric documented: $metric" docs/benchmarks.md "\`$metric\`"
+  expect "bench metric documented (zh): $metric" docs/benchmarks.zh.md "\`$metric\`"
+done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' benches/scripts/bench/model.py | sort -u)
+while IFS= read -r scenario; do
+  [ -n "$scenario" ] || continue
+  expect "bench scenario documented: $scenario" docs/benchmarks.md "\`$scenario\`"
+  expect "bench scenario documented (zh): $scenario" docs/benchmarks.zh.md "\`$scenario\`"
+done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' benches/scripts/bench/model.py | sort -u)
+expect "just bench-selfcheck documented" docs/checks.md 'just bench-selfcheck'
+expect "just bench documented" docs/benchmarks.md 'just bench'
+expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
+expect "just bench-doctor documented" docs/benchmarks.md 'just bench-doctor'
+expect "just bench-compare documented" docs/benchmarks.md 'just bench-compare'
+
 # soft notice: stale upstream references are expected only in provenance docs
 if grep -qiF 'rathole-org' README.md README.zh.md 2>/dev/null; then
   echo "  note: upstream 'rathole-org' references present (expected: provenance links only)"
