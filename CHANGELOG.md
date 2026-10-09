@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transparent (L3) services: the client owns the public `ip:port`.** A new
+  service type, `protocol = "transparent"`, stops the server from binding the
+  service's endpoint at all: the client claims a public `ip:port` on a TUN
+  device, the server routes whole IP packets into the tunnel, and the client's
+  own kernel answers the visitor. The backend therefore sees the visitor's real
+  source address, TCP keeps its end-to-end semantics, and the server holds no
+  socket and no per-flow state for the connection. Both ends attach to an
+  **existing** TUN device named by `[client.transparent].tun` /
+  `[server.transparent].tun` (default `molehill0`) — the daemon never creates,
+  addresses or routes it — and a prerequisite that is missing (the device, an
+  address the client does not carry, a non-zero `rp_filter`) is refused with
+  the exact command to run instead of silent packet loss. Linux only, with
+  `CAP_NET_ADMIN` on both ends; the `transparent` feature is in the default
+  set, and a config that asks for the type on another platform, or in a build
+  without the feature, is refused with a precise reason. `local_addr` and
+  `nodelay` are refused for the type — the local application binds the claimed
+  address itself, so nothing is dialed — as are the UDP-only keys. The wire
+  moves to **protocol v5** (one service type and one data-channel command,
+  `StartForwardTransparent`, whose channel carries `[u16 length][packet]`
+  frames), so both ends upgrade together as with every protocol change.
+  `MOLEHILL_L3_STATS=1` prints the data path's cumulative counters. Not in this
+  version: IPv6 (dropped and counted), per-flow channels (every flow of one
+  claimed endpoint shares the service's single channel), and any automatic
+  network configuration. Keys and the two operator recipes are in
+  `docs/configuration.md` ("Transparent (L3) services") and
+  `docs/deployment.md` ("Transparent services"); the acceptance harness is
+  `just l3-accept` (root-only, Linux-only, outside the check chain).
+
 ## [0.10.0] - 2026-10-01
 
 ### Changed

@@ -6,7 +6,7 @@
 - **Server**: the publicly accessible host running molehill in server mode
 - **Client**: the host behind NAT running molehill in client mode; it holds the services to be exposed
 - **Visitor**: someone who connects to a service through the server
-- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v4). Two services share it when they declare the same endpoint and the same transport — a connection speaks one transport, so a service that overrides `transport` gets a session of its own
+- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5). Two services share it when they declare the same endpoint and the same transport — a connection speaks one transport, so a service that overrides `transport` gets a session of its own
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel. It names the service it carries with a four-byte prologue (see "Forwarding")
 - **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that belongs to a control session and carries many data channels as streams
 - **Tunnel pool**: the set of tunnels one client keeps for one key — the whole session, or one service, depending on `[client.data].shared_pool` (see "The tunnel pool")
@@ -16,7 +16,7 @@
 
 In client mode, molehill groups its configured services by endpoint: a service's own `remote_addr` (`[client.services.<name>]`) when it declares one, else the client-wide `[client.control].default_remote_addr`. Every group dials **one control session**, authenticates once with `[client].default_token`, and registers its services on it. The server owns no service configuration: each `Register` carries the service's name, type and public endpoint (`remote_bind_addr`), and the server validates it against its policy before exposing anything — `allow_ports` whitelist, the declared data-plane carrier, and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
 
-On success the server binds the endpoint and starts serving visitors. On failure it answers `RegisterRejected` for **that registration alone**: the client reports the exact reason once and stops that service, while the session and the services beside it keep running. A v4 registration carries no pool size — the channel pool is the client's own concern (see "Forwarding").
+On success the server binds the endpoint and starts serving visitors. On failure it answers `RegisterRejected` for **that registration alone**: the client reports the exact reason once and stops that service, while the session and the services beside it keep running. A registration carries no pool size — the channel pool is the client's own concern (see "Forwarding").
 
 A session reconnects on its own after a retryable failure (a dead connection, a timeout), drops the tunnel pools it had built on the old connection (their tunnels carry that session's nonce, so the new server refuses them as stale) and re-registers everything it carries, each service building the pool it needs. A graceful server shutdown ends the sessions it was serving — service listeners, pools and tunnels together — rather than leaving them bound until the process exits. Two failures are terminal for the session instead, because only a human can fix them: the server is older than the client's protocol version (it closes the connection without answering the hello, or answers in another dialect), or it refused the session token.
 
@@ -31,7 +31,11 @@ A session uses two credentials, which is what lets one connection carry services
 ### Protocol versions
 
 The protocol version rides in every hello, and this build speaks and serves one
-dialect: **v4** (0.8–0.9 spoke v3, which v0.10 removed outright). The rule — a
+dialect: **v5**. v5 adds one service type (`ServiceType::Transparent`) and one
+data-channel command (`DataChannelCmd::StartForwardTransparent`), nothing else:
+the selector byte, the session handshake, the service prologue, the striping
+frames and the UDP framing are v4's. (0.8–0.9 spoke v3 and 0.10 v4; each
+dialect was dropped by the release that followed it.) The rule — a
 dialect is defined by a release, its number moves with the tag that introduces
 it, and no two tags are compatible — lives in AGENTS.md §5; what it means on the
 wire is here: a server that does not serve the client's version closes the
@@ -45,9 +49,9 @@ you which side is behind.
 
 When a visitor connects to a registered service's endpoint, the server asks the session for one more channel for that service — `CreateDataChannelFor(service_id)`, which names the service because a session carries several. The client opens a data channel back (a fresh connection, or a yamux stream inside a tunnel), and the server marks it with a `StartForwardTcp`/`StartForwardUdp` command; the pair then copies the visitor's bytes bidirectionally.
 
-**The service prologue.** A v4 channel opens with the service's four-byte id before anything else: the session nonce identifies the *session*, not a service, so a channel has to say which one it is for. A direct channel writes it right after its hello; a stream of a multiplexed tunnel writes it right after the stream is opened, because a tunnel belongs to the session. Routing is per **stream**: one tunnel may carry streams of several services (which is what a shared pool produces), and each stream's prologue is what decides the queue it lands in. The server reads the prologue before routing, so a stream naming a service that is not registered on that session is dropped on its own, without touching the tunnel or the session.
+**The service prologue.** A data channel opens with the service's four-byte id before anything else: the session nonce identifies the *session*, not a service, so a channel has to say which one it is for. A direct channel writes it right after its hello; a stream of a multiplexed tunnel writes it right after the stream is opened, because a tunnel belongs to the session. Routing is per **stream**: one tunnel may carry streams of several services (which is what a shared pool produces), and each stream's prologue is what decides the queue it lands in. The server reads the prologue before routing, so a stream naming a service that is not registered on that session is dropped on its own, without touching the tunnel or the session.
 
-A v4 registration carries no channel count, so the client owns its channels: a UDP service opens its configured `udp_workers` (default 2) as soon as the registration is accepted, a TCP service opens none, and either opens one more for every `CreateDataChannelFor` — or, for a striped visitor, for every `CreateDataChannelForStripe`, which names the stripe group and the stripe's place in it. New channels are also requested on demand: per visitor for TCP, and whenever a UDP channel dies so the worker set keeps its size (a replacement never grows the set past the configured count; see "The tunnel pool").
+A registration carries no channel count, so the client owns its channels: a UDP service opens its configured `udp_workers` (default 2) as soon as the registration is accepted, a TCP service opens none, and either opens one more for every `CreateDataChannelFor` — or, for a striped visitor, for every `CreateDataChannelForStripe`, which names the stripe group and the stripe's place in it. New channels are also requested on demand: per visitor for TCP, and whenever a UDP channel dies so the worker set keeps its size (a replacement never grows the set past the configured count; see "The tunnel pool").
 
 **Pairing is per visitor, never serial.** The server's accept loop hands every visitor to its own pairing task: one visitor's wait for a data channel therefore costs that visitor and nothing else, and the accept loop keeps accepting. The pairing wait is a budget that re-requests rather than giving up, and a visitor the client refuses for the whole budget is shed — its socket closed, one failed request — while the service and its other visitors keep going. The number of pairings in flight at once is bounded (`MAX_CONCURRENT_VISITORS`, 128), which is what keeps a wedged service from growing unbounded tasks: each in-flight pairing owns one visitor socket and one data channel, and the listeners' backlog keeps the rest. A visitor whose channel request the client cannot answer — the pool at its placement ceiling — used to hold the accept loop for the whole 25-second budget, so every visitor behind it queued unanswered and the k-th one was shed a full budget after the first; measured, that is a service parked behind one visitor (`tests/pool_test.rs`, `one_unanswerable_visitor_does_not_park_the_service`). A stripe group's gather is the one pairing that stays atomic: its K channels are consumed all-or-none under a lock, so concurrent visitors cannot interleave two gathers' channels.
 
@@ -134,6 +138,81 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 - A stream's two users park on the connection's per-stream command channel independently, so each has its own waker slot: a *reader* waiting to queue a window update and a *writer* waiting for send credit would otherwise share one slot, and the later park would erase the earlier one's waker — a writer that then never wakes until an unrelated resize happens to notify, which stalls every visitor on that tunnel. The reader's park lives in its own slot (`Shared::reader_park`) and the connection wakes both when a command leaves the channel.
 
 `mode = "direct"` restores the one-connection-per-channel behavior: every data channel is its own transport connection, so nothing is multiplexed and each visitor connection pays the full connection setup (TCP connect plus, with `noise`, the Noise handshake). That is a design trade-off, not a performance claim — the measured comparison lives in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements), and the choice between the two is the decision tree in [Configuration](configuration.md).
+
+### Transparent (L3) services
+
+A transparent service reverses the ownership of the public endpoint. Its
+registration declares `ServiceType::Transparent`, and its `bind_addr` is a
+public `ip:port` the **client claims** rather than a listener the server binds:
+`bind_service_endpoint` returns `BoundEndpoint::Transparent` (nothing to bind),
+and the address's uniqueness is kept by a server-wide claim — `Registered::claim`,
+a `Claim` value held for the lifetime of the registration — so a second client
+claiming the same endpoint is rejected with a precise reason instead of silently
+stealing the first one's visitors.
+
+The data path is **one channel per claimed endpoint**:
+
+- The client opens **one** channel the moment its registration is accepted (a
+  TCP service opens none and waits to be asked; a transparent service's packets
+  all ride this one). It opens with the same four-byte service prologue as any
+  other data channel, so the server knows which service — and therefore which
+  endpoint — it carries before the first packet.
+- The server answers it with `DataChannelCmd::StartForwardTransparent` (tag 3,
+  a unit variant like the other fixed-size data commands), and from then on the
+  channel carries whole IP packets, framed `[u16 length][packet]` in both
+  directions by `IpTraffic` (`src/protocol.rs`). The packet travels verbatim —
+  there is no address tag, because the addresses are inside it — and a
+  zero-length frame is a protocol error rather than an empty packet.
+- When the channel ends the server asks for a replacement (the same
+  `DataChannelRequest` path a UDP worker's replacement takes) and keeps the
+  claim while it waits. From the second channel on, it waits 250 ms
+  (`TRANSPARENT_REPLACE_BACKOFF`) before sending the start command, so a peer
+  that cannot serve it is not polled in a tight loop.
+
+**Which end of a packet the claim is.** Both ends run the same hub
+(`src/transparent/hub.rs`): one reader per TUN device, a bounded queue per
+endpoint, and an endpoint table that decides which packet belongs to which
+service. They differ in the end they look at, which is the heart of the design:
+
+- the **server** routes by **destination**: its host routes the claimed address
+  into its device, so the packet the kernel hands it is one whose *destination*
+  the claimed endpoint names (`Direction::Destination`);
+- the **client** recognises its return traffic by **source**: its host *is* the
+  claimed address, so what it reads from its device is what its own kernel
+  emitted *from* that address (`Direction::Source`).
+
+A packet that carries a port matches the exact `(ip, port)` entry. A packet with
+no port to route by — ICMP, and the fragments after the first, which carry no
+transport header — matches on the address alone, and only when exactly one
+service claims that address: with two services on one address there is nothing
+to choose by, so it is dropped rather than guessed. A packet the device produced
+that belongs to nobody is counted (`unclaimed`) and dropped; nothing is logged
+per packet.
+
+**The claim is re-checked on the way in, in both directions.** What comes off a
+channel is parsed and matched against the endpoint that channel carries before
+it is injected into the local kernel, so a compromised or buggy peer cannot
+steer traffic into an arbitrary local address. On the client that check doubles
+as an allow-list, because the client is the end that owns local addresses.
+
+**What the daemon does not do.** It never creates, addresses or routes the
+device — `src/transparent/check.rs` is the whole of its network knowledge —
+which is what keeps the crate free of netlink and of shelling out to `ip`. What
+it does instead is verify the parts it depends on and refuse with the exact
+command to run: the device must exist on both ends; on the client, every claimed
+address must be one the host carries and `rp_filter` (the device's and `all`)
+must read 0; on the server, a registration is rejected if its device is missing.
+The recipes are in [Deployment](deployment.md#transparent-services).
+
+**Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
+and counted (`not_ipv4`), and there is no IPv6 path. One channel carries every
+flow of one claimed endpoint, so a retransmit for one flow can delay another
+flow sharing the channel — per-flow channels are not in this version. And the
+network stays the operator's: nothing here installs a route, a rule or a
+netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
+counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,
+`channel_errors`) once a second per data path, which is how a run is observed
+without logging per packet.
 
 ## UDP
 

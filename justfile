@@ -96,6 +96,17 @@ interop:
     # (libtest captures a passing test's output); this is the run that does them.
     cargo test --test interop_test -- --test-threads=1 --include-ignored
 
+# Transparent-L3 acceptance: the real binaries in a three-namespace topology,
+# proving the client (never the server) owns the public ip:port. Needs root
+# for the veth pairs, TUN devices and routes, so it is outside the check
+# chain; without root it skips loudly (exit 77) instead of passing silently.
+# See docs/checks.md, "Outside the chain".
+l3-accept:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+    bash benches/scripts/l3/run.sh
+
 # Run the soak benchmark: a tool (or a batch of them) through the scripted
 # workload under the stage schedule. Test types: capacity / rrul / soak /
 # cost / screen — see docs/release.md, "Benchmarks".

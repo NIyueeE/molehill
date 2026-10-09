@@ -1,0 +1,9 @@
+[server]
+default_token = "t"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = "molehill-srv0"

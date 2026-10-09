@@ -15,6 +15,7 @@ Page index:
 - [Choosing your configuration (decision tree)](#choosing-your-configuration-decision-tree)
 - [Dynamic service registration](#dynamic-service-registration)
 - [Multiplexing (`multiplex` feature)](#multiplexing-multiplex-feature)
+- [Transparent (L3) services](#transparent-l3-services)
 - [Logging](#logging)
 - [Tuning](#tuning)
 - [Examples & deployment](#examples--deployment)
@@ -197,10 +198,13 @@ psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it mus
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
+[client.transparent] # Optional. Transparent (L3) services only: the TUN device the client attaches to
+tun = "molehill0" # Optional. The device must already exist and carry the claimed address and its routes — that is the operator's job, not the daemon's. Default: molehill0
+
 [client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
-protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
-remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
+protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp", "transparent"]. Default: "tcp". A transparent service owns its public ip:port instead of forwarding to local_addr — see "Transparent (L3) services" below
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded. Refused by protocol = "transparent", where the local application binds the claimed public address itself
+remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server (a transparent service claims it instead of having the server bind it). Must be covered by the server's `allow_ports`
 nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
 retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
@@ -239,6 +243,9 @@ remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
+
+[server.transparent] # Optional. Transparent (L3) services only: the TUN device the server attaches to
+tun = "molehill0" # Optional. The device must already exist and have a route for every claimed address — that is the operator's job, not the daemon's. Default: molehill0
 ```
 
 ## Dynamic service registration
@@ -247,12 +254,12 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
 
 1. The client authenticates with `default_token`.
 2. For each configured service the client sends a `RegisterService` message:
-   name, `protocol` (tcp/udp), `remote_bind_addr`, the data-plane `carrier`
-   it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy UDP
-   listener) and the UDP buffer size. The channel count is not part of the
+   name, `protocol` (tcp/udp/transparent), `remote_bind_addr`, the data-plane
+   `carrier` it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy
+   UDP listener) and the UDP buffer size. The channel count is not part of the
    message: the client opens the channels it configured (one per visitor for
-   TCP, `udp_workers` for UDP) and the server asks for another when a visitor
-   arrives.
+   TCP, `udp_workers` for UDP, one long-lived channel for transparent) and the
+   server asks for another when a visitor arrives.
 3. The server validates:
    - **whitelist**: the requested port must be covered by `allow_ports`;
      an empty/missing `allow_ports` rejects *every* registration (this is
@@ -376,6 +383,112 @@ which then applies to every service that follows the client-wide endpoint.
 The wire-level design — tunnel upgrade, per-stream framing and windows, and
 why pooled streams need a SYN kick — is in [Internals](./internals.md).
 
+## Transparent (L3) services
+
+A `protocol = "transparent"` service gives the **client** the public `ip:port`
+instead of having the server bind it. The client's host carries the claimed
+address on a TUN device, the server routes whole IP packets into the tunnel,
+and the client's own kernel answers the visitor — so the backend sees the
+visitor's real source address, TCP keeps its end-to-end semantics, and the
+server holds no socket and no per-flow state for the connection.
+
+It is **Linux only** and needs `CAP_NET_ADMIN` on both ends (each side attaches
+to a TUN device); the `transparent` feature is part of the default set. A
+config that asks for it on another platform, or in a build without the feature,
+is refused at parse time with `... carries whole IP packets through a TUN
+device, and this platform is not Linux`, or with a message naming the missing
+`transparent` feature. Only IPv4 is carried today — a packet that is not IPv4
+is dropped and counted.
+
+**The daemon never configures the network.** It has no netlink code and never
+shells out to `ip`: the operator creates the TUN device and installs the
+addresses and routes, and the daemon verifies what it depends on and refuses
+with the exact command to run when something is missing. The two recipes — an
+address routed to the server, and a single-IP server — are in
+[Deployment](./deployment.md#transparent-services).
+
+| Key | Meaning |
+|---|---|
+| `[client.services.<name>].protocol` | `"transparent"` — the service owns a public `ip:port` instead of forwarding to `local_addr` |
+| `[client.services.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports`; the address has to be local on the client (the recipes assign it to the TUN device) |
+| `[client.transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
+| `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
+
+Three kinds of key a forwarding service would use are **refused at parse
+time**, because nothing would read them: `local_addr` (the local application
+binds the claimed public address itself, so this client dials nothing),
+`nodelay` (same reason), and the UDP-only keys `udp_workers`,
+`udp_buffer_size`, `udp_idle_timeout`, `udp_send_queue_size` and
+`udp_forwarder_ipv6`.
+
+### What the operator must prepare
+
+Both ends attach to an **existing** device named by their `tun` key; the daemon
+deliberately does not create one, because the operator's addresses and routes
+live on it.
+
+- **The device exists** (both ends). A missing device is refused with the two
+  commands that create it — `ip tuntap add dev <tun> mode tun` and
+  `ip link set <tun> up mtu 1400`.
+- **The client carries every address it claims.** The claimed IP is the one in
+  `remote_bind_addr`, and the client must own it: the refusal prints
+  `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and
+  `ip route add default dev <tun> table 100`. The address must be local because
+  the application binds it; the source rule is what sends the replies that
+  application emits back into the tunnel.
+- **Reverse-path filtering is off.** `net.ipv4.conf.<tun>.rp_filter` **and**
+  `net.ipv4.conf.all.rp_filter` must both read `0` — injected packets carry the
+  visitor's source address, which a strict check drops — and the refusal prints
+  the exact `sysctl -w` line. This check runs on the client; on the server the
+  daemon only verifies that its device exists.
+- **The routing brings the claimed address to the server** and lets the
+  client's replies out. Both recipes are in
+  [Deployment](./deployment.md#transparent-services).
+- `CAP_NET_ADMIN` for both processes; the systemd units in
+  [Deployment](./deployment.md#systemd) show the `AmbientCapabilities=` line.
+
+### A worked example
+
+```toml
+# server.toml - the server binds nothing for this service: it routes
+# 10.99.0.1/32 into its TUN device.
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```toml
+# client.toml - the client owns 10.99.0.1:8443 and carries the address on its
+# own TUN device, where the application binds it.
+[client]
+default_token = "change-me"
+
+[client.control]
+default_remote_addr = "203.0.113.5:2333"
+
+[client.transparent]
+tun = "molehill0"
+
+[client.services.web]
+protocol = "transparent"
+remote_bind_addr = "10.99.0.1:8443"
+```
+
+Two services may claim the same address when their ports differ, and a packet
+with no port to route by — ICMP, and the fragments after the first — is
+delivered only when exactly one service claims that address; otherwise it is
+dropped rather than guessed. `MOLEHILL_L3_STATS=1` prints the data path's
+cumulative counters once a second (see
+[Diagnostics switches](#diagnostics-switches-opt-in)); how each side decides
+which packet belongs to which service is in
+[Internals](./internals.md#transparent-l3-services).
+
 ## Logging
 
 `molehill`, like many other Rust programs, use environment variables to control the logging level. `info`, `warn`, `error`, `debug`, `trace` are available.
@@ -409,7 +522,7 @@ Consequences worth stating, because they are what keeps a busy log readable:
 
 ### Diagnostics switches (opt-in)
 
-Five environment variables turn on aggregated diagnostics, one `INFO` line per
+Six environment variables turn on aggregated diagnostics, one `INFO` line per
 second per subject. They are off by default, they never change the forwarding
 path, and turning one on is the consent — a line an operator would have to
 raise `RUST_LOG` to see never reaches anything:
@@ -421,6 +534,7 @@ raise `RUST_LOG` to see never reaches anything:
 | `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, cap, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+load:1->2`, `-idle:2->1`) |
 | `MOLEHILL_PLACEMENT_STATS=1` | one line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
 | `MOLEHILL_UDP_STATS=1` | one line per second per process | the UDP affinity table's size, its evictions, and each worker's pinned peers |
+| `MOLEHILL_L3_STATS=1` | one line per second per transparent data path | the transparent data path's cumulative counters: `forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)` and `channel_errors` |
 
 The counters are cumulative, so a reader that knows the window — or takes the
 first and the last line of a run — gets per-second rates and cost per unit. The
@@ -499,8 +613,8 @@ above and follow that guide.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v4. 0.10 serves v4 only, so an older client *or* an older server gets this; upgrade both ends together. |
-| The client stops with `protocol v4` after a server's hello never arrives | The server is older than 0.10: it reads version 4, fails its own check and closes that connection. Upgrade the server. |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5 (the 0.10 line serves v4 only), so an older client *or* an older server gets this; upgrade both ends together. |
+| The client stops with `protocol v5` after a server's hello never arrives | The server is older than this build: it reads version 5, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |
@@ -510,3 +624,9 @@ above and follow that guide.
 | UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; idle mappings time out after `udp_idle_timeout` seconds. |
 | Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |
+| `Interface <tun> does not exist. Prepare it first` (client, or a registration rejection on the server) | A transparent service attaches to a device the operator creates; the daemon never creates one. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). |
+| `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims: run the `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines the message prints. |
+| `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | Injected packets carry the visitor's source address, which a strict check drops. Run the `sysctl -w` line the message prints; both `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` must read `0`. |
+| `Address <ip:port> is already claimed by another transparent service on this server` | Two clients claim the same endpoint; the first claim is held for the lifetime of its registration. Give one of them another address or port. |
+| `protocol = "transparent"` refused at startup with `... and this platform is not Linux`, or with a message naming the missing `transparent` feature | The service type needs a Linux build with the `transparent` feature (part of the default set). On another platform, use `tcp`/`udp`. |
+| A transparent service's visitors get nothing, and `MOLEHILL_L3_STATS=1` counts `unclaimed` drops | The routing is incomplete: the server needs a route for the claimed address into its device and the client the `from <ip>` rule plus its table route (see [Deployment](./deployment.md#transparent-services)). `unclaimed` is also the reconnect window, while no channel holds the endpoint; `no_channel` means the endpoint's queue was full. |

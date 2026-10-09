@@ -7,6 +7,7 @@ material around them. Every key they use is specified in
 default and its allowed values.
 
 - [Worked examples](#worked-examples)
+- [Transparent services](#transparent-services)
 - [systemd](#systemd)
 - [Container](#container)
 - [Network requirements](#network-requirements)
@@ -193,6 +194,144 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 ```
 
+## Transparent services
+
+A `protocol = "transparent"` service makes the **client** the owner of a public
+`ip:port`: the server binds nothing, routes whole IP packets into the tunnel,
+and the client's kernel answers the visitor. The keys, the prerequisites and
+the exact refusals belong to
+[Configuration](./configuration.md#transparent-l3-services); this section is the
+network the operator has to build. It is Linux only, needs `CAP_NET_ADMIN` on
+both ends (each side opens a TUN device), and configures nothing itself.
+
+Both recipes start from the same two facts:
+
+- **The claimed address is not a listener.** Nothing may bind it on the server;
+  the server needs a route that hands its packets to the TUN device.
+- **The client owns the address.** Its TUN device carries the claimed address,
+  and a source rule sends the replies the local application emits back into the
+  tunnel.
+
+Both recipes end with the same configuration:
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```toml
+# client.toml
+[client]
+default_token = "change-me"
+
+[client.control]
+default_remote_addr = "<server-address>:2333"
+
+[client.transparent]
+tun = "molehill0"
+
+[client.services.web]
+protocol = "transparent"
+remote_bind_addr = "<public-ip>:8443"
+```
+
+The device names are per host, so the two `tun` values need not match.
+
+### Recipe A: an address routed to the server
+
+The clean, NAT-free case: the upstream network routes the claimed address (a
+routed /32, or an address out of a block delivered to this host) to the server,
+and the address is **not** configured on any of its interfaces — so packets
+addressed to it are forwarded, which is exactly what the TUN device needs. One
+route is the whole server side.
+
+```bash
+# ---------- server ----------
+# <public-ip> is routed to this host by the upstream; it is NOT on any interface
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo ip route add <public-ip>/32 dev molehill0
+# the visitor's packet arrives on the visitor-facing interface and is forwarded
+sudo sysctl -w net.ipv4.ip_forward=1
+# injected packets carry a source this stack does not expect on that device
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# ---------- client ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+# the claimed address, and a policy that sends its replies back into the tunnel:
+# matching on the source takes only the traffic this service emits
+sudo ip addr add <public-ip>/32 dev molehill0
+sudo ip rule add from <public-ip> lookup 100
+sudo ip route add default dev molehill0 table 100
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+```
+
+Two decisions to check afterwards: on the server, `ip route get <public-ip>`
+must name the TUN device; on the client, `ip route get <visitor-ip> from
+<public-ip>` must as well.
+
+### Recipe B: a single-IP server
+
+When the claimed address is the server's **own** public IP, a route is not
+enough: the kernel would deliver a packet addressed to one of its own addresses
+locally before any later routing table is consulted. The operator therefore
+marks the claimed port before the routing decision and gives the marked packets
+a table of their own. Nothing is translated — the mark only selects a route —
+and because the mark names the port, the server's own traffic is untouched.
+
+```bash
+# ---------- server ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# Mark the claimed port before the routing decision (iptables; with nftables the
+# same rule ends in `meta mark set 0x1`). Mark UDP as well if the service uses
+# it. ICMP addressed to <public-ip> itself is still answered by the server.
+sudo iptables -t mangle -A PREROUTING -d <public-ip> -p tcp --dport 8443 -j MARK --set-mark 0x1
+
+# A marked packet must reach table 100 before the kernel's local table
+# (priority 0) can deliver it locally, so the local lookup moves below the
+# mark rule; everything unmarked still resolves through it as before.
+sudo ip rule del pref 0
+sudo ip rule add pref 200 lookup local
+sudo ip rule add pref 100 fwmark 0x1 lookup 100
+sudo ip route add default dev molehill0 table 100
+```
+
+The client side is recipe A's, unchanged: it does not matter whose address the
+client claims — it carries it, and its application binds it. Afterwards,
+`ip route get <public-ip> mark 0x1` must name the TUN device, and `ip rule
+show` must list the mark rule above the local lookup.
+
+### Operational notes
+
+- The `ip` and `sysctl` commands are runtime state. Make them persistent with
+  your distribution's mechanism (a boot unit, a networkd/NetworkManager
+  dispatcher, `sysctl.d` for the `rp_filter` keys); the daemon only verifies
+  what it finds when the service starts.
+- `mtu 1400` is the value the daemon's own refusal prints, and the value these
+  recipes use. Keep it at or below the path MTU: the client's kernel derives the
+  MSS it advertises from the TUN device's MTU, and a tunnel MTU smaller than the
+  path is what keeps a segment from being too large for it.
+- `MOLEHILL_L3_STATS=1` (see
+  [Configuration](./configuration.md#diagnostics-switches-opt-in)) prints the
+  data path's counters once a second, which is how you see whether the two
+  devices are actually moving packets.
+
 ## systemd
 
 Run molehill as a systemd service, with root or rootless, including
@@ -200,7 +339,9 @@ multiple instances. In the unit names, `molehills` stands for
 `molehill --server`, `molehillc` for `molehill --client`, and `molehill`
 for the auto-detect mode. The `@` in a unit name instantiates it per config
 file. Store config files with permission `600` (they contain the shared
-token).
+token). A transparent service needs `CAP_NET_ADMIN` to open its TUN device —
+root has it implicitly, and the units below carry the `AmbientCapabilities=`
+line (commented out) for a unit that runs as another user.
 
 ```ini
 # molehills@.service - one server instance per config: systemctl enable molehills@app1 --now
@@ -213,6 +354,9 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+# Transparent services: the process opens a TUN device. Uncomment when this
+# unit does not run as root.
+# AmbientCapabilities=CAP_NET_ADMIN
 
 # with root
 ExecStart=/usr/bin/molehill -s /etc/molehill/%i.toml
@@ -234,6 +378,9 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+# Transparent services: the process opens a TUN device. Uncomment when this
+# unit does not run as root.
+# AmbientCapabilities=CAP_NET_ADMIN
 
 # with root
 ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
@@ -293,8 +440,8 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 The image carries the full default feature set (`server`, `client`, `noise`,
-`hot-reload`, `multiplex`, `kcp`), so `default_carrier = "kcp"` needs no
-different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
+`hot-reload`, `multiplex`, `kcp`, `transparent`), so `default_carrier = "kcp"`
+needs no different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
 instead of `:latest` when you want reproducible upgrades.
 
 Two consequences of running as UID 1000:

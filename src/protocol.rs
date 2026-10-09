@@ -15,7 +15,8 @@ const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
 const _PROTO_V2: u8 = 2u8;
 const _PROTO_V3: u8 = 3u8;
-const PROTO_V4: u8 = 4u8;
+const _PROTO_V4: u8 = 4u8;
+const PROTO_V5: u8 = 5u8;
 
 /// v4: every connection starts with a one-byte transport selector (`0x00`
 /// plain / `0x01` noise) so the server can accept both transports on one
@@ -39,22 +40,37 @@ const PROTO_V4: u8 = 4u8;
 /// on one tunnel: the group still worked, but the spread D24 asks for was gone.
 /// The data plane (hellos, prologue, the striping frames) is unchanged.
 ///
-/// Which dialect a release speaks, and when the number moves: AGENTS.md §5.
-pub const PROTO_V4_VERSION: ProtocolVersion = PROTO_V4;
+/// v4's number, kept for the refusal tests: this build speaks v5 and a v4
+/// hello must be turned away with the version the peer actually sent.
+#[cfg(test)]
+pub const PROTO_V4_VERSION: ProtocolVersion = _PROTO_V4;
+
+/// v5 adds one service type and one data-channel command, nothing else: a
+/// registration may declare `ServiceType::Transparent`, whose `bind_addr` is a
+/// public `ip:port` the client *claims* rather than a listener the server
+/// binds, and whose data channel carries whole IP packets — framed
+/// `[u16 length][packet]` by [`IpTraffic`] — once the server has announced it
+/// with [`DataChannelCmd::StartForwardTransparent`]. The server keeps no
+/// per-visitor state for such a service: it routes packets it was given by the
+/// host's own routing, and the client's kernel owns the connections.
+///
+/// The selector byte, the session handshake, the service prologue, the
+/// striping frames and the UDP framing are unchanged from v4.
+pub const PROTO_V5_VERSION: ProtocolVersion = PROTO_V5;
 
 /// The dialect this build *speaks*: the version it puts in the hellos it
 /// originates. It is deliberately separate from [`SUPPORTED_PROTO_VERSIONS`],
 /// because a server has to keep serving the dialects it no longer speaks.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V4_VERSION;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V5_VERSION;
 
 /// The dialect a *server* accepts, and the only one it speaks.
 ///
-/// v3 (one service per control connection, a registration carrying a requested
-/// channel count) stopped being served when v4 landed in 0.10.0: this project
-/// is self-hosted, both ends are the same binary, and a wire break is
-/// announced on the connection it happens on (see [`read_hello`]). Anything
-/// else is refused there, loudly, with the version the peer actually sent.
-pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V4_VERSION];
+/// v4 (one control session per endpoint, service-id-carrying commands) stopped
+/// being served when v5 landed: this project is self-hosted, both ends are the
+/// same binary, and a wire break is announced on the connection it happens on
+/// (see [`read_hello`]). Anything else is refused there, loudly, with the
+/// version the peer actually sent.
+pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V5_VERSION];
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
@@ -334,6 +350,15 @@ pub enum DataChannelCmd {
     /// them unchanged. A peer that does not know this variant fails loudly
     /// on the unknown tag instead of silently reframing payload bytes.
     StartForwardStripedTcp([u8; 4], u8, u8),
+    /// Transparent forwarding: this data channel carries whole IP packets for
+    /// the service the stream's prologue named, framed `[u16 length][packet]`
+    /// by [`IpTraffic`]. The client's host owns the claimed address, so the
+    /// packets are injected on its side and its kernel answers the visitor;
+    /// the server never pairs a visitor with this channel.
+    ///
+    /// A unit variant like the other fixed-size data commands: the tag alone
+    /// decides the length the reader must consume.
+    StartForwardTransparent,
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -515,6 +540,67 @@ pub fn digest(data: &[u8]) -> Digest {
     use sha2::{Digest, Sha256};
     let d = Sha256::new().chain_update(data).finalize();
     d.into()
+}
+
+/// The framing of a transparent data channel: `[u16 length][packet]`, in both
+/// directions.
+///
+/// A namespace type rather than a painted buffer — the packet's destination
+/// lives *inside* it, so unlike [`UdpTraffic`] there is no address tag to
+/// carry, and callers read straight into their own scratch buffer.
+// Present where it is carried (the transparent data path) or exercised (this
+// module's own framing tests): a build with neither would only know it as dead
+// code, and the tests would not compile without it.
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub struct IpTraffic;
+
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+impl IpTraffic {
+    /// Frame one packet and send it with a **single** `write_all` (and so a
+    /// single Noise record). Callers reuse `scratch` across packets to avoid
+    /// per-packet allocations.
+    pub async fn write_frame<T: AsyncWrite + Unpin>(
+        writer: &mut T,
+        scratch: &mut BytesMut,
+        packet: &[u8],
+    ) -> Result<()> {
+        let len = u16::try_from(packet.len()).with_context(|| {
+            format!(
+                "IP packet of {} bytes exceeds the wire format limit",
+                packet.len()
+            )
+        })?;
+        scratch.clear();
+        scratch.reserve(2 + packet.len());
+        scratch.put_u16(len);
+        scratch.extend_from_slice(packet);
+        writer.write_all(scratch).await?;
+        Ok(())
+    }
+
+    /// Read one frame into `scratch`, which is resized to the packet's length;
+    /// the returned value is that length.
+    ///
+    /// A zero-length frame is a protocol error and is rejected here rather
+    /// than handed to the caller as an empty packet.
+    pub async fn read<T: AsyncRead + Unpin>(
+        reader: &mut T,
+        scratch: &mut BytesMut,
+    ) -> Result<usize> {
+        let len = reader
+            .read_u16()
+            .await
+            .with_context(|| "Failed to read IP frame length")? as usize;
+        if len == 0 {
+            bail!("Empty IP frame: the stream is corrupt");
+        }
+        scratch.resize(len, 0);
+        reader
+            .read_exact(&mut scratch[..])
+            .await
+            .with_context(|| "Failed to read IP frame")?;
+        Ok(len)
+    }
 }
 
 struct PacketLength {
@@ -807,6 +893,12 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
             return Ok(DataChannelCmd::StartForwardUdp);
         }
         2 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
+        3 => {
+            // StartForwardTransparent is a unit variant, so the tag alone is
+            // the whole command and the channel's IP framing starts right
+            // after it.
+            return Ok(DataChannelCmd::StartForwardTransparent);
+        }
         tag => bail!("Unknown data channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -1354,25 +1446,27 @@ mod tests {
         }
     }
 
-    /// The v4 data-channel handshake: the hello stays 34 bytes, and the four
+    /// The data-channel handshake: the hello stays 34 bytes, and the four
     /// service bytes follow it — which is where the server reads them.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn v4_data_channel_carries_the_service_after_the_hello() {
+    async fn data_channel_carries_the_service_after_the_hello() {
         use tokio::io::duplex;
 
         let (mut tx, mut rx) = duplex(128);
         let nonce = sample_digest(9);
         let id = ServiceId::new(0x0102_0304);
-        let hello = postcard::to_stdvec(&Hello::DataChannelHello(PROTO_V4_VERSION, nonce)).unwrap();
+        let hello =
+            postcard::to_stdvec(&Hello::DataChannelHello(CURRENT_PROTO_VERSION, nonce)).unwrap();
         assert_eq!(hello.len(), PacketLength::new().hello);
         tx.write_all(&hello).await.unwrap();
         write_stream_prologue(&mut tx, id).await.unwrap();
 
         let (version, back) = read_hello(&mut rx).await.unwrap();
-        assert_eq!(version, PROTO_V4_VERSION);
+        assert_eq!(version, CURRENT_PROTO_VERSION);
         assert!(matches!(back, Hello::DataChannelHello(_, n) if n == nonce));
-        // Only now, and only for v4, does the server read the prologue.
+        // Only now, and only after the hello, does the server read the
+        // prologue: it is what names the service the channel carries.
         assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), id);
     }
 
@@ -1643,5 +1737,72 @@ mod tests {
         tx.write_u16(over_cap).await.unwrap();
         let err = read_session_cmd(&mut rx).await.unwrap_err();
         assert!(format!("{err:#}").contains("too large"));
+    }
+
+    /// The transparent data channel's framing: `[u16 length][packet]`, and the
+    /// packet comes back byte for byte -- including the header, which is the
+    /// whole point of this service type.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_roundtrip_preserves_the_packet() {
+        use tokio::io::duplex;
+
+        // A minimal but well-formed IPv4 header (20 bytes) plus payload.
+        let mut packet = vec![
+            0x45, 0x00, 0x00, 0x28, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2,
+        ];
+        packet.extend_from_slice(&[10, 0, 0, 1]);
+        packet.extend_from_slice(b"payload");
+
+        let (mut tx, mut rx) = duplex(4096);
+        let mut scratch = BytesMut::new();
+        IpTraffic::write_frame(&mut tx, &mut scratch, &packet)
+            .await
+            .unwrap();
+
+        let mut got = BytesMut::new();
+        let len = IpTraffic::read(&mut rx, &mut got).await.unwrap();
+        assert_eq!(len, packet.len());
+        assert_eq!(&got[..], &packet[..], "the packet must survive verbatim");
+    }
+
+    /// A frame longer than the reader is willing to buffer is refused by the
+    /// length prefix, and a zero-length frame is a corrupt stream — neither may
+    /// be handed to the caller as a packet.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_rejects_empty_and_oversized() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_u16(0).await.unwrap();
+        let mut scratch = BytesMut::new();
+        let err = IpTraffic::read(&mut rx, &mut scratch).await.unwrap_err();
+        assert!(format!("{err:#}").contains("Empty IP frame"));
+
+        // One byte past the wire-format ceiling must be refused at write time,
+        // before anything reaches the channel.
+        let oversized = vec![0u8; usize::from(u16::MAX) + 1];
+        let (mut tx, _rx) = duplex(64);
+        let err = IpTraffic::write_frame(&mut tx, &mut scratch, &oversized)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds the wire format limit"));
+    }
+
+    /// A truncated frame (the writer died mid-packet) surfaces as an error, so
+    /// the channel is torn down instead of injecting half a packet.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_rejects_a_truncated_packet() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(4096);
+        tx.write_u16(20).await.unwrap();
+        tx.write_all(&[0x45; 8]).await.unwrap();
+        drop(tx);
+
+        let mut scratch = BytesMut::new();
+        assert!(IpTraffic::read(&mut rx, &mut scratch).await.is_err());
     }
 }

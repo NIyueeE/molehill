@@ -490,12 +490,22 @@ impl Client {
         // The client opens its configured channels itself: a v4 registration
         // asks the server for none. UDP opens its worker set (they are the
         // sharding targets and the pool's UDP floor); TCP opens none, because
-        // the server asks for one channel per visitor.
+        // the server asks for one channel per visitor; a transparent service
+        // opens one, long-lived, because every packet for its claimed endpoint
+        // rides it and the server asks for a replacement when it ends.
         let channels = match cfg.service_type {
             ServiceType::Tcp => 0,
             ServiceType::Udp => usize::from(cfg.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS)),
+            ServiceType::Transparent => 1,
         };
         let retry_interval = cfg.retry_interval.unwrap_or(1);
+
+        // A transparent service's prerequisites are the operator's to satisfy
+        // and this process's to verify: it must already own the address it
+        // claims, and the kernel must be willing to accept injected packets.
+        if cfg.service_type == ServiceType::Transparent {
+            check_transparent_client(&cfg)?;
+        }
 
         let previous = self.services.remove(&name);
         if let Some(loc) = &previous
@@ -1202,8 +1212,80 @@ async fn forward_data_channel(
                 "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
             );
         }
+        DataChannelCmd::StartForwardTransparent => {
+            if service.service_type != ServiceType::Transparent {
+                bail!("Expect transparent traffic. Please check the configuration.")
+            }
+            #[cfg(all(feature = "transparent", target_os = "linux"))]
+            run_transparent_channel(conn, service).await?;
+            #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+            {
+                let _ = (conn, service);
+                bail!(
+                    "This build cannot carry a transparent service: it needs Linux and the \
+                     `transparent` feature"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// Inject what the tunnel sends for this service's claimed endpoint, and hand
+/// the kernel's return traffic back.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+async fn run_transparent_channel(
+    conn: ClientDataChannel,
+    service: &ClientServiceConfig,
+) -> Result<()> {
+    use crate::transparent::hub::{TunHub, forward_transparent};
+    use crate::transparent::{Endpoint, Stats};
+
+    let addr: SocketAddr = service.remote_bind_addr.parse().with_context(|| {
+        format!(
+            "service {}: invalid `remote_bind_addr`: {:?}",
+            service.name, service.remote_bind_addr
+        )
+    })?;
+    let stats = Arc::new(Stats::default());
+    crate::transparent::spawn_stats_reporter("client", Arc::clone(&stats));
+    let hub = TunHub::get_or_spawn(
+        &service.transparent_tun,
+        Arc::clone(&stats),
+        crate::transparent::Direction::Source,
+    )?;
+    forward_transparent(
+        conn,
+        hub,
+        Endpoint::new(addr.ip(), addr.port()),
+        Arc::clone(&stats),
+    )
+    .await
+}
+
+/// The client's side of a transparent service's contract, checked before the
+/// service registers rather than after its first packet disappears.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn check_transparent_client(cfg: &ClientServiceConfig) -> Result<()> {
+    let addr: SocketAddr = cfg.remote_bind_addr.parse().with_context(|| {
+        format!(
+            "service {}: invalid `remote_bind_addr`: {:?}",
+            cfg.name, cfg.remote_bind_addr
+        )
+    })?;
+    crate::transparent::check::check_client(&cfg.transparent_tun, &[addr.ip()]).with_context(|| {
+        format!(
+            "service {}: transparent prerequisites are not met",
+            cfg.name
+        )
+    })
+}
+
+#[cfg(not(all(feature = "transparent", target_os = "linux")))]
+fn check_transparent_client(_cfg: &ClientServiceConfig) -> Result<()> {
+    bail!(
+        "This build cannot carry a transparent service: it needs Linux and the `transparent` feature"
+    );
 }
 
 /// Dial an extra connection and upgrade it into a yamux data tunnel.
@@ -1905,7 +1987,7 @@ fn build_udp_hub(
             },
             pins,
         ))),
-        ServiceType::Tcp => None,
+        ServiceType::Tcp | ServiceType::Transparent => None,
     }
 }
 
@@ -2874,7 +2956,7 @@ mod tests {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("protocol v4"),
+            msg.contains(&format!("protocol v{CURRENT_PROTO_VERSION}")),
             "the dialect must be named: {msg}"
         );
         assert!(

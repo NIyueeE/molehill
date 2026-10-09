@@ -1,0 +1,12 @@
+# requires: transparent
+# expect: `local_addr` does not apply
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.services.web]
+protocol = "transparent"
+remote_bind_addr = "10.99.0.1:8443"
+local_addr = "127.0.0.1:8080"

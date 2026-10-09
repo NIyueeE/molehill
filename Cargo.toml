@@ -22,6 +22,7 @@ default = [
     "hot-reload",
     "multiplex",
     "kcp",
+    "transparent",
 ]
 
 # Run as a server
@@ -55,6 +56,13 @@ console = ["console-subscriber", "tokio/tracing"]
 # A KCP tunnel is a mux tunnel over UDP: the feature implies `multiplex`.
 # In the default set so one release binary covers all comparison arms.
 kcp = [ "multiplex"]
+# Transparent (L3) services: the client owns the public `ip:port` instead of
+# the server binding it, so the visitor's packets reach the client's TUN device
+# and its kernel answers them -- the backend sees the visitor's real address
+# and the server holds no connection state. Linux only (it needs a TUN device
+# and CAP_NET_ADMIN on both ends); a config that asks for one on another
+# platform is refused with a precise reason.
+transparent = []
 snow = ["dep:snow"]
 pin-project = ["dep:pin-project"]
 base64 = ["dep:base64"]
@@ -111,7 +119,7 @@ thiserror = "2.0.20"
 libc = "0.2.189"
 parking_lot = { version = "0.12.5", optional = true }
 nohash-hasher = { version = "0.2.0", optional = true }
-nix = { version = "0.31.3", features = ["socket"] }
+nix = { version = "0.31.3", features = ["socket", "net"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [build-dependencies]

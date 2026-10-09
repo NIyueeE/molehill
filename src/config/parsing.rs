@@ -142,6 +142,10 @@ pub struct ClientServiceConfig {
     pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
+    /// The local service's address, e.g. `"127.0.0.1:6022"`. Required by
+    /// `tcp`/`udp`, and refused by `transparent` — there the local service
+    /// binds the claimed public address itself, and nothing dials anything.
+    #[serde(default)]
     pub local_addr: String,
     /// The public address (e.g. `"0.0.0.0:6022"`) this service is exposed at
     /// on the server. Required.
@@ -181,6 +185,11 @@ pub struct ClientServiceConfig {
     pub udp_idle_timeout: Option<u64>,
     /// Queue size for outbound UDP datagrams per data channel. Default: 1024.
     pub udp_send_queue_size: Option<u16>,
+    /// The TUN device a `protocol = "transparent"` service attaches to, copied
+    /// from `[client.transparent].tun` when the config is validated. Empty for
+    /// every other service type.
+    #[serde(skip)]
+    pub transparent_tun: String,
 }
 
 impl ClientServiceConfig {
@@ -231,6 +240,13 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
+    /// The client *owns* the public `ip:port` instead of the server binding it:
+    /// the client's host carries the address on its own TUN device and its
+    /// kernel answers the visitor, so the backend sees the visitor's real
+    /// address and the server holds no connection state. Linux only, and it
+    /// needs `CAP_NET_ADMIN` on both ends; see `docs/configuration.md`.
+    #[serde(rename = "transparent")]
+    Transparent,
 }
 
 fn default_service_type() -> ServiceType {
@@ -441,6 +457,34 @@ impl DataCarrierLimits {
             .clamp(1, usize::from(MAX_MUX_TUNNELS_CAP))
     }
 }
+/// The TUN device a `protocol = "transparent"` service attaches to.
+///
+/// Only the *name* is configuration: the device itself, its addresses and its
+/// routes belong to the operator, and this daemon deliberately never installs
+/// one ([deployment.md](../../docs/deployment.md) owns the recipes). Both ends
+/// may need a device — the server routes the claimed address into its own, the
+/// client carries the address on its own.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentConfig {
+    /// Interface name, created and configured by the operator before the
+    /// daemon starts. Default: `molehill0`.
+    #[serde(default = "default_tun_name")]
+    pub tun: String,
+}
+
+fn default_tun_name() -> String {
+    "molehill0".to_owned()
+}
+
+impl Default for TransparentConfig {
+    fn default() -> Self {
+        Self {
+            tun: default_tun_name(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -454,6 +498,8 @@ pub struct ClientConfig {
     pub services: HashMap<String, ClientServiceConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
+    #[serde(default)]
+    pub transparent: TransparentConfig,
 }
 
 impl ClientConfig {
@@ -589,6 +635,8 @@ pub struct ServerConfig {
     pub data: ServerDataConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
+    #[serde(default)]
+    pub transparent: TransparentConfig,
 }
 
 /// Server-side wire material (`[server.transport]`): only the Noise keys.
@@ -875,27 +923,7 @@ impl Config {
                 bail!("service {name}: `remote_bind_addr` port must not be 0");
             }
 
-            // UDP-only keys on a TCP service are refused, not ignored: they
-            // used to be accepted and silently dropped, which let a config's
-            // owner believe a buffer or a worker count was in effect when
-            // nothing read it. The message names the key and the protocol.
-            if matches!(s.service_type, ServiceType::Tcp) {
-                for (key, written) in [
-                    ("udp_workers", s.udp_workers.is_some()),
-                    ("udp_buffer_size", s.udp_buffer_size.is_some()),
-                    ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
-                    ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
-                    ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
-                ] {
-                    if written {
-                        bail!(
-                            "service {name}: `{key}` is only valid for a UDP service \
-                             (`protocol = \"udp\"`), but this service is TCP. Remove the key, or \
-                             declare the service as UDP"
-                        );
-                    }
-                }
-            }
+            Config::validate_service_protocol(name, s, &client.transparent.tun)?;
 
             // Fill in runtime defaults.
             if matches!(s.service_type, ServiceType::Udp) {
@@ -929,6 +957,95 @@ impl Config {
 
         Config::validate_transport_config(&client.transport)?;
 
+        Ok(())
+    }
+
+    /// Per-protocol service keys: what each protocol requires, and what it
+    /// refuses because nothing would read it.
+    ///
+    /// The refusals are deliberate rather than lenient — a key that is
+    /// accepted and ignored lets its writer believe a buffer or a worker count
+    /// is in effect when nothing reads it.
+    fn validate_service_protocol(
+        name: &str,
+        s: &mut ClientServiceConfig,
+        transparent_tun: &str,
+    ) -> Result<()> {
+        // The local address is required by the forwarding protocols, and
+        // refused by `transparent`: there the local service binds the
+        // claimed public address itself, so there is nothing to dial.
+        match s.service_type {
+            ServiceType::Tcp | ServiceType::Udp => {
+                if s.local_addr.is_empty() {
+                    let protocol = if s.service_type == ServiceType::Tcp {
+                        "tcp"
+                    } else {
+                        "udp"
+                    };
+                    bail!("service {name}: `local_addr` is required for a {protocol} service");
+                }
+            }
+            ServiceType::Transparent => {
+                if !s.local_addr.is_empty() {
+                    bail!(
+                        "service {name}: `local_addr` does not apply to \
+                         `protocol = \"transparent\"`: the local service binds the claimed \
+                         public address itself, so nothing is dialed. Remove the key"
+                    );
+                }
+                if !cfg!(all(feature = "transparent", target_os = "linux")) {
+                    let why = if cfg!(feature = "transparent") {
+                        "this platform is not Linux"
+                    } else {
+                        "this build was compiled without the `transparent` feature"
+                    };
+                    bail!(
+                        "service {name}: `protocol = \"transparent\"` carries whole IP \
+                         packets through a TUN device, and {why}"
+                    );
+                }
+                // One address per service internally: the endpoint owned.
+                s.local_addr.clone_from(&s.remote_bind_addr);
+                transparent_tun.clone_into(&mut s.transparent_tun);
+            }
+        }
+
+        // UDP-only keys on a TCP service are refused, not ignored: they
+        // used to be accepted and silently dropped, which let a config's
+        // owner believe a buffer or a worker count was in effect when
+        // nothing read it. The message names the key and the protocol.
+        if !matches!(s.service_type, ServiceType::Udp) {
+            let protocol = match s.service_type {
+                ServiceType::Tcp => "TCP",
+                ServiceType::Transparent => "transparent (it carries whole IP packets)",
+                ServiceType::Udp => "UDP",
+            };
+            for (key, written) in [
+                ("udp_workers", s.udp_workers.is_some()),
+                ("udp_buffer_size", s.udp_buffer_size.is_some()),
+                ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
+                ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
+                ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
+            ] {
+                if written {
+                    bail!(
+                        "service {name}: `{key}` is only valid for a UDP service \
+                         (`protocol = \"udp\"`), but this service is {protocol}. Remove the \
+                         key, or declare the service as UDP"
+                    );
+                }
+            }
+        }
+
+        // `nodelay` tunes a socket this daemon dials; a transparent
+        // service dials nothing, so nobody would read it.
+        if matches!(s.service_type, ServiceType::Transparent) && s.nodelay.is_some() {
+            bail!(
+                "service {name}: `nodelay` does not apply to `protocol = \"transparent\"` — \
+                 this client dials nothing for it, the local service owns its own sockets. \
+                 Remove the key"
+            );
+        }
         Ok(())
     }
 
@@ -1095,6 +1212,13 @@ mod tests {
                 let available = cfg!(feature = "multiplex");
                 if !available {
                     println!("  skip {name}: needs the `multiplex` feature");
+                }
+                available
+            }
+            "transparent" => {
+                let available = cfg!(all(feature = "transparent", target_os = "linux"));
+                if !available {
+                    println!("  skip {name}: needs a Linux build with the `transparent` feature");
                 }
                 available
             }

@@ -19,6 +19,8 @@ pub mod logging;
 mod mux;
 mod protocol;
 mod stripe;
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+mod transparent;
 mod transport;
 
 pub use cli::Cli;
@@ -40,6 +42,12 @@ use core::run_server;
 /// far (see the integration suite's session-count assertions).
 #[cfg(feature = "server")]
 pub use core::control_sessions_accepted;
+
+/// The dialect this build speaks, re-exported for the integration suite: the
+/// session tests hand-write hellos, so they must name the current version
+/// rather than a copy of it that goes stale at the next bump.
+#[doc(hidden)]
+pub use protocol::CURRENT_PROTO_VERSION;
 
 /// The client's elastic tunnel pool, re-exported for the integration suite:
 /// the pool's own state is what the pool tests assert on, instead of parsing

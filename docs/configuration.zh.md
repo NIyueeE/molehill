@@ -18,6 +18,7 @@
 - [选择配置(决策树)](#选择配置决策树)
 - [动态服务注册](#动态服务注册)
 - [多路复用(`multiplex` 特性)](#多路复用multiplex-特性)
+- [透明(L3)服务](#透明l3服务)
 - [日志](#日志)
 - [调优](#调优)
 - [示例与部署](#示例与部署)
@@ -195,10 +196,13 @@ psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须�
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
+[client.transparent] # 可选。仅透明(L3)服务:客户端连接的 TUN 设备
+tun = "molehill0" # 可选。设备必须已存在,并在上面配好所声明的地址与路由——那是运维方的事,不是守护进程的。默认:molehill0
+
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
-protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"
-local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址
-remote_bind_addr = "0.0.0.0:8081" # 必填。该服务在服务端暴露的公网地址。必须被服务端的 `allow_ports` 覆盖
+protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp", "transparent"]。默认:"tcp"。透明服务自己拥有公网 ip:port,而不是转发到 local_addr——见下文「透明(L3)服务」
+local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址。protocol = "transparent" 时会被拒绝,因为本地应用自己绑定所声明的公网地址
+remote_bind_addr = "0.0.0.0:8081" # 必填。该服务在服务端暴露的公网地址(透明服务是自己声明拥有它,而不是由服务端绑定)。必须被服务端的 `allow_ports` 覆盖
 nodelay = true # 可选。该服务数据通道的 TCP_NODELAY。默认:即使不设置也为 true;设为 `false` 关闭
 retry_interval = 1 # 可选。按服务的重连退避上限,语义与 `client.control.default_retry_interval` 相同。默认:继承 `client.control.default_retry_interval`
 token = "service-specific-token" # 可选。仅对本服务覆盖 `client.default_token`——例如对使用独立 token 的服务端做鉴权 # security-scan:allow documentation placeholder
@@ -237,6 +241,9 @@ remote_public_key = "key_encoded_in_base64"
 psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+
+[server.transparent] # 可选。仅透明(L3)服务:服务端连接的 TUN 设备
+tun = "molehill0" # 可选。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
 ```
 
 ## 动态服务注册
@@ -245,10 +252,11 @@ resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一�
 
 1. 客户端用 `default_token` 鉴权。
 2. 对每个配置的服务,客户端发送 `RegisterService` 消息:名称、
-   `protocol`(tcp/udp)、`remote_bind_addr`、将要使用的数据面
+   `protocol`(tcp/udp/transparent)、`remote_bind_addr`、将要使用的数据面
    `carrier`(tcp/kcp——`kcp` carrier 会触发服务端懒绑定 UDP 监听)与
    UDP 缓冲大小。通道数不在消息里:客户端打开自己配置的通道(TCP 每个访客
-   一条,UDP 为 `udp_workers` 条),服务端在访客到达时再要一条。
+   一条,UDP 为 `udp_workers` 条,透明服务为一条长生命周期通道),服务端在
+   访客到达时再要一条。
 3. 服务端校验:
    - **白名单**:请求的端口必须被 `allow_ports` 覆盖;为空/缺失的
      `allow_ports` 会拒绝*每一次*注册(这也是完全禁用该特性的方式);
@@ -342,6 +350,96 @@ FD 占用。
 线级设计——隧道升级、每流分帧与窗口,以及池化流为何需要 SYN 启动——
 见[内部原理](./internals.md)。
 
+## 透明(L3)服务
+
+`protocol = "transparent"` 的服务把公网 `ip:port` 交给**客户端**拥有,而不是让
+服务端绑定它。客户端的宿主机在自己的 TUN 设备上承载所声明的地址,服务端把整个
+IP 包路由进隧道,由客户端自己的内核应答访客——因此后端看到访客的真实源地址,
+TCP 保持端到端语义,服务端也不为该连接持有任何 socket 或按流的状态。
+
+它**仅支持 Linux**,两端都需要 `CAP_NET_ADMIN`(各自要连接一个 TUN 设备);
+`transparent` 特性属于默认特性集。其他平台上的配置、或在不含该特性的构建里,
+都会在解析配置时被拒绝:信息形如 `... carries whole IP packets through a TUN
+device, and this platform is not Linux`,或指明缺少 `transparent` 特性。目前只
+承载 IPv4——非 IPv4 的包会被丢弃并计数。
+
+**守护进程从不配置网络。** 它没有 netlink 代码,也从不调用 `ip`:TUN 设备与
+地址、路由都由运维方创建和安装,守护进程只校验自己依赖的东西,缺什么就用要执行
+的确切命令拒绝。两套配方——地址被路由到服务端,以及单 IP 服务端——见
+[部署文档](./deployment.zh.md#透明l3服务)。
+
+| 键 | 含义 |
+|---|---|
+| `[client.services.<name>].protocol` | `"transparent"`——该服务拥有一个公网 `ip:port`,而不是转发到 `local_addr` |
+| `[client.services.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
+| `[client.transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
+| `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
+
+转发型服务会用到的三类键在这里会被**解析期拒绝**,因为没有任何代码会读它们:
+`local_addr`(本地应用自己绑定所声明的公网地址,本客户端不拨任何东西)、
+`nodelay`(同理),以及仅限 UDP 的 `udp_workers`、`udp_buffer_size`、
+`udp_idle_timeout`、`udp_send_queue_size` 与 `udp_forwarder_ipv6`。
+
+### 运维方需要准备什么
+
+两端都连接到自己 `tun` 键指定的**已存在**设备;守护进程刻意不创建设备,因为
+运维方的地址和路由就落在它上面。
+
+- **设备存在**(两端)。设备缺失时,拒绝信息会给出创建它的两条命令——
+  `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`。
+- **客户端承载它声明的每个地址。** 所声明的 IP 就是 `remote_bind_addr` 里的
+  那个,客户端必须拥有它:拒绝信息会打印 `ip addr add <ip>/32 dev <tun>`、
+  `ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table
+  100`。地址必须是本地的,因为应用要绑定它;源地址规则则把该应用发出的回包送回
+  隧道。
+- **关闭反向路径过滤。** `net.ipv4.conf.<tun>.rp_filter` **和**
+  `net.ipv4.conf.all.rp_filter` 都必须读到 `0`——注入的包携带访客的源地址,
+  严格的检查会丢掉它们——拒绝信息会打印确切的 `sysctl -w` 行。这项检查在
+  客户端执行;服务端只校验自己的设备是否存在。
+- **路由要把所声明的地址带到服务端**,并让客户端的回包出得去。两套配方见
+  [部署文档](./deployment.zh.md#透明l3服务)。
+- 两个进程都需要 `CAP_NET_ADMIN`;[部署文档](./deployment.zh.md#systemd)的
+  systemd 单元展示了 `AmbientCapabilities=` 行。
+
+### 一个完整示例
+
+```toml
+# server.toml - 服务端不为该服务绑定任何东西:它把 10.99.0.1/32 路由进自己的
+# TUN 设备。
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```toml
+# client.toml - 客户端拥有 10.99.0.1:8443,并在自己的 TUN 设备上承载该地址,
+# 应用就绑定在那里。
+[client]
+default_token = "change-me"
+
+[client.control]
+default_remote_addr = "203.0.113.5:2333"
+
+[client.transparent]
+tun = "molehill0"
+
+[client.services.web]
+protocol = "transparent"
+remote_bind_addr = "10.99.0.1:8443"
+```
+
+多个服务只有在端口不同时才能声明同一个地址;而没有端口可路由的包——ICMP,以及
+首个分片之后的分片——只有在恰好一个服务声明该地址时才会投递,否则宁可丢弃也不
+猜测。`MOLEHILL_L3_STATS=1` 每秒打印一次数据面的累计计数(见
+[诊断开关](#诊断开关按需开启));两端各自如何判断一个包属于哪个服务,见
+[内部原理](./internals.md#transparent-l3-services)。
+
 ## 日志
 
 和许多 Rust 程序一样,`molehill` 用环境变量控制日志级别。可选 `info`、
@@ -385,7 +483,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 
 ### 诊断开关(按需开启)
 
-五个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`。它们默认关闭,从不
+六个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`。它们默认关闭,从不
 改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
 永远不会落到任何地方:
 
@@ -396,6 +494,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 | `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、上限、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+load:1->2`、`-idle:2->1`) |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
+| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors` |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
 就能算出每秒速率与单位成本。pool 与 placement 两行就是共享弹性 pool 的 S1
@@ -510,8 +609,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v4 的 molehill。0.10 只服务 v4,因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
-| 客户端在服务端的 hello 始终不到达后以 `protocol v4` 停止 | 服务端早于 0.10:它读到版本 4、自己的版本检查失败并关闭该连接。请升级服务端。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5 的 molehill(0.10 系列只服务 v4),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| 客户端在服务端的 hello 始终不到达后以 `protocol v5` 停止 | 服务端早于本构建:它读到版本 5、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
 | 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |
@@ -521,3 +620,9 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | UDP 流量不通 | 检查 `protocol = "udp"`;大于 `udp_buffer_size` 的数据报会被截断到该大小;空闲映射在 `udp_idle_timeout` 秒后超时。 |
 | 有状态 UDP 会话(游戏、QUIC、WireGuard)中途断开 | 确保两端运行带 UDP 会话亲和的版本(≥ 本修复);空闲超过 `udp_idle_timeout` 的对端会在下一个数据报时重新绑定到新本地 socket(源端口变化)——调大超时或发送周期流量。 |
 | `Failed to read cmd: early eof` 警告 | 对端关闭了通道(重启或关停);客户端会自动重连。 |
+| 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | 透明服务连接的是运维方创建的设备,守护进程绝不自己创建。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务))。 |
+| `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印的 `ip addr add <ip>/32 dev <tun>`、`ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table 100`。 |
+| `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | 注入的包携带访客的源地址,严格的检查会丢掉它们。执行信息里打印的 `sysctl -w` 行;`net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都必须读到 `0`。 |
+| `Address <ip:port> is already claimed by another transparent service on this server` | 两个客户端声明了同一个端点;先到的声明在其注册存续期间一直持有。给其中一个换地址或端口。 |
+| `protocol = "transparent"` 在启动时被拒,信息为 `... and this platform is not Linux`,或指明缺少 `transparent` 特性 | 该服务类型需要 Linux 构建并启用 `transparent` 特性(默认特性集的一部分)。在其他平台上请改用 `tcp`/`udp`。 |
+| 透明服务的访客拿不到任何响应,`MOLEHILL_L3_STATS=1` 计入 `unclaimed` 丢弃 | 路由不完整:服务端需要一条把所声明地址送进自己设备的路由,客户端需要 `from <ip>` 规则及其表内路由(见[部署文档](./deployment.zh.md#透明l3服务))。`unclaimed` 也会出现在没有任何通道持有该端点时的重连窗口;`no_channel` 则表示该端点的队列已满。 |

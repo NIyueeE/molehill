@@ -15,7 +15,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `Cargo.toml` | crate manifest; `[lints]` is policy documented in [lint-policy](lint-policy.md) |
 | `Cargo.lock` | locked dependency graph (committed; verified with `--locked` in CI builds) |
 | `build.rs` | build metadata injection via vergen (git SHA, timestamp, features, target) |
-| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `interop` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `soak` / `soak-peers` / `soak-plot` / `soak-check` / `container` |
+| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `interop` / `l3-accept` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `soak` / `soak-peers` / `soak-plot` / `soak-check` / `container` |
 | `rust-toolchain.toml` | `channel = "stable"` + clippy/rustfmt components; never hardcode versions |
 | `deny.toml` | cargo-deny policy: licenses, bans, advisories (pre-push + CI) |
 | `ruff.toml` | ruff configuration for the python bench/test entries: the lint set and the repo-wide waivers (see [lint-policy](lint-policy.md)) |
@@ -63,6 +63,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `src/kcp.rs` + `src/kcp/` | internal KCP (ARQ) protocol engine — self-maintained, algorithm aligned with the reference C implementation by skywind3000, plus the SACK extensions the adapter needs; kept in-repo so nothing external needs patching and the module follows molehill's own rules. The tokio adapter around it (pump task, channels, send batching / receive coalescing, pacer, keepalive) is `src/transport/kcp.rs` |
 | `src/mux.rs` + `src/mux/` | the yamux framing engine — vendored from rust-yamux 0.14 and maintained in-repo (like the KCP engine), wire-identical with the yamux specification and tokio-native (tokio IO traits, no compat shim); the `multiplex` transport integrates it through `src/transport/multiplex.rs` |
 | `src/stripe.rs` | the stripe group: spreads one visitor connection over K data channels with numbered 32 KiB chunks (`[server.data] stripe_count`, default 1 = off) — the frame a chunk is read into crosses to the stripe by ownership, and the receiver reassembles by sequence number; design in docs/internals.md, "Data-channel striping" |
+| `src/transparent/` | the transparent (L3) data path — attaching to and reading/writing a TUN device (`tun.rs`, the one audited `TUNSETIFF` ioctl), the header-only packet parser (`ip.rs`), the per-device hub with its endpoint table and per-service queues (`hub.rs`), the endpoint table, drop counters and stats line (`mod.rs`), and the startup prerequisite checks (`check.rs`). Linux-only, behind the `transparent` feature; design in docs/internals.md, "Transparent (L3) services" |
 
 ## Tests, benches, examples, docs
 
@@ -70,7 +71,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 |------|---------|
 | `tests/integration_test.rs` | spawns real server+client pairs; TCP/UDP across transports and the session contract |
 | `tests/pool_test.rs` | the tunnel pool end to end: a shared pool serving two services, the per-service default, UDP source-port stickiness across a grow/shrink, the first visitor after the pool shrank, a burst spreading over tunnels while it is placed, an unanswerable visitor not parking the service, the valve refusing growth without killing the tunnel, and the opt-in telemetry lines from a real binary |
-| `tests/session_test.rs` | the v4 server contract driven by a hand-written v4 client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
+| `tests/session_test.rs` | the session server contract driven by a hand-written client (one session, N services, per-service rejection, deregistration, the tunnel prologue) |
 | `tests/log_budget_test.rs` | drives the real binary and counts what an operator sees: a healthy run must emit no WARN/ERROR, bounded INFO, and no message shape more than three times |
 | `tests/interop_test.rs` | this build against the previous release's binary: each side refuses the other's dialect on that connection alone (v0.10 serves v4 only), an unknown dialect is refused the same way, and a refusing process keeps serving a peer of its own version (`#[ignore]`d; `just interop` sets `MOLEHILL_OLD_BIN`) |
 | `tests/hot_reload_test.rs` | the config watcher against a real binary: a changed file reaches the running service |
@@ -79,6 +80,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the session cases, the control-channel teardown case, valid/invalid configs |
 | `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`), the interop fetcher (`scripts/interop/fetch_old.py`), the UDP stress probe (`scripts/udp_stress.py`) |
+| `benches/scripts/l3/` | the transparent-L3 acceptance harness: `run.sh` builds the real binaries and drives three network namespaces (visitor, server, client) to prove the client owns the public `ip:port` and the server holds no connection state for the flow; `visitor.py` and `echo_service.py` are its PEP 723 peers. Linux-only and root-only, outside the check chain (`just l3-accept`; see docs/checks.md) |
 | `docs/configuration.md` | every setting: meaning, default, allowed values, logging, tuning, troubleshooting, and the decision tree |
 | `docs/deployment.md` (+ `.zh.md`) | ready-to-run configurations for common scenarios, systemd units, container/compose/Quadlet recipes, network requirements, deployment security |
 | `docs/benchmarks.md` (+ `.zh.md`) | how the published numbers are produced, read and reproduced — the home of the benchmark method |

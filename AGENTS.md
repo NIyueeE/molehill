@@ -377,20 +377,22 @@ pointers, not copies:
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
   `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels, in the default set); `embedded` (minimal).
+  KCP-over-UDP data tunnels, in the default set); `transparent` (a
+  client-owned public `ip:port` carried as whole IP packets over a TUN device,
+  Linux only, in the default set); `embedded` (minimal).
   Clippy runs twice in the pre-commit gate: the second pass covers the
   minimal no-default-features `server,client` build that the default-feature
   pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v4, one control session per endpoint; the rule and the
+- **Protocol**: v5, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
   `opt-level = "z"`, `bench`) and the scratch container image are
   [docs/build-guide.md](docs/build-guide.md).
-- **Unsafe** is denied crate-wide; the one module that opts in per item, the
+- **Unsafe** is denied crate-wide; the modules that opt in per item, the
   `src/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
 - **Bench/test entries are PEP 723 python scripts run via `uv run`**; their

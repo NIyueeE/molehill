@@ -83,8 +83,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Plain transport selector (the first byte of every connection).
 const PLAIN_SELECTOR: u8 = 0x00;
-/// `CURRENT_PROTO_VERSION` of the client half of this change; the v4 dialect.
-const PROTO_V4: u8 = 4;
+/// The dialect this build speaks. The session wire is what these tests pin,
+/// and it is version-independent within v5; taking the number from the crate
+/// keeps a future bump from leaving a copy behind.
+use molehill_rathole::CURRENT_PROTO_VERSION as PROTO;
 
 type Digest = [u8; 32];
 
@@ -270,7 +272,7 @@ async fn read_control_cmd(conn: &mut TcpStream) -> Result<ControlCmd> {
 async fn open_session() -> Result<(TcpStream, Digest)> {
     let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
     conn.write_u8(PLAIN_SELECTOR).await?;
-    let hello = Hello::ControlChannelHello(PROTO_V4, [0x42; 32]);
+    let hello = Hello::ControlChannelHello(PROTO, [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
 
@@ -282,8 +284,8 @@ async fn open_session() -> Result<(TcpStream, Digest)> {
         bail!("the server answered a control hello with another hello variant");
     };
     assert_eq!(
-        version, PROTO_V4,
-        "the server must answer in the v4 dialect"
+        version, PROTO,
+        "the server must answer in the dialect this build speaks"
     );
     Ok((conn, nonce))
 }
@@ -359,7 +361,7 @@ impl Session {
     async fn open_data_channel(&self, id: u32) -> Result<TcpStream> {
         let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
         conn.write_u8(PLAIN_SELECTOR).await?;
-        let hello = Hello::DataChannelHello(PROTO_V4, self.nonce);
+        let hello = Hello::DataChannelHello(PROTO, self.nonce);
         conn.write_all(&postcard::to_stdvec(&hello)?).await?;
         conn.write_all(&id.to_be_bytes()).await?;
         conn.flush().await?;
@@ -468,9 +470,9 @@ async fn wait_for_free_port(port: u16) -> Result<()> {
 fn the_wire_mirror_is_total() {
     let tag = [0u8; 32];
     for hello in [
-        Hello::ControlChannelHello(PROTO_V4, tag),
-        Hello::DataChannelHello(PROTO_V4, tag),
-        Hello::DataChannelTunnelHello(PROTO_V4, tag),
+        Hello::ControlChannelHello(PROTO, tag),
+        Hello::DataChannelHello(PROTO, tag),
+        Hello::DataChannelTunnelHello(PROTO, tag),
     ] {
         assert_eq!(postcard::to_stdvec(&hello).unwrap().len(), 34);
     }
@@ -654,7 +656,7 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     // The hello exchange, by hand, on the striped fixture's port.
     let mut conn = TcpStream::connect(STRIPED_CONTROL).await?;
     conn.write_u8(PLAIN_SELECTOR).await?;
-    let hello = Hello::ControlChannelHello(PROTO_V4, [0x42; 32]);
+    let hello = Hello::ControlChannelHello(PROTO, [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
     let mut buf = [0u8; 34];
@@ -664,7 +666,10 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     else {
         bail!("the server answered a control hello with another hello variant");
     };
-    assert_eq!(version, PROTO_V4, "the server speaks protocol v4");
+    assert_eq!(
+        version, PROTO,
+        "the server speaks the dialect this build was compiled with"
+    );
 
     // Authenticate, then register one service — the same frames `Session`
     // writes, and the same session key for a default-token service.

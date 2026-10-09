@@ -169,6 +169,20 @@ the tag ritual, and `tests/interop_test.rs` **skips loudly** (never silently)
 when `MOLEHILL_OLD_BIN` is unset, so a plain `cargo test` stays honest about
 what it did not check.
 
+### Transparent-L3 acceptance (`just l3-accept`)
+
+`just l3-accept` runs `benches/scripts/l3/run.sh`: three network namespaces, a
+real `molehill` server and client, and a visitor whose connection is owned by
+the **client** namespace — the server routes the packets into its TUN while
+holding no socket and no conntrack entry for the flow, and the backend sees the
+visitor's real address.
+
+It is Linux-only (a TUN device) and root-only (`CAP_NET_ADMIN`) for its veth
+pairs, TUN devices, routes and `ip rule`, so it is **not** part of `just check`
+or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
+command and exits 77, never a silent pass. The daemon configures no network
+itself; the harness is the operator.
+
 ## When a gate blocks you
 
 Fix the code first; a waiver is the last resort. The discipline that governs one
