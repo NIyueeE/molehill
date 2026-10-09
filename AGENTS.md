@@ -153,9 +153,9 @@ code-level.**
   still in development it is still being defined, so commands may be extended
   **in place** under that number; once the tag exists, the next change to the
   wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
-  — the first three read off each tag's `CURRENT_PROTO_VERSION`, 0.10 off
-  `src/protocol.rs` at HEAD, because the tag that would confirm it does not
-  exist yet.
+  — each read off its tag's `CURRENT_PROTO_VERSION`. The unreleased line on top
+  of v0.10.0 is v5; it has no tag yet, so its commands may still be extended in
+  place.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
