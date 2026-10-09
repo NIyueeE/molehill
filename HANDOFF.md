@@ -95,22 +95,35 @@ configuration surface is free to change — and this cycle changes it.
    takes the model as an argument (`ClientModel`) rather than being forked, and
    its messages follow it — a claim is a *claim*, and the block named is
    `[transparent.control]`, not `[client.control]`.
-2. **M — measure the L3 path before writing a compressor.** Mean packet size
-   (per-arm `/proc/net/dev` deltas) and wire bytes per payload byte, on a
-   small-packet arm and a bulk one, against a baseline built from a worktree at
-   the `v0.10.0` tag — same host, same run, same method (§10 comparability).
-3. **Z — only if M passes.** VJ-style (RFC 1144) per-flow header deltas, with
-   the encoder authoritative (every context change is an explicit frame, so a
-   reliable ordered stream cannot desync), self-describing `[u8 kind]` frames
-   under v5, and `MOLEHILL_L3_COMPRESS=0` as the A/B switch. No negotiation:
-   there is one dialect and both ends ship together.
-4. **V — the verdict, before any `v0.11` tag.** While unreleased a "no benefit"
-   verdict is a `git revert`; after the tag it would be a protocol version bump.
+2. ~~**M — measure the L3 path before writing a compressor.**~~ **Done**
+   (2026-10-09, `9507a7a`): the harness samples `/proc/net/dev` per arm and
+   `benches/scripts/l3/wire_report.py` reports carried packet sizes and a
+   header-compression ceiling. Campaign in `docs/benchmarks.md`, "The
+   transparent-L3 wire question".
+3. ~~**Z — only if M passes.**~~ **Not built: the measurement says no.** The
+   ceiling on the workload compression exists for (2000 round trips of 64 B) is
+   **17.9 % of the wire** — under the 20 % bar written before the run, and an
+   upper bound before exemptions. The same table says why: 196 B of wire per
+   116 B carried packet, i.e. ~80 B of tunnel transport per packet (our 2-byte
+   length, the multiplexer's frame, the carrier's TCP/IP header and its ACKs)
+   against ~35 B of compressible header. **Framing is the lever, not headers**;
+   batching several packets per frame is the next candidate and needs its own
+   measurement.
+4. ~~**V — the verdict, before any `v0.11` tag.**~~ **Recorded above, and it is
+   a no**: nothing was added to the wire, so there is nothing to remove and no
+   v6 risk.
+5. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
+   worktree build at the `v0.10.0` tag running the same echo backend over the
+   same topology, same host, same run) is not in the harness yet. The two arms
+   measured above are internal to HEAD and answer the compression question
+   only; the L3-versus-L4 cost is still unmeasured.
 
-**Pre-registered criteria.** Small packets (≤128 B payload): wire bytes down
-≥ 20%. Mid (512 B–1 KB): ≥ 5%. Bulk (1400 B): throughput down ≤ 2%. The
-small-packet and the bulk conditions must both hold; a difference inside the
-variance counts as *no difference*, and either failure removes the feature.
+**Pre-registered criteria (kept as written, for the record).** Small packets
+(≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
+(1400 B): throughput down ≤ 2 %. The small-packet and the bulk conditions must
+both hold; a difference inside the variance counts as *no difference*, and
+either failure removes the feature. The small-packet arm failed on the ceiling
+alone, so the other arms were not run for the verdict.
 
 ### Open threads
 

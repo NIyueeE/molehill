@@ -177,6 +177,12 @@ the **client** namespace — the server routes the packets into its TUN while
 holding no socket and no conntrack entry for the flow, and the backend sees the
 visitor's real address.
 
+It also measures: each arm is bracketed by `/proc/net/dev` samples inside the
+namespaces, and `benches/scripts/l3/wire_report.py` turns them into carried
+packet sizes and the ceiling a header compressor could reach. The method and the
+numbers it produced belong to [benchmarks.md](benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model);
+its verdict was that compression is not worth building.
+
 The same run also covers the server's own switch, negatively: it restarts the
 server without `[server.transparent]` **after deleting that namespace's TUN
 device**, so the refusal it asserts on must be the policy one — a server that

@@ -14,8 +14,11 @@
 #   2. the service sees the VISITOR's real address (transparency);
 #   3. the server namespace holds NO connection state for the visitor's flow;
 #   4. the client namespace owns the accepted connection;
-#   5. 200 KB round-trips byte-exactly (no PMTU black hole);
-#   6. a server whose config has no `[server.transparent]` refuses the
+#   5. 200 KB round-trips byte-exactly (no PMTU black hole), and so do 2000
+#      small request/response round trips;
+#   6. the run reports what each arm costs on the wire and what share of it a
+#      header compressor could reach (benches/scripts/l3/wire_report.py);
+#   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
 #      deleted for that run, so the order is proven rather than asserted).
 set -euo pipefail
@@ -69,6 +72,10 @@ TUN_CLI=l3cli0
 ROUTE_TABLE=100
 TUN_MTU=1400
 BULK_BYTES=200000
+# The small-packet arm's instrument: strict round trips of this size. Both are
+# recorded with the numbers, because they are what the numbers mean.
+SMALL_REQUESTS=2000
+SMALL_BYTES=64
 # Long enough that the socket and conntrack snapshots are taken while the
 # visitor's connection is unmistakably live.
 HOLD_SECONDS=5
@@ -130,6 +137,24 @@ dump_log() {
     else
         echo "(no log at $file)" >&2
     fi
+}
+
+# Packet and byte counters for the interfaces a measurement arm cares about,
+# read inside the namespaces that own them. For a tun device the host's view is
+# the L3 path's: `rx` is what userspace wrote into the kernel, `tx` is what the
+# kernel routed out to userspace. The client's veth is the tunnel's wire.
+dev_snapshot() {
+    local out="$1"
+    : >"$out"
+    ip netns exec "$NS_CLI" cat /proc/net/dev | grep -E "($TUN_CLI|v-cli):" >>"$out"
+    ip netns exec "$NS_SRV" cat /proc/net/dev | grep -E "($TUN_SRV|v-srv2):" >>"$out"
+}
+
+# One arm's counters, turned into carried packet sizes and the ceiling any
+# header compressor could reach (the reasoning is wire_report.py's docstring).
+wire_report() {
+    uv run "$HERE/wire_report.py" --label "$1" --before "$2" --after "$3" \
+        --client-tun "$TUN_CLI" --server-tun "$TUN_SRV" --tunnel v-cli | tee "$4"
 }
 
 # Poll a log for a readiness line instead of sleeping blind.
@@ -411,11 +436,13 @@ echo "================= BULK / MTU ================="
 # 200 KB through the tunnel: many segments. The client's TUN MTU (1400) is the
 # smallest on the path, so the MSS it advertises keeps every segment inside
 # it -- the PMTU black hole is avoided by construction, not by clamping.
+dev_snapshot "$LOG/bulk.before"
 BULK_START=$(date +%s.%N)
 BULK_RC=0
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
     --size "$BULK_BYTES" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
 BULK_END=$(date +%s.%N)
+dev_snapshot "$LOG/bulk.after"
 cat "$LOG/visitor-bulk.log"
 awk -v s="$BULK_START" -v e="$BULK_END" -v n="$BULK_BYTES" 'BEGIN {
     d = e - s
@@ -423,6 +450,32 @@ awk -v s="$BULK_START" -v e="$BULK_END" -v n="$BULK_BYTES" 'BEGIN {
     printf "elapsed %.3fs, %.2f Mbit/s round-trip (diagnostic, not a benchmark)\n",
         d, 2 * n * 8 / d / 1e6
 }'
+wire_report "bulk ${BULK_BYTES}B" "$LOG/bulk.before" "$LOG/bulk.after" "$LOG/bulk.report"
+
+echo
+echo "================= SMALL PACKETS ================="
+# The workload a header compressor lives or dies by: one strict round trip at a
+# time, so both directions carry many small segments instead of a few full ones.
+# $SMALL_REQUESTS x $SMALL_BYTES is the instrument; it is recorded with the
+# numbers because it decides them (§10, "instrument parameters are part of the
+# method").
+dev_snapshot "$LOG/small.before"
+SMALL_START=$(date +%s.%N)
+SMALL_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$SMALL_REQUESTS" --size "$SMALL_BYTES" >"$LOG/visitor-small.log" 2>&1 \
+    || SMALL_RC=$?
+SMALL_END=$(date +%s.%N)
+dev_snapshot "$LOG/small.after"
+cat "$LOG/visitor-small.log"
+awk -v s="$SMALL_START" -v e="$SMALL_END" -v n="$SMALL_REQUESTS" -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d round trips of %d B in %.3fs, %.0f round trips/s (diagnostic, not a benchmark)\n",
+        n, b, d, n / d
+}'
+wire_report "small ${SMALL_REQUESTS}x${SMALL_BYTES}B" "$LOG/small.before" "$LOG/small.after" \
+    "$LOG/small.report"
 
 echo
 echo "================= NEGATIVE: NO SERVER SWITCH ================="
@@ -507,6 +560,12 @@ if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
     pass "200 KB round-trip (no MTU black hole)"
 else
     fail "200 KB round-trip (no MTU black hole)"
+fi
+
+if [ "$SMALL_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-small.log"; then
+    pass "$SMALL_REQUESTS small round trips stay byte-exact"
+else
+    fail "$SMALL_REQUESTS small round trips stay byte-exact (exit $SMALL_RC)"
 fi
 
 if grep -qF "does not serve transparent (L3) services" "$LOG/no-l3-server.log"; then

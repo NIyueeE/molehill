@@ -382,6 +382,48 @@ Which setting to pick, and why:
 for what a per-decision figure is and is not comparable with, see
 [Comparability](#comparability).
 
+## The transparent-L3 wire question (not part of the soak model)
+
+An L3 client carries whole IP packets, so the question "how much of the wire is
+header, and how much of *that* could a compressor take?" has its own instrument:
+`benches/scripts/l3/run.sh` samples `/proc/net/dev` inside its namespaces around
+each arm, and `benches/scripts/l3/wire_report.py` turns the difference into
+carried packet sizes and a ceiling. Two interfaces matter — the veth the client
+dials the server on (the tunnel's wire, both directions, including the carrier's
+own TCP/IP headers) and the two TUN devices (the packets the L3 path actually
+carries). The denominator is always stated: **wire** is the veth's bytes, which
+is the link's real cost; **carried** is those packets plus this protocol's
+2-byte length prefix.
+
+| Arm (one connection each) | Carried | Mean carried packet | Wire | Wire per carried packet | Header-compression ceiling |
+|---|---|---|---|---|---|
+| bulk: 200 000 B echoed | 434 packets / 422 584 B | 974 B | 493 633 B | 1137 B | 3.1 % of the wire (3.6 % of carried) |
+| small: 2000 round trips of 64 B | 4010 packets / 464 536 B | 116 B | 785 983 B | 196 B | 17.9 % of the wire (29.7 % of carried) |
+
+The ceiling is `35 B × carried packets`, an **upper bound** rather than a
+measurement: an IPv4+TCP header is 40 B (52 B with the timestamps every Linux
+host sends) and a VJ-style per-flow delta carries about 5, every packet is
+assumed compressible, and the first packet of each flow, ICMP and fragments
+would each cost some of it back.
+
+What the numbers decided: **header compression was not built.** On the
+small-packet arm — the workload it exists for — the ceiling is under the 20 %
+wire-bytes bar the decision was written against. The reason is visible in the
+same table: at 196 B of wire per 116 B carried packet, the tunnel's own
+transport costs about 80 B per packet (this protocol's 2-byte length, the
+multiplexer's frame, the carrier's TCP/IP header and its acknowledgements),
+which is more than twice what compressing a 40–52 B header could recover. On
+the bulk arm the ceiling is 3.1 %: the packets are full-sized, so there is
+almost no header share to win.
+
+**Comparability.** One host, no shaping, one connection per arm, measured at
+`9507a7a`; the two arms are comparable with each other and with nothing else —
+in particular not with the soak numbers above, which use another instrument, a
+shaped path and many connections. The instrument is root-only and lives outside
+the check chain (see [checks.md](checks.md)); reproduce it with
+`just l3-accept` and read `bulk.report` / `small.report` in the artifact
+directory.
+
 ## The UDP queue question (not part of the soak model)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the
