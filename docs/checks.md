@@ -196,6 +196,19 @@ or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
 command and exits 77, never a silent pass. The daemon configures no network
 itself; the harness is the operator.
 
+### The same topology as a measurement (`just l3-compare`)
+
+Beside the acceptance harness is its bench sibling: `just l3-compare` runs
+`benches/scripts/l3/compare.py` on the same three namespaces, with the control,
+L4 (default pool, a capped pool, and `direct`) and L3 arms interleaved over one
+backend, one port set and one binary. It is a measurement, not a check: it
+asserts nothing, gates nothing, and is not part of `just check` or CI. Its
+method — the arms, the workloads, the conventions that make its numbers mean
+something, and how to run it — is owned by
+[benchmarks.md](benchmarks.md#the-l3-versus-l4-comparison-not-part-of-the-soak-model);
+its own section here exists so a reader looking for what runs outside the chain
+finds it.
+
 ## When a gate blocks you
 
 Fix the code first; a waiver is the last resort. The discipline that governs one

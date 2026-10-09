@@ -486,6 +486,82 @@ matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), and `CLAIM_MODE`
 (unset, which measures the product's own default; `multiplex` selects the other
 data-channel mode).
 
+## The L3-versus-L4 comparison (not part of the soak model)
+
+The soak model runs every arm on host loopback, where a transparent client has
+no visitor stack to own an address in. The question "what does carrying whole
+packets cost, against terminating connections?" therefore has its own topology:
+`benches/scripts/l3/compare.py` builds three network namespaces (visitor,
+server, client), two veth pairs and two TUN devices, and runs its arms through
+them over one backend process, one port set and one binary.
+
+| arm | what it is |
+|---|---|
+| `control` | no tool in the path: the ceiling of this topology and backend |
+| `l4` | the product's default forwarding (multiplex pool) |
+| `l4-mux1`, `l4-mux2` | the same with the pool capped at one and two channels |
+| `l4-direct` | the same binary in `direct` mode |
+| `l3` | a transparent claim |
+| `l3-deep` | the same claim with both TUN devices' queue length raised |
+
+The arms take turns inside one campaign (the order rotates per round), so the
+comparison is against the same machine state rather than against yesterday's.
+Its workloads are one to sixteen iperf3 streams and two single-stream runs at
+once (one per service or claim, which separates a per-claim cost from a
+per-process one), a paced UDP probe and a UDP rate ladder, and request/response
+arms on one and on sixteen connections.
+
+What every workload records, and the conventions that make those records
+readable:
+
+- **The rate is the receiver's own window.** iperf3's interval accounting breaks
+  around a `-O` warm-up — it has been seen emitting a 1 ms interval carrying
+  hundreds of MB, and dropping a whole measured interval — so the rate this
+  instrument quotes is the receiving side's own window. The interval-derived
+  headline stays in the record beside it, for provenance.
+- **Byte ratios come from interface counters**, on both sides of the same
+  window: the visitor link's egress is the offered load, the server-to-client
+  link's two directions are what the path cost, and the ratio between them needs
+  no instrument's own accounting to be correct.
+- **Loss is its own evidence.** Every run samples the namespaces' TCP segment
+  counters and every interface's dropped columns; iperf3's `retransmits` field
+  is recorded but is not trusted on its own, because it has read zero on a run
+  whose visitor namespace retransmitted tens of thousands of segments.
+- **A backend binds where its architecture delivers.** The L4 arms' services
+  forward to the loopback, an L3 claim's packets are delivered to the owned
+  address, and the control arm's service is the client namespace's own address.
+  This is not cosmetic: an iperf3 UDP server left on the wildcard learns the
+  visitor as its peer and connects its socket outbound, after which datagrams
+  addressed to the owned address match no socket and the run ends on an ICMP
+  port-unreachable.
+- **One condition per campaign.** `--shape <class>` puts a netem condition —
+  the vocabulary is the soak model's (`rtt100`, `loss1`, `rate20`, …) — on both
+  ends of one leg, `visitor` or `tunnel`, for the whole run: every arm is then
+  measured under the same path, which is what keeps the arms comparable within
+  a campaign.
+- **CPU and I/O shape per daemon**: CPU-seconds and busy cores out of
+  `/proc`, bytes per syscall, the service-port sockets each side holds (sampled
+  *during* the workload — a round-trip arm's connections have closed by the
+  time it returns), and the peer address the backend actually saw.
+
+It is Linux-only and root-only, and lives outside the check chain like the
+acceptance harness next to it:
+
+```bash
+sudo -n just l3-compare --rounds 4
+sudo -n uv run benches/scripts/l3/compare.py --help    # arms, workloads, knobs
+```
+
+`--only <workloads>` runs a subset, which is for instrument work rather than for
+a campaign. The results file defaults to `~/tmp/l3-vs-l4-<timestamp>.json` —
+outside the tree — and the per-arm summary is printed when the run ends.
+
+**Comparability.** One host and one topology per campaign, and the arms are
+comparable with each other within it — and with nothing else: not with the soak
+numbers above (another instrument, another path model, many connections) and not
+with the acceptance harness's diagnostic arms. This section owns the method; a
+campaign's numbers are added beside it when that campaign is published.
+
 ## The UDP queue question (not part of the soak model)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the

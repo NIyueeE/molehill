@@ -160,11 +160,25 @@ configuration surface is free to change — and this cycle changes it.
    packets instead of 1400 measured **3579 Mbit/s** at half the CPU per byte, so
    the TUN MTU (an operator setting, with a link MTU to match) is worth more than
    any remaining code change, and the deployment recipes now say so.
-6. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
-   worktree build at the `v0.10.0` tag running the same echo backend over the
-   same topology, same host, same run) is not in the harness yet. The two arms
-   measured above are internal to HEAD and answer the compression question
-   only; the L3-versus-L4 cost is still unmeasured.
+6. **The L3-versus-L4 instrument exists; its campaigns are being analyzed
+   outside the tree.** `benches/scripts/l3/compare.py` (`just l3-compare`) runs
+   the acceptance harness's three-namespace topology as a *measurement*: control,
+   L4 (default pool, capped pool, `direct`) and L3 arms interleaved over one
+   backend, one port set and one binary, with a two-claim arm, a paced UDP probe
+   and UDP rate ladder, and `--shape` for a netem condition on either leg
+   (`f9c3750`, `1bc4093`). The method is documented on
+   [docs/benchmarks.md](docs/benchmarks.md#the-l3-versus-l4-comparison-not-part-of-the-soak-model),
+   which also states its conventions (receiver's-own-window rates, counter-based
+   byte ratios, loss as its own evidence).
+   Its campaigns have been run on this host (a head-to-head, a replication, an
+   MTU-lever run, a pool sweep, a UDP ladder and one shaped run); their artifacts
+   are held **outside** the repository while the analysis is settled, and the
+   numbers move onto the benchmarks page only when that analysis is published.
+   What is still open after it: the shaped conditions beyond the one run
+   (`rtt100`, `rate20`), and the two findings that look like product questions
+   rather than measurements — the multiplexer's single-flow cost and the
+   transparent path's packet-rate ceiling — which the next cycle should decide
+   whether to attack.
 
 **Pre-registered criteria (kept as written, for the record).** Small packets
 (≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
@@ -176,9 +190,17 @@ alone, so the other arms were not run for the verdict.
 ### Open threads
 
 - **The soak bench has no namespace support** — every arm runs on host loopback
-  — so an L3 arm cannot be expressed as a config variant there. The L3 numbers
-  come from the l3 harness instead; folding L3 into the soak is a separate
-  decision that needs netns plumbing in `soak/lib.py`.
+  — so an L3 arm cannot be expressed as a config variant there. The decision
+  taken (2026-10-09) is a **sibling instrument** rather than netns plumbing
+  inside `soak.py`: the stage-schedule runner shapes `lo`, owns per-tool HTB
+  classes and a loopback-bound backend/probe set, so an L3 arm there would mean
+  a second topology, a second backend and a second probe under the same results
+  schema — for a question (one host, one topology, no peers) the stage schedule
+  does not ask. `benches/scripts/l3/compare.py` reuses the soak model's `lib`
+  primitives (`iperf_result` and its measured-window convention, the host
+  identity, the revision verdict) so the two cannot drift apart on what a
+  reading means. Folding L3 into the *stage schedule* stays open, and would
+  start from a namespace-aware backend/probe layer rather than from the arms.
 - The benchmark comparison against v0.10.0 must build that state (worktree at
   the tag): there is no released asset that speaks v5, and no two tags are
   compatible, so each side runs as a complete pair.

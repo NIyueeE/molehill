@@ -107,6 +107,15 @@ l3-accept:
     cd "$(git rev-parse --show-toplevel)"
     bash benches/scripts/l3/run.sh
 
+# L3 against L4 as a measurement, not a check: the acceptance harness's three
+# namespaces with the control, L4 (default pool, capped pool, direct) and L3
+# arms interleaved over one backend, one port set and one binary. Root-only and
+# outside the check chain; the results file lands outside the tree by default.
+# Method: docs/benchmarks.md, "The L3-versus-L4 comparison".
+# Example: sudo -n just l3-compare --rounds 4
+l3-compare *ARGS:
+    uv run benches/scripts/l3/compare.py {{ARGS}}
+
 # Run the soak benchmark: a tool (or a batch of them) through the scripted
 # workload under the stage schedule. Test types: capacity / rrul / soak /
 # cost / screen — see docs/release.md, "Benchmarks".
