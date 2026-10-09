@@ -36,6 +36,8 @@ import argparse  # noqa: E402
 import contextlib  # noqa: E402
 import json  # noqa: E402
 import py_compile  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
 
 import analysis  # noqa: E402
 import instruments as inst  # noqa: E402
@@ -494,6 +496,32 @@ def _check_probes(c: Checker) -> None:
                 Path(str(probe) + "c").unlink()
 
 
+def _check_socket_query(c: Checker) -> None:
+    """The socket filter must be a command `ss` accepts.
+
+    This is the cheap mechanical guard for a real incident: the flags were
+    unpacked character by character, `ss` failed on stderr, and the watcher
+    read the empty stdout as "no sockets" for a whole campaign.
+    """
+    if not shutil.which("ss"):
+        return
+    query = ["ss", "-Htn", "state", "established", "sport = :1"]
+    r = subprocess.run(query, capture_output=True, text=True, check=False)
+    c.check(
+        "the socket filter is a valid ss invocation",
+        r.returncode == 0,
+        f"exit {r.returncode}: {r.stderr.strip()[:200]}",
+    )
+    udp = subprocess.run(
+        ["ss", "-Hun", "sport = :1"], capture_output=True, text=True, check=False
+    )
+    c.check(
+        "the datagram socket filter is a valid ss invocation",
+        udp.returncode == 0,
+        f"exit {udp.returncode}: {udp.stderr.strip()[:200]}",
+    )
+
+
 def _check_topology(c: Checker) -> None:
     c.check(
         "every shape is a netem argument list",
@@ -528,6 +556,7 @@ def cmd_selfcheck(args) -> int:
     _check_comparability(c)
     _check_fingerprint(c)
     _check_probes(c)
+    _check_socket_query(c)
     _check_topology(c)
     return c.report()
 

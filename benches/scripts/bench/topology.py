@@ -326,15 +326,21 @@ class Topology:
         none (the client's namespace does), and the tunnel's own connections are
         excluded by the port filter, which is the point — they exist either way.
         """
-        out: dict = {}
+        out: dict = {"server": 0, "client": 0, "error": ""}
         flag = "-Htn" if kind == "tcp" else "-Hun"
         state = ["state", "established"] if kind == "tcp" else []
         for short, ns in (("server", SRV_NS), ("client", CLI_NS)):
-            text = run(
-                self.ns_argv(ns, ["ss", *flag, *state, f"sport = :{port}"]),
-                check=False,
-            ).stdout
-            out[short] = len([ln for ln in text.splitlines() if ln.strip()])
+            r = run(
+                self.ns_argv(ns, ["ss", flag, *state, f"sport = :{port}"]), check=False
+            )
+            if r.returncode != 0:
+                # A filter `ss` cannot run prints nothing and says so on stderr;
+                # reading the empty stdout as "no sockets" is how an instrument
+                # reports a silent zero (this one did, for a whole campaign:
+                # the flags were unpacked character by character).
+                out["error"] = f"ss in {ns}: {r.stderr.strip()[:200]}"
+                continue
+            out[short] = len([ln for ln in r.stdout.splitlines() if ln.strip()])
         return out
 
 

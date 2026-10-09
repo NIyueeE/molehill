@@ -268,6 +268,8 @@ def measured(ctx: Ctx, port: int, kind: str = "tcp"):
             window["sample"] = inst.delta(before, after)
             window["peaks"] = dict(proc.peak)
             window["sockets"] = dict(sock.peak)
+            window["socket_polls"] = sock.polls
+            window["socket_error"] = sock.error
 
 
 def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
@@ -293,6 +295,8 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
         "tcp": sample.get("tcp"),
         "peaks": peaks,
         "sockets": sockets,
+        "socket_polls": window.get("socket_polls"),
+        "socket_error": window.get("socket_error") or None,
         "probe_startup_s": ctx.probe_startup_s,
     }
     if extra:

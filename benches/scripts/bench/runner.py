@@ -383,14 +383,6 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
     turn = ArmTurn(camp, arm, rnd)
     samples: list = []
     _, ready = turn.start()
-    ctx = workloads.Ctx(
-        topo=camp.topo,
-        pids_of=turn.pids,
-        work=turn.dir,
-        arm=arm,
-        probe_startup_s=camp.results["meta"]["probe_startup_s"],
-        peers_of=camp.backend.peers if camp.backend else None,
-    )
     try:
         if not ready:
             reason = (
@@ -414,6 +406,14 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
                 continue
             params = scenario.params_for(camp.profile)
             who = _who(arm, rnd, warmup, scenario)
+            ctx = workloads.Ctx(
+                topo=camp.topo,
+                pids_of=turn.pids,
+                work=turn.dir,
+                arm=arm,
+                probe_startup_s=camp.results["meta"]["probe_startup_s"],
+                peers_of=_cell_peers(camp.backend),
+            )
             t0 = time.perf_counter()
             try:
                 cells = workloads.run(scenario.kind, ctx, params)
@@ -444,6 +444,20 @@ def _headline(cells: list, scenario: model.Scenario) -> str:
         label = f"{cell.cell}: " if cell.cell else ""
         parts.append(f"{label}{shown}{suffix}")
     return "; ".join(parts)
+
+
+def _cell_peers(backend):
+    """A reader of the peers the backend announces *from now on*.
+
+    The backend logs one `PEER ip:port` per accepted connection, and it is the
+    transparency evidence: on an L3 arm the backend must see the visitor. Read
+    cumulatively it would carry every earlier cell's connections; read this way
+    a cell records its own, which is what makes the evidence readable.
+    """
+    if backend is None:
+        return None
+    before = set(backend.peers())
+    return lambda: sorted(set(backend.peers()) - before)
 
 
 def _who(arm: model.Arm, rnd: int, warmup: bool, scenario: model.Scenario) -> dict:

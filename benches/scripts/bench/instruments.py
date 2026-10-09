@@ -174,14 +174,30 @@ class SocketWatch:
     ):
         self.topo, self.port, self.kind, self.interval = topo, port, kind, interval
         self.peak = {"server": 0, "client": 0}
+        self.polls = 0
+        self.error = ""
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
+        """Poll until stopped, and *say so* if a poll fails.
+
+        A watcher that dies on its first exception would report a silent zero —
+        the exact failure mode this model forbids. The failure is recorded with
+        how many polls succeeded, so a zero peak is distinguishable from no
+        measurement at all.
+        """
         while not self._stop.is_set():
-            counts = self.topo.sockets(self.port, self.kind)
+            try:
+                counts = self.topo.sockets(self.port, self.kind)
+            except Exception as exc:  # noqa: BLE001 - recorded, never silent
+                self.error = f"{type(exc).__name__}: {exc}"[:200]
+                return
+            if counts.get("error"):
+                self.error = str(counts["error"])
             for role in self.peak:
                 self.peak[role] = max(self.peak[role], counts.get(role, 0))
+            self.polls += 1
             self._stop.wait(self.interval)
 
     def __enter__(self):
