@@ -34,6 +34,14 @@ only the policy:
   against its `allow_ports` whitelist before exposing anything.
 - Both sides authenticate with one shared secret (`default_token`).
 
+A process runs in exactly **one** of three modes, and the file says which:
+`[server]`, `[client]` (forwarding) or `[transparent]` (L3 — see
+[Transparent (L3) services](#transparent-l3-services)). A mode is a property of
+the *process* — its capabilities, its sockets, its TUN device — so a file
+carrying two blocks is refused, and a host that wants two roles runs two
+processes. `--server` / `--client` / `--transparent` override what the file
+says.
+
 A typical setup:
 
 1. Pick a transport — `plain` or `noise` — and, for `noise`, generate a keypair (see [Transport](./transport.md)).
@@ -114,6 +122,11 @@ The next section states what each of the replacements does and what it costs;
 [CHANGELOG.md](../CHANGELOG.md) records why the removals happened.
 
 ## Choosing your configuration (decision tree)
+
+The first choice is the mode: `[client]` forwards to a local application,
+`[transparent]` owns public addresses instead (see
+[Transparent (L3) services](#transparent-l3-services)) — and it is a choice
+about the process, not about a service, so it comes before anything below.
 
 The defaults — `mode = "multiplex"`, `max_tunnels = 4`, `carrier = "tcp"`,
 plain transport — are the right starting point for almost everyone. Deviate
@@ -198,13 +211,10 @@ psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it mus
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
-[client.transparent] # Optional. Transparent (L3) services only: the TUN device the client attaches to
-tun = "molehill0" # Optional. The device must already exist and carry the claimed address and its routes — that is the operator's job, not the daemon's. Default: molehill0
-
 [client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
-protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp", "transparent"]. Default: "tcp". A transparent service owns its public ip:port instead of forwarding to local_addr — see "Transparent (L3) services" below
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded. Refused by protocol = "transparent", where the local application binds the claimed public address itself
-remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server (a transparent service claims it instead of having the server bind it). Must be covered by the server's `allow_ports`
+protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp". A service that must own its public ip:port instead is not a forwarding service at all: it belongs to a `[transparent]` block, which is its own run mode — see "Transparent (L3) services" below
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
+remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
 nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
 retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
@@ -233,7 +243,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
-# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `protocol = "transparent"` service: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
+# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `[transparent]` client's claims: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
 # max_tunnels_per_client = 0 # Optional. The operator's valve on the elastic pool: how many multiplexed data tunnels ONE client may hold across every service of its session. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector); placing the keys lets the server accept Noise connections in addition to plain ones
@@ -244,7 +254,7 @@ psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it mus
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
-[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) services at all. Without it a client's `protocol = "transparent"` registration is refused by policy, before any device is looked at — serving L3 is what asks this process for CAP_NET_ADMIN and a TUN device, so the decision belongs to the operator, never to a remote client
+[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) clients at all. Without it a claim is refused by policy, before any device is looked at — serving L3 is what asks this process for CAP_NET_ADMIN and a TUN device, so the decision belongs to the operator, never to a remote client
 tun = "molehill0" # Optional. The TUN device the server attaches to. It must already exist and have a route for every claimed address — that is the operator's job, not the daemon's. Default: molehill0
 ```
 
@@ -385,20 +395,32 @@ why pooled streams need a SYN kick — is in [Internals](./internals.md).
 
 ## Transparent (L3) services
 
-A `protocol = "transparent"` service gives the **client** the public `ip:port`
-instead of having the server bind it. The client's host carries the claimed
-address on a TUN device, the server routes whole IP packets into the tunnel,
-and the client's own kernel answers the visitor — so the backend sees the
-visitor's real source address, TCP keeps its end-to-end semantics, and the
-server holds no socket and no per-flow state for the connection.
+A transparent (L3) client gives the **client** the public `ip:port` instead of
+having the server bind it. The client's host carries the claimed address on a
+TUN device, the server routes whole IP packets into the tunnel, and the client's
+own kernel answers the visitor — so the backend sees the visitor's real source
+address, TCP keeps its end-to-end semantics, and the server holds no socket and
+no per-flow state for the connection.
+
+It is **its own run mode, with its own model**: a `[transparent]` block, started
+with `molehill <config> --transparent` (or on its own, since the block says what
+the process is). Every service it has is a **claim** on a public address, so
+there is no `protocol` key to switch an entry's meaning and the keys a
+forwarding service would use have no home in the schema at all: `local_addr`,
+`nodelay` and the UDP-only keys cannot be written, rather than being written and
+refused. A `[client.services.<name>]` entry with `protocol = "transparent"` is
+refused with a message pointing here, and a file carrying both a `[client]` and
+a `[transparent]` block is refused too — a host that both forwards and claims
+runs **two processes**, which is also what keeps `CAP_NET_ADMIN` off the one
+that does not need it.
 
 It is **Linux only** and needs `CAP_NET_ADMIN` on both ends (each side attaches
-to a TUN device); the `transparent` feature is part of the default set. A
-config that asks for it on another platform, or in a build without the feature,
-is refused at parse time with `... carries whole IP packets through a TUN
-device, and this platform is not Linux`, or with a message naming the missing
-`transparent` feature. Only IPv4 is carried today — a packet that is not IPv4
-is dropped and counted.
+to a TUN device); the `transparent` feature is part of the default set. A config
+that asks for it on another platform, or in a build without the feature, is
+refused at parse time with `... carries whole IP packets through a TUN device,
+and this platform is not Linux`, or with a message naming the missing
+`transparent` feature. Only IPv4 is carried today — a packet that is not IPv4 is
+dropped and counted.
 
 **Serving L3 is the server operator's decision.** On the server the
 `[server.transparent]` table is the switch: without it a transparent
@@ -406,7 +428,7 @@ registration is refused by policy, before any device is looked at, so a client
 can never be what makes the server reach for `/dev/net/tun` or ask the kernel
 for `CAP_NET_ADMIN`. A server that only forwards `tcp`/`udp` services therefore
 needs no capability for this feature at all. Enabling L3 does have a
-consequence worth stating plainly: such a service is never encrypted, so a
+consequence worth stating plainly: such a client is never encrypted, so a
 server that serves one accepts plaintext connections from it, whatever
 `[server.transport.noise]` says — the Noise keys keep applying to the clients
 that do negotiate them.
@@ -420,23 +442,18 @@ address routed to the server, and a single-IP server — are in
 
 | Key | Meaning |
 |---|---|
-| `[client.services.<name>].protocol` | `"transparent"` — the service owns a public `ip:port` instead of forwarding to `local_addr` |
-| `[client.services.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports`; the address has to be local on the client (the recipes assign it to the TUN device) |
-| `[client.transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
+| `[transparent]` | **the mode**: this block is what makes the process an L3 client, and it is where the client-wide half lives (`default_token`, `tun`, `control`, `data`, `transport`) |
+| `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
+| `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
+| `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
-Four things a forwarding service would use are **refused at parse time**,
-because nothing would read them: `local_addr` (the local application binds the
-claimed public address itself, so this client dials nothing), `nodelay` (same
-reason), the UDP-only keys `udp_workers`, `udp_buffer_size`,
-`udp_idle_timeout`, `udp_send_queue_size` and `udp_forwarder_ipv6`, and
-**encryption**: a transparent service is never encrypted. The visitor's own
-end-to-end protection — TLS, or whatever the protocol brings — is what covers
-the content, and this hop is a plain link by design, so the config is refused
-both when the per-service `transport` table asks for it and when a client-wide
-`[client.transport].type = "noise"` would reach it. The refusal names the key
-to remove.
+Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
+`retry_interval`, `mode`, `carrier`. `[transparent.transport]` holds one key,
+`proxy`, because what an L3 client sends is the visitor's own traffic: this hop
+is a plain link by design, so the model has no encryption keys to offer, and
+`[transparent].tun` is where a device is named.
 
 ### What the operator must prepare
 
@@ -481,19 +498,16 @@ tun = "molehill0"
 ```
 
 ```toml
-# client.toml - the client owns 10.99.0.1:8443 and carries the address on its
-# own TUN device, where the application binds it.
-[client]
+# client.toml - the client owns 10.99.0.1:8443 and carries the address on its own
+# TUN device, where the application binds it. One block, one mode: claims only.
+[transparent]
 default_token = "change-me"
-
-[client.control]
-default_remote_addr = "203.0.113.5:2333"
-
-[client.transparent]
 tun = "molehill0"
 
-[client.services.web]
-protocol = "transparent"
+[transparent.control]
+default_remote_addr = "203.0.113.5:2333"
+
+[transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 ```
 
@@ -646,5 +660,7 @@ above and follow that guide.
 | `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims: run the `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines the message prints. |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | Injected packets carry the visitor's source address, which a strict check drops. Run the `sysctl -w` line the message prints; both `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` must read `0`. |
 | `Address <ip:port> is already claimed by another transparent service on this server` | Two clients claim the same endpoint; the first claim is held for the lifetime of its registration. Give one of them another address or port. |
-| `protocol = "transparent"` refused at startup with `... and this platform is not Linux`, or with a message naming the missing `transparent` feature | The service type needs a Linux build with the `transparent` feature (part of the default set). On another platform, use `tcp`/`udp`. |
-| A transparent service's visitors get nothing, and `MOLEHILL_L3_STATS=1` counts `unclaimed` drops | The routing is incomplete: the server needs a route for the claimed address into its device and the client the `from <ip>` rule plus its table route (see [Deployment](./deployment.md#transparent-services)). `unclaimed` is also the reconnect window, while no channel holds the endpoint; `no_channel` means the endpoint's queue was full. |
+| `protocol = "transparent"` is refused inside a `[client.services.<name>]` entry, with a message naming `[transparent.claims.<name>]` | A client that owns its public address is not a forwarding client: move the entry to a `[transparent]` block and start that process with `--transparent`. See [Transparent (L3) services](#transparent-l3-services). |
+| `[client.transparent]` is refused as "configuration this version moved" | The device belongs to the mode now: `[client.transparent].tun` → `[transparent].tun`, and each transparent service becomes a `[transparent.claims.<name>]` entry. |
+| A `[transparent]` block refused at startup with `... and this platform is not Linux`, or with a message naming the missing `transparent` feature | Carrying whole IP packets needs a Linux build with the `transparent` feature (part of the default set). On another platform, keep to a forwarding `[client]`. |
+| A claimed address's visitors get nothing, and `MOLEHILL_L3_STATS=1` counts `unclaimed` drops | The routing is incomplete: the server needs a route for the claimed address into its device and the client the `from <ip>` rule plus its table route (see [Deployment](./deployment.md#transparent-services)). `unclaimed` is also the reconnect window, while no channel holds the endpoint; `no_channel` means the endpoint's queue was full. |

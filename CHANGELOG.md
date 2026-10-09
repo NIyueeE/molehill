@@ -9,11 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Transparent (L3) services: the client owns the public `ip:port`.** A new
-  service type, `protocol = "transparent"`, stops the server from binding the
-  service's endpoint at all: the client claims a public `ip:port` on a TUN
-  device, the server routes whole IP packets into the tunnel, and the client's
-  own kernel answers the visitor. The backend therefore sees the visitor's real
+- **Transparent (L3) clients: the client owns the public `ip:port`.** A
+  `[transparent]` block is a run mode of its own, and every entry it has is a
+  claim: the client owns a public `ip:port` on a TUN device, the server routes
+  whole IP packets into the tunnel, and the client's own kernel answers the
+  visitor. Choosing a mode is choosing what the *process* is — its capabilities,
+  its device — so the block is a peer of `[server]` and `[client]`
+  (`--transparent`, or the block alone), a file carrying two of them is refused,
+  and a host that both forwards and claims runs two processes. That is also why
+  a claim has no `protocol` key and no home for `local_addr`, `nodelay` or the
+  UDP-only keys: they cannot be written, rather than being written and refused,
+  and `protocol = "transparent"` inside a `[client]` service is refused with a
+  message naming the entry's new home. The model is a front end, not a second
+  engine: it lowers into the same `ClientConfig` the forwarding path runs on, so
+  the client, the data path and the wire are unchanged. The backend therefore sees the visitor's real
   source address, TCP keeps its end-to-end semantics, and the server holds no
   socket and no per-flow state for the connection. Both ends attach to an
   **existing** TUN device named by `[client.transparent].tun` /
@@ -21,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   addresses or routes it — and a prerequisite that is missing (the device, an
   address the client does not carry, a non-zero `rp_filter`) is refused with
   the exact command to run instead of silent packet loss. Linux only, with
-  `CAP_NET_ADMIN` on both ends; the `transparent` feature is in the default
+  `CAP_NET_ADMIN` on the client and on any server that serves it; the `transparent` feature is in the default
   set, and a config that asks for the type on another platform, or in a build
   without the feature, is refused with a precise reason. Serving L3 is the
   **server operator's** decision: the `[server.transparent]` table is that
@@ -47,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network configuration. Keys and the two operator recipes are in
   `docs/configuration.md` ("Transparent (L3) services") and
   `docs/deployment.md` ("Transparent services"); the acceptance harness is
-  `just l3-accept` (root-only, Linux-only, outside the check chain).
+  `just l3-accept` (root-only, Linux-only, outside the check chain), which also
+  runs the negative half: a server without `[server.transparent]` refuses a
+  claim by policy, with its own device deleted for that run so the ordering is
+  proven rather than asserted.
 
 ## [0.10.0] - 2026-10-01
 

@@ -61,7 +61,7 @@
 
 **State as of 2026-10-09.** The feature is committed and green
 (`45adb6e` the feature, `edffa53` never-encrypted, `b1ce03b` the striping
-note): `protocol = "transparent"` makes the client the owner of a public
+note): the transparent (L3) client makes itself the owner of a public
 `ip:port`, carried as whole IP packets over a TUN device on both ends, with the
 wire at **v5** and `just l3-accept` (root-only, outside the check chain)
 proving the transparency end to end. Because none of it is released, the
@@ -85,14 +85,16 @@ configuration surface is free to change — and this cycle changes it.
 
 ### Next, in order
 
-1. **C — the `[transparent]` run mode and its config model.** `[transparent]`
-   + `[transparent.claims.<name>]`; `protocol = "transparent"` refused with a
-   redirect to the new home; `[client.transparent]` refused with a redirect to
-   `[transparent].tun`; the nine per-key refusals deleted (the keys no longer
-   exist); `[client]` untouched; the l3 harness rewritten onto the new schema.
-   The lowering is a front end: the L3 config becomes the same `ClientConfig`
-   the L4 path already uses, so `core/client.rs`, the data path and the wire do
-   not change.
+1. ~~**C — the `[transparent]` run mode and its config model.**~~ **Done**: the
+   `[transparent]` block, `[transparent.claims.<name>]`, `RunMode::Transparent`
+   with `--transparent`, the `[client.transparent]` and
+   `protocol = "transparent"` redirects, and the nine per-key refusals deleted
+   (those keys have no home in the schema). The lowering is a front end: the L3
+   block becomes the same `ClientConfig` the forwarding path already runs on, so
+   `core/client.rs`, the data path and the wire were not touched. Validation
+   takes the model as an argument (`ClientModel`) rather than being forked, and
+   its messages follow it — a claim is a *claim*, and the block named is
+   `[transparent.control]`, not `[client.control]`.
 2. **M — measure the L3 path before writing a compressor.** Mean packet size
    (per-arm `/proc/net/dev` deltas) and wire bytes per payload byte, on a
    small-packet arm and a bulk one, against a baseline built from a worktree at

@@ -1,0 +1,16 @@
+# requires: transparent
+# expect: unknown field
+#
+# The keys a forwarding service uses have no home in a claim — the parse says
+# so, rather than accepting a value nothing would read.
+
+[transparent]
+default_token = "t"
+tun = "molehill-test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+local_addr = "127.0.0.1:8080"

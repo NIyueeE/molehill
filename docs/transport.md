@@ -60,12 +60,14 @@ local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 
 ### Per-service encryption
 
-One service type is never encrypted: a `protocol = "transparent"` service is
+One client mode has no encryption to configure: a transparent (L3) client is
 always plain, because it carries whole IP packets whose content the visitor's
 own end-to-end protection already covers, and this hop is a plain link by
-design. The config is refused when either the per-service `transport` table or
-a client-wide `type = "noise"` would encrypt such a service — see
-[Configuration](./configuration.md#transparent-l3-services).
+design. That is structural rather than a rule — its `[transparent.transport]`
+table holds the `proxy` key and no key for a cipher, so there is nowhere to ask
+— see [Configuration](./configuration.md#transparent-l3-services). What a
+*server* accepts is unaffected: its Noise keys still apply to every client that
+negotiates them, and an L3 client simply never does.
 
 The client-wide `[client.transport].type` is the default for every service,
 and each service can override it individually — including its own keys, which

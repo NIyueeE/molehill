@@ -252,17 +252,14 @@ tun = "$TUN_SRV"
 TOML
 
     cat >"$LOG/client.toml" <<TOML
-[client]
+[transparent]
 default_token = "bench"
-
-[client.control]
-default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
-
-[client.transparent]
 tun = "$TUN_CLI"
 
-[client.services.web]
-protocol = "transparent"
+[transparent.control]
+default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
 }
@@ -330,7 +327,7 @@ if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
 fi
 echo "server listening on :$CONTROL_PORT (pid $SRV_PID)"
 
-ip netns exec "$NS_CLI" "$BIN" --client "$LOG/client.toml" >"$LOG/client.log" 2>&1 &
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/client.log" 2>&1 &
 CLI_PID=$!
 PIDS+=("$CLI_PID")
 echo "client started (pid $CLI_PID)"
@@ -450,7 +447,7 @@ if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
     dump_log "$LOG/no-l3-server.log"
     exit 1
 fi
-ip netns exec "$NS_CLI" "$BIN" --client "$LOG/client.toml" >"$LOG/no-l3-client.log" 2>&1 &
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/no-l3-client.log" 2>&1 &
 NO_L3_CLI=$!
 PIDS+=("$NO_L3_CLI")
 

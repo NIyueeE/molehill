@@ -182,6 +182,7 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
 
     if (old.server.is_some() != new.server.is_some())
         || (old.client.is_some() != new.client.is_some())
+        || (old.transparent.is_some() != new.transparent.is_some())
     {
         return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
     }
@@ -196,6 +197,15 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
             },
             None => return Some(vec![ConfigChange::General(Box::new(new.clone()))]),
         }
+    }
+
+    // An L3 client has no service-level events to compute: its block *is* the
+    // process's configuration (the device, the control endpoint, every claim),
+    // so any change to it restarts the instance. Without this an edit to
+    // `[transparent]` would compare equal on the two fields above and be
+    // silently ignored, which is the one outcome worse than a restart.
+    if old.transparent != new.transparent {
+        return Some(vec![ConfigChange::General(Box::new(new.clone()))]);
     }
 
     Some(ret)
@@ -240,10 +250,12 @@ mod test {
         let old = Config {
             server: Some(ServerConfig::default()),
             client: None,
+            transparent: None,
         };
         let new = Config {
             server: Some(ServerConfig::default()),
             client: Some(ClientConfig::default()),
+            transparent: None,
         };
         assert_eq!(
             calculate_events(&old, &new),
@@ -253,7 +265,51 @@ mod test {
         let server_a = Config {
             server: Some(ServerConfig::default()),
             client: None,
+            transparent: None,
         };
         assert_eq!(calculate_events(&server_a, &server_a), None);
+    }
+
+    /// The L3 client's block is process-level, like `[server]`'s: an edit to it
+    /// restarts the instance instead of being diffed into service events — and
+    /// in particular it is never silently ignored, which is what a change that
+    /// only touches `transparent` would be if the comparison looked at the
+    /// other two blocks alone.
+    #[test]
+    fn test_l3_block_changes_restart_the_instance() {
+        let without = Config {
+            server: None,
+            client: None,
+            transparent: None,
+        };
+        let l3 = Config {
+            server: None,
+            client: None,
+            transparent: Some(crate::config::transparent::TransparentClientConfig::default()),
+        };
+        assert_eq!(
+            calculate_events(&without, &l3),
+            Some(vec![ConfigChange::General(Box::new(l3.clone()))]),
+            "adding the block is a mode change: restart"
+        );
+        assert_eq!(
+            calculate_events(&l3, &without),
+            Some(vec![ConfigChange::General(Box::new(without.clone()))]),
+            "removing it is a mode change too"
+        );
+
+        let edited = Config {
+            server: None,
+            client: None,
+            transparent: Some(crate::config::transparent::TransparentClientConfig {
+                tun: "molehill1".to_string(),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            calculate_events(&l3, &edited),
+            Some(vec![ConfigChange::General(Box::new(edited.clone()))]),
+            "an edit inside the block must not be ignored"
+        );
     }
 }

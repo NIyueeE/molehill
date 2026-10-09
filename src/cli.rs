@@ -56,6 +56,14 @@ pub struct Cli {
     #[arg(long, short, group = "mode")]
     pub client: bool,
 
+    /// Run as a transparent (L3) client
+    ///
+    /// The `[transparent]` block is its own model: every service it has is a
+    /// claim on a public address, and the client's kernel answers the visitor.
+    /// A host that also forwards services runs a second process.
+    #[arg(long, short, group = "mode")]
+    pub transparent: bool,
+
     /// Generate a keypair for the use of the noise protocol
     ///
     /// x25519 is the curve this build can generate (the Noise resolver is

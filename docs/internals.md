@@ -141,7 +141,11 @@ With the `multiplex` feature (part of the default feature set) and `mode = "mult
 
 ### Transparent (L3) services
 
-A transparent service reverses the ownership of the public endpoint. Its
+A transparent (L3) client reverses the ownership of the public endpoint. It is
+a run mode of its own — `[transparent]`, lowered into the very `ClientConfig`
+the forwarding path runs on (`TransparentClientConfig::lower`), so nothing
+below this line has a second code path to follow: one `ServiceType::Transparent`
+service per claim, and the client engine is the same one. Each such
 registration declares `ServiceType::Transparent`, and its `bind_addr` is a
 public `ip:port` the **client claims** rather than a listener the server binds:
 `bind_service_endpoint` returns `BoundEndpoint::Transparent` (nothing to bind),

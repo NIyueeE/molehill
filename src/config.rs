@@ -1,4 +1,5 @@
 pub mod parsing;
+pub mod transparent;
 pub mod watcher;
 
 #[cfg(any(feature = "client", feature = "notify"))]

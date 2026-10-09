@@ -1,13 +1,16 @@
 # requires: transparent
-[client]
+
+# An L3 client is its own run mode: one block, and every service it has is a
+# claim on a public address. There is no `protocol` key here, and the keys a
+# forwarding service would use (`local_addr`, `nodelay`, the UDP-only ones) have
+# no home in this schema at all.
+
+[transparent]
 default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.transparent]
 tun = "molehill-test0"
 
-[client.services.web]
-protocol = "transparent"
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"

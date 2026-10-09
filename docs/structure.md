@@ -55,7 +55,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `src/cli.rs` | clap-derive CLI definitions |
 | `src/protocol.rs` | wire protocol (Hello/Auth/Ack/commands, the session commands and per-service prologue), postcard serialization, protocol version |
 | `src/common.rs` + `src/common/` | constants, DNS/keepalive/retry helpers, `MultiMap`, the `AsyncWriteOwned` owned-write capability boundary (`owned_write.rs`), the idle-reaping forward wrapper (`forward.rs`) |
-| `src/config.rs` + `src/config/` | TOML parsing/validation (`Config`, `ClientConfig`, …, `MaskedString`), hot-reload watcher |
+| `src/config.rs` + `src/config/` | TOML parsing/validation (`Config`, `ClientConfig`, …, `MaskedString`), the L3 client's own block (`transparent.rs`: `TransparentClientConfig`, which lowers into the `ClientConfig` the client engine runs on), the hot-reload watcher |
 | `src/core/client.rs` | client mode: one control session per endpoint (auth, per-service registration, per-service state), data-channel requests, the UDP hub |
 | `src/core/server.rs` | server mode: registration policy, eager binding, the session registry, connection pools, UDP affinity |
 | `src/logging.rs` | colored span-aware log formatter |

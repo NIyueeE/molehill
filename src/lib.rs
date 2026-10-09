@@ -243,13 +243,20 @@ async fn run_instance(
     service_update: mpsc::Receiver<ConfigChange>,
 ) -> Result<()> {
     match determine_run_mode(&config, &args) {
-        RunMode::Undetermine => Err(anyhow!("Cannot determine running as a server or a client")),
+        RunMode::Undetermine => Err(anyhow!("{}", undetermined_reason(&config))),
         RunMode::Client => {
             info!("Running as a client");
             #[cfg(not(feature = "client"))]
             crate::common::helper::feature_not_compile("client");
             #[cfg(feature = "client")]
             run_client(config, shutdown_rx, service_update).await
+        }
+        RunMode::Transparent => {
+            info!("Running as a transparent (L3) client");
+            #[cfg(not(feature = "client"))]
+            crate::common::helper::feature_not_compile("client");
+            #[cfg(feature = "client")]
+            run_client(config.into_l3_client()?, shutdown_rx, service_update).await
         }
         RunMode::Server => {
             info!("Running as a server");
@@ -265,44 +272,118 @@ async fn run_instance(
 enum RunMode {
     Server,
     Client,
+    /// The L3 client: a `[transparent]` block, run through the same client
+    /// engine on the config it lowers to.
+    Transparent,
     Undetermine,
 }
 
 fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
-    if args.client && args.server {
-        RunMode::Undetermine
-    } else if args.client {
-        RunMode::Client
-    } else if args.server {
-        RunMode::Server
-    } else if config.client.is_some() && config.server.is_none() {
-        RunMode::Client
-    } else if config.server.is_some() && config.client.is_none() {
-        RunMode::Server
-    } else {
-        RunMode::Undetermine
+    // A flag wins over the config, and two flags are never a mode: the same
+    // rule as before, now with a third one.
+    let flags = [args.server, args.client, args.transparent];
+    if flags.iter().filter(|asked| **asked).count() > 1 {
+        return RunMode::Undetermine;
     }
+    if args.server {
+        return RunMode::Server;
+    }
+    if args.client {
+        return RunMode::Client;
+    }
+    if args.transparent {
+        return RunMode::Transparent;
+    }
+
+    // Otherwise the file says which mode it is, and it says exactly one: the
+    // three blocks are three roles, and a host with two of them is two
+    // processes.
+    match (
+        config.server.is_some(),
+        config.client.is_some(),
+        config.transparent.is_some(),
+    ) {
+        (true, false, false) => RunMode::Server,
+        (false, true, false) => RunMode::Client,
+        (false, false, true) => RunMode::Transparent,
+        _ => RunMode::Undetermine,
+    }
+}
+
+/// Why the mode could not be determined, naming what the file carries.
+///
+/// "Cannot determine" without the reason is a puzzle; the file's own blocks
+/// are the answer to it.
+fn undetermined_reason(config: &Config) -> String {
+    let mut blocks = Vec::new();
+    if config.server.is_some() {
+        blocks.push("`[server]`");
+    }
+    if config.client.is_some() {
+        blocks.push("`[client]`");
+    }
+    if config.transparent.is_some() {
+        blocks.push("`[transparent]`");
+    }
+    if blocks.is_empty() {
+        return "The configuration defines none of `[server]`, `[client]` or `[transparent]`"
+            .to_string();
+    }
+    format!(
+        "The configuration defines {}, and they are separate run modes: exactly one may be \
+         present. A host that is both, or a client that both forwards and claims, runs a \
+         second process",
+        blocks.join(" and ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::transparent::TransparentClientConfig;
     use crate::config::{ClientConfig, ServerConfig};
 
     #[test]
     fn test_determine_run_mode() {
-        // (config has `[server]`, config has `[client]`, `--server`, `--client`)
-        let tests: [(bool, bool, bool, bool, RunMode); 7] = [
-            (false, false, false, false, RunMode::Undetermine),
-            (true, false, false, false, RunMode::Server),
-            (false, true, false, false, RunMode::Client),
-            (true, true, false, false, RunMode::Undetermine),
-            (true, true, true, false, RunMode::Server),
-            (true, true, false, true, RunMode::Client),
-            (true, true, true, true, RunMode::Undetermine),
+        // (config has `[server]`, `[client]`, `[transparent]`;
+        //  `--server`, `--client`, `--transparent`)
+        let tests: [(bool, bool, bool, bool, bool, bool, RunMode); 13] = [
+            (
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                RunMode::Undetermine,
+            ),
+            (true, false, false, false, false, false, RunMode::Server),
+            (false, true, false, false, false, false, RunMode::Client),
+            // The L3 client is the third mode, and its block alone decides it.
+            (
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                RunMode::Transparent,
+            ),
+            (true, true, false, false, false, false, RunMode::Undetermine),
+            // Two blocks are two roles: a host that is both is two processes.
+            (true, false, true, false, false, false, RunMode::Undetermine),
+            (false, true, true, false, false, false, RunMode::Undetermine),
+            // A flag decides, and it wins over an ambiguous file.
+            (true, true, false, true, false, false, RunMode::Server),
+            (true, true, false, false, true, false, RunMode::Client),
+            (true, true, false, false, false, true, RunMode::Transparent),
+            // Two flags are never a mode.
+            (true, true, true, true, true, false, RunMode::Undetermine),
+            (true, true, true, true, false, true, RunMode::Undetermine),
+            (true, true, true, false, true, true, RunMode::Undetermine),
         ];
 
-        for (cfg_s, cfg_c, arg_s, arg_c, run_mode) in tests {
+        for (cfg_s, cfg_c, cfg_t, arg_s, arg_c, arg_t, run_mode) in tests {
             let config = Config {
                 server: if cfg_s {
                     Some(ServerConfig::default())
@@ -314,12 +395,18 @@ mod tests {
                 } else {
                     None
                 },
+                transparent: if cfg_t {
+                    Some(TransparentClientConfig::default())
+                } else {
+                    None
+                },
             };
 
             let args = Cli {
                 config_path: Some(std::path::PathBuf::new()),
                 server: arg_s,
                 client: arg_c,
+                transparent: arg_t,
                 ..Default::default()
             };
 

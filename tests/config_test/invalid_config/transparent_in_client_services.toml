@@ -1,5 +1,9 @@
 # requires: transparent
-# expect: `nodelay` does not apply
+# expect: is not a forwarding protocol
+#
+# A forwarding client may never own its public address: that is a different run
+# mode, and the refusal names where the entry goes instead.
+
 [client]
 default_token = "t"
 
@@ -9,4 +13,3 @@ default_remote_addr = "example.com:2333"
 [client.services.web]
 protocol = "transparent"
 remote_bind_addr = "10.99.0.1:8443"
-nodelay = true

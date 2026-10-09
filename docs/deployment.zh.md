@@ -193,7 +193,7 @@ bind_addr = "0.0.0.0:2333"
 
 ## 透明(L3)服务
 
-`protocol = "transparent"` 的服务让**客户端**成为公网 `ip:port` 的拥有者:
+透明(L3)客户端让**客户端**成为公网 `ip:port` 的拥有者:
 服务端不绑定任何东西,只把整个 IP 包路由进隧道,由客户端内核应答访客。各个键、
 前置条件与确切的拒绝信息归
 [配置文档](./configuration.zh.md#透明l3服务)负责;本节讲的是运维方要搭建的
@@ -229,18 +229,15 @@ tun = "molehill0"
 ```
 
 ```toml
-# client.toml
-[client]
+# client.toml - 整个进程就是 L3 客户端:没有转发服务,没有要拨的地址,只有一条认领。
+[transparent]
 default_token = "change-me"
-
-[client.control]
-default_remote_addr = "<server-address>:2333"
-
-[client.transparent]
 tun = "molehill0"
 
-[client.services.web]
-protocol = "transparent"
+[transparent.control]
+default_remote_addr = "<server-address>:2333"
+
+[transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
 ```
 

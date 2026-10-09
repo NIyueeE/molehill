@@ -196,7 +196,7 @@ bind_addr = "0.0.0.0:2333"
 
 ## Transparent services
 
-A `protocol = "transparent"` service makes the **client** the owner of a public
+A transparent (L3) client makes the **client** the owner of a public
 `ip:port`: the server binds nothing, routes whole IP packets into the tunnel,
 and the client's kernel answers the visitor. The keys, the prerequisites and
 the exact refusals belong to
@@ -235,18 +235,16 @@ tun = "molehill0"
 ```
 
 ```toml
-# client.toml
-[client]
+# client.toml - the whole process is the L3 client: no forwarding services,
+# nothing to dial, one claim.
+[transparent]
 default_token = "change-me"
-
-[client.control]
-default_remote_addr = "<server-address>:2333"
-
-[client.transparent]
 tun = "molehill0"
 
-[client.services.web]
-protocol = "transparent"
+[transparent.control]
+default_remote_addr = "<server-address>:2333"
+
+[transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
 ```
 
