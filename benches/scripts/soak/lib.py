@@ -871,6 +871,14 @@ class IperfDial:
     port: int
     host: str = "127.0.0.1"
     argv_prefix: tuple = ()
+    #: Run the UDP test shape instead of TCP: `-u`, optionally rate-limited
+    #: with `bitrate` and with fixed-size datagrams (`length`). The L3-vs-L4
+    #: comparison needs it because the two architectures carry datagrams in
+    #: different *kinds* (a packet either way, versus a per-peer channel), and
+    #: iperf3's UDP mode is the sink that can keep up with a rate ladder.
+    udp: bool = False
+    bitrate: str = ""
+    length: int = 0
     #: Seconds iperf3 omits from its accounting (`-O`): the Soak model's
     #: convention on a shaped path whose slow start is seconds long. Left at 2
     #: by the L3 comparison as well, which does *not* take its byte ratios from
@@ -907,6 +915,9 @@ def iperf_result(
         "-t",
         str(secs),
         *(["-O", str(dial.omit)] if dial.omit else []),
+        *(["-u"] if dial.udp else []),
+        *(["-b", dial.bitrate] if dial.bitrate else []),
+        *(["-l", str(dial.length)] if dial.length else []),
         "-P",
         str(streams),
     ]
@@ -919,7 +930,16 @@ def iperf_result(
         rc, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as e:
         timed_out = True
-        rc, err = None, (e.stderr or "")
+        rc = None
+        # Both streams need the same coercion: `text=True` does not guarantee
+        # str on this path (a known CPython quirk), and the artifact writer
+        # below refuses bytes — which is how a timed-out UDP run turned into a
+        # TypeError instead of a recorded timeout.
+        err = (
+            e.stderr
+            if isinstance(e.stderr, str)
+            else (e.stderr or b"").decode("utf-8", "replace")
+        )
         out = (
             e.stdout
             if isinstance(e.stdout, str)
@@ -1014,10 +1034,24 @@ def iperf_result(
     # defeated does the receiver's count become the evidence, and then it is
     # the ONLY evidence of what the path carried.
     headline_gbps = recv_gbps if degenerate else sent_gbps
+    # A UDP run reports a different summary: datagrams, and the loss and
+    # jitter either side saw. It is recorded beside the byte accounting (which
+    # iperf3 also fills for UDP) rather than replacing it.
+    udp_stats = None
+    if dial.udp:
+        total = end.get("sum") or {}
+        udp_stats = {
+            "packets": total.get("packets"),
+            "lost_packets": total.get("lost_packets"),
+            "lost_percent": total.get("lost_percent"),
+            "jitter_ms": total.get("jitter_ms"),
+            "seconds": total.get("seconds"),
+        }
     return base | {
         "ok": True,
         "bytes_sent": sent_b,
         "bytes_received": recv_b,
+        "udp": udp_stats,
         "bytes_interval_total": total_b,
         # What the probe itself cost on both ends, as iperf3 measured it: the
         # tool's CPU is sampled from /proc, and a path cannot be called cheap
