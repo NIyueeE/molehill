@@ -29,7 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves to **protocol v5** (one service type and one data-channel command,
   `StartForwardTransparent`, whose channel carries `[u16 length][packet]`
   frames), so both ends upgrade together as with every protocol change.
-  `MOLEHILL_L3_STATS=1` prints the data path's cumulative counters. Not in this
+  `MOLEHILL_L3_STATS=1` prints the data path's cumulative counters. Such a
+  service is **never encrypted**: the visitor's own end-to-end protection is
+  the content's and this hop is a plain link by design, so both a per-service
+  `transport` and a client-wide `[client.transport].type = "noise"` are refused
+  for it. Not in this
   version: IPv6 (dropped and counted), per-flow channels (every flow of one
   claimed endpoint shares the service's single channel), and any automatic
   network configuration. Keys and the two operator recipes are in

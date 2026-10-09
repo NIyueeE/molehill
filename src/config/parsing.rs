@@ -899,6 +899,25 @@ impl Config {
             if s.token.as_ref().is_some_and(|t| t.is_empty()) {
                 bail!("service {name}: `token` must not be empty");
             }
+            // A transparent service is never encrypted: the visitor's own
+            // end-to-end protection is the content's, this hop is a plain link
+            // by design, and asking for the opposite is refused rather than
+            // ignored. Checked *before* the Noise-keys rule below, so a config
+            // that asks for the impossible is told that instead of being sent
+            // to add keys it would never use. One condition covers both
+            // sources of the setting: the per-service override and the
+            // client-wide default.
+            if s.service_type == ServiceType::Transparent
+                && s.transport_type_with(client.transport.transport_type) == TransportType::Noise
+            {
+                bail!(
+                    "service {name}: `protocol = \"transparent\"` is never encrypted, but this \
+                     service's effective transport is noise. Remove \
+                     `[client.services.{name}.transport].type`, or the client-wide \
+                     `[client.transport].type = \"noise\"` that reaches it"
+                );
+            }
+
             // Effective transport is client-decided per service: the
             // `transport.type` override wins over the client-wide
             // `[client.transport].type`, and effective Noise needs keys

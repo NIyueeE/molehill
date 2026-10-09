@@ -375,10 +375,14 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[client.transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 
-转发型服务会用到的三类键在这里会被**解析期拒绝**,因为没有任何代码会读它们:
+转发型服务会用到的四类东西在这里会被**解析期拒绝**,因为没有任何代码会读它们:
 `local_addr`(本地应用自己绑定所声明的公网地址,本客户端不拨任何东西)、
 `nodelay`(同理),以及仅限 UDP 的 `udp_workers`、`udp_buffer_size`、
-`udp_idle_timeout`、`udp_send_queue_size` 与 `udp_forwarder_ipv6`。
+`udp_idle_timeout`、`udp_send_queue_size` 与 `udp_forwarder_ipv6`,以及
+**加密**:transparent 服务永不加密——内容由访问者自己的端到端保护(TLS,或该协议
+自带的任何加密)负责,这一跳按设计就是明文链路。因此无论你在按服务的 `transport`
+表里要求加密,还是 client 级的 `[client.transport].type = "noise"` 会作用到它,配置
+都会被拒绝;拒绝信息会指出要删掉的键。
 
 ### 运维方需要准备什么
 

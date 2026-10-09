@@ -60,6 +60,13 @@ local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 
 ### Per-service encryption
 
+One service type is never encrypted: a `protocol = "transparent"` service is
+always plain, because it carries whole IP packets whose content the visitor's
+own end-to-end protection already covers, and this hop is a plain link by
+design. The config is refused when either the per-service `transport` table or
+a client-wide `type = "noise"` would encrypt such a service — see
+[Configuration](./configuration.md#transparent-l3-services).
+
 The client-wide `[client.transport].type` is the default for every service,
 and each service can override it individually — including its own keys, which
 is what a multi-server setup needs (each server holds its own keypair):

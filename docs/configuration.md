@@ -414,12 +414,17 @@ address routed to the server, and a single-IP server — are in
 | `[client.transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
-Three kinds of key a forwarding service would use are **refused at parse
-time**, because nothing would read them: `local_addr` (the local application
-binds the claimed public address itself, so this client dials nothing),
-`nodelay` (same reason), and the UDP-only keys `udp_workers`,
-`udp_buffer_size`, `udp_idle_timeout`, `udp_send_queue_size` and
-`udp_forwarder_ipv6`.
+Four things a forwarding service would use are **refused at parse time**,
+because nothing would read them: `local_addr` (the local application binds the
+claimed public address itself, so this client dials nothing), `nodelay` (same
+reason), the UDP-only keys `udp_workers`, `udp_buffer_size`,
+`udp_idle_timeout`, `udp_send_queue_size` and `udp_forwarder_ipv6`, and
+**encryption**: a transparent service is never encrypted. The visitor's own
+end-to-end protection — TLS, or whatever the protocol brings — is what covers
+the content, and this hop is a plain link by design, so the config is refused
+both when the per-service `transport` table asks for it and when a client-wide
+`[client.transport].type = "noise"` would reach it. The refusal names the key
+to remove.
 
 ### What the operator must prepare
 
