@@ -556,25 +556,22 @@ pub struct IpTraffic;
 
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
 impl IpTraffic {
-    /// Frame one packet and send it with a **single** `write_all` (and so a
-    /// single Noise record). Callers reuse `scratch` across packets to avoid
-    /// per-packet allocations.
-    pub async fn write_frame<T: AsyncWrite + Unpin>(
-        writer: &mut T,
-        scratch: &mut BytesMut,
-        packet: &[u8],
-    ) -> Result<()> {
+    /// Append one packet to a batch as a `[u16 length][packet]` frame.
+    ///
+    /// Synchronous on purpose: a packet is framed where it is read, so a whole
+    /// batch of frames can be handed over and written as one unit. The frame
+    /// itself is unchanged — a batch is several of them in one write, and the
+    /// reader on the far side consumes them one frame at a time.
+    pub fn encode_into(batch: &mut BytesMut, packet: &[u8]) -> Result<()> {
         let len = u16::try_from(packet.len()).with_context(|| {
             format!(
                 "IP packet of {} bytes exceeds the wire format limit",
                 packet.len()
             )
         })?;
-        scratch.clear();
-        scratch.reserve(2 + packet.len());
-        scratch.put_u16(len);
-        scratch.extend_from_slice(packet);
-        writer.write_all(scratch).await?;
+        batch.reserve(2 + packet.len());
+        batch.put_u16(len);
+        batch.extend_from_slice(packet);
         Ok(())
     }
 
@@ -1755,10 +1752,10 @@ mod tests {
         packet.extend_from_slice(b"payload");
 
         let (mut tx, mut rx) = duplex(4096);
-        let mut scratch = BytesMut::new();
-        IpTraffic::write_frame(&mut tx, &mut scratch, &packet)
-            .await
-            .unwrap();
+        // A batch of one here; the writer hands over whole batches.
+        let mut batch = BytesMut::new();
+        IpTraffic::encode_into(&mut batch, &packet).unwrap();
+        tx.write_all(&batch).await.unwrap();
 
         let mut got = BytesMut::new();
         let len = IpTraffic::read(&mut rx, &mut got).await.unwrap();
@@ -1780,14 +1777,16 @@ mod tests {
         let err = IpTraffic::read(&mut rx, &mut scratch).await.unwrap_err();
         assert!(format!("{err:#}").contains("Empty IP frame"));
 
-        // One byte past the wire-format ceiling must be refused at write time,
-        // before anything reaches the channel.
+        // One byte past the wire-format ceiling must be refused while the
+        // batch is built, before anything reaches the channel.
         let oversized = vec![0u8; usize::from(u16::MAX) + 1];
-        let (mut tx, _rx) = duplex(64);
-        let err = IpTraffic::write_frame(&mut tx, &mut scratch, &oversized)
-            .await
-            .unwrap_err();
+        let mut batch = BytesMut::new();
+        let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
         assert!(format!("{err:#}").contains("exceeds the wire format limit"));
+        assert!(
+            batch.is_empty(),
+            "a refused packet must not leave a partial frame in the batch"
+        );
     }
 
     /// A truncated frame (the writer died mid-packet) surfaces as an error, so

@@ -405,6 +405,15 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 自己的流量:这一跳按设计就是明文链路,所以这个模型没有加密键可给;设备名写在
 `[transparent].tun`。
 
+`[transparent.data]` 接受与 `[client.data]` 相同的键——`default_data_addr`、
+`default_mode`、`default_carrier`、`shared_pool`、`idle_timeout`,以及两个按载体的
+`max_tunnels` 上限——但有**一处不同的默认值**:模式默认 `direct`,因为一条认领只有
+一条通道,除非打开 `shared_pool`,多路复用池对它没有任何好处。在同一主机、同一负载下
+实测:`direct` 的线上字节少 6%,每包 CPU 少 33%,每秒往返次数多 65%
+(见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题不属于-soak-模型))。
+若一个客户端要用一个池服务多条认领,就写 `default_mode = "multiplex"` 与
+`shared_pool = true`。
+
 ### 运维方需要准备什么
 
 两端都连接到自己 `tun` 键指定的**已存在**设备;守护进程刻意不创建设备,因为

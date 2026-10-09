@@ -416,12 +416,44 @@ which is more than twice what compressing a 40–52 B header could recover. On
 the bulk arm the ceiling is 3.1 %: the packets are full-sized, so there is
 almost no header share to win.
 
-**Comparability.** One host, no shaping, one connection per arm, measured at
-`9507a7a`; the two arms are comparable with each other and with nothing else —
-in particular not with the soak numbers above, which use another instrument, a
-shaped path and many connections. The instrument is root-only and lives outside
-the check chain (see [checks.md](checks.md)); reproduce it with
-`just l3-accept` and read `bulk.report` / `small.report` in the artifact
+### What the same instrument then changed
+
+The per-packet transport cost the table exposes was attacked directly, and the
+instrument measured each step (two runs per cell, same host, same workloads):
+
+| | bulk: wire per carried packet | small: wire per carried packet | small: round trips/s | small: CPU per carried packet |
+|---|---|---|---|---|
+| one packet per read, per write | 1137 B | 196 B | 2558 | — |
+| **batched** (`[u16 length][packet]` runs in one write) | 990-993 B | 196 B | 2389-2500 | 202-214 µs |
+| batched, **`mode = "direct"`** | 973-977 B | 184 B | 3980-4183 | 130-147 µs |
+
+Three things the table says. **Batching pays where packets queue** — 12 % fewer
+wire bytes on the bulk arm — and does nothing for a strict round trip, because
+there is never a second packet to wait for: a batch is flushed the moment the
+device runs dry, so coalescing costs no latency and buys nothing when there is
+nothing to coalesce. **The multiplexer is per-packet cost**: a claim has exactly
+one channel, so `direct` (the channel *is* the connection) drops the frame
+header and the pool machinery — 6 % of the wire, a third of the CPU and 65 % more
+round trips per second, which is why the L3 model defaults to it
+([configuration.md](configuration.md#transparent-l3-services)). And **CPU is now
+the interesting number**: ~135 µs of daemon time per carried packet is what
+bounds a single claim's small-packet rate, not the wire.
+
+The instrument reports CPU beside the bytes for that reason: a wire figure alone
+cannot say whether the next lever is fewer bytes per packet or more cores on the
+same bytes. What it cannot answer yet is the many-flow case — every arm here is
+one connection, so nothing in this table says whether parallel TUN queues would
+help a busy host, and that needs an arm with concurrent flows before it can be
+claimed either way. The bulk arm's CPU is reported but not quoted: its 65 ms
+window is inside the counter's 10 ms resolution.
+
+**Comparability.** One host, no shaping, one connection per arm, measured
+between `9507a7a` and this revision; the arms are comparable with each other and
+with nothing else — in particular not with the soak numbers above, which use
+another instrument, a shaped path and many connections. The instrument is
+root-only and lives outside the check chain (see [checks.md](checks.md));
+reproduce it with `just l3-accept` (`CLAIM_MODE=multiplex` selects the other
+data-channel mode) and read `bulk.report` / `small.report` in the artifact
 directory.
 
 ## The UDP queue question (not part of the soak model)

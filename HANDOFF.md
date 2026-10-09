@@ -112,7 +112,20 @@ configuration surface is free to change — and this cycle changes it.
 4. ~~**V — the verdict, before any `v0.11` tag.**~~ **Recorded above, and it is
    a no**: nothing was added to the wire, so there is nothing to remove and no
    v6 risk.
-5. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
+5. **Done after M: the L3 data path was optimised where the measurement pointed.**
+   Batching (drain the device, frame each packet where it is read, hand a run of
+   frames over as one write) took 12 % off the bulk arm's wire bytes; the L3
+   model's `[transparent.data].default_mode` is now `direct` (a claim has one
+   channel, so the multiplexer was pure per-packet cost), worth another 6 % of
+   the wire, a third of the CPU per packet and 65 % more small round trips per
+   second. Numbers and method in `docs/benchmarks.md`, "The transparent-L3 wire
+   question". What the same instrument now says is that **CPU, not the wire, is
+   the next lever** (~135 µs of daemon time per carried packet on the small
+   arm), and that it **cannot yet answer the many-flow case**: every arm is one
+   connection, so parallel TUN queues (`IFF_MULTI_QUEUE`, one reader per queue)
+   are a candidate that needs a concurrent-flow arm before it can be claimed
+   either way. That is the next measurement, not the next feature.
+6. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
    worktree build at the `v0.10.0` tag running the same echo backend over the
    same topology, same host, same run) is not in the harness yet. The two arms
    measured above are internal to HEAD and answer the compression question

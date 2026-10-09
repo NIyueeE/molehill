@@ -455,6 +455,17 @@ Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
 is a plain link by design, so the model has no encryption keys to offer, and
 `[transparent].tun` is where a device is named.
 
+`[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
+`default_mode`, `default_carrier`, `shared_pool`, `idle_timeout`, and the two
+per-carrier `max_tunnels` caps — with **one different default**: the mode is
+`direct`, because a claim has exactly one channel and the multiplex pool
+therefore buys it nothing unless `shared_pool` is on. Measured on one host and
+workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
+carried 65 % more round trips per second than `multiplex`
+([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model)).
+A client that serves many claims from one pool writes `default_mode = "multiplex"`
+and `shared_pool = true`.
+
 ### What the operator must prepare
 
 Both ends attach to an **existing** device named by their `tun` key; the daemon
@@ -510,6 +521,10 @@ default_remote_addr = "203.0.113.5:2333"
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 ```
+
+The service on the far side of that claim is the visitor's own traffic: a
+transparent client forwards nothing, so it has no `[transparent.services]` — a
+host that *also* forwards runs a second process with a `[client]` block.
 
 Two services may claim the same address when their ports differ, and a packet
 with no port to route by — ICMP, and the fragments after the first — is

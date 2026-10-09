@@ -25,7 +25,7 @@ use crate::config::parsing::{
     TransportConfig, TransportType, default_tun_name,
 };
 #[cfg(feature = "multiplex")]
-use crate::config::parsing::{ClientDataConfig, DataCarrier, DataMode};
+use crate::config::parsing::{ClientDataConfig, DataCarrier, DataCarrierLimits, DataMode};
 
 /// `[transparent]`: the whole configuration of an L3 client.
 ///
@@ -45,7 +45,7 @@ pub struct TransparentClientConfig {
     pub control: ClientControlConfig,
     #[cfg(feature = "multiplex")]
     #[serde(default)]
-    pub data: ClientDataConfig,
+    pub data: TransparentDataConfig,
     #[serde(default)]
     pub transport: TransparentTransportConfig,
     /// The public addresses this client claims, one per named entry.
@@ -86,6 +86,67 @@ pub struct TransparentClaimConfig {
     /// valid only with `mode = "multiplex"`.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
+}
+
+/// Data-plane knobs for a claim (`[transparent.data]`).
+///
+/// The same keys as `[client.data]`, with one measured difference: the default
+/// mode is **`direct`**, because a claim has exactly one channel and the
+/// multiplex pool therefore buys it nothing unless `shared_pool` is on. The
+/// numbers behind that default are in
+/// [benchmarks.md](../../docs/benchmarks.md), "The transparent-L3 wire
+/// question": on the same host and workload, `direct` moved 6 % fewer wire
+/// bytes, took 33 % less CPU per packet and carried 65 % more round trips per
+/// second.
+#[cfg(feature = "multiplex")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentDataConfig {
+    /// Data-plane endpoint; defaults to the claim's control endpoint. Applies
+    /// to every claim that does not name its own `remote_addr`.
+    pub default_data_addr: Option<String>,
+    /// `direct` (default) or `multiplex`. Multiplex is the choice for a client
+    /// that serves many claims from one tunnel pool (`shared_pool = true`);
+    /// for a single claim the channel would be one stream on a one-tunnel
+    /// pool, which is the multiplexer's framing for nothing.
+    #[serde(default = "default_direct_mode")]
+    pub default_mode: DataMode,
+    /// `tcp` (default) or `kcp`; `kcp` needs `default_mode = "multiplex"`.
+    #[serde(default)]
+    pub default_carrier: DataCarrier,
+    /// Serve every claim of one control session from **one** shared tunnel
+    /// pool per carrier, instead of one pool per claim. Default: `false`.
+    #[serde(default)]
+    pub shared_pool: bool,
+    /// Seconds a tunnel pool with no streams must stay idle before it removes
+    /// one tunnel. Default: 60.
+    pub idle_timeout: Option<u64>,
+    /// `[transparent.data.tcp]`: the TCP carrier's tunnel ceiling.
+    #[serde(default)]
+    pub tcp: DataCarrierLimits,
+    /// `[transparent.data.kcp]`: the KCP carrier's tunnel ceiling.
+    #[serde(default)]
+    pub kcp: DataCarrierLimits,
+}
+
+#[cfg(feature = "multiplex")]
+impl Default for TransparentDataConfig {
+    fn default() -> Self {
+        Self {
+            default_data_addr: None,
+            default_mode: default_direct_mode(),
+            default_carrier: DataCarrier::default(),
+            shared_pool: false,
+            idle_timeout: None,
+            tcp: DataCarrierLimits::default(),
+            kcp: DataCarrierLimits::default(),
+        }
+    }
+}
+
+#[cfg(feature = "multiplex")]
+fn default_direct_mode() -> DataMode {
+    DataMode::Direct
 }
 
 /// How this client reaches its server (`[transparent.transport]`).
@@ -137,7 +198,15 @@ impl TransparentClientConfig {
             default_token: self.default_token.clone(),
             control: self.control.clone(),
             #[cfg(feature = "multiplex")]
-            data: self.data.clone(),
+            data: ClientDataConfig {
+                default_data_addr: self.data.default_data_addr.clone(),
+                default_mode: self.data.default_mode,
+                default_carrier: self.data.default_carrier,
+                shared_pool: self.data.shared_pool,
+                idle_timeout: self.data.idle_timeout,
+                tcp: self.data.tcp.clone(),
+                kcp: self.data.kcp.clone(),
+            },
             services,
             transport: TransportConfig {
                 transport_type: TransportType::Plain,
@@ -267,6 +336,94 @@ local_addr = "127.0.0.1:8080"
         assert!(
             message.contains("unknown field `local_addr`"),
             "a key the model has no home for must be an unknown field, got: {message}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "multiplex"))]
+mod data_tests {
+    #![expect(
+        clippy::unwrap_used,
+        reason = "tests unwrap values they just constructed"
+    )]
+    use crate::config::DataMode;
+    use crate::config::parsing::Config;
+
+    /// A claim has one channel, so the L3 model defaults to `direct`: the
+    /// multiplex pool would be one stream on a one-tunnel pool, and the
+    /// multiplexer's framing on every packet for nothing.
+    #[test]
+    fn a_claim_defaults_to_direct() {
+        let config = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap();
+        let client = config.into_l3_client().unwrap().client.unwrap();
+        assert_eq!(client.data.default_mode, DataMode::Direct);
+        assert!(!client.multiplex_enabled());
+    }
+
+    /// The default is a default, not a lock: a client that serves many claims
+    /// from one pool says so.
+    #[test]
+    fn a_claim_may_ask_for_multiplex() {
+        let config = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data]
+default_mode = "multiplex"
+shared_pool = true
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap();
+        let client = config.into_l3_client().unwrap().client.unwrap();
+        assert_eq!(client.data.default_mode, DataMode::Multiplex);
+        assert!(client.shared_pool());
+    }
+
+    /// The KCP carrier does not multiplex, so asking for it without saying
+    /// `multiplex` is refused with the key to write — the same rule the
+    /// forwarding model has, now reachable through the L3 default.
+    #[test]
+    fn a_kcp_carrier_needs_multiplex_explicitly() {
+        let err = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data]
+default_carrier = "kcp"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[transparent.data].default_carrier")
+                && message.contains("requires `default_mode = \"multiplex\"`"),
+            "the refusal must name the block the reader wrote and the key to add, got: {message}"
         );
     }
 }

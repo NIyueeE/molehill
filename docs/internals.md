@@ -154,6 +154,19 @@ a `Claim` value held for the lifetime of the registration — so a second client
 claiming the same endpoint is rejected with a precise reason instead of silently
 stealing the first one's visitors.
 
+The data path is **one channel per claimed endpoint**, and it moves **batches**,
+not packets: the device is drained until it runs dry, every packet is framed
+where it is read into its endpoint's buffer, and the run of frames is handed
+over and written as one unit. That is the same lever as a WireGuard
+super-packet, one layer up: the far side still reads one frame at a time, while
+the carrier pays one header, one acknowledgement and one syscall per *batch*
+instead of per packet. Because the flush happens the moment the device is
+drained, the first packet of a burst waits for nothing — the batching only
+collects what was already queued. A claim's channels run in `direct` mode by
+default for the same reason: it has exactly one channel, so a multiplexer's
+frame on every packet buys it nothing (see
+[Benchmarks](benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model)).
+
 The data path is **one channel per claimed endpoint**:
 
 - The client opens **one** channel the moment its registration is accepted (a

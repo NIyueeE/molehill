@@ -29,6 +29,12 @@ taken against a number rather than an intuition.
 The denominator is stated with every number: `wire` is the veth's bytes, which
 is the link's real cost and the convention the keep/remove criteria use;
 `carried` is the same packets plus this protocol's own 2-byte length prefix.
+
+The same snapshots carry the two daemons' CPU time, because a wire figure alone
+cannot say whether a path is cheap or merely slow: cost per packet and the
+share of one core it takes are what decide whether the next lever is fewer
+bytes per packet (framing, headers) or more cores on the same bytes
+(queues).
 """
 
 from __future__ import annotations
@@ -41,28 +47,36 @@ from pathlib import Path
 # options is 40 bytes, and a per-flow delta of the changing fields is ~5.
 HEADER_SAVING_BYTES = 35
 
-# /proc/net/dev columns per interface: 8 receive fields, then the transmit
-# ones, so a short line is a malformed one rather than an interface.
-MIN_DEV_COLUMNS = 16
+# A snapshot line's own arity: `iface <ns> <name> <rx B> <rx pkt> <tx B>
+# <tx pkt>` and `cpu <who> <ticks>`. A shorter line is malformed, not an
+# interface or a process.
+IFACE_COLUMNS = 6
+CPU_COLUMNS = 2
 
 
-def parse(path: Path) -> dict[str, dict[str, int]]:
-    """`{interface: {rx_bytes, rx_pkts, tx_bytes, tx_pkts}}` from /proc/net/dev."""
+def parse(path: Path) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+    """The snapshot: per-interface counters, and per-process CPU ticks.
+
+    The harness writes both into one file, in its own two line shapes —
+    `iface <namespace> <name> <rx bytes> <rx pkts> <tx bytes> <tx pkts>` and
+    `cpu <who> <ticks>` — so that a report never has to know how either was
+    read.
+    """
     out: dict[str, dict[str, int]] = {}
+    cpu: dict[str, int] = {}
     for line in path.read_text().splitlines():
-        name, _, rest = line.partition(":")
-        if not rest:
-            continue
+        kind, _, rest = line.partition(" ")
         cols = rest.split()
-        if len(cols) < MIN_DEV_COLUMNS:
-            continue
-        out[name.strip()] = {
-            "rx_bytes": int(cols[0]),
-            "rx_pkts": int(cols[1]),
-            "tx_bytes": int(cols[8]),
-            "tx_pkts": int(cols[9]),
-        }
-    return out
+        if kind == "iface" and len(cols) >= IFACE_COLUMNS:
+            out[cols[1]] = {
+                "rx_bytes": int(cols[2]),
+                "rx_pkts": int(cols[3]),
+                "tx_bytes": int(cols[4]),
+                "tx_pkts": int(cols[5]),
+            }
+        elif kind == "cpu" and len(cols) >= CPU_COLUMNS:
+            cpu[cols[0]] = int(cols[1])
+    return out, cpu
 
 
 def delta(before: dict, after: dict) -> dict[str, int]:
@@ -79,8 +93,13 @@ def main() -> int:
     ap.add_argument("--tunnel", default="v-cli")
     args = ap.parse_args()
 
-    before, after = parse(args.before), parse(args.after)
-    d = {name: delta(before[name], after[name]) for name in before if name in after}
+    iface_before, cpu_before = parse(args.before)
+    iface_after, cpu_after = parse(args.after)
+    d = {
+        name: delta(iface_before[name], iface_after[name])
+        for name in iface_before
+        if name in iface_after
+    }
 
     def mean(counters: dict[str, int], byte_key: str, pkt_key: str) -> float:
         pkts = counters[pkt_key]
@@ -141,6 +160,21 @@ def main() -> int:
         "delta), every packet assumed compressible; first-packet, ICMP and "
         "fragment exemptions would lower it. Diagnostic, not a benchmark."
     )
+
+    # CPU: the daemons' own time, ticks at the kernel's 100 Hz.
+    cpu = {
+        who: (cpu_after.get(who, 0) - cpu_before.get(who, 0)) * 10_000
+        for who in ("client", "server")
+        if who in cpu_after and who in cpu_before
+    }
+    if cpu and carried_pkts:
+        total_us = sum(cpu.values())
+        client_us = cpu.get("client", 0)
+        server_us = cpu.get("server", 0)
+        print(
+            f"  cpu: client {client_us} us + server {server_us} us = "
+            f"{total_us / carried_pkts:.2f} us per carried packet"
+        )
     return 0
 
 

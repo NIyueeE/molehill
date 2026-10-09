@@ -76,6 +76,11 @@ BULK_BYTES=200000
 # recorded with the numbers, because they are what the numbers mean.
 SMALL_REQUESTS=2000
 SMALL_BYTES=64
+# Optional override of the claim's data-channel mode. Empty writes nothing,
+# which is how the run measures the default an operator would get; the axis
+# exists because a claim has exactly one channel, so its mode is a cost
+# decision rather than a topology one.
+CLAIM_MODE="${CLAIM_MODE:-}"
 # Long enough that the socket and conntrack snapshots are taken while the
 # visitor's connection is unmistakably live.
 HOLD_SECONDS=5
@@ -146,8 +151,24 @@ dump_log() {
 dev_snapshot() {
     local out="$1"
     : >"$out"
-    ip netns exec "$NS_CLI" cat /proc/net/dev | grep -E "($TUN_CLI|v-cli):" >>"$out"
-    ip netns exec "$NS_SRV" cat /proc/net/dev | grep -E "($TUN_SRV|v-srv2):" >>"$out"
+    for ns in "$NS_CLI" "$NS_SRV"; do
+        ip netns exec "$ns" cat /proc/net/dev \
+            | awk -v ns="$ns" '/:/ { print "iface " ns " " $1, $2, $3, $10, $11 }' \
+            | sed 's/://' >>"$out"
+    done
+    # CPU the two daemons spend on the arm, in clock ticks (100/s): the
+    # difference between "this path is cheap" and "this path is a core".
+    cpu_ticks "$CLI_PID" client >>"$out"
+    cpu_ticks "$SRV_PID" server >>"$out"
+}
+
+# utime + stime of one process, in ticks. The tokio runtime's threads are all
+# in this process, so one number covers the whole data path.
+cpu_ticks() {
+    local pid="$1" who="$2"
+    if [ -r "/proc/$pid/stat" ]; then
+        awk -v who="$who" '{ print "cpu", who, $14 + $15 }' "/proc/$pid/stat"
+    fi
 }
 
 # One arm's counters, turned into carried packet sizes and the ceiling any
@@ -287,6 +308,10 @@ default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 [transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
+    # The claim's mode is the product's default unless the run names one.
+    if [ -n "$CLAIM_MODE" ]; then
+        printf 'mode = "%s"\n' "$CLAIM_MODE" >>"$LOG/client.toml"
+    fi
 }
 
 # The same server without `[server.transparent]`: the negative half of the

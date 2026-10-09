@@ -22,7 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `protocol = "transparent"` inside a `[client]` service is refused with a
   message naming the entry's new home. The model is a front end, not a second
   engine: it lowers into the same `ClientConfig` the forwarding path runs on, so
-  the client, the data path and the wire are unchanged. The backend therefore sees the visitor's real
+  the client, the data path and the wire are unchanged. The L3 data path moves
+  **batches**: the TUN device is drained and every packet is framed where it is
+  read, so a run of frames leaves as one write — the carrier pays one header and
+  one acknowledgement per batch instead of per packet, and a batch is flushed
+  the moment the device runs dry, so nothing waits for company. Measured on one
+  host and workload, that took 12 % off the wire on a bulk flow, and its
+  `[transparent.data]` defaults to `mode = "direct"` (a claim has exactly one
+  channel) for another 6 % of the wire, a third of the CPU per packet and 65 %
+  more small round trips per second than `multiplex` (docs/benchmarks.md, "The
+  transparent-L3 wire question"). The backend therefore sees the visitor's real
   source address, TCP keeps its end-to-end semantics, and the server holds no
   socket and no per-flow state for the connection. Both ends attach to an
   **existing** TUN device named by `[client.transparent].tun` /

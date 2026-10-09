@@ -769,6 +769,26 @@ impl ClientModel {
             Self::Claiming => "[transparent.control]",
         }
     }
+
+    /// The same, for the data-plane sub-table. Only the multiplex build has
+    /// one to validate, so it is gated with its caller.
+    #[cfg(feature = "multiplex")]
+    const fn data_block(self) -> &'static str {
+        match self {
+            Self::Forwarding => "[client.data]",
+            Self::Claiming => "[transparent.data]",
+        }
+    }
+
+    /// The table one carrier's limits live in, e.g. `[client.data.tcp]`.
+    #[cfg(feature = "multiplex")]
+    fn carrier_block(self, carrier: &str) -> String {
+        let base = match self {
+            Self::Forwarding => "[client.data",
+            Self::Claiming => "[transparent.data",
+        };
+        format!("{base}.{carrier}]")
+    }
 }
 
 /// Keys a release removed, the version that removed each one, and what to
@@ -1025,7 +1045,7 @@ impl Config {
         }
 
         #[cfg(feature = "multiplex")]
-        Config::validate_data_config(client)?;
+        Config::validate_data_config(client, model)?;
 
         // Validate the entries: services in a `[client]` block, claims in a
         // `[transparent]` one. The word follows the model, because that is
@@ -1186,35 +1206,39 @@ impl Config {
         Ok(())
     }
 
-    /// Validate the `[client.data]` knobs.
+    /// Validate the data-plane knobs of whichever block the reader wrote.
     #[cfg(feature = "multiplex")]
-    fn validate_data_config(client: &ClientConfig) -> Result<()> {
+    fn validate_data_config(client: &ClientConfig, model: ClientModel) -> Result<()> {
         use DataCarrier::Kcp;
         use DataMode::Direct;
 
         let data = &client.data;
+        let block = model.data_block();
 
         if data.idle_timeout == Some(0) {
-            bail!("`[client.data].idle_timeout` must be greater than 0");
+            bail!("`{block}.idle_timeout` must be greater than 0");
         }
         // The elastic pool's per-carrier ceiling. `0` would mean "a pool that
         // may never have a tunnel"; the value is validated rather than clamped
         // so a typo is refused with the carrier's name in it.
         for (carrier, limits) in [("tcp", &data.tcp), ("kcp", &data.kcp)] {
             if limits.max_tunnels == Some(0) {
-                bail!("`[client.data.{carrier}].max_tunnels` must be at least 1");
+                bail!(
+                    "`{}.max_tunnels` must be at least 1",
+                    model.carrier_block(carrier)
+                );
             }
         }
         if let Some(addr) = data.default_data_addr.as_deref()
             && addr.rfind(':').is_none()
         {
-            bail!("client.data.default_data_addr is missing the port: {addr}");
+            bail!("{block}.default_data_addr is missing the port: {addr}");
         }
 
         if matches!(data.default_mode, Direct) {
             if matches!(data.default_carrier, Kcp) {
                 bail!(
-                    "`[client.data].default_carrier = \"kcp\"` requires `default_mode = \"multiplex\"`"
+                    "`{block}.default_carrier = \"kcp\"` requires `default_mode = \"multiplex\"`"
                 );
             }
             return Ok(());
@@ -1223,7 +1247,7 @@ impl Config {
         if matches!(data.default_carrier, Kcp) {
             #[cfg(not(feature = "kcp"))]
             bail!(
-                "`[client.data].default_carrier = \"kcp\"` requires a binary built with the `kcp` feature"
+                "`{block}.default_carrier = \"kcp\"` requires a binary built with the `kcp` feature"
             );
         }
 
