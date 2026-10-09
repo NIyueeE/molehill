@@ -30,8 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   host and workload, that took 12 % off the wire on a bulk flow, and its
   `[transparent.data]` defaults to `mode = "direct"` (a claim has exactly one
   channel) for another 6 % of the wire, a third of the CPU per packet and 65 %
-  more small round trips per second than `multiplex` (docs/benchmarks.md, "The
-  transparent-L3 wire question"). The backend therefore sees the visitor's real
+  more small round trips per second than `multiplex`. Both halves of the data
+  path batch, reads as well as writes: one socket read carries a run of frames
+  and the inject loop walks the run, so a burst costs one read and then a run of
+  device writes instead of two awaits per packet (bulk: +27 % throughput, −56 %
+  CPU per packet). Numbers, method and the no-tunnel controls that keep them
+  honest are in docs/benchmarks.md, "The transparent-L3 wire question". The backend therefore sees the visitor's real
   source address, TCP keeps its end-to-end semantics, and the server holds no
   socket and no per-flow state for the connection. Both ends attach to an
   **existing** TUN device named by `[client.transparent].tun` /

@@ -125,6 +125,29 @@ configuration surface is free to change — and this cycle changes it.
    connection, so parallel TUN queues (`IFF_MULTI_QUEUE`, one reader per queue)
    are a candidate that needs a concurrent-flow arm before it can be claimed
    either way. That is the next measurement, not the next feature.
+
+   **Both of those are now answered, and neither is the next thing to build.**
+   The harness gained a multi-flow arm *and a control beside it* (the same flows
+   with the tunnel out of the path): at 16 connections the tunnel carries
+   19 900 round trips/s against the control's 23 750 (84 % of a ceiling that is
+   the probe's own), at 64 connections 27 700 against 30 900 (90 %). So parallel
+   TUN queues have no measured need — the device reader is not what limits a
+   busy host, and a control is what makes that statement checkable instead of
+   plausible. Bulk is the arm where the path *is* the limit (338 Mbit/s against
+   the control's 602), and it moved a long way by batching the read side as well
+   as the write side (+27 % throughput, −56 % CPU per packet).
+
+   What is left is one number, measured and characterized: the **paced single
+   flow**, at ~142 µs of daemon CPU per carried packet, which is the wakeup
+   chain (a read wakeup, a channel hop and a write, per direction, per side).
+   Nothing above moves it — it is the async task-per-hop shape, not a batch
+   that is missing — so the only lever left is a synchronous data path (a
+   blocking thread per direction, WireGuard's queue-thread shape, `nix` for the
+   readiness instead of tokio tasks). It is a rewrite of this path's concurrency
+   model, and the case for it is bounded: a single paced flow already carries
+   4 000 round trips/s, and the workloads L3 exists for sit two orders of
+   magnitude below that per flow; the flows that are busy queue, and queued
+   flows batch. Measure it before building it if it is built at all.
 6. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
    worktree build at the `v0.10.0` tag running the same echo backend over the
    same topology, same host, same run) is not in the harness yet. The two arms

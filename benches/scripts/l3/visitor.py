@@ -11,9 +11,12 @@ sends a deterministic N-byte payload and compares the echoed bytes exactly, so
 a dropped or reordered segment fails the run. `--requests N` runs N strict
 request/response round trips instead, which is the small-packet workload: every
 round trip is its own segment in both directions, so the tunnel carries many
-small packets rather than a few full ones. `--hold S` keeps the connection open
-after the check, so the harness can snapshot live socket and conntrack state. A
-one-line `VISITOR OK` (and exit 0) is the pass signal.
+small packets rather than a few full ones. `--connections N` runs that workload
+on N connections at once, which is the *multi-flow* arm: several flows
+interleaved through one claim, where packets queue and batches can form.
+`--hold S` keeps the connection open after the check, so the harness can
+snapshot live socket and conntrack state. A one-line `VISITOR OK` (and exit 0)
+is the pass signal.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from __future__ import annotations
 import argparse
 import socket
 import sys
+import threading
 import time
 
 PREFIX = b"echo:"
@@ -60,8 +64,67 @@ def round_trips(sock: socket.socket, count: int, size: int) -> bool:
     return True
 
 
+def one_flow(
+    target: tuple, index: int, requests: int, size: int, timeout: float
+) -> str:
+    """One connection's worth of strict round trips; returns "" when it passed."""
+    try:
+        with socket.create_connection(target, timeout=timeout) as sock:
+            banner = recv_exactly(sock, len(PREFIX))
+            if banner != PREFIX:
+                return f"flow {index}: expected {PREFIX!r}, got {banner!r}"
+            if not round_trips(sock, requests, size):
+                return f"flow {index}: round trips did not match"
+    except OSError as exc:
+        return f"flow {index}: {exc}"
+    return ""
+
+
+def many_flows(
+    target: tuple, conns: int, requests: int, size: int, timeout: float
+) -> bool:
+    """`conns` flows at once: what a claim looks like with several visitors.
+
+    Threads, not processes: a socket read releases the GIL, so the flows
+    interleave in the tunnel the way separate visitors would, while the probe
+    itself costs one process.
+    """
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def worker(index: int) -> None:
+        failure = one_flow(target, index, requests, size, timeout)
+        if failure:
+            with lock:
+                failures.append(failure)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(conns)]
+    started = time.perf_counter()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    elapsed = time.perf_counter() - started
+
+    for failure in failures:
+        print(f"CONCURRENT FAIL {failure}", flush=True)
+    print(
+        f"CONCURRENT conns={conns} requests={requests} size={size} "
+        f"ok={conns - len(failures)}/{conns} in {elapsed:.3f}s",
+        flush=True,
+    )
+    return not failures
+
+
 def run(args: argparse.Namespace) -> bool:
     host, port = args.target.rsplit(":", 1)
+    if args.connections:
+        ok = many_flows(
+            (host, int(port)), args.connections, args.requests, args.size, args.timeout
+        )
+        print("VISITOR OK" if ok else "VISITOR FAIL concurrent flows", flush=True)
+        return ok
+
     with socket.create_connection((host, int(port)), timeout=args.timeout) as sock:
         local = sock.getsockname()
         print(f"CONNECTED {local[0]}:{local[1]}", flush=True)
@@ -109,12 +172,14 @@ def main() -> int:
     ap.add_argument("--size", type=int, default=0)
     # --requests N: N strict round trips of --size bytes (default 64).
     ap.add_argument("--requests", type=int, default=0)
+    # --connections N: run that workload on N connections at once (multi-flow).
+    ap.add_argument("--connections", type=int, default=0)
     ap.add_argument("--hold", type=float, default=0.0)
     # The readiness probe retries with a short timeout; the real visitor can
     # afford the default.
     ap.add_argument("--timeout", type=float, default=5.0)
     args = ap.parse_args()
-    if args.requests and not args.size:
+    if (args.requests or args.connections) and not args.size:
         args.size = 64
 
     try:

@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::protocol::IpTraffic;
+use crate::protocol::{IpFrames, IpTraffic};
 use crate::transparent::ip;
 use crate::transparent::tun::Tun;
 use crate::transparent::{Direction, DropReason, Endpoint, EndpointTable, Stats};
@@ -265,7 +265,7 @@ pub async fn forward_transparent<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(conn);
+    let (reader, mut writer) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
     hub.register(endpoint, tx)?;
 
@@ -286,20 +286,23 @@ where
         }
     });
 
-    let mut scratch = BytesMut::new();
+    // The receive half is batched the same way the send half is: one socket
+    // read carries a run of frames, so the inject loop walks a burst of packets
+    // without awaiting between them (and the far side writes them that way).
+    let mut frames = IpFrames::new(reader);
     let result = loop {
-        match IpTraffic::read(&mut reader, &mut scratch).await {
-            Ok(len) => {
+        match frames.next().await {
+            Ok(packet) => {
                 // Defence in depth: a peer must not be able to steer traffic
                 // into a local address this service did not claim. Which end
                 // of the packet names the claim depends on the side: the
                 // client is the destination, the server is the source of the
                 // traffic it hands back.
-                if !claims(&endpoint, &scratch[..len], hub.direction()) {
+                if !claims(&endpoint, packet, hub.direction()) {
                     stats.count_drop(DropReason::Unclaimed);
                     continue;
                 }
-                if let Err(e) = hub.inject(&scratch[..len]).await {
+                if let Err(e) = hub.inject(packet).await {
                     break Err(anyhow::Error::from(e))
                         .with_context(|| format!("Failed to inject a packet for {endpoint}"));
                 }
@@ -381,12 +384,10 @@ mod tests {
         tx.write_all(&batch.frames).await.unwrap();
         drop(tx);
 
-        let mut got = BytesMut::new();
-        let len = IpTraffic::read(&mut rx, &mut got).await.unwrap();
-        assert_eq!(&got[..len], &first[..]);
-        let len = IpTraffic::read(&mut rx, &mut got).await.unwrap();
+        let mut frames = IpFrames::new(&mut rx);
+        assert_eq!(frames.next().await.unwrap(), &first[..]);
         assert_eq!(
-            &got[..len],
+            frames.next().await.unwrap(),
             &second[..],
             "the second frame follows the first"
         );

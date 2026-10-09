@@ -421,23 +421,31 @@ almost no header share to win.
 The per-packet transport cost the table exposes was attacked directly, and the
 instrument measured each step (two runs per cell, same host, same workloads):
 
-| | bulk: wire per carried packet | small: wire per carried packet | small: round trips/s | small: CPU per carried packet |
-|---|---|---|---|---|
-| one packet per read, per write | 1137 B | 196 B | 2558 | — |
-| **batched** (`[u16 length][packet]` runs in one write) | 990-993 B | 196 B | 2389-2500 | 202-214 µs |
-| batched, **`mode = "direct"`** | 973-977 B | 184 B | 3980-4183 | 130-147 µs |
+| | bulk: wire per carried packet | bulk: Mbit/s round trip | bulk: CPU per carried packet | small: wire per carried packet | small: round trips/s | small: CPU per carried packet |
+|---|---|---|---|---|---|---|
+| one packet per read, per write | 1137 B | 266 | 37 µs | 196 B | 2558 | — |
+| **writing** batches (`[u16 length][packet]` runs in one write) | 990-993 B | 267 | 37 µs | 196 B | 2389-2500 | 202-214 µs |
+| + **`mode = "direct"`** (the model's default) | 973-977 B | 267 | 23-69 µs | 184 B | 3980-4183 | 130-147 µs |
+| + **reading** batches too (one socket read, many frames) | 999 B | **338** | **16 µs** | 184 B | 4080 | 142 µs |
 
-Three things the table says. **Batching pays where packets queue** — 12 % fewer
-wire bytes on the bulk arm — and does nothing for a strict round trip, because
-there is never a second packet to wait for: a batch is flushed the moment the
+Four things the table says. **Batching pays where packets queue**, and each half
+of it pays on a different workload: writing batches took 12 % off the bulk arm's
+wire, while reading batches took 27 % onto its throughput and 56 % off its CPU,
+because a burst now costs one socket read and then a run of TUN writes instead
+of two awaits per frame. Neither half does anything for a strict round trip,
+which has no second packet to wait for: a batch is handed over the moment the
 device runs dry, so coalescing costs no latency and buys nothing when there is
 nothing to coalesce. **The multiplexer is per-packet cost**: a claim has exactly
 one channel, so `direct` (the channel *is* the connection) drops the frame
 header and the pool machinery — 6 % of the wire, a third of the CPU and 65 % more
 round trips per second, which is why the L3 model defaults to it
-([configuration.md](configuration.md#transparent-l3-services)). And **CPU is now
-the interesting number**: ~135 µs of daemon time per carried packet is what
-bounds a single claim's small-packet rate, not the wire.
+([configuration.md](configuration.md#transparent-l3-services)). **Concurrency
+batches by itself**: at 16 flows the same code path moves 146 B per carried
+packet and 68 µs of CPU per packet with no change at all, because packets queue
+on their own. And **what is left is the paced single flow**: ~142 µs of daemon
+time per carried packet, which is the wakeup chain around each packet (a read
+wakeup, a channel hop and a write, per direction) — the one number here that a
+different design, rather than a batching change, would move.
 
 The instrument reports CPU beside the bytes for that reason: a wire figure alone
 cannot say whether the next lever is fewer bytes per packet or more cores on the
@@ -448,8 +456,17 @@ is the wakeup chain around it — ~37 µs when a batch amortises the chain over
 eleven packets, ~125 µs when a paced round trip pays it alone. What it cannot answer yet is the many-flow case — every arm here is
 one connection, so nothing in this table says whether parallel TUN queues would
 help a busy host, and that needs an arm with concurrent flows before it can be
-claimed either way. The bulk arm's CPU is reported but not quoted: its 65 ms
-window is inside the counter's 10 ms resolution.
+claimed either way — and it can now, because the harness has an arm for it with
+a **control** beside it: the same flows with the tunnel out of the path, straight
+at the service. At 16 connections the tunnel carries 19 900 round trips per
+second against the control's 23 750 (84 % of a ceiling that is the probe's own,
+not the path's); at 64 connections, 27 700 against 30 900 (90 %). The bulk arm
+has the same control: 338 Mbit/s through the tunnel against 602 Mbit/s straight
+at the service, so bulk is where the path, not the probe, is the limit. That is
+what a control is for — without it, "the rate stopped growing" would have read
+as a tunnel limit when it was python's. The bulk arm's CPU is quoted from the
+2 MB run for the same reason its throughput is: the counters' 100 Hz resolution
+does not resolve a 65 ms window.
 
 **Comparability.** One host, no shaping, one connection per arm, measured
 between `9507a7a` and this revision; the arms are comparable with each other and

@@ -14,10 +14,11 @@
 #   2. the service sees the VISITOR's real address (transparency);
 #   3. the server namespace holds NO connection state for the visitor's flow;
 #   4. the client namespace owns the accepted connection;
-#   5. 200 KB round-trips byte-exactly (no PMTU black hole), and so do 2000
+#   5. the bulk arm round-trips byte-exactly (no PMTU black hole), and so do 2000
 #      small request/response round trips;
-#   6. the run reports what each arm costs on the wire and what share of it a
-#      header compressor could reach (benches/scripts/l3/wire_report.py);
+#   6. 16 concurrent flows stay byte-exact too, and the run reports what each
+#      arm costs on the wire, on the CPU and what share of it a header
+#      compressor could reach (benches/scripts/l3/wire_report.py);
 #   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
 #      deleted for that run, so the order is proven rather than asserted).
@@ -83,6 +84,12 @@ SMALL_BYTES="${SMALL_BYTES:-64}"
 # exists because a claim has exactly one channel, so its mode is a cost
 # decision rather than a topology one.
 CLAIM_MODE="${CLAIM_MODE:-}"
+# The multi-flow arm: N connections at once, each doing its own strict round
+# trips. This is where packets queue, so it is the arm that says what several
+# visitors through one claim cost (and the only one a queue-per-CPU change
+# could ever show up in).
+CONCURRENT_CONNS="${CONCURRENT_CONNS:-16}"
+CONCURRENT_REQUESTS="${CONCURRENT_REQUESTS:-200}"
 # Long enough that the socket and conntrack snapshots are taken while the
 # visitor's connection is unmistakably live.
 HOLD_SECONDS=5
@@ -505,6 +512,69 @@ wire_report "small ${SMALL_REQUESTS}x${SMALL_BYTES}B" "$LOG/small.before" "$LOG/
     "$LOG/small.report"
 
 echo
+echo "================= MANY FLOWS ================="
+# The same round trips on $CONCURRENT_CONNS connections at once. Unlike the arm
+# above, packets queue here, so this is where batching pays and where a limit
+# that is per-core (one reader, one channel task per direction) shows up as a
+# rate that does not grow with the flow count.
+dev_snapshot "$LOG/many.before"
+MANY_START=$(date +%s.%N)
+MANY_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-many.log" 2>&1 || MANY_RC=$?
+MANY_END=$(date +%s.%N)
+dev_snapshot "$LOG/many.after"
+cat "$LOG/visitor-many.log"
+awk -v s="$MANY_START" -v e="$MANY_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips of %d B in %.3fs, %.0f round trips/s aggregate \
+(diagnostic, not a benchmark)\n", c, n, b, d, c * n / d
+}'
+wire_report "many ${CONCURRENT_CONNS}x${CONCURRENT_REQUESTS}x${SMALL_BYTES}B" \
+    "$LOG/many.before" "$LOG/many.after" "$LOG/many.report"
+
+echo
+echo "================= CONTROL: STRAIGHT AT THE SERVICE ================="
+# The same flows with the tunnel out of the path: the visitor runs inside the
+# client namespace, where the service is simply a local listener. Without this
+# control a slow probe and a slow tunnel are indistinguishable from the arm
+# above (the soak model's rule, and the reason its UDP probe ends with a
+# straight-at-the-sink step). It measures the probe and the echo service, not
+# molehill.
+CONTROL_RC=0
+CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-control.log" 2>&1 || CONTROL_RC=$?
+CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-control.log"
+awk -v s="$CONTROL_START" -v e="$CONTROL_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips straight at the service: %.0f round trips/s aggregate \
+(control, no tunnel, diagnostic)\n", c, n, c * n / d
+}'
+
+echo
+echo "--- control: the same $((${BULK_BYTES} / 1000)) KB straight at the service ---"
+BULK_CONTROL_RC=0
+BULK_CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --size "$BULK_BYTES" >"$LOG/visitor-bulk-control.log" 2>&1 || BULK_CONTROL_RC=$?
+BULK_CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-bulk-control.log"
+awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%.2f Mbit/s round-trip straight at the service (control, no tunnel, diagnostic)\n",
+        2 * n * 8 / d / 1e6
+}'
+
+echo
 echo "================= NEGATIVE: NO SERVER SWITCH ================="
 # The switch is the *server's*: a server whose config has no
 # `[server.transparent]` must refuse a transparent registration by policy, and
@@ -584,15 +654,27 @@ else
 fi
 
 if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
-    pass "200 KB round-trip (no MTU black hole)"
+    pass "$((BULK_BYTES / 1000)) KB round-trip (no MTU black hole)"
 else
-    fail "200 KB round-trip (no MTU black hole)"
+    fail "$((BULK_BYTES / 1000)) KB round-trip (no MTU black hole)"
 fi
 
 if [ "$SMALL_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-small.log"; then
     pass "$SMALL_REQUESTS small round trips stay byte-exact"
 else
     fail "$SMALL_REQUESTS small round trips stay byte-exact (exit $SMALL_RC)"
+fi
+
+if [ "$CONTROL_RC" -ne 0 ] || [ "$BULK_CONTROL_RC" -ne 0 ]; then
+    fail "a control arm passed no tunnel and still failed (exit $CONTROL_RC/$BULK_CONTROL_RC)"
+else
+    pass "control arms: the same workloads straight at the service, no tunnel"
+fi
+
+if [ "$MANY_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-many.log"; then
+    pass "$CONCURRENT_CONNS concurrent flows stay byte-exact"
+else
+    fail "$CONCURRENT_CONNS concurrent flows stay byte-exact (exit $MANY_RC)"
 fi
 
 if grep -qF "does not serve transparent (L3) services" "$LOG/no-l3-server.log"; then
