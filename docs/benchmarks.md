@@ -441,7 +441,11 @@ bounds a single claim's small-packet rate, not the wire.
 
 The instrument reports CPU beside the bytes for that reason: a wire figure alone
 cannot say whether the next lever is fewer bytes per packet or more cores on the
-same bytes. What it cannot answer yet is the many-flow case — every arm here is
+same bytes. It is what says the cost is **per packet and not per byte**: the
+paced arm at 64 B costs 125 µs of daemon time per carried packet and the same arm
+at 1000 B costs 137 µs, so 8.6× the bytes is 10 % more CPU. What a packet costs
+is the wakeup chain around it — ~37 µs when a batch amortises the chain over
+eleven packets, ~125 µs when a paced round trip pays it alone. What it cannot answer yet is the many-flow case — every arm here is
 one connection, so nothing in this table says whether parallel TUN queues would
 help a busy host, and that needs an arm with concurrent flows before it can be
 claimed either way. The bulk arm's CPU is reported but not quoted: its 65 ms
@@ -452,9 +456,13 @@ between `9507a7a` and this revision; the arms are comparable with each other and
 with nothing else — in particular not with the soak numbers above, which use
 another instrument, a shaped path and many connections. The instrument is
 root-only and lives outside the check chain (see [checks.md](checks.md));
-reproduce it with `just l3-accept` (`CLAIM_MODE=multiplex` selects the other
-data-channel mode) and read `bulk.report` / `small.report` in the artifact
-directory.
+reproduce it with `just l3-accept` and read `bulk.report` / `small.report` in
+the artifact directory. Its instrument parameters are environment overrides,
+because they change what the numbers mean: `BULK_BYTES` (200 000 by default;
+raise it past a second of traffic when the CPU counters' 100 Hz resolution
+matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), and `CLAIM_MODE`
+(unset, which measures the product's own default; `multiplex` selects the other
+data-channel mode).
 
 ## The UDP queue question (not part of the soak model)
 

@@ -71,11 +71,13 @@ TUN_SRV=l3srv0
 TUN_CLI=l3cli0
 ROUTE_TABLE=100
 TUN_MTU=1400
-BULK_BYTES=200000
+# The bulk arm's size. Long enough to resolve the CPU counters (100 Hz) when a
+# run needs that: BULK_BYTES=2000000.
+BULK_BYTES="${BULK_BYTES:-200000}"
 # The small-packet arm's instrument: strict round trips of this size. Both are
 # recorded with the numbers, because they are what the numbers mean.
-SMALL_REQUESTS=2000
-SMALL_BYTES=64
+SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
+SMALL_BYTES="${SMALL_BYTES:-64}"
 # Optional override of the claim's data-channel mode. Empty writes nothing,
 # which is how the run measures the default an operator would get; the axis
 # exists because a claim has exactly one channel, so its mode is a cost
