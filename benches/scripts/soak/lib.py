@@ -853,27 +853,60 @@ def iperf_active_seconds(doc: dict, secs: int) -> float:
     return acc if acc > 0 else float(secs)
 
 
+@dataclass(frozen=True)
+class IperfDial:
+    """Where an iperf3 client dials, and how it gets there.
+
+    The host-loopback model dials `127.0.0.1:<port>` from this process, which is
+    what passing a plain port to `iperf_result` still means. An arm that does
+    not run on host loopback — the L3 comparison, whose visitor dials a
+    tool-exposed address from inside a network namespace — needs a target other
+    than the loopback and an `ip netns exec <ns>` prefix. Carrying both in one
+    value keeps the parsing (the `-O` warm-up, the measured-window convention,
+    the degenerate-sender fallback) shared: an out-of-model arm is summarised by
+    the same code the gate's numbers come from, not by a second implementation
+    that can drift from it.
+    """
+
+    port: int
+    host: str = "127.0.0.1"
+    argv_prefix: tuple = ()
+    #: Seconds iperf3 omits from its accounting (`-O`): the Soak model's
+    #: convention on a shaped path whose slow start is seconds long. Left at 2
+    #: by the L3 comparison as well, which does *not* take its byte ratios from
+    #: this run's payload counters — around the `-O` boundary iperf3's interval
+    #: list can lose a whole measured interval, so those ratios come from
+    #: interface counters instead (see `benches/scripts/l3/compare.py`).
+    omit: int = 2
+
+
 def iperf_result(
-    port: int, streams: int, secs: int, timeout: float, artifact: Path | None
+    target: int | IperfDial,
+    streams: int,
+    secs: int,
+    timeout: float,
+    artifact: Path | None,
 ) -> dict:
     """One `-P streams` iperf3 client run through the tunnel; never raises.
 
-    A raw artifact directory is captured on EVERY outcome (requested and
-    actual timeout, exit status, stdout, stderr) so a later null in the
-    results file can be re-diagnosed instead of guessed at."""
+    `target` is the port to dial (host loopback) or an [`IperfDial`] for every
+    other case. A raw artifact directory is captured on EVERY outcome
+    (requested and actual timeout, exit status, stdout, stderr) so a later null
+    in the results file can be re-diagnosed instead of guessed at."""
+    dial = target if isinstance(target, IperfDial) else IperfDial(target)
     if artifact is not None:
         artifact.mkdir(parents=True, exist_ok=True)
     cmd = [
+        *dial.argv_prefix,
         "iperf3",
         "-J",
         "-c",
-        "127.0.0.1",
+        dial.host,
         "-p",
-        str(port),
+        str(dial.port),
         "-t",
         str(secs),
-        "-O",
-        "2",
+        *(["-O", str(dial.omit)] if dial.omit else []),
         "-P",
         str(streams),
     ]
@@ -942,6 +975,16 @@ def iperf_result(
     end = doc["end"]
     sent = end.get("sum_sent") or {}
     recv = end.get("sum_received") or {}
+    # The whole test's bytes, warm-up included (the omitted intervals carry
+    # their own byte counts). Recorded for provenance: around the `-O` boundary
+    # iperf3 can also mangle the list itself — a measured 1 ms interval carrying
+    # hundreds of MB, and sometimes a whole measured interval missing — which
+    # under-reported one run's total by 12 %, so this is not a safe denominator
+    # for a byte ratio. `sum_sent`/`sum_received` cover only the post-omit
+    # window, which is the right numerator for the rate.
+    total_b = sum(
+        (iv.get("sum") or {}).get("bytes", 0) for iv in doc.get("intervals") or []
+    )
     active_s = iperf_active_seconds(doc, secs)
     sent_b = sent.get("bytes", 0)
     recv_b = recv.get("bytes", 0)
@@ -975,6 +1018,11 @@ def iperf_result(
         "ok": True,
         "bytes_sent": sent_b,
         "bytes_received": recv_b,
+        "bytes_interval_total": total_b,
+        # What the probe itself cost on both ends, as iperf3 measured it: the
+        # tool's CPU is sampled from /proc, and a path cannot be called cheap
+        # when the instrument is the busy side.
+        "cpu_utilization_percent": end.get("cpu_utilization_percent"),
         "active_s": round(active_s, 3),
         "gbps_sent_only": round(sent_gbps, 4),
         "gbps_received_window": round(recv_gbps, 4),
