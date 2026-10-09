@@ -137,17 +137,29 @@ configuration surface is free to change — and this cycle changes it.
    the control's 602), and it moved a long way by batching the read side as well
    as the write side (+27 % throughput, −56 % CPU per packet).
 
-   What is left is one number, measured and characterized: the **paced single
-   flow**, at ~142 µs of daemon CPU per carried packet, which is the wakeup
-   chain (a read wakeup, a channel hop and a write, per direction, per side).
-   Nothing above moves it — it is the async task-per-hop shape, not a batch
-   that is missing — so the only lever left is a synchronous data path (a
-   blocking thread per direction, WireGuard's queue-thread shape, `nix` for the
-   readiness instead of tokio tasks). It is a rewrite of this path's concurrency
-   model, and the case for it is bounded: a single paced flow already carries
-   4 000 round trips/s, and the workloads L3 exists for sit two orders of
-   magnitude below that per flow; the flows that are busy queue, and queued
-   flows batch. Measure it before building it if it is built at all.
+   **The remaining levers were then attributed, and none of them is a code
+   change.** Two instrument errors had to be fixed first, and both are worth
+   remembering: the bulk arm sent one blob and read afterwards, so any run past
+   the buffers measured a *deadlock* (two runs of 20 MB and 100 MB were reported
+   as throughput when they were five-second stalls), and the harness built
+   **debug** while the product ships release — the same arm measures 783 Mbit/s
+   in debug and 1986 Mbit/s in release. Both are fixed (`BULK_CHUNK`,
+   `PROFILE_BUILD=release`), and the numbers below are release.
+
+   Release, one host, with the no-tunnel control beside each arm: bulk 200 MB in
+   65 KB chunks **1986 Mbit/s** against the control's 12 024; a paced single flow
+   **10 362 round trips/s**; 16 flows **22 543** against the control's 23 388 —
+   **96 % of a ceiling that is python's, not the path's**.
+
+   A `perf` profile of the release build during the bulk arm puts **84 % of the
+   CPU in the kernel**, 10 % in molehill, 5 % in libc, with no symbol above 11 %:
+   the cost is four syscalls per packet (TUN read, socket write, socket read, TUN
+   write), spread thin. That retires the synchronous data path as a plan — it
+   would chase the userspace tenth, not the kernel's five sixths — and it names
+   the lever that does work: **packet size**. The same bulk bytes in 8000-byte
+   packets instead of 1400 measured **3579 Mbit/s** at half the CPU per byte, so
+   the TUN MTU (an operator setting, with a link MTU to match) is worth more than
+   any remaining code change, and the deployment recipes now say so.
 6. **Open: the v0.10.0 architecture comparison.** The L4 baseline arm (a
    worktree build at the `v0.10.0` tag running the same echo backend over the
    same topology, same host, same run) is not in the harness yet. The two arms

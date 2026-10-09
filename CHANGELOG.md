@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path batch, reads as well as writes: one socket read carries a run of frames
   and the inject loop walks the run, so a burst costs one read and then a run of
   device writes instead of two awaits per packet (bulk: +27 % throughput, −56 %
-  CPU per packet). Numbers, method and the no-tunnel controls that keep them
-  honest are in docs/benchmarks.md, "The transparent-L3 wire question". The backend therefore sees the visitor's real
+  CPU per packet on the arm those were measured on). Numbers, the build they
+  came from, and the no-tunnel controls that keep them honest are in
+  docs/benchmarks.md, "The transparent-L3 wire question". The backend therefore sees the visitor's real
   source address, TCP keeps its end-to-end semantics, and the server holds no
   socket and no per-flow state for the connection. Both ends attach to an
   **existing** TUN device named by `[client.transparent].tun` /

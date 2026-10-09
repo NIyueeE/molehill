@@ -27,7 +27,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 LOG="${LOG:-/tmp/l3-accept}"
-BIN="$ROOT/target/debug/molehill"
+# Which build the run measures. `debug` is the default because it builds
+# fastest; `release` is what an operator runs, and the two do not cost the same
+# per packet, so a run that is quoted as the path's cost should say which one it
+# measured (`PROFILE_BUILD=release`).
+PROFILE_BUILD="${PROFILE_BUILD:-debug}"
+if [ "$PROFILE_BUILD" = "release" ]; then
+    BUILD_ARGS="--release"
+    BIN="$ROOT/target/release/molehill"
+else
+    BUILD_ARGS=""
+    BIN="$ROOT/target/debug/molehill"
+fi
 
 # A silent pass without root would be worse than a failure: exit 77 is the
 # "skipped" status, and the exact command to run is part of the message.
@@ -71,10 +82,21 @@ CONTROL_PORT=2333
 TUN_SRV=l3srv0
 TUN_CLI=l3cli0
 ROUTE_TABLE=100
-TUN_MTU=1400
+TUN_MTU="${TUN_MTU:-1400}"
+# The veth MTU, i.e. how large a segment the tunnel's own TCP may carry. Raising
+# it (with TUN_MTU) is the experiment that separates per-packet cost from
+# per-byte cost: the same bytes in a quarter of the packets.
+LINK_MTU="${LINK_MTU:-1500}"
 # The bulk arm's size. Long enough to resolve the CPU counters (100 Hz) when a
 # run needs that: BULK_BYTES=2000000.
 BULK_BYTES="${BULK_BYTES:-200000}"
+# The bulk arm streams in chunks of this size rather than sending one blob and
+# reading afterwards: a send-then-read workload whose size exceeds the buffers
+# deadlocks against an echo that must read to reply (the visitor waits for the
+# echo, the echo waits for the visitor to read), which is a property of that
+# workload and not of the tunnel. Chunked round trips exercise the same
+# full-size packets without it.
+BULK_CHUNK="${BULK_CHUNK:-65536}"
 # The small-packet arm's instrument: strict round trips of this size. Both are
 # recorded with the numbers, because they are what the numbers mean.
 SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
@@ -90,6 +112,11 @@ CLAIM_MODE="${CLAIM_MODE:-}"
 # could ever show up in).
 CONCURRENT_CONNS="${CONCURRENT_CONNS:-16}"
 CONCURRENT_REQUESTS="${CONCURRENT_REQUESTS:-200}"
+# Optional attribution: sample both daemons for this many seconds, starting with
+# the measurement section, and print the self-time report. The counters say what
+# an arm costs; this says where it went. Tune the arm sizes so one arm dominates
+# the window (see docs/benchmarks.md).
+PROFILE="${PROFILE:-}"
 # Long enough that the socket and conntrack snapshots are taken while the
 # visitor's connection is unmistakably live.
 HOLD_SECONDS=5
@@ -256,10 +283,10 @@ topology_up() {
     for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
         ip -n "$ns" link set lo up
     done
-    ip -n "$NS_VIS" link set v-vis up
-    ip -n "$NS_SRV" link set v-srv up
-    ip -n "$NS_SRV" link set v-srv2 up
-    ip -n "$NS_CLI" link set v-cli up
+    ip -n "$NS_VIS" link set v-vis up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv2 up mtu "$LINK_MTU"
+    ip -n "$NS_CLI" link set v-cli up mtu "$LINK_MTU"
 
     ip -n "$NS_VIS" route add default via "$SRV_VIS_IP"
 
@@ -339,7 +366,7 @@ TOML
 
 echo "================= BUILD ================="
 mkdir -p "$LOG"
-if ! (cd "$ROOT" && cargo build) >"$LOG/cargo-build.log" 2>&1; then
+if ! (cd "$ROOT" && cargo build $BUILD_ARGS) >"$LOG/cargo-build.log" 2>&1; then
     echo "cargo build failed; refusing to run against a stale or missing binary:" >&2
     tail -n 30 "$LOG/cargo-build.log" >&2
     exit 1
@@ -348,7 +375,7 @@ if [ ! -x "$BIN" ]; then
     echo "no executable at $BIN after the build" >&2
     exit 1
 fi
-echo "binary: $BIN"
+echo "binary: $BIN ($PROFILE_BUILD)"
 sha256sum "$BIN" | tee "$LOG/binary.sha256"
 "$BIN" --version 2>&1 | tee "$LOG/binary.version" || true
 
@@ -466,6 +493,23 @@ VISITOR_RC=0
 wait "$VISITOR_PID" || VISITOR_RC=$?
 
 echo
+
+# Attribution, when asked for: `perf record` follows both daemons for $PROFILE
+# seconds while the arms below run.
+PERF_PID=""
+if [ -n "$PROFILE" ]; then
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "PROFILE=$PROFILE was asked for, but perf is not installed" >&2
+        exit 1
+    fi
+    perf record -o "$LOG/perf.data" -F 999 -p "$SRV_PID" -p "$CLI_PID" -- sleep "$PROFILE" \
+        >"$LOG/perf-record.log" 2>&1 &
+    PERF_PID=$!
+    PIDS+=("$PERF_PID")
+    sleep 0.3
+    echo "profiling $SRV_PID and $CLI_PID for ${PROFILE}s"
+fi
+
 echo "================= BULK / MTU ================="
 # 200 KB through the tunnel: many segments. The client's TUN MTU (1400) is the
 # smallest on the path, so the MSS it advertises keeps every segment inside
@@ -473,8 +517,10 @@ echo "================= BULK / MTU ================="
 dev_snapshot "$LOG/bulk.before"
 BULK_START=$(date +%s.%N)
 BULK_RC=0
+BULK_ROUNDS=$((BULK_BYTES / BULK_CHUNK))
+[ "$BULK_ROUNDS" -ge 1 ] || BULK_ROUNDS=1
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
-    --size "$BULK_BYTES" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
 BULK_END=$(date +%s.%N)
 dev_snapshot "$LOG/bulk.after"
 cat "$LOG/visitor-bulk.log"
@@ -560,11 +606,19 @@ awk -v s="$CONTROL_START" -v e="$CONTROL_END" -v c="$CONCURRENT_CONNS" -v n="$CO
 }'
 
 echo
+if [ -n "$PERF_PID" ]; then
+    wait "$PERF_PID" || true
+    perf report --stdio -i "$LOG/perf.data" --percent-limit 1 >"$LOG/perf.report" 2>&1 || true
+    echo "--- perf report (self time, by symbol) ---"
+    sed -n '/^# Overhead/,$p' "$LOG/perf.report" | head -30
+fi
+
 echo "--- control: the same $((${BULK_BYTES} / 1000)) KB straight at the service ---"
 BULK_CONTROL_RC=0
 BULK_CONTROL_START=$(date +%s.%N)
 ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
-    --size "$BULK_BYTES" >"$LOG/visitor-bulk-control.log" 2>&1 || BULK_CONTROL_RC=$?
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk-control.log" 2>&1 \
+    || BULK_CONTROL_RC=$?
 BULK_CONTROL_END=$(date +%s.%N)
 cat "$LOG/visitor-bulk-control.log"
 awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGIN {
@@ -654,9 +708,9 @@ else
 fi
 
 if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
-    pass "$((BULK_BYTES / 1000)) KB round-trip (no MTU black hole)"
+    pass "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
 else
-    fail "$((BULK_BYTES / 1000)) KB round-trip (no MTU black hole)"
+    fail "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
 fi
 
 if [ "$SMALL_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-small.log"; then
