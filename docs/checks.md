@@ -177,6 +177,13 @@ the **client** namespace — the server routes the packets into its TUN while
 holding no socket and no conntrack entry for the flow, and the backend sees the
 visitor's real address.
 
+The same run also covers the server's own switch, negatively: it restarts the
+server without `[server.transparent]` **after deleting that namespace's TUN
+device**, so the refusal it asserts on must be the policy one — a server that
+checked the interface first would answer with the missing-device recipe
+instead. That ordering is the point: a client's registration must never be what
+makes a server reach for `/dev/net/tun`.
+
 It is Linux-only (a TUN device) and root-only (`CAP_NET_ADMIN`) for its veth
 pairs, TUN devices, routes and `ip rule`, so it is **not** part of `just check`
 or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`

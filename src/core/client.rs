@@ -2597,9 +2597,14 @@ impl ClientSession {
             Ack::RegisterRejected(reason) => {
                 // Per-service and terminal: the session and the siblings are
                 // untouched, and a retry would only spam the server.
+                // The reason is the server's own sentence and names what it
+                // refused for (`allow_ports`, the missing `[server.transparent]`
+                // switch, a claimed address, ...), so the advice stays generic:
+                // this end cannot know which policy answered.
                 error!(
                     "Server rejected service {name}: {reason}. Giving up on that service; fix \
-                     the client config or the server's `allow_ports`, then reload."
+                     what the reason names — in the client config or in the server's policy — \
+                     then reload."
                 );
                 if let Some(entry) = self.services.get_mut(&id) {
                     entry.state = ServiceState::Rejected;

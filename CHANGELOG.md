@@ -23,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the exact command to run instead of silent packet loss. Linux only, with
   `CAP_NET_ADMIN` on both ends; the `transparent` feature is in the default
   set, and a config that asks for the type on another platform, or in a build
-  without the feature, is refused with a precise reason. `local_addr` and
+  without the feature, is refused with a precise reason. Serving L3 is the
+  **server operator's** decision: the `[server.transparent]` table is that
+  switch, and without it a registration is refused by policy before any device
+  is looked at — so a client can never be what makes the server reach for
+  `/dev/net/tun` or ask for `CAP_NET_ADMIN`, and a server that only forwards
+  `tcp`/`udp` needs no capability for this feature at all. `local_addr` and
   `nodelay` are refused for the type — the local application binds the claimed
   address itself, so nothing is dialed — as are the UDP-only keys. The wire
   moves to **protocol v5** (one service type and one data-channel command,
@@ -33,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   service is **never encrypted**: the visitor's own end-to-end protection is
   the content's and this hop is a plain link by design, so both a per-service
   `transport` and a client-wide `[client.transport].type = "noise"` are refused
-  for it. Not in this
+  for it. Enabling the server switch therefore means that server accepts
+  plaintext connections from such a client, whatever its `[server.transport]`
+  says; the Noise keys keep applying to the clients that do negotiate them. Not
+  in this
   version: IPv6 (dropped and counted), per-flow channels (every flow of one
   claimed endpoint shares the service's single channel), and any automatic
   network configuration. Keys and the two operator recipes are in

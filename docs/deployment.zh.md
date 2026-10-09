@@ -200,6 +200,11 @@ bind_addr = "0.0.0.0:2333"
 网络。它仅支持 Linux,两端都需要 `CAP_NET_ADMIN`(各自要打开 TUN 设备),而且
 自己不配置任何网络。
 
+服务端只有在**它自己的**配置要求时才提供 L3:下面 `server.toml` 里的
+`[server.transparent]` 就是那个开关,没有它,注册会在碰到任何设备之前被拒绝。
+把提供 L3 的服务端放在带该能力的 unit 下,只做 L4 的服务端放在不带该能力的
+unit 下(见 [systemd](#systemd))。
+
 两套配方都基于同样两个事实:
 
 - **所声明的地址不是监听器。** 服务端上没有任何东西可以绑定它;服务端需要一条
@@ -210,7 +215,8 @@ bind_addr = "0.0.0.0:2333"
 两套配方最终用同一份配置:
 
 ```toml
-# server.toml
+# server.toml - 最后一张表就是开关:没有它,本服务端会按策略拒绝透明注册,
+# 也完全不会打开 TUN 设备。
 [server]
 default_token = "change-me"
 allow_ports = ["8443"]
@@ -322,8 +328,10 @@ sudo ip route add default dev molehill0 table 100
 把 molehill 作为 systemd 服务运行,支持 root 与 rootless,以及多实例。
 单元名中 `molehills` 代表 `molehill --server`,`molehillc` 代表
 `molehill --client`,`molehill` 是自动判断模式。单元名里的 `@` 表示按
-配置文件实例化。配置文件建议权限 `600`(内含共享 token)。透明服务需要
-`CAP_NET_ADMIN` 才能打开自己的 TUN 设备——root 隐含具备;以其他用户运行的
+配置文件实例化。配置文件建议权限 `600`(内含共享 token)。提供透明服务的服务端
+需要 `CAP_NET_ADMIN` 才能打开自己的 TUN 设备——也只有这种服务端需要:这项能力是
+由 `[server.transparent]` 这张表索取的,所以配置里没有它的 `molehill --server`
+不需要该能力运行,并按策略拒绝 L3 注册。root 隐含具备;以其他用户运行的
 单元请使用下面单元里那行(默认注释掉的)`AmbientCapabilities=`。
 
 ```ini

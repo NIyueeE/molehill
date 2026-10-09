@@ -242,8 +242,8 @@ psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须�
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
-[server.transparent] # 可选。仅透明(L3)服务:服务端连接的 TUN 设备
-tun = "molehill0" # 可选。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
+[server.transparent] # 可选,而这张表本身就是开关:它存在,服务端才会提供透明(L3)服务。没有它,客户端发来的 `protocol = "transparent"` 注册会在看任何设备之前被策略拒绝——提供 L3 意味着向本进程索要 CAP_NET_ADMIN 与 TUN 设备,所以这是运维方的决定,永远不是远端客户端的
+tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
 ```
 
 ## 动态服务注册
@@ -363,6 +363,13 @@ TCP 保持端到端语义,服务端也不为该连接持有任何 socket 或按�
 device, and this platform is not Linux`,或指明缺少 `transparent` 特性。目前只
 承载 IPv4——非 IPv4 的包会被丢弃并计数。
 
+**服务不服务 L3,由服务端运维决定。** 在服务端,`[server.transparent]` 这张表
+就是开关:没有它,transparent 注册会在看任何设备之前被策略拒绝,所以客户端永远
+不可能成为"让服务端去碰 `/dev/net/tun`、向内核索要 `CAP_NET_ADMIN`"的原因。只转发
+`tcp`/`udp` 的服务端因此完全不需要这项能力。启用 L3 有一个后果要直说:这类服务
+永不加密,所以提供它的服务端会接受来自该客户端的明文连接,无论
+`[server.transport.noise]` 写了什么——Noise 键仍然作用于真正协商了它的客户端。
+
 **守护进程从不配置网络。** 它没有 netlink 代码,也从不调用 `ip`:TUN 设备与
 地址、路由都由运维方创建和安装,守护进程只校验自己依赖的东西,缺什么就用要执行
 的确切命令拒绝。两套配方——地址被路由到服务端,以及单 IP 服务端——见
@@ -373,6 +380,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[client.services.<name>].protocol` | `"transparent"`——该服务拥有一个公网 `ip:port`,而不是转发到 `local_addr` |
 | `[client.services.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
 | `[client.transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
+| `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次 transparent 注册都会在看任何设备之前被策略拒绝 |
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 
 转发型服务会用到的四类东西在这里会被**解析期拒绝**,因为没有任何代码会读它们:
@@ -409,7 +417,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 
 ```toml
 # server.toml - 服务端不为该服务绑定任何东西:它把 10.99.0.1/32 路由进自己的
-# TUN 设备。
+# TUN 设备。最后一张表就是允许它这么做的开关:去掉它,下面的注册会被策略拒绝。
 [server]
 default_token = "change-me"
 allow_ports = ["8443"]
@@ -625,6 +633,7 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | 有状态 UDP 会话(游戏、QUIC、WireGuard)中途断开 | 确保两端运行带 UDP 会话亲和的版本(≥ 本修复);空闲超过 `udp_idle_timeout` 的对端会在下一个数据报时重新绑定到新本地 socket(源端口变化)——调大超时或发送周期流量。 |
 | `Failed to read cmd: early eof` 警告 | 对端关闭了通道(重启或关停);客户端会自动重连。 |
 | 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | 透明服务连接的是运维方创建的设备,守护进程绝不自己创建。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务))。 |
+| 注册被拒:`This server does not serve transparent (L3) services: [server.transparent] is not configured` | 服务端自己的开关没打开,所以注册在看设备之前就被策略拒绝了。如果这台主机确实要路由所声明的地址,就**在服务端的**配置里加上这张表;否则从客户端去掉该服务。 |
 | `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印的 `ip addr add <ip>/32 dev <tun>`、`ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table 100`。 |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | 注入的包携带访客的源地址,严格的检查会丢掉它们。执行信息里打印的 `sysctl -w` 行;`net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都必须读到 `0`。 |
 | `Address <ip:port> is already claimed by another transparent service on this server` | 两个客户端声明了同一个端点;先到的声明在其注册存续期间一直持有。给其中一个换地址或端口。 |

@@ -743,6 +743,27 @@ enum Registration {
     Rejected(String),
 }
 
+/// The TUN device this server routes transparent services into, or the policy
+/// refusal to answer a registration with.
+///
+/// `[server.transparent]` **is** the switch. Serving L3 is what asks this
+/// process for `CAP_NET_ADMIN` and a device, so it is the operator's decision,
+/// taken statically in the server's own configuration — never a remote
+/// client's, whose registration arrives at runtime and could otherwise be what
+/// makes this host reach for `/dev/net/tun`. A server without the table
+/// therefore refuses by policy, before any device is looked at.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
+    match server_config.transparent.as_ref() {
+        Some(transparent) => Ok(&transparent.tun),
+        None => Err(
+            "This server does not serve transparent (L3) services: `[server.transparent]` is \
+             not configured"
+                .to_string(),
+        ),
+    }
+}
+
 /// Validate one service registration against the server's policy and bind its
 /// public endpoint: the body both dialects share.
 ///
@@ -803,15 +824,23 @@ async fn register_service(
     }
 
     // A transparent service claims a public address this host never binds, so
-    // three things have to hold before it is accepted: the build and platform
-    // can carry it, the routing contract is satisfiable (the operator's TUN
-    // device exists), and no other service already owns that address.
+    // four things have to hold before it is accepted: this server serves L3 at
+    // all (the operator's own `[server.transparent]`, checked first so that a
+    // client's registration is never what makes this process reach for a
+    // device), the build and platform can carry it, the routing contract is
+    // satisfiable (the operator's TUN device exists), and no other service
+    // already owns that address.
     #[cfg(all(feature = "transparent", target_os = "linux"))]
     let (claim, transparent_tun) = {
         if reg.service_type == ServiceType::Transparent {
-            if let Err(e) =
-                crate::transparent::check::require_interface(&server_config.transparent.tun)
-            {
+            let tun = match transparent_tun_for(server_config) {
+                Ok(tun) => tun,
+                Err(reason) => {
+                    warn!(service = %reg.name, "{reason}");
+                    return Ok(Registration::Rejected(reason));
+                }
+            };
+            if let Err(e) = crate::transparent::check::require_interface(tun) {
                 let reason = format!("{e:#}");
                 warn!(service = %reg.name, "Registration failed: {reason}");
                 return Ok(Registration::Rejected(reason));
@@ -824,7 +853,7 @@ async fn register_service(
                 warn!(service = %reg.name, "{reason}");
                 return Ok(Registration::Rejected(reason));
             };
-            (Some(held), Some(server_config.transparent.tun.clone()))
+            (Some(held), Some(tun.to_string()))
         } else {
             (None, None)
         }
@@ -3356,6 +3385,32 @@ mod tests {
 
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Serving L3 is the *server operator's* decision: without the table a
+    /// transparent registration is refused by policy — with a reason that names
+    /// the missing switch, not a missing device — and with it the device named
+    /// there is what the data path gets. `[server.transparent]` is an `Option`
+    /// for exactly this reason: a defaulted table would leave this process
+    /// armed to attach a device the operator never asked for.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn the_server_switch_governs_transparent_registrations() {
+        let mut server = ServerConfig::default();
+        let refusal = transparent_tun_for(&server).unwrap_err();
+        assert!(
+            refusal.contains("[server.transparent]"),
+            "the refusal must name the missing switch, got: {refusal}"
+        );
+
+        server.transparent = Some(crate::config::parsing::TransparentConfig {
+            tun: "l3test0".to_string(),
+        });
+        assert_eq!(
+            transparent_tun_for(&server).unwrap(),
+            "l3test0",
+            "the device comes from the table the operator wrote"
+        );
     }
 
     /// The operator's valve, at the level the tunnel path reads it: a cap of

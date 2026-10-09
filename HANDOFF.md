@@ -26,6 +26,13 @@
 
 ## Where this stands
 
+- **An unreleased cycle is in flight** on `feat/transparent-l3`: transparent
+  (L3) services, wire **v5**, based on `main` at `cf01091`. Nothing of it is in
+  `v0.10.0` (verified: the tag's tree has no transparent code at all), so its
+  configuration surface is still being shaped in place. The decision record,
+  the model it is being reshaped into, and the header-compression question are
+  in "The transparent-L3 cycle" below.
+
 - **v0.10.0 shipped on 2026-10-01**: the release run is green on all thirteen
   jobs (nine platform builds, GitHub Release, GHCR, crates.io), and the
   released artifact is `benches/scripts/soak/results-soak-v0.10.0.json` —
@@ -50,7 +57,71 @@
   for `main` and the release secrets. They are tracked as an open thread below;
   nothing in this repository can enable them.
 
+## The transparent-L3 cycle (unreleased, branch `feat/transparent-l3`)
+
+**State as of 2026-10-09.** The feature is committed and green
+(`45adb6e` the feature, `edffa53` never-encrypted, `b1ce03b` the striping
+note): `protocol = "transparent"` makes the client the owner of a public
+`ip:port`, carried as whole IP packets over a TUN device on both ends, with the
+wire at **v5** and `just l3-accept` (root-only, outside the check chain)
+proving the transparency end to end. Because none of it is released, the
+configuration surface is free to change — and this cycle changes it.
+
+### Decisions
+
+| # | Decision |
+|---|---|
+| L1 | L3 is a **run mode**, not a service type: touching a NIC is a process-level capability, so an entry-level key must not be what opens it |
+| L2 | The mode is chosen by its own top-level table (`[transparent]`), exactly as `[server]`/`[client]` are; a CLI flag only overrides |
+| L3 | `[client]` and `[transparent]` in one file is `Undetermine`: two roles are two processes (capability and restart isolation) |
+| L4 | The server gets **no** mode. It is a policy host: one config serves encrypted L4 clients and plaintext L3 ones |
+| L5 | `[server.transparent]` **is** the server's switch: absent, a registration is refused by policy *before* any device is looked at, so a client can never be what makes the server reach for `/dev/net/tun` (shipped first in this cycle) |
+| L6 | **No** `allow_addresses`: one shared `default_token` is one trust domain, so a global address list cannot discriminate between clients; the address universe is already expressed by the operator's own routing |
+| L7 | Noise and L3 are **not** mutually exclusive — the Noise keys simply have no effect on an L3 client. The documented consequence: enabling L3 means that server accepts plaintext connections from it |
+| L8 | `allow_ports` keeps gating L3 too: it is documented as the master switch for dynamic registration, and an L3 claim is a registration |
+| L9 | A claim's address key stays `remote_bind_addr`, and `proxy` stays in `[transparent.transport]` (the only key there — no encryption key has a home in that table) |
+| L10 | Header compression is an **intermediate state**: keep it when the measurement shows benefit, remove it when it does not, against criteria written down *before* the run |
+| L11 | No startup INFO for the switch; the plaintext consequence lives in the docs instead |
+
+### Next, in order
+
+1. **C — the `[transparent]` run mode and its config model.** `[transparent]`
+   + `[transparent.claims.<name>]`; `protocol = "transparent"` refused with a
+   redirect to the new home; `[client.transparent]` refused with a redirect to
+   `[transparent].tun`; the nine per-key refusals deleted (the keys no longer
+   exist); `[client]` untouched; the l3 harness rewritten onto the new schema.
+   The lowering is a front end: the L3 config becomes the same `ClientConfig`
+   the L4 path already uses, so `core/client.rs`, the data path and the wire do
+   not change.
+2. **M — measure the L3 path before writing a compressor.** Mean packet size
+   (per-arm `/proc/net/dev` deltas) and wire bytes per payload byte, on a
+   small-packet arm and a bulk one, against a baseline built from a worktree at
+   the `v0.10.0` tag — same host, same run, same method (§10 comparability).
+3. **Z — only if M passes.** VJ-style (RFC 1144) per-flow header deltas, with
+   the encoder authoritative (every context change is an explicit frame, so a
+   reliable ordered stream cannot desync), self-describing `[u8 kind]` frames
+   under v5, and `MOLEHILL_L3_COMPRESS=0` as the A/B switch. No negotiation:
+   there is one dialect and both ends ship together.
+4. **V — the verdict, before any `v0.11` tag.** While unreleased a "no benefit"
+   verdict is a `git revert`; after the tag it would be a protocol version bump.
+
+**Pre-registered criteria.** Small packets (≤128 B payload): wire bytes down
+≥ 20%. Mid (512 B–1 KB): ≥ 5%. Bulk (1400 B): throughput down ≤ 2%. The
+small-packet and the bulk conditions must both hold; a difference inside the
+variance counts as *no difference*, and either failure removes the feature.
+
+### Open threads
+
+- **The soak bench has no namespace support** — every arm runs on host loopback
+  — so an L3 arm cannot be expressed as a config variant there. The L3 numbers
+  come from the l3 harness instead; folding L3 into the soak is a separate
+  decision that needs netns plumbing in `soak/lib.py`.
+- The benchmark comparison against v0.10.0 must build that state (worktree at
+  the tag): there is no released asset that speaks v5, and no two tags are
+  compatible, so each side runs as a complete pair.
+
 ## The v0.10.0 theme
+
 One control session per endpoint, one shared elastic pool per carrier,
 transparent visibility and a quiet log. Four of the milestones were independent
 and are already merged on `main` (unreleased, so they are part of this release);

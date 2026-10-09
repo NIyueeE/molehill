@@ -204,6 +204,12 @@ the exact refusals belong to
 network the operator has to build. It is Linux only, needs `CAP_NET_ADMIN` on
 both ends (each side opens a TUN device), and configures nothing itself.
 
+The server serves L3 only if **its own** config asks for it: the
+`[server.transparent]` table in `server.toml` below is that switch, and without
+it the registration is refused before any device is touched. Run the L3 server
+under a unit that has the capability, and an L4-only server under one that does
+not (see [systemd](#systemd)).
+
 Both recipes start from the same two facts:
 
 - **The claimed address is not a listener.** Nothing may bind it on the server;
@@ -215,7 +221,8 @@ Both recipes start from the same two facts:
 Both recipes end with the same configuration:
 
 ```toml
-# server.toml
+# server.toml - the last table is the switch: without it this server refuses
+# transparent registrations by policy, and never opens a TUN device at all.
 [server]
 default_token = "change-me"
 allow_ports = ["8443"]
@@ -339,9 +346,13 @@ multiple instances. In the unit names, `molehills` stands for
 `molehill --server`, `molehillc` for `molehill --client`, and `molehill`
 for the auto-detect mode. The `@` in a unit name instantiates it per config
 file. Store config files with permission `600` (they contain the shared
-token). A transparent service needs `CAP_NET_ADMIN` to open its TUN device —
-root has it implicitly, and the units below carry the `AmbientCapabilities=`
-line (commented out) for a unit that runs as another user.
+token). A server that serves transparent services needs `CAP_NET_ADMIN` to
+open its TUN device — and only such a server does: the capability is asked for
+by the `[server.transparent]` table, so a `molehill --server` whose config does
+not carry it runs without it and refuses L3 registrations by policy. Root has
+the capability implicitly, and the units below carry the
+`AmbientCapabilities=` line (commented out) for a unit that runs as another
+user.
 
 ```ini
 # molehills@.service - one server instance per config: systemctl enable molehills@app1 --now

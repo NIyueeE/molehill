@@ -14,7 +14,10 @@
 #   2. the service sees the VISITOR's real address (transparency);
 #   3. the server namespace holds NO connection state for the visitor's flow;
 #   4. the client namespace owns the accepted connection;
-#   5. 200 KB round-trips byte-exactly (no PMTU black hole).
+#   5. 200 KB round-trips byte-exactly (no PMTU black hole);
+#   6. a server whose config has no `[server.transparent]` refuses the
+#      registration BY POLICY, before it looks at a device (its device is
+#      deleted for that run, so the order is proven rather than asserted).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -264,6 +267,20 @@ remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
 }
 
+# The same server without `[server.transparent]`: the negative half of the
+# policy. Serving L3 is the server operator's decision, so this server must
+# refuse the registration *by policy* — and before it looks at a device.
+write_no_l3_config() {
+    cat >"$LOG/server-no-l3.toml" <<TOML
+[server]
+default_token = "bench"
+allow_ports = ["$PUBLIC_PORT"]
+
+[server.control]
+bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+TOML
+}
+
 echo "================= BUILD ================="
 mkdir -p "$LOG"
 if ! (cd "$ROOT" && cargo build) >"$LOG/cargo-build.log" 2>&1; then
@@ -411,6 +428,43 @@ awk -v s="$BULK_START" -v e="$BULK_END" -v n="$BULK_BYTES" 'BEGIN {
 }'
 
 echo
+echo "================= NEGATIVE: NO SERVER SWITCH ================="
+# The switch is the *server's*: a server whose config has no
+# `[server.transparent]` must refuse a transparent registration by policy, and
+# must do so before it looks at a device. The order is proven, not asserted:
+# the device is DELETED from the server namespace first, so an implementation
+# that checked the interface first would answer with the "does not exist"
+# recipe instead of the policy refusal.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+sleep 0.5
+ip netns exec "$NS_SRV" ip link del "$TUN_SRV"
+write_no_l3_config
+echo "--- server-no-l3.toml ---"
+cat "$LOG/server-no-l3.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server-no-l3.toml" >"$LOG/no-l3-server.log" 2>&1 &
+NO_L3_SRV=$!
+PIDS+=("$NO_L3_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the no-L3 server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/no-l3-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --client "$LOG/client.toml" >"$LOG/no-l3-client.log" 2>&1 &
+NO_L3_CLI=$!
+PIDS+=("$NO_L3_CLI")
+
+# Wait for the refusal itself rather than for a fixed delay.
+if ! wait_for "$LOG/no-l3-server.log" "does not serve transparent"; then
+    echo "the no-L3 server never logged a refusal" >&2
+    dump_log "$LOG/no-l3-server.log"
+fi
+echo "--- no-L3 server log ---"
+cat "$LOG/no-l3-server.log"
+echo "--- no-L3 client log ---"
+cat "$LOG/no-l3-client.log" 2>/dev/null || true
+
+echo
 echo "================= VERDICT ================="
 FAILURES=0
 pass() {
@@ -456,6 +510,21 @@ if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
     pass "200 KB round-trip (no MTU black hole)"
 else
     fail "200 KB round-trip (no MTU black hole)"
+fi
+
+if grep -qF "does not serve transparent (L3) services" "$LOG/no-l3-server.log"; then
+    pass "a server without [server.transparent] refuses L3 by policy"
+else
+    fail "a server without [server.transparent] refuses L3 by policy"
+fi
+
+# The device is gone in that run, so a missing-interface recipe in the log would
+# mean the policy check ran second — the exact ordering this milestone exists
+# for.
+if grep -qF "does not exist" "$LOG/no-l3-server.log"; then
+    fail "the policy refusal comes before the device is looked at (the log carries the missing-interface recipe)"
+else
+    pass "the policy refusal comes before the device is looked at"
 fi
 
 exit "$FAILURES"

@@ -464,6 +464,12 @@ impl DataCarrierLimits {
 /// one ([deployment.md](../../docs/deployment.md) owns the recipes). Both ends
 /// may need a device — the server routes the claimed address into its own, the
 /// client carries the address on its own.
+///
+/// On the **server** the table carries a second meaning: it is the operator's
+/// own switch for the feature, because serving L3 is what asks this process for
+/// `CAP_NET_ADMIN` and a device. `[server]` therefore holds this as an
+/// `Option`, and a server without the table refuses every transparent
+/// registration by policy instead of being steered into a device by a client.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentConfig {
@@ -635,8 +641,12 @@ pub struct ServerConfig {
     pub data: ServerDataConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
-    #[serde(default)]
-    pub transparent: TransparentConfig,
+    /// `[server.transparent]`: **the presence of this table is the switch**
+    /// that lets this server serve transparent (L3) services. Without it a
+    /// registration of that type is refused by policy before any device is
+    /// looked at, so this process never touches `/dev/net/tun` on a
+    /// client's say-so (see [`TransparentConfig`]).
+    pub transparent: Option<TransparentConfig>,
 }
 
 /// Server-side wire material (`[server.transport]`): only the Noise keys.
@@ -1444,6 +1454,43 @@ max_tunnels_per_client = 6
 "#;
         let cfg = Config::from_str(config).unwrap();
         assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 6);
+    }
+
+    /// `[server.transparent]` is opt-in, and the *table's presence* is the
+    /// switch: a server that never mentions it parses to `None` rather than to
+    /// a default device it would then be willing to attach. Inside the table
+    /// the device name keeps its default, because writing the table already is
+    /// the operator's decision.
+    #[test]
+    fn test_server_transparent_is_opt_in() {
+        let without = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+"#;
+        let cfg = Config::from_str(without).unwrap();
+        assert!(
+            cfg.server.unwrap().transparent.is_none(),
+            "a server that does not mention transparent must not be armed for it"
+        );
+
+        let with = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+"#;
+        let cfg = Config::from_str(with).unwrap();
+        assert_eq!(
+            cfg.server.unwrap().transparent.map(|t| t.tun).as_deref(),
+            Some("molehill0"),
+            "writing the table is the decision; the device name still defaults"
+        );
     }
 
     #[test]

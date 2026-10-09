@@ -244,8 +244,8 @@ psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it mus
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
-[server.transparent] # Optional. Transparent (L3) services only: the TUN device the server attaches to
-tun = "molehill0" # Optional. The device must already exist and have a route for every claimed address — that is the operator's job, not the daemon's. Default: molehill0
+[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) services at all. Without it a client's `protocol = "transparent"` registration is refused by policy, before any device is looked at — serving L3 is what asks this process for CAP_NET_ADMIN and a TUN device, so the decision belongs to the operator, never to a remote client
+tun = "molehill0" # Optional. The TUN device the server attaches to. It must already exist and have a route for every claimed address — that is the operator's job, not the daemon's. Default: molehill0
 ```
 
 ## Dynamic service registration
@@ -400,6 +400,17 @@ device, and this platform is not Linux`, or with a message naming the missing
 `transparent` feature. Only IPv4 is carried today — a packet that is not IPv4
 is dropped and counted.
 
+**Serving L3 is the server operator's decision.** On the server the
+`[server.transparent]` table is the switch: without it a transparent
+registration is refused by policy, before any device is looked at, so a client
+can never be what makes the server reach for `/dev/net/tun` or ask the kernel
+for `CAP_NET_ADMIN`. A server that only forwards `tcp`/`udp` services therefore
+needs no capability for this feature at all. Enabling L3 does have a
+consequence worth stating plainly: such a service is never encrypted, so a
+server that serves one accepts plaintext connections from it, whatever
+`[server.transport.noise]` says — the Noise keys keep applying to the clients
+that do negotiate them.
+
 **The daemon never configures the network.** It has no netlink code and never
 shells out to `ip`: the operator creates the TUN device and installs the
 addresses and routes, and the daemon verifies what it depends on and refuses
@@ -412,6 +423,7 @@ address routed to the server, and a single-IP server — are in
 | `[client.services.<name>].protocol` | `"transparent"` — the service owns a public `ip:port` instead of forwarding to `local_addr` |
 | `[client.services.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports`; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[client.transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
+| `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
 Four things a forwarding service would use are **refused at parse time**,
@@ -455,8 +467,8 @@ live on it.
 ### A worked example
 
 ```toml
-# server.toml - the server binds nothing for this service: it routes
-# 10.99.0.1/32 into its TUN device.
+# server.toml - the server binds nothing: it routes 10.99.0.1/32 into its TUN
+# device. The last table is the switch; without it the registration is refused.
 [server]
 default_token = "change-me"
 allow_ports = ["8443"]
@@ -630,6 +642,7 @@ above and follow that guide.
 | Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |
 | `Interface <tun> does not exist. Prepare it first` (client, or a registration rejection on the server) | A transparent service attaches to a device the operator creates; the daemon never creates one. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). |
+| `This server does not serve transparent (L3) services: [server.transparent] is not configured` (registration rejection) | The server's own switch is off, so the registration was refused by policy before the device was looked at. Add the table to the **server's** config if this host is meant to route the claimed address, or drop the service from the client. |
 | `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims: run the `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines the message prints. |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | Injected packets carry the visitor's source address, which a strict check drops. Run the `sysctl -w` line the message prints; both `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` must read `0`. |
 | `Address <ip:port> is already claimed by another transparent service on this server` | Two clients claim the same endpoint; the first claim is held for the lifetime of its registration. Give one of them another address or port. |
