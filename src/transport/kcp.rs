@@ -127,10 +127,39 @@ const KCP_FAST_RESEND: i32 = 2;
 /// them (4 × 2.8 MiB = 11.2 MiB send-side).
 const KCP_SND_WND: u16 = 2048;
 const KCP_RCV_WND: u16 = 4096;
-/// Cap on app data queued in the `Kcp` send queue, in segments. Beyond this
-/// the pump stops pulling from the writer channel, backpressuring
-/// `AsyncWrite`.
-const SND_QUEUE_LIMIT: usize = 2 * KCP_SND_WND as usize;
+/// The two windows as **byte budgets**: 2048 and 4096 segments at KCP's
+/// 1400-byte default, which is what the segment counts above were tuned as.
+///
+/// KCP counts its windows in segments, so a session that follows its path up
+/// to 8 KiB datagrams multiplies every one of these buffers by 5.7 — 2.8 MiB
+/// of in-flight data becomes 16 MiB, and the app-side queue limit below
+/// becomes 32 MiB. The symptom is measurable: a session that has just carried
+/// a bulk transfer keeps the *next* transfer's data behind that backlog, and
+/// the cell reads a fraction of the same cell on a fresh session (2.0 against
+/// 6.1 Gbit/s, reproducibly). The budgets are bytes here and segments only
+/// where KCP insists on them.
+const KCP_SND_WINDOW_BYTES: usize = KCP_SND_WND as usize * 1400;
+const KCP_RCV_WINDOW_BYTES: usize = KCP_RCV_WND as usize * 1400;
+/// Cap on app data queued for the wire, as a byte budget (twice the send
+/// window, as the segment count used to be). Beyond it the pump stops pulling
+/// from the writer channel, backpressuring `AsyncWrite`.
+const SND_QUEUE_BYTES: usize = 2 * KCP_SND_WINDOW_BYTES;
+
+/// How many segments a byte budget is worth at `mtu`.
+///
+/// The floor keeps a window usable on a path whose datagrams are tiny; the
+/// ceiling is the tuned segment count, so a *small* MTU never inflates the
+/// window past what the tuning chose.
+fn segments_for_bytes(bytes: usize, mtu: usize) -> u16 {
+    let mss = mtu.saturating_sub(KCP_OVERHEAD).max(1);
+    u16::try_from((bytes / mss).clamp(32, usize::from(KCP_RCV_WND))).unwrap_or(KCP_RCV_WND)
+}
+
+/// The app-queue cap in segments at `mtu` (`wait_snd` counts segments).
+fn snd_queue_limit(mtu: usize) -> usize {
+    let mss = mtu.saturating_sub(KCP_OVERHEAD).max(1);
+    (SND_QUEUE_BYTES / mss).max(64)
+}
 /// One `Kcp::send` call must stay under 128 segments (`UserBufTooBig`), so
 /// app writes are chunked well below that.
 const SEND_CHUNK: usize = 64 * 1024;
@@ -331,6 +360,15 @@ pub(crate) static KCP_RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// sessions of this process. `KCP_NS_DELIVER` is the whole delivery
 /// phase and stays for continuity; the two splits below carve the spill
 /// flush and the receive-queue drain out of it.
+/// Bytes handed to a session's reader channel and not yet consumed by it, and
+/// the bytes parked in spill queues beside it. These are the buffers between
+/// the wire and the reader, and their depth is what the path above experiences
+/// as round-trip time when a reader cannot keep up.
+pub(crate) static KCP_READER_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Peak `wait_snd` (unacknowledged segments) since the last stats line: the
+/// session's own queue, as the engine sees it.
+pub(crate) static KCP_WAIT_SND_PEAK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
@@ -380,6 +418,9 @@ pub(crate) struct KcpStats {
     pub ms_writer: f64,
     pub ms_output: f64,
     pub ms_update: f64,
+    pub reader_queued_bytes: u64,
+    pub spill_bytes: u64,
+    pub wait_snd_peak: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -409,6 +450,9 @@ pub(crate) fn kcp_stats() -> KcpStats {
         ms_writer: ms(&KCP_NS_WRITER),
         ms_output: ms(&KCP_NS_OUTPUT),
         ms_update: ms(&KCP_NS_UPDATE),
+        reader_queued_bytes: KCP_READER_QUEUED_BYTES.load(Ordering::Relaxed),
+        spill_bytes: KCP_SPILL_BYTES.load(Ordering::Relaxed),
+        wait_snd_peak: KCP_WAIT_SND_PEAK.swap(0, Ordering::Relaxed),
     }
 }
 
@@ -449,6 +493,9 @@ fn spawn_kcp_stats() {
                     ms_writer = format!("{:.3}", s.ms_writer),
                     ms_output = format!("{:.3}", s.ms_output),
                     ms_update = format!("{:.3}", s.ms_update),
+                    reader_queued_bytes = s.reader_queued_bytes,
+                    spill_bytes = s.spill_bytes,
+                    wait_snd_peak = s.wait_snd_peak,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -489,6 +536,9 @@ pub(crate) struct ReadBatch {
     /// The segments, in delivery order; each is one complete stream-mode
     /// message (≤ one MSS).
     pub parts: Vec<Bytes>,
+    /// `parts`' total length, kept so the residency gauges need not walk the
+    /// vector on the hot path.
+    pub bytes: usize,
 }
 
 /// Collects `Kcp` output as whole datagrams: each `Write::write` call from
@@ -602,7 +652,39 @@ impl DatagramSink for DatagramOut {
 /// Apply the fixed arm-2 protocol parameters (see the module docs).
 fn configure(kcp: &mut Kcp<DatagramOut>) {
     kcp.set_nodelay(true, KCP_INTERVAL_MS, KCP_FAST_RESEND, true);
-    kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
+    apply_windows(kcp);
+}
+
+/// Add to a residency gauge (saturating: a gauge is a diagnostic, never a
+/// correctness input).
+fn add_bytes(gauge: &AtomicU64, bytes: usize) {
+    gauge.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Subtract from a residency gauge, saturating at zero.
+fn sub_bytes(gauge: &AtomicU64, bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let _ = gauge.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
+
+/// Record the session's send-queue depth for the periodic stats line (a peak
+/// since the last line, so a transient backlog is visible rather than averaged
+/// away).
+fn note_wait_snd(depth: usize) {
+    KCP_WAIT_SND_PEAK.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Size both windows from the session's current datagram size (see
+/// [`KCP_SND_WINDOW_BYTES`]). Called at session start and whenever the
+/// path-MTU probe changes the datagram size.
+fn apply_windows(kcp: &mut Kcp<DatagramOut>) {
+    let mtu = kcp.mtu();
+    kcp.set_wndsize(
+        segments_for_bytes(KCP_SND_WINDOW_BYTES, mtu).min(KCP_SND_WND),
+        segments_for_bytes(KCP_RCV_WINDOW_BYTES, mtu),
+    );
 }
 
 /// Request large kernel buffers on a KCP socket (see
@@ -751,15 +833,17 @@ fn flush_parts(
     parts: &mut Vec<Bytes>,
     spill: &mut std::collections::VecDeque<ReadBatch>,
 ) -> BlobFlush {
-    let batch = ReadBatch {
-        parts: std::mem::replace(parts, Vec::with_capacity(MAX_READ_PARTS)),
-    };
+    let parts = std::mem::replace(parts, Vec::with_capacity(MAX_READ_PARTS));
+    let bytes = parts.iter().map(Bytes::len).sum();
+    let batch = ReadBatch { parts, bytes };
     match in_tx.try_send(batch) {
         Ok(()) => {
             KCP_BLOBS_OUT.fetch_add(1, Ordering::Relaxed);
+            add_bytes(&KCP_READER_QUEUED_BYTES, bytes);
             BlobFlush::Sent
         }
         Err(TrySendError::Full(batch)) => {
+            add_bytes(&KCP_SPILL_BYTES, batch.bytes);
             spill.push_back(batch);
             BlobFlush::Spilled
         }
@@ -800,13 +884,21 @@ fn deliver_recv(
     {
         let _t = PhaseTimer::new(&KCP_NS_DELIVER_SPILL);
         while let Some(batch) = spill.pop_front() {
+            let spilled = batch.bytes;
             match in_tx.try_send(batch) {
-                Ok(()) => delivered = true,
+                Ok(()) => {
+                    sub_bytes(&KCP_SPILL_BYTES, spilled);
+                    add_bytes(&KCP_READER_QUEUED_BYTES, spilled);
+                    delivered = true;
+                }
                 Err(TrySendError::Full(batch)) => {
                     spill.push_front(batch);
                     break;
                 }
-                Err(TrySendError::Closed(_)) => return Delivery::ReaderGone,
+                Err(TrySendError::Closed(_)) => {
+                    sub_bytes(&KCP_SPILL_BYTES, spilled);
+                    return Delivery::ReaderGone;
+                }
             }
         }
     }
@@ -903,7 +995,7 @@ fn drain_writer(
         // One queued write consumed: hand the capacity permit back to the
         // writer half.
         out_sem.add_permits(1);
-        if kcp.wait_snd() >= SND_QUEUE_LIMIT {
+        if kcp.wait_snd() >= snd_queue_limit(kcp.mtu()) {
             break;
         }
         match out_rx.try_recv() {
@@ -1271,6 +1363,9 @@ fn maybe_path_mtu(
     };
     let before = kcp.mtu();
     if kcp.set_mtu(fits) != before {
+        // The windows are byte budgets: a bigger datagram carries more of the
+        // budget per segment, so the segment counts follow it down.
+        apply_windows(kcp);
         datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
         info!(
             peer = %net.peer,
@@ -1479,7 +1574,10 @@ async fn run_session(
             // channel permanently ready under load, tokio's uniform select
             // fairness would otherwise starve the writer side to a fraction
             // of the link rate (measured ~half the window limit at 20 ms).
-            data = out_rx.recv(), if !closing && kcp.wait_snd() < SND_QUEUE_LIMIT => {
+            data = out_rx.recv(), if {
+                note_wait_snd(kcp.wait_snd());
+                !closing && kcp.wait_snd() < snd_queue_limit(kcp.mtu())
+            } => {
                 if let Some(data) = data {
                     let mut fatal = false;
                     let _t = PhaseTimer::new(&KCP_NS_WRITER);
@@ -1898,6 +1996,7 @@ impl AsyncRead for KcpStream {
             };
             match rx.poll_recv(cx) {
                 Poll::Ready(Some(batch)) => {
+                    sub_bytes(&KCP_READER_QUEUED_BYTES, batch.bytes);
                     for part in batch.parts {
                         if !part.is_empty() {
                             me.read_queue.push_back(part);
