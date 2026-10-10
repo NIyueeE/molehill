@@ -116,7 +116,7 @@
 | `[client.services.<name>].count` | 无需填写:池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].tunnels` 是它的宽度 |
 | `[client.services.<name>].pool_size` | UDP 服务写 `[client.services.<name>].udp_workers`(默认 2)。TCP 服务按访客即时打开数据通道 |
 | `[client.services.<name>].heartbeat_timeout` | 无需填写:服务端在会话确认里声明自己的心跳节奏,客户端据此推导超时。`[client.control].default_heartbeat_timeout` 仍作为可选下限保留 |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限) |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的承载连接数;0 = 不限) |
 | `[client.services.<name>].health_check` | 无需填写:只要客户端在运行,服务就保持注册;无法转发的请求只对那个访客失败 |
 
 下一节说明每个替代键做什么、代价是什么;[CHANGELOG.md](../CHANGELOG.md) 记录
@@ -249,7 +249,7 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
 # stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
-# max_tunnels_per_client = 0 # 可选。运维方对多路复用隧道的阀门:一个客户端在其会话的所有服务上一共可持有多少条数据隧道。配置的 `tunnels` 超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
+# max_tunnels_per_client = 0 # 可选。运维方对「一个客户端在其会话的所有服务上一共可持有多少条承载连接」的阀门:既包括多路复用的数据隧道,也包括透明认领的车道(一条车道就是一条自己的连接——认领永不multiplex)。配置的 `tunnels`/车道预算超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝并在应答里写明上限;车道则被丢弃,并输出一行写明上限的 INFO;会话本身继续运行
 
 [server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)

@@ -63,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([HANDOFF.md](HANDOFF.md), "The mux×1 gap, measured before touching it"). The
   wire protocol is unchanged.
 
+- **`[server.data].max_tunnels_per_client` now counts a transparent claim's
+  lanes too.** The valve was checked on the tunnel hello, so it bounded
+  multiplexed data tunnels and nothing else — and a claim's lane is a plain data
+  channel of its own, which made a claim's carrier connections the one kind of
+  establishment no server-side policy bounded. The cap now covers both, because
+  both are what it says: the carrier connections ONE client may hold across the
+  services of its session. A lane over the cap is dropped with one `INFO` line
+  naming the cap (then `DEBUG`), and the claim keeps serving on the lanes it
+  got. Deployments that set the key *and* run transparent services with a lane
+  budget may need to raise it; `0` (the default) is unlimited and unaffected.
+  A build without the `multiplex` feature has no session counter, so its lanes
+  stay unbounded.
+
 - **A claim's flow placement is remembered, so a lane change cannot reorder a
   flow.** The hub used to route every packet by `hash % width`, which meant a
   lane *joining* re-placed every established flow — the one event that could

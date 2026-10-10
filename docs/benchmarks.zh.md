@@ -833,8 +833,11 @@ CPU 减半。那是运维侧的设置,不是代码改动:TUN 的 MTU,以及与�
 用 `just l3-accept` 复现,产物目录里的 `bulk.report` / `small.report` 就是原始输出。
 它的仪器参数是环境变量覆盖,因为它们会改变数字的含义:`BULK_BYTES`(默认
 200 000;当 CPU 计数器 100 Hz 的分辨率重要时,把它提到一秒以上的流量)、
-`SMALL_REQUESTS` 与 `SMALL_BYTES`(默认 2000 × 64 B)、`CLAIM_MODE`(不设置,即测量
-产品自身的默认值;`multiplex` 选另一种数据通道模式)。
+`SMALL_REQUESTS` 与 `SMALL_BYTES`(默认 2000 × 64 B)、`CLAIM_LANES`(不设置,即测量
+产品自身的默认值——每条认领一条承载连接;设为更大的数字会把该认领的流铺到那么多条
+连接上),以及 `CLAIM_LANE_CAP`(不设置;设成小于 `CLAIM_LANES` 的值,即测量服务端
+`[server.data].max_tunnels_per_client` 阀门拒绝认领多余车道、而认领用剩下的车道继续
+服务的情形)。
 
 ## UDP 队列问题(仅 molehill 的诊断)
 

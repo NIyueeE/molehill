@@ -22,8 +22,11 @@
 #   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
 #      deleted for that run, so the order is proven rather than asserted);
-#   8. with CLAIM_MEMBERS > 1 the claim holds that many carrier channels, its
-#      flows are spread across them, and every arm above is still byte-exact.
+#   8. with CLAIM_LANES > 1 the claim holds that many carrier connections, its
+#      flows are spread across them, and every arm above is still byte-exact;
+#   9. with CLAIM_LANE_CAP below CLAIM_LANES the server's valve (which counts a
+#      claim's lanes) refuses the surplus with one line naming the cap, and the
+#      claim keeps serving byte-exactly on the lanes it got.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -103,16 +106,17 @@ BULK_CHUNK="${BULK_CHUNK:-65536}"
 # recorded with the numbers, because they are what the numbers mean.
 SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
 SMALL_BYTES="${SMALL_BYTES:-64}"
-# Optional override of the claim's data-channel mode. Empty writes nothing,
-# which is how the run measures the default an operator would get; the axis
-# exists because a one-member claim has nothing for a multiplexer to multiplex,
-# so its mode is a cost decision rather than a topology one.
-CLAIM_MODE="${CLAIM_MODE:-}"
-# Optional member count for the claim (`default_members`). Empty writes nothing
-# (the product's one channel); 2 or more asks for a member set, which is what
-# makes this run prove that a claim's flows are spread over several carriers and
-# still arrive byte-exact.
-CLAIM_MEMBERS="${CLAIM_MEMBERS:-}"
+# Optional lane budget for the claim (`[transparent.data.tcp].tunnels`). Empty
+# writes nothing (the product's one connection per claim); 2 or more asks for
+# several lanes, which is what makes this run prove that a claim's flows are
+# spread over several carrier connections and still arrive byte-exact.
+CLAIM_LANES="${CLAIM_LANES:-}"
+# Optional cap on the carrier connections one client may hold, written into the
+# server (`[server.data].max_tunnels_per_client`). Empty writes nothing (the
+# product's unlimited default); a value below CLAIM_LANES makes the run prove
+# that the operator's valve counts a claim's lanes and refuses the surplus while
+# the claim keeps serving on what it got.
+CLAIM_LANE_CAP="${CLAIM_LANE_CAP:-}"
 # The multi-flow arm: N connections at once, each doing its own strict round
 # trips. This is where packets queue, so it is the arm that says what several
 # visitors through one claim cost (and the only one a queue-per-CPU change
@@ -339,6 +343,12 @@ bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 [server.transparent]
 tun = "$TUN_SRV"
 TOML
+    # The operator's valve is a server-side policy, so it goes in the server's
+    # own table — and it counts a claim's lanes, which is what a run with
+    # CLAIM_LANE_CAP below CLAIM_LANES proves.
+    if [ -n "$CLAIM_LANE_CAP" ]; then
+        printf '\n[server.data]\nmax_tunnels_per_client = %s\n' "$CLAIM_LANE_CAP" >>"$LOG/server.toml"
+    fi
 
     cat >"$LOG/client.toml" <<TOML
 [transparent]
@@ -348,21 +358,17 @@ tun = "$TUN_CLI"
 [transparent.control]
 default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 TOML
-    # The claim's member set is the product's default (one channel) unless the
-    # run names a count. The table has to precede the claim, or the key would
-    # land in the claim's own table.
-    if [ -n "$CLAIM_MEMBERS" ]; then
-        printf '\n[transparent.data]\ndefault_members = %s\n' "$CLAIM_MEMBERS" >>"$LOG/client.toml"
+    # The claim's lane budget is the product's default (one connection per
+    # claim) unless the run names one. The table has to precede the claim, or
+    # the key would land in the claim's own table.
+    if [ -n "$CLAIM_LANES" ]; then
+        printf '\n[transparent.data.tcp]\ntunnels = %s\n' "$CLAIM_LANES" >>"$LOG/client.toml"
     fi
     cat >>"$LOG/client.toml" <<TOML
 
 [transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
-    # The claim's mode is the product's default unless the run names one.
-    if [ -n "$CLAIM_MODE" ]; then
-        printf 'mode = "%s"\n' "$CLAIM_MODE" >>"$LOG/client.toml"
-    fi
 }
 
 # The same server without `[server.transparent]`: the negative half of the
@@ -644,6 +650,54 @@ awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGI
 }'
 
 echo
+echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
+# `[server.data].max_tunnels_per_client` is the server operator's cap on the
+# carrier connections ONE client may hold — and a claim's lane is one of them,
+# which is the half that used to be unbounded. With a cap of 1 against a claim
+# that asks for 2, the surplus lane must be refused with a line naming the cap,
+# and the claim must keep serving byte-exactly on the lane it got. The lane
+# budget is a client-side key and the cap is a server-side one, so this is the
+# only run where the two halves are proven to meet.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+sleep 0.5
+CLAIM_LANES=2
+CLAIM_LANE_CAP=1
+write_configs
+echo "--- server-valve.toml ---"
+cat "$LOG/server.toml"
+echo "--- client-valve.toml ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/valve-server.log" 2>&1 &
+VALVE_SRV=$!
+PIDS+=("$VALVE_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the valve server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/valve-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/valve-client.log" 2>&1 &
+VALVE_CLI=$!
+PIDS+=("$VALVE_CLI")
+
+VALVE_REFUSED=0
+# Wait for the refusal itself rather than for a fixed delay; the lane budget is
+# established at service start, so the line is the client's second lane meeting
+# the cap.
+if wait_for "$LOG/valve-server.log" "Refused a transparent lane"; then
+    VALVE_REFUSED=1
+fi
+echo "--- valve server log ---"
+cat "$LOG/valve-server.log"
+
+# The claim must still serve: the lane it kept is a working data path, and the
+# workload is the same strict round-trip suite the main run uses.
+VALVE_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    >"$LOG/valve-visitor.log" 2>&1 || VALVE_RC=$?
+cat "$LOG/valve-visitor.log"
+
+echo
 echo "================= NEGATIVE: NO SERVER SWITCH ================="
 # The switch is the *server's*: a server whose config has no
 # `[server.transparent]` must refuse a transparent registration by policy, and
@@ -652,6 +706,7 @@ echo "================= NEGATIVE: NO SERVER SWITCH ================="
 # that checked the interface first would answer with the "does not exist"
 # recipe instead of the policy refusal.
 kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+kill "$VALVE_SRV" "$VALVE_CLI" 2>/dev/null || true
 sleep 0.5
 ip netns exec "$NS_SRV" ip link del "$TUN_SRV"
 write_no_l3_config
@@ -759,6 +814,18 @@ if grep -qF "does not exist" "$LOG/no-l3-server.log"; then
     fail "the policy refusal comes before the device is looked at (the log carries the missing-interface recipe)"
 else
     pass "the policy refusal comes before the device is looked at"
+fi
+
+if [ "$VALVE_REFUSED" -eq 1 ]; then
+    pass "the operator's valve refuses a claim's surplus lane, naming the cap"
+else
+    fail "the operator's valve never refused the lane over the cap"
+fi
+
+if [ "$VALVE_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/valve-visitor.log"; then
+    pass "the claim serves byte-exactly on the lanes it got"
+else
+    fail "the claim stopped serving once a lane was refused (exit $VALVE_RC)"
 fi
 
 exit "$FAILURES"
