@@ -864,11 +864,16 @@ each needs its own evidence):
       (`src/mux/connection/stream.rs`, `Vec::from(&buf[..k])`) plus the copy
       into the connection's buffer after it — a structural change to encode the
       header and payload once, straight into the outgoing buffer;
-   2. `DEFAULT_SPLIT_SEND_SIZE` (`src/mux.rs`, 32 KiB): a larger framed write is
-      fewer syscalls and fewer frames per byte, at the cost of interleaving
-      latency between streams of one tunnel. Worth *measuring* before deciding —
-      a one-constant experiment, and the yamux issue behind the current value is
-      the trade-off to read first.
+   2. `DEFAULT_SPLIT_SEND_SIZE` (`src/mux.rs`, 32 KiB): **measured, and it is not
+      a lever at this resolution.** Three runs at 32 KiB gave 8.85 / 8.04 /
+      10.9 Gbit/s (median 8.85) and three at 128 KiB gave 8.12 / 9.45 / 10.4
+      (median 9.45) on the same loopback shape — a 7 % median gap inside a
+      ±15 % spread, so the two are indistinguishable and the constant stays at
+      the value its rationale (interleaving latency between streams of one
+      tunnel) was chosen for. Reverted; the numbers are here so nobody re-runs
+      it expecting a win. (A tighter instrument — the bench model, with its own
+      A/A floor and more rounds — could still resolve a 7 % effect, but nothing
+      in the profile suggests that is where the 87 % lives.)
    3. window-update amortisation, if the profile's `poll_read` share survives 1.
       Budget: stop after three failed attempts on the same problem (§9) and
    write what was learned here rather than grinding.
