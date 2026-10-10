@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression baseline, because the gate refuses a baseline whose method record
   does not match. The method, the metric definitions and the profiles are on
   [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard).
+  An arm now states its **carrier** as well as its mode (`l3`, `l3-mux`,
+  `l3-kcp`, `l3-mux-kcp`, `l4-kcp`), so the two axes are measured apart, and the
+  condition vocabulary gained `loss1_rate100` — a 100 Mbit uplink that also
+  loses packets, the lossy WAN the carrier choice is actually about. First
+  measurements of that axis: [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model).
 
 ### Added
 

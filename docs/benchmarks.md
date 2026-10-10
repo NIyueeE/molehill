@@ -286,24 +286,36 @@ carried" are different findings.
 
 ### The timeline
 
-This is the default schedule — what the `capacity` and `rrul` runs walk
-through. Three other schedules exist, and which one a run uses is recorded in
-its results file (`meta.timeline`, beside the path classes):
+The **staged scenarios** (`timeline`, `soak`, `cost`) walk a *timeline*: an
+ordered list of stages, each a condition held for a number of seconds. Which
+timeline a run used is recorded in its results file, together with the scale
+applied to its holds.
 
+- **`sweep`** is the release schedule: `clean` → `rtt100` → `loss1` → `loss5` →
+  `rate100` → `rate20` → `jitter` → `clean`, and it ends where it started,
+  because whether a tool is still the tool it was after the path recovers is
+  part of the question;
 - **`soak`** rotates a shorter one for a longer time: `clean` → `loss1` →
-  `rtt100` → `loss5` → `clean`, 180 s each;
-- **`cost`** and **`screen`** run a single stage — `--path` at `--secs`
-  (60 s by default);
-- **any test** accepts an explicit `--timeline clean:60,loss1:120,...`.
+  `rtt100` → `loss5` → `clean`;
+- **`single`** is one stage — the fixed operating point a `cost` or a `screen`
+  run measures.
 
-| Stage | What it emulates | Applied to the path | Duration |
+`--scale` multiplies every hold without changing the order or the set, so the
+same shape answers a question in two minutes or in forty; the scale travels in
+the fingerprint, because a run that used it measured a different method.
+
+A **single-condition** run (`--condition NAME`, on every other scenario) is the
+same vocabulary without the schedule: one cell, one condition, one number.
+
+| Stage | What it emulates | Applied to the path | `sweep` hold |
 |---|---|---|---|
 | `clean` | a healthy network (the control) | nothing | 150 s |
 | `rtt100` | a long-haul or satellite link | 100 ms delay | 120 s |
 | `loss1` | a lossy wifi or mobile link | 10 ms delay, 1 % loss | 120 s |
 | `loss5` | a badly congested path | 100 ms delay, 5 % loss | 120 s |
-| `rate100` | a 100 Mbit uplink | 100 Mbit/s, 20 ms delay | 120 s |
-| `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay | 120 s |
+| `rate100` | a 100 Mbit uplink | 100 Mbit/s, 20 ms delay, 2000-packet queue | 120 s |
+| `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
+| `loss1_rate100` | a 100 Mbit uplink that also loses packets — the lossy WAN the carriers are chosen for | 100 Mbit/s, 20 ms delay, 1 % loss | focused cell only |
 | `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms | 120 s |
 | `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
 
@@ -326,9 +338,8 @@ any default timeline:
 MTU is an *interface* property, not a qdisc: a stage that uses one of these
 classes changes the path for **every packet on `lo`** during that stage — the
 peers', the harness's and the tool's control plane included — which is why they
-stay out of the default schedules and are run as focused single-stage cells
-(`--test=cost --path=loss1_mtu1280`, or `--test=screen --path=…` to A/B two
-builds on it). `meta.mtu_restore_to` records the interface's MTU at the start of
+stay out of the default timelines and are run as focused cells
+(`--condition loss1_mtu1280`, or `--profile screen` on it to A/B two builds). `meta.mtu_restore_to` records the interface's MTU at the start of
 the run and the harness restores it on teardown, failing loudly if it cannot —
 a leftover 1280 would poison every later run on the host. The reason the axis
 exists at all: `lo` is MTU 65536, so without it every datagram fits in one
@@ -536,6 +547,77 @@ against the sweeps that followed.
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
 | `[server.data].stripe_count` | `K = 4` (a striped group spreads one visitor connection over K data channels; see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
+
+### The carrier axis: TCP versus KCP (2026-10-10, this model)
+
+`mode` and `carrier` are independent, so the two axes are measured apart:
+`l3` / `l3-mux` are the same L3 arm over TCP with and without the multiplexer,
+and `l3-kcp` / `l3-mux-kcp` are the same pair over KCP. Every figure below is
+one results file, two measured rounds per arm, the A/A twin in the run as its
+own noise floor, and the condition named on the row — `clean` is an unshaped
+path, `tunnel` means the shaping lands on the link the carrier crosses.
+
+**Clean path, one bulk flow** (`--profile smoke --condition clean`, L3 arms, the
+control arm is the same topology with no tool in it):
+
+| Arm | Mode / carrier | Throughput | CPU per Gbit | Wire per visitor byte |
+|---|---|---|---|---|
+| control | — (no tool) | 41.813 Gbit/s | — | 1.0010 |
+| `l3` | direct / tcp | 4.173 Gbit/s | 0.855 s | 1.0745 |
+| `l3-mux` | multiplex / tcp | 2.995 Gbit/s | 1.435 s | 1.0898 |
+| `l3-kcp` | direct / kcp | 2.188 Gbit/s | 2.554 s | 1.1483 |
+| `l3-mux-kcp` | multiplex / kcp | 2.511 Gbit/s | 2.310 s | 1.1414 |
+| `l3~aa` | direct / tcp (the same arm twice) | 4.008 Gbit/s | 0.868 s | 1.0746 |
+
+Read it as two costs that stack: the multiplexer costs **28 %** of the bulk
+throughput and **68 %** more CPU per byte (`l3` → `l3-mux`), and the KCP carrier
+costs **48 %** of it and **3×** the CPU per byte (`l3` → `l3-kcp`) on a path with
+nothing wrong with it. The same ordering holds for one connection doing
+request-response round trips (`rr-1`: 16 283/s at p99 0.070 ms on `l3`,
+13 866/s at 0.086 ms on `l3-mux`, 9 742/s at 0.137 ms on `l3-kcp`), while
+16 concurrent connections finish within 12 % of each other on every arm — that
+scenario is bounded by the probe, not by the carrier.
+
+**Loss on the carrier's own leg** (`--condition-leg tunnel`), one bulk flow:
+
+| Condition (tunnel leg) | control | `l4` (mux/tcp) | `l4-kcp` | `l3` (direct/tcp) | `l3-kcp` | A/A twin |
+|---|---|---|---|---|---|---|
+| `loss1` — 10 ms delay, 1 % loss | 4.425 | 2.506 | **0.395** | 2.030 | **0.413** | 2.810 |
+| `loss1_rate100` — 100 Mbit/s, 20 ms, 1 % loss | 0.096 | 0.093 | **failed, 3/3 rounds** | 0.089 | 0.059 | 0.095 |
+
+All figures Gbit/s. KCP is **five to six times behind TCP** once the path loses
+packets, in both architectures, and on the rate-limited lossy leg the
+multiplexed KCP arm does not finish its test at all: three rounds out of three
+died with `iperf3: control socket has closed unexpectedly`, and the daemon's own
+debug log names the cause — `KCP session dead link`. The visitor's connection
+dies with the session, where a TCP carrier would simply have slowed down.
+
+The mechanism is in the carrier's own counters (`MOLEHILL_KCP_STATS=1`, the
+sender's side of a 3-second cell): **22 % of the datagrams it sent were
+retransmissions** and the path's own loss accounted for a fraction of that. With
+`nc=1` the ARQ has no congestion control — the pacer's only signal is a PONG
+that fails to arrive within 2.5 s — so a window-sized burst goes into whatever
+queue the path has; the standing queue delays the acknowledgements past KCP's
+escalating RTO, the retransmissions enlarge the queue, and on a rate-limited
+path the ARQ exhausts its 20-retransmit budget and declares the peer dead. That
+is a congestion collapse, self-inflicted, and it is the thing to fix before the
+carrier is worth choosing for a lossy path.
+
+**The one place KCP won.** On the same `loss1_rate100` leg, 16 concurrent
+connections of short round trips (`rr-16`) came out *ahead* on both KCP arms —
+338.6/s for `l3-kcp` and 337.8/s for `l4-kcp` against 323.2 control, 328.0 `l4`,
+335.3 `l3` and 323.3 for the A/A twin — with the best p99 of any arm (92.8 ms
+for `l4-kcp`, against 286.2 ms for the control). Fast retransmit is worth
+something on a lossy path; it is the bulk path where the missing congestion
+control costs more than the recovery gains.
+
+What this means for the guidance: `carrier = "kcp"` stays a choice for paths
+where TCP tunnels are blocked or throttled, not a general improvement, and the
+bulk-collapse above is a reason to prefer it only where the workload is
+many short interactions. The open work — and the reason this section exists in
+this shape — is a carrier whose pacing reacts to the path's rate instead of to a
+2.5-second timeout; the model A/Bs it against the current build with
+`--ab-arm l3-kcp --binary-b <other build>` on these same conditions.
 
 Which setting to pick, and why:
 [configuration.md](configuration.md#choosing-your-configuration-decision-tree);

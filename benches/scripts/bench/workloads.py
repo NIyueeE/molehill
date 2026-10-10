@@ -293,6 +293,8 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
         "dial_host": ctx.arm.dial_host,
         "backend_bind": ctx.arm.backend_bind,
         "arm_kind": ctx.arm.kind,
+        "arm_data_mode": ctx.arm.data_mode,
+        "arm_data_carrier": ctx.arm.data_carrier,
         "window_s": sample.get("elapsed_s"),
         "cpu_s": sample.get("cpu_s"),
         "cpu_s_total": sample.get("cpu_s_total"),

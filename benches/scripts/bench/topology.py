@@ -506,20 +506,25 @@ tun = "{TUN_SRV}"
                 [
                     f"[transparent.claims.s{port}]",
                     f'remote_bind_addr = "{model.TOPO_PUBLIC_IP}:{port}"',
-                    # The mode is written out even though it is the product's
-                    # default: an arm must record the configuration it measured.
-                    f'mode = "{arm.data_mode}"',
                 ]
             )
             + "\n"
             for port in SERVICE_PORTS
         )
+        # The data plane is stated once, on the block every claim inherits:
+        # both keys are written even when they are the product's defaults,
+        # because an arm must record the configuration it measured and the
+        # carrier is one of the axes this model compares.
         client = f"""[transparent]
 default_token = "bench"
 tun = "{TUN_CLI}"
 
 [transparent.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
+
+[transparent.data]
+default_mode = "{arm.data_mode}"
+default_carrier = "{arm.data_carrier}"
 
 {claims}"""
     else:
@@ -567,6 +572,7 @@ default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
 [client.data]
 default_mode = "{arm.data_mode}"
+default_carrier = "{arm.data_carrier}"
 {cap}
 {"".join(services)}"""
     (d / "server.toml").write_text(server)

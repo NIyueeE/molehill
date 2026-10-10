@@ -64,6 +64,7 @@ def cmd_list(args) -> int:
     for name, arm in model.ARM_CATALOG.items():
         print(
             f"  {name:<12} kind={arm.kind:<8} mode={arm.data_mode:<10} "
+            f"carrier={arm.data_carrier or '-':<5} "
             f"pool_cap={arm.pool_cap or 'default':<8} txqueuelen={arm.txqueuelen}"
         )
     print("\nprofiles (a profile is a time budget with a method attached):")
@@ -271,11 +272,32 @@ def _check_arms(c: Checker) -> None:
             spec = f"id={kind},mode=direct,txqueuelen={model.DEEP_TXQUEUELEN}"
             parsed = model.parse_arm_spec(spec)
             c.equal(f"arm spec {kind} txqueuelen", parsed.txqueuelen, 10000)
-    with contextlib.suppress(ValueError):
-        model.parse_arm_spec("id=l3,typo=1")
-        c.check("unknown arm key is refused", False, "typo=1 was accepted")
-        return
-    c.check("unknown arm key is refused", True)
+    # `mode` and `carrier` are independent axes: the product accepts every
+    # combination, so the catalog may state every combination.
+    for mode in ("direct", "multiplex"):
+        spec = f"id=l3,mode={mode},carrier=kcp"
+        parsed = model.parse_arm_spec(spec)
+        c.equal(f"arm spec carries kcp in {mode} mode", parsed.data_carrier, "kcp")
+        c.equal(f"arm spec keeps the {mode} mode", parsed.data_mode, mode)
+    c.check(
+        "arm spec refuses an unknown carrier",
+        _refused(model.parse_arm_spec, "id=l3,carrier=quic"),
+        "carrier=quic was accepted",
+    )
+    c.check(
+        "unknown arm key is refused",
+        _refused(model.parse_arm_spec, "id=l3,typo=1"),
+        "typo=1 was accepted",
+    )
+
+
+def _refused(fn, value) -> bool:
+    """True when the call raises: the shape of every refusal check here."""
+    try:
+        fn(value)
+    except ValueError:
+        return True
+    return False
 
 
 def _check_analysis(c: Checker) -> None:
