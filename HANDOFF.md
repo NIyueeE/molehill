@@ -261,13 +261,19 @@ configuration surface is free to change — and this cycle changes it.
    delays the acks past the escalating RTO, and the retransmissions enlarge the
    queue until the ARQ declares a live-but-rate-limited peer dead.
 
-   **The obvious fix was tried and is wrong**: `nc=0` (KCP's own congestion
-   control) as an A/B against the shipped build on `loss1_rate100` measured
-   **0.002 Gbit/s against 0.043** on bulk and 256/s against 344/s on `rr-16` —
-   KCP's built-in control collapses the window on a lossy path and never
-   recovers. So the fix is not a flag: it is a pacer that reacts to the path's
-   delivery rate or to RTT inflation, in the adapter, with this A/B as its
-   gate. The one place KCP won is worth keeping in view: on the same leg,
+   **Both obvious fixes were tried and both are wrong.** `nc=0` (KCP's own
+   congestion control) as an A/B against the shipped build on `loss1_rate100`
+   measured **0.002 Gbit/s against 0.043** on bulk and 256/s against 344/s on
+   `rr-16` — KCP's built-in control collapses the window on a lossy path and
+   never recovers. And capping the send window to the path's BDP (2048 → 256
+   segments, `set_wndsize`) left bulk where it was (**0.039 against 0.044**) and
+   the multiplexed arm still died. The counters say why a knob cannot do it: on
+   that leg the sender retransmits **24 % of its output** against a 1 % loss
+   rate, so the recovery loop itself is the defect — it needs a controller
+   driven by what the path delivers (delivery rate and/or RTT inflation), in the
+   adapter, with the `loss1_rate100` A/B as its gate. The engine exposes
+   `set_wndsize`/`wait_snd` but not `snd_una`/`rx_srtt`, so such a controller
+   starts with two accessors. The one place KCP won is worth keeping in view: on the same leg,
    many short interactions (`rr-16`) were fastest on both KCP arms with the best
    p99 — fast retransmit pays, and it is the bulk path where the missing control
    costs more.

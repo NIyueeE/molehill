@@ -681,6 +681,18 @@ for `l4-kcp`, against 286.2 ms for the control). Fast retransmit is worth
 something on a lossy path; it is the bulk path where the missing congestion
 control costs more than the recovery gains.
 
+**Two obvious fixes were tried, and both are wrong.** `nc = 0` (the engine's
+own congestion control) as an A/B against the shipped build on `loss1_rate100`
+measured 0.002 Gbit/s against 0.043 on bulk and 256/s against 344/s on `rr-16`:
+its window collapses on a lossy path and does not recover. Capping the send
+window to what fits the path instead of blasting 2.8 MiB into it (2048 → 256
+segments, an A/B on the same condition) left the bulk cell where it was (0.039
+against 0.044 Gbit/s) and did not stop the multiplexed arm's dead link. So the
+missing piece is not a window size either: the carrier's recovery loop retransmits
+**24 % of its output** on that leg against a 1 % loss rate, and it needs a
+controller driven by what the path actually delivers — which is a redesign of
+the adapter's pacing, not a constant.
+
 What this means for the guidance: `carrier = "kcp"` stays a choice for paths
 where TCP tunnels are blocked or throttled, not a general improvement, and the
 bulk-collapse above is a reason to prefer it only where the workload is
