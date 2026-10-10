@@ -2417,7 +2417,7 @@ fn spawn_transparent_service(
     }
 }
 
-/// Report that a service's pool task could not serve its listener any more./// Report that a service's pool task could not serve its listener any more.
+/// Report that a service's pool task could not serve its listener any more.
 ///
 /// Only the *abnormal* end is reported: a pool that returns `Ok` ended
 /// orderly (shutdown, or the control channel gone), and must never tell the
