@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   condition vocabulary gained `loss1_rate100` — a 100 Mbit uplink that also
   loses packets, the lossy WAN the carrier choice is actually about. First
   measurements of that axis: [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model).
+  Two metrics changed scope after an audit of their instrument:
+  `bytes_per_syscall` and `syscalls_per_s` are **device-I/O** readings
+  (`/proc/<pid>/io` does not account socket payload — 200 MB through a
+  socketpair moves `rchar` by 105 KB, the same bytes through a pipe by 209 MB),
+  so only an L3 arm publishes them now and a forwarding arm records a typed
+  absence instead of a number that described the runtime's plumbing.
 
 ### Added
 

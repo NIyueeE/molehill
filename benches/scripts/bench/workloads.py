@@ -336,17 +336,36 @@ TOOL_ONLY_METRICS = (
     "service_sockets_peak",
 )
 
+#: The metrics that describe **device** I/O — the L3 path's shape. Only an arm
+#: that moves its payload through a character device can produce them:
+#: `/proc/<pid>/io` accounts file and pipe traffic, not socket payload
+#: (measured: 200 MB through a socketpair moves `rchar` by 105 KB, the same
+#: bytes through a pipe by 209 MB), so for a forwarding arm the reading would
+#: describe the runtime's plumbing rather than the path. Reported as a typed
+#: absence instead, never as a number.
+DEVICE_IO_METRICS = ("bytes_per_syscall", "syscalls_per_s")
+
 
 def _counter_cell(spot: Spot, metrics: dict, extra: dict | None = None) -> Cell:
     merged = dict(metrics)
     window = spot.window
-    merged |= inst.counter_metrics(window["sample"], window.get("peaks", {}))
+    merged |= inst.counter_metrics(
+        window["sample"], window.get("peaks", {}), device_io=spot.ctx.arm.uses_device_io
+    )
     if window.get("sockets"):
         merged["service_sockets_peak"] = window["sockets"].get("server")
     unavailable: dict = {}
     if not spot.ctx.arm.is_tool:
         reason = "the control arm runs no tool processes"
         for metric in TOOL_ONLY_METRICS:
+            merged.pop(metric, None)
+            unavailable[metric] = {"reason": reason}
+    elif not spot.ctx.arm.uses_device_io:
+        reason = (
+            "this arm's payload never crosses a device, and `/proc/<pid>/io` "
+            "does not account socket payload"
+        )
+        for metric in DEVICE_IO_METRICS:
             merged.pop(metric, None)
             unavailable[metric] = {"reason": reason}
     return Cell(

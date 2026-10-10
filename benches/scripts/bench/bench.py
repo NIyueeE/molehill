@@ -43,6 +43,7 @@ import instruments as inst  # noqa: E402
 import model  # noqa: E402
 import runner  # noqa: E402
 import topology  # noqa: E402
+import workloads  # noqa: E402
 
 
 def cmd_list(args) -> int:
@@ -288,6 +289,41 @@ def _check_arms(c: Checker) -> None:
         "unknown arm key is refused",
         _refused(model.parse_arm_spec, "id=l3,typo=1"),
         "typo=1 was accepted",
+    )
+
+
+def _check_device_io(c: Checker) -> None:
+    """The device-I/O metrics belong to the arms that have a device.
+
+    `/proc/<pid>/io` does not account socket payload (measured in this
+    container: 200 MB through a socketpair moves `rchar` by 105 KB, the same
+    bytes through a pipe by 209 MB), so a forwarding arm would report its
+    runtime's plumbing as if it were the path. The reader of a result sees a
+    typed absence for those arms instead of a number that means nothing.
+    """
+    l3 = model.arms_from_names(["l3"], "/bin/true")[0]
+    l4 = model.arms_from_names(["l4"], "/bin/true")[0]
+    c.check("an L3 arm has device I/O", l3.uses_device_io, "l3 reported no device")
+    c.check("an L4 arm has no device I/O", not l4.uses_device_io, "l4 reported one")
+    sample = {
+        "elapsed_s": 2.0,
+        "io": {"server": {"rchar": 4096, "wchar": 2048, "syscr": 2, "syscw": 1}},
+        "syscalls": 3,
+        "cpu_s_total": 1.0,
+        "wire": {},
+    }
+    with_device = inst.counter_metrics(sample, {}, device_io=True)
+    without = inst.counter_metrics(sample, {}, device_io=False)
+    c.equal(
+        "a device arm reports bytes per syscall",
+        with_device["bytes_per_syscall"],
+        2048.0,
+    )
+    c.equal("a socket arm reports none", without["bytes_per_syscall"], None)
+    c.check(
+        "the two device metrics share one rule",
+        workloads.DEVICE_IO_METRICS == ("bytes_per_syscall", "syscalls_per_s"),
+        "the rule and the metric list disagree",
     )
 
 
@@ -586,6 +622,7 @@ def cmd_selfcheck(args) -> int:
     c = Checker()
     _check_registry(c)
     _check_arms(c)
+    _check_device_io(c)
     _check_analysis(c)
     _check_summary(c)
     _check_comparability(c)

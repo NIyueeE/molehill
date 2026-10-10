@@ -83,6 +83,16 @@ just bench-gate RESULTS.json           # may this run be published?
 just bench-selfcheck                   # the model's own checks (a fast gate)
 ```
 
+> **The two syscall metrics are device-I/O readings, and only an L3 arm can
+> produce them.** `/proc/<pid>/io` accounts file and pipe traffic, not socket
+> payload: measured in this container, 200 MB through a socketpair moves
+> `rchar` by 105 KB while the same bytes through a pipe move it by 209 MB. A
+> forwarding arm's bytes never cross that boundary, so the reading would
+> describe the runtime's plumbing instead of the path — the model records a
+> **typed absence** for those arms and `just bench-selfcheck` fails if the rule
+> and the metric list ever disagree. For an L3 arm the reading is exactly what
+> it claims to be: the packets read from and written to the TUN device.
+
 ### The rules the model enforces
 
 - **A metric is defined once, in code.** Unit, direction, the denominator it is
@@ -156,8 +166,8 @@ the definitions are what the report and the verdict render.
 | `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request (the setup a visitor pays to arrive) | one connection |
 | `cpu_s_per_gbit` | s/Gbit | lower is better | tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered | Gbit on the visitor's link egress |
 | `cpu_cores` | cores | lower is better | tool CPU-seconds / measured window | the workload's measured window |
-| `bytes_per_syscall` | B | higher is better | tool process rchar+wchar / syscr+syscw (the I/O granularity) | one read/write-family syscall |
-| `syscalls_per_s` | 1/s | lower is better | tool process syscr+syscw / measured window | the workload's measured window |
+| `bytes_per_syscall` | B | higher is better | device I/O per call: the tool process's rchar+wchar / syscr+syscw. **L3 arms only** — see the note under the table | one read/write-family syscall |
+| `syscalls_per_s` | 1/s | lower is better | device I/O calls per second: the tool process's syscr+syscw over the measured window. **L3 arms only** | the workload's measured window |
 | `wire_per_visitor_byte` | ratio | lower is better | tunnel-link bytes (both directions) / visitor-link egress bytes | bytes the visitor offered |
 | `mean_carried_packet_b` | B | context, not a verdict | tunnel-link bytes / tunnel-link packets, both directions | one packet on the tunnel link |
 | `rss_peak_mib` | MiB | lower is better | peak RSS summed over the tool's daemons, sampled during the workload | one process set |

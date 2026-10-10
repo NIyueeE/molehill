@@ -71,6 +71,14 @@ just bench-gate RESULTS.json           # may this run be published?
 just bench-selfcheck                   # the model's own checks (a fast gate)
 ```
 
+> **这两个系统调用指标是设备 I/O 读数,只有 L3 臂能产出。**
+> `/proc/<pid>/io` 记的是文件与管道流量,不记 socket 载荷:在本容器内实测,200 MB
+> 经过 socketpair 只让 `rchar` 增加 105 KB,而同样字节经过管道会让它增加 209 MB。
+> 转发臂的字节从不跨越这条边界,读数描述的就会是运行时的管道而不是那条路径——
+> 模型对这类臂记录**类型化缺失**,而 `just bench-selfcheck` 会在规则与指标列表
+> 不一致时失败。对 L3 臂而言,这个读数正是它声称的东西:从 TUN 设备读出与写入
+> TUN 设备的包。
+
 ### 模型强制的规则
 
 - **一个指标只在代码里定义一次。** 单位、方向、它作为比值时所用的分母、能够
@@ -136,8 +144,8 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `setup_p50_ms` | ms | 越低越好 | 建立一条连接所需时间的中位数,前提是工作负载每次请求都新开一条连接(访客为抵达而付出的建连代价) | 一条连接 |
 | `cpu_s_per_gbit` | s/Gbit | 越低越好 | 工具 CPU 秒数(user+sys,两个 daemon 合计) / 访客报价的 Gbit | 访客链路出方向上的 Gbit |
 | `cpu_cores` | cores | 越低越好 | 工具 CPU 秒数 / 测量窗口 | 工作负载的测量窗口 |
-| `bytes_per_syscall` | B | 越高越好 | 工具进程的 rchar+wchar / syscr+syscw(I/O 粒度) | 一次 read/write 族系统调用 |
-| `syscalls_per_s` | 1/s | 越低越好 | 工具进程的 syscr+syscw / 测量窗口 | 工作负载的测量窗口 |
+| `bytes_per_syscall` | B | 越高越好 | 每次设备 I/O 的字节数:工具进程的 rchar+wchar / syscr+syscw。**仅 L3 臂**——见表格下方的说明 | 一次 read/write 族系统调用 |
+| `syscalls_per_s` | 1/s | 越低越好 | 每秒设备 I/O 调用数:工具进程的 syscr+syscw 除以测量窗口。**仅 L3 臂** | 工作负载的测量窗口 |
 | `wire_per_visitor_byte` | ratio | 越低越好 | 隧道链路字节数(双向) / 访客链路出方向字节数 | 访客报价的字节数 |
 | `mean_carried_packet_b` | B | 背景,不是判定 | 隧道链路字节数 / 隧道链路包数,双向 | 隧道链路上的一个包 |
 | `rss_peak_mib` | MiB | 越低越好 | 在工作负载进行中采样,工具各 daemon 的 RSS 峰值之和 | 一组进程 |

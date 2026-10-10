@@ -407,7 +407,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "id": "bytes_per_syscall",
         "unit": "B",
         "direction": "higher",
-        "definition": "tool process rchar+wchar / syscr+syscw (the I/O granularity)",
+        "definition": (
+            "device I/O per call: the tool process's rchar+wchar / syscr+syscw. "
+            "Only an L3 arm can produce it — `/proc/<pid>/io` does not account "
+            "socket payload — so a forwarding arm records a typed absence"
+        ),
         "denominator": "one read/write-family syscall",
         "needs": (
             "bulk",
@@ -425,7 +429,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "id": "syscalls_per_s",
         "unit": "1/s",
         "direction": "lower",
-        "definition": "tool process syscr+syscw / measured window",
+        "definition": (
+            "device I/O calls per second: the tool process's syscr+syscw over "
+            "the measured window. The L3 path's shape, and only its: see "
+            "`bytes_per_syscall`"
+        ),
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
@@ -818,6 +826,18 @@ class Arm:
     @property
     def states_kcp(self) -> bool:
         return self.data_carrier == "kcp"
+
+    @property
+    def uses_device_io(self) -> bool:
+        """Whether this arm's payload crosses a character device.
+
+        Only the L3 path does: a claim reads and writes whole packets on its TUN
+        device. Everything else moves payload through sockets, and
+        `/proc/<pid>/io` does not account socket payload (measured: 200 MB
+        through a socketpair moves `rchar` by 105 KB, the same bytes through a
+        pipe by 209 MB), so the device-I/O metrics can only be produced here.
+        """
+        return self.kind == "l3"
 
     @property
     def dial_host(self) -> str:
