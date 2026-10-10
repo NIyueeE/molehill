@@ -1118,8 +1118,8 @@ impl Config {
                 bail!("{entry} {name}: udp_send_queue_size must be greater than 0");
             }
 
-            #[cfg(feature = "multiplex")]
-            Config::validate_service_data(client.data.default_mode, name, s, entry)?;
+            #[cfg(all(feature = "multiplex", not(feature = "kcp")))]
+            Config::refuse_service_kcp_without_feature(name, s, entry)?;
         }
 
         Config::validate_transport_config(&client.transport)?;
@@ -1210,7 +1210,6 @@ impl Config {
     #[cfg(feature = "multiplex")]
     fn validate_data_config(client: &ClientConfig, model: ClientModel) -> Result<()> {
         use DataCarrier::Kcp;
-        use DataMode::Direct;
 
         let data = &client.data;
         let block = model.data_block();
@@ -1235,15 +1234,9 @@ impl Config {
             bail!("{block}.default_data_addr is missing the port: {addr}");
         }
 
-        if matches!(data.default_mode, Direct) {
-            if matches!(data.default_carrier, Kcp) {
-                bail!(
-                    "`{block}.default_carrier = \"kcp\"` requires `default_mode = \"multiplex\"`"
-                );
-            }
-            return Ok(());
-        }
-
+        // The carrier is orthogonal to the mode, and has been since a direct
+        // channel could ride a KCP session: `kcp` needs a build with the
+        // feature, and that is the whole rule.
         if matches!(data.default_carrier, Kcp) {
             #[cfg(not(feature = "kcp"))]
             bail!(
@@ -1254,34 +1247,24 @@ impl Config {
         Ok(())
     }
 
-    /// Validate one service's data-plane overrides: the same rules as the
-    /// global `[client.data]` block, applied to the merged view (the
-    /// service's value, or the global default when unset).
-    #[cfg(feature = "multiplex")]
-    fn validate_service_data(
-        default_mode: DataMode,
+    /// Refuse a service that asks for the KCP carrier in a binary without the
+    /// feature.
+    ///
+    /// `mode` and `carrier` are independent — a direct channel may ride a KCP
+    /// session — so this is the only per-service data-plane rule left, and it
+    /// exists only in the build that can fail it. The message names the
+    /// service, its block and the feature.
+    #[cfg(all(feature = "multiplex", not(feature = "kcp")))]
+    fn refuse_service_kcp_without_feature(
         name: &str,
         s: &ClientServiceConfig,
         entry: &str,
     ) -> Result<()> {
-        use DataCarrier::Kcp;
-        use DataMode::Direct;
-
-        let mode = s.mode.unwrap_or(default_mode);
-        if matches!(mode, Direct) {
-            if matches!(s.carrier, Some(Kcp)) {
-                bail!("{entry} {name}: `carrier = \"kcp\"` requires `mode = \"multiplex\"`");
-            }
-            return Ok(());
-        }
-
-        if matches!(s.carrier, Some(Kcp)) {
-            #[cfg(not(feature = "kcp"))]
+        if matches!(s.carrier, Some(DataCarrier::Kcp)) {
             bail!(
                 "{entry} {name}: `carrier = \"kcp\"` requires a binary built with the `kcp` feature"
             );
         }
-
         Ok(())
     }
 
@@ -2167,6 +2150,9 @@ default_mode = "multiplex"
         } else {
             "default_carrier = \"tcp\"\n"
         });
+        // One service overrides the carrier back to TCP and to direct mode:
+        // the per-service keys are independent of each other and of the block.
+
         config.push_str(
             r#"
 [client.services.muxed]
@@ -2324,8 +2310,10 @@ remote_addr = "other.example.com:2444"
     #[cfg(feature = "multiplex")]
     #[test]
     fn test_per_service_data_validation() {
-        // `carrier = "kcp"` requires multiplex mode.
-        let bad = r#"
+        // `mode` and `carrier` are independent: a direct service may ride a
+        // KCP session, and that pair must load (the direct channel *is* the
+        // session, so there is no multiplexer involved at all).
+        let direct_kcp = r#"
 [client]
 default_token = "t"
 
@@ -2338,7 +2326,20 @@ remote_bind_addr = "0.0.0.0:6080"
 mode = "direct"
 carrier = "kcp"
 "#;
-        assert!(Config::from_str(bad).is_err());
+        if cfg!(feature = "kcp") {
+            let cfg = Config::from_str(direct_kcp).unwrap();
+            let s = &cfg.client.unwrap().services["test"];
+            assert_eq!(s.mode, Some(DataMode::Direct));
+            assert_eq!(s.carrier, Some(DataCarrier::Kcp));
+        } else {
+            // Without the feature the carrier is refused, and the message names
+            // the feature rather than a mode the pair never needed.
+            let err = format!("{:#}", Config::from_str(direct_kcp).unwrap_err());
+            assert!(
+                err.contains("kcp"),
+                "the refusal must name the feature: {err}"
+            );
+        }
 
         // `max_tunnels = 0` is rejected, with the carrier named.
         let bad = r#"

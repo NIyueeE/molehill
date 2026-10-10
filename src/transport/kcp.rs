@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 use crate::kcp::{DatagramSink, KCP_OVERHEAD, Kcp, get_conv};
 use anyhow::{Context as _, Result, bail};
 use bytes::{Buf, Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::error::TrySendError;
@@ -2007,6 +2007,43 @@ impl AsyncWrite for KcpTunnelStream {
             KcpTunnelStream::Noise(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
+}
+
+/// Client side: open one KCP session to `remote`, carrying the protocol.
+///
+/// A TCP connection opens with one transport selector byte (or a full Noise
+/// handshake, where the wrapper owns the selector); a KCP session must open the
+/// same way, because everything above it — the hello, the prologue, the
+/// forwarder — is protocol-agnostic. This is that opening, in one place, so a
+/// KCP **tunnel** (yamux on top) and a KCP **direct data channel** (the session
+/// is the channel) can never drift apart.
+///
+/// The conversation id is random: together with the ephemeral source port it
+/// keeps the server's session map collision-free across restarts.
+#[cfg(all(feature = "client", feature = "multiplex"))]
+pub async fn connect_stream(
+    remote: SocketAddr,
+    #[cfg(feature = "noise")] noise: Option<&crate::config::NoiseConfig>,
+) -> Result<KcpTunnelStream> {
+    use rand::TryRng;
+
+    let mut rng = rand::rngs::SysRng;
+    let mut conv_bytes = [0u8; 4];
+    rng.try_fill_bytes(&mut conv_bytes)
+        .with_context(|| "Failed to generate a KCP conversation id")?;
+    let conv = u32::from_le_bytes(conv_bytes);
+
+    let stream = connect(remote, conv).await?;
+    #[cfg(feature = "noise")]
+    if let Some(cfg) = noise {
+        let keys = crate::transport::NoiseKeys::from_config(cfg)?;
+        return Ok(KcpTunnelStream::Noise(Box::new(
+            keys.wrap_initiator_full(stream).await?,
+        )));
+    }
+    let mut stream = stream;
+    stream.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
+    Ok(KcpTunnelStream::Plain(stream))
 }
 
 /// Client side: open one KCP session to `remote` under `conv`.

@@ -346,8 +346,8 @@ mod data_tests {
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
-    use crate::config::DataMode;
     use crate::config::parsing::Config;
+    use crate::config::{DataCarrier, DataMode};
 
     /// A claim has one channel, so the L3 model defaults to `direct`: the
     /// multiplex pool would be one stream on a one-tunnel pool, and the
@@ -398,13 +398,13 @@ remote_bind_addr = "10.99.0.1:8443"
         assert!(client.shared_pool());
     }
 
-    /// The KCP carrier does not multiplex, so asking for it without saying
-    /// `multiplex` is refused with the key to write — the same rule the
-    /// forwarding model has, now reachable through the L3 default.
+    /// A claim's carrier is independent of its mode: the default mode is
+    /// `direct`, and a direct channel over KCP is a session per channel rather
+    /// than a yamux stream, so the pair is exactly what the L3 default plus
+    /// `default_carrier = "kcp"` means.
     #[test]
-    fn a_kcp_carrier_needs_multiplex_explicitly() {
-        let err = Config::from_str(
-            r#"
+    fn a_kcp_carrier_is_allowed_in_direct_mode() {
+        let config = r#"
 [transparent]
 default_token = "t"
 
@@ -416,14 +416,22 @@ default_carrier = "kcp"
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
-"#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("[transparent.data].default_carrier")
-                && message.contains("requires `default_mode = \"multiplex\"`"),
-            "the refusal must name the block the reader wrote and the key to add, got: {message}"
-        );
+"#;
+        if cfg!(feature = "kcp") {
+            let client = Config::from_str(config)
+                .unwrap()
+                .into_l3_client()
+                .unwrap()
+                .client
+                .unwrap();
+            assert_eq!(client.data.default_mode, DataMode::Direct);
+            assert_eq!(client.data.default_carrier, DataCarrier::Kcp);
+        } else {
+            let message = format!("{:#}", Config::from_str(config).unwrap_err());
+            assert!(
+                message.contains("[transparent.data].default_carrier") && message.contains("kcp"),
+                "the refusal must name the block the reader wrote, got: {message}"
+            );
+        }
     }
 }

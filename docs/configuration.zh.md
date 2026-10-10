@@ -159,7 +159,7 @@ flowchart TD
 | `max_tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
 | `max_tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限 |
 | `carrier` | `"tcp"`(默认) | 有损与限速路径上表现良好的默认值;前提是网络不封锁 TCP 隧道 |
-| `carrier` | `"kcp"` | TCP 隧道被封锁/限速时的延迟优先 UDP 传输;它不做多路复用,因此需要配合 `noise` + 调高 `max_tunnels` 来拿连接上限 |
+| `carrier` | `"kcp"` | 在 TCP 被封锁、限速或有损的路径上改用 UDP 传输;它与 `mode` 相互独立,既能承载多路复用池(`multiplex` + `kcp`),也能做到每条通道一个会话(`direct` + `kcp`)。路径干净时它会损失吞吐,所以它是按路径选,而不是默认选 |
 | transport | `"plain"` | 不加密;每字节开销最低 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
 | 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节,之后池就热了,并可按需长到 `max_tunnels` |
@@ -185,8 +185,8 @@ default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:�
 
 [client.data] # 可选。所有服务的数据面默认值(特性 `multiplex`,默认构建的一部分)。每个服务都可以单独覆盖 default_mode/default_carrier——见下方 `[client.services.*]` 里的按服务键
 # default_data_addr = "example.com:2343" # 可选。数据面端点;默认为服务的控制端点(设置了 `client.services.<name>.remote_addr` 时用该地址,否则用 `client.control.default_remote_addr`)。`default_carrier = "kcp"` 时 KCP 会话用 UDP 拨控制地址——TCP 控制与 UDP KCP 可以共用一个端口(协议不同互不冲突)
-default_mode = "multiplex" # 可选。默认数据面模式:"multiplex"(默认)或 "direct"(每条数据通道一条连接;`carrier` 不适用)
-default_carrier = "tcp" # 可选。默认数据载体:"tcp"(默认)复用控制通道的传输栈;"kcp" 使用 KCP-over-UDP 会话(特性 `kcp`;服务端在第一条 `kcp` 注册到达时才打开 KCP 监听,无需服务端配置)。两种传输都可与 KCP 组合:transport 为 `noise` 时同样的 Noise 握手包裹每个 KCP 会话,`plain` 时会话保持明文
+default_mode = "multiplex" # 可选。默认数据面模式:"multiplex"(默认)或 "direct"(每个访问者连接一条数据通道,各自一条物理连接)。它与 `default_carrier` 相互独立:任何 `mode`/`carrier` 组合都成立
+default_carrier = "tcp" # 可选。默认数据载体:"tcp"(默认)复用控制通道的传输栈;"kcp" 使用 KCP-over-UDP 会话(特性 `kcp`;服务端在第一条 `kcp` 注册到达时才打开 KCP 监听,无需服务端配置)。两种传输都可与 KCP 组合:transport 为 `noise` 时同样的 Noise 握手包裹每个 KCP 会话,`plain` 时会话保持明文。`mode = "multiplex"` 时会话就是池里的隧道;`mode = "direct"` 时每条数据通道就是一个 KCP 会话,多路复用器的成帧完全不在这条路径上
 # shared_pool = false # 可选。把一条控制会话的所有服务放进每个 carrier 一个共享隧道池(true),而不是每个服务一个池(false,默认)。两者是同一套代码路径,只有池的 key 不同
 # idle_timeout = 60 # 可选。池在没有 stream、没有待打开、也没有被钉住的 UDP peer 的情况下要空闲多少秒才移除一条隧道。默认:60。池永远不会缩到少于一条隧道,也不会低于 UDP 推导出的下限
 [client.data.tcp] # 可选。TCP carrier 的弹性池上限
@@ -215,7 +215,7 @@ retry_interval = 1 # 可选。按服务的重连退避上限,语义与 `client.c
 token = "service-specific-token" # 可选。仅对本服务覆盖 `client.default_token`——例如对使用独立 token 的服务端做鉴权 # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # 可选。仅对本服务覆盖 `client.control.default_remote_addr`——它的控制通道(默认还包括数据面)拨向这个服务端。让同一个客户端可以把服务分散到多个 molehill 服务端
 mode = "multiplex" # 可选。仅对本服务覆盖 `client.data.default_mode`:"multiplex"(默认)或 "direct"
-carrier = "tcp" # 可选。仅对本服务覆盖 `client.data.default_carrier`;仅在 `mode = "multiplex"` 时有效。不设则继承默认值
+carrier = "tcp" # 可选。仅对本服务覆盖 `client.data.default_carrier`。不设则继承默认值;与 `mode` 相互独立
 transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" = 加密,"plain" = 明文;不设 = 跟随 `client.transport.type`)与 `noise` 密钥(本服务加密时使用;不设 = 用 `client.transport.noise`)。让同一个客户端明文与加密服务并存——例如拨向不同服务端、带自己公钥的服务
 
 [client.services.service2] # 可以定义多个服务
@@ -404,6 +404,11 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 `carrier`。`[transparent.transport]` 只有一个键 `proxy`,因为 L3 客户端发送的是访问者
 自己的流量:这一跳按设计就是明文链路,所以这个模型没有加密键可给;设备名写在
 `[transparent].tun`。
+
+和转发服务一样,认领的 `mode` 与 `carrier` 也相互独立:`direct` + `tcp`(默认组合)是
+每条认领一条 TCP 连接,`direct` + `kcp` 是每条认领一个 KCP 会话——载体自己的会话**就是**
+数据通道,上面没有多路复用器——而 `multiplex` 这一组合属于用一个共享池服务多条认领的
+客户端。
 
 `[transparent.data]` 接受与 `[client.data]` 相同的键——`default_data_addr`、
 `default_mode`、`default_carrier`、`shared_pool`、`idle_timeout`,以及两个按载体的

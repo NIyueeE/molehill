@@ -891,6 +891,23 @@ async fn kcp_tunnel() -> Result<()> {
     Ok(())
 }
 
+/// The other half of the carrier axis: `mode = "direct"` with
+/// `carrier = "kcp"` — one KCP session per visitor, no multiplexer above it.
+/// The session *is* the data channel, so the KCP listener must read the
+/// data-channel hello (not only the tunnel hello) and hand the stream to the
+/// service's pool like any other direct channel. Full lifecycle, over Noise.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+#[tokio::test]
+async fn kcp_direct_channel() -> Result<()> {
+    init();
+
+    spawn_tcp_backends();
+
+    test("tests/for_tcp/kcp_direct.toml", Type::Tcp, None).await?;
+
+    Ok(())
+}
+
 /// KCP tunnels on the default data-plane endpoint: with neither
 /// `[client.data].default_addr` nor `[server.data].bind_addr` set, the KCP sessions
 /// dial the control address over UDP — TCP control and UDP KCP data share

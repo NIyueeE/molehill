@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The KCP carrier is independent of the data-plane mode: a `direct` service
+  can ride a KCP session.** `carrier = "kcp"` used to require
+  `mode = "multiplex"`, because a KCP session was only ever a multiplexed
+  tunnel. It is now also a **direct data channel**: the client opens one KCP
+  session per channel and the server's KCP listener reads the
+  data-channel hello exactly as its TCP listener does, so
+  `mode = "direct"` + `carrier = "kcp"` carries one channel with no yamux
+  framing above it. Configuring the pair is what this changes — the previous
+  refusal is gone, in the client model and in the transparent (L3) model alike,
+  and both `[client.data]`/`[client.services.*]` and
+  `[transparent.data]`/`[transparent.claims.*]` accept every mode/carrier
+  combination. What it costs and what it buys is measured, per path condition,
+  in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
+
 ### Changed
 
 - **The benchmark model is one runner again: the soak sweep is a profile of

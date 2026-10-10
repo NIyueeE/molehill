@@ -444,7 +444,7 @@ async fn ensure_kcp_listener(
     })?;
     info!("Listening for KCP tunnels at {bound}");
     let acceptor = Arc::new(acceptor);
-    tokio::spawn(run_kcp_tunnel_listener(
+    tokio::spawn(run_kcp_listener(
         Arc::clone(&acceptor),
         Arc::clone(&registry),
         Arc::clone(&shared),
@@ -699,7 +699,7 @@ async fn handle_connection(
             // A direct data channel names its service in the 4 bytes right
             // after the hello.
             let service_id = read_stream_prologue(&mut conn).await?;
-            do_v4_data_channel(conn, registry, nonce, service_id).await?;
+            do_v4_data_channel(tcp_data_channel(conn), registry, nonce, service_id).await?;
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
@@ -1177,14 +1177,19 @@ impl SessionCtx {
 
 /// One end of a forwarded connection, as handed to the connection pool.
 ///
-/// With the `multiplex` feature a data channel is either a plain transport
-/// stream (no-mux mode) or one yamux stream of the client's tunnel.
+/// With the `multiplex` feature a data channel is a plain transport stream
+/// (no-mux mode), one yamux stream of the client's tunnel, or — with the `kcp`
+/// carrier — a KCP session that *is* the channel.
 #[cfg(not(feature = "multiplex"))]
 type DataChannel = ServerStream;
 
 #[cfg(feature = "multiplex")]
 enum DataChannel {
     Raw(ServerStream),
+    /// A direct channel over KCP: no yamux above it, the session's own byte
+    /// stream is the channel (`carrier = "kcp"` with `mode = "direct"`).
+    #[cfg(feature = "kcp")]
+    RawKcp(crate::transport::kcp::KcpTunnelStream),
     Mux(crate::transport::MuxStream),
 }
 
@@ -1208,6 +1213,8 @@ impl tokio::io::AsyncRead for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -1222,6 +1229,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -1231,6 +1240,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
@@ -1240,6 +1251,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -1250,8 +1263,13 @@ impl tokio::io::AsyncWrite for DataChannel {
 /// A channel for a service that is not registered (a stale one, or an id the
 /// client never registered) is dropped here; the session — and every other
 /// service on it — is untouched.
+///
+/// The carrier decides how the channel was dialed (TCP, or a KCP session when
+/// the client declared that carrier for a direct service), not what happens
+/// here: once the prologue is read, every direct channel is one byte stream
+/// handed to the service's pool.
 async fn do_v4_data_channel(
-    conn: ServerStream,
+    conn: DataChannel,
     registry: Arc<Registry>,
     nonce: Nonce,
     service_id: ServiceId,
@@ -1263,13 +1281,19 @@ async fn do_v4_data_channel(
         return Ok(());
     };
 
-    conn.hint(SocketOpts::for_service(None));
     handle
         .data_channel
-        .send(new_data_channel(conn))
+        .send(conn)
         .await
-        .with_context(|| "Data channel for a stale control session")?;
+        .map_err(|_| anyhow!("Data channel for a stale control session"))?;
     Ok(())
+}
+
+/// A direct data channel accepted on the TCP data listener: apply the
+/// per-connection TCP options first — there is a socket to apply them to.
+fn tcp_data_channel(conn: ServerStream) -> DataChannel {
+    conn.hint(SocketOpts::for_service(None));
+    new_data_channel(conn)
 }
 
 /// A v4 multiplex tunnel: it belongs to the session, not to a service, and
@@ -1529,11 +1553,17 @@ where
     Some(queue)
 }
 
-/// Accept KCP tunnel sessions (arm 2 of the transport comparison) and
-/// upgrade each into a yamux data tunnel. Sessions authenticate exactly like
-/// TCP tunnels: the hello carries the control session's nonce.
+/// Accept KCP sessions (arm 2 of the transport comparison) and serve whatever
+/// the hello on them turns out to be.
+///
+/// One listener serves both data-plane shapes, exactly as the TCP data
+/// listener does: a **tunnel** hello opens a yamux session (the `multiplex`
+/// mode), a **data channel** hello is a direct channel whose carrier happens to
+/// be KCP. Which one it is, is the client's own declaration — the same
+/// `carrier` it registered the service with — so nothing here needs a
+/// configuration of its own.
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
-async fn run_kcp_tunnel_listener(
+async fn run_kcp_listener(
     acceptor: Arc<KcpAcceptor>,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
@@ -1550,7 +1580,7 @@ async fn run_kcp_tunnel_listener(
                 let shared = Arc::clone(&shared);
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_kcp_tunnel_session(
+                        if let Err(e) = handle_kcp_session(
                             session,
                             registry,
                             shared,
@@ -1569,10 +1599,10 @@ async fn run_kcp_tunnel_listener(
     debug!("KCP tunnel listener stopped");
 }
 
-/// Validate one accepted KCP session (optional Noise handshake + tunnel
-/// hello) and hand it to the shared tunnel upgrade path.
+/// Open one accepted KCP session (transport selector, optional Noise
+/// handshake), read the hello, and hand it to the path its variant names.
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
-async fn handle_kcp_tunnel_session(
+async fn handle_kcp_session(
     mut session: crate::transport::kcp::AcceptedSession,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
@@ -1602,7 +1632,7 @@ async fn handle_kcp_tunnel_session(
                 KcpTunnelStream::Noise(Box::new(
                     tokio::time::timeout(deadline, keys.wrap_responder(session.stream))
                         .await
-                        .with_context(|| "KCP tunnel noise handshake timed out")??,
+                        .with_context(|| "KCP session noise handshake timed out")??,
                 ))
             }
             #[cfg(not(feature = "noise"))]
@@ -1616,15 +1646,40 @@ async fn handle_kcp_tunnel_session(
         other => bail!("Unknown transport selector {other:#04x}"),
     };
 
-    // Read and validate the tunnel hello, then run the shared upgrade.
-    let (owner, nonce) =
-        tokio::time::timeout(deadline, validate_tunnel_hello(&mut io, &registry, "KCP"))
-            .await
-            .with_context(|| "KCP tunnel hello timed out")??;
+    // The hello names the shape: a tunnel (multiplex mode, yamux above this
+    // stream) or a direct data channel (the session *is* the channel).
+    let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
+        .await
+        .with_context(|| "KCP hello timed out")??;
+    match hello {
+        Hello::DataChannelHello(_, nonce) => {
+            let service_id = read_stream_prologue(&mut io).await?;
+            do_v4_data_channel(DataChannel::RawKcp(io), registry, nonce, service_id).await
+        }
+        Hello::DataChannelTunnelHello(_, nonce) => {
+            let owner = tunnel_owner(&registry, nonce, "KCP").await?;
+            serve_kcp_tunnel(io, owner, nonce, registry, max_tunnels_per_client).await
+        }
+        other @ Hello::ControlChannelHello(..) => {
+            bail!("Expected a data-plane hello on the KCP session, got {other:?}")
+        }
+    }
+}
 
-    // A KCP tunnel is one of the client's multiplexed tunnels and takes a
-    // slot exactly like a TCP one: the valve must not be bypassable by
-    // choosing the other carrier.
+/// Reserve the tunnel's slot on its session and run the shared upgrade.
+///
+/// A KCP tunnel is one of the client's multiplexed tunnels and takes a slot
+/// exactly like a TCP one: the valve must not be bypassable by choosing the
+/// other carrier. Shared by the TCP and KCP accept paths so the two cannot
+/// disagree about the cap.
+#[cfg(all(feature = "kcp", feature = "multiplex"))]
+async fn serve_kcp_tunnel(
+    mut io: crate::transport::kcp::KcpTunnelStream,
+    owner: TunnelOwner,
+    nonce: Nonce,
+    registry: Arc<Registry>,
+    max_tunnels_per_client: usize,
+) -> Result<()> {
     let session = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
         TunnelSlot::Held(slot) => Some(slot),
         TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
@@ -1643,36 +1698,23 @@ async fn handle_kcp_tunnel_session(
     upgrade_to_tunnel(io, owner, session).await
 }
 
-/// Read the tunnel hello on a freshly established tunnel stream (any arm)
-/// and resolve the session it belongs to via the session nonce.
+/// Resolve the session a validated tunnel hello names.
 ///
 /// A tunnel names its session only; every stream inside it names its own
-/// service (see `TunnelOwner::Session`).
+/// service (see [`TunnelOwner`]). `arm` is the carrier's name, so a stale nonce
+/// says which listener saw it.
+///
+/// The KCP listener is the only caller: the TCP path builds its owner inline
+/// (it has no arm name to report).
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
-async fn validate_tunnel_hello<S>(
-    conn: &mut S,
-    registry: &Registry,
-    arm: &str,
-) -> Result<(TunnelOwner, Nonce)>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let (_version, hello) = read_hello(conn).await?;
-    match hello {
-        Hello::DataChannelTunnelHello(_, nonce) => {
-            if !registry.sessions.read().await.contains_key(&nonce) {
-                bail!("{arm} tunnel hello carried an incorrect nonce");
-            }
-            Ok((
-                TunnelOwner {
-                    sessions: Arc::clone(&registry.sessions),
-                    nonce,
-                },
-                nonce,
-            ))
-        }
-        other => bail!("Expected a tunnel hello on the {arm} tunnel, got {other:?}"),
+async fn tunnel_owner(registry: &Registry, nonce: Nonce, arm: &str) -> Result<TunnelOwner> {
+    if !registry.sessions.read().await.contains_key(&nonce) {
+        bail!("{arm} tunnel hello carried an incorrect nonce");
     }
+    Ok(TunnelOwner {
+        sessions: Arc::clone(&registry.sessions),
+        nonce,
+    })
 }
 
 /// A live control channel, kept alive by holding the three channel
