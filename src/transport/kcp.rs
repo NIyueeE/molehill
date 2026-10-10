@@ -1308,6 +1308,55 @@ fn park(pace: &mut PaceState, buf: &Bytes, spans: Vec<Span>) {
     pace.parked.push_back(ParkedBatch::new(buf.clone(), spans));
 }
 
+/// Put one batch's spans on the wire. Returns how many datagrams the kernel
+/// took (a short count means its send buffer filled, not that the rest are
+/// lost — the caller parks them).
+#[cfg(target_os = "linux")]
+async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    // Park on writability first: this arms tokio's writable interest — a bare
+    // `try_io` would only run the closure on *cached* readiness and drop the
+    // very first batch. After an EAGAIN, `try_io` clears the cached flag, so
+    // this await parks until the kernel send buffer drains — no spinning.
+    net.socket.writable().await?;
+    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
+    net.socket.try_io(Interest::WRITABLE, || {
+        send_batch.send_spans(net.socket.as_raw_fd(), net.peer, buf, spans)
+    })
+}
+
+/// Put one batch's spans on the wire, one datagram at a time (see the Linux
+/// version for the batched one). A two-iovec span is reassembled into a single
+/// buffer here — the copy this platform pays, byte-identical on the wire.
+#[cfg(not(target_os = "linux"))]
+async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::Result<usize> {
+    let mut dgram_buf = [0u8; KCP_MTU_CEILING + KCP_OVERHEAD];
+    let mut sent = 0;
+    for span in spans {
+        let (header, payload): (&[u8], &[u8]) = match span {
+            Span::Staged { off, len } => (&buf[*off..*off + *len], &[]),
+            Span::Split { hdr_off, payload } => {
+                (&buf[*hdr_off..*hdr_off + KCP_OVERHEAD], payload.as_ref())
+            }
+        };
+        let total = header.len() + payload.len();
+        if total > dgram_buf.len() {
+            continue; // cannot happen: one datagram is at most one MTU
+        }
+        net.socket.writable().await?;
+        dgram_buf[..header.len()].copy_from_slice(header);
+        dgram_buf[header.len()..total].copy_from_slice(payload);
+        match net.socket.try_send_to(&dgram_buf[..total], net.peer) {
+            Ok(_) => sent += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(sent)
+}
+
 /// Drain KCP's outbound datagrams onto the wire, through the pacer.
 ///
 /// Nothing here is dropped on refusal: a datagram the pacer or the kernel will
@@ -1322,78 +1371,30 @@ async fn drain_dgrams(
     kcp: &Kcp<DatagramOut>,
     sent_any: &mut bool,
 ) {
-    #[cfg(target_os = "linux")]
-    {
-        if pace.parked.is_empty() {
-            drain_batches(dgram_rx, net, pace, sent_any).await;
-        } else {
-            // Parked data goes first: it is older than anything still in the
-            // channel, and letting newer datagrams overtake it would reorder a
-            // stream the ARQ has already put on the wire.
-            drain_parked(net, pace, kcp, sent_any).await;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // No sendmmsg here, so a two-iovec (split) datagram is reassembled
-        // into one buffer before the single-datagram send — the copy this
-        // platform pays, byte-identical on the wire.
-        let mut dgram_buf = [0u8; KCP_MTU_CEILING + KCP_OVERHEAD];
-        let rate = pace.rate_bps;
-        while let Ok(batch) = dgram_rx.try_recv() {
-            for span in &batch.spans {
-                let (header, payload): (&[u8], &[u8]) = match span {
-                    Span::Staged { off, len } => (&batch.buf[*off..*off + *len], &[]),
-                    Span::Split { hdr_off, payload } => (
-                        &batch.buf[*hdr_off..*hdr_off + KCP_OVERHEAD],
-                        payload.as_ref(),
-                    ),
-                };
-                let total = header.len() + payload.len();
-                if total > dgram_buf.len() {
-                    continue; // cannot happen: one datagram is at most one MTU
-                }
-                if pace.pacer.allow(Instant::now(), total, rate).is_err() {
-                    park(pace, &batch.buf, vec![span.clone()]);
-                    continue;
-                }
-                if net.socket.writable().await.is_err() {
-                    return;
-                }
-                dgram_buf[..header.len()].copy_from_slice(header);
-                dgram_buf[header.len()..total].copy_from_slice(payload);
-                match net.socket.try_send_to(&dgram_buf[..total], net.peer) {
-                    Ok(_) => *sent_any = true,
-                    Err(e) => {
-                        debug!("KCP datagram send failed (peer {}): {e}", net.peer);
-                        park(pace, &batch.buf, vec![span.clone()]);
-                    }
-                }
-            }
-        }
+    if pace.parked.is_empty() {
+        drain_batches(dgram_rx, net, pace, sent_any).await;
+    } else {
+        // Parked data goes first: it is older than anything still in the
+        // channel, and letting newer datagrams overtake it would reorder a
+        // stream the ARQ has already put on the wire.
+        drain_parked(net, pace, kcp, sent_any).await;
     }
 }
 
 /// Send what an earlier round parked, in order, as tokens accrue. Returns when
 /// the parked queue is empty or the rate will not allow more this round.
-#[cfg(target_os = "linux")]
 async fn drain_parked(
     net: &SessionNet,
     pace: &mut PaceState,
     kcp: &Kcp<DatagramOut>,
     sent_any: &mut bool,
 ) {
-    use std::os::fd::AsRawFd;
-    use tokio::io::Interest;
-
-    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
-    // Read the rate before borrowing the queue: `allowance` is a read of the
-    // pacer, the queue walk is a write to it.
-    let rate = pace.rate_bps;
     let deadline = PaceState::park_deadline(kcp);
     while let Some(front) = pace.parked.front_mut() {
-        // Past the deadline the pacer yields: holding the datagram longer
-        // would have the ARQ send the same bytes again (see `park_deadline`).
+        let rate = pace.rate_bps;
+        // Past the deadline the pacer yields: a datagram held longer than the
+        // engine's own retransmission timer has the ARQ send the same bytes
+        // again (see `PaceState::park_deadline`).
         let overdue = front.parked_at.elapsed() >= deadline;
         let mut take: Vec<Span> = Vec::with_capacity(front.spans.len());
         let mut rest: Vec<Span> = Vec::new();
@@ -1417,15 +1418,11 @@ async fn drain_parked(
         } else {
             front.spans = rest;
         }
-        if net.socket.writable().await.is_err() {
-            park(pace, &buf, take);
-            return;
-        }
-        match net.socket.try_io(Interest::WRITABLE, || {
-            send_batch.send_spans(net.socket.as_raw_fd(), net.peer, &buf, &take)
-        }) {
+        match send_spans(net, &buf, &take).await {
             Ok(k) => {
-                *sent_any = true;
+                if k > 0 {
+                    *sent_any = true;
+                }
                 if k < take.len() {
                     // The kernel took what it could; the tail goes back to the
                     // front of the queue rather than on the floor.
@@ -1445,30 +1442,29 @@ async fn drain_parked(
 
 /// Take fresh batches from the engine and put what the pacer allows on the
 /// wire, parking the refused tail (see [`drain_dgrams`]).
-#[cfg(target_os = "linux")]
 async fn drain_batches(
     dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
     net: &SessionNet,
     pace: &mut PaceState,
     sent_any: &mut bool,
 ) {
-    use std::os::fd::AsRawFd;
-    use tokio::io::Interest;
-
-    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
-    // Spans the pacer allowed from the batch in hand (= the whole batch unless
-    // the rate is currently cut). A `Span::Split` clones the payload's `Bytes`
-    // handle (an O(1) refcount share), never the payload itself.
-    let mut allowed: Vec<Span> = Vec::with_capacity(BATCH);
     loop {
         let Ok(batch) = dgram_rx.try_recv() else {
             return;
         };
-        allowed.clear();
-        let rate = pace.rate_bps;
+        // Spans the pacer allowed from the batch in hand (= the whole batch
+        // unless the rate is currently cut). A `Span::Split` clones the
+        // payload's `Bytes` handle (an O(1) refcount share), never the payload
+        // itself.
+        let mut allowed: Vec<Span> = Vec::with_capacity(batch.spans.len());
         let mut denied: Vec<Span> = Vec::new();
         for span in &batch.spans {
-            if denied.is_empty() && pace.pacer.allow(Instant::now(), span.len(), rate).is_ok() {
+            let ok = denied.is_empty()
+                && pace
+                    .pacer
+                    .allow(Instant::now(), span.len(), pace.rate_bps)
+                    .is_ok();
+            if ok {
                 allowed.push(span.clone());
             } else {
                 denied.push(span.clone());
@@ -1478,19 +1474,11 @@ async fn drain_batches(
             park(pace, &batch.buf, denied);
             return;
         }
-        // Park on writability first: this arms tokio's writable interest — a
-        // bare `try_io` would only run the closure on *cached* readiness and
-        // drop the very first batch. After an EAGAIN, `try_io` clears the
-        // cached flag, so this await parks until the kernel send buffer drains
-        // — no spinning.
-        if net.socket.writable().await.is_err() {
-            return;
-        }
-        match net.socket.try_io(Interest::WRITABLE, || {
-            send_batch.send_spans(net.socket.as_raw_fd(), net.peer, &batch.buf, &allowed)
-        }) {
+        match send_spans(net, &batch.buf, &allowed).await {
             Ok(k) => {
-                *sent_any = true;
+                if k > 0 {
+                    *sent_any = true;
+                }
                 // A partial send and an EAGAIN mean the same thing — the
                 // kernel took what it could — so the tail is parked with the
                 // refused rest and retried, never dropped.
@@ -1503,7 +1491,7 @@ async fn drain_batches(
             }
             Err(e) => {
                 debug!("KCP datagram send failed (peer {}): {e}", net.peer);
-                let mut unsent = std::mem::take(&mut allowed);
+                let mut unsent = allowed;
                 unsent.extend(denied);
                 park(pace, &batch.buf, unsent);
                 return;
@@ -1526,13 +1514,15 @@ fn closing_quiescent(
     delivered: bool,
     kcp: &Kcp<DatagramOut>,
     spill: &std::collections::VecDeque<ReadBatch>,
+    parked: &std::collections::VecDeque<ParkedBatch>,
     quiet_rounds: &mut u32,
     close_deadline: Instant,
 ) -> bool {
-    // Quiet = ARQ queue empty and nothing emitted or delivered:
-    // everything KCP accepted was acked (or the peer vanished, which the
-    // deadline bounds).
-    if !sent_any && !delivered && kcp.wait_snd() == 0 && spill.is_empty() {
+    // Quiet = ARQ queue empty, nothing emitted or delivered, and nothing the
+    // pacer is still holding: a parked datagram is data the peer has not seen,
+    // so a session with one is not done — the engine would sit `wait_snd`
+    // until the close deadline and then drop the tail.
+    if !sent_any && !delivered && kcp.wait_snd() == 0 && spill.is_empty() && parked.is_empty() {
         *quiet_rounds += 1;
     } else {
         *quiet_rounds = 0;
@@ -1749,6 +1739,7 @@ async fn pump_tail(
                 delivered,
                 kcp,
                 tail.spill,
+                &pace.parked,
                 tail.quiet_rounds,
                 close_deadline,
             )
