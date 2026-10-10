@@ -35,8 +35,11 @@
 
 - **v0.10.0 shipped on 2026-10-01**: the release run is green on all thirteen
   jobs (nine platform builds, GitHub Release, GHCR, crates.io), and the
-  released artifact is `benches/scripts/soak/results-soak-v0.10.0.json` —
-  measured at `96bda00`, gated by `just soak-check` with no waiver.
+  released artifact is `benches/records/results-soak-v0.10.0.json` — measured
+  at `96bda00` with the model the bench model replaced, and gated by the
+  sweep's own check with no waiver. That schema is history now: the next
+  release publishes `results-bench-vX.Y.Z.json` and gates it with
+  `just bench-gate`.
 - **The release cost four tag pushes, and the three failures are worth
   remembering**: the emulated cross legs (`native_target` guard missing on a
   new spawn-based test), the musl leg (an assertion pinned to glibc's wording),
@@ -50,7 +53,7 @@
   `v0.10.0` names `104626f`.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
-  `Cargo.*`, `build.rs` or `benches/scripts/soak/*.py` changed since — the
+  `Cargo.*`, `build.rs` or the bench model's own code changed since — the
   changelog date and the README numbers may, code may not (AGENTS.md §10,
   "prove provenance").
 - **The repository-settings items are a human's to make** — branch protection
