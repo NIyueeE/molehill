@@ -837,11 +837,41 @@ each needs its own evidence):
    A/A floor. Until that exists, the changelog says what lending does and claims
    no speedup for it.
 2. **The mux×1 gap (L18).** The baseline is measured and recorded above
-   (9.15 against 18.95 Gbit/s, +87 % CPU per byte, 15.35 % A/A floor). The
-   attribution is the first step — a `perf` profile of the `l4-mux2` arm, to
-   see whether the per-write `Vec::from`, the 32 KiB split, the driver hand-off
-   or the window updates own the gap — and each candidate lands as its own
-   commit with its own A/B, reverted if it does not clear the floor.
+   (9.15 against 18.95 Gbit/s, +87 % CPU per byte, 15.35 % A/A floor), and the
+   attribution has started: `benches/scripts/mux/gap_profile.sh` builds a
+   symbol-carrying bench-profile binary (`CARGO_PROFILE_BENCH_STRIP=false`,
+   `target/profile/`, so the model's own binary is untouched), runs one iperf3
+   flow through one tunnel on loopback and prints the top symbols per daemon.
+   What it shows, and the shape it reproduced (9.5–11.3 Gbit/s single flow on
+   `tunnels = 1` against the model's 9.15 on `l4-mux2`):
+
+   - **~35 % kernel**, unsymbolized *in this container* — `/proc/kallsyms` is
+     hidden from `perf` even as root, so the kernel's share is a number without
+     names here. A host that allows it would name them.
+   - **~15 % libc**, at three addresses that a stripped glibc will not name (the
+     region is the string/memory routines). That is where the extra copies of a
+     framed path would land, and it is the one lead the profile gives.
+   - **a few percent per mux symbol**, the largest being
+     `mux::connection::Active::poll` and `Stream::poll_read`; nothing above 1 %.
+     The cost is spread across the copies and syscalls *per byte*, not a hot
+     function — the same conclusion the L3 path reached (docs/benchmarks.md,
+     "What is left is per-packet syscall cost").
+
+   Candidates, in the order they are worth trying, each with its own A/B and
+   each reverted if it does not clear the model's own floor:
+
+   1. the framed write path's per-write allocation
+      (`src/mux/connection/stream.rs`, `Vec::from(&buf[..k])`) plus the copy
+      into the connection's buffer after it — a structural change to encode the
+      header and payload once, straight into the outgoing buffer;
+   2. `DEFAULT_SPLIT_SEND_SIZE` (`src/mux.rs`, 32 KiB): a larger framed write is
+      fewer syscalls and fewer frames per byte, at the cost of interleaving
+      latency between streams of one tunnel. Worth *measuring* before deciding —
+      a one-constant experiment, and the yamux issue behind the current value is
+      the trade-off to read first.
+   3. window-update amortisation, if the profile's `poll_read` share survives 1.
+      Budget: stop after three failed attempts on the same problem (§9) and
+   write what was learned here rather than grinding.
 3. **The model/docs sweep.** `docs/benchmarks.md` (+ `.zh.md`) still describes
    the retired arms inside its measurement records; each record is history and
    stays, but the current catalog's names (`l3`, `l3-lanes4`, `l3-kcp4`) want a

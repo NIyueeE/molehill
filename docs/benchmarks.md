@@ -993,6 +993,18 @@ measured 1.8× the throughput at half the CPU per byte. That is an operator
 setting, not a code change: the TUN MTU, with a link MTU to match
 ([deployment.md](deployment.md#transparent-services)).
 
+**Attributing the multiplexing overhead.** The L4 rows above say what
+multiplexing costs (a single flow on a pinned pool carries about half what a
+connection of its own does, at roughly twice the CPU per byte); where that CPU
+goes is `benches/scripts/mux/gap_profile.sh`, which samples both daemons with
+`perf` while one iperf3 flow crosses one tunnel and prints the top symbols per
+daemon. The shape it reports on this host: **~35 % kernel, ~15 % libc's memory
+routines, and the mux's own Rust code a few percent per symbol** — every leaf is
+small and the sum is in the copies and syscalls per byte, not in a hotspot. That
+is the same conclusion the TUN path reached below, and it is why the candidates
+are structural (how many times a packet is copied, how large a framed write is)
+rather than a function to optimise.
+
 **Method note: the bulk arm used to measure a deadlock.** It sent one large blob
 and only then read the echo, which cannot work past the buffers — the visitor
 waits for the echo, the echo waits for the visitor to read — and two runs of
