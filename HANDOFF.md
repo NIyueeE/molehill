@@ -552,6 +552,66 @@ either failure removes the feature. The small-packet arm failed on the ceiling
 alone, so the other arms were not run for the verdict.
 
 #
+## An L3 claim holds a member set (2026-10-10, this session)
+
+The transparent path's claim used to be one data channel, and one carrier
+connection is a hard ceiling — measured flat at ~7.1 Gbit/s for one inner flow
+and eight alike, while the forwarding path's per-connection channels reached
+22-28 through the pool. A claim now holds **K data channels (its members)**, and
+its inner flows are hashed across them by their canonical 5-tuple. Landed in
+slices, each with its own acceptance:
+
+- **S1 (`6a4c751`)** — the hub routes by *member slot* instead of one queue per
+  endpoint: a fixed slot set per claim, batches keyed `(endpoint, slot)`, and
+  slots that **outlive their members** (a replacement inherits its predecessor's
+  index), so the routing target of a flow never moves when a channel does.
+  Pure refactor at width 1; `MOLEHILL_L3_STATS` gained a per-member line, which
+  is the instrument the feature has to be measured with.
+- **S2a (`a804f6e`)** — `members` / `[transparent.data].default_members`
+  (default 1, max 64; `tunnels < members` refused next to the UDP-workers
+  floor). The client opens that many channels, placed on distinct tunnels in
+  `multiplex` mode; the server supervises them as a set and replaces each one
+  that ends. Acceptance was **indistinguishability**: `members = 4` against
+  `members = 1` showed no claim above the run's 9.8 % floor, `fds_peak`
+  identical at 69 (members in mux mode are streams on tunnels that already
+  exist), RSS +1.3 MiB for 20 extra streams.
+- **S2b (`229d3a4`)** — the flow hash: `src/transparent/flow.rs`, FNV-1a with a
+  **splitmix64 finalizer**, fixed seed, over protocol + the two `(address, port)`
+  endpoints sorted (portless packets hash on the address pair alone). Jumbo path,
+  four rounds an arm, twin in the run, 8 flows: **one member 6.989 Gbit/s →
+  four members 13.924 [11.528..15.091]**, the same configuration's twin at
+  13.598 — **1.99x**, on a run whose own floors were 3.34 % (throughput) and
+  0.17 % (the twin pair). `bulk-1` indistinguishable (6.201/6.244/6.299),
+  `churn-16` +22 %, `rr-16` −1.8 %, `fds_peak` identical at 69,
+  `wire_per_visitor_byte` unchanged, and the one-member claim's carrier
+  retransmits 518 → 0. The fan-out is proven per member: 3-4 of 4 slots carry
+  traffic in every round, and both ends report the same split to within a point
+  (23/52/24/0 against 23/53/24/0).
+- **S3 (`6ee0038`)** — a member's death is proven not to move the others: the
+  slot stays, the survivors keep forwarding, only the dead slot counts
+  `no_channel`, its replacement inherits the index, and the modulus never moves.
+
+**The finding inside S2b is worth keeping.** The first run of the slice read
+11.282/13.142 instead of 13.924: FNV-1a's low bits are weak, the byte that
+varies between eight `iperf3` streams is its ephemeral port, every one of those
+ports was even, and `h % width` reads exactly those bits — so eight flows landed
+on two of four members. The splitmix64 finalizer fixes it and the regression
+test pins the measured port set and every stride. The lesson generalises: a
+modulo over a hash whose *low* bits are weak is a placement bug waiting for a
+traffic pattern, and per-member counters are what make it visible.
+
+**What this does not do, and the two facts to carry forward.** The claim still
+trails the forwarding path (13.9 against 29.2 Gbit/s), which is the pre-stated
+band that means *the constraint has moved to the device path* — one server TUN
+reader, one client injection path, one syscall per packet. That is the next
+lever, and it needs its own arm before it is a claim.
+Also unclosed: there is **no server-side valve on concurrent members** in
+`direct` mode (in `multiplex` mode the surface is streams on tunnels the pool
+already bounds; in direct mode K connections per claim are held for the claim's
+life), and the model has **no fault-injection axis** for a member's death, so
+the slot-retention semantics are proven by unit and loopback tests rather than
+by a measured recovery number.
+
 ## The tunnel pool is pinned (2026-10-10, this session)
 
 The client's multiplex pool is no longer elastic. It establishes
@@ -606,14 +666,44 @@ Still open from this work (next steps, in the order agreed):
    with the configured count and the ceiling, and every later refusal is DEBUG
    (`logging::RepeatNotice`). `OpenError::AtCapacity`'s text now names the
    setting instead of a growth that can no longer happen.
-2. **Member kinds and L3 flow hashing.** The pool has one member kind (a yamux
-   tunnel). The design that follows from the numbers: a member may also be a
-   *raw* channel (for a logical connection whose count is known and fits), and a
-   transparent claim should hold a *set* of members with its inner flows hashed
-   across them — per flow, never per packet, so ordering survives. That is what
-   would let an L3 claim use more than one carrier connection (today it uses
-   exactly one, which is why its throughput is flat from one inner flow to
-   eight).
+2. ~~**Member kinds and L3 flow hashing.**~~ **Landed 2026-10-10 (S1/S2a/S2b).**
+   A claim now holds a *set* of members — `[transparent.data].default_members`,
+   or a claim's own `members`, default 1 — and its inner flows are spread across
+   them, one flow per member, by a hash of the flow's five-tuple. Both carrier
+   kinds are members: a stream of the claim's tunnel pool in `multiplex` mode,
+   a connection of its own in `direct` mode. The set is discovered by the hub
+   (the channels that actually join), so nothing about it is on the wire; a
+   member that dies keeps its slot and its replacement inherits the index.
+   Measured (dev profile, jumbo path, A/A twin in the run, `bulk-n` = 8 inner
+   flows): one member 6.989 Gbit/s, four members **13.924 / 13.598** (two
+   copies, A/A throughput floor 3.34 %) against the L4 pool's 29.17 — the claim
+   nearly doubles, at 0.653 against 0.560 s/Gbit, with `fds_peak` identical
+   (69) and RSS +12–19 % for the 20 extra streams. `bulk-1` is unchanged (one
+   flow, one member), `churn-16` gains ~22 %, `rr-16` loses ~2 %.
+   **What is not covered yet, in the order it should be picked up:**
+   - **No server-side valve on a claim's concurrent members in `direct` mode.**
+     `[server.data].max_tunnels_per_client` counts *tunnels*, and a direct
+     member is a data channel, not a tunnel, so a client may hold `members`
+     connections per claim with nothing bounding the total. In `multiplex` mode
+     the surface is streams on tunnels the operator already caps (and the pool's
+     56-per-tunnel ceiling bounds it), so this is a direct-mode gap.
+   - **No fault-injection axis in the bench model for member death.** The
+     failure semantics — a dead member's slot keeps its index, its flows are
+     dropped and counted `no_channel` on that slot until the replacement joins,
+     the survivors untouched — are unit- and loopback-tested only; the model
+     cannot yet price a member dying during a measured cell.
+   - **The flow hash needed a finalizer, and that was found by a run, not by
+     review.** A bare FNV-1a `% width` aliases with the *low* bits of the ports
+     (its last step is a multiplication by a prime, which preserves their
+     residue structure). The measured `iperf3` ports
+     `52044, 52052, 52054, 52058, 52070, 52082, 52088, 52094` — all even,
+     several four apart — took two of the four members, which is why the first
+     measurement read 11.28/13.14 instead of 13.92/13.60. The per-member
+     counters (`MOLEHILL_L3_STATS=1`) plus the iperf3 JSON's `local_port` list
+     diagnosed it; splitmix64's finalizer fixes it, and the regression test
+     pins both the measured port set and every port stride. The lesson for the
+     next hash-shaped decision: `% width` on a raw FNV value is not a placement
+     rule, and the per-member counters are the instrument that says so.
 
 ## Open threads
 

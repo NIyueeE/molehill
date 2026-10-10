@@ -620,11 +620,42 @@ the link MTU at 9000, against the forwarding path with its pool capped — the
 One carrier connection tops out near 8–10 Gbit/s on this host — the one-tunnel
 arm says so directly, at one flow and at eight streams over the same tunnel —
 and the forwarding path scales past it only by spreading streams over *several*
-tunnels. A claim has exactly one channel, so it sits at that per-connection
+tunnels. A claim carried by **one** channel therefore sits at that per-connection
 ceiling by construction, which is why its `bulk-n` is *below* its `bulk-1`:
-eight flows through one channel is the same connection. Raising that ceiling
-means giving a claim more than one channel (per-flow sharding, which the model
-cannot price until it exists), and it is a design decision, not a tuning one.
+eight flows through one channel is the same connection.
+
+**A claim can now hold a member set**, and that is what finally moved the
+ceiling (`members` / `[transparent.data].default_members`, default 1 — so every
+arm above keeps its meaning). With four members, inner flows hashed across them
+by a canonical 5-tuple, jumbo path, four measured rounds an arm and the A/A twin
+in the run:
+
+| `bulk-n` (8 flows) | `l3` (direct, 1) | `l3-mux` (mux, 1) | `l3-mux4` (4 members) | twin (same config) | `l4` (forwarding pool) |
+|---|---|---|---|---|---|
+| throughput | 5.446 Gbit/s | 6.989 | **13.924** [11.528..15.091] | 13.598 | 29.166 |
+| CPU s/Gbit | 0.270 | 0.560 | 0.653 | 0.655 | 0.412 |
+| FDs | 39 | 69 | 69 | 69 | 99 |
+| RSS | 18.35 MiB | 21.45 | 25.45 | 24.35 | 25.45 |
+
+The claim **nearly doubles** — 13.924 against 6.989, with the twin at 13.598, on
+a run whose own A/A floors were 3.34 % (throughput) and 0.17 % on the twin pair,
+so this clears the noise by an order of magnitude. The rest of the cells hold:
+`bulk-1` indistinguishable (6.201 / 6.244 / 6.299), `churn-16` **+22 %**
+(6837/s against 5586/s), `rr-16` −1.8 % (inside the twin's 0.1 % pair spread),
+`fds_peak` identical at 69 (members in `multiplex` mode are streams on tunnels
+that already exist), `wire_per_visitor_byte` unchanged, and the one-member
+claim's carrier retransmits fall from 518 to **0**.
+
+Two findings ride with it. The fan-out is visible per member — every measured
+round spread its flows over 3 or 4 of 4 slots, and **both ends agreed on the
+split to within a point** (23/52/24/0 server-side against 23/53/24/0 client-side),
+which is the canonical key verified in production rather than in a unit test.
+And the first run of this slice read 11.282/13.142 instead of the table above:
+FNV-1a's low bits are weak, the byte that varies between eight `iperf3` streams
+is its ephemeral port, and every one of those ports was even — so modulo read a
+collapsed distribution and put eight flows on two members. That is why the hash
+ends with a splitmix64 finalizer, and why the regression test pins the measured
+port set and every stride.
 
 The operator's copy of the packet-size finding, with the recipe, is
 [deployment.md](deployment.md#transparent-services); what is left on the table —
