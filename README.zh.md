@@ -42,7 +42,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 - **低资源消耗** 内存占用远低于同类工具。[二进制文件最小](docs/build-guide.md)可以到 **~500KiB**，可以部署在嵌入式设备如路由器上。
 - **客户端声明服务** 从 v0.7 起，服务端不再需要逐服务配置：客户端声明要暴露的内容（包括公网端口），服务端只通过 `allow_ports` 白名单和共享 `default_token` 执行策略。
 - **透明(L3)客户端(仅 Linux)** `[transparent]` 表让客户端拥有公网 `ip:port`：服务端把整个 IP 包路由进隧道，由客户端内核应答访客，因此后端看到访客的真实源地址，服务端不持有该连接的连接状态。它是独立的运行模式（`--transparent`），所以同时还要转发的机器就跑两个进程；客户端需要 TUN 设备与 `CAP_NET_ADMIN`，而服务端只有在自己的 `[server.transparent]` 表要求时才需要。见[配置文档](./docs/configuration.zh.md#透明l3服务)。
-- **多路复用** 每个数据通道都作为 yamux 流跑在一个固定隧道池（`[client.data.tcp|kcp].tunnels`，默认 4）的某条隧道上——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。池在服务启动时建立、永不按负载调整大小（死亡的隧道会被修复）；可选的 `default_carrier = "kcp"`（feature `kcp`）把数据面换成 KCP-over-UDP 会话。`[client.data]` 选项与 `mode = "direct"` 回退路径见[配置文档](./docs/configuration.zh.md)。
+- **多路复用** 转发服务的每个数据通道都作为 yamux 流跑在一个固定隧道池（`[client.data.tcp|kcp].tunnels`，默认 4）的某条隧道上——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。池在服务启动时建立、永不按负载调整大小（死亡的隧道会被修复）；可选的 `default_carrier = "kcp"`（feature `kcp`）把数据面换成 KCP-over-UDP 会话。透明（L3）认领是唯一不做多路复用的形态——它的通道**就是**它的载体连接；`[client.data]` 选项见[配置文档](./docs/configuration.zh.md)。
 - **安全性** 共享 token 强制鉴权，`allow_ports` 白名单限制客户端可暴露的端口。可选的 Noise Protocol 只需一对预共享 X25519 密钥即可加密传输——没有 PKI、没有 CA；设置 `resume = true` 后，重连用一次 MAC 证明持有上次会话的握手摘要即可，不必重跑密钥交换(建连从每对 442.7 us 降到 38.5 us)。`plain` 为明文转发。
 - **热重载** 支持配置文件热重载，动态添加或移除端口转发服务。
 
@@ -58,7 +58,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 每个工具都被驱以完全相同的工作负载,同时路径按阶段表推进、原地切换,会话
 从不重建——下图是本主机上的 v0.10.0 一次运行,用发布二进制的默认值
-(`multiplex`、明文传输);图例与阶段日程见
+(多路复用池、明文传输);图例与阶段日程见
 [基准测试方法](docs/benchmarks.zh.md#怎么读这些图)。
 
 ![Soak: molehill 与对端在阶段日程上的形态](assets/soak-v0.10.0.png)

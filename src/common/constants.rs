@@ -115,6 +115,18 @@ pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 
+/// Upper bound for a transparent client's lane budget
+/// (`[transparent.data.tcp|kcp].tunnels`).
+///
+/// A claim's lane **is** a carrier connection — no multiplexer sits above it —
+/// so this is not the pool ceiling ([`MAX_MUX_TUNNELS_CAP`]): a client serving
+/// a hundred claims needs at least a hundred lanes before any claim can hold a
+/// second one. The bound is a resource guard, not a tuning knob: a lane is a
+/// connection, measured at 2.6 file descriptors and 0.5–0.8 MiB RSS with no
+/// threads, and a typo should be refused rather than dialled.
+#[cfg(feature = "multiplex")]
+pub const MAX_TRANSPARENT_LANES: u16 = 1024;
+
 // The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this
 // constant are gone with the elastic model): a pool's tunnels are established
 // at service start and kept, so that the capacity a deployment offers does not

@@ -764,28 +764,28 @@ class Arm:
     TUN queue length decides whether an L3 arm measures the architecture or the
     kernel's default queue.
 
-    `members` is the third such setting, and it is L3-only: the number of data
-    channels one transparent claim holds, which is what its inner flows are
-    spread across (`[transparent.data].default_members`). `0` leaves the key out
-    of the generated config — the product's one-channel claim — so an arm states
-    the set it measured instead of inheriting whatever the default is this week.
+    `pool_cap` is the third such setting, and it means one thing per kind: for an
+    L4 arm it is the pool's `[client.data.tcp].tunnels`; for an L3 arm it is the
+    claim's carrier **lane budget** (`[transparent.data.<carrier>].tunnels`),
+    which is one connection per lane because a claim never multiplexes. `0`
+    leaves the key out of the generated config — the product's default, four
+    tunnels for a forwarding pool and one lane per claim for a claim — so an arm
+    states the width it measured instead of inheriting whatever the default is
+    this week.
 
     `carrier` is the transport the data plane rides: `tcp` (the control
     channel's own wire stack) or `kcp` (KCP-over-UDP sessions, feature `kcp`).
     It is the difference between a congestion-controlled stream and a
     retransmit-aggressive one on a shaped path, so an arm that does not state
-    it is not describing the run it measured — and `kcp` needs `mode` =
-    `multiplex` (a KCP session is a mux tunnel), which `states_kcp` names.
+    it is not describing the run it measured. The data plane's *shape* is not an
+    arm parameter at all: a forwarding service always multiplexes and a claim
+    never does, which is what the product derives from the service type.
     """
 
     id: str
     kind: str
-    mode: str = "multiplex"
     carrier: str = "tcp"
     pool_cap: int = 0
-    #: L3 only: data channels one claim holds (`[transparent.data].default_members`).
-    #: 0 leaves the key unset (the product's one-channel claim).
-    members: int = 0
     txqueuelen: int = 1000
     binary: str = ""
     #: Free-form label recorded in the results (e.g. "A"/"B" for a build pair).
@@ -808,19 +808,6 @@ class Arm:
         if self.kind == "peer":
             raise ValueError(f"a peer arm ({self.tool}) has no mode flag")
         return "--transparent" if self.kind == "l3" else "--client"
-
-    @property
-    def data_mode(self) -> str:
-        if self.kind == "peer":
-            return ""
-        if self.kind == "control":
-            # No tool in the path: the architecture has no data plane to
-            # describe, and printing the dataclass default here would read as a
-            # configuration the control arm never had.
-            return ""
-        if self.kind == "l3":
-            return self.mode if self.mode in ("direct", "multiplex") else "direct"
-        return self.mode
 
     @property
     def data_carrier(self) -> str:
@@ -903,31 +890,28 @@ TOPO_CONTROL_IP = TOPO_CLI_IP
 ARM_CATALOG: dict = {
     "control": Arm("control", "control"),
     "l4": Arm("l4", "l4"),
-    "l4-mux1": Arm("l4-mux1", "l4", pool_cap=1),
     "l4-mux2": Arm("l4-mux2", "l4", pool_cap=2),
     "l4-mux8": Arm("l4-mux8", "l4", pool_cap=8),
     # `pool_cap` writes `[client.data.tcp].tunnels`, so these arms are the pool
-    # *pinned* at 1 / 2 / 8 connections — the arm's width, not a cap it may
-    # grow to.
-    "l4-direct": Arm("l4-direct", "l4", mode="direct"),
-    "l3": Arm("l3", "l3", mode="direct"),
-    "l3-mux": Arm("l3-mux", "l3", mode="multiplex"),
-    # The member-set axis: one L3 claim holding four data channels, so its inner
-    # flows can be spread over four carrier connections instead of one. `l3-mux4`
-    # takes four streams of a four-tunnel pool (`pool_cap` is the pool's width,
-    # `members` the claim's channel count), `l3-raw4` opens four direct channels
-    # and never touches a pool — the two ways a member can be a carrier.
-    "l3-mux4": Arm("l3-mux4", "l3", mode="multiplex", pool_cap=4, members=4),
-    "l3-raw4": Arm("l3-raw4", "l3", mode="direct", members=4),
-    "l3-deep": Arm("l3-deep", "l3", mode="direct", txqueuelen=DEEP_TXQUEUELEN),
-    # The carrier axis: `kcp` rides UDP, `mode` says whether a yamux pool sits
-    # above the carrier (multiplex) or the carrier's own session *is* the
-    # channel (direct). The two are independent, so the L3 arm that pairs
-    # `direct` with `kcp` measures KCP without the multiplexer's framing — the
-    # pairing the question "does KCP pay for its framing?" needs.
-    "l3-kcp": Arm("l3-kcp", "l3", mode="direct", carrier="kcp"),
-    "l3-mux-kcp": Arm("l3-mux-kcp", "l3", mode="multiplex", carrier="kcp"),
-    "l4-kcp": Arm("l4-kcp", "l4", mode="multiplex", carrier="kcp"),
+    # *pinned* at 2 / 8 connections — the arm's width, not a cap it may grow to.
+    # There is no `l4-mux1`: the topology carries a UDP service with two workers,
+    # so `tunnels = 1` is below the UDP-derived floor and the client refuses to
+    # start (the degenerate L4 cell docs/benchmarks.md used to record without a
+    # cause). One stream on a multiplexed session is measured with `l4-mux2` in a
+    # single-flow scenario — the same shape, one stream on one session, with a
+    # legal pool.
+    "l3": Arm("l3", "l3"),
+    # The lane axis: one L3 claim's carrier budget, so its inner flows can be
+    # spread over several connections instead of one. A claim never multiplexes,
+    # so the budget *is* the number of connections it holds.
+    "l3-lanes4": Arm("l3-lanes4", "l3", pool_cap=4),
+    "l3-deep": Arm("l3-deep", "l3", txqueuelen=DEEP_TXQUEUELEN),
+    # The carrier axis: `kcp` rides UDP. A lane over KCP is a KCP session of its
+    # own, with no multiplexer above it, which is what the L3 arms measure; the
+    # L4 arm measures the same carrier with the multiplexer above it.
+    "l3-kcp": Arm("l3-kcp", "l3", carrier="kcp"),
+    "l3-kcp4": Arm("l3-kcp4", "l3", carrier="kcp", pool_cap=4),
+    "l4-kcp": Arm("l4-kcp", "l4", carrier="kcp"),
     # The reference tools. Their adapters live in `peers.py`; the arm is the
     # same shape as any other, which is what makes the comparison one run.
     "frp": Arm("frp", "peer", tool="frp", label="frp"),
@@ -964,7 +948,7 @@ def default_arms() -> list:
 
 
 def parse_arm_spec(spec: str) -> Arm:
-    """`id=l3,mode=direct,carrier=kcp,txqueuelen=10000,side=B` — an arm as data.
+    """`id=l3,carrier=kcp,pool_cap=4,txqueuelen=10000,side=B` — an arm as data.
 
     The syntax exists so that an experiment with a knob the catalog does not
     name is still *declared* (and therefore recorded and comparable) rather than
@@ -983,10 +967,8 @@ def parse_arm_spec(spec: str) -> Arm:
     known = {
         "id",
         "kind",
-        "mode",
         "carrier",
         "pool_cap",
-        "members",
         "txqueuelen",
         "binary",
         "side",
@@ -996,7 +978,7 @@ def parse_arm_spec(spec: str) -> Arm:
     unknown = sorted(set(fields) - known)
     if unknown:
         raise ValueError(f"unknown arm key(s) {unknown}; known: {sorted(known)}")
-    for numeric in ("pool_cap", "members", "txqueuelen"):
+    for numeric in ("pool_cap", "txqueuelen"):
         if numeric in fields:
             fields[numeric] = int(fields[numeric])
     if "carrier" in fields and fields["carrier"] not in ("tcp", "kcp"):
@@ -1015,10 +997,11 @@ def parse_arm_spec(spec: str) -> Arm:
 def refuse_unknown_carrier(arm: Arm) -> None:
     """Refuse a carrier the product does not have.
 
-    `mode` and `carrier` are independent axes now (a direct channel rides a KCP
-    session as readily as a TCP connection), so the only thing left to check is
-    the vocabulary: an arm that names a carrier nothing implements would fail
-    every cell on a config error instead of measuring.
+    The carrier is the only data-plane axis an arm states (the product derives
+    the *shape* from the service type: a forwarding service multiplexes, a claim
+    never does), so the only thing left to check is the vocabulary: an arm that
+    names a carrier nothing implements would fail every cell on a config error
+    instead of measuring.
     """
     if arm.kind in ("l3", "l4") and arm.data_carrier not in ("tcp", "kcp"):
         raise ValueError(

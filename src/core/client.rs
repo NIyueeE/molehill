@@ -2,14 +2,14 @@ use crate::common::helper::{datagram_len, udp_connect};
 #[cfg(feature = "notify")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
+#[cfg(feature = "multiplex")]
+use crate::config::DataCarrier;
 #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
 use crate::config::NoiseConfig;
 use crate::config::{
     ClientConfig, ClientServiceConfig, Config, MaskedString, ServiceType, TransportConfig,
     TransportType,
 };
-#[cfg(feature = "multiplex")]
-use crate::config::{DataCarrier, DataMode};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
@@ -70,11 +70,13 @@ pub async fn run_client(
 type Nonce = protocol::Digest;
 
 /// Data-plane knobs for one service, resolved from `[client.data]` with the
-/// service's own `mode`/`carrier` overrides.
+/// service's own `carrier` override.
 #[derive(Clone, Debug, Default)]
 struct DataOpts {
-    /// Whether the service multiplexes its data plane onto tunnels. Only the
-    /// `multiplex` build has tunnels, so the field does not exist without it.
+    /// Whether the service multiplexes its data plane onto tunnels. Derived
+    /// from the service type rather than configured
+    /// ([`ClientServiceConfig::uses_pool`]); only the `multiplex` build has
+    /// tunnels, so the field does not exist without it.
     #[cfg(feature = "multiplex")]
     enabled: bool,
     /// Endpoint the data plane dials: the service's own `remote_addr` when
@@ -314,9 +316,7 @@ impl DataOpts {
     fn for_service(c: &ClientConfig, s: &ClientServiceConfig) -> DataOpts {
         DataOpts {
             #[cfg(feature = "multiplex")]
-            enabled: s
-                .mode
-                .map_or_else(|| c.multiplex_enabled(), |m| m == DataMode::Multiplex),
+            enabled: s.uses_pool(),
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
             carrier: s.carrier.unwrap_or(c.data.default_carrier),
@@ -325,9 +325,10 @@ impl DataOpts {
             #[cfg(feature = "multiplex")]
             channels: match s.service_type {
                 ServiceType::Udp => s.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS),
-                // A claim's member set draws from the pool too: one member per
-                // tunnel, so the floor covers it the same way a worker set does.
-                ServiceType::Transparent => s.transparent_members,
+                // A claim's lanes are connections of its own, drawn from its
+                // carrier's budget — never a pool. The budget is capped at
+                // `MAX_TRANSPARENT_LANES`, so the conversion cannot truncate.
+                ServiceType::Transparent => u16::try_from(s.lanes()).unwrap_or(u16::MAX),
                 ServiceType::Tcp => 0,
             },
             #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
@@ -547,13 +548,14 @@ impl Client {
         // asks the server for none. UDP opens its worker set (they are the
         // sharding targets and the pool's UDP floor); TCP opens none, because
         // the server asks for one channel per visitor; a transparent service
-        // opens its **member set** — one channel per configured member — and
-        // keeps them, because the claim's flows are spread across them and the
-        // server asks for a replacement for each member that ends.
+        // opens its **lanes** — one carrier connection per lane, from the
+        // carrier's budget — and keeps them, because the claim's inner flows are
+        // spread across them and the server asks for a replacement for each lane
+        // that ends.
         let channels = match cfg.service_type {
             ServiceType::Tcp => 0,
             ServiceType::Udp => usize::from(cfg.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS)),
-            ServiceType::Transparent => cfg.claim_members(),
+            ServiceType::Transparent => cfg.lanes(),
         };
         let retry_interval = cfg.retry_interval.unwrap_or(1);
 
@@ -735,11 +737,6 @@ struct RunDataChannelArgs {
     /// Placement state of this service's stripe groups, by group id (D24).
     #[cfg(feature = "multiplex")]
     stripe_placements: StripePlacements,
-    /// The tunnels this claim's live members hold, so the next member is placed
-    /// on a tunnel the set does not already occupy while the pool has one.
-    /// Empty for every service that is not an L3 claim.
-    #[cfg(feature = "multiplex")]
-    member_placement: Arc<MemberPlacement>,
 }
 
 /// What the server's `CreateDataChannelForStripe` said about one data channel:
@@ -892,57 +889,6 @@ impl StripePlacement {
             }
         }
         self.placed.fetch_add(1, Ordering::Relaxed) + 1 >= self.count
-    }
-}
-
-/// The tunnels a claim's live members hold (D24's exclusion, applied to a
-/// claim's member set rather than to a stripe group).
-///
-/// A claim's members are its carrier connections: the point of a member set is
-/// that no two members share a tunnel while the pool has a free one, because
-/// two members on one tunnel share that tunnel's connection and the claim's
-/// throughput is the sum of *connections*, not of streams. The set is a claim's
-/// own and lives as long as the service does, so a replacement member lands on
-/// a tunnel the surviving members do not occupy.
-#[cfg(feature = "multiplex")]
-#[derive(Default)]
-struct MemberPlacement {
-    /// The tunnel ids the claim's live members were placed on.
-    tunnels: std::sync::Mutex<Vec<usize>>,
-}
-
-#[cfg(feature = "multiplex")]
-impl MemberPlacement {
-    /// The tunnels the claim's live members occupy.
-    fn used(&self) -> Vec<usize> {
-        self.tunnels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Remember one member's tunnel, and report whether it was new to the set.
-    fn record(&self, tunnel: usize) -> bool {
-        let mut used = self
-            .tunnels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if used.contains(&tunnel) {
-            return false;
-        }
-        used.push(tunnel);
-        true
-    }
-
-    /// Release a member's tunnel: it died, and its replacement is free to take
-    /// that tunnel again — through the pool's own placement, which is what
-    /// actually picks it.
-    fn release(&self, tunnel: usize) {
-        let mut used = self
-            .tunnels
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        used.retain(|held| *held != tunnel);
     }
 }
 
@@ -1200,19 +1146,9 @@ async fn run_mux_data_channel(
 ) -> Result<()> {
     let mut stream = match stripe {
         Some(request) => open_stripe_stream(args, tunnel, request).await?,
-        None if args.service.service_type == ServiceType::Transparent => {
-            open_member_stream(args, tunnel).await?
-        }
         None => tunnel.open_stream().await?,
     };
     trace!("Multiplexed data channel opened");
-    // The tunnel this member was placed on is the claim's for as long as the
-    // member lives: a replacement must avoid it (see `MemberPlacement`).
-    let member_tunnel =
-        (args.service.service_type == ServiceType::Transparent).then(|| stream.tunnel_id());
-    if let Some(placed) = member_tunnel {
-        args.member_placement.record(placed);
-    }
     // A v4 tunnel belongs to the session, so each of its streams names the
     // service it carries: the server reads these four bytes before its
     // forwarding command. Several services may share the tunnel — that is
@@ -1236,30 +1172,7 @@ async fn run_mux_data_channel(
     if let Some(udp) = &args.udp {
         udp.unbind_channel(channel);
     }
-    if let Some(placed) = member_tunnel {
-        args.member_placement.release(placed);
-    }
     result
-}
-
-/// Open one member of a claim's set, on a tunnel the claim's live members do
-/// not already occupy while the pool has a free one.
-///
-/// The exclusion is the same one a stripe group uses (D24), for the same
-/// reason and with the same floor: a pool smaller than the member set makes
-/// the members share tunnels rather than fail. What it buys here is that a
-/// claim's throughput is the sum of *connections*: two members on one tunnel
-/// share that tunnel.
-#[cfg(feature = "multiplex")]
-async fn open_member_stream(
-    args: &Arc<RunDataChannelArgs>,
-    tunnel: &Tunnels,
-) -> Result<TunnelStream> {
-    let used = args.member_placement.used();
-    let stream = tunnel
-        .open_stream_on_distinct(&used, args.service.claim_members())
-        .await?;
-    Ok(stream)
 }
 
 /// Open one stripe's stream, on a tunnel the group does not already occupy
@@ -3007,8 +2920,6 @@ impl ClientSession {
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
                 #[cfg(feature = "multiplex")]
                 stripe_placements: StripePlacements::default(),
-                #[cfg(feature = "multiplex")]
-                member_placement: Arc::new(MemberPlacement::default()),
             }),
             #[cfg(feature = "multiplex")]
             tunnel,

@@ -13,7 +13,6 @@ default_remote_addr = "example.com:2333"
 default_retry_interval = 2
 
 [transparent.data]
-default_mode = "multiplex"
 default_carrier = "kcp"
 
 [transparent.data.kcp]
@@ -30,5 +29,4 @@ remote_bind_addr = "10.99.0.1:2222"
 token = "per-claim-token"
 remote_addr = "other.example.com:2333"
 retry_interval = 5
-mode = "direct"
 carrier = "tcp"

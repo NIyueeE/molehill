@@ -57,7 +57,10 @@ A typical setup:
 > `[client].heartbeat_timeout` / `retry_interval` →
 > `[client.control].default_*`;
 > `[client].mux = false` → `[client.data].default_mode = "direct"`;
-> `[client].mux = true` → `[client.data].default_mode = "multiplex"` (the
+> `[client].mux = true` → `[client.data].default_mode = "multiplex"` — and
+> `default_mode` was itself removed afterwards, because the shape is derived
+> from the service type now (see "Migrating: the data plane's shape is no
+> longer a key") (the
 > `mux_receive_window` / `mux_max_streams` knobs are gone — fixed internal
 > yamux defaults now);
 > `[client.transport].type = "tcp"` → `"plain"`;
@@ -75,10 +78,10 @@ A typical setup:
 > The 0.8 client-side blocks use `default_`-prefixed names for the
 > client-wide defaults — `[client.control]` (`default_remote_addr`,
 > `default_heartbeat_timeout`, `default_retry_interval`) and `[client.data]`
-> (`default_data_addr`, `default_mode`, `default_carrier`) — so they read
+> (`default_data_addr`, `default_carrier`) — so they read
 > distinctly from the per-service overlay keys on
 > `[client.services.<name>]` (`protocol`, `remote_addr`, `token`,
-> `retry_interval`, `mode`, `carrier`, `transport`, `udp_workers`,
+> `retry_interval`, `carrier`, `transport`, `udp_workers`,
 > `udp_forwarder_ipv6`, `udp_send_queue_size`, ...; new in 0.8).
 > `[client.transport]` keeps `type`/`noise` unprefixed: its per-service
 > overrides live in the nested `transport` table, so there is no same-name
@@ -121,6 +124,25 @@ write). Write this instead:
 The next section states what each of the replacements does and what it costs;
 [CHANGELOG.md](../CHANGELOG.md) records why the removals happened.
 
+### Migrating: the data plane's shape is no longer a key
+
+`mode` is gone. A config that still carries `[client.data].default_mode` or a
+per-service `[client.services.<name>].mode` does not start: the refusal names
+the key and what to do. What the key used to express is a property of the
+service type now:
+
+| Removed key | Write instead |
+|---|---|
+| `[client.data].default_mode` | Nothing: a forwarding service always multiplexes. `[client.data.tcp\|kcp].tunnels` is how wide its pool is |
+| `[client.services.<name>].mode` | Nothing: the shape follows the protocol — a forwarding service multiplexes, a transparent claim never does |
+
+A claim's channels *are* its carrier connections — a claim's throughput is the
+sum of connections rather than of streams — so multiplexing one is framing for
+nothing: on the same host and workload the same claim on its own connection
+moved 6 % fewer wire bytes, took 33 % less CPU per packet and carried 65 % more
+round trips per second
+([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
+
 ## Choosing your configuration (decision tree)
 
 The first choice is the mode: `[client]` forwards to a local application,
@@ -128,27 +150,25 @@ The first choice is the mode: `[client]` forwards to a local application,
 [Transparent (L3) services](#transparent-l3-services)) — and it is a choice
 about the process, not about a service, so it comes before anything below.
 
-The defaults — `mode = "multiplex"`, `tunnels = 4`, `carrier = "tcp"`,
-plain transport — are the right starting point for almost everyone. Deviate
-only when the tree says so, change one thing at a time, and measure the result
-on your own path: the published runs, their numbers and how to reproduce them are
+The defaults — a pinned pool of `tunnels = 4` multiplexed connections,
+`carrier = "tcp"`, plain transport — are the right starting point for almost
+everyone. Deviate only when the tree says so, change one thing at a time, and
+measure the result on your own path: the published runs, their numbers and how
+to reproduce them are
 in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
-    A["Start: defaults<br/>multiplex, tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
+    A["Start: defaults<br/>tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
     B -- Yes --> C["transport type = noise<br/>+ keypair (Transport doc)"]
-    B -- No --> D{"One service or a few<br/>long-lived connections?"}
+    B -- No --> D{"Many concurrent<br/>visitor connections?"}
     C --> D
-    D -- "Yes, raw throughput first" --> E["mode = direct"]
-    D -- "No: many services,<br/>many users, churn" --> F{"Many concurrent<br/>connections?"}
-    E --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
-    F -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
-    F -- Typical --> H["keep tunnels = 4"]
+    D -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
+    D -- Typical --> H["keep tunnels = 4"]
     G --> I{"Path quality?"}
     H --> I
     I -- "High pure latency +<br/>UDP game (100ms+ RTT)" --> J["A/B test carrier = kcp"]
-    I -- Otherwise --> Z
+    I -- Otherwise --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
     J --> Z
 ```
 
@@ -156,13 +176,11 @@ flowchart TD
 
 | Decision | Option | What you give up / gain |
 |---|---|---|
-| `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
-| `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
 | `tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain. Measured as the worst configuration on every path |
 | `tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
 | `tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling; measured worth +77 % throughput from one tunnel to eight on a clean fast path |
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
-| `carrier` | `"kcp"` | UDP transport for paths where TCP is blocked, throttled or lossy; independent of `mode`, so it can carry a multiplexed pool (`multiplex` + `kcp`) or one session per channel (`direct` + `kcp`). It costs throughput where the path is clean, so choose it for the path, not by default |
+| `carrier` | `"kcp"` | UDP transport for paths where TCP is blocked, throttled or lossy. It costs throughput where the path is clean, so choose it for the path, not by default |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
 | pool establishment | (no key) | the pool's `tunnels` connections are dialed at service start, not on the first visitor: nothing is paid at request time, and the cost is `tunnels` idle connections (measured at 0.5–0.8 MiB RSS and 2.6 FDs each, no threads) |
@@ -188,10 +206,9 @@ default_remote_addr = "example.com:2333" # Necessary. The address of the server
 # default_heartbeat_timeout = 65 # Optional. Application-layer heartbeat timeout. Unset (the default) derives it from the cadence the server declares in the session ack: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. A value below that floor is refused at startup (it would time out a healthy server); 0 disables the check
 default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
-[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_mode/default_carrier individually — see the per-service keys in `[client.services.*]` below
+[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_carrier individually — see the per-service keys in `[client.services.*]` below
 # default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). With `default_carrier = "kcp"` the KCP sessions dial the control address over UDP — TCP control and UDP KCP can share one port (distinct protocols)
-default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one data channel per visitor connection, its own physical connection). Independent of `default_carrier`: every `mode`/`carrier` pair is valid
-default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted. With `mode = "multiplex"` the sessions are the pool's tunnels; with `mode = "direct"` each data channel is one KCP session, so the multiplexer's framing is not in the path at all
+default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted. The sessions are this carrier's pool's tunnels
 # shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool per carrier (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
 [client.data.tcp] # Optional. The TCP carrier's tunnel count
 # tunnels = 4 # Optional. How many tunnels this carrier's pool establishes at service start and keeps. Validated `>= 1` and `>= ` the UDP-derived floor of the services that share it; clamped to 1..=64. Default: 4
@@ -218,8 +235,7 @@ nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default
 retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
-mode = "multiplex" # Optional. Override `client.data.default_mode` for this service only. "multiplex" (default) or "direct"
-carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only. Inherits the default when unset; independent of `mode`
+carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only. Inherits the default when unset
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
 
 [client.services.service2] # Multiple services can be defined
@@ -267,8 +283,8 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
    `carrier` it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy
    UDP listener) and the UDP buffer size. The channel count is not part of the
    message: the client opens the channels it configured (one per visitor for
-   TCP, `udp_workers` for UDP, `default_members`/`members` long-lived channels
-   for a transparent claim) and the server asks for another when a visitor
+   TCP, `udp_workers` for UDP, the carrier's lane share — long-lived connections
+   — for a transparent claim) and the server asks for another when a visitor
    arrives or a channel ends.
 3. The server validates:
    - **whitelist**: the requested port must be covered by `allow_ports`;
@@ -291,17 +307,17 @@ restarting client takes over cleanly.
 
 ## Multiplexing (`multiplex` feature)
 
-The `multiplex` feature is part of the default feature set. With
-`mode = "multiplex"` (the default), a registered service runs over a
-**fixed pool of tunnel connections** (`[client.data.tcp|kcp].tunnels`,
-default 4), and every subsequent data channel becomes a yamux stream inside one
-of them. This removes the per-connection handshake latency (TCP connect plus,
-with `noise`, the Noise handshake) and cuts FD usage under many concurrent
-visitors.
+The `multiplex` feature is part of the default feature set. A registered
+forwarding service runs over a **fixed pool of tunnel connections**
+(`[client.data.tcp|kcp].tunnels`, default 4), and every data channel it carries
+becomes a yamux stream inside one of them. This removes the per-connection
+handshake latency (TCP connect plus, with `noise`, the Noise handshake) and cuts
+FD usage under many concurrent visitors. The shape is not a key: a forwarding
+service always multiplexes (there is no `mode` to write), and a
+[transparent claim](#transparent-l3-services) never does.
 
-- The decision belongs to the client alone (`[client.data].default_mode`); the server
-  adapts per connection automatically.
-- `mode = "direct"` restores the one-connection-per-channel path.
+- The decision belongs to the client alone; the server adapts per connection
+  automatically.
 - Per-tunnel buffering is bounded by internal defaults (32 MiB yamux receive
   window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
@@ -364,22 +380,21 @@ visitors.
 - Building without the feature removes the option entirely, and such a
   build must not see the corresponding tables at all: a config that
   contains `[client.data]` or `[server.data]` is rejected there (unknown
-  keys — `deny_unknown_fields`). Delete those tables and the data plane
-  always uses the one-connection-per-channel path.
+  keys — `deny_unknown_fields`). Delete those tables and every data channel is
+  a connection of its own.
 
 **Per-service overrides.** `[client.data]` holds the defaults; each service
-can override `mode` and `carrier` individually on its own
+can override `carrier` individually on its own
 `[client.services.<name>]` block. The same rules as the global block apply
-to the merged view: `carrier` is only valid with `mode = "multiplex"`, and
-`carrier = "kcp"` additionally needs the `kcp` feature. A service's carrier
-selects which of the two counts (`[client.data.tcp|kcp].tunnels`) its pool is
-established with; with `[client.data].shared_pool` every service of the session shares
-one pool per carrier. So one client can mix a multiplexed interactive service
-(few handshakes, NAT-friendly) with a `direct` bulk service (raw throughput)
-without any server configuration change: the server adapts per connection and
-opens its KCP listener on the first `kcp` registration (there is no per-carrier
-server configuration). The same overlay pattern covers the control defaults:
-`token` and `remote_addr` override `[client].default_token` and
+to the merged view: `carrier = "kcp"` needs the `kcp` feature. A service's
+carrier selects which of the two counts (`[client.data.tcp|kcp].tunnels`) its
+pool is established with; with `[client.data].shared_pool` every service of the
+session shares one pool per carrier. So one client can put a latency-sensitive
+service on TCP and a service whose path blocks TCP on KCP, or share one pool
+between two services, without any server configuration change: the server adapts
+per connection and opens its KCP listener on the first `kcp` registration (there
+is no per-carrier server configuration). The same overlay pattern covers the
+control defaults: `token` and `remote_addr` override `[client].default_token` and
 `[client.control].default_remote_addr`, and `retry_interval` overrides
 `default_retry_interval`. A service's heartbeat is not a per-service knob: one
 session carries one timer, derived from the cadence the server declares (see
@@ -463,40 +478,35 @@ address routed to the server, and a single-IP server — are in
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
-| `[transparent.data].default_members` | how many data channels one claim holds — its **member set**, and the number of carrier connections its inner flows are spread across (one flow per member, by a hash of its five-tuple). Default: `1`. In `multiplex` mode the pool must be at least that wide (`[transparent.data.tcp\|kcp].tunnels`), in `direct` mode each member is a connection of its own. At most 64. **Both ends must carry member sets**: a peer without them starts one channel at a time, so a claim that holds several would only have one used |
-| `[transparent.claims.<name>].members` | the same, for one claim only: it overrides `[transparent.data].default_members` |
+| `[transparent.data.tcp\|kcp].tunnels` | the carrier's **lane budget**: how many carrier connections this client holds for all of its claims together on that carrier, divided equally among the claims that draw on it. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: one lane per claim — the shape a claim has always had — and a budget below the claim count is refused with the number to write. At most 1024 |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
-`retry_interval`, `mode`, `carrier`, `members`. `[transparent.transport]` holds
+`retry_interval`, `carrier`. `[transparent.transport]` holds
 one key, `proxy`, because what an L3 client sends is the visitor's own traffic:
 this hop is a plain link by design, so the model has no encryption keys to offer,
 and `[transparent].tun` is where a device is named.
 
-`mode` and `carrier` are independent for a claim as they are for a forwarding
-service: `direct` + `tcp` (the default pair) is one TCP connection per claim,
-`direct` + `kcp` is one KCP session per claim — the carrier's session *is* the
-data channel, with no multiplexer above it — and `multiplex` is the pair for a
-client that serves many claims from one shared pool.
+`carrier` is the only data-plane choice a claim has: `tcp` (the default) is one
+TCP connection per lane, `kcp` is one KCP session per lane — the carrier's
+session *is* the data channel, with no multiplexer above it. A claim never
+multiplexes: its lanes are its carrier connections, and its throughput is the
+sum of them. On one host and workload the same claim on its own connection
+moved 6 % fewer wire bytes, took 33 % less CPU per packet and carried 65 % more
+round trips per second than the same claim as one stream of a pool
+([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
 `[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
-`default_mode`, `default_carrier`, `shared_pool`, the two
-per-carrier `tunnels` counts, and `default_members` — with **one different
-default**: the mode is `direct`, because a claim has exactly one channel unless
-it is given a member set, and the multiplex pool therefore buys a one-channel
-claim nothing unless `shared_pool` is on. Measured on one host and
-workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
-carried 65 % more round trips per second than `multiplex`
-([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
-A client that serves many claims from one pool writes `default_mode = "multiplex"`
-and `shared_pool = true`.
-
-A claim's `members` is how many data channels it holds, and the pool must be at
-least that wide in `multiplex` mode: a claim's carriers are meant to be distinct
-tunnels, so `members = 4` with `tunnels = 2` is refused with the count to write
-instead. In `direct` mode there is no pool to keep them apart — each member is a
-connection of its own — and no floor to satisfy.
+`default_carrier` and the two per-carrier `tunnels` counts — with a different
+meaning for the count. A forwarding `tunnels` is a pool's width; a claim's is a
+budget of connections, because there is no pool: each claim's share is
+`tunnels / claims` on its carrier, never below one, so
+`[transparent.data.tcp].tunnels = 4` with two claims gives each of them two
+connections, and `tunnels = 1` with two claims is refused with `2` to write. A
+claim's inner flows are spread across its lanes (one flow per lane, by a hash of
+its five-tuple), so more lanes are how a claim that carries many concurrent
+connections gets more than one connection's worth of throughput.
 
 ### What the operator must prepare
 
@@ -624,14 +634,14 @@ beside `stripe_count`, the value it replaces.
 
 ## Tuning
 
-The step-by-step way to pick `mode`/`tunnels`/`carrier`/transport for
+The step-by-step way to pick `tunnels`/`carrier`/transport for
 your workload is the [decision tree](#choosing-your-configuration-decision-tree)
 above (with the trade-offs and how to validate them). This section covers
 the per-connection knobs.
 
 From v0.4.7, molehill enables TCP_NODELAY by default on every TCP connection: the control channel, the data-plane tunnels, both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
-Only the client honours `nodelay`, and only on the two socket kinds the client creates for a service: its data-channel connections on the one-connection-per-channel path, and its TCP connection towards the local service. Every other socket stays nodelay regardless: the control channel is always set up with TCP_NODELAY at both ends, the client's multiplexed tunnels use those same control-channel options, and the server always applies its fixed latency-friendly defaults (nodelay + keepalive) to its end of every data channel and to the visitor-facing sockets. `nodelay = false` therefore cannot turn Nagle back on there.
+Only the client honours `nodelay`, and only on the two socket kinds the client creates for a service: its data-channel connections (a claim's lanes, and every channel in a build without the `multiplex` feature), and its TCP connection towards the local service. Every other socket stays nodelay regardless: the control channel is always set up with TCP_NODELAY at both ends, the client's multiplexed tunnels use those same control-channel options, and the server always applies its fixed latency-friendly defaults (nodelay + keepalive) to its end of every data channel and to the visitor-facing sockets. `nodelay = false` therefore cannot turn Nagle back on there.
 
 TCP keepalive is also enabled by default on these sockets (20s idle time, 8s probe interval), so pooled data channels that were silently dropped by NATs or middleboxes are detected instead of being handed out to visitors.
 

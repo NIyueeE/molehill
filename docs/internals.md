@@ -127,16 +127,36 @@ The **S1 observation** is opt-in and aggregated, so a normal run stays silent an
 
 ### Multiplexing
 
-With the `multiplex` feature (part of the default feature set) and `mode = "multiplex"` (the default), a registered service runs over a **fixed pool of tunnels**, established when the service activates (each announced with a distinct hello so the server upgrades it to a yamux session) and held for its lifetime; a dead one is repaired back to the count. Data-channel opens take the least-loaded tunnel, and a dead tunnel is skipped transparently. The pool's width is `[client.data.tcp|kcp].tunnels` and its ownership depends on `[client.data].shared_pool`; both are described in "The tunnel pool" below. The tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr` when set, else `[client.data].default_data_addr`, else the control endpoint) and are accepted by the server's data listener — the control listener itself when the addresses match, otherwise `[server.data].bind_addr`. From then on:
+With the `multiplex` feature (part of the default feature set), a registered
+**forwarding** service runs over a **fixed pool of tunnels**, established when
+the service activates (each announced with a distinct hello so the server
+upgrades it to a yamux session) and held for its lifetime; a dead one is
+repaired back to the count. The shape is not a key: a forwarding service always
+multiplexes, and a [transparent claim](#transparent-l3-services) never does,
+because a claim's channels *are* its carrier connections. Data-channel opens
+take the least-loaded tunnel, and a dead tunnel is skipped transparently. The
+pool's width is `[client.data.tcp|kcp].tunnels` and its ownership depends on
+`[client.data].shared_pool`; both are described in "The tunnel pool" below. The
+tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr`
+when set, else `[client.data].default_data_addr`, else the control endpoint) and
+are accepted by the server's data listener — the control listener itself when
+the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 - `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel, and the stream's prologue names the service it carries.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
-- Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps both modes testable against each other.
+- Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps the stream path and the connection path testable against each other.
 - The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 - A stream's two users park on the connection's per-stream command channel independently, so each has its own waker slot: a *reader* waiting to queue a window update and a *writer* waiting for send credit would otherwise share one slot, and the later park would erase the earlier one's waker — a writer that then never wakes until an unrelated resize happens to notify, which stalls every visitor on that tunnel. The reader's park lives in its own slot (`Shared::reader_park`) and the connection wakes both when a command leaves the channel.
 
-`mode = "direct"` restores the one-connection-per-channel behavior: every data channel is its own transport connection, so nothing is multiplexed and each visitor connection pays the full connection setup (TCP connect plus, with `noise`, the Noise handshake). That is a design trade-off, not a performance claim — the measured comparison lives in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements), and the choice between the two is the decision tree in [Configuration](configuration.md).
+A plain (unmultiplexed) data channel is a transport connection of its own: nothing
+is multiplexed and each visitor connection pays the full connection setup (TCP
+connect plus, with `noise`, the Noise handshake). That is a design trade-off, not
+a performance claim — the measured comparison lives in
+[Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
+Two things still open such channels: a transparent claim's lanes, and every
+channel of a build without the `multiplex` feature; a forwarding service in the
+default build always multiplexes.
 
 ### Transparent (L3) services
 
@@ -153,29 +173,30 @@ a `Claim` value held for the lifetime of the registration — so a second client
 claiming the same endpoint is rejected with a precise reason instead of silently
 stealing the first one's visitors.
 
-A claimed endpoint is carried by a **member set** — one or more data channels,
-each a *member* of the claim — and it moves **batches**, not packets: the device
+A claimed endpoint is carried by a **lane set** — one or more data channels, each
+a *lane* of the claim, and each a carrier connection of its own (a claim never
+multiplexes) — and it moves **batches**, not packets: the device
 is drained until it runs dry, every packet is framed where it is read into its
-member's buffer, and the run of frames is handed over and written as one unit.
+lane's buffer, and the run of frames is handed over and written as one unit.
 That is the same lever as a WireGuard super-packet, one layer up: the far side
 still reads one frame at a time, while the carrier pays one header, one
 acknowledgement and one syscall per *batch* instead of per packet. Because the
 flush happens the moment the device is drained, the first packet of a burst
 waits for nothing — the batching only collects what was already queued. A claim
-with one member runs in `direct` mode by default for the same reason: it has
-nothing for a multiplexer to multiplex, so its frame on every packet buys
-nothing (see
+with one lane pays that batching and nothing else: it has nothing for a
+multiplexer to multiplex, so a frame on every packet would buy nothing (see
 [Benchmarks](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
-How a claim's member set is opened, held and repaired:
+How a claim's lane set is opened, held and repaired:
 
-- The client opens the claim's **member count** in one go the moment its
-  registration is accepted — `[transparent.data].default_members`, or the
-  claim's own `members`, one channel by default (a TCP service opens none and
-  waits to be asked). In `multiplex` mode those channels are streams of the
-  claim's tunnel pool, placed on tunnels the set does not already occupy while
-  the pool has a free one, so a claim's carriers stay distinct; in `direct` mode
-  each member is a connection of its own. Every channel opens with the same
+- The client opens the claim's **lane count** in one go the moment its
+  registration is accepted. The count is derived, not written per claim: each
+  carrier's `[transparent.data.tcp|kcp].tunnels` is a budget of connections,
+  divided equally among the claims that draw on that carrier and never below one
+  (`TransparentClientConfig::claim_lanes`), so a client that writes no budget at
+  all gets the one connection per claim it always had. No multiplexer sits above
+  a lane: a `tcp` lane is a TCP connection, a `kcp` lane a KCP session. Every
+  channel opens with the same
   four-byte service prologue as any other data channel, so the server knows
   which service — and therefore which endpoint — it carries before the first
   packet.
@@ -188,33 +209,33 @@ How a claim's member set is opened, held and repaired:
   empty packet.
 - The server supervises the set, and it is not told the set's width: the
   channels the client opens *are* the set, and the hub discovers the width from
-  the members that actually join, widening by one whenever a join finds every
-  slot taken. A member that ends keeps its slot — a replacement inherits it, so
-  the packets placed in it resume there while the surviving members are
-  untouched — and every member that ends is replaced (the same
+  the lanes that actually join, widening by one whenever a join finds every
+  slot taken. A lane that ends keeps its slot — a replacement inherits it, so
+  the packets placed in it resume there while the surviving lanes are
+  untouched — and every lane that ends is replaced (the same
   `DataChannelRequest` path a UDP worker's replacement takes), the claim staying
-  held while it waits. A channel that arrives after a member ended is paced:
+  held while it waits. A channel that arrives after a lane ended is paced:
   250 ms (`TRANSPARENT_REPLACE_BACKOFF`) before the start command is written, so
   a peer that cannot serve it is not polled in a tight loop.
-- Which member a packet rides is decided **per flow**, by one hash of its
+- Which lane a packet rides is decided **per flow**, by one hash of its
   five-tuple (`src/transparent/flow.rs`): the protocol, then the two endpoints
   sorted (address bytes, then port), so both directions of a flow — and both
-  ends of a claim, which see opposite ones — place it on the same member. A set
+  ends of a claim, which see opposite ones — place it on the same lane. A set
   of one has one answer; otherwise the slot is `hash % width`. Per *flow*, never
-  per packet: each member is one ordered carrier, so a flow that stays on one
-  member arrives in the order its sender wrote it, while a flow dealt out packet
+  per packet: each lane is one ordered carrier, so a flow that stays on one
+  lane arrives in the order its sender wrote it, while a flow dealt out packet
   by packet would be interleaved across carriers that drain at their own speeds
   and injected — by the far end, which injects what it reads — out of order. A
-  flow whose member dies is **not moved**: the dead member's slot stays in the
+  flow whose lane dies is **not moved**: the dead lane's slot stays in the
   set, so its flows are dropped (and counted `no_channel` on that slot) until the
   replacement joins it. Moving them would reorder them against what the dead
-  member had already delivered.
+  lane had already delivered.
 
 **Which end of a packet the claim is.** Both ends run the same hub
-(`src/transparent/hub.rs`): one reader per TUN device, a **member set** per
+(`src/transparent/hub.rs`): one reader per TUN device, a **lane set** per
 claimed endpoint — the data channels carrying it, one bounded queue each, one
 slot of the set each — and an endpoint table that decides which packet belongs
-to which claim. A slot outlives the member that held it: a replaced channel
+to which claim. A slot outlives the lane that held it: a replaced channel
 takes the slot its predecessor left, so the routing target of a packet never
 moves when a channel does. They differ in the end they look at, which is the
 heart of the design:
@@ -250,19 +271,19 @@ must read 0; on the server, a registration is rejected if its device is missing.
 The recipes are in [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
-and counted (`not_ipv4`), and there is no IPv6 path. A claim's member set is
-spread **per flow**, so the claim's throughput is the sum of its members while
-one flow still cannot exceed one member; a member that dies takes its flows'
+and counted (`not_ipv4`), and there is no IPv6 path. A claim's lane set is
+spread **per flow**, so the claim's throughput is the sum of its lanes while
+one flow still cannot exceed one lane; a lane that dies takes its flows'
 packets with it until its replacement joins the slot, and a portless packet
 (ICMP, a later fragment) hashes on its addresses alone, so the fragments of one
-datagram can take different members — IP reassembly is order-insensitive, which
+datagram can take different lanes — IP reassembly is order-insensitive, which
 is what makes that safe. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
 counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,
-`channel_errors`) once a second per data path, and one line per member slot of
+`channel_errors`) once a second per data path, and one line per lane slot of
 every claim on that device (`live`, `forwarded`, `no_channel`), which is how a
-run is observed without logging per packet and how a member set is told from a
+run is observed without logging per packet and how a lane set is told from a
 stack.
 
 ## UDP

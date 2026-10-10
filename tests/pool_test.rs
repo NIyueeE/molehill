@@ -1155,7 +1155,6 @@ async fn run_binary_pair(
              type = \"plain\"\n\
              \n\
              [client.data]\n\
-             default_mode = \"multiplex\"\n\
              shared_pool = true\n\
              \n\
              [client.data.tcp]\n\

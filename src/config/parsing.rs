@@ -9,7 +9,7 @@ use tokio::fs;
 use url::Url;
 
 #[cfg(feature = "multiplex")]
-use crate::common::constants::{DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS_CAP};
+use crate::common::constants::{DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS_CAP, MAX_TRANSPARENT_LANES};
 use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
     DEFAULT_UDP_WORKERS,
@@ -55,22 +55,6 @@ pub enum TransportType {
     Plain,
     #[serde(rename = "noise")]
     Noise,
-}
-
-/// How the data plane carries forwarded traffic (`[client.data].default_mode`;
-/// overridable per service on `[client.services.*]`).
-#[cfg(feature = "multiplex")]
-#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
-pub enum DataMode {
-    /// Multiplex data channels as yamux streams over `count` tunnel
-    /// connections (default).
-    #[default]
-    #[serde(rename = "multiplex")]
-    Multiplex,
-    /// One physical connection per data channel. `count` and `carrier`
-    /// do not apply.
-    #[serde(rename = "direct")]
-    Direct,
 }
 
 /// Which transport carries the data plane (`[client.data].default_carrier`;
@@ -161,11 +145,7 @@ pub struct ClientServiceConfig {
     /// only: the service's control channel (and, by default, its data
     /// plane) dials this server instead of the client-wide one.
     pub remote_addr: Option<String>,
-    /// Override `[client.data].default_mode` for this service only.
-    #[cfg(feature = "multiplex")]
-    pub mode: Option<DataMode>,
-    /// Override `[client.data].default_carrier` for this service only;
-    /// valid only with `mode = "multiplex"`.
+    /// Override `[client.data].default_carrier` for this service only.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
     /// Per-service transport override (encryption enablement + keys).
@@ -189,12 +169,12 @@ pub struct ClientServiceConfig {
     /// for every forwarding service: only a claim touches a device.
     #[serde(skip)]
     pub transparent_tun: String,
-    /// How many data channels this claim holds — its **member set** — filled by
-    /// the L3 model's lowering from `[transparent.data].default_members` or the
-    /// claim's own `members`. `0` for every forwarding service, which never
-    /// reads it.
+    /// How many carrier connections this claim holds — its **lanes** — filled
+    /// by the L3 model's lowering from the carrier's budget
+    /// (`[transparent.data.tcp|kcp].tunnels`, divided equally among the claims
+    /// that draw on it). `0` for every forwarding service, which never reads it.
     #[serde(skip)]
-    pub transparent_members: u16,
+    pub transparent_lanes: u16,
 }
 
 impl ClientServiceConfig {
@@ -223,13 +203,27 @@ impl ClientServiceConfig {
             .unwrap_or(global)
     }
 
-    /// The member count of a claim's data plane, at least one: the set a
-    /// claim's packets are placed in never has fewer slots than the one channel
-    /// every service has.
+    /// The lane count of a claim's data plane, at least one: a claim always has
+    /// one carrier connection, whatever the budget division rounds to.
     ///
     /// Only a claim's value is ever read; a forwarding service answers 1.
-    pub fn claim_members(&self) -> usize {
-        usize::from(self.transparent_members.max(1))
+    pub fn lanes(&self) -> usize {
+        usize::from(self.transparent_lanes.max(1))
+    }
+
+    /// Whether this service's data channels ride the multiplexed pool.
+    ///
+    /// Derived, never configured. A forwarding service multiplexes: its channels
+    /// are per-visitor and unbounded, so a bounded pool of connections is what
+    /// keeps the client's FD and NAT footprint flat. A transparent claim never
+    /// does: its channels *are* its carrier connections, and its throughput is
+    /// the sum of connections rather than of streams, so a multiplexer over them
+    /// would be framing for nothing (measured: 28 % of the bulk throughput and
+    /// 68 % more CPU per byte; see HANDOFF.md, "The data plane is derived").
+    /// Without the `multiplex` feature no pool exists and every channel is a
+    /// connection of its own — the same answer.
+    pub fn uses_pool(&self) -> bool {
+        cfg!(feature = "multiplex") && self.service_type != ServiceType::Transparent
     }
 
     /// The Noise config this service will use: its own
@@ -407,10 +401,14 @@ pub struct ClientControlConfig {
 
 /// Data-plane defaults (`[client.data]`).
 ///
-/// Every service inherits these and may override `mode` and `carrier`
-/// individually on its own `[client.services.<name>]` block;
-/// `addr` itself cannot be overridden per service, but a service with its
-/// own `remote_addr` dials that server's data endpoint instead.
+/// Every service inherits these and may override `carrier` individually on its
+/// own `[client.services.<name>]` block; `addr` itself cannot be overridden per
+/// service, but a service with its own `remote_addr` dials that server's data
+/// endpoint instead.
+///
+/// The *shape* of the data plane is not a key: a forwarding service always
+/// multiplexes ([`ClientServiceConfig::uses_pool`]) and a transparent claim
+/// never does.
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -421,12 +419,10 @@ pub struct ClientDataConfig {
     /// that does not override `remote_addr` itself.
     pub default_data_addr: Option<String>,
     #[serde(default)]
-    pub default_mode: DataMode,
-    #[serde(default)]
     pub default_carrier: DataCarrier,
     /// Serve every service of one control session from **one** shared tunnel
     /// pool per carrier, instead of one pool per service. Default: `false`
-    /// (one pool per service, the classic shape). Both modes are one code
+    /// (one pool per service, the classic shape). Both shapes are one code
     /// path; they differ only in the pool's key.
     #[serde(default)]
     pub shared_pool: bool,
@@ -479,6 +475,17 @@ impl DataCarrierLimits {
             None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
         }
     }
+
+    /// The count the operator wrote for this carrier, unclamped, or `None`.
+    ///
+    /// The L3 model reads this one rather than [`Self::tunnels`]: a
+    /// transparent client's `tunnels` is a *lane budget* (one lane is one
+    /// connection, [`MAX_TRANSPARENT_LANES`]), not the multiplexed pool's
+    /// ceiling, so a value above that ceiling is a refusal with a number to
+    /// write rather than a silent clamp.
+    pub fn written(&self) -> Option<usize> {
+        self.tunnels.map(usize::from)
+    }
 }
 /// The TUN device a transparent (L3) service attaches to.
 ///
@@ -530,23 +537,6 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-    /// Default data-plane mode: whether data channels should be multiplexed
-    /// over tunnel connections. A service overrides this with its own
-    /// `[client.services.<name>].mode`.
-    #[cfg(feature = "multiplex")]
-    pub fn multiplex_enabled(&self) -> bool {
-        matches!(self.data.default_mode, DataMode::Multiplex)
-    }
-
-    /// Always `false` without the `multiplex` feature.
-    #[cfg(not(feature = "multiplex"))]
-    pub fn multiplex_enabled(&self) -> bool {
-        // The data plane is always direct without the feature; keep the
-        // method signature uniform with the multiplex build.
-        let _ = self;
-        false
-    }
-
     /// Whether one control session's services share one tunnel pool per
     /// carrier (`[client.data].shared_pool`). `false` is the classic shape:
     /// one pool per service.
@@ -811,8 +801,6 @@ impl ClientModel {
 enum FloorCause {
     /// A UDP service's worker set (`udp_workers`): its shards must stay apart.
     UdpWorkers(u16),
-    /// An L3 claim's member set (`members`): its carriers must stay apart.
-    ClaimMembers(u16),
 }
 
 /// Keys a release removed, the version that removed each one, and what to
@@ -905,6 +893,19 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
         "a service stays registered for as long as its client runs: a request that cannot be \
          forwarded fails for that visitor, and the reason goes to the log",
     ),
+    (
+        "client.data.default_mode",
+        "the next release",
+        "the data plane's shape is derived from the service type now: a forwarding service always \
+         multiplexes and `[client.data.tcp|kcp].tunnels` says how wide its pool is, so there is no \
+         mode to write; remove the key",
+    ),
+    (
+        "client.services.*.mode",
+        "the next release",
+        "a service's shape follows its protocol — a forwarding service multiplexes and a claim \
+         does not — so there is no mode to write; remove the key",
+    ),
 ];
 
 /// Refuse a config that still carries a key from [`REMOVED_KEYS`], naming
@@ -972,6 +973,64 @@ fn reject_moved_tables(doc: &toml::Value) -> Result<()> {
     Ok(())
 }
 
+/// Keys the unreleased L3 model carried, and what to write instead.
+///
+/// The same reasoning as [`MOVED_TABLES`], for keys rather than tables: nothing
+/// of this surface was ever released (the transparent model is being shaped
+/// before its first tag), so an upgrade instruction cannot name a release, but
+/// the key still has to be refused by name rather than left to
+/// `deny_unknown_fields`, which says *what* is wrong without saying what to do.
+const UNRELEASED_KEYS: &[(&str, &str)] = &[
+    (
+        "transparent.data.default_mode",
+        "a transparent claim never multiplexes: its data channels are carrier connections of its \
+         own, and `[transparent.data.tcp|kcp].tunnels` is their budget; remove the key",
+    ),
+    (
+        "transparent.claims.*.mode",
+        "a transparent claim never multiplexes: its data channels are carrier connections of its \
+         own; remove the key",
+    ),
+    (
+        "transparent.data.default_members",
+        "a claim's lanes come from its carrier's budget now: write \
+         `[transparent.data.tcp|kcp].tunnels`, divided equally among the claims that draw on that \
+         carrier, and every claim keeps at least one; remove the key",
+    ),
+    (
+        "transparent.claims.*.members",
+        "a claim's lanes come from its carrier's budget now: write \
+         `[transparent.data.tcp|kcp].tunnels`, divided equally among the claims that draw on that \
+         carrier; remove the key",
+    ),
+    (
+        "transparent.data.shared_pool",
+        "a transparent client has no pool to share: every claim's channels are connections of its \
+         own, drawn from the carrier's lane budget; remove the key",
+    ),
+];
+
+/// Refuse a config that still carries a key of the unreleased L3 model this
+/// version does not know, naming it and what to write instead.
+fn reject_unreleased_keys(doc: &toml::Value) -> Result<()> {
+    let mut found: Vec<String> = Vec::new();
+    for (pattern, advice) in UNRELEASED_KEYS {
+        let segments: Vec<&str> = pattern.split('.').collect();
+        let mut hits = 0;
+        count_at(doc, &segments, &mut hits);
+        if hits > 0 {
+            found.push(format!("  `{pattern}` ({hits}x): {advice}"));
+        }
+    }
+    anyhow::ensure!(
+        found.is_empty(),
+        "this config still carries keys this version does not know:\n{}\n\
+         Remove them, then start again.",
+        found.join("\n")
+    );
+    Ok(())
+}
+
 /// Walk `value` along `segments`, counting the leaves that are present. `*`
 /// descends into every value of a table.
 fn count_at(value: &toml::Value, segments: &[&str], hits: &mut usize) {
@@ -1009,6 +1068,7 @@ impl Config {
             toml::from_str(s).with_context(|| "Failed to parse the config")?;
         reject_removed_keys(&mut doc)?;
         reject_moved_tables(&doc)?;
+        reject_unreleased_keys(&doc)?;
         let mut config: Config =
             Config::deserialize(doc).with_context(|| "Failed to parse the config")?;
 
@@ -1026,7 +1086,7 @@ impl Config {
         // legal, and that is the model argument.
         if let Some(transparent) = config.transparent.as_mut() {
             #[cfg(feature = "multiplex")]
-            Config::validate_claim_members(transparent)?;
+            Config::validate_claim_lanes(transparent)?;
             let mut lowered = transparent.lower();
             Config::validate_client_config(&mut lowered, ClientModel::Claiming)?;
             transparent.lowered = Some(Box::new(lowered));
@@ -1311,39 +1371,45 @@ impl Config {
         Ok(())
     }
 
-    /// Refuse a member count a claim may not hold.
+    /// Refuse a lane budget that cannot give every claim a connection of its
+    /// own.
     ///
-    /// `members` is a count like `tunnels`, and it is refused rather than
-    /// clamped for the same reason: the operator wrote a number, and a count
-    /// nobody obeys is worse than a refusal that names the key. One is the
-    /// floor (a claim always has its one channel), and the tunnel cap is the
-    /// ceiling — a claim with more members than the pool may ever hold would be
-    /// asking for carriers that cannot stay distinct.
+    /// A claim's lane **is** a carrier connection — a transparent client never
+    /// multiplexes — so a budget below the number of claims drawing on that
+    /// carrier cannot be honoured: some claim would have no carrier at all. One
+    /// lane per claim is therefore both the default (when the key is unwritten)
+    /// and the floor, and the message names the count to write instead. The
+    /// upper bound is a resource guard, not a pool ceiling: `tunnels` here is
+    /// [`MAX_TRANSPARENT_LANES`], not [`MAX_MUX_TUNNELS_CAP`].
     ///
     /// Run on the L3 model's own block, before it is lowered: the key the
-    /// message names is the one the reader wrote (`default_members`, or one
-    /// claim's `members`), which the lowered form no longer knows.
+    /// message names is the one the reader wrote.
     #[cfg(feature = "multiplex")]
-    fn validate_claim_members(transparent: &TransparentClientConfig) -> Result<()> {
-        let cap = usize::from(MAX_MUX_TUNNELS_CAP);
-        let check = |key: String, members: u16| -> Result<()> {
-            if members == 0 {
-                bail!("`{key}` must be at least 1");
+    fn validate_claim_lanes(transparent: &TransparentClientConfig) -> Result<()> {
+        for carrier in [DataCarrier::Tcp, DataCarrier::Kcp] {
+            let claims = transparent.claims_on(carrier);
+            if claims == 0 {
+                continue;
             }
-            if usize::from(members) > cap {
+            let block = format!("[transparent.data.{}]", carrier.as_str());
+            let Some(written) = transparent.written_budget(carrier) else {
+                continue;
+            };
+            let cap = usize::from(MAX_TRANSPARENT_LANES);
+            if written > cap {
                 bail!(
-                    "`{key} = {members}` is above the {cap} data channels one claim may hold; \
-                     lower it, or split the service"
+                    "`{block}.tunnels = {written}` is above the {cap} carrier connections a \
+                     transparent client may hold on one carrier; lower it, or split the claims \
+                     across clients"
                 );
             }
-            Ok(())
-        };
-        if let Some(members) = transparent.data.default_members {
-            check("[transparent.data].default_members".to_owned(), members)?;
-        }
-        for (name, claim) in &transparent.claims {
-            if let Some(members) = claim.members {
-                check(format!("[transparent.claims.{name}].members"), members)?;
+            if written < claims {
+                bail!(
+                    "`{block}.tunnels = {written}` is below what this client's claims need: \
+                     {claims} claim(s) draw on the {} carrier, and a claim's lane is a connection \
+                     of its own. Write `{block}.tunnels = {claims}` or more",
+                    carrier.as_str()
+                );
             }
         }
         Ok(())
@@ -1352,14 +1418,17 @@ impl Config {
     /// Refuse a tunnel count smaller than what the services of that carrier
     /// need.
     ///
-    /// Two things ask for one tunnel per unit of demand: a UDP service's worker
-    /// set shards across tunnels, and an L3 claim's member set spreads its
-    /// inner flows across them. A pinned pool keeps one tunnel per worker or
-    /// member so those paths stay distinct — that is the floor, and a pool that
+    /// One thing asks for one tunnel per unit of demand: a UDP service's worker
+    /// set shards across tunnels. A pinned pool keeps one tunnel per worker so
+    /// those shards stay on distinct tunnels — that is the floor, and a pool that
     /// cannot grow cannot meet it later either, so a count below it is a
     /// configuration that would silently degrade the service it was written
     /// for. The message names the count to write instead, because an operator
     /// who has just been told "no" needs the number, not the rule.
+    ///
+    /// A transparent claim is not part of this floor: it never draws from a
+    /// pool, and what bounds its own carrier connections is validated on the L3
+    /// block itself.
     #[cfg(feature = "multiplex")]
     fn validate_tunnel_floor(client: &ClientConfig, model: ClientModel) -> Result<()> {
         for (carrier, limits) in [
@@ -1382,11 +1451,6 @@ impl Config {
                      per worker so their shards stay on distinct tunnels. Write `{block}.tunnels \
                      = {needed}` or more, or lower that service's `udp_workers`."
                 ),
-                FloorCause::ClaimMembers(members) => format!(
-                    "claim `{name}` holds {members} members, and a pool keeps one tunnel per \
-                     member so a claim's carriers stay distinct tunnels. Write `{block}.tunnels \
-                     = {needed}` or more, or lower that claim's `members`."
-                ),
             };
             bail!(
                 "`{block}.tunnels = {written}` is below what the services of that carrier need: \
@@ -1401,15 +1465,15 @@ impl Config {
     ///
     /// "Deepest" rather than "summed": every pool is keyed per service (or, with
     /// `shared_pool`, per session), and a service's own pool only ever has to
-    /// carry that service's workers — or that claim's members — at once, because
-    /// what a floor buys is distinctness *within* one set of channels. The floor
-    /// of the largest demand is therefore what every pool on that carrier must
-    /// be able to hold: the conservative reading, and the one that cannot
-    /// under-provision a service.
+    /// carry that service's workers at once, because what a floor buys is
+    /// distinctness *within* one set of channels. The floor of the largest
+    /// demand is therefore what every pool on that carrier must be able to hold:
+    /// the conservative reading, and the one that cannot under-provision a
+    /// service.
     ///
-    /// Only a service that draws from a pool counts: a `direct` service opens
-    /// its own connection per channel and never touches one, so its count is no
-    /// reason to refuse a tunnel count.
+    /// Only a service that draws from a pool counts. A transparent claim never
+    /// does: its channels are carrier connections of its own (it never
+    /// multiplexes), so its count is no reason to refuse a tunnel count.
     #[cfg(feature = "multiplex")]
     fn deepest_floor(
         client: &ClientConfig,
@@ -1418,9 +1482,7 @@ impl Config {
         let stream_cap = crate::transport::multiplex::stream_cap();
         let mut deepest: Option<(usize, String, FloorCause)> = None;
         for (name, service) in &client.services {
-            if service.carrier.unwrap_or(client.data.default_carrier) != carrier
-                || service.mode.unwrap_or(client.data.default_mode) != DataMode::Multiplex
-            {
+            if service.carrier.unwrap_or(client.data.default_carrier) != carrier {
                 continue;
             }
             let (demand, cause) = match service.service_type {
@@ -1428,14 +1490,7 @@ impl Config {
                     let workers = service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS);
                     (usize::from(workers), FloorCause::UdpWorkers(workers))
                 }
-                ServiceType::Transparent => {
-                    let members = service.transparent_members;
-                    (
-                        usize::from(members.max(1)),
-                        FloorCause::ClaimMembers(members),
-                    )
-                }
-                ServiceType::Tcp => continue,
+                ServiceType::Transparent | ServiceType::Tcp => continue,
             };
             let floor = crate::transport::pool::udp_floor([demand], stream_cap);
             if deepest
@@ -2322,9 +2377,9 @@ remote_bind_addr = "0.0.0.0:6080"
     #[cfg(feature = "multiplex")]
     #[test]
     fn test_per_service_data_overrides_parse() {
-        // `[client.data]` acts as defaults; a service's own mode/carrier win.
-        // The runtime merge lives in `DataOpts::for_service` (client code);
-        // here we pin that the keys parse and validate per service.
+        // `[client.data]` acts as defaults; a service's own carrier wins. The
+        // runtime merge lives in `DataOpts::for_service` (client code); here we
+        // pin that the key parses and validates per service.
         // `default_carrier = "kcp"` (and `[client.data.kcp]`) need the `kcp`
         // feature; the CI legs build this test with and without it, so the
         // override is exercised with whatever carrier the build has — the
@@ -2338,7 +2393,6 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [client.data]
-default_mode = "multiplex"
 "#,
         );
         config.push_str(if cfg!(feature = "kcp") {
@@ -2346,15 +2400,14 @@ default_mode = "multiplex"
         } else {
             "default_carrier = \"tcp\"\n"
         });
-        // One service overrides the carrier back to TCP and to direct mode:
-        // the per-service keys are independent of each other and of the block.
+        // One service overrides the carrier back to TCP: the per-service key is
+        // independent of the block.
 
         config.push_str(
             r#"
 [client.services.muxed]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-mode = "direct"
 
 [client.services.bulk]
 local_addr = "127.0.0.1:81"
@@ -2364,9 +2417,7 @@ carrier = "tcp"
         );
         let cfg = Config::from_str(&config).unwrap();
         let services = &cfg.client.unwrap().services;
-        assert_eq!(services["muxed"].mode, Some(DataMode::Direct));
         assert_eq!(services["muxed"].carrier, None);
-        assert_eq!(services["bulk"].mode, None);
         assert_eq!(services["bulk"].carrier, Some(DataCarrier::Tcp));
     }
 
@@ -2506,10 +2557,10 @@ remote_addr = "other.example.com:2444"
     #[cfg(feature = "multiplex")]
     #[test]
     fn test_per_service_data_validation() {
-        // `mode` and `carrier` are independent: a direct service may ride a
-        // KCP session, and that pair must load (the direct channel *is* the
-        // session, so there is no multiplexer involved at all).
-        let direct_kcp = r#"
+        // A forwarding service multiplexes whatever carrier it names: a KCP
+        // service rides KCP *tunnels* (the carrier's session is the pool's
+        // connection, with the multiplexer above it), and that must load.
+        let kcp_service = r#"
 [client]
 default_token = "t"
 
@@ -2519,18 +2570,16 @@ default_remote_addr = "example.com:2333"
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-mode = "direct"
 carrier = "kcp"
 "#;
         if cfg!(feature = "kcp") {
-            let cfg = Config::from_str(direct_kcp).unwrap();
+            let cfg = Config::from_str(kcp_service).unwrap();
             let s = &cfg.client.unwrap().services["test"];
-            assert_eq!(s.mode, Some(DataMode::Direct));
             assert_eq!(s.carrier, Some(DataCarrier::Kcp));
         } else {
             // Without the feature the carrier is refused, and the message names
             // the feature rather than a mode the pair never needed.
-            let err = format!("{:#}", Config::from_str(direct_kcp).unwrap_err());
+            let err = format!("{:#}", Config::from_str(kcp_service).unwrap_err());
             assert!(
                 err.contains("kcp"),
                 "the refusal must name the feature: {err}"
@@ -2612,15 +2661,15 @@ udp_workers = 4
         assert!(Config::from_str(&unset).is_ok());
     }
 
-    /// A claim's member set draws from the pool the same way a UDP worker set
-    /// does: the pool keeps one tunnel per member so the carriers stay distinct,
-    /// and a pinned pool cannot grow to meet a count below the floor. The
-    /// refusal names the claim, the count to write and the knob — a claim's
-    /// `members`, not a UDP service's `udp_workers`.
+    /// A lane budget is a count like any other: above the resource guard it is
+    /// refused with the bound named, never clamped. Clamping is the *pool*
+    /// ceiling's behaviour, and a claim's lanes are connections rather than
+    /// streams, so the two are deliberately different keys with different
+    /// bounds.
     #[cfg(feature = "multiplex")]
     #[test]
-    fn test_a_tunnel_count_below_a_claims_member_count_is_refused() {
-        let config = |tunnels: u16, mode: &str, members: &str| {
+    fn test_a_lane_budget_above_the_guard_is_refused() {
+        let config = |tunnels: u16| {
             format!(
                 r#"
 [transparent]
@@ -2629,97 +2678,27 @@ tun = "l3test0"
 
 [transparent.control]
 default_remote_addr = "example.com:2333"
-
-[transparent.data]
-default_mode = "{mode}"
 
 [transparent.data.tcp]
 tunnels = {tunnels}
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
-{members}
 "#
             )
         };
 
-        // Four members ask for four carriers; two tunnels cannot keep them
-        // distinct.
-        let err = format!(
+        let over = format!(
             "{:#}",
-            Config::from_str(&config(2, "multiplex", "members = 4")).unwrap_err()
+            Config::from_str(&config(MAX_TRANSPARENT_LANES + 1)).unwrap_err()
         );
         assert!(
-            err.contains("`[transparent.data.tcp].tunnels = 2`")
-                && err.contains("`[transparent.data.tcp].tunnels = 4`")
-                && err.contains("claim `web` holds 4 members"),
-            "the refusal must name the key, the count to write and the claim: {err}"
+            over.contains("[transparent.data.tcp].tunnels")
+                && over.contains(&MAX_TRANSPARENT_LANES.to_string()),
+            "the refusal must name the key and the bound: {over}"
         );
 
-        // The floor itself is the operator's number, and the claim is accepted.
-        assert!(Config::from_str(&config(4, "multiplex", "members = 4")).is_ok());
-
-        // A claim that opens a connection per member (`direct`) never draws
-        // from the pool, so the pool's width is no reason to refuse it.
-        assert!(
-            Config::from_str(&config(2, "direct", "members = 4")).is_ok(),
-            "a direct claim has no pool and therefore no pool floor"
-        );
-    }
-
-    /// A member count is a count: at least one channel per claim, and never
-    /// more than one claim may hold. The refusal names the key the reader
-    /// wrote, which is why it runs on the L3 block rather than its lowering.
-    #[cfg(feature = "multiplex")]
-    #[test]
-    fn test_a_claim_member_count_out_of_range_is_refused() {
-        let claim = |members: &str| {
-            format!(
-                r#"
-[transparent]
-default_token = "t"
-tun = "l3test0"
-
-[transparent.control]
-default_remote_addr = "example.com:2333"
-
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-{members}
-"#
-            )
-        };
-
-        let zero = format!("{:#}", Config::from_str(&claim("members = 0")).unwrap_err());
-        assert!(
-            zero.contains("[transparent.claims.web].members") && zero.contains("at least 1"),
-            "zero is not a member set: {zero}"
-        );
-
-        let too_many = format!(
-            "{:#}",
-            Config::from_str(&claim("members = 65")).unwrap_err()
-        );
-        assert!(
-            too_many.contains("[transparent.claims.web].members")
-                && too_many.contains(&MAX_MUX_TUNNELS_CAP.to_string()),
-            "the refusal must name the key and the cap: {too_many}"
-        );
-
-        // The cap itself is a count this client may hold, and the block's
-        // default is validated under its own name.
-        assert!(Config::from_str(&claim("members = 64")).is_ok());
-        let block = format!(
-            "{:#}",
-            Config::from_str(&claim("").replace(
-                "[transparent.claims.web]",
-                "[transparent.data]\ndefault_members = 0\n\n[transparent.claims.web]"
-            ))
-            .unwrap_err()
-        );
-        assert!(
-            block.contains("[transparent.data].default_members"),
-            "the block's default is named as the reader wrote it: {block}"
-        );
+        // The guard itself is a budget this client may hold.
+        assert!(Config::from_str(&config(MAX_TRANSPARENT_LANES)).is_ok());
     }
 }

@@ -9,9 +9,9 @@ pub use parsing::{ClientConfig, ClientServiceConfig};
 #[cfg(feature = "server")]
 pub use parsing::ServerConfig;
 pub use parsing::{Config, MaskedString, ServiceType, TransportConfig, TransportType};
-// Only meaningful together with the data-plane fields they select between
+// Only meaningful together with the data-plane field it selects
 #[cfg(feature = "multiplex")]
-pub use parsing::{DataCarrier, DataMode};
+pub use parsing::DataCarrier;
 // Only used by the noise transport
 #[cfg(feature = "noise")]
 pub use parsing::NoiseConfig;

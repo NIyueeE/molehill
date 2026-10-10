@@ -19,7 +19,6 @@ default_remote_addr = "127.0.0.1:2395"
 type = "plain"
 
 [client.data]
-default_mode = "multiplex"
 default_carrier = "tcp"
 
 [client.data.tcp]

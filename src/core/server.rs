@@ -1187,7 +1187,9 @@ type DataChannel = ServerStream;
 enum DataChannel {
     Raw(ServerStream),
     /// A direct channel over KCP: no yamux above it, the session's own byte
-    /// stream is the channel (`carrier = "kcp"` with `mode = "direct"`).
+    /// stream is the channel. With the data plane's shape derived from the
+    /// service type, this is a transparent claim's lane: a KCP carrier with no
+    /// multiplexer over it.
     #[cfg(feature = "kcp")]
     RawKcp(crate::transport::kcp::KcpTunnelStream),
     Mux(crate::transport::MuxStream),

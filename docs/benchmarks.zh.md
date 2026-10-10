@@ -81,6 +81,17 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 ### 模型强制的规则
 
+- **臂必须写明它测的宽度;数据面的形态根本不是臂的参数。** 转发臂的 `pool_cap`
+  是池的 `[client.data.tcp|kcp].tunnels`,L3 臂的则是透明认领的**车道预算**——
+  一条车道一条连接,因为认领永不multiplex——另一条轴是 `carrier`。形态本身由
+  服务类型推导(转发服务多路复用,认领永不),所以仍写着 `mode` 的臂会被
+  `just bench-selfcheck` 拒绝。下文的记录沿用各次运行当时目录里的臂名:记录里写
+  `l3-mux`(池上一条流)、`l3-mux4`(四条流)或 `l3-raw4`(四条连接)的地方,现在的
+  目录是 `l3`(一条连接)与 `l3-lanes4`(四条连接);而 `l4-mux1` 已删除,因为拓扑里
+  UDP 的下限会拒绝只有一条隧道的池——"两条隧道池上的单条流"对应单流场景下的
+  `l4-mux2`(见 [HANDOFF.md](../HANDOFF.md)「The mux×1 gap, measured before
+  touching it」)。
+
 - **一个指标只在代码里定义一次。** 单位、方向、它作为比值时所用的分母、能够
   产出它的工作负载种类,以及值得称为一个 claim 的最小差异,全都写在
   `model.METRICS` 里;下面那张表就是从这个注册表生成的,`just bench-list` 会

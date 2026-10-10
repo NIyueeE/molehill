@@ -95,6 +95,21 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 ### The rules the model enforces
 
+- **An arm states the width it measured, and the data plane's shape is not an
+  arm parameter at all.** `pool_cap` is the pool's
+  `[client.data.tcp|kcp].tunnels` for a forwarding arm and a transparent
+  claim's **lane budget** for an L3 one — one connection per lane, because a
+  claim never multiplexes — and `carrier` is the other axis. The shape itself is
+  derived from the service type (a forwarding service multiplexes, a claim never
+  does), so an arm spec that still names a `mode` is refused by
+  `just bench-selfcheck`. Records below name the arms the catalog had when each
+  run was made: where one says `l3-mux` (one stream of a pool), `l3-mux4` (four
+  streams) or `l3-raw4` (four connections), today's catalog has `l3` (one
+  connection) and `l3-lanes4` (four connections), and `l4-mux1` is gone because
+  the topology's UDP floor refuses a one-tunnel pool — one stream on a
+  two-tunnel pool is `l4-mux2` in a single-flow scenario
+  ([HANDOFF.md](../HANDOFF.md), "The mux×1 gap, measured before touching it").
+
 - **A metric is defined once, in code.** Unit, direction, the denominator it is
   a ratio over, the workload kinds that can produce it and the smallest
   difference worth calling a claim all live in `model.METRICS`; the table below

@@ -511,14 +511,13 @@ tun = "{TUN_SRV}"
             + "\n"
             for port in SERVICE_PORTS
         )
-        # The data plane is stated once, on the block every claim inherits:
-        # both keys are written even when they are the product's defaults,
-        # because an arm must record the configuration it measured and the
-        # carrier is one of the axes this model compares. The two keys that
-        # *are* left out when an arm says nothing — the pool's width and the
-        # claim's member count — keep every arm that predates them on the exact
-        # config it measured (and therefore on its method fingerprint).
-        members = f"\ndefault_members = {arm.members}\n" if arm.members else ""
+        # The data plane is stated once, on the block every claim inherits: the
+        # carrier is written even when it is the product's default, because an
+        # arm must record the configuration it measured and the carrier is one
+        # of the axes this model compares. The key that *is* left out when an
+        # arm says nothing — the claim's lane budget — keeps every arm that
+        # predates it on the exact config it measured (and therefore on its
+        # method fingerprint): an unwritten budget is one connection per claim.
         cap = (
             f"\n[transparent.data.{arm.data_carrier}]\ntunnels = {arm.pool_cap}\n"
             if arm.pool_cap
@@ -532,8 +531,7 @@ tun = "{TUN_CLI}"
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
 [transparent.data]
-default_mode = "{arm.data_mode}"
-default_carrier = "{arm.data_carrier}"{members}{cap}
+default_carrier = "{arm.data_carrier}"{cap}
 {claims}"""
     else:
         cap = f"\n[client.data.tcp]\ntunnels = {arm.pool_cap}\n" if arm.pool_cap else ""
@@ -575,7 +573,6 @@ default_token = "bench"
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
 [client.data]
-default_mode = "{arm.data_mode}"
 default_carrier = "{arm.data_carrier}"
 {cap}
 {"".join(services)}"""

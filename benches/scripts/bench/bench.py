@@ -270,16 +270,22 @@ def _check_arms(c: Checker) -> None:
         arm = model.arms_from_names([name], "/bin/true")[0]
         c.equal(f"arm {name} id", arm.id, name)
         for kind in ("control", "l4", "l3"):
-            spec = f"id={kind},mode=direct,txqueuelen={model.DEEP_TXQUEUELEN}"
+            spec = f"id={kind},txqueuelen={model.DEEP_TXQUEUELEN}"
             parsed = model.parse_arm_spec(spec)
             c.equal(f"arm spec {kind} txqueuelen", parsed.txqueuelen, 10000)
-    # `mode` and `carrier` are independent axes: the product accepts every
-    # combination, so the catalog may state every combination.
-    for mode in ("direct", "multiplex"):
-        spec = f"id=l3,mode={mode},carrier=kcp"
-        parsed = model.parse_arm_spec(spec)
-        c.equal(f"arm spec carries kcp in {mode} mode", parsed.data_carrier, "kcp")
-        c.equal(f"arm spec keeps the {mode} mode", parsed.data_mode, mode)
+    # The carrier is the only data-plane axis an arm states: the *shape* is
+    # derived from the service type (a forwarding service multiplexes, a claim
+    # never does), so an arm spec that still names a mode is refused rather than
+    # silently measuring the default — and `pool_cap` means the pool's width for
+    # an L4 arm and the claim's lane budget for an L3 one.
+    parsed = model.parse_arm_spec("id=l3,carrier=kcp,pool_cap=4")
+    c.equal("arm spec carries kcp", parsed.data_carrier, "kcp")
+    c.equal("arm spec keeps the l3 lane budget", parsed.pool_cap, 4)
+    c.check(
+        "arm spec refuses the removed mode key",
+        _refused(model.parse_arm_spec, "id=l3,mode=direct"),
+        "mode=direct was accepted",
+    )
     c.check(
         "arm spec refuses an unknown carrier",
         _refused(model.parse_arm_spec, "id=l3,carrier=quic"),

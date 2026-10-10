@@ -25,7 +25,7 @@ use crate::config::parsing::{
     TransportConfig, TransportType, default_tun_name,
 };
 #[cfg(feature = "multiplex")]
-use crate::config::parsing::{ClientDataConfig, DataCarrier, DataCarrierLimits, DataMode};
+use crate::config::parsing::{ClientDataConfig, DataCarrier, DataCarrierLimits};
 
 /// `[transparent]`: the whole configuration of an L3 client.
 ///
@@ -79,87 +79,44 @@ pub struct TransparentClaimConfig {
     pub remote_addr: Option<String>,
     /// Override `[transparent.control].default_retry_interval` for this claim.
     pub retry_interval: Option<u64>,
-    /// Override `[transparent.data].default_mode` for this claim only.
-    #[cfg(feature = "multiplex")]
-    pub mode: Option<DataMode>,
-    /// Override `[transparent.data].default_carrier` for this claim only;
-    /// valid only with `mode = "multiplex"`.
+    /// Override `[transparent.data].default_carrier` for this claim only.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
-    /// Override `[transparent.data].default_members` for this claim only: how
-    /// many data channels this claim holds, its inner flows spread across them.
-    #[cfg(feature = "multiplex")]
-    pub members: Option<u16>,
 }
 
 /// Data-plane knobs for a claim (`[transparent.data]`).
 ///
-/// The same keys as `[client.data]`, with one measured difference: the default
-/// mode is **`direct`**, because a claim carries its flows over **one** channel
-/// unless the operator asks for a member set, and the multiplex pool buys a
-/// one-channel claim nothing unless `shared_pool` is on. The numbers behind
-/// that default are in
-/// [benchmarks.md](../../docs/benchmarks.md), "The transparent-L3 wire
-/// question": on the same host and workload, `direct` moved 6 % fewer wire
-/// bytes, took 33 % less CPU per packet and carried 65 % more round trips per
-/// second.
+/// The same keys as `[client.data]`, minus the pool: a claim **never**
+/// multiplexes, because its channels *are* its carrier connections — its
+/// throughput is the sum of them, not of streams. A multiplexer over such a
+/// channel would be framing for nothing: on the same host and workload, a claim
+/// on its own connection moved 6 % fewer wire bytes, took 33 % less CPU per
+/// packet and carried 65 % more round trips per second than the same claim as
+/// one stream of a pool ([benchmarks.md](../../docs/benchmarks.md), "The
+/// transparent-L3 wire question").
+///
+/// What is left for `tunnels` to mean is therefore a **lane budget**: the
+/// carrier connections this client holds for all of its claims together, shared
+/// out by [`TransparentClientConfig::claim_lanes`]. One lane is one connection,
+/// and every claim always has at least one.
 #[cfg(feature = "multiplex")]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentDataConfig {
     /// Data-plane endpoint; defaults to the claim's control endpoint. Applies
     /// to every claim that does not name its own `remote_addr`.
     pub default_data_addr: Option<String>,
-    /// `direct` (default) or `multiplex`. Multiplex is the choice for a client
-    /// that serves many claims from one tunnel pool (`shared_pool = true`);
-    /// for a single claim the channel would be one stream on a one-tunnel
-    /// pool, which is the multiplexer's framing for nothing.
-    #[serde(default = "default_direct_mode")]
-    pub default_mode: DataMode,
-    /// `tcp` (default) or `kcp`; `kcp` needs `default_mode = "multiplex"`.
+    /// `tcp` (default) or `kcp`. Either one carries a claim's connections: a
+    /// `tcp` channel is a TCP connection, a `kcp` one is a KCP session of its
+    /// own.
     #[serde(default)]
     pub default_carrier: DataCarrier,
-    /// How many data channels one claim holds — its **member set** — unless the
-    /// claim writes its own `members`. Default: 1, one channel carrying every
-    /// flow of the claim.
-    ///
-    /// More than one member spreads the claim's inner flows over that many
-    /// carrier connections: the claim's throughput ceiling stops being one
-    /// connection's. In `multiplex` mode the pool must be at least this wide
-    /// (`[transparent.data.tcp|kcp].tunnels`), so the members land on distinct
-    /// tunnels; in `direct` mode each member is a connection of its own.
-    #[serde(default)]
-    pub default_members: Option<u16>,
-    /// Serve every claim of one control session from **one** shared tunnel
-    /// pool per carrier, instead of one pool per claim. Default: `false`.
-    #[serde(default)]
-    pub shared_pool: bool,
-    /// `[transparent.data.tcp]`: the TCP carrier's tunnel ceiling.
+    /// `[transparent.data.tcp]`: the TCP carrier's lane budget.
     #[serde(default)]
     pub tcp: DataCarrierLimits,
-    /// `[transparent.data.kcp]`: the KCP carrier's tunnel ceiling.
+    /// `[transparent.data.kcp]`: the KCP carrier's lane budget.
     #[serde(default)]
     pub kcp: DataCarrierLimits,
-}
-
-#[cfg(feature = "multiplex")]
-impl Default for TransparentDataConfig {
-    fn default() -> Self {
-        Self {
-            default_data_addr: None,
-            default_mode: default_direct_mode(),
-            default_carrier: DataCarrier::default(),
-            default_members: None,
-            shared_pool: false,
-            tcp: DataCarrierLimits::default(),
-            kcp: DataCarrierLimits::default(),
-        }
-    }
-}
-
-#[cfg(feature = "multiplex")]
-fn default_direct_mode() -> DataMode {
-    DataMode::Direct
 }
 
 /// How this client reaches its server (`[transparent.transport]`).
@@ -173,6 +130,51 @@ fn default_direct_mode() -> DataMode {
 pub struct TransparentTransportConfig {
     /// Proxy used to reach the server (`http` / `socks5`).
     pub proxy: Option<Url>,
+}
+
+#[cfg(feature = "multiplex")]
+impl TransparentClientConfig {
+    /// How many claims draw on one carrier's lane budget.
+    pub(crate) fn claims_on(&self, carrier: DataCarrier) -> usize {
+        self.claims
+            .values()
+            .filter(|claim| claim.carrier.unwrap_or(self.data.default_carrier) == carrier)
+            .count()
+    }
+
+    /// The carrier's lane budget as the operator wrote it, or `None`.
+    pub(crate) fn written_budget(&self, carrier: DataCarrier) -> Option<usize> {
+        match carrier {
+            DataCarrier::Tcp => self.data.tcp.written(),
+            DataCarrier::Kcp => self.data.kcp.written(),
+        }
+    }
+
+    /// The carrier's lane budget: what the operator wrote, else one lane per
+    /// claim that draws on it.
+    ///
+    /// The default is the shape a claim had before the budget existed — one
+    /// carrier connection each — so a client that never writes `tunnels` gets
+    /// exactly that, and raising the key is what spreads a busy claim's inner
+    /// flows over more connections.
+    pub(crate) fn lane_budget(&self, carrier: DataCarrier) -> usize {
+        match self.written_budget(carrier) {
+            Some(written) => written,
+            None => self.claims_on(carrier).max(1),
+        }
+    }
+
+    /// One claim's lane count: an equal share of the carrier's budget, never
+    /// below one.
+    ///
+    /// Equal share is the whole policy for now, and it is deliberately static:
+    /// it is a function of the configuration, so the capacity a deployment
+    /// offers does not depend on what it happened to be doing a minute ago.
+    /// Lending a lane that an idle claim is not using is the next step, and the
+    /// one that needs its own measurement (HANDOFF.md, L15).
+    pub(crate) fn claim_lanes(&self, carrier: DataCarrier) -> usize {
+        (self.lane_budget(carrier) / self.claims_on(carrier).max(1)).max(1)
+    }
 }
 
 impl TransparentClientConfig {
@@ -200,13 +202,13 @@ impl TransparentClientConfig {
                 service.retry_interval = claim.retry_interval;
                 #[cfg(feature = "multiplex")]
                 {
-                    service.mode = claim.mode;
+                    let carrier = claim.carrier.unwrap_or(self.data.default_carrier);
                     service.carrier = claim.carrier;
-                    // The claim's member count, resolved here so the engine has
-                    // one number to read: its own, the block's default, or the
-                    // one channel every claim has.
-                    service.transparent_members =
-                        claim.members.or(self.data.default_members).unwrap_or(1);
+                    // The claim's lane count, resolved here so the engine has one
+                    // number to read: an equal share of the carrier's budget,
+                    // never below the one connection every claim has.
+                    service.transparent_lanes =
+                        u16::try_from(self.claim_lanes(carrier)).unwrap_or(u16::MAX);
                 }
                 (name.clone(), service)
             })
@@ -218,9 +220,11 @@ impl TransparentClientConfig {
             #[cfg(feature = "multiplex")]
             data: ClientDataConfig {
                 default_data_addr: self.data.default_data_addr.clone(),
-                default_mode: self.data.default_mode,
                 default_carrier: self.data.default_carrier,
-                shared_pool: self.data.shared_pool,
+                // A claim never draws from a pool, so pool ownership has nothing
+                // to select here: the lowered block carries the defaults the
+                // engine reads for the data endpoint and the carrier only.
+                shared_pool: false,
                 tcp: self.data.tcp.clone(),
                 kcp: self.data.kcp.clone(),
             },
@@ -300,8 +304,8 @@ token = "claim-token"
         assert_eq!(service.transparent_tun, "l3test0");
         assert_eq!(&**service.token.as_ref().unwrap(), "claim-token");
         assert_eq!(
-            service.transparent_members, 1,
-            "a claim has one member unless the operator asks for a set"
+            service.transparent_lanes, 1,
+            "a claim has one lane unless the carrier's budget is raised"
         );
         assert_eq!(client.transport.transport_type, TransportType::Plain);
         assert!(client.transport.noise.is_none());
@@ -311,14 +315,14 @@ token = "claim-token"
         );
     }
 
-    /// The member count resolves the way the other per-claim overrides do: the
-    /// claim's own `members` over the block's `default_members`, and one channel
-    /// when neither was written.
+    /// A claim's lanes are an equal share of its carrier's budget: one each
+    /// when the key is unwritten (the shape a claim had before the budget), and
+    /// the written budget divided among the claims that draw on that carrier.
     #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     #[test]
-    fn a_claims_member_count_resolves_claim_then_block_then_one() {
-        let config = |default: &str, claim: &str| {
-            Config::from_str(&format!(
+    fn a_claims_lanes_are_an_equal_share_of_the_carriers_budget() {
+        let lanes = |budget: &str, claims: &str| {
+            let config = Config::from_str(&format!(
                 r#"
 [transparent]
 default_token = "t"
@@ -328,12 +332,9 @@ tun = "l3test0"
 default_remote_addr = "example.com:2333"
 
 [transparent.data]
-default_mode = "multiplex"
-{default}
+{budget}
 
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-{claim}
+{claims}
 "#
             ))
             .unwrap()
@@ -341,24 +342,78 @@ remote_bind_addr = "10.99.0.1:8443"
             .unwrap()
             .client
             .unwrap()
-            .services
-            .remove("web")
-            .unwrap()
-            .transparent_members
+            .services;
+            (
+                config["web"].transparent_lanes,
+                config.get("ssh").map(|s| s.transparent_lanes),
+            )
         };
+        let web = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
+        let two =
+            format!("{web}\n[transparent.claims.ssh]\nremote_bind_addr = \"10.99.0.1:2222\"\n");
 
-        assert_eq!(config("", "members = 3"), 3, "the claim's own count wins");
         assert_eq!(
-            config("default_members = 2", ""),
+            lanes("", web).0,
+            1,
+            "one connection per claim is the default: the budget is the claim count"
+        );
+        assert_eq!(
+            lanes("[transparent.data.tcp]\ntunnels = 4\n", &two).0,
             2,
-            "the block's default applies to a claim that wrote none"
+            "four lanes over two claims is two each"
         );
         assert_eq!(
-            config("default_members = 2", "members = 3"),
-            3,
-            "the claim overrides the block"
+            lanes("[transparent.data.tcp]\ntunnels = 4\n", &two).1,
+            Some(2),
+            "the share is equal, not first-come"
         );
-        assert_eq!(config("", ""), 1, "one channel is the default claim");
+        assert_eq!(
+            lanes("[transparent.data.tcp]\ntunnels = 5\n", &two).0,
+            2,
+            "a budget that does not divide evenly still gives every claim one (integer share)"
+        );
+        assert_eq!(
+            lanes("[transparent.data.tcp]\ntunnels = 2\n", web).0,
+            2,
+            "a single claim takes the whole budget"
+        );
+    }
+
+    /// A budget below the claim count is refused with the number to write: a
+    /// claim's lane is a connection of its own, so some claim would otherwise
+    /// have no carrier at all.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn a_lane_budget_below_the_claim_count_is_refused() {
+        let err = format!(
+            "{:#}",
+            Config::from_str(
+                r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data.tcp]
+tunnels = 1
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+
+[transparent.claims.ssh]
+remote_bind_addr = "10.99.0.1:2222"
+"#
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("`[transparent.data.tcp].tunnels = 1`")
+                && err.contains("`[transparent.data.tcp].tunnels = 2`")
+                && err.contains("2 claim(s)"),
+            "the refusal must name the key, the count and the count to write: {err}"
+        );
     }
 
     /// The `[transparent.control]` block is where the server is named, so a
@@ -417,14 +472,14 @@ mod data_tests {
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
+    use crate::config::DataCarrier;
     use crate::config::parsing::Config;
-    use crate::config::{DataCarrier, DataMode};
 
-    /// A claim has one channel, so the L3 model defaults to `direct`: the
-    /// multiplex pool would be one stream on a one-tunnel pool, and the
-    /// multiplexer's framing on every packet for nothing.
+    /// A claim never multiplexes: its data channels are carrier connections of
+    /// its own, which is what `ClientServiceConfig::uses_pool` derives from the
+    /// service type — the shape is a property of the model, not a key.
     #[test]
-    fn a_claim_defaults_to_direct() {
+    fn a_claim_never_multiplexes() {
         let config = Config::from_str(
             r#"
 [transparent]
@@ -439,42 +494,13 @@ remote_bind_addr = "10.99.0.1:8443"
         )
         .unwrap();
         let client = config.into_l3_client().unwrap().client.unwrap();
-        assert_eq!(client.data.default_mode, DataMode::Direct);
-        assert!(!client.multiplex_enabled());
+        assert!(!client.services["web"].uses_pool());
     }
 
-    /// The default is a default, not a lock: a client that serves many claims
-    /// from one pool says so.
+    /// A claim's carrier is a key of its own: a claim over KCP is a KCP session
+    /// per channel, and the pair needs no mode to be meaningful.
     #[test]
-    fn a_claim_may_ask_for_multiplex() {
-        let config = Config::from_str(
-            r#"
-[transparent]
-default_token = "t"
-
-[transparent.control]
-default_remote_addr = "example.com:2333"
-
-[transparent.data]
-default_mode = "multiplex"
-shared_pool = true
-
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-"#,
-        )
-        .unwrap();
-        let client = config.into_l3_client().unwrap().client.unwrap();
-        assert_eq!(client.data.default_mode, DataMode::Multiplex);
-        assert!(client.shared_pool());
-    }
-
-    /// A claim's carrier is independent of its mode: the default mode is
-    /// `direct`, and a direct channel over KCP is a session per channel rather
-    /// than a yamux stream, so the pair is exactly what the L3 default plus
-    /// `default_carrier = "kcp"` means.
-    #[test]
-    fn a_kcp_carrier_is_allowed_in_direct_mode() {
+    fn a_kcp_carrier_is_allowed_for_a_claim() {
         let config = r#"
 [transparent]
 default_token = "t"
@@ -495,8 +521,8 @@ remote_bind_addr = "10.99.0.1:8443"
                 .unwrap()
                 .client
                 .unwrap();
-            assert_eq!(client.data.default_mode, DataMode::Direct);
             assert_eq!(client.data.default_carrier, DataCarrier::Kcp);
+            assert!(!client.services["web"].uses_pool());
         } else {
             let message = format!("{:#}", Config::from_str(config).unwrap_err());
             assert!(
