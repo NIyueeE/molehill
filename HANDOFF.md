@@ -319,13 +319,47 @@ configuration surface is free to change — and this cycle changes it.
 
    Open, in the order the measurements argue for them:
 
-   - **A device path that carries more than one packet per syscall.** The
-     remaining per-packet cost is the TUN read and the TUN write; a virtio-net
-     header with GSO/GRO would let one syscall carry a 64 KB run, which is the
-     same amortization the channel side already has. It needs an arm of its own
-     (the packets on the device differ, so `mean_carried_packet_b` and the wire
-     ratios are the readings to watch) and it changes how the device is
-     attached, so it is a design decision before it is a patch.
+   - **A device path that carries more than one packet per syscall** — chosen
+     as the next lever (2026-10-10), and **the kernel half is now verified**
+     (spike outside the repo, same host):
+     - attaching to an operator-created device with `IFF_VNET_HDR` works, and
+       so do `TUNSETVNETHDRSZ` (its argument goes **by pointer**) and
+       `TUNSETOFFLOAD` (its argument goes **by value** — mixing the two
+       conventions returns `EINVAL` for every mask, which cost an hour of the
+       spike);
+     - `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6` is accepted, so the device advertises
+       TSO/GSO;
+     - one 54 918-byte **USO** write (`gso_type = UDP_L4`) was delivered as
+       **40 datagrams of 1372 B** to a local socket: one syscall, forty packets,
+       segmented by the kernel;
+     - one 54 440-byte **TSO** super-packet was accepted and crossed a veth as
+       *one* 54 KB skb (the virtual link preserves GSO), so segmentation is
+       deferred to wherever it is really needed.
+
+     The design that follows, in two slices:
+
+     * **Slice 1, no wire change.** Both TUNs attach with `IFF_VNET_HDR` and
+       enable the offloads; the *inject* side groups consecutive packets of one
+       flow (same 5-tuple and direction, consecutive TCP sequence numbers or
+       equal-size UDP payloads, no SYN/FIN/RST inside the run, DF set) and
+       writes the run as one GSO packet, falling back to one write per packet
+       whenever the run does not qualify or the device has no offloads. The
+       frames on the wire stay one packet each, so nothing needs a version bump
+       and an old peer keeps working.
+     * **Slice 2, with a wire change.** The virtio metadata travels in the L3
+       frame, so a super-packet read from one TUN is carried as one unit and
+       injected as one write at the far end (and the reverse direction too).
+       This is a protocol change (v6) and is only worth it after slice 1 has
+       been measured.
+
+     Measurement plan, all of it on the model as it stands: the L3 arms
+     (`l3`, `l3-deep`) at the default 1400-byte TUN MTU and at 8000, on
+     `bulk-1`/`bulk-n`/`rr-16` and on `udp-pace` (`bytes_per_syscall` and
+     `syscalls_per_s` are the readings that must move — they are device-I/O
+     metrics, so an L3 arm is exactly where they are valid), with `l3-deep`'s
+     deeper queue as the control for "is it syscalls or queueing". Success is a
+     throughput gain the run's own A/A floor can see, at no cost to `rr-16`'s
+     latency or the wire ratio.
    - **A rate-aware pacer for the KCP carrier** (above), gated on the
      `loss1_rate100` A/B.
    - **What the multiplexer's 28 % actually is.** The earlier per-cell model
