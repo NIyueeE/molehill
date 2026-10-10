@@ -2082,6 +2082,39 @@ impl ControlChannelHandle {
 #[cfg(all(feature = "transparent", target_os = "linux"))]
 const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The member set as its supervisor sees it: how many members have ended.
+///
+/// A member's end is the claim's only event that asks for something — one more
+/// channel — and it is also what makes an arriving channel a *replacement*
+/// rather than part of the set the client opened in one go. Both halves of that
+/// rule live here so they can be read (and tested) without a TUN device: the
+/// loop below is plumbing, this is the policy.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[derive(Default)]
+struct MemberSupervisor {
+    ended: usize,
+}
+
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+impl MemberSupervisor {
+    /// Whether a channel arriving now is a replacement, and therefore paced.
+    ///
+    /// The claim's own channels start at once; only a channel that follows a
+    /// member's death waits out [`TRANSPARENT_REPLACE_BACKOFF`], so a client
+    /// that cannot serve the start command is not polled in a tight loop while
+    /// a fresh claim still comes up at full width.
+    fn paces_arrivals(&self) -> bool {
+        self.ended > 0
+    }
+
+    /// One member ended: the claim is short exactly one channel, so this is the
+    /// request that goes to the client — one per end, never one per two.
+    fn member_ended(&mut self) -> DataChannelRequest {
+        self.ended += 1;
+        DataChannelRequest::Plain
+    }
+}
+
 /// Serve one transparent service: take the channels the client opened when its
 /// registration was accepted, hand the device's packets to them, and inject what
 /// comes back.
@@ -2124,10 +2157,8 @@ where
     let start_cmd = Arc::new(postcard::to_stdvec(
         &DataChannelCmd::StartForwardTransparent,
     )?);
-    // How many members have ended: it is what makes an arriving channel a
-    // *replacement* (the client opening one because the claim lost one), and
-    // the only thing that is paced.
-    let mut lost = 0usize;
+    // What the claim has lost, and what that makes of the channels arriving.
+    let mut lost_members = MemberSupervisor::default();
     // Dropping the set aborts every member still running: a claim that goes
     // away (shutdown, a dead control session, a deregistration) takes its
     // channels with it.
@@ -2147,7 +2178,7 @@ where
                 // a client that cannot serve the start command (an older build,
                 // a broken data path of its own) must not be polled in a tight
                 // loop.
-                let paced = lost > 0;
+                let paced = lost_members.paces_arrivals();
                 members.spawn(async move {
                     if paced {
                         tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
@@ -2165,12 +2196,11 @@ where
                 if let Some(Err(e)) = joined {
                     error!("A transparent member task for {endpoint} failed: {e}");
                 }
-                lost += 1;
                 // A member ended: the claim is short one channel, so ask for a
                 // replacement and keep holding the address while the client
                 // opens it. The slot it held stays in the claim's set, so the
                 // flows placed in it resume on the replacement.
-                let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
+                let _ = data_ch_req_tx.send(lost_members.member_ended());
             }
             _ = shutdown_rx.recv() => return Ok(()),
             _ = &mut control_task => return Ok(()),
@@ -3843,5 +3873,32 @@ mod tests {
             data_channel_cmd(service, &DataChannelRequest::Plain),
             ControlChannelCmd::CreateDataChannelFor(id) if id == service
         ));
+    }
+
+    /// A claim's member set: its first channels are the set the client opened
+    /// and start at once, and from the first member's death on every arriving
+    /// channel is a replacement and is paced. Each end asks for exactly one
+    /// channel — one death, one request — because a claim short two members
+    /// must be repaired twice, not once.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn a_member_end_makes_the_next_channel_a_paced_replacement() {
+        let mut supervisor = MemberSupervisor::default();
+        assert!(
+            !supervisor.paces_arrivals(),
+            "the set the client opened in one go is not paced"
+        );
+        assert!(
+            matches!(supervisor.member_ended(), DataChannelRequest::Plain),
+            "one member's end asks for one plain channel"
+        );
+        assert!(
+            supervisor.paces_arrivals(),
+            "a channel arriving after a death is a replacement, and is paced"
+        );
+        assert!(
+            matches!(supervisor.member_ended(), DataChannelRequest::Plain),
+            "a second end is a second request, never one for two"
+        );
     }
 }

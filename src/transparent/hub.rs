@@ -929,6 +929,60 @@ mod tests {
         assert_eq!(routes.member_stats()[survivor].forwarded, 1);
     }
 
+    /// A member that died is replaced **in its own slot**, and the flows that
+    /// were placed in it resume there: the slot is what the placement reduces
+    /// against, so a replacement has to inherit its predecessor's index rather
+    /// than take a new one at the end of the set — otherwise every flow of the
+    /// dead member would move, and moving a flow is what reorders it.
+    #[test]
+    fn a_replacement_takes_the_dead_members_slot_and_its_flows_resume_there() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        let (second, _rx_second) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        routes.join(web, second).unwrap();
+
+        let packet = packet_on_port(40_000);
+        let info = ip::parse(&packet).unwrap();
+        let (endpoint, placed) = routes.pick(&info, Direction::Destination).unwrap();
+        let survivor = 1 - placed;
+
+        // The member dies: its slot drops this flow's packets, and only its
+        // counters move.
+        routes.vacate(&web, placed);
+        let mut batch = Batch::default();
+        batch.push(&packet).unwrap();
+        assert!(
+            !routes.flush(&endpoint, placed, batch),
+            "dropped while the slot is empty"
+        );
+        assert_eq!(routes.member_stats()[placed].no_channel, 1);
+        assert_eq!(routes.member_stats()[survivor].no_channel, 0);
+
+        // The replacement joins and takes the freed slot; the flow is placed
+        // there again, so it never moved.
+        let (replacement, mut rx_replacement) = mpsc::channel(4);
+        assert_eq!(
+            routes.join(web, replacement).unwrap(),
+            placed,
+            "the replacement inherits the dead member's slot"
+        );
+        assert_eq!(
+            routes.pick(&info, Direction::Destination).unwrap().1,
+            placed,
+            "and the flow that was placed in it stays there"
+        );
+        let mut batch = Batch::default();
+        batch.push(&packet).unwrap();
+        assert!(routes.flush(&endpoint, placed, batch));
+        assert!(
+            rx_replacement.try_recv().is_ok(),
+            "the flow resumes on the replacement"
+        );
+        assert_eq!(routes.member_stats()[placed].forwarded, 1);
+    }
+
     /// A claim nobody carries any more is not a routing answer: the last
     /// member's departure takes it out of the table, and the packets for it are
     /// unclaimed until a member comes back.
