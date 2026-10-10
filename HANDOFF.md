@@ -85,6 +85,13 @@ configuration surface is free to change — and this cycle changes it.
 | L9 | A claim's address key stays `remote_bind_addr`, and `proxy` stays in `[transparent.transport]` (the only key there — no encryption key has a home in that table) |
 | L10 | Header compression is an **intermediate state**: keep it when the measurement shows benefit, remove it when it does not, against criteria written down *before* the run |
 | L11 | No startup INFO for the switch; the plaintext consequence lives in the docs instead |
+| L12 | `tunnels` is one quantity in both models — **how many carrier connections this client holds for that carrier**: L4 spends them on a pool that carries unbounded per-visitor streams, L3 hands them to claims as lanes |
+| L13 | The data plane's shape is **derived from the service type**, not configured: a forwarding service always multiplexes, a transparent claim never does. `mode` is deleted, and a config that still carries it is refused by name |
+| L14 | A claim's lane count is `max(1, floor(tunnels / claims on that carrier))`, and `tunnels` unset means one lane per claim; a budget below the claim count is refused with the number to write |
+| L15 | A lane **is** a connection, so reclamation moves **idle lanes only** — at most one per tick, never below one per claim: taking a busy lane would drop that claim's packets while its replacement was dialled anyway |
+| L16 | Flow placement is a **per-flow table**, not a hash modulus: assignment happens once, into a *live* slot; established flows never move; entries expire after silence in either direction, so a lane change cannot reorder a flow |
+| L17 | `[server.data].max_tunnels_per_client` counts a client's **carrier connections**: a transparent claim's direct lane registers against it, a per-visitor channel (the no-`multiplex` build's shape) does not |
+| L18 | The mux×1-versus-direct gap is attributed with the model before it is optimised, and each optimisation lands only if it clears that run's own noise floor. No reorder buffer, no mid-stream framing switch, no compact single-stream mode |
 
 ### Next, in order
 
@@ -719,6 +726,60 @@ Still open from this work (next steps, in the order agreed):
      pins both the measured port set and every port stride. The lesson for the
      next hash-shaped decision: `% width` on a raw FNV value is not a placement
      rule, and the per-member counters are the instrument that says so.
+
+## The mux×1 gap, measured before touching it (2026-10-10, this session)
+
+The decision to derive the data plane (L12–L18) rests on two facts, and the
+second one was measured before any of it was written, because the comparison
+stops being configurable the moment `mode` is deleted.
+
+**The gap, on the pristine tree.** `l4-mux2` is one flow on a two-tunnel pool —
+one stream on one session, the shape a sparse visitor or a lane gets — against
+`l4-direct`, the same flow on a connection of its own. Both arms in one run,
+the A/A twin on the mux arm as the run's own noise floor, `smoke` profile
+(two measured rounds per arm), loopback, host `d764f9da9c7e5b2a`:
+
+```
+sudo -n just bench --profile smoke --arms l4-mux2,l4-direct,control --aa \
+  --binary ~/tmp/molehill-c0-baseline --out ~/tmp/bench-c0-mux-vs-direct.json
+```
+
+| arm | bulk-1 throughput | bulk-1 CPU | rr-1 rate |
+|---|---|---|---|
+| `control` (no tool) | 40.65 Gbit/s | — | 32 000/s |
+| `l4-direct` | **18.95** Gbit/s [17.52..20.37] | **0.110** s/Gbit | **15 885/s** |
+| `l4-mux2` | **9.15** Gbit/s [9.00..9.29] | **0.207** s/Gbit | 13 357/s |
+| `l4-mux2~aa` (twin) | 7.93 Gbit/s [7.19..8.67] | 0.250 s/Gbit | 13 583/s |
+
+Read: the multiplexer costs **2.07× the throughput and +87 % of the CPU per
+byte** on one stream, and this run's own A/A floor is **15.35 %** on that
+metric — so the gap is real at this profile, resolvable, and worth attacking
+(which is why L18 gates the engine work on this number rather than on a hunch).
+Provenance is exact: the binary is the pristine `80b0e62` build
+(`v0.10.0-47-g80b0e62`, sha256 `94549863c4f6392d`), run from a worktree at that
+commit with that commit's model. The symbol-level attribution (which of the
+per-write allocation, the 32 KiB frame split, the driver hand-off or the
+window updates owns the gap) is the first step of the engine work itself, not
+of this baseline.
+
+**A model defect found by the same run.** The catalog arm `l4-mux1`
+(`pool_cap = 1`) cannot start against the model's L4 topology at all: that
+topology carries a UDP service with `udp_workers = 2`, so `tunnels = 1` is
+below the UDP-derived floor and the client refuses to start —
+
+```
+`[client.data.tcp].tunnels = 1` is below what the services of that carrier
+need: service `game` declares 2 UDP workers, and a pool keeps one tunnel per
+worker so their shards stay on distinct tunnels. Write
+`[client.data.tcp].tunnels = 2` or more, ...
+```
+
+Its four scenarios then report `not ready: no visitor could reach
+10.10.0.254:2401` — the degenerate L4 cell recorded as an open thread in
+[benchmarks.md](docs/benchmarks.md), now with a cause for at least this arm.
+`l4-mux2` is the closest legal mux×1 shape and is what the table above uses;
+the arm's own fix (raise `udp_workers`, or drop the arm) belongs with the model
+change, not here.
 
 ## Open threads
 
