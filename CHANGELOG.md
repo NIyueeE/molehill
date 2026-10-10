@@ -16,15 +16,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (placed on distinct tunnels, so the pool must be at least that wide:
   `tunnels < members` is refused with the count to write) or four connections
   of its own in `direct` mode. The default is `1`, so an existing configuration
-  behaves exactly as before, and the maximum is 64. A member that dies keeps
-  its slot: its replacement inherits the index, so the claim's traffic resumes
-  where it was, while the surviving members are untouched — where a
-  one-channel claim dropped every packet until its replacement came up. The
+  behaves exactly as before, and the maximum is 64. The claim's inner flows are
+  **spread across its members**, one flow per member, by a hash of the flow's
+  five-tuple — computed on the canonical (sorted) endpoint pair, so both
+  directions of a flow ride the same member — which is what stops a claim's
+  throughput from being one connection's ceiling; the claim's own flows are
+  never split, so nothing is reordered. A member that dies keeps its slot: its
+  replacement inherits the index and the flows placed in it resume there, while
+  the surviving members are untouched — where a one-channel claim dropped every
+  packet until its replacement came up. A flow whose member is gone is dropped
+  rather than moved onto a survivor (moving it would reorder it against what
+  the dead member had already delivered); `MOLEHILL_L3_STATS=1` counts those
+  drops on the dead member's own line. The
   member set is a client-side decision and the server learns it from the
   channels the client opens, so the wire protocol is unchanged; both ends must
   carry member sets, since a peer without them starts one channel at a time.
   `MOLEHILL_L3_STATS=1` now also prints one line per member slot (`live`,
-  `forwarded`, `no_channel`), which is how a set is told from a stack.
+  `forwarded`, `no_channel`), which is how a set is told from a stack. On a
+  jumbo path with eight inner flows, four members carry 13.9 Gbit/s against one
+  member's 7.0 while a single flow is unchanged; the method, the numbers and
+  the run's own noise floor are in
+  [docs/benchmarks.md](docs/benchmarks.md).
 
 - **The KCP carrier is independent of the data-plane mode: a `direct` service
   can ride a KCP session.** `carrier = "kcp"` used to require

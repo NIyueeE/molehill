@@ -21,7 +21,9 @@
 #      compressor could reach (benches/scripts/l3/wire_report.py);
 #   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
-#      deleted for that run, so the order is proven rather than asserted).
+#      deleted for that run, so the order is proven rather than asserted);
+#   8. with CLAIM_MEMBERS > 1 the claim holds that many carrier channels, its
+#      flows are spread across them, and every arm above is still byte-exact.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -103,9 +105,14 @@ SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
 SMALL_BYTES="${SMALL_BYTES:-64}"
 # Optional override of the claim's data-channel mode. Empty writes nothing,
 # which is how the run measures the default an operator would get; the axis
-# exists because a claim has exactly one channel, so its mode is a cost
-# decision rather than a topology one.
+# exists because a one-member claim has nothing for a multiplexer to multiplex,
+# so its mode is a cost decision rather than a topology one.
 CLAIM_MODE="${CLAIM_MODE:-}"
+# Optional member count for the claim (`default_members`). Empty writes nothing
+# (the product's one channel); 2 or more asks for a member set, which is what
+# makes this run prove that a claim's flows are spread over several carriers and
+# still arrive byte-exact.
+CLAIM_MEMBERS="${CLAIM_MEMBERS:-}"
 # The multi-flow arm: N connections at once, each doing its own strict round
 # trips. This is where packets queue, so it is the arm that says what several
 # visitors through one claim cost (and the only one a queue-per-CPU change
@@ -340,6 +347,14 @@ tun = "$TUN_CLI"
 
 [transparent.control]
 default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+TOML
+    # The claim's member set is the product's default (one channel) unless the
+    # run names a count. The table has to precede the claim, or the key would
+    # land in the claim's own table.
+    if [ -n "$CLAIM_MEMBERS" ]; then
+        printf '\n[transparent.data]\ndefault_members = %s\n' "$CLAIM_MEMBERS" >>"$LOG/client.toml"
+    fi
+    cat >>"$LOG/client.toml" <<TOML
 
 [transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"

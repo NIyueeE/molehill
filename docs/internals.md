@@ -196,6 +196,19 @@ How a claim's member set is opened, held and repaired:
   held while it waits. A channel that arrives after a member ended is paced:
   250 ms (`TRANSPARENT_REPLACE_BACKOFF`) before the start command is written, so
   a peer that cannot serve it is not polled in a tight loop.
+- Which member a packet rides is decided **per flow**, by one hash of its
+  five-tuple (`src/transparent/flow.rs`): the protocol, then the two endpoints
+  sorted (address bytes, then port), so both directions of a flow — and both
+  ends of a claim, which see opposite ones — place it on the same member. A set
+  of one has one answer; otherwise the slot is `hash % width`. Per *flow*, never
+  per packet: each member is one ordered carrier, so a flow that stays on one
+  member arrives in the order its sender wrote it, while a flow dealt out packet
+  by packet would be interleaved across carriers that drain at their own speeds
+  and injected — by the far end, which injects what it reads — out of order. A
+  flow whose member dies is **not moved**: the dead member's slot stays in the
+  set, so its flows are dropped (and counted `no_channel` on that slot) until the
+  replacement joins it. Moving them would reorder them against what the dead
+  member had already delivered.
 
 **Which end of a packet the claim is.** Both ends run the same hub
 (`src/transparent/hub.rs`): one reader per TUN device, a **member set** per
@@ -237,10 +250,13 @@ must read 0; on the server, a registration is rejected if its device is missing.
 The recipes are in [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
-and counted (`not_ipv4`), and there is no IPv6 path. A member set is held as a
-set but is not yet a *spread*: every packet of the claim rides its first member,
-so a retransmit for one flow can still delay another flow sharing that member,
-and the claim's throughput is one member's however many it holds. And the
+and counted (`not_ipv4`), and there is no IPv6 path. A claim's member set is
+spread **per flow**, so the claim's throughput is the sum of its members while
+one flow still cannot exceed one member; a member that dies takes its flows'
+packets with it until its replacement joins the slot, and a portless packet
+(ICMP, a later fragment) hashes on its addresses alone, so the fragments of one
+datagram can take different members — IP reassembly is order-insensitive, which
+is what makes that safe. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
 counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,

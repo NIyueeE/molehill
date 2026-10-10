@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::protocol::{IpFrames, IpTraffic};
+use crate::transparent::flow;
 use crate::transparent::ip::{self, PacketInfo};
 use crate::transparent::tun::Tun;
 use crate::transparent::{Direction, DropReason, Endpoint, EndpointTable, Stats};
@@ -290,18 +291,16 @@ impl Routes {
     ///
     /// The endpoint lookup is the allow-list; a packet whose claimed end names
     /// no registered endpoint belongs to nobody and is counted as unclaimed by
-    /// the caller.
+    /// the caller. The member is the claim's **flow placement**
+    /// ([`flow::slot`]): a pure function of the packet's five-tuple and the
+    /// set's width, so a flow keeps the member it was placed on for as long as
+    /// the width does — a member *joining* is the one thing that changes the
+    /// width, and a member leaving deliberately does not ([`Self::vacate`]).
     fn pick(&self, info: &PacketInfo, direction: Direction) -> Option<(Endpoint, usize)> {
         let table = self.table.lock().ok()?;
         let endpoint = table.endpoint_for(info, direction)?;
-        // Every entry in the table *is* a member set, so the lookup above is
-        // also the proof that one exists. Which of its members a packet rides
-        // is its first one in this slice: the set, its slots and its per-member
-        // counters exist, but the flow hash that spreads a claim's inner flows
-        // across the set is not here yet — a different slot would buy nothing
-        // and an empty one would only drop. The per-packet decision goes here,
-        // and it is a *per-flow* one (one member per flow, for ordering).
-        Some((endpoint, 0))
+        let width = table.lookup_endpoint(&endpoint)?.slots.len();
+        Some((endpoint, flow::slot(info, width)))
     }
 
     /// Hand one member's batch to its queue.
@@ -631,6 +630,91 @@ mod tests {
         packet
     }
 
+    /// The claim's packet with a given visitor source port: two of these are
+    /// two flows of the same claim.
+    fn packet_on_port(port: u16) -> Vec<u8> {
+        let mut packet = packet_for_claim();
+        packet[20..22].copy_from_slice(&port.to_be_bytes());
+        packet
+    }
+
+    /// A claim's flows ride different members of its set, and each flow keeps
+    /// the member it was placed on: the spread is what the set exists for, and
+    /// the stability is what keeps a flow's packets in order.
+    #[test]
+    fn a_claims_flows_are_spread_over_its_members_and_stay_there() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, mut rx_first) = mpsc::channel(4);
+        let (second, mut rx_second) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        routes.join(web, second).unwrap();
+        assert_eq!(
+            routes.member_stats().len(),
+            2,
+            "the set is two members wide"
+        );
+
+        // Two visitor ports the placement sends to different members: the hash
+        // decides, so the test asks it instead of assuming.
+        let mut different: Option<(u16, u16, usize, usize)> = None;
+        let mut found: Option<(u16, usize)> = None;
+        for port in 40_000..41_000u16 {
+            let info = ip::parse(&packet_on_port(port)).unwrap();
+            let slot = flow::slot(&info, 2);
+            match found {
+                Some((seen, seen_slot)) if seen_slot != slot => {
+                    different = Some((seen, port, seen_slot, slot));
+                    break;
+                }
+                None => found = Some((port, slot)),
+                _ => {}
+            }
+        }
+        let (port_a, port_b, slot_a, slot_b) = different.unwrap_or((40_000, 40_001, 0, 1));
+        assert_ne!(slot_a, slot_b, "the two flows were picked to differ");
+
+        // Each flow's frames reach the queue of the member it was placed in —
+        // and nothing else does. Slot 0 is the first member that joined, slot 1
+        // the second.
+        let flows = [
+            (slot_a, packet_on_port(port_a)),
+            (slot_b, packet_on_port(port_b)),
+        ];
+        for (slot, packet) in &flows {
+            let info = ip::parse(packet).unwrap();
+            let (endpoint, placed) = routes.pick(&info, Direction::Destination).unwrap();
+            assert_eq!(placed, *slot, "a flow keeps the member it was placed on");
+            let mut batch = Batch::default();
+            batch.push(packet).unwrap();
+            assert!(routes.flush(&endpoint, placed, batch));
+        }
+        for (slot, queue) in [(0usize, &mut rx_first), (1usize, &mut rx_second)] {
+            match flows.iter().find(|(placed, _)| *placed == slot) {
+                Some((_, packet)) => {
+                    let frames = queue.try_recv().unwrap();
+                    assert_eq!(
+                        &frames[2..],
+                        &packet[..],
+                        "member {slot} carried the flow placed in it, and only that"
+                    );
+                }
+                None => assert!(
+                    queue.try_recv().is_err(),
+                    "no flow was placed in member {slot}"
+                ),
+            }
+        }
+
+        // And the same flow asks for the same member again, which is the
+        // property that keeps its packets in order.
+        let info = ip::parse(&packet_on_port(port_a)).unwrap();
+        assert_eq!(
+            routes.pick(&info, Direction::Destination).unwrap().1,
+            slot_a
+        );
+    }
+
     /// A batch is a run of the same frames the single-packet path wrote, which
     /// is what lets the far side keep reading them one at a time: what changed
     /// is only how many of them share a hand-over.
@@ -775,48 +859,74 @@ mod tests {
     fn a_dropped_member_is_counted_apart_and_the_survivors_keep_forwarding() {
         let routes = Routes::new();
         let web = claim();
-        let (tx, mut rx) = mpsc::channel(4);
-        routes.join(web, tx).unwrap();
-        let (spare, _rx_spare) = mpsc::channel(4);
-        routes.join(web, spare).unwrap();
+        let (tx, mut rx_first) = mpsc::channel(4);
+        let first_slot = routes.join(web, tx).unwrap();
+        let (spare, mut rx_second) = mpsc::channel(4);
+        let second_slot = routes.join(web, spare).unwrap();
+        assert_eq!(
+            (first_slot, second_slot),
+            (0, 1),
+            "join order is slot order"
+        );
 
         let packet = packet_for_claim();
         let info = ip::parse(&packet).unwrap();
-        let (endpoint, slot) = routes.pick(&info, Direction::Destination).unwrap();
+        let (endpoint, placed) = routes.pick(&info, Direction::Destination).unwrap();
         assert_eq!(endpoint, web);
-        assert_eq!(slot, 0);
+        // Which slot the flow is placed in is the hash's business; the test
+        // follows it rather than assuming one. Slot 0's queue is the first
+        // member that joined, slot 1's the second.
+        let (survivor, placed_rx, survivor_rx) = if placed == 0 {
+            (1, &mut rx_first, &mut rx_second)
+        } else {
+            (0, &mut rx_second, &mut rx_first)
+        };
 
         let mut batch = Batch::default();
         batch.push(&packet).unwrap();
         assert!(
-            routes.flush(&endpoint, slot, batch),
+            routes.flush(&endpoint, placed, batch),
             "the live member took it"
         );
+        let stats = routes.member_stats();
+        assert_eq!(stats[placed].forwarded, 1);
+        assert_eq!(stats[placed].no_channel, 0);
+        assert_eq!(
+            stats[survivor].forwarded, 0,
+            "the other member was not charged"
+        );
         assert!(
-            rx.try_recv().is_ok(),
-            "the frames reached the member's queue"
+            placed_rx.try_recv().is_ok(),
+            "the frames reached the placed member's queue"
+        );
+        assert!(
+            survivor_rx.try_recv().is_err(),
+            "the other member's queue stayed empty"
         );
 
         // The member goes away: its slot drops what is placed in it, and says
         // so on its own counters.
-        routes.vacate(&web, 0);
+        routes.vacate(&web, placed);
         let mut batch = Batch::default();
         batch.push(&packet).unwrap();
         assert!(
-            !routes.flush(&endpoint, slot, batch),
+            !routes.flush(&endpoint, placed, batch),
             "the empty slot dropped it"
         );
         let stats = routes.member_stats();
-        assert_eq!(stats[0].forwarded, 1);
-        assert_eq!(stats[0].no_channel, 1);
-        assert_eq!(stats[1].forwarded, 0, "the survivor was not charged for it");
-        assert_eq!(stats[1].no_channel, 0);
+        assert_eq!(stats[placed].forwarded, 1);
+        assert_eq!(stats[placed].no_channel, 1);
+        assert_eq!(
+            stats[survivor].forwarded, 0,
+            "the survivor was not charged for the dead member's traffic"
+        );
+        assert_eq!(stats[survivor].no_channel, 0);
 
         // And the survivor still carries traffic of its own.
         let mut batch = Batch::default();
         batch.push(&packet).unwrap();
-        assert!(routes.flush(&endpoint, 1, batch));
-        assert_eq!(routes.member_stats()[1].forwarded, 1);
+        assert!(routes.flush(&endpoint, survivor, batch));
+        assert_eq!(routes.member_stats()[survivor].forwarded, 1);
     }
 
     /// A claim nobody carries any more is not a routing answer: the last

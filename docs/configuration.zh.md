@@ -407,7 +407,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
 | `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
 | `[transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
-| `[transparent.data].default_members` | 一条认领持有多少条数据通道——它的**成员集合**。默认:`1`。大于 1 时该认领就拥有相应数量的载体连接:`multiplex` 模式下池宽必须至少这么大(`[transparent.data.tcp\|kcp].tunnels`),`direct` 模式下每个成员都是自己的一条连接。上限 64。**两端都必须支持成员集合**:不支持的对端一次只启动一条通道,持有多个成员的认领只会用上其中一条 |
+| `[transparent.data].default_members` | 一条认领持有多少条数据通道——它的**成员集合**,也是其内部各流被分散到的载体连接数(每条流按五元组哈希落在同一个成员上)。默认:`1`。`multiplex` 模式下池宽必须至少这么大(`[transparent.data.tcp\|kcp].tunnels`),`direct` 模式下每个成员都是自己的一条连接。上限 64。**两端都必须支持成员集合**:不支持的对端一次只启动一条通道,持有多个成员的认领只会用上其中一条 |
 | `[transparent.claims.<name>].members` | 同上,但只作用于这一条认领:覆盖 `[transparent.data].default_members` |
 | `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次认领都会在看任何设备之前被策略拒绝 |
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
@@ -548,7 +548,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 | `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
-| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors` |
+| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个成员槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`forwarded` 与 `no_channel`——即哪个成员承载了多少,以及替换窗口让哪个成员丢了多少。这是区分「成员集合」与「全部堆在一个成员上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该成员死亡期间被丢弃的流量 |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
 就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
@@ -682,4 +682,4 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | 在 `[client.services.<name>]` 里写 `protocol = "transparent"` 会被拒绝,信息指向 `[transparent.claims.<name>]` | 自己拥有公网地址的客户端不是转发客户端:把该条目搬到 `[transparent]` 表,并用 `--transparent` 启动那个进程。见[透明(L3)服务](#透明l3服务)。 |
 | `[client.transparent]` 被作为"配置在本版本中已迁移"拒绝 | 设备现在属于模式:`[client.transparent].tun` → `[transparent].tun`,而每个透明服务变成一个 `[transparent.claims.<name>]` 条目。 |
 | `[transparent]` 表在启动时被拒,信息为 `... and this platform is not Linux`,或指明缺少 `transparent` 特性 | 承载整个 IP 包需要 Linux 构建并启用 `transparent` 特性(默认特性集的一部分)。在其他平台上请继续用转发型 `[client]`。 |
-| 透明服务的访客拿不到任何响应,`MOLEHILL_L3_STATS=1` 计入 `unclaimed` 丢弃 | 路由不完整:服务端需要一条把所声明地址送进自己设备的路由,客户端需要 `from <ip>` 规则及其表内路由(见[部署文档](./deployment.zh.md#透明l3服务))。`unclaimed` 也会出现在没有任何通道持有该端点时的重连窗口;`no_channel` 则表示该端点的队列已满。 |
+| 透明服务的访客拿不到任何响应,`MOLEHILL_L3_STATS=1` 计入 `unclaimed` 丢弃 | 路由不完整:服务端需要一条把所声明地址送进自己设备的路由,客户端需要 `from <ip>` 规则及其表内路由(见[部署文档](./deployment.zh.md#透明l3服务))。`unclaimed` 也会出现在没有任何成员持有该端点时的重连窗口;`no_channel` 表示某个成员的队列已满,或该流所落的成员已经消失——具体是哪一个,看按槽位的那几行。 |

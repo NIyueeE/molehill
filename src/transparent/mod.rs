@@ -17,6 +17,7 @@
 //! Linux only, because the data path is a TUN device.
 
 pub mod check;
+pub mod flow;
 pub mod hub;
 pub mod ip;
 pub mod tun;
@@ -173,9 +174,8 @@ impl<V> EndpointTable<V> {
     /// The value registered for exactly this endpoint, if it is still
     /// registered.
     ///
-    /// Only the tests read the table without editing it today; the production
-    /// paths act on `endpoint_for`, `insert`, `remove` and `iter` alone.
-    #[cfg(test)]
+    /// The packet path reads the claim's width through this: a packet's member
+    /// is a function of the flow and the width of the set it belongs to.
     pub fn lookup_endpoint(&self, endpoint: &Endpoint) -> Option<&V> {
         self.entries.get(&(endpoint.ip, endpoint.port))
     }
