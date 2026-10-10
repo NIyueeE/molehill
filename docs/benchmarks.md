@@ -592,7 +592,28 @@ bytes on the visitor's leg were tunnel overhead (`wire_per_visitor_byte` 1.0755)
 at 8000 it is 1.5 % (1.0152), because the carrier's own header and
 acknowledgements are paid once per 8000-byte packet instead of once per 1400.
 
-The operator's copy of this finding, with the recipe, is
+**What the ceiling then is.** The same topology, with the TUN MTU at 8000 and
+the link MTU at 9000, against the forwarding path with its pool capped — the
+`l4-mux1` arm is one tunnel, so it prices a single carrier connection:
+
+| Arm | `bulk-1` (1 flow) | `bulk-n` (8 flows) |
+|---|---|---|
+| control | 38.672 Gbit/s | 44.805 |
+| `l3` | 7.136 | 5.847 |
+| `l4` (pool capped at 4 tunnels) | 8.286 | 21.604 |
+| `l4-mux1` (one tunnel) | 9.819 | 12.646 |
+| `l4-mux8` | 9.058 | 21.955 |
+
+One carrier connection tops out near 8–10 Gbit/s on this host — the one-tunnel
+arm says so directly, at one flow and at eight streams over the same tunnel —
+and the forwarding path scales past it only by spreading streams over *several*
+tunnels. A claim has exactly one channel, so it sits at that per-connection
+ceiling by construction, which is why its `bulk-n` is *below* its `bulk-1`:
+eight flows through one channel is the same connection. Raising that ceiling
+means giving a claim more than one channel (per-flow sharding, which the model
+cannot price until it exists), and it is a design decision, not a tuning one.
+
+The operator's copy of the packet-size finding, with the recipe, is
 [deployment.md](deployment.md#transparent-services); what is left on the table —
 a device path that can carry more than one packet per syscall — is the next
 lever, and it needs its own arm before it is a claim.

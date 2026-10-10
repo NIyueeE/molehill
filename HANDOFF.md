@@ -290,6 +290,27 @@ configuration surface is free to change — and this cycle changes it.
    [deployment.md](docs/deployment.md#transparent-services) now carries the
    number.
 
+   At that packet size a second measurement says *what* the remaining ceiling
+   is — the forwarding path with its pool capped, so that one arm prices one
+   carrier connection:
+
+   | Arm (TUN MTU 8000) | `bulk-1` | `bulk-n` (8 flows) |
+   |---|---|---|
+   | control | 38.672 | 44.805 |
+   | `l3` | 7.136 | 5.847 |
+   | `l4` (pool ≤ 4) | 8.286 | 21.604 |
+   | `l4-mux1` (one tunnel) | 9.819 | 12.646 |
+   | `l4-mux8` | 9.058 | 21.955 |
+
+   One carrier connection tops out near 8–10 Gbit/s here (the one-tunnel arm
+   says so at one flow *and* at eight streams over that tunnel), and the
+   forwarding path passes it only by spreading streams over several tunnels. A
+   claim has exactly one channel, so it sits at the per-connection ceiling by
+   construction — that is why its `bulk-n` is below its `bulk-1`. Going past it
+   is a **design** decision (per-flow sharding: several channels per claim, one
+   per inner flow), not a tuning one, and the model cannot price it before it
+   exists.
+
    Open, in the order the measurements argue for them:
 
    - **A device path that carries more than one packet per syscall.** The
