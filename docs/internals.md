@@ -186,9 +186,13 @@ The data path is **one channel per claimed endpoint**:
   that cannot serve it is not polled in a tight loop.
 
 **Which end of a packet the claim is.** Both ends run the same hub
-(`src/transparent/hub.rs`): one reader per TUN device, a bounded queue per
-endpoint, and an endpoint table that decides which packet belongs to which
-service. They differ in the end they look at, which is the heart of the design:
+(`src/transparent/hub.rs`): one reader per TUN device, a **member set** per
+claimed endpoint — the data channels carrying it, one bounded queue each, one
+slot of the set each — and an endpoint table that decides which packet belongs
+to which claim. A slot outlives the member that held it: a replaced channel
+takes the slot its predecessor left, so the routing target of a packet never
+moves when a channel does. They differ in the end they look at, which is the
+heart of the design:
 
 - the **server** routes by **destination**: its host routes the claimed address
   into its device, so the packet the kernel hands it is one whose *destination*
@@ -227,8 +231,10 @@ flow sharing the channel — per-flow channels are not in this version. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
 counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,
-`channel_errors`) once a second per data path, which is how a run is observed
-without logging per packet.
+`channel_errors`) once a second per data path, and one line per member slot of
+every claim on that device (`live`, `forwarded`, `no_channel`), which is how a
+run is observed without logging per packet and how a member set is told from a
+stack.
 
 ## UDP
 

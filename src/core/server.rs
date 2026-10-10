@@ -2103,15 +2103,11 @@ where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use crate::transparent::hub::{TunHub, forward_transparent};
-    use crate::transparent::{Endpoint, Stats};
+    use crate::transparent::{Direction, Endpoint};
 
-    let stats = Arc::new(Stats::default());
-    crate::transparent::spawn_stats_reporter("server", Arc::clone(&stats));
-    let hub = TunHub::get_or_spawn(
-        &tun,
-        Arc::clone(&stats),
-        crate::transparent::Direction::Destination,
-    )?;
+    // The hub owns the data path's counters, so every member of a claim counts
+    // into the same line.
+    let hub = TunHub::get_or_spawn(&tun, Direction::Destination)?;
     let endpoint = Endpoint::new(endpoint.ip(), endpoint.port());
     // Held for the service's lifetime: the address stays claimed until this
     // task ends, and the claim is what a second client's registration hits.
@@ -2142,9 +2138,7 @@ where
             let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
             continue;
         }
-        if let Err(e) =
-            forward_transparent(channel, Arc::clone(&hub), endpoint, Arc::clone(&stats)).await
-        {
+        if let Err(e) = forward_transparent(channel, Arc::clone(&hub), endpoint, 1).await {
             debug!("Transparent channel for {endpoint} ended: {e:#}");
         }
         // No channel for this endpoint any more: ask for one, and keep holding

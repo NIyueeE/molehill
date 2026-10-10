@@ -24,7 +24,6 @@ pub mod tun;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::transparent::ip::{PacketInfo, ParseError, TCP, UDP};
@@ -173,8 +172,27 @@ impl<V> EndpointTable<V> {
 
     /// The value registered for exactly this endpoint, if it is still
     /// registered.
+    ///
+    /// Only the tests read the table without editing it today; the production
+    /// paths act on `endpoint_for`, `insert`, `remove` and `iter` alone.
+    #[cfg(test)]
     pub fn lookup_endpoint(&self, endpoint: &Endpoint) -> Option<&V> {
         self.entries.get(&(endpoint.ip, endpoint.port))
+    }
+
+    /// The value registered for exactly this endpoint, mutably: a member set is
+    /// edited in place — a slot taken or vacated — without the claim leaving
+    /// the table.
+    pub fn lookup_endpoint_mut(&mut self, endpoint: &Endpoint) -> Option<&mut V> {
+        self.entries.get_mut(&(endpoint.ip, endpoint.port))
+    }
+
+    /// Every registered endpoint with its value, in no particular order, for
+    /// the telemetry that reports per-claim state.
+    pub fn iter(&self) -> impl Iterator<Item = (Endpoint, &V)> {
+        self.entries
+            .iter()
+            .map(|((ip, port), value)| (Endpoint::new(*ip, *port), value))
     }
 
     /// The value a packet belongs to, looking at the end this side owns.
@@ -262,33 +280,6 @@ impl Stats {
     pub fn enabled() -> bool {
         std::env::var_os("MOLEHILL_L3_STATS").is_some()
     }
-}
-
-/// One `INFO` line per second per process while `MOLEHILL_L3_STATS=1`.
-///
-/// Cumulative counters, like every other `MOLEHILL_*_STATS` switch: rates come
-/// from consecutive lines.
-pub fn spawn_stats_reporter(role: &'static str, stats: Arc<Stats>) {
-    if !Stats::enabled() {
-        return;
-    }
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            tick.tick().await;
-            tracing::info!(
-                target: "molehill::transparent",
-                "l3-stats: role={role} forwarded={} dropped(not_ipv4={} malformed={} \
-                 unclaimed={} no_channel={}) channel_errors={}",
-                stats.forwarded.load(Ordering::Relaxed),
-                stats.dropped_not_ipv4.load(Ordering::Relaxed),
-                stats.dropped_malformed.load(Ordering::Relaxed),
-                stats.dropped_unclaimed.load(Ordering::Relaxed),
-                stats.dropped_no_channel.load(Ordering::Relaxed),
-                stats.channel_errors.load(Ordering::Relaxed),
-            );
-        }
-    });
 }
 
 #[cfg(test)]

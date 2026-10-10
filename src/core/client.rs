@@ -1340,7 +1340,7 @@ async fn run_transparent_channel(
     service: &ClientServiceConfig,
 ) -> Result<()> {
     use crate::transparent::hub::{TunHub, forward_transparent};
-    use crate::transparent::{Endpoint, Stats};
+    use crate::transparent::{Direction, Endpoint};
 
     let addr: SocketAddr = service.remote_bind_addr.parse().with_context(|| {
         format!(
@@ -1348,20 +1348,10 @@ async fn run_transparent_channel(
             service.name, service.remote_bind_addr
         )
     })?;
-    let stats = Arc::new(Stats::default());
-    crate::transparent::spawn_stats_reporter("client", Arc::clone(&stats));
-    let hub = TunHub::get_or_spawn(
-        &service.transparent_tun,
-        Arc::clone(&stats),
-        crate::transparent::Direction::Source,
-    )?;
-    forward_transparent(
-        conn,
-        hub,
-        Endpoint::new(addr.ip(), addr.port()),
-        Arc::clone(&stats),
-    )
-    .await
+    // The hub owns the data path's counters, so every channel of the claim —
+    // its member set — counts into the same line.
+    let hub = TunHub::get_or_spawn(&service.transparent_tun, Direction::Source)?;
+    forward_transparent(conn, hub, Endpoint::new(addr.ip(), addr.port()), 1).await
 }
 
 /// The client's side of a transparent service's contract, checked before the
