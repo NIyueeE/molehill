@@ -416,7 +416,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
 | `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
 | `[transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
-| `[transparent.data.tcp\|kcp].tunnels` | 该 carrier 的**车道预算**:这个客户端在该 carrier 上为它所有认领一共持有多少条载体连接,在共用该 carrier 的认领之间平分。一条车道**就是**一条连接(认领永远不做多路复用),且每条认领至少保留一条。默认:每条认领一条车道——认领一直以来的形态——低于认领数的预算会被拒绝并给出该写入的条数。上限 1024 |
+| `[transparent.data.tcp\|kcp].tunnels` | 该 carrier 的**车道预算**:这个客户端在该 carrier 上为它所有认领一共持有多少条载体连接,在共用该 carrier 的认领之间平分。一条车道**就是**一条连接(认领永远不做多路复用),且每条认领至少保留一条。默认:每条认领一条车道——认领一直以来的形态——低于认领数的预算会被拒绝并给出该写入的条数。上限 1024。平分只是车道的**起点**:承载的流比车道更多的认领,会从还有空闲车道的认领那里借走一条(但绝不借走最后一条),也就是说预算是「存在多少条连接」的决定者,而谁持有它们由流量决定 |
 | `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次认领都会在看任何设备之前被策略拒绝 |
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 

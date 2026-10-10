@@ -797,7 +797,7 @@ change, not here.
 
 ### The derived data plane: what landed, and what is next
 
-Two commits of the L12–L18 plan are in:
+The plan's L12–L18 are in, as four commits:
 
 - the schema change: `mode` and `members` are gone, `uses_pool` derives the
   shape from the service type, `[transparent.data.tcp|kcp].tunnels` is the
@@ -807,36 +807,42 @@ Two commits of the L12–L18 plan are in:
 - the placement table: a claim's flows are placed once and remembered, so a
   lane change cannot reorder a flow, a new flow never lands in an empty slot,
   an entry expires after 60 s of silence in either direction, and
-  `MOLEHILL_L3_STATS` reports each lane's `flows`.
+  `MOLEHILL_L3_STATS` reports each lane's `flows`;
+- the valve (L17): `[server.data].max_tunnels_per_client` now counts a
+  transparent claim's lanes, not just multiplexed tunnels, and the harness case
+  that proves it (cap `1` against a two-lane claim) is in `run.sh`;
+- the allocator (L15): `src/transparent/lanes.rs` decides, `LanePool` in
+  `src/core/client.rs` reads the hubs and dials, a lane is asked to end only
+  when it holds no flow at all, and the receiver's lane is dialled only after
+  the donor's has ended. The target is **a lane per talking flow**, and the
+  first measurement of it is the harness's lending case: two claims sharing a
+  budget of four, one carrying the 16-flow arm, the other nothing —
+  `Lane allocator: lent lane 0 of claim 10.99.0.1:8444 to claim 10.99.0.1:8443
+  on the Tcp carrier`, with the busy claim byte-exact through the change.
+
+The honest limit of (L15) as it stands: **a single flow cannot be spread over
+two lanes** (its packets must stay in order, which is what pins it to one lane),
+so a one-flow workload gains nothing from more lanes by construction. What
+lending buys is per-flow parallelism — N flows want N lanes — and the numbers
+for that are still owed: the harness proves the mechanism and its safety, not
+a throughput delta.
 
 Next, in the order they should be picked up (each is a session of its own, and
 each needs its own evidence):
 
-1. **Reclaim an idle lane for a busy claim (L15).** The hub half is almost
-   there — `MemberSlot::flows` is the idleness signal the rule needs — but the
-   runtime is the work: a per-claim lane target the client's transparent
-   service owns, a `draining` mark on the donor's slot *before* it is dropped
-   (so no new flow can land in the window), a lane task that can be asked to
-   end, and the server's replacement request suppressed for a lane that was
-   retired on purpose. It needs a **mixed-claims scenario in the bench model**
-   (one busy claim, several idle ones) before it is a claim, not after: the
-   mechanism's only evidence is the throughput a busy claim gains.
-2. **The server's valve over transparent lanes (L17).** The cap counts
-   multiplexed tunnels only (registered by `reserve_tunnel` on the tunnel
-   hello), and a claim's lane is a plain data channel, so nothing bounds it. The
-   fix is `SessionGate { sessions, nonce, cap }` threaded into
-   `ControlChannelHandle::new` → `spawn_transparent_service` →
-   `run_transparent_service`, one reservation per arriving lane held for the
-   member's life, and the same once-INFO-then-DEBUG refusal the tunnel valve
-   uses. It is a one-call-chain change, but it touches the session registry,
-   which is why it wants a fresh pass rather than the tail of another one.
-3. **The mux×1 gap (L18).** The baseline is measured and recorded above
+1. **The lending throughput number.** The bench model needs a **mixed-claims
+   scenario** (one busy claim carrying the many-flow arm, one or more idle
+   claims) so the gain is a measurement rather than a mechanism: `l3-lanes4`
+   against the same topology with lending effectively off, on the model's own
+   A/A floor. Until that exists, the changelog says what lending does and claims
+   no speedup for it.
+2. **The mux×1 gap (L18).** The baseline is measured and recorded above
    (9.15 against 18.95 Gbit/s, +87 % CPU per byte, 15.35 % A/A floor). The
    attribution is the first step — a `perf` profile of the `l4-mux2` arm, to
    see whether the per-write `Vec::from`, the 32 KiB split, the driver hand-off
    or the window updates own the gap — and each candidate lands as its own
    commit with its own A/B, reverted if it does not clear the floor.
-4. **The model/docs sweep.** `docs/benchmarks.md` (+ `.zh.md`) still describes
+3. **The model/docs sweep.** `docs/benchmarks.md` (+ `.zh.md`) still describes
    the retired arms inside its measurement records; each record is history and
    stays, but the current catalog's names (`l3`, `l3-lanes4`, `l3-kcp4`) want a
    note where a reader meets them, and the mixed-claims scenario of (1) is a new

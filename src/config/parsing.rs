@@ -70,7 +70,7 @@ pub enum TransportType {
 ///   the control transport is `noise`. The carrier is client-declared in
 ///   the service registration; the server adapts per connection.
 #[cfg(feature = "multiplex")]
-#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub enum DataCarrier {
     #[default]
     #[serde(rename = "tcp")]

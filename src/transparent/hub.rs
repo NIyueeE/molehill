@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::protocol::{IpFrames, IpTraffic};
 use crate::transparent::flow;
@@ -174,11 +174,31 @@ impl TunHub {
     /// exactly as long as the returned guard.
     fn join(&self, endpoint: Endpoint, queue: mpsc::Sender<Bytes>) -> Result<MemberGuard> {
         let slot = self.routes.join(endpoint, queue)?;
+        // A claim that vanished between the two calls leaves the lane with a
+        // wake nobody will ring: it simply never retires, which is the safe
+        // direction.
+        let retire = self
+            .routes
+            .retire_watch(&endpoint)
+            .unwrap_or_else(|| Arc::new(Notify::new()));
         Ok(MemberGuard {
             routes: Arc::clone(&self.routes),
             endpoint,
             slot,
+            retire,
         })
+    }
+
+    /// Ask one of a claim's lanes to end, and say whether it is idle right now.
+    ///
+    /// This is the whole of the hub's part in lending a lane: the hub never ends
+    /// a lane itself (the task that owns the connection does, see
+    /// [`MemberGuard::retired`]) and never decides *whether* to — that is the
+    /// allocator's policy ([`crate::transparent::lanes`]). A caller reaches for
+    /// this only for a slot the policy has already found idle; the return value
+    /// is the same answer as seen under the lock.
+    pub fn retire_lane(&self, endpoint: &Endpoint, slot: usize) -> bool {
+        self.routes.retire_lane(endpoint, slot)
     }
 
     /// The reader loop: device to service queues. Runs until the device is
@@ -259,6 +279,32 @@ struct MemberGuard {
     routes: Arc<Routes>,
     endpoint: Endpoint,
     slot: usize,
+    /// Woken when any lane of this claim is asked to end; the guard then asks
+    /// the hub whether the ask was for *its* slot.
+    retire: Arc<Notify>,
+}
+
+impl MemberGuard {
+    /// Resolves when this lane has been asked to end and has nothing left to
+    /// carry.
+    ///
+    /// The hub does not end a lane: the task that owns the connection does, so
+    /// the packets already in flight on it finish first — and no new flow can
+    /// have been placed in its slot since the ask, because a draining slot takes
+    /// none (`ClaimSlots::live_slots`). Waiting on the notification rather than
+    /// polling is what keeps a quiet lane from holding its slot until its next
+    /// packet, which may never come.
+    async fn retired(&self) {
+        loop {
+            // Armed before the check, so an ask that lands between the two is
+            // not missed (the permit is stored).
+            let notified = Arc::clone(&self.retire).notified_owned();
+            if self.routes.should_retire(&self.endpoint, self.slot) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Drop for MemberGuard {
@@ -331,6 +377,39 @@ impl Routes {
         let slot = claim.place(queue);
         table.insert(endpoint, claim);
         Ok(slot)
+    }
+
+    /// The wake one of a claim's lanes waits on to hear that it was asked to
+    /// end, or `None` when the claim is gone.
+    fn retire_watch(&self, endpoint: &Endpoint) -> Option<Arc<Notify>> {
+        self.table.lock().ok().and_then(|mut table| {
+            table
+                .lookup_endpoint_mut(endpoint)
+                .map(|claim| Arc::clone(&claim.retire))
+        })
+    }
+
+    /// Ask one of a claim's lanes to end, and say whether it is idle right now.
+    fn retire_lane(&self, endpoint: &Endpoint, slot: usize) -> bool {
+        let Ok(mut table) = self.table.lock() else {
+            return false;
+        };
+        table
+            .lookup_endpoint_mut(endpoint)
+            .is_some_and(|claim| claim.retire(slot))
+    }
+
+    /// Whether the lane in `slot` was asked to end and has nothing left.
+    fn should_retire(&self, endpoint: &Endpoint, slot: usize) -> bool {
+        self.table
+            .lock()
+            .ok()
+            .and_then(|mut table| {
+                table
+                    .lookup_endpoint_mut(endpoint)
+                    .map(|claim| claim.should_retire(slot))
+            })
+            .unwrap_or(false)
     }
 
     /// Which claim and which of its lanes one packet belongs to.
@@ -422,6 +501,11 @@ impl Routes {
         };
         if let Some(entry) = claim.slots.get_mut(slot) {
             entry.queue = None;
+            // A lane that is gone is not on its way out any more: the slot is
+            // free for whoever takes it next (a replacement, or a lane lent
+            // back), and a draining mark left behind would keep every new flow
+            // out of it for good.
+            entry.draining = false;
         }
         let live = claim.slots.iter().any(|entry| entry.queue.is_some());
         if !live {
@@ -470,6 +554,9 @@ struct ClaimSlots {
     /// When the idle sweep last ran, so the table does not walk itself on every
     /// packet.
     swept: std::time::Instant,
+    /// Woken when a lane of this claim is asked to end, so the task that owns
+    /// it notices without polling (see [`MemberGuard::retired`]).
+    retire: Arc<Notify>,
 }
 
 /// One lane's place in a claim's set.
@@ -477,6 +564,10 @@ struct ClaimSlots {
 struct MemberSlot {
     /// The queue of the lane that holds this slot, while one does.
     queue: Option<mpsc::Sender<Bytes>>,
+    /// Set when the claim's owner has asked this lane to end: new flows are
+    /// placed elsewhere, and the lane's task stops once the flows it already
+    /// has are gone (`flows` reaches zero).
+    draining: bool,
     /// Packets this slot handed to its lane.
     forwarded: u64,
     /// Packets placed here while the slot was empty.
@@ -498,6 +589,7 @@ impl ClaimSlots {
             slots: vec![MemberSlot::default()],
             flows: HashMap::new(),
             swept: std::time::Instant::now(),
+            retire: Arc::new(Notify::new()),
         }
     }
 
@@ -516,14 +608,42 @@ impl ClaimSlots {
         slot
     }
 
-    /// The slots that currently hold a lane.
+    /// The slots a **new** flow may be placed in: those that hold a lane and
+    /// are not on their way out.
+    ///
+    /// A draining lane keeps the flows it already has — they finish there — but
+    /// takes no more, which is what makes its flow count fall to zero by itself
+    /// and its end safe to wait for.
     fn live_slots(&self) -> Vec<usize> {
         self.slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| slot.queue.is_some())
+            .filter(|(_, slot)| slot.queue.is_some() && !slot.draining)
             .map(|(slot, _)| slot)
             .collect()
+    }
+
+    /// Ask the lane in `slot` to end, and say whether it is idle right now.
+    ///
+    /// The mark goes on first: from here on no new flow can be placed in the
+    /// slot (see [`Self::live_slots`]), so its flow count can only fall — the
+    /// idle sweep and the flows' own silence do the rest. Waking the claim's
+    /// lane tasks is what lets the one holding this slot finish without waiting
+    /// for its next packet.
+    fn retire(&mut self, slot: usize) -> bool {
+        if let Some(entry) = self.slots.get_mut(slot) {
+            entry.draining = true;
+        }
+        self.retire.notify_waiters();
+        self.slots.get(slot).is_some_and(|entry| entry.flows == 0)
+    }
+
+    /// Whether the lane in `slot` was asked to end and has nothing left to
+    /// carry.
+    fn should_retire(&self, slot: usize) -> bool {
+        self.slots
+            .get(slot)
+            .is_some_and(|entry| entry.draining && entry.flows == 0)
     }
 
     /// Which lane one packet belongs to, remembering a new flow's placement.
@@ -669,6 +789,7 @@ where
     let (reader, mut writer) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
     let guard = hub.join(endpoint, tx)?;
+    let slot = guard.slot;
 
     // The pump is one `write_all` per batch: the reader already framed every
     // packet, so a batch of N packets costs one syscall and one carrier
@@ -686,27 +807,38 @@ where
     // without awaiting between them (and the far side writes them that way).
     let mut frames = IpFrames::new(reader);
     let result = loop {
-        match frames.next().await {
-            Ok(packet) => {
-                // Defence in depth: a peer must not be able to steer traffic
-                // into a local address this service did not claim. Which end
-                // of the packet names the claim depends on the side: the
-                // client is the destination, the server is the source of the
-                // traffic it hands back.
-                let Some(info) = claimed_info(&endpoint, packet, hub.direction()) else {
-                    stats.count_drop(DropReason::Unclaimed);
-                    continue;
-                };
-                hub.touch(&endpoint, &info);
-                if let Err(e) = hub.inject(packet).await {
-                    break Err(anyhow::Error::from(e))
-                        .with_context(|| format!("Failed to inject a packet for {endpoint}"));
+        tokio::select! {
+            // The claim's owner asked this lane to end (its place is wanted
+            // elsewhere). Everything already in flight on it has been
+            // delivered: the loop reaches here between packets, and the hub
+            // stopped placing new flows in this slot when the ask was made.
+            () = guard.retired() => {
+                tracing::info!("Transparent lane {slot} for {endpoint} ended on request");
+                break Ok(());
+            }
+            frame = frames.next() => match frame {
+                Ok(packet) => {
+                    // Defence in depth: a peer must not be able to steer traffic
+                    // into a local address this service did not claim. Which end
+                    // of the packet names the claim depends on the side: the
+                    // client is the destination, the server is the source of the
+                    // traffic it hands back.
+                    let Some(info) = claimed_info(&endpoint, packet, hub.direction()) else {
+                        stats.count_drop(DropReason::Unclaimed);
+                        continue;
+                    };
+                    hub.touch(&endpoint, &info);
+                    if let Err(e) = hub.inject(packet).await {
+                        break Err(anyhow::Error::from(e))
+                            .with_context(|| format!("Failed to inject a packet for {endpoint}"));
+                    }
                 }
-            }
-            Err(e) => {
-                stats.count_channel_error();
-                break Err(e).with_context(|| format!("Transparent channel for {endpoint} ended"));
-            }
+                Err(e) => {
+                    stats.count_channel_error();
+                    break Err(e)
+                        .with_context(|| format!("Transparent channel for {endpoint} ended"));
+                }
+            },
         }
     };
     drop(guard);
@@ -1034,6 +1166,98 @@ mod tests {
         assert!(
             !slots.flows.contains_key(&key),
             "the flow was not remembered"
+        );
+    }
+
+    /// A lane that has been asked to end takes no new flow, and says so only
+    /// once the flows it already had are gone: that is what makes lending a lane
+    /// safe (nothing is reordered) and atomic (the receiver's lane is dialed
+    /// after this one has actually ended).
+    #[test]
+    fn a_draining_lane_takes_no_new_flow_and_retires_when_empty() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        let (second, _rx_second) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        routes.join(web, second).unwrap();
+
+        // A flow in slot 0, and one in slot 1, so both lanes are carrying
+        // something.
+        let busy = ip::parse(&packet_on_port(40_000)).unwrap();
+        let other = ip::parse(&packet_on_port(40_001)).unwrap();
+        let busy_slot = routes.pick(&busy, Direction::Destination).unwrap().1;
+        let other_slot = routes.pick(&other, Direction::Destination).unwrap().1;
+
+        // A claim's owner asks the lane in slot 0 to end while it is carrying a
+        // flow: the ask is refused (not idle), and the lane drains.
+        assert!(
+            !routes.retire_lane(&web, busy_slot),
+            "a lane with a flow in it is not idle"
+        );
+        assert!(!routes.should_retire(&web, busy_slot));
+        for port in 41_000..41_020u16 {
+            let info = ip::parse(&packet_on_port(port)).unwrap();
+            assert_ne!(
+                routes.pick(&info, Direction::Destination).unwrap().1,
+                busy_slot,
+                "a draining lane takes no new flow"
+            );
+        }
+
+        // Once its flow falls silent — the idle sweep forgets it — the lane has
+        // nothing left to carry and retires.
+        let later =
+            std::time::Instant::now() + FLOW_IDLE_EVICTION + std::time::Duration::from_secs(1);
+        {
+            let mut table = routes.table.lock().unwrap();
+            table.lookup_endpoint_mut(&web).unwrap().sweep_if_due(later);
+        }
+        assert_eq!(routes.member_stats()[busy_slot].flows, 0);
+        assert!(
+            routes.should_retire(&web, busy_slot),
+            "an empty lane that was asked to end retires"
+        );
+        assert!(
+            !routes.should_retire(&web, other_slot),
+            "the lanes nobody asked about are untouched"
+        );
+    }
+
+    /// A slot whose lane is gone is not draining any more: the replacement the
+    /// far end opens inherits a slot that can take flows again, whether the lane
+    /// ended because it was asked to or because it failed.
+    #[test]
+    fn a_vacated_slot_stops_draining() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        let (second, _rx_second) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        routes.join(web, second).unwrap();
+        assert!(routes.retire_lane(&web, 1), "an empty lane is idle");
+
+        // The lane ends (its task drops the guard).
+        routes.vacate(&web, 1);
+        assert!(
+            !routes.should_retire(&web, 1),
+            "the slot is not draining now"
+        );
+
+        // A replacement joins it: it is a routing target again.
+        let (replacement, _rx_replacement) = mpsc::channel(4);
+        assert_eq!(
+            routes.join(web, replacement).unwrap(),
+            1,
+            "the replacement inherits the freed slot"
+        );
+        for port in 42_000..42_040u16 {
+            let info = ip::parse(&packet_on_port(port)).unwrap();
+            let _ = routes.pick(&info, Direction::Destination).unwrap();
+        }
+        assert!(
+            routes.member_stats()[1].flows > 0,
+            "the replacement takes flows like any other lane"
         );
     }
 

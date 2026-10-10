@@ -239,6 +239,24 @@ How a claim's lane set is opened, held and repaired:
   mapping), which is safe because a flow that quiet has nothing in flight to
   reorder; past `MAX_TRACKED_FLOWS` a new flow is placed by the hash alone, so a
   visitor cannot grow the table without bound.
+- **Lanes are lent, and the flow count is what decides.** The configuration
+  gives every claim of a carrier an equal share of the budget
+  (`[transparent.data.tcp|kcp].tunnels`), which is the right starting point and
+  the wrong steady state. Once a second the client's allocator
+  (`src/transparent/lanes.rs` decides, `LanePool` in `src/core/client.rs` reads
+  the hubs and dials) moves at most **one** lane, from a claim that has a lane
+  with no flow in it and more than one lane, to the claim furthest from a lane
+  per talking flow. A lane is only asked to end when it holds **no** flow at
+  all — the condition `Routes::retire_lane` re-checks under the hub's lock — and
+  the receiver's lane is dialed only once the donor's has actually ended, so a
+  swap never holds more carrier connections than the budget at any instant (the
+  server's valve and the operator's bill both see a swap, not a growth).
+  Two consequences worth stating: **a single flow cannot be sped up by more
+  lanes** — its packets have to stay in order, which is why placement pins it to
+  one lane — so the parallelism a claim gains is per *flow*, and the target is
+  one lane per talking flow; and a claim is never reduced below one lane, which
+  is what keeps it reachable. The signal is the placement table's own per-slot
+  `flows` count, so what the allocator sees is what the router does.
 
 **Which end of a packet the claim is.** Both ends run the same hub
 (`src/transparent/hub.rs`): one reader per TUN device, a **lane set** per

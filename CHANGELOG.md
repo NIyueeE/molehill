@@ -46,6 +46,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A transparent claim's lanes are lent to the claim that needs them.** The
+  lane budget (`[transparent.data.tcp|kcp].tunnels`) used to be split equally at
+  startup and left that way, so a claim carrying sixteen flows on two
+  connections and a claim carrying nothing held the same number. The client now
+  looks once a second and moves at most one lane: from a claim that has a lane
+  with no flow in it and more than one lane, to the claim furthest from *a lane
+  per talking flow*. Three properties make it safe rather than clever — a lane
+  is asked to end only when it holds no flow at all, the receiver's lane is
+  dialled only after the donor's has actually ended (so the number of carrier
+  connections the operator pays for never grows, it moves), and a claim is never
+  reduced below one lane, which is what keeps it reachable. What it cannot do is
+  worth saying too: a *single* flow cannot be spread over two lanes — its
+  packets have to stay in order — so the gain is per flow, and a one-flow
+  workload is unaffected by design. Lending is observable: the client logs
+  `Lane allocator: lent lane N of claim A to claim B`, and
+  `MOLEHILL_L3_STATS=1` shows each lane's `flows`.
+
 - **The data plane's shape is derived from the service type: `mode` is gone.**
   A forwarding service always multiplexes over its pinned pool; a transparent
   claim never does, because its channels *are* its carrier connections.

@@ -20,6 +20,7 @@ pub mod check;
 pub mod flow;
 pub mod hub;
 pub mod ip;
+pub mod lanes;
 pub mod tun;
 
 use std::collections::HashMap;

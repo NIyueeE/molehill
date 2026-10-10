@@ -18,6 +18,14 @@ use crate::protocol::{
     SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
     read_register_result, write_session_cmd, write_stream_prologue,
 };
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::Direction;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::Endpoint;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::hub::TunHub;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::lanes::{self, ClaimLoad, LaneLoad};
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
@@ -653,6 +661,8 @@ impl Client {
             shared_pool: self.config.shared_pool(),
             #[cfg(feature = "multiplex")]
             pins: Arc::new(crate::transport::multiplex::PinRegistry::new()),
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            lane_pools: HashMap::new(),
         };
         tokio::spawn(
             async move {
@@ -1323,7 +1333,7 @@ async fn forward_data_channel(
             if service.service_type != ServiceType::Transparent {
                 bail!("Expect transparent traffic. Please check the configuration.")
             }
-            #[cfg(all(feature = "transparent", target_os = "linux"))]
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
             run_transparent_channel(conn, service).await?;
             #[cfg(not(all(feature = "transparent", target_os = "linux")))]
             {
@@ -2297,6 +2307,266 @@ enum ServiceState {
     Rejected,
 }
 
+/// The lanes one carrier's claims hold, and the allocator that moves them.
+///
+/// A lane is a claim's carrier connection — one per lane, because a claim never
+/// multiplexes. The configuration gives every claim of a carrier an equal share
+/// of the operator's budget, which is the right *starting* point and the wrong
+/// steady state: a claim carrying ten flows on one connection and a claim
+/// carrying nothing have no use for the same number of connections. Once a
+/// second this pool looks at what each claim's lanes are carrying and moves at
+/// most one idle lane from a claim that can spare one to a claim carrying more
+/// flows than it has lanes ([`crate::transparent::lanes`] owns the rule; this is
+/// the runtime that reads the hubs and dials).
+///
+/// Two properties make it safe:
+///
+/// - a lane is asked to end **only when it holds no flow at all**, which is the
+///   condition the hub re-checks under its own lock, and no flow ever moves —
+///   so lending cannot reorder anything;
+/// - the receiver's lane is dialed only after the donor's lane has actually
+///   ended, so the pair never holds more carrier connections than the budget at
+///   any instant: the server's `max_tunnels_per_client` valve, and the
+///   operator's bill, both see a swap rather than a growth.
+///
+/// The allocator redistributes what the configuration gave these claims; it does
+/// not invent lanes the configuration never allocated. That keeps the operator's
+/// `tunnels` the number that decides how many connections exist, with the
+/// *division* of them left to what the traffic turns out to be.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+struct LanePool {
+    /// The carrier whose lanes this pool moves, for the log line.
+    carrier: DataCarrier,
+    /// The claims of this pool, by claimed endpoint.
+    claims: std::sync::Mutex<HashMap<Endpoint, ClaimEntry>>,
+}
+
+/// One claim, as the allocator knows it.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+struct ClaimEntry {
+    /// The device the claim's hub reads (`[transparent].tun`).
+    tun: String,
+    /// What one data channel of the claim needs, so another lane can be dialed
+    /// for it without going back to the session.
+    args: Arc<RunDataChannelArgs>,
+    /// The lanes the configuration gave this claim (its equal share), which is
+    /// what the pool's budget is the sum of — a move redistributes these, it
+    /// does not create more.
+    share: usize,
+    /// The lanes the claim is wanted to hold right now: the share, adjusted by
+    /// every move. It is also what tells a replacement the server asks for
+    /// apart: a lane that *failed* leaves the claim short of its target, so the
+    /// replacement is dialed; a lane retired on purpose lowered the target
+    /// first, so that request is refused.
+    target: usize,
+}
+
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+impl LanePool {
+    fn new(carrier: DataCarrier) -> Self {
+        Self {
+            carrier,
+            claims: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Add a claim to the pool, or update the one already there (a hot reload
+    /// re-registers the same claim, possibly with a new share).
+    fn register(
+        &self,
+        endpoint: Endpoint,
+        tun: String,
+        args: Arc<RunDataChannelArgs>,
+        share: usize,
+    ) {
+        if let Ok(mut claims) = self.claims.lock() {
+            let share = share.max(1);
+            claims.insert(
+                endpoint,
+                ClaimEntry {
+                    tun,
+                    args,
+                    share,
+                    target: share,
+                },
+            );
+        }
+    }
+
+    /// A service is gone: its claim stops counting against the budget.
+    fn unregister(&self, endpoint: &Endpoint) {
+        if let Ok(mut claims) = self.claims.lock() {
+            claims.remove(endpoint);
+        }
+    }
+
+    /// Whether a data channel the server asked for is one this claim wants.
+    ///
+    /// A lane that failed leaves the claim short of its target, and the hub keeps
+    /// the dead lane's slot for exactly that replacement. A lane that was retired
+    /// on purpose lowered the target first, so this answers no — otherwise the
+    /// allocator would undo its own move on every request.
+    fn wants_another_lane(&self, endpoint: &Endpoint) -> bool {
+        let Some((tun, target)) = self.claims.lock().ok().and_then(|claims| {
+            claims
+                .get(endpoint)
+                .map(|entry| (entry.tun.clone(), entry.target))
+        }) else {
+            return true;
+        };
+        match TunHub::get_or_spawn(&tun, Direction::Source) {
+            Ok(hub) => {
+                hub.member_stats()
+                    .iter()
+                    .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                    .count()
+                    < target
+            }
+            // The device is not up (yet): a claim with no hub has no lanes
+            // either, so the channel is what it is waiting for.
+            Err(_) => true,
+        }
+    }
+
+    /// Start the allocator's tick for this pool.
+    ///
+    /// It runs for the session's lifetime rather than for its claims': a pool
+    /// that emptied and filled again must not need a second start, and one wake
+    /// per second with nothing to do costs nothing worth the bookkeeping.
+    fn spawn_ticker(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(lanes::LANE_TICK);
+            loop {
+                tick.tick().await;
+                pool.step();
+            }
+        });
+    }
+
+    /// What the policy sees: every claim's live lanes and what they carry, and
+    /// how many lanes that is in total.
+    fn snapshot(&self) -> (Vec<ClaimLoad>, usize) {
+        let Ok(claims) = self.claims.lock() else {
+            return (Vec::new(), 0);
+        };
+        let mut loads = Vec::with_capacity(claims.len());
+        let mut used = 0;
+        for (endpoint, entry) in claims.iter() {
+            let Ok(hub) = TunHub::get_or_spawn(&entry.tun, Direction::Source) else {
+                continue;
+            };
+            let lanes: Vec<LaneLoad> = hub
+                .member_stats()
+                .iter()
+                .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                .map(|lane| LaneLoad {
+                    slot: lane.slot,
+                    flows: lane.flows,
+                })
+                .collect();
+            used += lanes.len();
+            loads.push(ClaimLoad {
+                endpoint: *endpoint,
+                lanes,
+            });
+        }
+        (loads, used)
+    }
+
+    /// The budget these claims share: the lanes the configuration gave them.
+    ///
+    /// The *shares*, not the targets — a move must not raise the budget it moves
+    /// within, or an allocator that dialed once could keep finding room to dial
+    /// again.
+    fn budget(&self) -> usize {
+        self.claims
+            .lock()
+            .map_or(0, |claims| claims.values().map(|entry| entry.share).sum())
+    }
+
+    /// The hub of one claim, or `None` when its device is not up.
+    fn hub(&self, endpoint: &Endpoint) -> Option<Arc<TunHub>> {
+        let tun = self
+            .claims
+            .lock()
+            .ok()
+            .and_then(|claims| claims.get(endpoint).map(|entry| entry.tun.clone()))?;
+        TunHub::get_or_spawn(&tun, Direction::Source).ok()
+    }
+
+    /// One look: move at most one lane, if the policy says to.
+    fn step(&self) {
+        let (loads, used) = self.snapshot();
+        // Nothing to move between, and no move without a reason.
+        if loads.len() < 2 {
+            return;
+        }
+        let Some(plan) = lanes::plan(&loads, self.budget(), used) else {
+            return;
+        };
+        match plan {
+            lanes::Plan::Add { to } => {
+                // Room under the budget means a claim is holding fewer lanes than
+                // the configuration gave it — a lane died and its replacement has
+                // not arrived — so this hands the room to the claim that needs it
+                // rather than waiting for the dead one.
+                info!(
+                    "Lane allocator: claim {to} has more flows than lanes and the {:?} budget has \
+                     room; dialing a lane",
+                    self.carrier
+                );
+                self.dial(&to);
+            }
+            lanes::Plan::Lend {
+                from,
+                from_slot,
+                to,
+            } => {
+                let Some(hub) = self.hub(&from) else {
+                    return;
+                };
+                if !hub.retire_lane(&from, from_slot) {
+                    // The policy only names a lane that was carrying nothing, so
+                    // this is the race with the packets that arrived since its
+                    // snapshot: the lane is draining now, ends on its own, and
+                    // the next tick can lend it.
+                    debug!(
+                        "Lane {from_slot} of claim {from} is not idle; not lending it this tick"
+                    );
+                    return;
+                }
+                if let Ok(mut claims) = self.claims.lock()
+                    && let Some(entry) = claims.get_mut(&from)
+                {
+                    entry.target = entry.target.saturating_sub(1).max(1);
+                }
+                info!(
+                    "Lane allocator: lent lane {from_slot} of claim {from} to claim {to} on the \
+                     {:?} carrier",
+                    self.carrier
+                );
+                // Only now, with the donor's lane on its way out: a swap, never
+                // a growth.
+                self.dial(&to);
+            }
+        }
+    }
+
+    /// Dial one more lane for a claim, and count it as wanted.
+    fn dial(&self, endpoint: &Endpoint) {
+        let args = self.claims.lock().ok().and_then(|mut claims| {
+            claims.get_mut(endpoint).map(|entry| {
+                entry.target += 1;
+                Arc::clone(&entry.args)
+            })
+        });
+        if let Some(args) = args {
+            spawn_data_channel(args, None, None);
+        }
+    }
+}
+
 /// A registered service's live data plane.
 struct ActiveService {
     /// Everything one data channel of this service needs.
@@ -2312,6 +2582,10 @@ struct ActiveService {
     /// The pool's key in the session, so the service can be counted against it.
     #[cfg(feature = "multiplex")]
     pool_key: Option<String>,
+    /// The claimed endpoint this service's lanes carry, when it is a
+    /// transparent service: the allocator names a claim by it.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    lane: Option<Endpoint>,
 }
 
 /// Open `count` data channels for a registered service.
@@ -2389,6 +2663,15 @@ struct ClientSession {
     /// services: a tunnel with pinned peers is never shrunk (D30).
     #[cfg(feature = "multiplex")]
     pins: Arc<crate::transport::multiplex::PinRegistry>,
+    /// The lane allocator of every carrier this session's transparent claims
+    /// draw on.
+    ///
+    /// One pool per carrier, not one per claim: the budget a claim's lane count
+    /// comes out of is the carrier's, so the claims that share it are the claims
+    /// the allocator can move a lane between — and they are exactly the ones
+    /// that dial this session's server.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    lane_pools: HashMap<DataCarrier, Arc<LanePool>>,
 }
 
 impl ClientSession {
@@ -2688,6 +2971,12 @@ impl ClientSession {
                     );
                 }
                 SessionRequest::Deregister(id) => {
+                    #[cfg(all(
+                        feature = "transparent",
+                        feature = "multiplex",
+                        target_os = "linux"
+                    ))]
+                    self.forget_claim(id);
                     self.services.remove(&id);
                 }
             }
@@ -2901,6 +3190,22 @@ impl ClientSession {
         let pins = Arc::clone(&self.pins);
         #[cfg(not(feature = "multiplex"))]
         let pins = Arc::new(());
+        // A transparent service's lanes are the claim's carrier connections,
+        // and the allocator names the claim by the endpoint it carries. The
+        // registration already validated this address (`check_transparent_client`),
+        // so a parse that fails here means the config changed under us: the
+        // service still runs, it just has no claim to lend lanes to or from.
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        let lane = if slot.service.service_type == ServiceType::Transparent {
+            slot.service
+                .remote_bind_addr
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|addr| Endpoint::new(addr.ip(), addr.port()))
+        } else {
+            None
+        };
+
         let active = ActiveService {
             args: Arc::new(RunDataChannelArgs {
                 session_nonce: *nonce,
@@ -2925,8 +3230,28 @@ impl ClientSession {
             tunnel,
             #[cfg(feature = "multiplex")]
             pool_key,
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            lane,
         };
         open_channels(&active, slot.channels);
+        // The claim joins its carrier's allocator, which is what lets an idle
+        // lane of one claim become a lane of a congested sibling.
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        if let Some(endpoint) = lane {
+            let carrier = slot.data.carrier;
+            let share = slot.channels.max(1);
+            let pool = Arc::clone(self.lane_pools.entry(carrier).or_insert_with(|| {
+                let pool = Arc::new(LanePool::new(carrier));
+                pool.spawn_ticker();
+                pool
+            }));
+            pool.register(
+                endpoint,
+                slot.service.transparent_tun.clone(),
+                Arc::clone(&active.args),
+                share,
+            );
+        }
         self.services.insert(
             id,
             ServiceEntry {
@@ -3015,7 +3340,26 @@ impl ClientSession {
             return;
         };
         match &entry.state {
-            ServiceState::Active(active) => open_data_channel(active, stripe),
+            ServiceState::Active(active) => {
+                // A transparent claim's lanes are allotted, not asked for: the
+                // server asks for a replacement whenever one ends, and a lane
+                // the allocator retired on purpose is one the claim should not
+                // get back (the allocator lowered its target first). A lane that
+                // *failed* leaves the claim short, and this dials its
+                // replacement.
+                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                if let Some(endpoint) = active.lane
+                    && let Some(pool) = self.lane_pools.get(&entry.slot.data.carrier)
+                    && !pool.wants_another_lane(&endpoint)
+                {
+                    debug!(
+                        "Ignoring a data channel request for {id}: the claim holds the lanes it \
+                         was allotted"
+                    );
+                    return;
+                }
+                open_data_channel(active, stripe);
+            }
             ServiceState::Rejected => {
                 debug!("Ignoring a data channel request for rejected service {id}");
             }
@@ -3060,9 +3404,29 @@ impl ClientSession {
         self.register(id, nonce, rd, wr).await
     }
 
+    /// Tell the lane allocator a service is gone, so its claim stops counting
+    /// against its carrier's budget.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    fn forget_claim(&self, id: ServiceId) {
+        let Some(entry) = self.services.get(&id) else {
+            return;
+        };
+        let ServiceState::Active(active) = &entry.state else {
+            return;
+        };
+        let Some(endpoint) = active.lane else {
+            return;
+        };
+        if let Some(pool) = self.lane_pools.get(&entry.slot.data.carrier) {
+            pool.unregister(&endpoint);
+        }
+    }
+
     /// Drop one service: the server releases its public endpoint and the
     /// session keeps serving its siblings.
     async fn deregister<W: AsyncWrite + Unpin>(&mut self, id: ServiceId, wr: &mut W) -> Result<()> {
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        self.forget_claim(id);
         if self.services.remove(&id).is_some() {
             debug!("Deregistering service {id}");
             write_session_cmd(wr, &SessionCmd::Deregister(id)).await?;
