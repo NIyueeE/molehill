@@ -486,6 +486,17 @@ configuration surface is free to change — and this cycle changes it.
      are on the `MOLEHILL_KCP_STATS` line for good: `resends_rto` vs
      `resends_fast`, `rto_ms`/`srtt_ms`, the window state, the reader/spill
      residency and the pacer's allowance.
+     Two more results from chasing it, both landed: **the drain parks what the
+     pacer or the kernel refuses** instead of dropping it (worth +12 % on
+     `loss1`, 1.824 against 1.627 Gbit/s with disjoint ranges, at an identical
+     wire ratio) and the park is bounded by half the RTO so the ARQ does not
+     duplicate what the pacer is holding. And one **trade left on the table**:
+     with parking in place, capping the send rate at `window / srtt` is +21 % on
+     `rtt100` (0.204 against 0.169 Gbit/s) but **+14 % wire bytes** there; it is
+     measured, documented on the benchmarks page, and deliberately not carried
+     until someone decides that trade. A quick follow-up worth one run: whether
+     a *larger* pacer bucket (more burst allowed, less queueing delay) keeps the
+     throughput and loses the wire cost.
    - **A rate-aware pacer for the KCP carrier** (above) — **attempted
      2026-10-10, measured, reverted.** The design: sample the peer's
      acknowledged progress every 20 ms, convert it to segments per second, and

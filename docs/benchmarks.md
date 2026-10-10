@@ -706,12 +706,26 @@ Two repairs were tried against that, and the measurements chose between them:
   `srtt/8` (nothing changes below an 80 ms round trip) cuts RTO-driven resends by
   **42 %** and the wire ratio from **1.20 to 1.09** on that cell, with throughput
   flat (0.178 against 0.169–0.197 across the runs).
-* **Pacing the burst to the bandwidth-delay product — falsified.** Capping the
-  send rate at `window / srtt` (655 Mbit/s on this cell) is the textbook answer to
-  a bursting sender, and it is **35 % worse**: 0.114 [0.104..0.124] against
-  0.175 [0.160..0.181] Gbit/s over three rounds each, with the wire ratio
-  unchanged. Whatever the losses are, the pacer's bucket-and-rate gate does not
-  remove them; it only slows the sender down.
+* **Pacing the burst to the bandwidth-delay product — measured, and left out.**
+  Capping the send rate at `window / srtt` (655 Mbit/s on this cell) is the
+  textbook answer to a bursting sender, and as first built it was **35 % worse**:
+  0.114 [0.104..0.124] against 0.175 [0.160..0.181] Gbit/s over three rounds
+  each. The reason was not the rate, it was the refusal: a datagram the pacer
+  would not take was **dropped**, so every act of rate control became a loss
+  event with a recovery round trip behind it. Parking refusals instead (below)
+  makes the same cap worth **+21 %** on that cell — 0.204 [0.176..0.244] against
+  0.169 [0.154..0.201] — but the wire ratio grows by **14 %** with it, so it is a
+  trade rather than a win and stays out of the shipped path until something
+  decides that trade. Its numbers are here so the decision can be made on them.
+* **Parking what the pacer or the kernel refuses — kept.** The drain used to
+  discard a datagram it could not send (a denied span, a partial `sendmmsg`, an
+  `EAGAIN`) and let the ARQ re-send it a round trip later. Holding it instead, in
+  order and bounded by half the retransmission timeout, is worth **12 % on the
+  lossy leg** — 1.824 [1.822..1.855] against 1.627 [1.521..1.732] Gbit/s, ranges
+  disjoint — at an identical wire ratio, and it is neutral on the clean and
+  long-haul cells. The bound matters: a parked datagram the engine also times out
+  goes on the wire twice, which is where the pacing experiment's 14 % of extra
+  wire bytes comes from.
 
 **And the signal itself was wrong.****And the signal itself was wrong.** That PONG timeout is the pacer's only
 input, and it fires on *any* late PONG — including one queued behind a peer that

@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A refused KCP datagram is held, not dropped.** The send path discarded
+  anything the pacer would not admit or the kernel would not take (a denied
+  span, a partial `sendmmsg`, an `EAGAIN`) and let the ARQ re-send it a round
+  trip later — so every act of rate control and every full socket buffer became
+  packet loss. Refusals are now parked, in order and bounded by half the
+  retransmission timeout, and retried: **+12 % throughput on the benchmark's
+  lossy leg** (1.824 against 1.627 Gbit/s, disjoint ranges) at an identical wire
+  ratio, neutral on the clean and long-haul cells. Pacing the send burst to the
+  bandwidth-delay product on top of that is worth another +21 % on the
+  long-haul cell but costs 14 % more wire bytes there; it is measured, recorded
+  and **not** carried.
+
 - **A KCP retransmission timeout now clears the round trip it is timing.** The
   reference's timeout is `srtt + max(interval, 4·rttvar)`, and this adapter sets
   the flush interval to 10 ms for latency — which left a 200 ms path with a
