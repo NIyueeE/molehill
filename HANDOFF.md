@@ -336,6 +336,27 @@ configuration surface is free to change — and this cycle changes it.
        *one* 54 KB skb (the virtual link preserves GSO), so segmentation is
        deferred to wherever it is really needed.
 
+     Two more things the same day's experiments settled, both of them reasons
+     the header does **not** land on its own:
+
+     - **The offload flag is two-way, and enabling it alone breaks every
+       claim.** With `TUN_F_CSUM` on and the virtio header dropped on the floor,
+       no visitor could reach a claim at all (measured: both the framing run and
+       the readiness probe failed for every round). The reason is the topology's
+       own veth: it hands over packets whose transport checksum is still
+       partial, the device advertises that it may do so, and a daemon that
+       forwards the packet without its flags forwards something the far end can
+       only drop. The header's `flags`/`csum_*` fields have to travel with the
+       packet — which is the wire change, not a local one.
+     - **The header without the offloads is a pure cost.** Attach with
+       `IFF_VNET_HDR` only (offloads off, packets complete, everything still
+       working) measured **4–5 % below** the released build on `bulk-1`: three
+       rounds, the A/A twin beside it, every round below both old arms
+       (4.041 against 4.188/4.255 Gbit/s). The header costs a 10-byte copy on
+       read and a two-segment `writev` on write, and buys nothing until the
+       writes coalesce. So it lands *with* the GSO write, as one change whose
+       A/B has a win to show.
+
      The design that follows, in two slices:
 
      * **Slice 1, no wire change.** Both TUNs attach with `IFF_VNET_HDR` and
