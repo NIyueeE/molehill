@@ -713,10 +713,21 @@ flow):
 The third row is the safety property, and it is why this is done by following
 the probe rather than by raising a constant: on a 1500-byte path the datagram
 stays at what that path carries, so the change is neutral there, while the wire
-ratio improves in every jumbo row (1.1483 → 1.0892 on clean). What it does
-*not* fix is the multiplexed arm's dead link on a rate-limited lossy leg: with
-the same build it still fails `bulk-1` there, both rounds — that is the ARQ's
-retransmit budget, not its datagram size.
+ratio improves in every jumbo row (1.1483 → 1.0892 on clean).
+
+**The failure itself was then fixed, and it was the rule, not the size.** The
+`KCP session dead link` above is the engine's reference behaviour: a segment
+retransmitted twenty times ends the session. That conflates two different
+things — a peer that is *gone* and a peer that is *slow*. On a rate-limited
+path the acknowledgements sit behind megabytes of shaped traffic, so a segment
+collects its twenty retransmissions while the peer is answering everything
+else, and a live session is closed. Measured on the same `loss1_rate100` leg,
+the multiplexed arm failed `bulk-1` in **every** round before this change and
+completes **both** rounds after it (0.058–0.059 Gbit/s, 17 % fewer wire bytes
+than the direct arm and a third less CPU per byte), and the direct arm's CPU per
+byte fell by a fifth. The rule now needs both: the retransmit count *and* a send
+window that has not moved for five seconds — a gone peer stops acknowledging,
+a slow one keeps acknowledging something.
 
 **The obvious fixes were tried, and they are wrong.** `nc = 0` (the engine's
 own congestion control) as an A/B against the shipped build on `loss1_rate100`

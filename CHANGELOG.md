@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   combination. What it costs and what it buys is measured, per path condition,
   in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
 
+### Fixed
+
+- **A KCP session is no longer declared dead for being slow.** The dead-link
+  rule was the reference implementation's — a segment retransmitted twenty times
+  ends the session — which cannot tell a peer that is *gone* from one that is
+  *slow*. On a rate-limited path the acknowledgements queue behind the shaper,
+  so a segment collects its twenty retransmissions while the peer is answering
+  everything else, and the session (and the visitor's connection with it) is
+  closed: measured on the benchmark's 100 Mbit/s, 20 ms, 1 %-loss leg, the
+  multiplexed KCP arm failed its bulk cell in **every** round before this change
+  and completes **both** rounds after it. A session now ends only when the count
+  is reached *and* the send window has not moved for five seconds — a gone peer
+  stops acknowledging, a slow one keeps acknowledging something
+  ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
+
 ### Changed
 
 - **The KCP carrier's datagram size follows the path.** It was pinned at KCP's

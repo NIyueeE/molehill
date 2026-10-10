@@ -80,6 +80,21 @@ const KCP_INTERVAL: u32 = 100;
 /// KCP Header size
 pub const KCP_OVERHEAD: usize = 24;
 const KCP_DEADLINK: u32 = 20;
+/// How long the send window may stand still before [`KCP_DEADLINK`] means what
+/// it is for.
+///
+/// The reference counts a segment's retransmissions and calls the session dead
+/// at twenty, which conflates two different things: a peer that is **gone** and
+/// a peer that is **slow**. On a rate-limited path a segment's acknowledgement
+/// can be behind megabytes of queued traffic while the peer acknowledges
+/// everything else happily — and the retransmissions fired into that queue make
+/// the wait longer still, so twenty of them arrive in seconds and a live
+/// session is closed (measured: the multiplexed KCP arm died on every round of
+/// the bench's `loss1_rate100` cell, [benchmarks.md](../../docs/benchmarks.md)).
+/// A session that is moving its `snd_una` is not dead, whatever any single
+/// segment's retransmit count says; one that has moved nothing for this long is,
+/// whether or not twenty retransmissions have gone by.
+const KCP_DEAD_GRACE_MS: i32 = 5_000;
 
 const KCP_THRESH_INIT: u16 = 2;
 const KCP_THRESH_MIN: u16 = 2;
@@ -358,6 +373,9 @@ pub struct Kcp<Output> {
 
     /// Maximum resend time
     dead_link: u32,
+    /// `current` (ms) when the send window last moved: the difference between a
+    /// peer that is slow and one that is gone (see [`KCP_DEAD_GRACE_MS`]).
+    last_progress: u32,
     /// Maximum payload size
     incr: usize,
 
@@ -406,6 +424,7 @@ impl<Output> Debug for Kcp<Output> {
             .field("ts_probe", &self.ts_probe)
             .field("probe_wait", &self.probe_wait)
             .field("dead_link", &self.dead_link)
+            .field("last_progress", &self.last_progress)
             .field("incr", &self.incr)
             .field("snd_queue.len", &self.snd_queue.len())
             .field("rcv_queue.len", &self.rcv_queue.len())
@@ -506,6 +525,7 @@ impl<Output> Kcp<Output> {
             fastlimit: KCP_FASTACK_LIMIT,
             xmit: 0,
             dead_link: KCP_DEADLINK,
+            last_progress: 0,
 
             output: KcpOutput(output),
         }
@@ -847,6 +867,8 @@ impl<Output> Kcp<Output> {
         while let Some(seg) = self.snd_buf.front() {
             if timediff(una, seg.sn) > 0 {
                 self.snd_buf.pop_front();
+                // The window moved: whatever this session is, it is not gone.
+                self.last_progress = self.current;
             } else {
                 break;
             }
@@ -1237,11 +1259,25 @@ impl<Output> Kcp<Output> {
         self.rcv_nxt
     }
 
-    /// Check if KCP connection is dead (resend times excceeded)
+    /// Check if KCP connection is dead (resend times excceeded *and* the send
+    /// window has stood still — see [`Self::peer_is_gone`])
     #[inline]
     pub fn is_dead_link(&self) -> bool {
         self.state != 0
     }
+}
+
+/// Whether `xmit` retransmissions of one segment, together with a send window
+/// that has stood still past the grace, are a peer that is gone.
+///
+/// The reference's rule is the count alone, and a rate-limited path proves it
+/// wrong: acknowledgements queued behind megabytes of shaped traffic arrive
+/// later than the retransmissions they would have stopped, so the count climbs
+/// on a peer that is answering everything. The silence is what separates a peer
+/// that is slow from one that is absent (see [`KCP_DEAD_GRACE_MS`]).
+#[inline]
+const fn peer_is_gone(xmit: u32, dead_link: u32, window_still: bool) -> bool {
+    xmit >= dead_link && window_still
 }
 
 /// One parsed KCP segment header, as read off the wire in [`Kcp::input`].
@@ -1422,6 +1458,9 @@ impl<Output: DatagramSink> Kcp<Output> {
 
         let mut lost = false;
         let mut change = 0;
+        // Read the dead-link inputs before the loop borrows `snd_buf` mutably.
+        let dead_link = self.dead_link;
+        let window_still = timediff(self.current, self.last_progress) > KCP_DEAD_GRACE_MS;
 
         for snd_segment in &mut self.snd_buf {
             let mut need_send = false;
@@ -1484,7 +1523,9 @@ impl<Output: DatagramSink> Kcp<Output> {
                     snd_segment.encode(&mut self.buf);
                 }
 
-                if snd_segment.xmit >= self.dead_link {
+                // Dead is a *stalled* sender, not a retransmitted segment: the
+                // count is the trigger, the silence is the verdict.
+                if peer_is_gone(snd_segment.xmit, dead_link, window_still) {
                     self.state = -1; // (IUINT32)-1
                 }
             }
@@ -1624,6 +1665,60 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// The dead-link rule: the retransmit count only means "gone" once the send
+    /// window has stood still for the grace. A peer that keeps acknowledging is
+    /// slow, not absent, however many times one segment went out — which is
+    /// exactly the case a rate-limited path produces, and what closed a live
+    /// multiplexed session on every round of the bench's `loss1_rate100` cell.
+    #[test]
+    fn the_dead_link_needs_silence_not_just_retransmits() {
+        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
+        kcp.update(1).unwrap();
+        kcp.send(&[0u8; 64]).unwrap();
+        kcp.flush().unwrap();
+
+        // The same silence test `flush` performs, spelled out here so the two
+        // thresholds stay visible.
+        let still =
+            |kcp: &Kcp<SharedBuf>| timediff(kcp.current, kcp.last_progress) > KCP_DEAD_GRACE_MS;
+        let grace = u32::try_from(KCP_DEAD_GRACE_MS).unwrap();
+        kcp.current = 10_000;
+
+        // The count alone, with progress just inside the grace: alive.
+        kcp.last_progress = 10_000 - (grace - 1);
+        assert!(!peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+
+        // The same count with the window still where it was a whole grace ago:
+        // a peer that has stopped answering.
+        kcp.last_progress = 10_000 - (grace + 1);
+        assert!(peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+
+        // Below the count it is not a dead link either, however quiet: the
+        // first retransmissions of a stalled segment are what the RTO loop is
+        // for, and a peer that comes back inside them is served.
+        assert!(!peer_is_gone(KCP_DEADLINK - 1, KCP_DEADLINK, still(&kcp)));
+
+        // And the rule is what ends a session: a flush past both thresholds
+        // flips the state the adapter reads. Nodelay, as the adapter configures
+        // it, so the RTO steps by half of itself per retransmit rather than
+        // doubling — the difference between reaching the trigger in twenty
+        // rounds and in fifteen.
+        kcp.set_nodelay(true, 10, 2, true);
+        kcp.current = 10_000_000;
+        kcp.last_progress = 0;
+        for _ in 0..(KCP_DEADLINK + 2) {
+            // Far beyond any RTO the escalation can reach in nodelay mode, so
+            // every round retransmits.
+            kcp.current += 10 * KCP_RTO_MAX;
+            kcp.flush().unwrap();
+        }
+        assert!(
+            kcp.is_dead_link(),
+            "a window that has stood still past the grace, with the count over the trigger, \
+             must end the session"
+        );
     }
 
     /// `set_mtu` follows the caller in either direction and keeps a payload in

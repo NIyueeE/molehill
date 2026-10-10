@@ -346,8 +346,10 @@ handshake) and cuts FD usage under many concurrent visitors.
   sends a datagram that would have to be fragmented), 32 MiB socket
   buffers. Keepalive: a 2 s adapter-level PING/PONG
   keeps idle tunnels warm (NAT mappings) and probes the path RTT; a
-  vanished peer is only confirmed on the next write (dead-link after ~20
-  RTOs).
+  vanished peer is only confirmed on the next write: a session ends when a
+  segment has been retransmitted ~20 times **and** the send window has stood
+  still for five seconds, so a peer that is merely slow — acknowledgements
+  queued behind a shaper, say — is not mistaken for one that is gone.
 - Building without the feature removes the option entirely, and such a
   build must not see the corresponding tables at all: a config that
   contains `[client.data]` or `[server.data]` is rejected there (unknown

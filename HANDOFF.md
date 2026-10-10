@@ -406,10 +406,21 @@ configuration surface is free to change — and this cycle changes it.
      and a better wire ratio; `loss1` jumbo **0.407 → 1.713 (+4.2×)** at −40 %
      CPU; `loss1` on a 1500-byte link **neutral** (0.406 → 0.434), which is the
      safety property — the probe keeps a normal path at the size it carries;
-     `rr-16` on `loss1_rate100` +3.8 %. Still open on the same leg: the
-     multiplexed KCP arm's `dead link`, unchanged by this (both builds fail
-     `bulk-1` there), which is the ARQ's retransmit budget rather than its
-     datagram size.
+     `rr-16` on `loss1_rate100` +3.8 %.
+   - **The dead link was the rule, and it is fixed.** The engine inherited the
+     reference's dead-link rule — twenty retransmissions of one segment ends the
+     session — which conflates a peer that is gone with one that is slow. On a
+     rate-limited path the acknowledgements queue behind the shaper, so a
+     segment collects twenty retransmissions while the peer answers everything
+     else, and a live session is closed. The rule now needs the count *and* a
+     send window that has not moved for five seconds (`KCP_DEAD_GRACE_MS`, with
+     `last_progress` set wherever `snd_una` advances). Measured on
+     `loss1_rate100` + a jumbo link: the multiplexed arm failed `bulk-1` in
+     **every** round before and completes **both** after (0.058–0.059 Gbit/s,
+     17 % fewer wire bytes than the direct arm), and the direct arm's CPU per
+     byte fell by a fifth. The one cost: a genuinely vanished peer is now
+     detected up to five seconds later, which the session-level watchdogs
+     (`FORWARD_IDLE_TIMEOUT`) bound anyway.
    - **A rate-aware pacer for the KCP carrier** (above) — **attempted
      2026-10-10, measured, reverted.** The design: sample the peer's
      acknowledged progress every 20 ms, convert it to segments per second, and
