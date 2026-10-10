@@ -25,6 +25,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The KCP carrier's datagram size follows the path.** It was pinned at KCP's
+  1400-byte default, and the adaptation that existed was shrink-only: a small
+  path lowered the size, a jumbo path never raised it. Since the carrier's cost
+  is per *datagram* — a UDP send, a receive, a header, an acknowledgement and a
+  loss event — a jumbo path paid that 5.7× more often than it had to. The
+  carrier now sizes its segments from the kernel's path-MTU answer, from 1400 up
+  to an 8 KiB ceiling, re-read once a second, so a session on a 1500-byte path
+  behaves exactly as before (measured neutral) while one on a jumbo path
+  measures **+39 % throughput and −28 % CPU per byte** on a clean path, and
+  **4.2×** on a lossy one ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
+  No configuration changes; the kernel's own answer is the policy.
+
 - **The benchmark model is one runner again: the soak sweep is a profile of
   it.** `benches/scripts/bench/` now owns everything a performance number is
   produced by — the metric registry, the topology, the workloads, the scripted

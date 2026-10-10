@@ -179,14 +179,24 @@ const MAX_LISTENER_SESSIONS: usize = 4096;
 /// the writer arm) at high link rates.
 const INPUT_BATCH_LIMIT: usize = 512;
 /// Inbound datagram scratch buffer (one datagram is at most one MTU).
-const DGRAM_BUF: usize = 2048;
-/// Arm-2 MTU (KCP's protocol default; never tuned — see the module docs).
-/// Only sizes the send batch's staging buffer.
-const KCP_MTU: usize = 1400;
+///
+/// Sized for the **ceiling**, not for the session's current size: a session may
+/// grow its datagrams at any point (`maybe_path_mtu`), and a short buffer
+/// truncates the datagram instead of failing — the first jumbo experiment
+/// arrived as a retransmit storm because this was 2048 bytes against 8000-byte
+/// segments.
+const DGRAM_BUF: usize = KCP_MTU_CEILING + KCP_OVERHEAD;
+/// The largest datagram a session may use. The engine's default (1400) is where
+/// every session *starts*, because that is what any path carries; the path-MTU
+/// probe is what permits more, and this is the cap on what it may permit — a
+/// jumbo datagram, not an arbitrary one, so a bogus probe result cannot make
+/// the carrier emit something that must be fragmented.
+const KCP_MTU_CEILING: usize = 8000;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
-/// appending never reallocates inside a batch (≈46 KiB).
-const BATCH_STAGE_BYTES: usize = BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
+/// appending never reallocates inside a batch (≈256 KiB at the ceiling).
+const BATCH_STAGE_BYTES: usize =
+    BATCH * (KCP_MTU_CEILING + KCP_OVERHEAD) + KCP_MTU_CEILING + KCP_OVERHEAD;
 /// Reader-side coalescing target: consecutive segments are batched into
 /// one channel message up to this many bytes (the mux/yamux/Noise reader
 /// above asks for ~24 such segments per frame, so this cuts the
@@ -1137,7 +1147,7 @@ async fn drain_dgrams(
         // No sendmmsg here, so a two-iovec (split) datagram is reassembled
         // into one buffer before the single-datagram send — the copy this
         // platform pays, byte-identical on the wire.
-        let mut dgram_buf = [0u8; KCP_MTU + KCP_OVERHEAD];
+        let mut dgram_buf = [0u8; KCP_MTU_CEILING + KCP_OVERHEAD];
         while let Ok(batch) = dgram_rx.try_recv() {
             for span in &batch.spans {
                 let (header, payload): (&[u8], &[u8]) = match span {
@@ -1222,9 +1232,17 @@ async fn pump_head(
 /// at session start describes the path that existed then, and a session that
 /// keeps sending 1400-byte datagrams down a 1280-byte path pays a lost
 /// *datagram* for every lost fragment. One second is the cadence at which a
-/// path change costs a bounded amount of traffic; the check is one
-/// `getsockopt` on a throwaway socket, and `shrink_mtu` is one-way, so
-/// re-reading cannot oscillate.
+/// path change costs a bounded amount of traffic, and the check is one
+/// `getsockopt` on a throwaway socket.
+///
+/// The same probe is what lets a session *grow*: the kernel's answer is the
+/// path's own datagram size, and a carrier pinned below it pays its
+/// per-datagram cost 5.7× more often than it has to on a jumbo path (measured:
+/// +35 % throughput, −30 % CPU per byte — [benchmarks.md](../../docs/benchmarks.md),
+/// "The carrier axis"). Growth is bounded by [`KCP_MTU_CEILING`], and both
+/// directions are hysteresis-free on purpose: the value is a property of the
+/// path, not a probe of it, so a path that changes is followed rather than
+/// averaged.
 const PATH_MTU_RECHECK: Duration = Duration::from_secs(1);
 
 /// Re-read the path MTU and shrink the datagram size if the path got smaller.
@@ -1246,16 +1264,20 @@ fn maybe_path_mtu(
     let Some(path_mtu) = probe_path_mtu(local, net.peer) else {
         return;
     };
-    if let Some(fits) = clamp_mtu(kcp.mtu(), path_mtu, net.peer.is_ipv6()) {
-        let before = kcp.mtu();
-        kcp.shrink_mtu(fits);
+    let Some(fits) = datagram_for_path(path_mtu, net.peer.is_ipv6()) else {
+        // Smaller than a KCP header can be: not our call to make, and the
+        // engine's floor keeps a payload in any case.
+        return;
+    };
+    let before = kcp.mtu();
+    if kcp.set_mtu(fits) != before {
         datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
         info!(
             peer = %net.peer,
             path_mtu,
             datagram_before = before,
             datagram_after = kcp.mtu(),
-            "KCP datagram size adapted to the path MTU (shrink-only)"
+            "KCP datagram size adapted to the path MTU"
         );
     }
 }
@@ -1595,14 +1617,17 @@ fn ipv6_mtu_of(probe: &std::net::UdpSocket) -> Option<usize> {
 /// needs two fragments (measured on the `loss1_mtu1280` cell: the KCP arm
 /// drops from 0.3 Gbit/s to zero, while the TCP arm is unaffected because
 /// the kernel does this arithmetic for TCP).
-fn clamp_mtu(current: usize, path_mtu: usize, ipv6: bool) -> Option<usize> {
+/// The datagram size a path of `path_mtu` deserves: what is left after the IP
+/// and UDP headers this session's family adds, capped at [`KCP_MTU_CEILING`],
+/// or `None` when even a KCP header does not fit.
+fn datagram_for_path(path_mtu: usize, ipv6: bool) -> Option<usize> {
     let overhead = if ipv6 {
         IPV6_UDP_HEADERS
     } else {
         IPV4_UDP_HEADERS
     };
     let fits = path_mtu.saturating_sub(overhead);
-    (fits > KCP_OVERHEAD && fits < current).then_some(fits)
+    (fits > KCP_OVERHEAD).then(|| fits.min(KCP_MTU_CEILING))
 }
 
 /// The kernel's current path MTU towards `peer`, as it knows it today.
@@ -2412,7 +2437,7 @@ mod path_mtu_tests {
         reason = "a test's failure path is a panic; the module-level allow keeps \
                   the assertions readable"
     )]
-    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, clamp_mtu};
+    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, KCP_MTU_CEILING, datagram_for_path};
     use crate::kcp::KCP_OVERHEAD;
     #[cfg(target_os = "linux")]
     use crate::transport::kcp::ipv6_mtu_of;
@@ -2424,57 +2449,59 @@ mod path_mtu_tests {
     /// against the value the adapter actually ships with).
     const KCP_MTU_DEF: usize = 1400;
 
-    /// The arithmetic that decides whether a datagram fits, per family. Every
-    /// case here is a boundary a wrong constant would move: the default
-    /// datagram on a clean path, the same datagram on a 1280 path (the cell
-    /// this exists for), a path exactly the size of the datagram, a jumbo
-    /// path, and a path too small to carry a KCP header at all.
+    /// The arithmetic that decides which datagram size a path deserves, per
+    /// family. Every case here is a boundary a wrong constant would move: a
+    /// clean path, the 1280 path (the cell this exists for), a path exactly the
+    /// size of the engine's default, a jumbo path (where the *ceiling* binds),
+    /// and a path too small to carry a KCP header at all.
     ///
     /// The IPv6 column is what the `IPV6_MTU` probe feeds: its overhead is
     /// the 40-byte IPv6 header plus UDP, not the IPv4 pair.
     #[test]
-    fn clamp_mtu_fits_the_path_per_family() {
+    fn datagram_for_path_follows_the_path_per_family() {
         /// One row: the datagram size the kernel's answer must produce for
-        /// each family, or `None` when there is nothing to do.
-        fn row(current: usize, path_mtu: usize, v4: Option<usize>, v6: Option<usize>) {
+        /// each family, or `None` when the path cannot carry one.
+        fn row(path_mtu: usize, v4: Option<usize>, v6: Option<usize>) {
             assert_eq!(
-                clamp_mtu(current, path_mtu, false),
+                datagram_for_path(path_mtu, false),
                 v4,
-                "IPv4: {current} on a {path_mtu} path"
+                "IPv4 on a {path_mtu} path"
             );
             assert_eq!(
-                clamp_mtu(current, path_mtu, true),
+                datagram_for_path(path_mtu, true),
                 v6,
-                "IPv6: {current} on a {path_mtu} path"
+                "IPv6 on a {path_mtu} path"
             );
         }
 
-        // A clean path: the default datagram fits (1400 + 28 / + 48 <= 65536).
-        row(KCP_MTU_DEF, 65536, None, None);
+        // A clean path: the ceiling binds, not the path (65536 - 28 > 8000).
+        row(65536, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
 
         // 1280: the IPv6 minimum every real path must carry. The datagram has
         // to shed the header the path adds, per family.
         row(
-            KCP_MTU_DEF,
             1280,
             Some(1280 - IPV4_UDP_HEADERS),
             Some(1280 - IPV6_UDP_HEADERS),
         );
 
-        // A path exactly the size of the current datagram still fragments
-        // once the IP header is added, so it must shrink.
-        row(KCP_MTU_DEF, KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
+        // A path exactly the size of the engine's default: one byte less than
+        // it, once the header the path adds is paid.
+        row(KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
+
+        // A jumbo path is followed up to the ceiling — this is the growth the
+        // measurement asked for. The ceiling binds for both families: a 9000-byte
+        // link would carry 8972 bytes of IPv4 payload, and the carrier stops at
+        // 8000 by design rather than at whatever a probe reports.
+        row(9000, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
 
         // Smaller than a KCP header can be: not our call to make, leave the
         // engine alone rather than produce an unsendable size.
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_OVERHEAD + 10, false), None);
-
-        // Never grows: a jumbo path leaves a session that already shrank.
-        row(1252, 9000, None, None);
+        assert_eq!(datagram_for_path(KCP_OVERHEAD + 10, false), None);
 
         // Both families' 1280 arithmetic against the shipped engine default:
         // the datagram below the IPv6 minimum a v6 session must not exceed.
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, 1280, true), Some(1232));
+        assert_eq!(datagram_for_path(1280, true), Some(1232));
     }
 
     /// The IPv6 probe must answer off the **kernel**, not off a constant: a
@@ -2611,11 +2638,16 @@ mod tests {
 
     #[tokio::test]
     async fn coalescing_merges_segments_into_blobs() {
-        // One 32 KiB write crosses as ~24 MTU-sized segments; the
-        // receiver's deliver loop must merge them into far fewer
-        // reader-channel messages (COALESCE_LIMIT_BYTES each) while the
-        // byte stream arrives intact.
-        const PAYLOAD: usize = 32 * 1024;
+        // One 256 KiB write crosses as a run of MTU-sized segments; the
+        // receiver's deliver loop must merge consecutive ones into fewer
+        // reader-channel messages (`COALESCE_LIMIT_BYTES` each) while the byte
+        // stream arrives intact.
+        //
+        // The payload is sized so the *segment* count is high whatever the
+        // session's segment size is: that size follows the path now, and on the
+        // loopback it is the ceiling (8000), so a 32 KiB write would be four
+        // segments and the merge factor would say nothing.
+        const PAYLOAD: usize = 256 * 1024;
         let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
         let before = super::kcp_stats();
@@ -2635,8 +2667,14 @@ mod tests {
         let after = super::kcp_stats();
         let segments = after.datagrams_in - before.datagrams_in;
         let blobs = after.blobs_out - before.blobs_out;
+        // Two segments per message at least. The merge *factor* is bounded by
+        // `COALESCE_LIMIT_BYTES / segment size`, and the segment size is the
+        // path's now — on the loopback it is the 8000-byte ceiling, so a blob
+        // holds two segments and the factor cannot be large. What did not
+        // regress is the reading that matters: bytes per channel message went
+        // *up* (16 KiB against the 8 KiB that 1400-byte segments merged into).
         assert!(
-            blobs * 3 < segments,
+            blobs * 2 <= segments,
             "coalescing did not merge: {blobs} blobs for {segments} segments"
         );
     }
@@ -2817,10 +2855,10 @@ mod tests {
             .expect("the v6 loopback must answer the path-MTU probe");
         let expected = loopback_mtu - IPV6_UDP_HEADERS;
         assert!(
-            expected < KCP_MTU,
+            expected < KCP_MTU_CEILING,
             "this test needs a shrunken v6 loopback to mean anything: lo reports an MTU of \
-             {loopback_mtu}, so the engine's {KCP_MTU}-byte default already fits. Run it \
-             inside a network namespace:\n  \
+             {loopback_mtu}, so the carrier's {KCP_MTU_CEILING}-byte ceiling is what binds. Run \
+             it inside a network namespace:\n  \
              sudo unshare -n bash -c 'ip link set lo up; ip link set lo mtu 1280; \
              ip -6 addr add ::1/128 dev lo 2>/dev/null; \
              cargo test --lib ipv6_path_mtu_clamps_on_a_shrunk_loopback -- --ignored --nocapture'"
@@ -2846,9 +2884,9 @@ mod tests {
         assert_eq!(
             client.datagram_bytes(),
             expected,
-            "the client session's datagram must shrink to the v6 path (loopback MTU \
-             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected}); {KCP_MTU} means \
-             the IPv6 probe did not run"
+            "the client session's datagram must follow the v6 path (loopback MTU \
+             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected}); the engine \
+             default still being in force means the IPv6 probe did not run"
         );
         assert_eq!(
             server.datagram_bytes(),

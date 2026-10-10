@@ -392,6 +392,24 @@ configuration surface is free to change — and this cycle changes it.
      deeper queue as the control for "is it syscalls or queueing". Success is a
      throughput gain the run's own A/A floor can see, at no cost to `rr-16`'s
      latency or the wire ratio.
+   - **The datagram size follows the path — landed, measured, kept.** The
+     carrier had been pinned at 1400 bytes with a shrink-only adaptation, so
+     every jumbo path paid the per-datagram cost 5.7× more often than it had
+     to. `Kcp::set_mtu` (was `shrink_mtu`) now follows the caller in both
+     directions, the adapter computes the size from the kernel's path-MTU
+     answer up to an 8 KiB ceiling (`datagram_for_path`), re-reads it once a
+     second, and every inbound buffer is sized from the *ceiling* rather than
+     from the engine's default — the spike's first jumbo attempt arrived as a
+     retransmit storm because `DGRAM_BUF` was 2048 against 8000-byte segments.
+     A/B against the previous build, two rounds an arm, `l3-kcp`, one bulk
+     flow: clean jumbo **2.170 → 3.026 Gbit/s (+39 %)** at −28 % CPU per Gbit
+     and a better wire ratio; `loss1` jumbo **0.407 → 1.713 (+4.2×)** at −40 %
+     CPU; `loss1` on a 1500-byte link **neutral** (0.406 → 0.434), which is the
+     safety property — the probe keeps a normal path at the size it carries;
+     `rr-16` on `loss1_rate100` +3.8 %. Still open on the same leg: the
+     multiplexed KCP arm's `dead link`, unchanged by this (both builds fail
+     `bulk-1` there), which is the ARQ's retransmit budget rather than its
+     datagram size.
    - **A rate-aware pacer for the KCP carrier** (above) — **attempted
      2026-10-10, measured, reverted.** The design: sample the peer's
      acknowledged progress every 20 ms, convert it to segments per second, and

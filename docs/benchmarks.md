@@ -693,7 +693,32 @@ for `l4-kcp`, against 286.2 ms for the control). Fast retransmit is worth
 something on a lossy path; it is the bulk path where the missing congestion
 control costs more than the recovery gains.
 
-**Two obvious fixes were tried, and both are wrong.** `nc = 0` (the engine's
+**The lever that did work: the datagram size follows the path.** Every number
+above was taken with the carrier pinned at 1400-byte datagrams — KCP's protocol
+default — because the adaptation that existed was shrink-only: it lowered the
+size for a small path and never raised it. The per-datagram cost that ceilings
+the carrier (a UDP send, a receive, a header, an acknowledgement and a loss
+event, all *per datagram*) is therefore paid 5.7× more often than a jumbo path
+requires. Letting the size follow the kernel's path-MTU answer, up to an 8 KiB
+ceiling, measures (two rounds an arm, the A/B twin beside it, `l3-kcp`, one bulk
+flow):
+
+| Condition | pinned at 1400 | follows the path | CPU per Gbit |
+|---|---|---|---|
+| clean, jumbo link (`--link-mtu 9000`) | 2.170 Gbit/s | **3.026 Gbit/s (+39 %)** | 2.556 → **1.829 s (−28 %)** |
+| `loss1`, jumbo link | 0.407 | **1.713 (+4.2×)** | 1.749 → **1.051 (−40 %)** |
+| `loss1`, 1500-byte link | 0.406 | 0.434 (neutral) | 1.734 → 1.743 |
+| `loss1_rate100`, jumbo link, `rr-16` | 337.8/s | 350.5/s (+3.8 %) | — |
+
+The third row is the safety property, and it is why this is done by following
+the probe rather than by raising a constant: on a 1500-byte path the datagram
+stays at what that path carries, so the change is neutral there, while the wire
+ratio improves in every jumbo row (1.1483 → 1.0892 on clean). What it does
+*not* fix is the multiplexed arm's dead link on a rate-limited lossy leg: with
+the same build it still fails `bulk-1` there, both rounds — that is the ARQ's
+retransmit budget, not its datagram size.
+
+**The obvious fixes were tried, and they are wrong.** `nc = 0` (the engine's
 own congestion control) as an A/B against the shipped build on `loss1_rate100`
 measured 0.002 Gbit/s against 0.043 on bulk and 256/s against 344/s on `rr-16`:
 its window collapses on a lossy path and does not recover. Capping the send

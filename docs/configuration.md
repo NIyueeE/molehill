@@ -339,8 +339,12 @@ handshake) and cuts FD usage under many concurrent visitors.
   conflict (remember to open both protocols in the firewall/NAT). Fixed KCP
   parameters (recorded
   for comparability): stream mode, nodelay 10 ms interval, fast-resend 2,
-  congestion control off, snd window 2048 / rcv window 4096 segments, MTU
-  1400, 32 MiB socket buffers. Keepalive: a 2 s adapter-level PING/PONG
+  congestion control off, snd window 2048 / rcv window 4096 segments,
+  **datagram size follows the path** (1400 bytes — what any path carries —
+  up to 8 KiB where the path's own MTU allows it; the kernel's path-MTU
+  answer is re-read once a second, so a session on a 1500-byte path never
+  sends a datagram that would have to be fragmented), 32 MiB socket
+  buffers. Keepalive: a 2 s adapter-level PING/PONG
   keeps idle tunnels warm (NAT mappings) and probes the path RTT; a
   vanished peer is only confirmed on the next write (dead-link after ~20
   RTOs).
