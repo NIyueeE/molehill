@@ -468,6 +468,16 @@ configuration surface is free to change — and this cycle changes it.
      Reproduce with `sudo -n uv run benches/scripts/bench/bench.py run --profile
      smoke --arms l3-kcp --scenarios bulk-1,bulk-n --condition clean
      --link-mtu 9000 --tun-mtu 8000 --rounds 1 --warmup-rounds 0`.
+   - **The whole-workload sweep (`dev`, jumbo path, A/A twin) says where this
+     stands**: level with the TCP carrier on one bulk flow (7.136 against 7.554
+     and a twin at 7.496) and on churn (6 779 against 7 139, twin 7 209),
+     **19 % ahead on eight flows** (7.418 against 6.023, twin 6.243), **behind on
+     short round trips** (rr-1 10 177/s against 14 167/s, rr-16 30 264/s against
+     32 984/s, p99 equal) and **about twice the inner-UDP loss** at every rung of
+     the ladder (1.05 % against 0.60 % at 2 Gbit/s). The UDP loss is the one to
+     chase next if quality matters more than throughput: it is the hub's
+     endpoint channel dropping when the carrier's writer is slower than the
+     ingress, and the loss is unrecoverable for a UDP flow.
    - **The long-haul gap is the next real target, and its mechanism is now
      measured.** `rtt100` (100 ms each way, no configured loss): TCP carrier
      0.461 Gbit/s, `l3-kcp` 0.178 — the widest gap left in the model. The

@@ -685,6 +685,30 @@ path the ARQ exhausts its 20-retransmit budget and declares the peer dead. That
 is a congestion collapse, self-inflicted, and it is the thing to fix before the
 carrier is worth choosing for a lossy path.
 
+**Where the carrier stands across the whole workload.** The `dev` profile — every
+scenario, four measured rounds plus a warm-up, one condition, the A/A twin in the
+run — on a jumbo path, with the shipped build:
+
+| Scenario | `l3` (TCP carrier) | `l3-kcp` | `l3~aa` (the twin) |
+|---|---|---|---|
+| `bulk-1` (1 flow) | 7.554 Gbit/s | 7.136 | 7.496 |
+| `bulk-n` (8 flows) | 6.023 Gbit/s | **7.418** | 6.243 |
+| `bulk-pair` | 13.644 Gbit/s | 12.357 | 13.827 |
+| `rr-1` | 14 167/s @0.086 ms | 10 177/s @0.133 ms | 16 139/s @0.079 ms |
+| `rr-16` | 32 984/s @1.317 ms | 30 264/s @1.312 ms | 32 994/s @1.309 ms |
+| `churn-16` | 7 139/s @2.374 ms | 6 779/s @2.417 ms | 7 209/s @2.291 ms |
+| `udp-pace` (loss) | 0.802 % | 0.835 % | 0.790 % |
+| `udp-ladder` @2 Gbit/s (loss) | 0.60 % | 1.05 % | 0.60 % |
+
+Read against the twin's spread, that is: **level on one bulk flow and on churn,
+19 % ahead on eight flows, behind on short round trips** (`rr-1` −28 %, `rr-16`
+−8 %, at equal p99), and **roughly twice the inner-UDP loss** at every offered
+rate on the ladder (0.60 → 1.05 % at 2 Gbit/s, 0.55 → 1.04 % at 5 Gbit/s). The
+last one is the quality gap to keep in mind rather than a throughput one: UDP
+cannot recover what the carrier drops, and what drops it is the same hub that
+serves the TCP carrier — the difference is how fast the carrier's writer drains
+the endpoint's channel behind it.
+
 **The long-haul cell is the one that is still behind, and it is the path's
 queues, not the carrier's arithmetic.** On `rtt100` (100 ms each way, no loss
 configured) the TCP carrier moves 0.461 Gbit/s and `l3-kcp` 0.178 — 2.6× behind,
