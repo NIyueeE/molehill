@@ -392,8 +392,23 @@ configuration surface is free to change — and this cycle changes it.
      deeper queue as the control for "is it syscalls or queueing". Success is a
      throughput gain the run's own A/A floor can see, at no cost to `rr-16`'s
      latency or the wire ratio.
-   - **A rate-aware pacer for the KCP carrier** (above), gated on the
-     `loss1_rate100` A/B.
+   - **A rate-aware pacer for the KCP carrier** (above) — **attempted
+     2026-10-10, measured, reverted.** The design: sample the peer's
+     acknowledged progress every 20 ms, convert it to segments per second, and
+     set the send window to `rate × srtt × 1.5`, never below 64 segments. Its
+     A/B against the shipped build, same arm, two rounds each:
+     clean **neutral** (2.174 against 2.188 Gbit/s), `loss1_rate100` **slightly
+     ahead** (0.059 against 0.053 Gbit/s, 9 % fewer wire bytes), and `loss1`
+     **twelve times worse** (0.033 against 0.411). The reason is the signal, not
+     the intent: `snd_una` measures *contiguous* acknowledgement, so it stalls
+     on every gap and the window shrinks exactly when loss needs the opposite —
+     and a window too small starves fast retransmit, which is driven by the acks
+     of *later* segments; with nothing in flight the sender waits out a 30 ms+
+     RTO instead. Two things follow for the next attempt: the rate signal must
+     come from acks (or from `KCP_SACKS_SENT`/retransmit counters) rather than
+     from contiguous progress, and the window needs a loss-aware reserve with a
+     hard floor under fast retransmit's needs. The shipped constant window stays
+     until that exists.
    - **The churn scenario reports zeros, and only for L4 arms.** Three runs on
      2026-10-10 (`churn-16`, 2/5/10 rounds) produced four rounds with no samples
      at all and three rounds where the readiness probe could not reach the
