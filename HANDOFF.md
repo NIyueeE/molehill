@@ -394,6 +394,19 @@ configuration surface is free to change — and this cycle changes it.
      latency or the wire ratio.
    - **A rate-aware pacer for the KCP carrier** (above), gated on the
      `loss1_rate100` A/B.
+   - **The churn scenario reports zeros, and only for L4 arms.** Three runs on
+     2026-10-10 (`churn-16`, 2/5/10 rounds) produced four rounds with no samples
+     at all and three rounds where the readiness probe could not reach the
+     exposed port for its full 30 s — every one of them on an L4 arm or its
+     twin, never on L3, and the probe's own log for a zero round *does* contain
+     latency samples. Two candidate explanations, neither established: the
+     architecture (a fresh visitor connection costs L4 a data channel and a
+     pair of ephemeral ports that L3 does not spend) or the probe (which reports
+     a rate without saying why connections failed). Until the probe records the
+     failure reason, no churn number may be quoted — including the tempting
+     reading that L3 beat L4 in both runs' means (6366/7131 against 5638/4932).
+     The instrument is the thing to fix first; if the architecture is the cause,
+     it is a finding worth having.
    - **What the multiplexer's 28 % actually is.** The earlier per-cell model
      measured 6 % of wire and 33 % of CPU per packet for `direct` over
      `multiplex`; this model measures 28 % of throughput and 68 % of CPU per

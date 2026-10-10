@@ -501,6 +501,18 @@ must act on:
 
 Stated so a reader does not ask a chart for something it never measured:
 
+- **A churn comparison, until its instrument is fixed.** `churn-16` opens a
+  fresh connection per request and the reading is not yet trustworthy: in three
+  runs on 2026-10-10 the L4 arms produced every degenerate cell (four rounds
+  reporting no samples at all, three rounds where the readiness probe could not
+  reach the exposed port for its full 30 s), and never the L3 arms. Whether that
+  is the architecture (per-connection state, or the ephemeral ports one visitor
+  connection costs L4 and not L3) or the harness (a probe that reports zero
+  without saying why) is exactly what has to be established before the scenario
+  can order two architectures — the probe must record *why* a connection failed
+  before its rate is quoted. The pattern is recorded in HANDOFF.md as an open
+  thread, not as a result.
+
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
   two runs on one machine whose probes drifted beyond tolerance are refused
