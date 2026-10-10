@@ -63,6 +63,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([HANDOFF.md](HANDOFF.md), "The mux×1 gap, measured before touching it"). The
   wire protocol is unchanged.
 
+- **A claim's flow placement is remembered, so a lane change cannot reorder a
+  flow.** The hub used to route every packet by `hash % width`, which meant a
+  lane *joining* re-placed every established flow — the one event that could
+  deliver a flow's packets out of order. Placement is now a table: a flow is
+  placed once, on its first packet, into the least-loaded live lane (ties broken
+  by the same one-hash-of-the-five-tuple rule, which is what lets both
+  directions, and both ends of a claim, agree without anything on the wire), and
+  its entry routes every later packet. Two consequences are observable: a new
+  flow never lands in an empty slot, whose packets would be dropped while a live
+  lane could carry them, and an entry is forgotten only after 60 s of silence in
+  either direction — safe, because a flow that quiet has nothing in flight left
+  to reorder. The table is bounded; a flow past the bound is placed by the hash
+  alone, which is stable for as long as the set's width is.
+  `MOLEHILL_L3_STATS=1` prints each lane's `flows` count beside `live`,
+  `forwarded` and `no_channel`, which is how an idle lane is told from a busy
+  one.
+
 - **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`, established at
   service start.** The client's data plane used to run an *elastic*
   per-carrier pool: it started cold, grew on load, for a stripe group and to a

@@ -217,19 +217,28 @@ How a claim's lane set is opened, held and repaired:
   held while it waits. A channel that arrives after a lane ended is paced:
   250 ms (`TRANSPARENT_REPLACE_BACKOFF`) before the start command is written, so
   a peer that cannot serve it is not polled in a tight loop.
-- Which lane a packet rides is decided **per flow**, by one hash of its
-  five-tuple (`src/transparent/flow.rs`): the protocol, then the two endpoints
-  sorted (address bytes, then port), so both directions of a flow — and both
-  ends of a claim, which see opposite ones — place it on the same lane. A set
-  of one has one answer; otherwise the slot is `hash % width`. Per *flow*, never
-  per packet: each lane is one ordered carrier, so a flow that stays on one
-  lane arrives in the order its sender wrote it, while a flow dealt out packet
-  by packet would be interleaved across carriers that drain at their own speeds
-  and injected — by the far end, which injects what it reads — out of order. A
-  flow whose lane dies is **not moved**: the dead lane's slot stays in the
-  set, so its flows are dropped (and counted `no_channel` on that slot) until the
-  replacement joins it. Moving them would reorder them against what the dead
-  lane had already delivered.
+- Which lane a packet rides is decided **per flow**, and the decision is kept:
+  a flow is placed once, on its first packet, into the least-loaded live slot,
+  and the hub's placement table (`ClaimSlots::route`) is what routes every
+  later packet of that flow. The hash (`src/transparent/flow.rs`, over the
+  protocol and the two endpoints sorted — address bytes, then port) is the
+  *tie-break* between equally loaded lanes, which is what lets both directions
+  of a flow — and both ends of a claim, which see opposite ones — agree without
+  a word on the wire. Per *flow*, never per packet: each lane is one ordered
+  carrier, so a flow that stays on one lane arrives in the order its sender
+  wrote it, while a flow dealt out packet by packet would be interleaved across
+  carriers that drain at their own speeds and injected — by the far end, which
+  injects what it reads — out of order. A flow whose lane dies is **not moved**:
+  the dead lane's slot stays in the set, so its flows are dropped (and counted
+  `no_channel` on that slot) until the replacement joins it. Moving them would
+  reorder them against what the dead lane had already delivered.
+  The table is what makes a lane change safe: a lane joining, or one being lent
+  to another claim, cannot move a flow that is already talking, and a *new* flow
+  never lands in an empty slot. An entry is forgotten after 60 s of silence in
+  either direction (`FLOW_IDLE_EVICTION`, the same number as the UDP peer
+  mapping), which is safe because a flow that quiet has nothing in flight to
+  reorder; past `MAX_TRACKED_FLOWS` a new flow is placed by the hash alone, so a
+  visitor cannot grow the table without bound.
 
 **Which end of a packet the claim is.** Both ends run the same hub
 (`src/transparent/hub.rs`): one reader per TUN device, a **lane set** per

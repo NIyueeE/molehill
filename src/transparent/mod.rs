@@ -174,8 +174,10 @@ impl<V> EndpointTable<V> {
     /// The value registered for exactly this endpoint, if it is still
     /// registered.
     ///
-    /// The packet path reads the claim's width through this: a packet's member
-    /// is a function of the flow and the width of the set it belongs to.
+    /// Test-only since placement became a table: the packet path edits a
+    /// claim's slot in place ([`Self::lookup_endpoint_mut`]), and the reader
+    /// that is left is the one the routing tests assert with.
+    #[cfg(test)]
     pub fn lookup_endpoint(&self, endpoint: &Endpoint) -> Option<&V> {
         self.entries.get(&(endpoint.ip, endpoint.port))
     }
