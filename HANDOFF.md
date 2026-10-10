@@ -692,6 +692,21 @@ Still open from this work (next steps, in the order agreed):
      dropped and counted `no_channel` on that slot until the replacement joins,
      the survivors untouched — are unit- and loopback-tested only; the model
      cannot yet price a member dying during a measured cell.
+   - **Member kinds, measured (S4).** `l3-raw4` (four *direct* members, one
+     connection each) against `l3-mux4` (four streams of a four-tunnel pool),
+     same run, dev profile, jumbo path, A/A twin: `bulk-n` **15.013 / 16.196**
+     against 13.187 Gbit/s, at **0.516 / 0.502 against 0.658 s/Gbit**; `bulk-1`
+     7.316 / 7.189 against 6.640 at **0.337 / 0.321 against 0.561 s/Gbit**;
+     `rr-16` +2-3 %, `churn-16` indistinguishable (11.9 % floor). `fds_peak` is
+     identical (69) — the mux arm holds four *tunnels* per claim and the raw arm
+     four *connections*, so the count matches when `members == tunnels` — and
+     RSS is **lower** for raw (19.2 against 26.15 MiB at `bulk-n`, floor 9.17 %)
+     because there is no yamux session state per member. So a raw member is the
+     cheaper carrier per byte whenever the claim's member count is what the
+     deployment is paying for; the multiplexed pool remains what lets *unbounded*
+     per-visitor channels ride a bounded count of connections (the L4 path),
+     which is not a claim's shape. The cost stands as recorded below: nothing
+     bounds a claim's concurrent direct members server-side.
    - **The flow hash needed a finalizer, and that was found by a run, not by
      review.** A bare FNV-1a `% width` aliases with the *low* bits of the ports
      (its last step is a multiplication by a prime, which preserves their
