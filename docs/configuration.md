@@ -166,7 +166,7 @@ flowchart TD
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
 | cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move, then the pool is warm again up to `max_tunnels` |
-| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model) |
+| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic) |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -227,7 +227,7 @@ transport = { type = "plain" } # Optional. Per-service transport override: `type
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model)
+udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic)
 udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
@@ -462,7 +462,7 @@ per-carrier `max_tunnels` caps — with **one different default**: the mode is
 therefore buys it nothing unless `shared_pool` is on. Measured on one host and
 workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
 carried 65 % more round trips per second than `multiplex`
-([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model)).
+([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 A client that serves many claims from one pool writes `default_mode = "multiplex"`
 and `shared_pool = true`.
 

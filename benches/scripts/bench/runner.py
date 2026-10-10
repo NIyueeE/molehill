@@ -42,9 +42,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import analysis
+import hostinfo
 import instruments as inst
-import lib
 import model
+import peers
 import topology
 import workloads
 
@@ -130,11 +131,19 @@ def method_record(
         "warmup_rounds": profile["warmup_rounds"],
         "tun_mtu": args.tun_mtu,
         "link_mtu": args.link_mtu,
-        "shape": args.shape,
-        "shape_leg": args.shape_leg,
+        "condition": args.condition,
+        "condition_leg": args.condition_leg,
+        "slo": {
+            "rtt_p99_ms": model.SLO_RTT_P99_MS,
+            "error_rate_pct": model.SLO_ERROR_RATE_PCT,
+        },
         "instruments": {
             "socket_poll_s": inst.SOCKET_POLL_S,
             "proc_poll_s": inst.PROC_POLL_S,
+            "drift_poll_s": inst.DRIFT_POLL_S,
+            "wedge_silence_s": inst.WEDGE_SILENCE_S,
+            "drain_tolerance_b": topology.DRAIN_TOLERANCE_B,
+            "drain_quiet_polls": topology.DRAIN_QUIET_POLLS,
             "clk_tck": topology.CLK_TCK,
             "iperf_omit_default": 2,
         },
@@ -161,7 +170,7 @@ def resolve_scenarios(args, profile: dict) -> list:
     return [model.SCENARIOS[s] for s in wanted]
 
 
-def resolve_arms(args) -> list:
+def resolve_arms(args, profile: dict | None = None) -> list:
     """The arms a run measures: catalog names, explicit specs, or the default.
 
     `--arms` names the catalog; `--arm` states an arm as data, so a knob the
@@ -173,6 +182,8 @@ def resolve_arms(args) -> list:
     elif getattr(args, "arms", ""):
         names = [n.strip() for n in args.arms.split(",") if n.strip()]
         arms = model.arms_from_names(names, args.binary)
+    elif profile and model.profile_arms(profile):
+        arms = model.arms_from_names(model.profile_arms(profile), args.binary)
     else:
         arms = model.default_arms()
     arms = [a if a.binary else _with_binary(a, args.binary) for a in arms]
@@ -325,7 +336,9 @@ class ArmTurn:
         arm has no daemons at all.
         """
         self.camp.topo.set_txqueuelen(self.arm.txqueuelen)
-        if self.arm.is_tool:
+        if self.arm.kind == "peer":
+            self._start_peer()
+        elif self.arm.is_tool:
             cfg = topology.service_config(self.arm, self.camp.work)
             self.config = {
                 "server": cfg["server"].read_text(),
@@ -349,6 +362,42 @@ class ArmTurn:
         )
         return self.pids(), ready
 
+    def _start_peer(self) -> None:
+        """Start a reference tool from its own adapter (`peers.py`).
+
+        The adapter owns the tool's configuration language; the model owns the
+        topology, the ports and the measurement. That split is what lets a peer
+        be an arm like any other.
+        """
+        adapter = _peer_adapter(self.arm.tool)
+        ports = {
+            "control": topology.CONTROL_PORT,
+            "echo": topology.ECHO_PORT,
+            "iperf": topology.IPERF_PORT,
+            "iperf2": topology.IPERF2_PORT,
+            "udp": topology.UDP_PORT,
+            "udp_sink": topology.IPERF_UDP_PORT,
+        }
+        for role, argv in adapter.write(self.dir, ports).items():
+            self._spawn(role, argv)
+
+    def restart(self) -> tuple:
+        """Stop the arm and start it again, timing the visitor's first success.
+
+        The reconnect scenario's instrument: what a visitor waits after a
+        restart is not "the process is up" but "a connection is answered", so
+        the clock runs to `wait_target`'s first success.
+        """
+        self.stop(grace=0.0)
+        started = time.perf_counter()
+        self.procs.clear()
+        self.logs.clear()
+        _, ready = self.start()
+        elapsed = round(time.perf_counter() - started, 4)
+        if not ready:
+            return None, f"not ready within {elapsed}s"
+        return elapsed, ""
+
     def _spawn(self, role: str, argv: list) -> None:
         path = self.dir / f"{role}.log"
         fh = path.open("ab")
@@ -366,7 +415,7 @@ class ArmTurn:
                 out[role] = "\n".join(text)[:2000]
         return out
 
-    def stop(self) -> None:
+    def stop(self, grace: float = 0.3) -> None:
         for p in self.procs.values():
             with contextlib.suppress(OSError):
                 p.kill()
@@ -374,8 +423,10 @@ class ArmTurn:
             with contextlib.suppress(Exception):
                 p.wait(timeout=5)
         # A killed daemon can hold a port briefly; the next arm must be able to
-        # bind it, and an EADDRINUSE would look like a tool failure.
-        time.sleep(0.3)
+        # bind it, and an EADDRINUSE would look like a tool failure. A restart
+        # that is being timed passes `grace=0`: the wait is exactly what it
+        # measures.
+        time.sleep(grace)
 
 
 def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
@@ -413,6 +464,9 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
                 arm=arm,
                 probe_startup_s=camp.results["meta"]["probe_startup_s"],
                 peers_of=_cell_peers(camp.backend),
+                leg=camp.args.condition_leg,
+                condition=model.CONDITIONS[camp.args.condition],
+                restart_arm=turn.restart,
             )
             t0 = time.perf_counter()
             try:
@@ -444,6 +498,15 @@ def _headline(cells: list, scenario: model.Scenario) -> str:
         label = f"{cell.cell}: " if cell.cell else ""
         parts.append(f"{label}{shown}{suffix}")
     return "; ".join(parts)
+
+
+def _peer_adapter(tool: str):
+    """The reference tool's adapter, or a refusal naming the tools that exist."""
+    if tool not in peers.PEERS:
+        raise PreflightError(
+            f"no adapter for peer tool {tool!r}; known: {', '.join(peers.PEERS)}"
+        )
+    return peers.PEERS[tool]
 
 
 def _cell_peers(backend):
@@ -558,7 +621,7 @@ def _prepare(args) -> Campaign:
     profile_name = args.profile
     profile = model.profile_of(profile_name, args)
     aa = profile.get("aa", False) if args.aa is None else args.aa
-    arms = with_aa(resolve_arms(args), aa)
+    arms = with_aa(resolve_arms(args, profile), aa)
     scenarios = resolve_scenarios(args, profile)
     pre = preflight(
         args.binary, need_iperf=any(s.kind != model.Kind.RR for s in scenarios)
@@ -588,7 +651,7 @@ def _prepare(args) -> Campaign:
     _log(f"bench: results {out}")
     _log("bench: host probes (the machine's own baseline)...")
     provenance = {
-        "revision": lib.git_revision(exclude=out),
+        "revision": hostinfo.git_revision(exclude=out),
         "host": inst.host_provenance(with_calibration=not args.no_host_probes),
         "binaries": _binaries(arms),
         "engine_hash": method["engine_hash"],
@@ -602,7 +665,7 @@ def _open_topology(camp: Campaign, args) -> topology.Topology:
     topo = topology.Topology(tun_mtu=args.tun_mtu, link_mtu=args.link_mtu)
     t0 = time.perf_counter()
     topo.up()
-    topo.set_netem(args.shape_leg, topology.SHAPES[args.shape])
+    topo.set_condition(args.condition_leg, model.CONDITIONS[args.condition])
     camp.topo = topo
     camp.backend = workloads.Backend(topo, camp.work)
     camp.backend.start()
@@ -612,7 +675,7 @@ def _open_topology(camp: Campaign, args) -> topology.Topology:
         raise PreflightError("the control path never answered")
     _log(
         f"bench: topology up ({time.perf_counter() - t0:.1f}s), "
-        f"shape {args.shape} on the {args.shape_leg} leg"
+        f"condition {args.condition} on the {args.condition_leg} leg"
     )
     return topo
 

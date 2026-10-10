@@ -221,7 +221,7 @@ Both recipes start from the same two facts:
   packet, so the MTU decides how many packets a given byte rate costs: the same
   bulk transfer at an 8000-byte TUN MTU (with a link MTU to match) measured
   1.8× the throughput of 1400-byte packets at half the CPU per byte
-  ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model)).
+  ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
   The recipes below use 1400, which fits any path that carries the tunnel; raise
   it to what the path between the two ends actually allows.
 

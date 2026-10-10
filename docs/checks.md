@@ -114,7 +114,7 @@ commit; nothing here is a heavy gate.
 |---|-------|---------|
 | 14 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
 | 15 | exactly one dated `## [x.y.z] - YYYY-MM-DD` section in `CHANGELOG.md`, with prose in it and an empty `## [Unreleased]` | release notes single source |
-| 16 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
+| 16 | `benches/records/results-bench-vX.Y.Z.json` + `assets/bench-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
 | 17 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
 | 18 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 
@@ -138,14 +138,13 @@ serial suite), `just test-fast` (lib tests + the core integration subset,
 ~1 min), `just powerset` (feature powerset via cargo-hack, CI's `features`
 job), `just py-lint` (both ruff gates, also in the pre-commit gate),
 `just bench-selfcheck` (the performance model's own checks, also in the
-pre-commit gate), `just bench-deps` (iperf3 + tc/netem on the benchmark host),
-`just soak` (the tool under test through the scripted workload and stage
-schedule), `just soak-peers` (fetch the peer tools' latest release binaries),
-`just soak-plot` (charts + markdown tables from the latest results file),
-`just soak-check` (the gate: latest results vs the previous release's file;
-`--screen <file>` for a development A/B verdict), `just container` (scratch
-image), `just interop` (the interop matrix, below). The performance model's
-own commands are in the section below.
+pre-commit gate), `just bench-deps` (iperf3 + iproute2 on the benchmark host),
+`just bench-peers` (fetch the peer tools' latest release binaries),
+`just bench-plot` (charts + markdown tables from a results file),
+`just bench-gate` (the release gate: coverage, the endpoint invariant, the SLO,
+drift, wedges, the ramp, and the regression half against a baseline),
+`just container` (scratch image), `just interop` (the interop matrix, below).
+The performance model's own commands are in the section below.
 
 ## Outside the chain: the interop matrix (`just interop`)
 
@@ -183,7 +182,7 @@ visitor's real address.
 It also measures: each arm is bracketed by `/proc/net/dev` samples inside the
 namespaces, and `benches/scripts/l3/wire_report.py` turns them into carried
 packet sizes and the ceiling a header compressor could reach. The method and the
-numbers it produced belong to [benchmarks.md](benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model);
+numbers it produced belong to [benchmarks.md](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness);
 its verdict was that compression is not worth building.
 
 The same run also covers the server's own switch, negatively: it restarts the
@@ -201,11 +200,12 @@ itself; the harness is the operator.
 
 ### The performance model (`just bench`)
 
-`benches/scripts/bench/` is the repository's measurement standard: a declared
-metric registry, one topology for every arm (L4, L3 and a control with no tool
-in the path), scenarios that each state the claim they support, and verdicts
-that clear the run's own measured noise floor before they claim anything. Its
-method is owned by
+`benches/scripts/bench/` is the repository's measurement standard and its only
+runner: a declared metric registry, one topology for every arm (the product's
+configurations, the reference tools and a control with no tool in the path),
+scenarios that each state the claim they support, conditions and timelines that
+change the path in place, and verdicts that clear the run's own measured noise
+floor before they claim anything. Its method is owned by
 [benchmarks.md](benchmarks.md#the-bench-model-the-measurement-standard).
 
 Two of its commands are in the check chain, and the rest are measurements:
@@ -213,16 +213,19 @@ Two of its commands are in the check chain, and the rest are measurements:
 | Command | In the chain? | What it is |
 |---|---|---|
 | `just bench-selfcheck` | **yes** — a fast gate in `githooks/pre-commit` | the model's own checks: the metric registry is consistent, the verdict rules do what they say, comparability refuses what it must, the probes compile. No root, no topology, about a second. |
-| `just bench` | no | a campaign: root-only (three network namespaces), minutes, results outside the tree (`--profile smoke` is the fast loop) |
-| `just bench-doctor` | no | what this host can measure, and what it cannot |
-| `just bench-report` / `just bench-compare` | no | render a stored results file; A/B two of them, or refuse |
+| `just bench` | no | a campaign (`--profile smoke\|dev\|full\|stage\|soak\|screen\|sweep`): root-only (three network namespaces), minutes to hours, results outside the tree unless `--out` says otherwise |
+| `just bench-doctor` | no | what this host can measure, and what it cannot (root, TUN, iperf3, the peer binaries) |
+| `just bench-list` | no | the registry: every metric, condition, timeline, arm and profile |
+| `just bench-report` / `just bench-compare` / `just bench-gate` | no | render a stored run; A/B two of them (or refuse); gate a release run |
+| `just bench-plot` | no | the charts and markdown tables of a results file |
+| `just bench-peers` | no | fetch the peer tools' release binaries into `~/tmp/bench-peers` |
 
-The model asserts nothing about the tool and gates nothing: it produces numbers
-and verdicts, and `docs/release.md`'s ritual is what decides whether they ship.
-Keeping its self-check in the fast gate is what keeps the *rules* enforced even
-when nobody is measuring — a metric definition that contradicts the code, or a
-comparability rule that stopped refusing, fails a commit rather than a
-campaign.
+The model asserts nothing about the tool and gates nothing in CI: it produces
+numbers and verdicts, the gate decides whether a *release* run may be published,
+and `docs/release.md` owns the ritual. Keeping its self-check in the fast gate
+is what keeps the *rules* enforced even when nobody is measuring — a metric
+definition that contradicts the code, or a comparability rule that stopped
+refusing, fails a commit rather than a campaign.
 
 ## When a gate blocks you
 

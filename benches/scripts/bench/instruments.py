@@ -20,6 +20,7 @@ Two rules the code enforces rather than documents:
 from __future__ import annotations
 
 import contextlib
+import itertools
 import os
 import platform
 import subprocess
@@ -27,7 +28,7 @@ import threading
 import time
 from pathlib import Path
 
-import lib
+import hostinfo
 import topology
 
 #: The `/proc/<pid>/io` fields this model reads. `rchar`/`wchar` count bytes at
@@ -41,6 +42,15 @@ IO_FIELDS = ("rchar", "wchar", "syscr", "syscw")
 #: "peak" means.
 SOCKET_POLL_S = 0.15
 PROC_POLL_S = 0.20
+#: The drift sampler's cadence, and the two floors below which a series cannot
+#: show a slope at all (fewer points, or a span shorter than this).
+DRIFT_POLL_S = 2.0
+MIN_SLOPE_POINTS = 5
+MIN_SLOPE_SPAN_S = 60.0
+#: An interactive silence longer than this is a wedge, not a slow answer, and
+#: the fewest attempts that can show one.
+WEDGE_SILENCE_S = 5.0
+MIN_WEDGE_POINTS = 2
 #: The kernel's page size, for `statm`.
 PAGE_KIB = os.sysconf("SC_PAGE_SIZE") // 1024
 
@@ -296,6 +306,87 @@ def counter_metrics(sample: dict, peaks: dict) -> dict:
     }
 
 
+class DriftSampler:
+    """A slow series of the arm's footprint, for the drift axis.
+
+    A leak is a *slope over time*, not a level: an RSS line that is high but
+    flat is not a leak, and one that climbs slowly is. The sampler keeps the
+    series rather than a peak (that is `ProcWatch`'s job) so the analysis can
+    fit it, and it samples slowly because the question is minutes long.
+    """
+
+    def __init__(self, pids_of, interval: float = 2.0):
+        self.pids_of, self.interval = pids_of, interval
+        self.points: list = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            mem = proc_mem(self.pids_of())
+            if mem:
+                self.points.append(
+                    {
+                        "t": round(time.time(), 3),
+                        "rss_kib": sum(r.get("rss_kib", 0) for r in mem.values()),
+                        "fds": sum(r.get("fds", 0) for r in mem.values()),
+                        "threads": sum(r.get("threads", 0) for r in mem.values()),
+                    }
+                )
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=3)
+
+
+def slope_per_min(points: list, key: str):
+    """Least-squares slope of one sampled key, per minute.
+
+    `None` (not zero) when there is too little to fit: a flat line and no line
+    are different findings, and a zero slope from two points would read as
+    "measured, no leak".
+    """
+    if len(points) < MIN_SLOPE_POINTS:
+        return None
+    xs = [p["t"] for p in points]
+    ys = [p.get(key, 0) for p in points]
+    span = max(xs) - min(xs)
+    if span < MIN_SLOPE_SPAN_S:
+        return None
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if not denom:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    return round(slope / denom * 60.0, 4)
+
+
+def wedges(points: list, silence_s: float = WEDGE_SILENCE_S) -> dict:
+    """Interactive silences longer than `silence_s`: a wedge, with its length.
+
+    An average cannot show a tool that stops answering for ten seconds, and a
+    wedge is the failure mode the SLO is stated for; so it is its own metric.
+    The gaps are measured between consecutive attempts, so a stream that simply
+    stopped producing lines is a wedge too - `None` (not zero) when there are
+    fewer than two attempts to measure a gap between.
+    """
+    if len(points) < MIN_WEDGE_POINTS:
+        return {"count": None, "max_s": None}
+    times = [p["t"] for p in points]
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    silent = [g for g in gaps if g > silence_s]
+    return {
+        "count": len(silent),
+        "max_s": round(max(gaps), 3) if gaps else None,
+    }
+
+
 def binary_provenance(binary: str) -> dict:
     """The build under test: path, hash, size, mtime and its own version line.
 
@@ -304,7 +395,7 @@ def binary_provenance(binary: str) -> dict:
     exists. The version string comes from the binary itself, not from
     `Cargo.toml`.
     """
-    info = lib.binary_fingerprint(binary)
+    info = hostinfo.binary_fingerprint(binary)
     version = ""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         r = subprocess.run(
@@ -333,10 +424,10 @@ def host_provenance(with_calibration: bool = True) -> dict:
     every run, and two runs whose probes disagree are refused (see
     `analysis.comparability`).
     """
-    info = {"identity": lib.host_identity(), "kernel": platform.release()}
+    info = {"identity": hostinfo.host_identity(), "kernel": platform.release()}
     if with_calibration:
-        info["calibration"] = lib.host_calibration()
-        info["loopback"] = lib.host_loopback()
+        info["calibration"] = hostinfo.host_calibration()
+        info["loopback"] = hostinfo.host_loopback()
     return info
 
 

@@ -165,7 +165,7 @@ drained, the first packet of a burst waits for nothing — the batching only
 collects what was already queued. A claim's channels run in `direct` mode by
 default for the same reason: it has exactly one channel, so a multiplexer's
 frame on every packet buys it nothing (see
-[Benchmarks](benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model)).
+[Benchmarks](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
 The data path is **one channel per claimed endpoint**:
 

@@ -73,22 +73,13 @@ TCP_MIB_COLUMNS = 13
 #: Ticks per second of the CPU counters, the denominator of every cost figure.
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 
-#: A path condition per campaign, applied to both ends of one leg before the
-#: first arm runs — every arm then shares it, which is what keeps the arms
-#: comparable within a run. The vocabulary is the soak model's, the mechanism is
-#: not (a netem qdisc on a namespace interface, not an HTB class on `lo`).
-SHAPES: dict[str, list] = {
-    "clean": [],
-    "rtt100": ["delay", "100ms"],
-    "rtt20": ["delay", "20ms"],
-    "loss1": ["delay", "10ms", "loss", "1%"],
-    "loss5": ["delay", "100ms", "loss", "5%"],
-    "rate100": ["rate", "100mbit", "delay", "20ms", "limit", "2000"],
-    "rate20": ["rate", "20mbit", "delay", "40ms", "limit", "2000"],
-    "jitter": ["delay", "20ms", "10ms"],
-}
-#: The legs a shape can land on, as `(namespace, device)` pairs whose egress is
-#: shaped. Both ends of a leg are shaped because netem is egress-only.
+#: The legs a condition can land on, as `(namespace, device)` pairs whose egress
+#: is shaped. Both ends of a leg are shaped because netem is egress-only: one
+#: end alone would shape one direction.
+#:
+#: The condition *vocabulary* lives in `model.CONDITIONS` — it is method, and a
+#: run's fingerprint must move when a condition's meaning moves. This module
+#: only knows how to impose one.
 LEGS: dict[str, tuple] = {
     "visitor": ((VIS_NS, "v-vis"), (SRV_NS, "v-srv")),
     "tunnel": ((SRV_NS, "v-srv2"), (CLI_NS, "v-cli")),
@@ -105,6 +96,30 @@ DEFAULT_TXQUEUELEN = 1000
 #: The deeper queue an arm may ask for: the same architecture with one operator
 #: setting changed.
 DEEP_TXQUEUELEN = 10000
+
+
+#: How many consecutive quiet polls end a drain. Two, because one reading of a
+#: path that is still draining is not a predicate.
+DRAIN_QUIET_POLLS = 2
+#: The queue never reaches zero (the probes leave ~1 KB in it permanently), so
+#: "quiet" is a tolerance: one `lo` MTU worth of bytes.
+DRAIN_TOLERANCE_B = 65536
+
+#: `tc`'s backlog unit suffixes. A reading that assumed bytes would read "1Mb"
+#: as one byte; the parser exists because the drain predicate is a reading.
+BACKLOG_UNITS = {"b": 1, "Kb": 1000, "Mb": 1000**2, "Gb": 1000**3}
+
+
+def _bytes_of(raw: str) -> int:
+    """`"18432b"`/`"1Mb"` -> bytes, or 0 for a shape this parser does not know."""
+    for suffix, factor in sorted(BACKLOG_UNITS.items(), key=lambda kv: -len(kv[0])):
+        if raw.endswith(suffix):
+            with contextlib.suppress(ValueError):
+                return int(float(raw[: -len(suffix)]) * factor)
+            return 0
+    with contextlib.suppress(ValueError):
+        return int(raw)
+    return 0
 
 
 def run(argv: list, timeout: float = 30.0, check: bool = True):
@@ -129,6 +144,8 @@ class Topology:
     def __init__(self, tun_mtu: int = 1400, link_mtu: int = 1500):
         self.tun_mtu = tun_mtu
         self.link_mtu = link_mtu
+        #: (namespace, device) -> the MTU it had before this run changed it.
+        self._mtu_saved: dict = {}
 
     # --- lifecycle ---------------------------------------------------------
     def up(self) -> None:
@@ -191,6 +208,9 @@ class Topology:
         self.ns_run(CLI_NS, ["sysctl", "-qw", f"net.ipv4.conf.{TUN_CLI}.rp_filter=0"])
 
     def down(self) -> None:
+        failures = self.restore_mtus()
+        if failures:
+            raise TopologyError(f"could not restore interface MTUs: {failures}")
         for ns in NS_ALL:
             pids = run(["ip", "netns", "pids", ns], check=False).stdout.split()
             for pid in pids:
@@ -227,12 +247,126 @@ class Topology:
     def _ip(*argv: str, ns: str | None = None) -> None:
         run(["ip", *(["-n", ns] if ns else []), *argv])
 
-    def set_netem(self, leg: str, args: list) -> None:
-        """Put one path condition on a leg, both directions, or do nothing."""
-        if not args:
-            return
+    @staticmethod
+    def _ip_check(*argv: str, ns: str | None = None):
+        return run(["ip", *(["-n", ns] if ns else []), *argv], check=False)
+
+    def set_condition(self, leg: str, condition) -> None:
+        """Impose one condition on a leg, *in place*, both directions.
+
+        In place is the point: a staged run changes the path while the tool
+        keeps running, so what is measured is how the tool adapts rather than
+        how it starts. `tc qdisc replace` swaps the discipline without touching
+        the device, and `clean` removes it.
+        """
         for ns, dev in LEGS[leg]:
-            self.ns_run(ns, ["tc", "qdisc", "add", "dev", dev, "root", "netem", *args])
+            if condition.netem:
+                self.ns_run(
+                    ns,
+                    [
+                        "tc",
+                        "qdisc",
+                        "replace",
+                        "dev",
+                        dev,
+                        "root",
+                        "netem",
+                        *condition.netem,
+                    ],
+                )
+            else:
+                self.ns_run(ns, ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
+            if condition.mtu is not None:
+                self.set_link_mtu(ns, dev, condition.mtu)
+
+    def set_link_mtu(self, ns: str, dev: str, mtu: int) -> None:
+        """Change one interface's MTU, remembering the original to restore it.
+
+        An MTU class is an *interface* property, not a qdisc: it changes the
+        path for every packet on that device during the stage. A leftover 1280
+        would poison every later run on the host, so the original is recorded
+        and `down()` puts it back.
+        """
+        if (ns, dev) not in self._mtu_saved:
+            r = self.ns_run(ns, ["cat", f"/sys/class/net/{dev}/mtu"], check=False)
+            with contextlib.suppress(ValueError):
+                self._mtu_saved[(ns, dev)] = int(r.stdout.strip())
+        self._ip("link", "set", dev, "mtu", str(mtu), ns=ns)
+
+    def restore_mtus(self) -> list:
+        """Put every MTU this run changed back, and report the failures."""
+        failures = []
+        for (ns, dev), mtu in self._mtu_saved.items():
+            r = self._ip_check("link", "set", dev, "mtu", str(mtu), ns=ns)
+            if r.returncode != 0:
+                failures.append(f"{ns}/{dev}: {r.stderr.strip()[:120]}")
+        self._mtu_saved.clear()
+        return failures
+
+    def backlog(self, leg: str) -> int:
+        """Bytes queued in the leg's qdiscs, both ends — a reading, not a guess.
+
+        `tc` renders the backlog with a unit suffix (`b`, `Kb`, `Mb`, `Gb`), so
+        the suffix is parsed rather than assumed: a boundary that waits on a
+        number it misread waits on nothing.
+        """
+        total = 0
+        for ns, dev in LEGS[leg]:
+            text = self.ns_run(
+                ns, ["tc", "-s", "qdisc", "show", "dev", dev], check=False
+            ).stdout
+            for line in text.splitlines():
+                fields = line.split()
+                if "backlog" in fields:
+                    total += _bytes_of(fields[fields.index("backlog") + 1])
+        return total
+
+    def drain(
+        self, leg: str, budget_s: float = 60.0, tolerance_b: int = DRAIN_TOLERANCE_B
+    ) -> dict:
+        """Wait for a leg to go quiet before the next stage is imposed.
+
+        A killed bulk client keeps delivering what its kernel still holds, and
+        reshaping at that instant puts the old stage's drain into the new
+        stage's queue — a SYN behind it costs the next stage its first seconds.
+        The predicate is the queue below a tolerance *and* no socket that can
+        still send, held for two consecutive polls; the budget is a safety net,
+        and a wait that ends on it is recorded rather than absorbed.
+        """
+        started = time.time()
+        quiet_polls = 0
+        while time.time() - started < budget_s:
+            busy = self.send_capable_sockets()
+            queued = self.backlog(leg)
+            if queued <= tolerance_b and not busy:
+                quiet_polls += 1
+                if quiet_polls >= DRAIN_QUIET_POLLS:
+                    break
+            else:
+                quiet_polls = 0
+            time.sleep(0.25)
+        queued = self.backlog(leg)
+        busy = self.send_capable_sockets()
+        return {
+            "drain_s": round(time.time() - started, 3),
+            "drain_expired": bool(queued > tolerance_b or busy),
+            "drain_final_backlog": queued,
+            "drain_busy_sockets": busy,
+        }
+
+    def send_capable_sockets(self) -> int:
+        """Sockets on a service port that can still send (the drain's other half).
+
+        `FIN-WAIT-2`/`CLOSING` linger for minutes carrying nothing, while
+        `ESTAB`/`FIN-WAIT-1`/`CLOSE-WAIT`/`SYN-SENT`/`SYN-RECV` are exactly the
+        states that retransmit the tens of MB a killed client's kernel holds.
+        """
+        total = 0
+        for ns in NS_ALL:
+            for state in ("estab", "fin-wait-1", "close-wait", "syn-sent", "syn-recv"):
+                r = self.ns_run(ns, ["ss", "-Htn", "state", state], check=False)
+                total += len([ln for ln in r.stdout.splitlines() if ln.strip()])
+        return total
 
     def set_txqueuelen(self, length: int) -> None:
         """Set both TUN devices' queue length — the arm's stated setting."""

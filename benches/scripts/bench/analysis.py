@@ -22,6 +22,7 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import instruments as inst
 import model
 
 #: Tolerances for the two host probes, carried over from the soak model's
@@ -1077,6 +1078,35 @@ def _verdict_line(entry: dict) -> str:
     )
 
 
+def _ramp(results: dict, lines: list) -> list:
+    """A capacity ramp that carried nothing is not a reading."""
+    failures: list = []
+    for summary_cell in results.get("summary", {}).get("cells", []):
+        if summary_cell["cell"] != "ramp":
+            continue
+        for arm, stats in summary_cell["arms"].items():
+            streams = (stats["metrics"].get("capacity_streams") or {}).get("median")
+            lines.append(f"capacity: {arm} sustained {streams} stream(s)")
+            if streams == 0 and _arm_kind(results, arm) in SUBJECT_KINDS:
+                failures.append(f"capacity: {arm} carried no level that met the SLO")
+    return failures
+
+
+def _baseline(results: dict, baseline: dict | None, lines: list) -> list:
+    """The regression half: this run against a comparable earlier one."""
+    if baseline is None:
+        lines.append("baseline: none given (--baseline for the regression half)")
+        return []
+    text, refused, _claims = compare_files(baseline, results)
+    if refused:
+        lines.append("baseline: refused")
+        lines += [f"  {line}" for line in text.splitlines() if line.strip()]
+        return ["baseline: the two files are not comparable (see the gate output)"]
+    lines.append("baseline: compared")
+    lines += [f"  {line}" for line in text.splitlines() if line.strip()]
+    return []
+
+
 def load(path) -> dict:
     """A results file, with its summary recomputed from the samples.
 
@@ -1090,3 +1120,221 @@ def load(path) -> dict:
     if results.get("samples"):
         results["summary"] = summarize(results)
     return results
+
+
+# --- the release gate -------------------------------------------------------
+#: What a published run must not do. The thresholds are the soak model's, kept
+#: because they were set against measured spread, and they are absolute where
+#: the quantity is a leak (a slope, not a ratio).
+DRIFT_RSS_MIB_PER_MIN = 50.0
+DRIFT_FDS_PER_MIN = 1.0
+DRIFT_THREADS_PER_MIN = 1.0
+#: The shortest run a drift gate may judge. The thresholds above were set
+#: against the fifteen-minute `soak` profile, and a shorter run's slope is a
+#: slope through the pool's own growth (measured: a scaled 8-stage timeline read
+#: 2.7 fds/min on an unchanged build) — reported as context, never failed.
+MIN_DRIFT_SPAN_S = 900.0
+#: The arms whose numbers are gated. A reference peer that misses the SLO is a
+#: finding about the peer: reported with its number, never a block.
+SUBJECT_KINDS = ("l4", "l3")
+
+
+def gate(results: dict, baseline: dict | None = None) -> tuple:
+    """What a run must satisfy before its numbers may be published.
+
+    A single check per question, each one reporting what it saw rather than
+    only whether it passed:
+
+    * **coverage** — every cell the scenario declared, for every arm;
+    * **the endpoint invariant** — no sample dialed the backend it forwards to
+      (the mistake that made an early model report the loopback ceiling for
+      every tool);
+    * **the SLO on the clean stages** — for the product's own arms only;
+    * **the drift and wedge axes** — a leak is a slope, a wedge is a silence;
+    * **the capacity ramp** — a ramp that carried nothing is not a reading.
+
+    Returns `(lines, failures)`: the failures are the strings a reader must act
+    on, and an empty list is a pass.
+    """
+    lines: list = []
+    failures: list = []
+    meta = results.get("meta", {})
+    lines.append(
+        f"gate: profile {meta.get('profile')} fingerprint {meta.get('fingerprint')} "
+        f"revision {(meta.get('provenance') or {}).get('revision')}"
+    )
+    failures += _coverage(results, lines)
+    failures += _endpoints(results, lines)
+    failures += _slo(results, lines)
+    failures += _drift(results, lines)
+    failures += _ramp(results, lines)
+    failures += _baseline(results, baseline, lines)
+    if not failures:
+        lines.append("gate: PASS")
+    return lines, failures
+
+
+def _coverage(results: dict, lines: list) -> list:
+    """Every declared cell, for every arm, with at least one measured round."""
+    failures: list = []
+    params_of = {
+        s["id"]: s["params"] for s in results.get("meta", {}).get("scenarios", [])
+    }
+    measured = {
+        (sample["arm"], sample["scenario"], sample["cell"])
+        for sample in results.get("samples", [])
+        if sample.get("ok") and not sample.get("warmup")
+    }
+    declared = results.get("meta", {}).get("scenarios", [])
+    expected_kinds = {s["id"]: s["kind"] for s in declared}
+    # A diagnostic scenario has no tool-free path, so the control arm is not
+    # expected to have measured it at all.
+    diagnostic = {s["id"] for s in declared if not s.get("control", True)}
+    for arm in results.get("meta", {}).get("arms", []):
+        for scenario_id, params in params_of.items():
+            if arm["kind"] == "control" and scenario_id in diagnostic:
+                continue
+            for cell in model.expected_cells(scenario_id, params):
+                if (arm["id"], scenario_id, cell) in measured:
+                    continue
+                failures.append(
+                    f"coverage: {arm['id']} / {scenario_id}"
+                    f"{f' / {cell}' if cell else ''} produced no measured round "
+                    f"({expected_kinds.get(scenario_id, '?')})"
+                )
+    lines.append(f"coverage: {len(measured)} measured arm/scenario/cell triples")
+    return failures
+
+
+def _endpoints(results: dict, lines: list) -> list:
+    """A tool arm's probe must dial what the tool exposes, never its backend."""
+    failures: list = []
+    checked = 0
+    for sample in results.get("samples", []):
+        evidence = sample.get("evidence") or {}
+        dial, backend, kind = (
+            evidence.get("dial_host"),
+            evidence.get("backend_bind"),
+            evidence.get("arm_kind"),
+        )
+        # A transparent arm is the exception that proves the rule: the visitor
+        # dials the address the *client* owns, and the backend binds that same
+        # address inside the client namespace, because the client's kernel
+        # delivers the packet. The visitor cannot reach it without the tunnel
+        # (the acceptance harness proves that); the direct-dial mistake this
+        # check exists for is an L4/peer arm dialing its own backend.
+        if not dial or not backend or kind in ("control", "l3"):
+            continue
+        checked += 1
+        if dial == backend:
+            failures.append(
+                f"endpoint: {sample.get('arm')} / {sample.get('scenario')} dialed "
+                f"{dial}, which is the backend it forwards to"
+            )
+    lines.append(f"endpoint invariant: {checked} samples carry a dialed endpoint")
+    return failures
+
+
+def _slo(results: dict, lines: list) -> list:
+    """The clean stages must meet the SLO — for the product's own arms."""
+    failures: list = []
+    clean = 0
+    for summary_cell in results.get("summary", {}).get("cells", []):
+        if not _is_clean(results, summary_cell):
+            continue
+        for arm, stats in summary_cell["arms"].items():
+            if _arm_kind(results, arm) not in SUBJECT_KINDS:
+                continue
+            clean += 1
+            p99 = (stats["metrics"].get("rtt_p99_ms") or {}).get("median")
+            errors = (stats["metrics"].get("rtt_error_rate_pct") or {}).get("median")
+            if p99 is not None and p99 > model.SLO_RTT_P99_MS:
+                failures.append(
+                    f"SLO: {arm} / {summary_cell['scenario']}"
+                    f"[{summary_cell['cell']}] p99 {p99} ms > "
+                    f"{model.SLO_RTT_P99_MS} ms on a clean stage"
+                )
+            if errors is not None and errors > model.SLO_ERROR_RATE_PCT:
+                failures.append(
+                    f"SLO: {arm} / {summary_cell['scenario']}"
+                    f"[{summary_cell['cell']}] error rate {errors} % > "
+                    f"{model.SLO_ERROR_RATE_PCT} % on a clean stage"
+                )
+    lines.append(f"SLO: {clean} clean-stage cells gated")
+    return failures
+
+
+def _is_clean(results: dict, summary_cell: dict) -> bool:
+    scenario = summary_cell["scenario"]
+    cell = summary_cell["cell"]
+    for sample in results.get("samples", []):
+        if sample["scenario"] != scenario or sample["cell"] != cell:
+            continue
+        evidence = sample.get("evidence") or {}
+        if "condition" in evidence:
+            return evidence["condition"] == "clean"
+    return False
+
+
+def _series_span(results: dict, scenario: str) -> float:
+    """How long the drift series of one scenario is, in seconds."""
+    for sample in results.get("samples", []):
+        if sample["scenario"] != scenario or sample["cell"] != "run":
+            continue
+        series = (sample.get("evidence") or {}).get("drift_series") or []
+        if len(series) >= inst.MIN_WEDGE_POINTS:
+            return float(series[-1]["t"] - series[0]["t"])
+    return 0.0
+
+
+def _arm_kind(results: dict, arm_id: str) -> str:
+    for arm in results.get("meta", {}).get("arms", []):
+        if arm["id"] == arm_id:
+            return arm["kind"]
+    return ""
+
+
+def _drift(results: dict, lines: list) -> list:
+    """A leak is a slope and a wedge is a silence; both are failures.
+
+    The wedge half is judged at any run length — an interactive stream that
+    stopped answering for five seconds is not a slope question — while the
+    slope half needs a run long enough to carry one: the thresholds were set
+    against the fifteen-minute `soak` profile, and a shorter run's slope is a
+    slope through the pool's own growth (measured: a scaled eight-stage
+    timeline read 2.7 fds/min on an unchanged build).
+    """
+    failures: list = []
+    thresholds = {
+        "drift_rss_mib_per_min": DRIFT_RSS_MIB_PER_MIN,
+        "drift_fds_per_min": DRIFT_FDS_PER_MIN,
+        "drift_threads_per_min": DRIFT_THREADS_PER_MIN,
+    }
+    for summary_cell in results.get("summary", {}).get("cells", []):
+        if summary_cell["cell"] != "run":
+            continue
+        span = _series_span(results, summary_cell["scenario"])
+        long_enough = span >= MIN_DRIFT_SPAN_S
+        if not long_enough:
+            lines.append(
+                f"drift: {summary_cell['scenario']} ran {span:.0f}s, under the "
+                f"{MIN_DRIFT_SPAN_S:.0f}s a slope needs: slopes reported, wedges "
+                "still gated"
+            )
+        for arm, stats in summary_cell["arms"].items():
+            if _arm_kind(results, arm) not in SUBJECT_KINDS:
+                continue
+            wedges = (stats["metrics"].get("wedge_count") or {}).get("median")
+            if wedges:
+                worst = (stats["metrics"].get("wedge_max_s") or {}).get("median")
+                failures.append(
+                    f"wedge: {arm} went silent {wedges:.0f} time(s), longest {worst} s"
+                )
+            if not long_enough:
+                continue
+            for metric, limit in thresholds.items():
+                value = (stats["metrics"].get(metric) or {}).get("median")
+                if value is not None and abs(value) > limit:
+                    failures.append(f"drift: {arm} {metric} {value} exceeds {limit}")
+    lines.append("drift: checked the run cells' slopes and wedges")
+    return failures

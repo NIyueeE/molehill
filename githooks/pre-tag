@@ -105,19 +105,19 @@ echo "[release assets]"
 # In push mode (--commit) missing assets are a note, not a failure: a
 # historical tag legitimately predates the ritual, and re-pushing one to fix
 # a failed release must stay possible. At tag creation they are required.
-if exists_at "benches/scripts/soak/results-soak-v${version}.json"; then
-  echo "  ok    results-soak-v${version}.json committed"
+if exists_at "benches/records/results-bench-v${version}.json"; then
+  echo "  ok    results-bench-v${version}.json committed"
 elif [ "$passed_commit" -eq 1 ]; then
-  echo "  note  results-soak-v${version}.json absent at this commit (historical tag?)"
+  echo "  note  results-bench-v${version}.json absent at this commit (historical tag?)"
 else
-  fail "benches/scripts/soak/results-soak-v${version}.json missing — run the benchmark ritual (docs/release.md) and commit it"
+  fail "benches/records/results-bench-v${version}.json missing — run the benchmark ritual (docs/release.md) and commit it"
 fi
-if exists_at "assets/soak-v${version}.png"; then
-  echo "  ok    assets/soak-v${version}.png committed"
+if exists_at "assets/bench-v${version}.png"; then
+  echo "  ok    assets/bench-v${version}.png committed"
 elif [ "$passed_commit" -eq 1 ]; then
-  echo "  note  assets/soak-v${version}.png absent at this commit (historical tag?)"
+  echo "  note  assets/bench-v${version}.png absent at this commit (historical tag?)"
 else
-  fail "assets/soak-v${version}.png missing — run 'just soak-plot' and commit the chart"
+  fail "assets/bench-v${version}.png missing — run 'just bench-plot' and commit the charts"
 fi
 # The numbers must describe *this* state (AGENTS.md §10, "prove provenance").
 # The results file records the revision it was measured at, and the ritual
@@ -125,9 +125,12 @@ fi
 # happened is a *code* change in between: the artifact would then describe code
 # that is no longer here, which no reader of the chart can see. Doc and asset
 # commits after the sweep are fine — that is how the ritual lands it.
-if exists_at "benches/scripts/soak/results-soak-v${version}.json"; then
-  measured="$(at "benches/scripts/soak/results-soak-v${version}.json" \
-    | python3 -c 'import json,sys; print((json.load(sys.stdin).get("meta") or {}).get("revision") or "")' \
+if exists_at "benches/records/results-bench-v${version}.json"; then
+  measured="$(at "benches/records/results-bench-v${version}.json" \
+    | python3 -c 'import json,sys
+meta = (json.load(sys.stdin).get("meta") or {})
+rev = (meta.get("provenance") or {}).get("revision") or ""
+print((rev[0] if isinstance(rev, list) else rev) or "")' \
     2>/dev/null || true)"
   if [ -z "$measured" ]; then
     echo "  note  the results file records no revision to check"
@@ -135,7 +138,8 @@ if exists_at "benches/scripts/soak/results-soak-v${version}.json"; then
     echo "  note  the results file was measured at '${measured}', not a commit here"
   else
     drift="$(git diff --name-only "${measured}..${commit}" -- src tests build.rs \
-      Cargo.toml Cargo.lock 'benches/scripts/soak/*.py' 2>/dev/null || true)"
+      Cargo.toml Cargo.lock 'benches/scripts/bench/*.py' \
+      'benches/scripts/bench/probes/*.py' 2>/dev/null || true)"
     if [ -n "$drift" ]; then
       fail "the results file was measured at ${measured}, but code changed since — re-run the sweep on the release commit (docs/release.md, step 3): $(printf '%s ' $drift)"
     else
@@ -194,7 +198,7 @@ cat <<'EOF'
   [ ] Container image review: scratch + static musl; img/bin amd64+arm64
       layout; feature set server,client,noise,hot-reload,multiplex; the
       --help smoke test passed in the workflow run
-  [ ] Benchmark ritual done (docs/release.md): soak run, 'just soak-check'
+  [ ] Benchmark ritual done (docs/release.md): sweep run, 'just bench-gate'
       green vs the previous tag (waivers recorded in HANDOFF.md), README
       benchmark section refreshed
   [ ] Heavy gates green on this commit: 'just check' (pre-commit + pre-push);

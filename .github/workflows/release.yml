@@ -81,8 +81,8 @@ jobs:
           # notes, so the release stops here instead of publishing a claim
           # nobody can check.
           missing=0
-          for f in "benches/scripts/soak/results-soak-v$VERSION.json" \
-                   "assets/soak-v$VERSION.png"; do
+          for f in "benches/records/results-bench-v$VERSION.json" \
+                   "assets/bench-v$VERSION.png"; do
             if [ -f "$f" ]; then
               echo "ok: $f"
             else

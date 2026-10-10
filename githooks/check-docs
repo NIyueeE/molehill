@@ -97,10 +97,11 @@ expect "just check documented" README.md 'just check'
 expect "just check documented" README.zh.md 'just check'
 # The benchmark commands live on the method's page (one topic, one home);
 # the READMEs link to it instead of repeating the recipe.
-expect "just soak documented" docs/benchmarks.md 'just soak'
-expect "just soak documented (zh)" docs/benchmarks.zh.md 'just soak'
-expect "just soak-check documented" docs/benchmarks.md 'just soak-check'
-expect "just soak-peers documented" docs/benchmarks.md 'just soak-peers'
+expect "just bench documented" docs/benchmarks.md 'just bench'
+expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
+expect "just bench-gate documented" docs/benchmarks.md 'just bench-gate'
+expect "just bench-gate documented (zh)" docs/benchmarks.zh.md 'just bench-gate'
+expect "just bench-peers documented" docs/benchmarks.md 'just bench-peers'
 
 # 6) hooks activation instruction
 expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'

@@ -1,19 +1,25 @@
 # Benchmarks
 
-How the numbers in the [README](../README.md#benchmarks) are produced, what
-they can and cannot answer, and how to reproduce them on your own hardware.
+One model produces every performance number in this repository, and this page
+owns its method: what is measured, how a metric is defined, how to read a
+chart, what the numbers may be compared with, and how to reproduce a run. The
+published numbers themselves are in the [README](../README.md#benchmarks).
 
 Chinese mirror: [benchmarks.zh.md](benchmarks.zh.md).
 
 <!-- TOC -->
 
 - [What is measured](#what-is-measured)
+- [The bench model (the measurement standard)](#the-bench-model-the-measurement-standard)
+- [The conditions and the stage schedule](#the-conditions-and-the-stage-schedule)
 - [How to read the charts](#how-to-read-the-charts)
-- [The stage schedule](#the-stage-schedule)
-- [Test types](#test-types)
-- [What this model cannot answer](#what-this-model-cannot-answer)
+- [Running it](#running-it)
+- [Reading a result](#reading-a-result)
+- [The gate](#the-gate)
+- [What the model cannot answer](#what-the-model-cannot-answer)
 - [What each configuration choice costs (per-decision measurements)](#what-each-configuration-choice-costs-per-decision-measurements)
-- [The UDP queue question (not part of the soak model)](#the-udp-queue-question-not-part-of-the-soak-model)
+- [The transparent-L3 wire question (the acceptance harness)](#the-transparent-l3-wire-question-the-acceptance-harness)
+- [The UDP queue question (a molehill-only diagnostic)](#the-udp-queue-question-a-molehill-only-diagnostic)
 - [Comparability](#comparability)
 - [Reproduce it yourself](#reproduce-it-yourself)
 
@@ -21,65 +27,225 @@ Chinese mirror: [benchmarks.zh.md](benchmarks.zh.md).
 
 ## What is measured
 
-A **workload over time**, not one average per network condition. Each tool is
-driven through the identical client-side workload — one interactive stream (a
-fresh TCP connection per ping: the instrument the SLO is stated on), N bulk TCP
-streams, a steady rate of short-lived connections, and one UDP session — while
-the path follows a scripted schedule of network conditions. The tool's
-processes start once and the shaping changes in place, so the session is never
-rebuilt: how a tool *adapts* to a degrading and then recovering path is part of
-the measurement, not a warm-up cost hidden before it.
+A **workload under a path**, observed from outside the tool. Every arm — the
+product in its configurations, a reference tool, or a control with no tool in
+the path at all — is driven through the same workloads, on the same
+three-namespace topology, by the same probes, in the same phase of one
+campaign:
 
-Everything is observed from outside the tool (throughput and per-interval
-retransmits from iperf3, RTT/loss/jitter from the probes, RSS / CPU / open fds
-/ threads from `/proc`). That is what lets the peer tools be measured by the
-same workload and charted in the same panels — and it is why molehill's own
-internal counters never appear in the comparison.
+- one **interactive stream**: a fresh TCP connection per ping, the instrument
+  the SLO is stated on;
+- **bulk TCP**: one to N streams (iperf3), the throughput axis;
+- **short-lived connections**: a churn of fresh connections, the cost of
+  arriving;
+- **UDP**: a paced datagram session, and a rate ladder up to the drop point;
+- and, for the release sweep, a **scripted schedule** of network conditions
+  that changes in place while the tool keeps running, so how a tool *adapts* to
+  a degrading and recovering path is part of the measurement rather than a
+  warm-up cost hidden before it.
+
+Everything is observed from outside (`/proc`, `ss`, the interfaces' counters,
+the namespaces' TCP MIB, iperf3's own receiver summary), which is what lets a
+peer binary, a shipped configuration and a control arm be described by one set
+of instruments — and why no internal counter of any tool ever appears in a
+comparison.
 
 Measurements are single-machine: visitor, server, client and backend all share
-one host, with the network condition applied to the loopback path. Absolute
-throughput therefore describes *this* host; the shapes, the ordering and the
-SLO behaviour are what travel.
+one host, with the path conditions applied to a veth leg of the topology.
+Absolute throughput therefore describes *this* host; the shapes, the ordering
+and the SLO behaviour are what travel. The topology exists so that an L4 arm
+(terminated TCP), an L3 arm (whole packets over a TUN) and the control arm are
+measured on **the same path**: they differ in the address the visitor dials and
+in the mode written into their configuration, and in nothing else.
 
 An interactive stream's p99 at or under **50 ms**, with an error rate at or
-under **0.5 %**, is the SLO: the break condition of the `capacity` test, the
-dashed line in every chart, and what the release gate checks on the clean
-stages. Degraded stages are *expected* to sit far above it — that is the
-measurement, not a failure.
+under **0.5 %**, is the SLO: the break condition of the capacity ramp, the
+dashed line in every chart, and what the gate checks on the clean stages.
+Degraded stages are *expected* to sit far above it — that is the measurement,
+not a failure.
 
-The error term is a rate rather than "zero" because zero is not a property of a
-tool here: one run across four arms measured frp 0, rathole 0.05 %, molehill
-0.07 % and nps 0.31 % on their clean stages, so an absolute zero flagged the
-middle of the spread as a release blocker while two reference arms were worse.
-Half a percent is above every arm measured so far and far below anything a user
-would notice; a run may tighten it with `SOAK_SLO_ERROR_RATE`.
+## The bench model (the measurement standard)
+
+`benches/scripts/bench/` is the standard and the only runner. The sweep the
+release publishes is not a second instrument: it is this model's `sweep`
+profile — the `timeline` and `capacity` scenarios over the product and the
+reference tools — which is why the staged schedule and the load ramp travel in
+one results file, under one schema, behind one gate.
+
+```bash
+sudo -n just bench                     # the smoke profile, about a minute
+sudo -n just bench --profile dev --aa  # the default loop for an optimization
+sudo -n just bench-doctor              # what this host can and cannot measure
+just bench-list                        # every metric, condition and profile
+just bench-report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
+just bench-plot ~/tmp/bench-*.json     # its charts and markdown tables
+just bench-gate RESULTS.json           # may this run be published?
+just bench-selfcheck                   # the model's own checks (a fast gate)
+```
+
+### The rules the model enforces
+
+- **A metric is defined once, in code.** Unit, direction, the denominator it is
+  a ratio over, the workload kinds that can produce it and the smallest
+  difference worth calling a claim all live in `model.METRICS`; the table below
+  is generated from that registry and `just bench-list` prints it. A metric
+  described one way and computed another fails `just bench-selfcheck`.
+- **A control arm is mandatory.** Every scenario also runs on the same
+  topology, ports and backend with no tool in the path. Without it a slow probe
+  and a slow tunnel are the same reading, which is why the model always reports
+  a tool arm *against its own control* rather than on its own.
+- **A run states its whole method before its first sample.** The results file
+  carries a fingerprint over the topology, the conditions and timelines, the
+  scenarios and their *resolved* parameters, the instrument cadences and the
+  model's own code. Two files may only be compared when it matches, and
+  `just bench-compare` names every key that differs instead of printing a
+  difference between two methods.
+- **The run measures its own resolution.** One arm is measured twice under two
+  names (`--aa`; on by default in `dev`, `full` and `stage`), and the paired
+  difference between those two halves is the smallest difference the run can
+  believe. Every verdict raises the metric's own materiality floor to it, and
+  the run prints the floors beside its tables. A resolution of 16 % is a
+  statement about the run, not an excuse: it says what to change (longer
+  workloads, more rounds) to resolve more.
+- **A verdict has five states, and "no claim" is one of them.** `claim` needs
+  every paired round to agree in sign *and* both floors cleared; `directional`
+  is a direction with a disagreement or a floor in the way; `indistinguishable`
+  is inside the run's own scatter; `single-round` refuses to read a direction
+  into one measurement; `unavailable` names what was not measured. A metric no
+  arm could produce is reported with the instrument's reason, never as zero.
+- **Evidence stays with the number.** Each cell records the commands it ran,
+  the counters it read, the endpoint the probe dialed, the peers the backend
+  saw, the raw per-round sample arrays and the log its probe left behind. The
+  results file is written as the run goes, so an interrupted campaign is still
+  analysable.
+- **Results live outside the tree** unless the run *is* the release sweep: a
+  run writes `~/tmp/bench-<stamp>.json` and its artifacts beside it (the
+  invoking user's home, even under `sudo`); `--out`/`--work` move them, and an
+  existing `--out` is refused unless `--force`.
+
+### The metrics
+
+Generated from `model.METRICS`; `just bench-list` prints the same registry, and
+the definitions are what the report and the verdict render.
+| metric | unit | direction | what it is | divided by |
+|---|---|---|---|---|
+| `throughput_gbps` | Gbit/s | higher is better | receiver-window payload bytes x 8 / measured window | the workload's measured window |
+| `offered_gbps` | Gbit/s | context, not a verdict | visitor link egress bytes x 8 / measured window | the workload's measured window |
+| `rtt_worst_1s_ms` | ms | lower is better | the worst one-second mean of the interactive stream's round trips: a burst that a percentile over the whole stage would average away | one second of the interactive stream |
+| `rtt_error_rate_pct` | % | lower is better | failed interactive pings / (successful + failed) | one interactive ping |
+| `churn_per_s` | 1/s | higher is better | short-lived connections established per second | the stage's measured window |
+| `drift_rss_mib_per_min` | MiB/min | lower is better | least-squares slope of the arm's summed RSS over the run: a leak is a slope over time, not a level | one minute of run time |
+| `drift_fds_per_min` | count/min | lower is better | least-squares slope of the arm's open descriptors | one minute of run time |
+| `drift_threads_per_min` | count/min | lower is better | least-squares slope of the arm's thread count | one minute of run time |
+| `wedge_count` | count | lower is better | interactive silences longer than 5 s: a tool that stops answering under degradation, which an average cannot show | one silent stretch |
+| `wedge_max_s` | s | lower is better | the longest interactive silence in the run | one silent stretch |
+| `capacity_streams` | count | higher is better | the highest bulk-stream level whose interactive stream still met the SLO, from the capacity ramp | one bulk stream |
+| `capacity_headroom_pct` | % | higher is better | 1 - max sustainable streams / the ramp's ceiling | the ramp's ceiling |
+| `startup_s` | s | lower is better | median time from process start to the service answering a fresh connection: what a visitor pays after a restart | one cold start |
+| `startup_max_s` | s | lower is better | the worst cold start the run saw | one cold start |
+| `slo_broken` | bool | context, not a verdict | 1 when the cell broke the SLO (p99 above 50 ms or error rate above 0.5 %), so a level's verdict travels with its numbers | one measured level or stage |
+| `rate_per_s` | 1/s | higher is better | completed request/response pairs / measured window | the workload's measured window |
+| `rtt_p50_ms` | ms | lower is better | nearest-rank median of the probe's per-request round trips | one request/response pair |
+| `rtt_p99_ms` | ms | lower is better | nearest-rank 99th percentile of the probe's round trips | one request/response pair |
+| `rtt_max_ms` | ms | lower is better | worst single round trip the probe observed | one request/response pair |
+| `rtt_samples` | count | context, not a verdict | round trips the percentile is taken over | none (sample count) |
+| `udp_recv_mbit` | Mbit/s | higher is better | datagrams the probe received x payload / the probe's own measured window (which for a blast includes the drain) | the probe's receive window |
+| `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
+| `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
+| `udp_rtt_p99_ms` | ms | lower is better | 99th percentile of the probe's datagram echo round trips | one echoed datagram |
+| `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request (the setup a visitor pays to arrive) | one connection |
+| `cpu_s_per_gbit` | s/Gbit | lower is better | tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered | Gbit on the visitor's link egress |
+| `cpu_cores` | cores | lower is better | tool CPU-seconds / measured window | the workload's measured window |
+| `bytes_per_syscall` | B | higher is better | tool process rchar+wchar / syscr+syscw (the I/O granularity) | one read/write-family syscall |
+| `syscalls_per_s` | 1/s | lower is better | tool process syscr+syscw / measured window | the workload's measured window |
+| `wire_per_visitor_byte` | ratio | lower is better | tunnel-link bytes (both directions) / visitor-link egress bytes | bytes the visitor offered |
+| `mean_carried_packet_b` | B | context, not a verdict | tunnel-link bytes / tunnel-link packets, both directions | one packet on the tunnel link |
+| `rss_peak_mib` | MiB | lower is better | peak RSS summed over the tool's daemons, sampled during the workload | one process set |
+| `fds_peak` | count | lower is better | peak open file descriptors summed over the tool's daemons | one process set |
+| `threads_peak` | count | lower is better | peak thread count summed over the tool's daemons | one process set |
+| `service_sockets_peak` | count | lower is better | peak sockets on the exposed service port in the server's own namespace: the per-visitor state the architecture keeps | one visitor |
+| `retrans_segments` | count | lower is better | TCP segments retransmitted by the visitor and server namespaces | one TCP segment |
+| `dropped_packets` | count | lower is better | packets the topology's interfaces dropped over the window | one packet |
+
+
+Two conventions the table cannot state, because they belong to the workload:
+
+- **A rate's window is the instrument's own, and it is named.** A bulk rate is
+  the receiver's post-warm-up window (iperf3's); a round-trip rate is the
+  probe's measured window, not the interpreter's start (the start cost is
+  recorded in `meta.probe_startup_s`); a datagram rate is the probe's receive
+  window, which for a blast includes the drain. Counter-derived ratios
+  (`cpu_s_per_gbit`, `wire_per_visitor_byte`, `syscalls_per_s`) use the
+  counters' window, which brackets exactly the workload's process — so a
+  ratio's numerator and denominator cover the same seconds.
+- **`wire_per_visitor_byte` has a floor of 1 for one-way traffic and 2 for a
+  strict request/response workload**, because it counts both directions of the
+  tunnel link and a round trip is carried there twice. Read it against the
+  control's own reading, never against 1.
+
+### The scenarios
+
+| scenario | workload | the claim it supports | headline |
+|---|---|---|---|
+| `bulk-1` | `bulk` | what one bulk TCP stream carries, and what it costs per byte | `throughput_gbps` |
+| `bulk-n` | `bulk` | whether N streams aggregate, or share one ceiling | `throughput_gbps` |
+| `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
+| `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
+| `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
+| `churn-16` | `rr` | a fresh connection per request: the setup cost a visitor pays, and the per-visitor state the architecture keeps | `rate_per_s` |
+| `udp-pace` | `udp` | a paced UDP session: what fraction arrives, and how it is spaced | `udp_loss_pct` |
+| `udp-ladder` | `udp-ladder` | where a UDP path starts shedding, per offered rate | `udp_loss_pct` |
+| `timeline` | `staged` | how the tool behaves as the path degrades and recovers: one interactive stream, N bulk streams, a churn stream and a UDP session, over a scripted schedule of conditions, in place | `rtt_p99_ms` |
+| `soak` | `staged` | over a long run on a rotating path: does anything leak, drift or degrade | `rtt_p99_ms` |
+| `cost` | `staged` | at one fixed operating point, how many CPU-seconds one carried Gbit/s costs | `cpu_s_per_gbit` |
+| `capacity` | `capacity` | how much bulk load the tool carries while a fresh interactive connection still meets the SLO | `capacity_streams` |
+| `reconnect` | `reconnect` | what a visitor pays after a restart: time from process start to answering | `startup_s` |
+| `udp-blast` | `udp` | the datagram ceiling when the probe offers as fast as it can | `udp_recv_mbit` |
+
+### The profiles
+
+A profile is a time budget with a method attached: which scenarios run, how
+many rounds each arm is measured for, and the sizes the scenarios take.
+`dev` is the loop an optimization should use and `sweep` is what a release
+publishes; `--scale` shortens or lengthens every staged timeline's holds
+without changing the schedule's *shape*, and because the scale lands in the
+fingerprint, a shortened run can never be mistaken for a published one.
+
+| profile | rounds | budget per arm | what it is for |
+|---|---|---|---|
+| `smoke` | 2 (+1 warm-up) | ~45 s | the fast loop: every headline metric, seconds not minutes |
+| `dev` | 4 (+1 warm-up) | ~150 s | the default for an optimization: every scenario, minutes |
+| `full` | 6 (+1 warm-up) | ~420 s | the release-grade sweep: everything, for as long as it takes |
+| `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
+| `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
+| `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
+| `sweep` | 1 (+0 warm-up) | ~2400 s | the release sweep: the staged schedule and the load ramp |
 
 ## How to read the charts
+Six figures, each answering one question, each drawn only when the run carried
+that data and each carrying its method in the footer:
 
-- **The SLO line (dashed).** An interactive stream must keep p99 at or under
-  50 ms and 0.5 % errors for a path to be considered usable. It is the one
-  line every chart shares.
-- **The vertical axis of a response time is logarithmic.** A degraded path
-  costs three orders of magnitude; on a linear axis the healthy stages would be
-  invisible.
-- **The shaded bands are the path classes**, named along the top; green bands
-  are the unshaped control stages, grey ones are deliberately degraded. The
-  last band is the same clean condition as the first: the **recovery axis**.
-- **A red bar on the bottom edge is a wedge** — the interactive stream went
-  silent (no response at all) for more than five seconds. Its duration is
-  printed in the corner of the panel. A tool that stays wedged is a finding;
-  one that recovers is the more useful answer.
-- **Solids and dashes are the per-stage distribution**: the solid step line is
-  each stage's median, the dashed one its p99. They exist because a scatter of
-  tens of thousands of samples hides the summary, and the summary hides the
-  outliers — you want both.
-- **The small-multiples figure** (`soak-<version>-stages.png`) answers the
-  comparison question directly: one panel per condition, one lollipop per tool
-  (dot = median, bar = p99, tick = worst single second). An `x` means that
-  stage produced no samples for that tool.
-- **The drift figure** prints the fitted slope of every line, because a leak is
-  a slope over time, not a level: an RSS line that is high but flat is not a
-  leak, and one that climbs slowly is.
+- **the timeline master** — per arm, the interactive stream's per-stage p50
+  (solid step line) and p99 (dashed) on a log axis, the SLO as a dashed line,
+  the stage bands shaded (clean versus degraded), wedges marked, and the bulk
+  throughput per stage beneath it. It answers "what happens as the path
+  changes";
+- **the small multiples** — one panel per stage, one lollipop per arm (dot =
+  p50, bar = p99, tick = worst single round trip): the comparison the scatter
+  hides;
+- **the capacity curve** — throughput and p99 against offered load, with the
+  SLO line and each arm's max sustainable level marked: sustainable load is
+  where a curve crosses the line;
+- **the UDP ladder** — received rate and loss against offered rate, with the
+  lossless reference;
+- **the drift panels** — RSS, open descriptors and threads over the run, with
+  the fitted slope per minute printed: a leak is a slope, not a level;
+- **the cost bars** — CPU-seconds per carried Gbit per arm, the number the
+  CPU-cost metric is for.
+
+A cell that carried no reading is drawn as `x` and printed as `- (reason)`,
+never as `0`: "the path carried nothing" and "nobody could measure what it
+carried" are different findings.
 
 ### How to read a cell
 
@@ -116,7 +282,7 @@ would notice; a run may tighten it with `SOAK_SLO_ERROR_RATE`.
   estimate. The charts mark it with the worst-second tick; the results file
   carries `rtt_n` per stage so a reader can tell which kind of number a cell is.
 
-## The stage schedule
+## The conditions and the stage schedule
 
 ### The timeline
 
@@ -169,45 +335,44 @@ exists at all: `lo` is MTU 65536, so without it every datagram fits in one
 fragment and the cost of a lost fragment is unmeasurable. Read the two classes
 together with the `carrier = "kcp"` row below.
 
-### The shaping scope and its switches
+### The shaping scope
 
-**A class is applied to the visitor's leg** (`SOAK_SHAPE_LEGS=visitor`, the
-default) — the ports the workload dials on the tool's exposed side — plus, for
-the KCP carrier, the tunnel's own UDP port, the one tunnel the harness can name
-on the wire. An injected delay is therefore paid once. The tool's backend leg
-(the client process to the backend it forwards to) stays unshaped, because a
-real deployment's WAN is on the visitor's side and the backend is next to the
-tool; `SOAK_SHAPE_LEGS=both` extends the shaping to that leg as well, and the
-value a run used is recorded in its `meta.shape_legs`.
+**A condition is applied to one leg of the topology**: `--condition-leg visitor`
+(the default) shapes the link between the visitor and the server, and
+`--condition-leg tunnel` shapes the link the tool's carrier crosses. Both ends
+of the chosen leg are shaped, because netem is egress-only — shaping one end
+would shape one direction. An injected delay is therefore paid once, on the
+visitor's side, where a real deployment's WAN is; the backend leg (the client
+process to the backend it forwards to) stays unshaped, because the backend is
+next to the tool. The leg a run used travels in its results meta.
 
-Only the data plane is shaped. The tool's control channel stays on the
-unshaped path: shaping it kills the heartbeat and turns a capacity measurement
-into a wedge study.
+Only the data plane is shaped. The tool's control channel stays on the unshaped
+path: shaping it kills the heartbeat and turns a capacity measurement into a
+wedge study.
 
-**A rate class bounds the bulk client's socket window** (`SOAK_RATE_SOCKET_WINDOW`,
-default `256K`; `off` disables the bound). An unbounded sender defeats its own
-accounting against a rate shaper: its writes complete into a socket buffer far
-larger than the shaped path can drain, the measured intervals then read zero
-bytes while the path keeps carrying them, and the client can still be blocked
-past the stage boundary, so its summary never arrives at all. The bounded window
-keeps the writes tracking the path. It is applied to rate classes alone: a window
-is meaningful only where the path's rate is known, and on a delay-only or clean
-stage it would cap the bandwidth-delay product and change the measurement it
-exists to serve.
+**A rate class is read from the receiver.** An unbounded sender defeats its own
+accounting against a rate shaper — its writes complete into a socket buffer far
+larger than the shaped path can drain, so the sender's own intervals read zero
+bytes while the path keeps carrying them. The model does not bound the client's
+socket window; it quotes the **receiver's** window for every rate (the table's
+first convention), and the interface counters carry what the path actually
+moved beside it. That is why a `rate20` cell is a reading rather than a
+property of the client's buffer.
 
 ### Stage transitions
 
 A stage does not start until the previous one has gone quiet. The boundary
-kills the bulk client, and a killed TCP socket keeps delivering what its kernel
-side still holds — and keeps retransmitting its FIN through whatever qdisc is
+kills the stage's bulk client, and a killed TCP socket keeps delivering what its
+kernel still holds — and keeps retransmitting its FIN through whatever qdisc is
 installed. Reshaping at that instant would put the old stage's drain into the
 same queue as the new stage's handshake, and because a tool's data-plane ports
 share one netem class, a SYN dropped behind that drain costs the next stage its
-first tens of seconds. So the harness waits, at the *old* shaper, until the path
-is quiet by two measurements — no more than a frame's worth queued (`64 KiB`, one
-`lo` MTU) **and** no socket on the throughput port in a state that can still send
-(`ESTAB`, `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`) — both holding for
-two consecutive polls, and only then applies the next stage's shaping.
+first seconds. So the model waits, at the *old* condition, until the path is
+quiet by two measurements — no more than a frame's worth queued
+(`topology.DRAIN_TOLERANCE_B`, 64 KiB) **and** no socket in a state that can
+still send (`ESTAB`, `FIN-WAIT-1`, `CLOSE-WAIT`, `SYN-SENT`, `SYN-RECV`) — both
+holding for two consecutive polls (`topology.DRAIN_QUIET_POLLS`), and only then
+imposes the next stage's condition.
 
 Both halves are tolerances. The queue never reaches zero — the interactive,
 churn and UDP probes share the tool's class and leave ~1.2 KB in it permanently
@@ -220,138 +385,133 @@ client's kernel still holds. The queue half is a *reading*, not an assumption:
 `tc` renders the backlog with a unit suffix (`b`, `Kb`, `Mb`, `Gb`), so the
 drain parses the suffix into bytes before it decides anything.
 
-`SOAK_DRAIN_BUDGET` (180 s) is a **safety net, not the mechanism**, sized above
-the worst transition measured on this model: the wait ends on the predicate, and
-a budget that fires is logged and recorded rather than absorbed. What the wait
-cost and what it left behind travel with the stage it precedes (`drain_s`,
-`drain_expired`, `drain_final_backlog`, `drain_busy_sockets`), and so does the
-transition the spine itself saw (`spine_sockets` on both throughput legs,
-`backend_restart`, `spine_attempts`, `spine_first_interval_s`) — a drain that
-ends on its budget leaves the next stage's bulk starting in a state that is
-recorded rather than implied.
+The wait's budget (60 s) is a **safety net, not the mechanism**: the wait ends
+on the predicate, and a budget that fires is recorded rather than absorbed. What
+the wait cost and what it left behind travel with the stage it precedes
+(`drain_s`, `drain_expired`, `drain_final_backlog`, `drain_busy_sockets`), so a
+stage that began in a busy state says so.
 
-A transition cannot always be made quiet *quickly*, so the spine is dialed at
-`SOAK_SPINE_RETRY_S` (seconds into the stage; default `0,25,50,80`) and stops at
-the first dial that carries intervals; a dial that has carried *nothing* is
-abandoned at the next offset so a stuck one cannot eat the retry it exists to
-leave room for. `spine_attempts` counts the dials and `spine_first_interval_s`
-says when the bulk actually started. The single-test `iperf3` backend is
-restarted before every stage's bulk attempt and after a failed sample — a
-teardown that lands on it can leave it answering `Bad file descriptor`, after
-which every later dial hangs — and the restart is recorded.
+Each stage then dials its own bulk spine, with the stage's hold as its window
+and its warm-up scaled to it (`-O` of a quarter of the hold, at most two
+seconds). A stage whose `iperf3` client fails is a typed failure for that cell
+and the run continues: one bad stage cannot poison the next, and the cell
+carries the instrument's own reason.
 
-## Test types
+## Running it
 
-`--test` takes a comma list, because one artifact can carry several types: the
-release sweep runs `rrul,capacity`, so the staged schedule and the load ramp
-travel in the same file (one `meta`, one host, one revision). They are **two
-different instruments** and never cross-check each other: the schedule answers
-"what happens as the path changes over time", the ramp answers "how much can it
-carry before the SLO breaks". Each test entry in the file carries its own
-`test` type, and the gate compares like with like (per tool *and* test type).
+```bash
+# the fast loop, and the loop an optimization should use
+sudo -n just bench
+sudo -n just bench --profile dev --aa
 
-| Type | The question it answers |
-|---|---|
-| `capacity` | how much bulk load can the tool carry while a fresh interactive connection still meets the SLO? (sustainable load + the full response-time curve) |
-| `rrul` | under saturation, what happens to a new visitor's latency as the path changes over time? (the figure in the README) |
-| `soak` | over a long run on a rotating path: does anything leak, drift or degrade? |
-| `cost` | at a fixed operating point, how many CPU-seconds does one carried Gbit/s cost? |
-| `screen` | for a development change: is the difference between two builds — or between two configurations of one build — a claim or noise? |
+# the release sweep: the staged schedule and the load ramp, four arms
+just bench-peers
+sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
-The opt-in diagnostics (`MOLEHILL_MUX_STATS`, `MOLEHILL_KCP_STATS`,
-`MOLEHILL_POOL_STATS`, `MOLEHILL_PLACEMENT_STATS`, `MOLEHILL_UDP_STATS` and
-`MOLEHILL_STRIPE_COUNT`) are settings, documented in
-[configuration.md](configuration.md#diagnostics-switches-opt-in); the per-line
-content of each instrument is the S1 record in
-[internals.md](internals.md#the-tunnel-pool). A run records whichever ones it
-inherited in its results meta (`instrumentation`), so an instrumented run is
-never mistaken for a clean one.
+# one condition, the whole workload (a shape question in minutes)
+sudo -n just bench --profile stage --scenarios cost --arms molehill,frp
 
-### Two ways to isolate one variable
+# an A/B: the same arm twice, two builds, interleaved, verdicts against the
+# run's own noise floor
+sudo -n just bench --profile screen --ab-arm molehill --binary-b /path/to/build
 
-The stage schedule compares a tool against its peers. The two interleaved modes
-compare something against itself, which is what a development decision usually
-needs: both arms run inside every load step of one run, so they sample the same
-machine state, and sequential before/after runs — defeated by epoch drift — are
-never used to decide anything.
+# an experiment with a knob the catalog does not carry: declare it
+sudo -n just bench --arm id=l3-deep,txqueuelen=20000
+```
 
-- **`--ab BIN_A,BIN_B`** (`screen`) swaps two *builds* at every step.
-- **`--ab-variants VAR_A,VAR_B`** (`screen`) swaps two *configuration variants of
-  one binary* the same way: one build, two configs. This is how a configuration
-  decision — `direct` versus a shared pool, for instance — is measured without a
-  build axis riding along. The axis is recorded in the results file
-  (`meta.builds.axis`), and the verdict tool prints it, so a reader cannot
-  mistake a configuration pair for a build pair.
+`just bench-doctor` states what this host can and cannot measure before a run
+has to find out (root, `/dev/net/tun`, iperf3, the peer binaries). The peer
+binaries come from `just bench-peers`: the latest GitHub release assets, never
+built from source, with the resolved versions recorded in the results meta.
 
-**Both metrics get their own table and their own verdict** — throughput and
-interactive p99 — whenever the run carries both. A claim requires every step to
-agree in sign *and* by at least 15 %, per metric.
+## Reading a result
 
-Both are refused where they cannot apply rather than silently ignored: the
-variant pair only makes sense for `screen` (the staged types run one
-configuration throughout) and a mistyped variant name is rejected instead of
-measuring one configuration against itself.
+- **A profile is a resolution, and the smoke profile's is wide.** Repeated runs
+  of one unchanged binary at `smoke` (`--aa`) have claimed differences of
+  13-20 % on the round-trip cells and 23-29 % on the shortest ones: at
+  seconds-long arms the model's own scatter is that large, and it says so
+  rather than hiding it. Treat a smoke claim as a hypothesis, and re-measure it
+  with `dev` — which is what `dev` exists for.
+- **The cell table is a median with its range** over the measured rounds, per
+  arm. Warm-up rounds are excluded; failed rounds are counted and listed with
+  the instrument's typed reason, never averaged in.
+- **The floors table is the run's resolution** per metric: the A/A difference,
+  the A/A scatter and the control's drift over the run, and the largest of the
+  three, which is what a claim must clear. The cell that produced the worst
+  reading is named, because that is where to spend more time.
+- **The verdicts are per scenario and cell**, each tool arm against the
+  control, plus every twin's own verdicts — a metric on which the A/A pair
+  claims a difference is a metric that run cannot resolve, and it says so.
+- **A results file is `meta`, `samples` and `summary`.** `meta` carries the
+  method (the fingerprint, the resolved scenario parameters, the topology, the
+  conditions, the instrument cadences, the SLO), the provenance (revision, the
+  binary's sha256 and its own `--version` line, host identity, both calibration
+  probes) and the arm list; `samples` is one record per arm, round, scenario
+  and cell, each with its metrics, its typed absences and its evidence;
+  `summary` is what the analysis derived from those samples — and
+  `just bench-report` recomputes it, because the samples are the evidence and
+  the summary is a rendering of it.
+- **`just bench-plot` renders exactly the figures this page describes** from
+  any results file: the timeline master, the small multiples, the capacity
+  curve, the UDP ladder, the drift panels and the cost bars.
 
-### The slow visitor (`SOAK_SLOW_VISITOR_BPS`)
+## The gate
 
-Off by default. With it set, every stage also runs one slow visitor: a connection
-to the tool's echo service that reads the response back at that rate, so the
-return path stays backpressured for the whole stage. It exists to make
-head-of-line blocking measurable — whether one slow visitor's stream delays the
-interactive stream sharing its pool — and the number to read beside it is the
-stage's interactive p99, never the visitor's own rate: a paced reader reports the
-knob it was given, which makes its series a stall detector (a stage below the
-knob is the finding), not a capacity number.
+`just bench-gate` is what a run must satisfy before its numbers may be
+published. It reports what it saw for every question and fails the ones a human
+must act on:
 
-An injected visitor is part of the workload, so a run that carries one records a
-different **method version** (`meta.workload_version` 1 without it, 2 with it).
-The gate therefore refuses to compare a probe run against a run without one, and
-refuses two probe runs at different rates. The probe runs in its own process
-like every other probe — the harness never sits in the path it measures — and
-its outcome is recorded per stage (`completed` / `failed` / `killed`, with the
-typed reason) and never fatal. It is refused for `reconnect`, which measures
-cold starts rather than a workload.
+- **coverage** — every cell the scenarios declared, for every arm;
+- **the endpoint invariant** — no L4 or peer arm dialed the backend it forwards
+  to (a transparent arm is the documented exception: the visitor dials the
+  address the client owns, and the client's kernel delivers it);
+- **the SLO on the clean stages** — for the product's own arms; a reference
+  peer that misses it is reported with its number and never blocks a tag;
+- **the drift and wedge axes** — a leak is a slope over time and a wedge is an
+  interactive silence; a slope is only judged when the run is long enough to
+  carry one (fifteen minutes), and a shorter run's slopes are reported as
+  context;
+- **the capacity ramp** — a ramp that sustained nothing is not a reading;
+- and, with `--baseline`, the **regression half**: the same comparison
+  `just bench-compare` makes, refused unless the two files' method records
+  match.
 
-## What this model cannot answer
+## What the model cannot answer
 
 Stated so a reader does not ask a chart for something it never measured:
 
-- **One sample per stage.** A stage's numbers come from one walk of that
-  schedule, so a single run cannot state its own repeatability for a class the
-  schedule visits once. The schedule visits `clean` twice (the run's own
-  replicate, reported by `just soak-check`), and the shaped classes' repeatability
-  was measured separately: three runs of one unchanged method moved a shaped p99
-  cell by 5-24 % and a shaped bulk cell by 0.2-3 % on this host. A cross-run
-  difference smaller than the class's own
-  spread is not resolvable by one pair of runs — that is what the `screen`
-  interleave is for, and it is why `soak-check` refuses a difference verdict on a
-  shaped stage at all (see [How to read a cell](#how-to-read-a-cell)).
-- **The control plane under degradation.** Only the data plane is shaped; the
+- **A number from another host.** The host identity and the two calibration
+  probes travel in every file; two runs on different machines are refused, and
+  two runs on one machine whose probes drifted beyond tolerance are refused
+  too.
+- **Two arms at the loopback ceiling.** On one host the top of the range is the
+  path itself, not the tool, so the arms that reach it cannot be ordered by a
+  run: across three sweeps of identical code the two fastest read 15.9-22.2 and
+  12.8-20.4 Gbit/s — swings wide enough to *reverse* their order — while a
+  reference tool an order of magnitude below moved by under 3 %. Read those
+  rows as one reading of the host's state, and never carry their order as a
+  standing claim.
+- **One sample per condition.** A staged cell is one walk of that schedule, so
+  a single run cannot state its own repeatability for a condition it visits
+  once. The schedule visits `clean` twice (the run's own replicate) and the
+  A/A pair measures the rest; a difference smaller than the floors is not
+  resolvable by that run.
+- **The control plane under degradation.** Only the data leg is shaped: the
   tool's own control channel stays on the unshaped path, because shaping it
   turns a capacity measurement into a wedge study. Anything the control channel
-  does *under* loss (heartbeat survival, reconnection behaviour) is outside
-  this model's reach.
-- **A tool's own internals.** Everything measured is externally observable, so
-  a peer tool and molehill are measured identically — and no internal counter
-  of either appears in the comparison. The opt-in `MOLEHILL_*` switches add
-  molehill-only diagnostics to a run, and a run that inherits one records it in
-  `meta.instrumentation`.
-- **Two arms at the loopback ceiling.** On one host the top of the range is the
-  loopback path itself, not the tool, so the arms that reach it cannot be
-  ordered by a run. Across three sweeps of identical code (only tests and docs
-  changed between them) the two that do here read 15.9-22.2 and 12.8-20.4
-  Gbit/s — swings of 39 % and 59 %, wide enough to *reverse* their order — while
-  `frp` (6.04-6.19) and `nps` (0.133-0.136), an order of magnitude below the
-  ceiling, moved by under 3 %. The host's own loopback probe stayed inside
-  21.6-21.9 Gbit/s across the same runs, so the swing is not the path. Read those two rows
-  as one reading of the host's state, never carry their order as a standing
-  claim, and never read a run-to-run difference between them as a code change.
-- **Which configuration a peer number describes.** The published four-tool
-  table is molehill's **default configuration** (plain transport, `multiplex`
-  mode, one pool per service). The shared elastic pool (`--variants shared`),
-  the Noise transport, the KCP carrier and `direct` mode are separate arms, and
-  the per-decision measurements below are the only recorded basis for choosing
-  between them.
+  does *under* loss is outside this model's reach.
+- **A tool's internals.** Everything measured is externally observable, so a
+  peer binary and molehill are measured identically — and no internal counter
+  of either appears in a comparison. The opt-in `MOLEHILL_*` switches add
+  molehill-only diagnostics to a run; a run that inherits one records it in its
+  results meta.
+- **Anything no tool-free path can run.** A scenario that cannot run on the
+  control arm is `diagnostic` by declaration: it produces numbers and never a
+  verdict.
+
+
+
+Stated so a reader does not ask a chart for something it never measured:
 
 ## What each configuration choice costs (per-decision measurements)
 
@@ -382,7 +542,7 @@ Which setting to pick, and why:
 for what a per-decision figure is and is not comparable with, see
 [Comparability](#comparability).
 
-## The transparent-L3 wire question (not part of the soak model)
+## The transparent-L3 wire question (the acceptance harness)
 
 An L3 client carries whole IP packets, so the question "how much of the wire is
 header, and how much of *that* could a compressor take?" has its own instrument:
@@ -486,199 +646,7 @@ matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), and `CLAIM_MODE`
 (unset, which measures the product's own default; `multiplex` selects the other
 data-channel mode).
 
-## The bench model (the measurement standard)
-
-Every performance claim about a change is made with one model:
-`benches/scripts/bench/`. It is not the sweep above, and the two share no
-numbers. The sweep answers *how does a tool behave while the path degrades,
-against its peers*, one sample per stage; the model answers *what did this
-change cost, and is the difference larger than this run's own ability to
-measure it*, over repeated rounds with a control in every one. A number from
-one is not comparable with a number from the other.
-
-The per-question instruments that used to live beside the sweep — a comparison
-runner for the L3 and L4 arms, a memory sampler, an HTTP latency script — are
-scenarios of this model now, or they are gone: a number that is not in the
-registry below has no definition to be compared with.
-
-```bash
-sudo -n just bench                     # the smoke profile, about a minute
-sudo -n just bench --profile dev --aa  # the default loop for an optimization
-sudo -n just bench-doctor              # what this host can and cannot measure
-just bench-report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
-just bench-compare a.json b.json       # A/B two runs, or refuse to
-just bench-selfcheck                   # the model's own checks (a fast gate)
-```
-
-### The rules the model enforces
-
-- **A metric is defined once, in code.** Unit, direction, the denominator it is
-  a ratio over, the workload kinds that can produce it and the smallest
-  difference worth calling a claim all live in `model.METRICS`; the table below
-  is generated from that registry and `just bench-list` prints it. A metric
-  described one way and computed another fails `just bench-selfcheck`.
-- **A control arm is mandatory.** Every scenario also runs on the same
-  topology, ports and backend with no tool in the path. Without it a slow probe
-  and a slow tunnel are the same reading, which is why the model always reports
-  a tool arm *against its own control* rather than on its own.
-- **One topology for every arm.** Three network namespaces, two veth pairs and
-  two TUN devices; the L4, L3 and control arms differ in the address the
-  visitor dials and in the mode written into their config, and in nothing else
-  — same binary, same backend, same ports, same probe, same phase of the run.
-  That is what makes an L3 number and an L4 number comparable at all. It costs
-  root, which `just bench-doctor` states before a run has to find out.
-- **A run states its whole method before its first sample.** The results file
-  carries a fingerprint over the topology, the scenarios and their *resolved*
-  parameters, the instrument cadences and the model's own code. Two files may
-  only be compared when it matches, and `just bench-compare` names every key
-  that differs instead of printing a difference between two methods.
-- **The run measures its own resolution.** One arm is measured twice under two
-  names (`--aa`; on by default in `dev` and `full`), and the difference between
-  those two halves — paired round by round, so the host's drift cancels — is
-  the smallest difference the run can believe. Every verdict raises the
-  metric's own materiality floor to that number, and the run prints the floors
-  beside its tables. A resolution of 16 % is a statement about the run, not an
-  excuse: it says what to change (longer workloads, more rounds) to resolve
-  more.
-- **A verdict has five states, and "no claim" is one of them.** `claim` needs
-  every paired round to agree in sign *and* both floors cleared; `directional`
-  is a direction with a disagreement or a floor in the way; `indistinguishable`
-  is inside the run's own scatter; `single-round` refuses to read a direction
-  into one measurement; `unavailable` names what was not measured. A metric no
-  arm could produce is reported with the instrument's reason, never as zero.
-- **Evidence stays with the number.** Each cell records the commands it ran,
-  the counters it read (per-interface bytes, packets and drops; CPU-seconds and
-  `/proc/<pid>/io` per daemon; the namespaces' TCP MIB; peak sockets), the raw
-  per-round sample arrays, and the log its probe left behind. The results file
-  is written as the run goes, so an interrupted campaign is still analysable.
-- **Results live outside the tree.** A run writes `~/tmp/bench-<stamp>.json`
-  and its artifacts beside it (the invoking user's home, even under `sudo`);
-  `--out`/`--work` move them, and an existing `--out` is refused unless
-  `--force`. A results file is evidence for a decision, not a repository
-  artifact — the release sweep above owns the committed numbers.
-
-### The metrics
-
-Generated from `model.METRICS`; `just bench-list` prints the same registry,
-and the definitions are what the report and the verdict render.
-
-| metric | unit | direction | what it is | divided by |
-|---|---|---|---|---|
-| `throughput_gbps` | Gbit/s | higher is better | receiver-window payload bytes x 8 / measured window | the workload's measured window |
-| `offered_gbps` | Gbit/s | context, not a verdict | visitor link egress bytes x 8 / measured window | the workload's measured window |
-| `rate_per_s` | 1/s | higher is better | completed request/response pairs / measured window | the workload's measured window |
-| `rtt_p50_ms` | ms | lower is better | nearest-rank median of the probe's per-request round trips | one request/response pair |
-| `rtt_p99_ms` | ms | lower is better | nearest-rank 99th percentile of the probe's round trips | one request/response pair |
-| `rtt_max_ms` | ms | lower is better | worst single round trip the probe observed | one request/response pair |
-| `rtt_samples` | count | context, not a verdict | round trips the percentile is taken over | none (sample count) |
-| `udp_recv_mbit` | Mbit/s | higher is better | datagrams the probe received x payload / the probe's own measured window (which for a blast includes the drain) | the probe's receive window |
-| `udp_loss_pct` | % | lower is better | (datagrams sent - datagrams received) / datagrams sent | datagrams the probe sent |
-| `udp_gap_p99_ms` | ms | lower is better | 99th percentile of the gaps between replies the probe received | one received datagram |
-| `udp_rtt_p99_ms` | ms | lower is better | 99th percentile of the probe's datagram echo round trips | one echoed datagram |
-| `setup_p50_ms` | ms | lower is better | median time to establish one connection, when the workload opens a fresh one per request (the setup a visitor pays to arrive) | one connection |
-| `cpu_s_per_gbit` | s/Gbit | lower is better | tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered | Gbit on the visitor's link egress |
-| `cpu_cores` | cores | lower is better | tool CPU-seconds / measured window | the workload's measured window |
-| `bytes_per_syscall` | B | higher is better | tool process rchar+wchar / syscr+syscw (the I/O granularity) | one read/write-family syscall |
-| `syscalls_per_s` | 1/s | lower is better | tool process syscr+syscw / measured window | the workload's measured window |
-| `wire_per_visitor_byte` | ratio | lower is better | tunnel-link bytes (both directions) / visitor-link egress bytes | bytes the visitor offered |
-| `mean_carried_packet_b` | B | context, not a verdict | tunnel-link bytes / tunnel-link packets, both directions | one packet on the tunnel link |
-| `rss_peak_mib` | MiB | lower is better | peak RSS summed over the tool's daemons, sampled during the workload | one process set |
-| `fds_peak` | count | lower is better | peak open file descriptors summed over the tool's daemons | one process set |
-| `threads_peak` | count | lower is better | peak thread count summed over the tool's daemons | one process set |
-| `service_sockets_peak` | count | lower is better | peak sockets on the exposed service port in the server's own namespace: the per-visitor state the architecture keeps | one visitor |
-| `retrans_segments` | count | lower is better | TCP segments retransmitted by the visitor and server namespaces | one TCP segment |
-| `dropped_packets` | count | lower is better | packets the topology's interfaces dropped over the window | one packet |
-
-Two conventions the table cannot state, because they belong to the workload:
-
-- **A rate's window is the instrument's own, and it is named.** A bulk rate is
-  the receiver's post-warm-up window (iperf3's); a round-trip rate is the
-  probe's measured window, not the interpreter's start (the start cost is
-  recorded in `meta.probe_startup_s`); a datagram rate is the probe's receive
-  window, which for a blast includes the drain. Counter-derived ratios
-  (`cpu_s_per_gbit`, `wire_per_visitor_byte`, `syscalls_per_s`) use the
-  counters' window, which brackets exactly the workload's process — so a
-  ratio's numerator and denominator cover the same seconds.
-- **`wire_per_visitor_byte` has a floor of 1 for one-way traffic and 2 for a
-  strict request/response workload**, because it counts both directions of the
-  tunnel link and a round trip is carried there twice. Read it against the
-  control's own reading, never against 1.
-
-### The scenarios
-
-| scenario | workload | the claim it supports | headline |
-|---|---|---|---|
-| `bulk-1` | `bulk` | what one bulk TCP stream carries, and what it costs per byte | `throughput_gbps` |
-| `bulk-n` | `bulk` | whether N streams aggregate, or share one ceiling | `throughput_gbps` |
-| `bulk-pair` | `bulk-pair` | whether two services (or two L3 claims) each carry a full stream, which separates a per-flow ceiling from a per-host one | `throughput_gbps` |
-| `rr-1` | `rr` | the round-trip rate and latency of one strict request/response flow | `rtt_p99_ms` |
-| `rr-16` | `rr` | the same, 16 flows at once: aggregate rate and tail latency | `rate_per_s` |
-| `churn-16` | `rr` | a fresh connection per request: the setup cost a visitor pays, and the per-visitor state the architecture keeps | `rate_per_s` |
-| `udp-pace` | `udp` | a paced UDP session: what fraction arrives, and how it is spaced | `udp_loss_pct` |
-| `udp-ladder` | `udp-ladder` | where a UDP path starts shedding, per offered rate | `udp_loss_pct` |
-| `udp-blast` | `udp` | the datagram ceiling when the probe offers as fast as it can | `udp_recv_mbit` |
-
-| profile | measured rounds | budget | what it is for |
-|---|---|---|---|
-| `smoke` | 2 (+1 warm-up) | ~45 s per arm | the fast loop: every headline metric, seconds not minutes |
-| `dev` | 4 (+1 warm-up) | ~150 s per arm | the default for an optimization: every scenario, minutes |
-| `full` | 6 (+1 warm-up) | ~420 s per arm | the release-grade sweep: everything, for as long as it takes |
-
-### Reading a result
-
-- **A profile is a resolution, and the smoke profile's is wide.** Repeated
-  runs of one unchanged binary at `smoke` (`--aa`) have claimed differences of
-  13-20 % on the round-trip cells and of 23-29 % on the shortest ones: at
-  seconds-long arms the model's own scatter is that large, and it says so
-  rather than hiding it. Treat a smoke claim as a hypothesis, and re-measure it
-  with `dev` — which is what `dev` exists for.
-- **The cell table is a median with its range** (`median (min to max)`) over
-  the measured rounds, per arm. Warm-up rounds are excluded; failed rounds are
-  counted and listed with the instrument's typed reason, never averaged in.
-- **The floors table is the run's resolution** per metric: the A/A difference,
-  the A/A scatter and the control's drift over the run, and the largest of the
-  three, which is what a claim must clear. The cell that produced the worst
-  reading is named, because that is where to spend more time.
-- **The verdicts are per scenario and cell**, each tool arm against the
-  control, plus the A/A twin's own verdicts — a metric on which the twin claims
-  a difference is a metric that run cannot resolve, and it says so.
-- **A results file is `meta`, `samples` and `summary`.** `meta` carries the
-  method (the fingerprint, the resolved scenario parameters, the topology, the
-  instrument cadences), the provenance (revision, the binary's sha256 and its
-  own `--version` line, host identity, both calibration probes) and the arm
-  list; `samples` is one record per arm, round, scenario and cell, each with
-  its metrics, its typed absences and its evidence; `summary` is what the
-  analysis derived from those samples — and `just bench-report` recomputes it,
-  because the samples are the evidence and the summary is a rendering of it.
-- **`just bench-compare` compares two files per arm id**: the same arm in two
-  builds reads as "this change did X to this arm", and the control arm's own
-  delta is printed first as the drift between the two runs. The comparison is
-  refused, with every blocker named, if the fingerprints differ, if the host
-  identity differs, or if either file's CPU or loopback probe is missing or
-  disagrees beyond its tolerance (25 % and 15 %; the same two probes and the
-  same reasoning as [Comparability](#comparability) below). A run with no A/A
-  twin carries no measurement of its own scatter, so a comparison involving one
-  reports every difference as `directional` and never as a claim: run both
-  sides with `--aa` when the answer is meant to decide something.
-
-### What the model cannot answer
-
-- **A number from another host.** The host identity and the two calibration
-  probes travel in every file; two runs on different machines are refused, and
-  two runs on one machine whose probes drifted beyond tolerance are refused
-  too.
-- **Anything the control arm cannot reach.** A scenario that no tool-free path
-  can run is `diagnostic` by declaration (the catalog marks it) and produces
-  numbers with no verdict.
-- **The kernel's own behaviour under a shaped path**, and a tool's internals:
-  the model shapes one leg of its topology and reads only externally
-  observable state, so a `MOLEHILL_*` counter never appears in a comparison.
-  The UDP queue question below is a molehill-only *diagnostic* for exactly that
-  reason.
-- **The release sweep's questions** — peer tools, a scripted degradation
-  timeline, drift over hours. Those stay with the sweep.
-
-## The UDP queue question (not part of the soak model)
+## The UDP queue question (a molehill-only diagnostic)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the
 stage schedule, so it has its own instrument: `benches/scripts/udp_stress.py`
@@ -696,131 +664,59 @@ configuration page beside `udp_workers`. The probe behind it is
 your own host.
 
 ## Comparability
-
-How to read one individual results cell — which side speaks, what a missing
-reading says, the sample count — is [How to read a cell](#how-to-read-a-cell).
-
-- **Same model, same method, same host.** Every results file records the method
-  version, the host and the harness revision; a number from another host or
-  another model is context, not a baseline.
-- **The gate compares the method record, not just its version number.** A
-  method version is one integer for the whole model, so it cannot notice that
-  the stage transition, the drain predicate, the retry schedule or a probe rate
-  changed underneath it. `soak_check.METHOD_KEYS` lists the keys that carry the
-  method (the schedule, the shaper classes, the load, the SLO, the probe rates
-  and the transition settings), and a comparison is refused — naming the keys
-  that differ, and the keys a file does not record at all — rather than printed.
-  An absent key is not read as a default: it means that file predates the
-  instrument, and inventing a value for it would invent a method.
-- **Same host — the same measured state, riding the same path.** The host is
-  recorded as `hostname` (what a reader recognises), `host_id` (the machine id
-  plus the CPU model and core count, hashed) and **two** tool-free probes the
-  runner measures before every run, each carrying its own spread:
-  `host_calibration` for *state* (SHA-256 over a 192 MiB buffer, median of
-  three, MiB/s) and `host_loopback` for the *path* the fast cells ride (512 MiB
-  through one loopback socket pair, median of five, **pinned to one CPU in a
-  child process of its own**, Gbit/s — unpinned, the two threads' cores decide
-  which copy path they get and the probe reads bimodally across processes,
-  29.4-29.7 against 34.2-34.4 Gbit/s on one idle host, which a comparability key
-  cannot carry; and the pin lives in a child because `sched_setaffinity` is
-  inherited by everything the runner spawns, so pinning in place confines the
-  whole run — tools, clients and samplers — to one core). The CPU budget and
-  the loopback ceiling are properties of the *machine*, so a containerized bench
-  host changing its hostname on every restart must not break comparability —
-  that is what `host_id` is for. But an identity key is a *name*, and on a host
-  with no readable machine id it reduces to `cpu_model | nproc`: two different
-  machines can then hash to the same host, and one machine can be a different
-  machine's worth of busy between two runs. A run is therefore comparable only
-  if the identity matches **and** both probes agree: the CPU workload within
-  25 % (`soak_check.HOST_CALIBRATION_TOLERANCE_PCT`) and the loopback path
-  within 15 % (`soak_check.HOST_LOOPBACK_TOLERANCE_PCT` — the pinned probe
-  repeats to ~1.5 % across processes and drops ~5 % under four busy loops,
-  against the 25-39 % it has to catch). The two are not
-  redundant — the CPU probe repeats to ~2 % and is *blind* to the loopback
-  ceiling, which two container instances of one `host_id` moved by 25-39 % on
-  the clean cells of the two arms that reach it while the CPU probe read 1.7 %
-  apart — so neither one alone certifies a comparison. A results file that
-  predates a probe is reported as *unverifiable* for that probe rather than read
-  as agreement; a file with no `host_id` at all falls back to the recorded
-  hostnames, which is conservative in the safe direction (refusing to compare).
-- **Every blocking reason is reported, not just the first.** A baseline can
-  fail more than one test, and naming only the first would suggest that
-  clearing it makes the pair comparable.
-- **A repeated stage class is the run's own replicate.** The schedule measures
-  `clean` at both ends of every timeline, so those two readings are two samples
-  of one condition about an hour apart: `just soak-check` reports their spread,
-  and it is the scale every between-tool difference has to clear. It is
-  reported, never judged — variance is data, and a threshold on it would be
-  invented.
-- **The per-decision figures rest on a retired instrument.** Releases up to
-  v0.8.x measured one average per tool per network condition, in a cold-started
-  process, and reported a median over repetitions. Those tables cannot be
-  compared with these figures — an average per cold cell cannot see a wedge, and
-  several of this model's findings are wedges. Where the per-decision table
-  below still rests on them it says so, and they are directional: re-measure
-  your own case. Historical numbers stay in the release notes of their own
-  version.
-- **Variance is stated, not smoothed.** If a difference sits inside the spread
-  of the runs being compared, it is reported as directional and no claim is
-  made from it.
+- **Same model, same method, same host.** Every results file records the
+  fingerprint, the host identity and both calibration probes; a number from
+  another host or another method is context, not a baseline.
+- **The comparison is refused, not approximated.** `just bench-compare` names
+  every blocker — a differing method key, a missing probe, a host that
+  disagrees beyond its tolerance (25 % for the CPU probe, 15 % for the loopback
+  one; the same two probes the gate uses) — and a run with no A/A pair reports
+  every between-file difference as `directional`, never as a claim.
+- **Within one campaign the arms are comparable by construction**: one
+  topology, one backend, one binary per arm, one rotation, and a control in
+  every round.
+- **The soak records are history, not a baseline.**
+  `benches/records/results-soak-vX.Y.Z.json` were measured with the model this
+  one replaced: a different schema, different instruments and a different
+  definition of a cell. The gate refuses one as a baseline, and the numbers in
+  the released tables stand as what was measured then, with
+  [the per-decision table](#what-each-configuration-choice-costs-per-decision-measurements)
+  as the only surviving basis for choosing between configurations.
+- **Variance is stated, not smoothed.** If a difference sits inside the run's
+  own floors, it is reported as indistinguishable and no claim is made from it.
 - **Stages are compared by occurrence, not by name.** The schedule opens and
-  closes with the same `clean` condition, so the k-th `clean` of one run is
-  compared against the k-th `clean` of the other: the return stage — the
-  recovery axis — is judged against the baseline's *return*, not against its
-  fresh start.
+  closes with the same `clean` condition, so `clean#2` of one run is compared
+  with `clean#2` of another: the return stage — the recovery axis — is judged
+  against the baseline's *return*, not against its fresh start.
 - **The tunnel pool is elastic, so the pool's size is a *result*, not a
-  setting.** A build with the shared elastic pool (`[client.data].shared_pool`,
-  `[client.data].idle_timeout`, `[client.data.tcp|kcp].max_tunnels`) starts
-  **cold** — no tunnel exists until a visitor needs one — and then grows and
-  shrinks on its own up to `max_tunnels`. A configuration that still carries the
-  fixed-count keys does not start; write the replacements in the
-  [configuration migration table](configuration.md#migrating-to-010-removed-keys)
-  instead. The per-decision `count` figures below were measured under that
-  pinned-count model and describe what a *pinned* pool size cost. They are the
-  basis for choosing that cap, not a prediction of what a run's pool will do —
-  the `MOLEHILL_POOL_STATS` timeline is what records the size a run actually
-  used.
+  setting.** A build with the shared elastic pool starts **cold** and grows and
+  shrinks on its own up to `max_tunnels`; the `MOLEHILL_POOL_STATS` timeline is
+  what records the size a run actually used.
 
 ## Reproduce it yourself
 
-On a Linux host with `iperf3` and `tc` (see `just bench-deps`):
+On a Linux host with `iperf3`, `tc` and root (see `just bench-deps`):
 
 ```bash
-just soak-peers    # download the peer tools' latest release binaries
-just soak          # one tool (or a batch) through the stage schedule
-just soak-plot     # render the charts and print the markdown tables
-just soak-check    # verdict: completeness, endpoints, SLO, drift
+just bench-doctor                      # is this host ready?
+just bench-peers                       # the reference tools' release binaries
+sudo -n just bench --profile dev --aa  # a change, measured
+just bench-plot ~/tmp/bench-*.json     # its charts and tables
 ```
 
-The release sweep is one command — the staged schedule and the load ramp in one
-artifact (see [release.md](release.md), "Benchmarks"):
+The release sweep is one command, and the gate is the other:
 
 ```bash
-just soak --test=rrul,capacity --tools molehill,frp,rathole,nps \
-     --out benches/scripts/soak/results-soak-vX.Y.Z.json
+sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
+just bench-gate benches/records/results-bench-vX.Y.Z.json \
+     --baseline benches/records/results-bench-v<previous>.json
 ```
 
-`just soak --help` lists the test types, the variants (`mux`, `shared`,
-`direct`, `mux-off`, `noise`, `noise-direct`, `mux1`, `mux8`, `kcp4`), the
-stage schedule and the batching controls; the load, SLO and sample-rate knobs
-are environment
-variables (`SOAK_*`) and every one of them is echoed into the results meta.
-
-To compare **two of your own builds** — or two configurations of one build —
-without a full run:
-
-```bash
-just soak --test=screen --path=loss1 --streams-max=8 \
-     --ab /path/to/bin-a,/path/to/bin-b --out results-screen.json
-just soak --test=screen --path=clean --ab-variants mux,direct \
-     --out results-screen-variants.json
-just soak-check --screen results-screen.json
-```
-
-The verdict claims a difference only when every step agrees in sign and exceeds
-the threshold, and calls everything else directional. It is **domain-scoped**:
-it says whether to pursue a direction on that path class, never whether the
-change may ship — the sweep and the release gate decide that.
+`just bench --help` lists the profiles, the arms, the conditions and the knobs;
+`just bench-list` prints the registry; and every parameter that changes what a
+number means is recorded in the results file (the resolved scenario parameters,
+the condition, the timeline, the instrument cadences, the SLO), so a chart can
+always be traced back to the method that produced it.
 
 The release gate — what a published number must satisfy before a tag can carry
 it — is documented in [release.md](release.md).

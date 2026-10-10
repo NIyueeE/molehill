@@ -30,7 +30,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "soak"))
 
 import argparse  # noqa: E402
 import contextlib  # noqa: E402
@@ -137,6 +136,20 @@ def cmd_report(args) -> int:
     if not args.markdown:
         print()
         print(analysis.verdicts_text(results))
+    return 0
+
+
+def cmd_gate(args) -> int:
+    """What a run must satisfy before its numbers are published."""
+    results = analysis.load(args.file)
+    baseline = analysis.load(args.baseline) if args.baseline else None
+    lines, failures = analysis.gate(results, baseline)
+    print("\n".join(lines))
+    if failures:
+        print(f"gate: {len(failures)} FAILURE(S)")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
     return 0
 
 
@@ -458,8 +471,8 @@ def _check_fingerprint(c: Checker) -> None:
     class Args:
         tun_mtu = 1400
         link_mtu = 1500
-        shape = "clean"
-        shape_leg = "visitor"
+        condition = "clean"
+        condition_leg = "visitor"
 
     scenarios = [model.SCENARIOS["bulk-1"]]
     method = runner.method_record(model.PROFILES["smoke"], scenarios, Args(), "smoke")
@@ -525,8 +538,8 @@ def _check_socket_query(c: Checker) -> None:
 def _check_topology(c: Checker) -> None:
     c.check(
         "every shape is a netem argument list",
-        all(isinstance(v, list) for v in topology.SHAPES.values()),
-        "a shape is not a list",
+        all(isinstance(c.netem, tuple) for c in model.CONDITIONS.values()),
+        "a condition's netem arguments are not a tuple",
     )
     c.check(
         "both legs are shaped on both ends",
@@ -593,6 +606,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--scenarios", default="", help="comma list of scenario ids")
     run.add_argument("--rounds", type=int, default=0, help="measured rounds per arm")
+    run.add_argument(
+        "--scale",
+        type=float,
+        default=0.0,
+        help="scale every staged timeline's holds (a full sweep in minutes)",
+    )
     run.add_argument("--warmup-rounds", type=int, default=None)
     run.add_argument(
         "--binary", default=str(HERE.parents[2] / "target/release/molehill")
@@ -605,8 +624,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="measure one arm twice as the run's own noise floor",
     )
-    run.add_argument("--shape", default="clean", choices=sorted(topology.SHAPES))
-    run.add_argument("--shape-leg", default="visitor", choices=sorted(topology.LEGS))
+    run.add_argument(
+        "--condition",
+        default="clean",
+        choices=sorted(model.CONDITIONS),
+        help="the path condition the whole campaign runs under",
+    )
+    run.add_argument(
+        "--condition-leg", default="visitor", choices=sorted(topology.LEGS)
+    )
     run.add_argument("--tun-mtu", type=int, default=1400)
     run.add_argument("--link-mtu", type=int, default=1500)
     run.add_argument(
@@ -622,6 +648,13 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("file")
     report.add_argument("--markdown", action="store_true")
     report.set_defaults(func=cmd_report)
+
+    gate = sub.add_parser(
+        "gate", help="what a run must satisfy before its numbers are published"
+    )
+    gate.add_argument("file")
+    gate.add_argument("--baseline", default="", help="a comparable earlier run")
+    gate.set_defaults(func=cmd_gate)
 
     compare = sub.add_parser("compare", help="A/B two results files, or refuse")
     compare.add_argument("a")

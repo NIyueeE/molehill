@@ -46,7 +46,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "higher",
         "definition": "receiver-window payload bytes x 8 / measured window",
         "denominator": "the workload's measured window",
-        "needs": ("bulk", "bulk-pair"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "staged",
+        ),
         "materiality": ("rel", 10.0),
         "precision": 3,
         "headline": True,
@@ -57,9 +61,167 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "none",
         "definition": "visitor link egress bytes x 8 / measured window",
         "denominator": "the workload's measured window",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 10.0),
         "precision": 3,
+    },
+    {
+        "id": "rtt_worst_1s_ms",
+        "unit": "ms",
+        "direction": "lower",
+        "definition": (
+            "the worst one-second mean of the interactive stream's round trips: "
+            "a burst that a percentile over the whole stage would average away"
+        ),
+        "denominator": "one second of the interactive stream",
+        "needs": ("staged",),
+        "materiality": ("rel", 30.0),
+        "precision": 3,
+    },
+    {
+        "id": "rtt_error_rate_pct",
+        "unit": "%",
+        "direction": "lower",
+        "definition": "failed interactive pings / (successful + failed)",
+        "denominator": "one interactive ping",
+        "needs": ("staged", "capacity"),
+        "materiality": ("abs", 0.5),
+        "precision": 4,
+    },
+    {
+        "id": "churn_per_s",
+        "unit": "1/s",
+        "direction": "higher",
+        "definition": "short-lived connections established per second",
+        "denominator": "the stage's measured window",
+        "needs": ("staged",),
+        "materiality": ("rel", 10.0),
+        "precision": 1,
+    },
+    {
+        "id": "drift_rss_mib_per_min",
+        "unit": "MiB/min",
+        "direction": "lower",
+        "definition": (
+            "least-squares slope of the arm's summed RSS over the run: a leak is "
+            "a slope over time, not a level"
+        ),
+        "denominator": "one minute of run time",
+        "needs": ("staged",),
+        "materiality": ("abs", 50.0),
+        "precision": 3,
+    },
+    {
+        "id": "drift_fds_per_min",
+        "unit": "count/min",
+        "direction": "lower",
+        "definition": "least-squares slope of the arm's open descriptors",
+        "denominator": "one minute of run time",
+        "needs": ("staged",),
+        "materiality": ("abs", 1.0),
+        "precision": 3,
+    },
+    {
+        "id": "drift_threads_per_min",
+        "unit": "count/min",
+        "direction": "lower",
+        "definition": "least-squares slope of the arm's thread count",
+        "denominator": "one minute of run time",
+        "needs": ("staged",),
+        "materiality": ("abs", 1.0),
+        "precision": 3,
+    },
+    {
+        "id": "wedge_count",
+        "unit": "count",
+        "direction": "lower",
+        "definition": (
+            "interactive silences longer than 5 s: a tool that stops answering "
+            "under degradation, which an average cannot show"
+        ),
+        "denominator": "one silent stretch",
+        "needs": ("staged",),
+        "materiality": ("abs", 1.0),
+        "precision": 0,
+    },
+    {
+        "id": "wedge_max_s",
+        "unit": "s",
+        "direction": "lower",
+        "definition": "the longest interactive silence in the run",
+        "denominator": "one silent stretch",
+        "needs": ("staged",),
+        "materiality": ("abs", 1.0),
+        "precision": 3,
+    },
+    {
+        "id": "capacity_streams",
+        "unit": "count",
+        "direction": "higher",
+        "definition": (
+            "the highest bulk-stream level whose interactive stream still met "
+            "the SLO, from the capacity ramp"
+        ),
+        "denominator": "one bulk stream",
+        "needs": ("capacity",),
+        "materiality": ("abs", 1.0),
+        "precision": 0,
+        "headline": True,
+    },
+    {
+        "id": "capacity_headroom_pct",
+        "unit": "%",
+        "direction": "higher",
+        "definition": "1 - max sustainable streams / the ramp's ceiling",
+        "denominator": "the ramp's ceiling",
+        "needs": ("capacity",),
+        "materiality": ("abs", 5.0),
+        "precision": 1,
+    },
+    {
+        "id": "startup_s",
+        "unit": "s",
+        "direction": "lower",
+        "definition": (
+            "median time from process start to the service answering a fresh "
+            "connection: what a visitor pays after a restart"
+        ),
+        "denominator": "one cold start",
+        "needs": ("reconnect",),
+        "materiality": ("rel", 20.0),
+        "precision": 3,
+        "headline": True,
+    },
+    {
+        "id": "startup_max_s",
+        "unit": "s",
+        "direction": "lower",
+        "definition": "the worst cold start the run saw",
+        "denominator": "one cold start",
+        "needs": ("reconnect",),
+        "materiality": ("rel", 25.0),
+        "precision": 3,
+    },
+    {
+        "id": "slo_broken",
+        "unit": "bool",
+        "direction": "none",
+        "definition": (
+            "1 when the cell broke the SLO (p99 above 50 ms or error rate above "
+            "0.5 %), so a level's verdict travels with its numbers"
+        ),
+        "denominator": "one measured level or stage",
+        "needs": ("staged", "capacity"),
+        "materiality": ("abs", 1.0),
+        "precision": 0,
     },
     {
         "id": "rate_per_s",
@@ -78,7 +240,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "nearest-rank median of the probe's per-request round trips",
         "denominator": "one request/response pair",
-        "needs": ("rr",),
+        "needs": (
+            "rr",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 3,
     },
@@ -88,7 +254,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "nearest-rank 99th percentile of the probe's round trips",
         "denominator": "one request/response pair",
-        "needs": ("rr",),
+        "needs": (
+            "rr",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 3,
         "headline": True,
@@ -99,7 +269,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "worst single round trip the probe observed",
         "denominator": "one request/response pair",
-        "needs": ("rr",),
+        "needs": (
+            "rr",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 25.0),
         "precision": 3,
     },
@@ -109,7 +283,12 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "none",
         "definition": "round trips the percentile is taken over",
         "denominator": "none (sample count)",
-        "needs": ("rr", "udp"),
+        "needs": (
+            "rr",
+            "udp",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 0.0),
         "precision": 0,
     },
@@ -122,7 +301,10 @@ METRIC_SPECS: tuple[dict, ...] = (
             "window (which for a blast includes the drain)"
         ),
         "denominator": "the probe's receive window",
-        "needs": ("udp", "udp-ladder"),
+        "needs": (
+            "udp",
+            "udp-ladder",
+        ),
         "materiality": ("rel", 10.0),
         "precision": 1,
         "headline": True,
@@ -133,7 +315,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "(datagrams sent - datagrams received) / datagrams sent",
         "denominator": "datagrams the probe sent",
-        "needs": ("udp", "udp-ladder"),
+        "needs": (
+            "udp",
+            "udp-ladder",
+            "staged",
+        ),
         "materiality": ("abs", 1.0),
         "precision": 3,
         "headline": True,
@@ -144,7 +330,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "99th percentile of the gaps between replies the probe received",
         "denominator": "one received datagram",
-        "needs": ("udp", "udp-ladder"),
+        "needs": (
+            "udp",
+            "udp-ladder",
+            "staged",
+        ),
         "materiality": ("rel", 20.0),
         "precision": 3,
     },
@@ -154,7 +344,10 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "99th percentile of the probe's datagram echo round trips",
         "denominator": "one echoed datagram",
-        "needs": ("udp",),
+        "needs": (
+            "udp",
+            "staged",
+        ),
         "materiality": ("rel", 20.0),
         "precision": 3,
     },
@@ -179,7 +372,15 @@ METRIC_SPECS: tuple[dict, ...] = (
             "tool CPU-seconds (user+sys, both daemons) / Gbit the visitor offered"
         ),
         "denominator": "Gbit on the visitor's link egress",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 4,
         "headline": True,
@@ -190,7 +391,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "tool CPU-seconds / measured window",
         "denominator": "the workload's measured window",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 3,
     },
@@ -200,7 +409,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "higher",
         "definition": "tool process rchar+wchar / syscr+syscw (the I/O granularity)",
         "denominator": "one read/write-family syscall",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 1,
     },
@@ -210,7 +427,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "tool process syscr+syscw / measured window",
         "denominator": "the workload's measured window",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 0,
     },
@@ -220,7 +445,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "tunnel-link bytes (both directions) / visitor-link egress bytes",
         "denominator": "bytes the visitor offered",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 10.0),
         "precision": 4,
         "headline": True,
@@ -231,7 +464,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "none",
         "definition": "tunnel-link bytes / tunnel-link packets, both directions",
         "denominator": "one packet on the tunnel link",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 5.0),
         "precision": 1,
     },
@@ -243,7 +484,15 @@ METRIC_SPECS: tuple[dict, ...] = (
             "peak RSS summed over the tool's daemons, sampled during the workload"
         ),
         "denominator": "one process set",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 10.0),
         "precision": 1,
     },
@@ -253,7 +502,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "peak open file descriptors summed over the tool's daemons",
         "denominator": "one process set",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 0,
     },
@@ -263,7 +520,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "peak thread count summed over the tool's daemons",
         "denominator": "one process set",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("rel", 15.0),
         "precision": 0,
     },
@@ -276,7 +541,11 @@ METRIC_SPECS: tuple[dict, ...] = (
             "namespace: the per-visitor state the architecture keeps"
         ),
         "denominator": "one visitor",
-        "needs": ("bulk", "rr"),
+        "needs": (
+            "bulk",
+            "rr",
+            "staged",
+        ),
         "materiality": ("abs", 1.0),
         "precision": 0,
     },
@@ -286,7 +555,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "TCP segments retransmitted by the visitor and server namespaces",
         "denominator": "one TCP segment",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         # Counts are judged in packets, not in percent: a percentage of a small
         # retransmit count is noise, and "a thousand packets" is a finding.
         "materiality": ("abs", 1000.0),
@@ -298,7 +575,15 @@ METRIC_SPECS: tuple[dict, ...] = (
         "direction": "lower",
         "definition": "packets the topology's interfaces dropped over the window",
         "denominator": "one packet",
-        "needs": ("bulk", "bulk-pair", "rr", "udp", "udp-ladder"),
+        "needs": (
+            "bulk",
+            "bulk-pair",
+            "rr",
+            "udp",
+            "udp-ladder",
+            "staged",
+            "capacity",
+        ),
         "materiality": ("abs", 1000.0),
         "precision": 0,
     },
@@ -346,6 +631,103 @@ def metrics_for(kind: str) -> list:
 
 
 # --------------------------------------------------------------------------
+# Conditions and timelines
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Condition:
+    """One path condition: what it emulates, and how it is imposed.
+
+    `netem` is the argument list of a netem qdisc (`[]` is the clean path) and
+    `mtu` is an *interface* property, not a qdisc: a condition that names one
+    changes the path for every packet during that stage, which is why the MTU
+    classes are never in a default timeline. The vocabulary lives here because
+    it is method: a run's fingerprint must move when a condition's meaning
+    moves, and a report must be able to say what a stage emulated.
+    """
+
+    name: str
+    what: str
+    netem: tuple = ()
+    mtu: int | None = None
+
+
+CONDITIONS: dict[str, Condition] = {
+    "clean": Condition("clean", "a healthy network (the control)"),
+    "rtt100": Condition("rtt100", "a long-haul or satellite link", ("delay", "100ms")),
+    "loss1": Condition(
+        "loss1", "a lossy wifi or mobile link", ("delay", "10ms", "loss", "1%")
+    ),
+    "loss5": Condition(
+        "loss5", "a badly congested path", ("delay", "100ms", "loss", "5%")
+    ),
+    "rate100": Condition(
+        "rate100",
+        "a 100 Mbit uplink",
+        ("rate", "100mbit", "delay", "20ms", "limit", "2000"),
+    ),
+    "rate20": Condition(
+        "rate20",
+        "a 20 Mbit uplink",
+        ("rate", "20mbit", "delay", "40ms", "limit", "2000"),
+    ),
+    "jitter": Condition(
+        "jitter", "a bufferbloated access link", ("delay", "20ms", "10ms")
+    ),
+    "mtu1280": Condition("mtu1280", "a tunnel or an IPv6-minimum path", mtu=1280),
+    "loss1_mtu1280": Condition(
+        "loss1_mtu1280",
+        "a lossy link that also fragments",
+        ("delay", "10ms", "loss", "1%"),
+        mtu=1280,
+    ),
+}
+
+
+#: The stage schedules. A timeline is a *list* rather than a dict because the
+#: recovery axis is a repeat: the clean stage at both ends is the run's own
+#: replicate, and its position is part of what it means.
+TIMELINES: dict[str, tuple] = {
+    # The sweep: how a tool behaves as the path degrades, and whether it is
+    # still the tool it was when the path recovers.
+    "sweep": (
+        ("clean", 150.0),
+        ("rtt100", 120.0),
+        ("loss1", 120.0),
+        ("loss5", 120.0),
+        ("rate100", 120.0),
+        ("rate20", 120.0),
+        ("jitter", 120.0),
+        ("clean", 150.0),
+    ),
+    # The drift axis: fewer conditions, longer holds.
+    "soak": (
+        ("clean", 180.0),
+        ("loss1", 180.0),
+        ("rtt100", 180.0),
+        ("loss5", 180.0),
+        ("clean", 180.0),
+    ),
+    # One stage: the fixed operating point a cost or screen run measures.
+    "single": (("clean", 60.0),),
+}
+
+
+#: The service-level objective: the line every chart shares and the one the
+#: capacity ramp breaks on. An *error rate* rather than zero, because zero is
+#: not a property of a tool on a shaped path (measured across four tools: 0 to
+#: 0.31 % on clean stages); half a percent is above every arm measured so far.
+SLO_RTT_P99_MS = 50.0
+SLO_ERROR_RATE_PCT = 0.5
+
+
+def timeline_for(name: str, scale: float = 1.0) -> tuple:
+    """A timeline with every stage's hold scaled, never the order or the set."""
+    if name not in TIMELINES:
+        raise SystemExit(f"unknown timeline {name!r}; known: {', '.join(TIMELINES)}")
+    return tuple((cond, round(secs * scale, 2)) for cond, secs in TIMELINES[name])
+
+
+# --------------------------------------------------------------------------
 # Arms
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -376,6 +758,14 @@ class Arm:
     binary: str = ""
     #: Free-form label recorded in the results (e.g. "A"/"B" for a build pair).
     side: str = ""
+    #: The peer tool this arm runs, when `kind` is "peer" (frp, rathole, nps).
+    tool: str = ""
+    #: What a table calls this arm; the id is what a result file calls it.
+    label: str = ""
+
+    @property
+    def name(self) -> str:
+        return self.label or self.id
 
     @property
     def is_tool(self) -> bool:
@@ -383,10 +773,14 @@ class Arm:
 
     @property
     def mode_flag(self) -> str:
+        if self.kind == "peer":
+            raise ValueError(f"a peer arm ({self.tool}) has no mode flag")
         return "--transparent" if self.kind == "l3" else "--client"
 
     @property
     def data_mode(self) -> str:
+        if self.kind == "peer":
+            return ""
         if self.kind == "l3":
             return self.mode if self.mode in ("direct", "multiplex") else "direct"
         return self.mode
@@ -399,9 +793,12 @@ class Arm:
         server exposes its own listener, an L3 client exposes the address its
         TUN owns, and the control arm exposes the backend directly.
         """
-        return {"control": TOPO_CONTROL_IP, "l4": TOPO_SRV_IP, "l3": TOPO_PUBLIC_IP}[
-            self.kind
-        ]
+        return {
+            "control": TOPO_CONTROL_IP,
+            "l4": TOPO_SRV_IP,
+            "peer": TOPO_SRV_IP,
+            "l3": TOPO_PUBLIC_IP,
+        }[self.kind]
 
     @property
     def backend_bind(self) -> str:
@@ -415,6 +812,7 @@ class Arm:
         return {
             "control": TOPO_CONTROL_IP,
             "l4": "127.0.0.1",
+            "peer": "127.0.0.1",
             "l3": TOPO_PUBLIC_IP,
         }[self.kind]
 
@@ -447,6 +845,13 @@ ARM_CATALOG: dict = {
     "l3": Arm("l3", "l3", mode="direct"),
     "l3-mux": Arm("l3-mux", "l3", mode="multiplex"),
     "l3-deep": Arm("l3-deep", "l3", mode="direct", txqueuelen=DEEP_TXQUEUELEN),
+    # The reference tools. Their adapters live in `peers.py`; the arm is the
+    # same shape as any other, which is what makes the comparison one run.
+    "frp": Arm("frp", "peer", tool="frp", label="frp"),
+    "rathole": Arm("rathole", "peer", tool="rathole", label="rathole"),
+    "nps": Arm("nps", "peer", tool="nps", label="nps"),
+    # The sweep's own row name: the product in its default configuration.
+    "molehill": Arm("molehill", "l4", label="molehill"),
 }
 
 
@@ -463,6 +868,8 @@ def arms_from_names(names: list, binary: str) -> list:
             pool_cap=a.pool_cap,
             txqueuelen=a.txqueuelen,
             binary=binary,
+            tool=a.tool,
+            label=a.label,
         )
         for a in (ARM_CATALOG[n] for n in names)
     ]
@@ -494,7 +901,17 @@ def parse_arm_spec(spec: str) -> Arm:
             raise ValueError(f"arm spec segment needs key=value: {part!r}")
         key, value = (s.strip() for s in part.split("=", 1))
         fields[key] = value
-    known = {"id", "kind", "mode", "pool_cap", "txqueuelen", "binary", "side"}
+    known = {
+        "id",
+        "kind",
+        "mode",
+        "pool_cap",
+        "txqueuelen",
+        "binary",
+        "side",
+        "tool",
+        "label",
+    }
     unknown = sorted(set(fields) - known)
     if unknown:
         raise ValueError(f"unknown arm key(s) {unknown}; known: {sorted(known)}")
@@ -502,8 +919,8 @@ def parse_arm_spec(spec: str) -> Arm:
         if numeric in fields:
             fields[numeric] = int(fields[numeric])
     kind = fields.pop("kind", None) or fields.get("id", "")
-    if kind not in ("control", "l4", "l3"):
-        raise ValueError(f"unknown arm kind {kind!r}; known: control, l4, l3")
+    if kind not in ("control", "l4", "l3", "peer"):
+        raise ValueError(f"unknown arm kind {kind!r}; known: control, l4, l3, peer")
     return Arm(kind=kind, **fields)
 
 
@@ -549,6 +966,37 @@ class Scenario:
             )
         merged.update(overrides)
         return merged
+
+
+def profile_arms(profile: dict) -> list:
+    """The arms a profile runs when the command line names none."""
+    names = profile.get("arms") or ()
+    return list(names)
+
+
+def expected_cells(scenario_id: str, params: dict) -> list:
+    """The cells a scenario must produce for one arm, in order.
+
+    The gate checks this list, so "the run covered what it claimed" is a
+    declared expectation rather than a guess from whatever arrived. A staged
+    scenario expects one cell per stage *occurrence* (`clean`, `clean#2`), a
+    capacity ramp expects one per level plus its summary, and every other
+    scenario expects exactly one.
+    """
+    scenario = SCENARIOS[scenario_id]
+    if scenario.kind == Kind.STAGED:
+        holds = timeline_for(params["timeline"], params.get("scale", 1.0))
+        seen: dict = {}
+        cells = []
+        for condition, _ in holds:
+            seen[condition] = seen.get(condition, 0) + 1
+            cells.append(
+                condition if seen[condition] == 1 else f"{condition}#{seen[condition]}"
+            )
+        return [*cells, "run"]
+    if scenario.kind == Kind.CAPACITY:
+        return [f"L{n}" for n in range(1, params["streams_max"] + 1)] + ["ramp"]
+    return [""]
 
 
 def scenario_catalog() -> list:
@@ -646,6 +1094,86 @@ def scenario_catalog() -> list:
             headline="udp_loss_pct",
         ),
         Scenario(
+            id="timeline",
+            kind="staged",
+            claim=(
+                "how the tool behaves as the path degrades and recovers: one "
+                "interactive stream, N bulk streams, a churn stream and a UDP "
+                "session, over a scripted schedule of conditions, in place"
+            ),
+            params={
+                "timeline": "sweep",
+                "scale": 1.0,
+                "streams": 4,
+                "ping_interval_ms": 50,
+                "udp_interval_ms": 20,
+                "churn_per_s": 16,
+                "min_hold_s": 20.0,
+            },
+            headline="rtt_p99_ms",
+        ),
+        Scenario(
+            id="soak",
+            kind="staged",
+            claim=(
+                "over a long run on a rotating path: does anything leak, drift "
+                "or degrade"
+            ),
+            params={
+                "timeline": "soak",
+                "scale": 1.0,
+                "streams": 4,
+                "ping_interval_ms": 50,
+                "udp_interval_ms": 20,
+                "churn_per_s": 16,
+                "min_hold_s": 20.0,
+            },
+            headline="rtt_p99_ms",
+        ),
+        Scenario(
+            id="cost",
+            kind="staged",
+            claim=(
+                "at one fixed operating point, how many CPU-seconds one carried "
+                "Gbit/s costs"
+            ),
+            params={
+                "timeline": "single",
+                "scale": 1.0,
+                "streams": 6,
+                "ping_interval_ms": 50,
+                "udp_interval_ms": 20,
+                "churn_per_s": 16,
+                "min_hold_s": 20.0,
+            },
+            headline="cpu_s_per_gbit",
+        ),
+        Scenario(
+            id="capacity",
+            kind="capacity",
+            claim=(
+                "how much bulk load the tool carries while a fresh interactive "
+                "connection still meets the SLO"
+            ),
+            params={
+                "streams_max": 8,
+                "settle_s": 6.0,
+                "ping_interval_ms": 50,
+                "condition": "clean",
+            },
+            headline="capacity_streams",
+        ),
+        Scenario(
+            id="reconnect",
+            kind="reconnect",
+            claim=(
+                "what a visitor pays after a restart: time from process start to "
+                "answering"
+            ),
+            params={"reps": 5, "timeout_s": 30.0},
+            headline="startup_s",
+        ),
+        Scenario(
             id="udp-blast",
             kind="udp",
             claim="the datagram ceiling when the probe offers as fast as it can",
@@ -734,6 +1262,52 @@ PROFILES: dict[str, dict] = {
     },
 }
 
+#: The rest of the profiles are the sweep's own shapes. Each one is a budget:
+#: `stage` answers a shape question in two minutes, `soak` is the drift axis,
+#: `screen` is the interleaved A/B, and `sweep` is what a release publishes.
+PROFILES |= {
+    "stage": {
+        "what": "one condition, the whole workload: a shape question, minutes",
+        "rounds": 2,
+        "warmup_rounds": 1,
+        "scenarios": ("cost",),
+        "budget_s": 150.0,
+        "aa": True,
+        "arms": ("control", "molehill", "l3"),
+        "params": {"cost": {"scale": 1.0, "streams": 4}},
+    },
+    "soak": {
+        "what": "the drift axis: a rotating path held for a long time",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("soak",),
+        "budget_s": 1200.0,
+        "aa": False,
+        "arms": ("molehill",),
+        "params": {"soak": {"scale": 1.0, "streams": 4}},
+    },
+    "screen": {
+        "what": "a development A/B: one condition, the two builds interleaved",
+        "rounds": 3,
+        "warmup_rounds": 1,
+        "scenarios": ("cost",),
+        "budget_s": 240.0,
+        "aa": False,
+        "arms": (),
+        "params": {"cost": {"scale": 0.5, "streams": 4}},
+    },
+    "sweep": {
+        "what": "the release sweep: the staged schedule and the load ramp",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "scenarios": ("timeline", "capacity"),
+        "budget_s": 2400.0,
+        "aa": False,
+        "arms": ("molehill", "frp", "rathole", "nps"),
+        "params": {},
+    },
+}
+
 DEFAULT_PROFILE = "smoke"
 
 
@@ -750,6 +1324,16 @@ def profile_of(name: str, args) -> dict:
         profile["rounds"] = args.rounds
     if getattr(args, "warmup_rounds", None) is not None:
         profile["warmup_rounds"] = args.warmup_rounds
+    scale = getattr(args, "scale", None)
+    if scale:
+        # A staged scenario's budget is its timeline's holds: scaling them is
+        # how a full sweep becomes a five-minute look without changing the
+        # *shape* of the schedule, and it is recorded in the fingerprint like
+        # every other method parameter.
+        for scenario in SCENARIOS.values():
+            if scenario.kind == Kind.STAGED:
+                profile["params"].setdefault(scenario.id, {})
+                profile["params"][scenario.id]["scale"] = scale
     budget = getattr(args, "budget_s", None)
     del budget  # consumed by the caller, kept out of the fingerprint
     return profile
@@ -763,8 +1347,20 @@ class Kind:
     RR: ClassVar[str] = "rr"
     UDP: ClassVar[str] = "udp"
     UDP_LADDER: ClassVar[str] = "udp-ladder"
+    STAGED: ClassVar[str] = "staged"
+    CAPACITY: ClassVar[str] = "capacity"
+    RECONNECT: ClassVar[str] = "reconnect"
 
-    ALL: ClassVar[tuple] = (BULK, BULK_PAIR, RR, UDP, UDP_LADDER)
+    ALL: ClassVar[tuple] = (
+        BULK,
+        BULK_PAIR,
+        RR,
+        UDP,
+        UDP_LADDER,
+        STAGED,
+        CAPACITY,
+        RECONNECT,
+    )
 
 
 def validate_scenarios(names: list) -> list:

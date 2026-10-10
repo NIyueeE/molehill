@@ -163,7 +163,7 @@ flowchart TD
 | transport | `"plain"` | 不加密;每字节开销最低 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
 | 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节,之后池就热了,并可按需长到 `max_tunnels` |
-| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型) |
+| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断) |
 
 各选项的**实测代价**——这些取舍所依据的数字及其来源——见
 [基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
@@ -222,7 +222,7 @@ transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" =
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:报文上限是服务自身的属性,不随该值变化(多访客下 1400 字节数据报约 1 Gbit/s 即饱和),超过上限的数据报会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)。实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型)
+udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:报文上限是服务自身的属性,不随该值变化(多访客下 1400 字节数据报约 1 Gbit/s 即饱和),超过上限的数据报会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)。实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断)
 udp_forwarder_ipv6 = false # 可选。仅 UDP 服务:UDP 转发器连接本地服务时优先使用 IPv6。默认:false
 udp_buffer_size = 2048 # 可选。UDP 接收缓冲区,单位字节。默认:2048,最大 65535
 udp_idle_timeout = 60 # 可选。客户端上空闲 UDP 对端映射被丢弃的秒数(其本地 socket——即本地服务看到的源端口——随之回收)。默认:60
@@ -410,7 +410,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 `max_tunnels` 上限——但有**一处不同的默认值**:模式默认 `direct`,因为一条认领只有
 一条通道,除非打开 `shared_pool`,多路复用池对它没有任何好处。在同一主机、同一负载下
 实测:`direct` 的线上字节少 6%,每包 CPU 少 33%,每秒往返次数多 65%
-(见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题不属于-soak-模型))。
+(见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
 若一个客户端要用一个池服务多条认领,就写 `default_mode = "multiplex"` 与
 `shared_pool = true`。
 

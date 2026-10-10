@@ -178,10 +178,10 @@ code-level.**
      front of the real section would be published as the notes);
   4. `just check` is green on the tagged commit;
   5. the benchmark ritual is done (docs/release.md):
-     `results-soak-vX.Y.Z.json`, the new chart, and the README benchmark
-     table are refreshed in the release commit, and `just soak-check` is
-     green against the previous tag — capacity, SLO and drift must not
-     regress.
+     `benches/records/results-bench-vX.Y.Z.json`, the chart set, and the README
+     benchmark table are refreshed in the release commit, and `just bench-gate`
+     is green against the previous release — coverage, the SLO, drift and the
+     capacity ramp must not regress.
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 - **Mechanics live in [docs/release.md](docs/release.md)**: the exact changelog
@@ -349,8 +349,8 @@ revision) and are as binding as the lint discipline in §2.
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
   every reader of a key you touch, and keep a completeness gate in the
-  ritual (`soak_check.py`: the completeness of every test's series, the
-  endpoint invariant, the SLO verdicts).
+  ritual (`bench.py gate`: the coverage of every declared cell, the endpoint
+  invariant, the SLO verdicts, the drift and wedge axes).
 - **Prove provenance.** A run must correspond to a committed revision and a
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that
@@ -363,13 +363,16 @@ revision) and are as binding as the lint discipline in §2.
   its whole method as a fingerprint before its first sample, and a difference
   is only a claim when it clears both the metric's materiality floor and the
   run's *own measured noise* (`--aa`; the floors are printed with the tables).
-  A number produced any other way is context, not evidence — including one from
-  the soak sweep, which answers a different question (peers, a scripted
-  timeline) and shares no numbers with the model. Adding a metric means adding
-  its declaration, its scenario support and its row on the benchmarks page
-  (both languages): `githooks/check-docs` fails a registry entry that is not
-  documented, and `just bench-selfcheck` — a fast gate — fails a declaration
-  the code contradicts.
+  A number produced any other way is context, not evidence. The sweep a release
+  publishes *is* the model's `sweep` profile — the timeline and capacity
+  scenarios over the product and the reference tools — so there is one runner,
+  one schema and one gate; the records measured with the model it replaced stay
+  in `benches/records/` as published history and are never a regression
+  baseline (the gate refuses a baseline whose method record does not match).
+  Adding a metric means adding its declaration, its scenario support and its
+  row on the benchmarks page (both languages): `githooks/check-docs` fails a
+  registry entry that is not documented, and `just bench-selfcheck` — a fast
+  gate — fails a declaration the code contradicts.
 - **Docs move with the data.** The method's public home is
   `docs/benchmarks.md` (+ `.zh.md`): it owns what is measured, how to read a
   chart, the stage schedule, the test types, the per-decision measurements and

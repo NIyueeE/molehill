@@ -25,7 +25,9 @@ The discipline every kind keeps, in the same shape:
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
+import statistics
 import subprocess
 import sys
 import threading
@@ -34,12 +36,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import instruments as inst
-import lib
+import iperf
 import model
 import topology
 
 HERE = Path(__file__).resolve().parent
 RR_PROBE = HERE / "probes" / "rr.py"
+SERIES_PROBE = HERE / "probes" / "series.py"
 UDP_PROBE = HERE / "probes" / "udp.py"
 
 #: The backend inside the client namespace. It announces every accepted peer
@@ -136,6 +139,14 @@ class Ctx:
     #: backend must see the *visitor*, and on L4 the client. It is the
     #: transparency evidence, recorded beside the numbers rather than assumed.
     peers_of: object = None
+    #: The campaign's condition and the leg it is imposed on: a staged scenario
+    #: changes conditions *within* a run and must put this one back.
+    leg: str = "visitor"
+    condition: object = None
+    #: Restart the arm's daemons and return the seconds until the service
+    #: answers — the reconnect scenario's instrument (the runner owns the
+    #: processes, the workload owns the measurement).
+    restart_arm: object = None
 
 
 class Backend:
@@ -279,6 +290,9 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
     peaks = window.get("peaks", {})
     sockets = window.get("sockets", {})
     out = {
+        "dial_host": ctx.arm.dial_host,
+        "backend_bind": ctx.arm.backend_bind,
+        "arm_kind": ctx.arm.kind,
         "window_s": sample.get("elapsed_s"),
         "cpu_s": sample.get("cpu_s"),
         "cpu_s_total": sample.get("cpu_s_total"),
@@ -342,8 +356,8 @@ def _counter_cell(spot: Spot, metrics: dict, extra: dict | None = None) -> Cell:
     )
 
 
-def _dial(ctx: Ctx, params: dict) -> lib.IperfDial:
-    return lib.IperfDial(
+def _dial(ctx: Ctx, params: dict) -> iperf.IperfDial:
+    return iperf.IperfDial(
         params["port"],
         host=ctx.arm.dial_host,
         argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
@@ -388,7 +402,7 @@ def run_bulk(ctx: Ctx, params: dict) -> list:
     ):
         if not wait_listener(port):
             return [Cell("", False, reason="the iperf3 sink never listened")]
-        result = lib.iperf_result(
+        result = iperf.iperf_result(
             _dial(ctx, {**params, "port": port}),
             params["streams"],
             params["secs"],
@@ -419,7 +433,7 @@ def run_bulk_pair(ctx: Ctx, params: dict) -> list:
                 return [Cell("", False, reason="an iperf3 sink never listened")]
 
             def worker(index: int, port: int) -> None:
-                results[index] = lib.iperf_result(
+                results[index] = iperf.iperf_result(
                     _dial(ctx, {**params, "port": port}),
                     params["streams"],
                     params["secs"],
@@ -587,8 +601,8 @@ def run_udp_ladder(ctx: Ctx, params: dict) -> list:
         ):
             if not wait_listener(topology.IPERF_UDP_PORT):
                 return [Cell(cell, False, reason="the UDP sink never listened")]
-            result = lib.iperf_result(
-                lib.IperfDial(
+            result = iperf.iperf_result(
+                iperf.IperfDial(
                     topology.IPERF_UDP_PORT,
                     host=ctx.arm.dial_host,
                     argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
@@ -651,12 +665,453 @@ def _spawn_probe(argv: list, log: Path, timeout: float) -> tuple:
     return result, rc, wall
 
 
+# --- the staged sweep -------------------------------------------------------
+@dataclass(frozen=True)
+class SeriesSpec:
+    """What to start: the mode, who it dials, for how long, and where it writes."""
+
+    mode: str
+    target: str
+    seconds: float
+    log: Path | None = None
+
+
+def _series_probe(ctx: Ctx, spec: SeriesSpec, params: dict):
+    """Start one series probe; return `(process, log path)`.
+
+    The caller may name the log (a capacity ramp starts one probe per level and
+    must read each level's own file); when it does not, the mode names it.
+    """
+    mode = spec.mode
+    log = spec.log or ctx.work / f"series-{ctx.arm.id}-{mode}.ndjson"
+    argv = ctx.topo.ns_argv(
+        topology.VIS_NS,
+        [
+            sys.executable,
+            str(SERIES_PROBE),
+            "--mode",
+            mode,
+            "--target",
+            spec.target,
+            "--duration-s",
+            str(round(spec.seconds, 2)),
+            "--interval-ms",
+            str(
+                params.get("ping_interval_ms", 50)
+                if mode != "udp"
+                else params.get("udp_interval_ms", 20)
+            ),
+            "--rate",
+            str(params.get("churn_per_s", 16)),
+        ],
+    )
+    fh = log.open("wb")
+    proc = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT)
+    fh.close()
+    return proc, log
+
+
+def read_series(log: Path, since: float, until: float) -> list:
+    """The samples of one series log inside a window `[since, until]`."""
+    points: list = []
+    with contextlib.suppress(OSError):
+        for line in log.read_text(errors="replace").splitlines():
+            if not line.startswith("{"):
+                continue
+            with contextlib.suppress(ValueError):
+                row = json.loads(line)
+                if since <= row.get("t", 0.0) <= until:
+                    points.append(row)
+    return points
+
+
+def _stage_absences(metrics: dict, interaction: list, datagrams: list) -> dict:
+    """Why a stage's interactive or datagram numbers are missing, typed.
+
+    A stage where every attempt failed has no percentile to report — and the
+    difference between "the tool answered slowly" and "the tool never answered"
+    is the finding, so it is written down rather than left as an absent key.
+    """
+    unavailable: dict = {}
+    failed = [p for p in interaction if p["metric"] == "error"]
+    if failed and metrics.get("rtt_p99_ms") is None:
+        reason = f"all {len(failed)} interactive attempts failed in this stage"
+        for metric in ("rtt_p50_ms", "rtt_p99_ms", "rtt_max_ms", "rtt_worst_1s_ms"):
+            if metrics.get(metric) is None:
+                unavailable[metric] = {"reason": reason}
+    losses = [p for p in datagrams if p["metric"] in ("loss", "error")]
+    if losses and metrics.get("udp_rtt_p99_ms") is None:
+        unavailable["udp_rtt_p99_ms"] = {
+            "reason": f"no datagram came back: {len(losses)} attempt(s) lost"
+        }
+    return unavailable
+
+
+def _stage_metrics(
+    interaction: list, datagrams: list, churn: list, window_s: float
+) -> tuple:
+    """One stage's interactive/datagram/churn numbers, from its own samples."""
+    rtts = [p["v"] for p in interaction if p["metric"] == "rtt_ms"]
+    errors = [p for p in interaction if p["metric"] == "error"]
+    churn_setup = [p["v"] for p in churn if p["metric"] == "setup_ms"]
+    datagram_rtts = [p["v"] for p in datagrams if p["metric"] == "rtt_ms"]
+    losses = [p for p in datagrams if p["metric"] == "loss"]
+    losses += [p for p in datagrams if p["metric"] == "error"]
+    attempts = len(datagram_rtts) + len(losses)
+    metrics = {
+        "rtt_samples": len(rtts) or None,
+        "rtt_p50_ms": inst.pct(rtts, 0.50),
+        "rtt_p99_ms": inst.pct(rtts, 0.99),
+        "rtt_max_ms": max(rtts) if rtts else None,
+        "rtt_worst_1s_ms": _worst_second(interaction),
+        "rtt_error_rate_pct": (
+            round(100.0 * len(errors) / (len(rtts) + len(errors)), 4)
+            if (rtts or errors)
+            else None
+        ),
+        "churn_per_s": (
+            round(len(churn_setup) / window_s, 2) if window_s > 0 else None
+        ),
+        "udp_rtt_p99_ms": inst.pct(datagram_rtts, 0.99),
+        "udp_loss_pct": (
+            round(100.0 * len(losses) / attempts, 4) if attempts else None
+        ),
+        "udp_gap_p99_ms": _gap_p99(datagrams),
+    }
+    evidence = {
+        "series": {
+            "interactive": len(interaction),
+            "datagram": len(datagrams),
+            "churn": len(churn),
+        },
+        "series_logs": [str(p) for p in (interaction, datagrams, churn) if p],
+    }
+    return metrics, evidence, _stage_absences(metrics, interaction, datagrams)
+
+
+def _worst_second(points: list):
+    """The worst one-second mean of the interactive stream's round trips."""
+    rtts = [(p["t"], p["v"]) for p in points if p["metric"] == "rtt_ms"]
+    if len(rtts) < inst.MIN_WEDGE_POINTS:
+        return None
+    worst = None
+    start = 0
+    for end, (t, _) in enumerate(rtts):
+        while t - rtts[start][0] > 1.0:
+            start += 1
+        window = [v for _, v in rtts[start : end + 1]]
+        mean = sum(window) / len(window)
+        worst = mean if worst is None else max(worst, mean)
+    return round(worst, 4) if worst is not None else None
+
+
+def _gap_p99(points: list):
+    """The 99th percentile of the gaps between arriving datagram replies."""
+    times = [p["t"] for p in points if p["metric"] in ("rtt_ms", "loss")]
+    if len(times) < inst.MIN_WEDGE_POINTS:
+        return None
+    gaps = [(b - a) * 1000.0 for a, b in itertools.pairwise(times)]
+    return inst.pct(gaps, 0.99)
+
+
+def _stages_of(params: dict) -> list:
+    """The timeline with its holds scaled, floored, and numbered per condition."""
+    holds = model.timeline_for(params["timeline"], params.get("scale", 1.0))
+    floor = params.get("min_hold_s", 0.0)
+    seen: dict = {}
+    stages = []
+    for condition, secs in holds:
+        seen[condition] = seen.get(condition, 0) + 1
+        occurrence = seen[condition]
+        label = condition if occurrence == 1 else f"{condition}#{occurrence}"
+        stages.append((label, condition, max(secs, floor)))
+    return stages
+
+
+def run_staged(ctx: Ctx, params: dict) -> list:
+    """The scripted schedule: the tool runs while the path changes underneath.
+
+    The tool's processes start once and the condition changes in place, so what
+    is measured is how the tool *adapts* rather than how it starts. The three
+    series probes run for the whole timeline and are sliced per stage, which is
+    what makes a per-stage number and a whole-run drift slope come from the same
+    samples; the bulk spine is re-dialed per stage after the leg has gone quiet,
+    because a killed client keeps delivering what its kernel still holds.
+    """
+    stages = _stages_of(params)
+    cells: list = []
+    probes = [
+        # 0 = run until this workload kills them: a stage's drain cost is not
+        # known before the run, so a precomputed duration can end before the
+        # last stage begins.
+        _series_probe(ctx, SeriesSpec(mode, target, 0.0), params)
+        for mode, target in (
+            ("interactive", f"{ctx.arm.dial_host}:{topology.ECHO_PORT}"),
+            ("udp", f"{ctx.arm.dial_host}:{topology.UDP_PORT}"),
+            ("churn", f"{ctx.arm.dial_host}:{topology.ECHO_PORT}"),
+        )
+    ]
+    logs = {
+        mode: probe[1]
+        for mode, probe in zip(("interactive", "udp", "churn"), probes, strict=True)
+    }
+    drift_points: list = []
+    try:
+        with inst.DriftSampler(ctx.pids_of, interval=inst.DRIFT_POLL_S) as drift:
+            cells.extend(_one_stage(ctx, stage, params, logs) for stage in stages)
+            drift_points = list(drift.points)
+    finally:
+        for proc, _ in probes:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+        if ctx.condition is not None:
+            ctx.topo.set_condition(ctx.leg, ctx.condition)
+    cells.append(_run_cell(drift_points, logs))
+    return cells
+
+
+def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
+    """One stage: impose the condition, let the leg go quiet, then measure."""
+    label, condition, secs = stage
+    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
+    drain = ctx.topo.drain(ctx.leg)
+    port = topology.IPERF_PORT
+    with (
+        measured(ctx, topology.ECHO_PORT) as window,
+        iperf_sink(ctx, f"stage-{label}", port),
+    ):
+        if not wait_listener(port):
+            return Cell(label, False, reason="the iperf3 sink never listened")
+        t0 = time.time()
+        result = iperf.iperf_result(
+            iperf.IperfDial(
+                port,
+                host=ctx.arm.dial_host,
+                argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
+                omit=min(2, max(0, int(secs) // 4)),
+            ),
+            params.get("streams", 4),
+            secs,
+            iperf_timeout(secs + 20),
+            ctx.work / "iperf-raw" / f"{ctx.arm.id}-stage-{label}",
+        )
+        t1 = time.time()
+    interaction = read_series(logs["interactive"], t0, t1)
+    datagrams = read_series(logs["udp"], t0, t1)
+    churn = read_series(logs["churn"], t0, t1)
+    window_s = max(t1 - t0, 1e-9)
+    stage_metrics, evidence, unavailable = _stage_metrics(
+        interaction, datagrams, churn, window_s
+    )
+    stage_metrics |= {
+        "throughput_gbps": result.get("gbps_received_own_window"),
+        "slo_broken": _breaks_slo(stage_metrics),
+    }
+    built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics)
+    built.unavailable |= unavailable
+    built.evidence["series"] = evidence["series"]
+    built.evidence["series_logs"] = evidence["series_logs"]
+    built.evidence |= {
+        "condition": condition,
+        "hold_s": secs,
+        "series_window_s": round(window_s, 3),
+    }
+    built.evidence |= drain
+    return built
+
+
+def _breaks_slo(metrics: dict) -> int | None:
+    """1 when a level or stage broke the SLO, 0 when it met it, None if unmeasured."""
+    p99 = metrics.get("rtt_p99_ms")
+    errors = metrics.get("rtt_error_rate_pct")
+    if p99 is None and errors is None:
+        return None
+    broken = (p99 is not None and p99 > model.SLO_RTT_P99_MS) or (
+        errors is not None and errors > model.SLO_ERROR_RATE_PCT
+    )
+    return int(broken)
+
+
+def _run_cell(drift_points: list, logs: dict) -> Cell:
+    """The whole run: the drift axis and the wedge axis, from its own series."""
+    interaction = read_series(logs["interactive"], 0.0, time.time() + 1)
+    wedged = inst.wedges(interaction)
+    metrics = {
+        "drift_rss_mib_per_min": _per_min(inst.slope_per_min(drift_points, "rss_kib")),
+        "drift_fds_per_min": inst.slope_per_min(drift_points, "fds"),
+        "drift_threads_per_min": inst.slope_per_min(drift_points, "threads"),
+        "wedge_count": wedged["count"],
+        "wedge_max_s": wedged["max_s"],
+        "rtt_samples": len([p for p in interaction if p["metric"] == "rtt_ms"]) or None,
+    }
+    return Cell(
+        "run",
+        ok=True,
+        metrics=metrics,
+        unavailable={},
+        evidence={
+            "drift_points": len(drift_points),
+            "drift_series": _thinned(drift_points),
+            "series": {"interactive": len(interaction)},
+            "series_logs": [str(p) for p in logs.values()],
+            "wedge_silence_s": inst.WEDGE_SILENCE_S,
+        },
+    )
+
+
+def _per_min(slope):
+    """KiB/min -> MiB/min, or `None` when the series could not be fitted."""
+    return None if slope is None else round(slope / 1024.0, 4)
+
+
+def _thinned(points: list, every: int = 5) -> list:
+    """Every n-th drift sample, for the results file: the fit uses them all."""
+    return points[::every]
+
+
+def run_capacity(ctx: Ctx, params: dict) -> list:
+    """Ramp the bulk load until the interactive stream breaks the SLO.
+
+    The user's question is "how much can it carry and still be usable", and the
+    instrument is a fresh interactive connection per ping *during* the load:
+    the slow visitor's own rate is not the number, the arriving visitor's tail
+    latency is.
+    """
+    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[params["condition"]])
+    settle = params["settle_s"]
+    cells: list = []
+    sustainable = 0
+    level = 0
+    for level in range(1, params["streams_max"] + 1):
+        cell = _capacity_level(ctx, level, settle, params)
+        cells.append(cell)
+        if not cell.ok or cell.metrics.get("slo_broken"):
+            break
+        sustainable = level
+    cells.append(
+        Cell(
+            "ramp",
+            ok=True,
+            metrics={
+                "capacity_streams": sustainable,
+                "capacity_headroom_pct": round(
+                    100.0 * (1 - sustainable / params["streams_max"]), 2
+                ),
+            },
+            evidence={
+                "streams_max": params["streams_max"],
+                "levels_run": level,
+                "condition": params["condition"],
+                "slo": {
+                    "rtt_p99_ms": model.SLO_RTT_P99_MS,
+                    "error_rate_pct": model.SLO_ERROR_RATE_PCT,
+                },
+            },
+        )
+    )
+    return cells
+
+
+def _capacity_level(ctx: Ctx, level: int, settle: float, params: dict) -> Cell:
+    """One ramp level: N bulk streams, with a fresh-connection ping beside them."""
+    port = topology.IPERF_PORT
+    log = ctx.work / f"series-{ctx.arm.id}-ramp{level}.ndjson"
+    target = f"{ctx.arm.dial_host}:{topology.ECHO_PORT}"
+    probe, log = _series_probe(ctx, SeriesSpec("interactive", target, 0.0, log), params)
+    try:
+        with (
+            measured(ctx, topology.ECHO_PORT) as window,
+            iperf_sink(ctx, f"ramp-{level}", port),
+        ):
+            if not wait_listener(port):
+                return Cell(f"L{level}", False, reason="the iperf3 sink never listened")
+            t0 = time.time()
+            result = iperf.iperf_result(
+                iperf.IperfDial(
+                    port,
+                    host=ctx.arm.dial_host,
+                    argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
+                    omit=1,
+                ),
+                level,
+                settle,
+                iperf_timeout(settle),
+                ctx.work / "iperf-raw" / f"{ctx.arm.id}-ramp-{level}",
+            )
+            t1 = time.time()
+    finally:
+        with contextlib.suppress(OSError):
+            probe.kill()
+        with contextlib.suppress(Exception):
+            probe.wait(timeout=5)
+    interaction = read_series(log, t0, t1)
+    rtts = [p["v"] for p in interaction if p["metric"] == "rtt_ms"]
+    errors = [p for p in interaction if p["metric"] == "error"]
+    metrics = {
+        "throughput_gbps": result.get("gbps_received_own_window"),
+        "rtt_samples": len(rtts) or None,
+        "rtt_p99_ms": inst.pct(rtts, 0.99),
+        "rtt_p50_ms": inst.pct(rtts, 0.50),
+        "rtt_error_rate_pct": (
+            round(100.0 * len(errors) / (len(rtts) + len(errors)), 4)
+            if (rtts or errors)
+            else None
+        ),
+    }
+    metrics["slo_broken"] = _breaks_slo(metrics)
+    built = _iperf_cell(Spot(ctx, window, f"L{level}"), result, metrics)
+    built.evidence["series_log"] = str(log)
+    built.evidence["streams"] = level
+    return built
+
+
+def run_reconnect(ctx: Ctx, params: dict) -> list:
+    """Cold start: how long after a restart a visitor's first connection works.
+
+    The runner owns the processes (it is the thing that can restart an arm), so
+    the workload asks it to: five restarts, each timed from spawn to the first
+    answered connection, which is what a visitor actually waits for.
+    """
+    if ctx.restart_arm is None:
+        return [Cell("", False, reason="this arm cannot be restarted")]
+    starts: list = []
+    failures: list = []
+    for _ in range(max(1, params["reps"])):
+        seconds, why = ctx.restart_arm()
+        if seconds is None:
+            failures.append(why)
+        else:
+            starts.append(seconds)
+    if not starts:
+        return [Cell("", False, reason=f"no cold start succeeded: {failures[:2]}")]
+    return [
+        Cell(
+            "cold",
+            ok=True,
+            metrics={
+                "startup_s": round(statistics.median(starts), 4),
+                "startup_max_s": round(max(starts), 4),
+            },
+            evidence={
+                "starts_s": starts,
+                "failures": failures[:5],
+                "reps": params["reps"],
+            },
+        )
+    ]
+
+
 RUNNERS = {
     model.Kind.BULK: run_bulk,
     model.Kind.BULK_PAIR: run_bulk_pair,
     model.Kind.RR: run_rr,
     model.Kind.UDP: run_udp,
     model.Kind.UDP_LADDER: run_udp_ladder,
+    model.Kind.STAGED: run_staged,
+    model.Kind.CAPACITY: run_capacity,
+    model.Kind.RECONNECT: run_reconnect,
 }
 
 

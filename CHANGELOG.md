@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The benchmark model is one runner again: the soak sweep is a profile of
+  it.** `benches/scripts/bench/` now owns everything a performance number is
+  produced by — the metric registry, the topology, the workloads, the scripted
+  conditions and timelines, the reference tools (frp, rathole, nps) as arms,
+  the noise floor, the verdicts, the charts and the release gate — and the
+  retired sweep's scripts are gone. What that means for a reader of the
+  numbers: the staged schedule and the load ramp travel in one results file
+  under one schema (`--profile sweep`), a chart is rendered from that file by
+  `just bench-plot`, a release run is gated by `just bench-gate` (coverage, the
+  endpoint invariant, the SLO on the clean stages, the drift and wedge axes,
+  the ramp, and the regression half against a baseline), and the published
+  records of the previous model stay in `benches/records/` as history — never a
+  regression baseline, because the gate refuses a baseline whose method record
+  does not match. The method, the metric definitions and the profiles are on
+  [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard).
+
 ### Added
 
 - **Transparent (L3) clients: the client owns the public `ip:port`.** A
