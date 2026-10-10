@@ -685,7 +685,35 @@ path the ARQ exhausts its 20-retransmit budget and declares the peer dead. That
 is a congestion collapse, self-inflicted, and it is the thing to fix before the
 carrier is worth choosing for a lossy path.
 
-**And the signal itself was wrong.** That PONG timeout is the pacer's only
+**The long-haul cell is the one that is still behind, and it is the path's
+queues, not the carrier's arithmetic.** On `rtt100` (100 ms each way, no loss
+configured) the TCP carrier moves 0.461 Gbit/s and `l3-kcp` 0.178 — 2.6× behind,
+the widest gap left anywhere in this model. The carrier's own counters say why:
+**21 % of the datagrams it sent never reached the receiver** on a path that drops
+nothing on purpose, and **28 % of what it sent was recovery traffic** — split
+4 239 RTO-driven resends against 2 163 fast-retransmit ones, i.e. mostly the
+sender timing out on acknowledgements that were merely late. The mechanism is a
+whole window going out at once: 2 048 segments is 16 MiB at a jumbo datagram
+size, a bottleneck queue holds a thousand packets, and the ARQ has no congestion
+control to spread the difference.
+
+Two repairs were tried against that, and the measurements chose between them:
+
+* **RTO headroom — kept.** The reference's timeout is `srtt + max(interval,
+  4·rttvar)`, so this adapter's 10 ms flush interval is also the timeout's only
+  margin; on a low-jitter 200 ms path the timeout lands at **205 ms** and the
+  acknowledgements arrive at 200 ms plus the receiver's own batching. A margin of
+  `srtt/8` (nothing changes below an 80 ms round trip) cuts RTO-driven resends by
+  **42 %** and the wire ratio from **1.20 to 1.09** on that cell, with throughput
+  flat (0.178 against 0.169–0.197 across the runs).
+* **Pacing the burst to the bandwidth-delay product — falsified.** Capping the
+  send rate at `window / srtt` (655 Mbit/s on this cell) is the textbook answer to
+  a bursting sender, and it is **35 % worse**: 0.114 [0.104..0.124] against
+  0.175 [0.160..0.181] Gbit/s over three rounds each, with the wire ratio
+  unchanged. Whatever the losses are, the pacer's bucket-and-rate gate does not
+  remove them; it only slows the sender down.
+
+**And the signal itself was wrong.****And the signal itself was wrong.** That PONG timeout is the pacer's only
 input, and it fires on *any* late PONG — including one queued behind a peer that
 is busy sending, which is exactly the state a fast path is in. The cut is 25 %
 and the recovery is 5 % per four clean PONGs, so one heavy transfer ratchets the

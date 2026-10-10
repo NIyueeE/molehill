@@ -361,6 +361,10 @@ pub(crate) static KCP_PEER_WND: AtomicU64 = AtomicU64::new(0);
 /// on a keepalive timeout and only raised 5 % per four clean ones, so it is the
 /// one piece of state in this path that can hold a session down for minutes.
 pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
+/// The engine's current retransmission timeout and smoothed round-trip
+/// estimate, in milliseconds.
+pub(crate) static KCP_RTO_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_SRTT_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
@@ -398,6 +402,8 @@ pub(crate) struct KcpStats {
     pub datagrams_out: u64,
     pub retransmits: u64,
     pub acks_out: u64,
+    pub resends_rto: u64,
+    pub resends_fast: u64,
     pub sacks_sent: u64,
     pub blobs_out: u64,
     pub segments_delivered: u64,
@@ -417,6 +423,8 @@ pub(crate) struct KcpStats {
     pub advertised_wnd: u64,
     pub peer_wnd: u64,
     pub pacer_bps: u64,
+    pub rto_ms: u64,
+    pub srtt_ms: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -429,11 +437,14 @@ pub(crate) fn kcp_stats() -> KcpStats {
     fn ms(stat: &AtomicU64) -> f64 {
         Duration::from_nanos(stat.load(Ordering::Relaxed)).as_secs_f64() * 1.0e3
     }
+    let (dg_in, dg_out, retransmits, acks_out, resends_rto, resends_fast) = kcp_engine_stats();
     KcpStats {
-        datagrams_in: kcp_engine_stats().0,
-        datagrams_out: kcp_engine_stats().1,
-        retransmits: kcp_engine_stats().2,
-        acks_out: kcp_engine_stats().3,
+        datagrams_in: dg_in,
+        datagrams_out: dg_out,
+        retransmits,
+        acks_out,
+        resends_rto,
+        resends_fast,
         sacks_sent: KCP_SACKS_SENT.load(Ordering::Relaxed),
         blobs_out: KCP_BLOBS_OUT.load(Ordering::Relaxed),
         segments_delivered: KCP_SEGMENTS_DELIVERED.load(Ordering::Relaxed),
@@ -453,6 +464,8 @@ pub(crate) fn kcp_stats() -> KcpStats {
         advertised_wnd: KCP_ADVERTISED_WND.load(Ordering::Relaxed),
         peer_wnd: KCP_PEER_WND.load(Ordering::Relaxed),
         pacer_bps: KCP_PACER_BPS.load(Ordering::Relaxed),
+        rto_ms: KCP_RTO_MS.load(Ordering::Relaxed),
+        srtt_ms: KCP_SRTT_MS.load(Ordering::Relaxed),
     }
 }
 
@@ -480,6 +493,8 @@ fn spawn_kcp_stats() {
                     datagrams_in = s.datagrams_in,
                     datagrams_out = s.datagrams_out,
                     retransmits = s.retransmits,
+                    resends_rto = s.resends_rto,
+                    resends_fast = s.resends_fast,
                     acks_out = s.acks_out,
                     sacks_sent = s.sacks_sent,
                     blobs_out = s.blobs_out,
@@ -500,6 +515,8 @@ fn spawn_kcp_stats() {
                     advertised_wnd = s.advertised_wnd,
                     peer_wnd = s.peer_wnd,
                     pacer_mbit = s.pacer_bps / 1_000_000,
+                    rto_ms = s.rto_ms,
+                    srtt_ms = s.srtt_ms,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -695,6 +712,26 @@ fn note_pacer(rate_bps: f64) {
     KCP_PACER_BPS.store(bps, Ordering::Relaxed);
 }
 
+/// Sample every per-session gauge the periodic stats line reports, once per
+/// pump round: the send queue's peak, the receive-side window state, the
+/// timeout the engine is working to, and the pacer's allowance. They are the
+/// state a stuck session is stuck *in*, which is what made this path's measured
+/// regressions findable at all.
+fn note_gauges(kcp: &Kcp<DatagramOut>, pacer_bps: f64) {
+    note_wait_snd(kcp.wait_snd());
+    note_windows(kcp);
+    note_rto(kcp);
+    note_pacer(pacer_bps);
+}
+
+/// Record the retransmission timeout and round-trip estimate in force.
+fn note_rto(kcp: &Kcp<DatagramOut>) {
+    KCP_RTO_MS.store(u64::from(kcp.rx_rto_ms()), Ordering::Relaxed);
+    KCP_SRTT_MS.store(u64::from(kcp.rx_srtt_ms()), Ordering::Relaxed);
+}
+
+/// Record the receive queue's depth, the window this side advertises out of
+/// it, and the peer's window as last received.
 fn note_windows(kcp: &Kcp<DatagramOut>) {
     KCP_WAIT_RCV.store(
         u64::try_from(kcp.wait_rcv()).unwrap_or(u64::MAX),
@@ -1612,9 +1649,7 @@ async fn run_session(
             // fairness would otherwise starve the writer side to a fraction
             // of the link rate (measured ~half the window limit at 20 ms).
             data = out_rx.recv(), if {
-                note_wait_snd(kcp.wait_snd());
-                note_windows(&kcp);
-                note_pacer(pace.rate_bps);
+                note_gauges(&kcp, pace.rate_bps);
                 !closing && kcp.wait_snd() < SND_QUEUE_LIMIT
             } => {
                 if let Some(data) = data {

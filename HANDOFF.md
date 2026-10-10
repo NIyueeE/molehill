@@ -468,6 +468,24 @@ configuration surface is free to change — and this cycle changes it.
      Reproduce with `sudo -n uv run benches/scripts/bench/bench.py run --profile
      smoke --arms l3-kcp --scenarios bulk-1,bulk-n --condition clean
      --link-mtu 9000 --tun-mtu 8000 --rounds 1 --warmup-rounds 0`.
+   - **The long-haul gap is the next real target, and its mechanism is now
+     measured.** `rtt100` (100 ms each way, no configured loss): TCP carrier
+     0.461 Gbit/s, `l3-kcp` 0.178 — the widest gap left in the model. The
+     carrier's counters put 21 % of the sender's datagrams somewhere on the
+     floor and 28 % of its output into recovery, split 4 239 RTO against 2 163
+     fast-retransmit (so mostly spurious timeouts). **Kept:** RTO headroom of
+     `srtt/8` (`KCP_RTO_HEADROOM_DIVISOR`), worth −42 % RTO resends and a wire
+     ratio of 1.20 → 1.09 with throughput flat. **Falsified:** pacing the burst
+     to the BDP (`window / srtt`) is 35 % *slower* (0.114 against 0.175 Gbit/s,
+     three rounds each, ranges disjoint) and does not change the wire ratio —
+     the pacer's bucket-and-rate gate does not remove the losses, it only slows
+     the sender. So the next attempt has to find where those datagrams actually
+     die (the receiving socket's buffer, the veth queue between the namespaces,
+     or the ARQ's own flush cadence) rather than throttle the sender: the
+     obvious throttles have all been measured now. The diagnostics this needed
+     are on the `MOLEHILL_KCP_STATS` line for good: `resends_rto` vs
+     `resends_fast`, `rto_ms`/`srtt_ms`, the window state, the reader/spill
+     residency and the pacer's allowance.
    - **A rate-aware pacer for the KCP carrier** (above) — **attempted
      2026-10-10, measured, reverted.** The design: sample the peer's
      acknowledged progress every 20 ms, convert it to segments per second, and

@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A KCP retransmission timeout now clears the round trip it is timing.** The
+  reference's timeout is `srtt + max(interval, 4·rttvar)`, and this adapter sets
+  the flush interval to 10 ms for latency — which left a 200 ms path with a
+  **205 ms** timeout, so acknowledgements that arrived at 200 ms plus the
+  receiver's own batching were treated as losses: on the model's `rtt100` cell
+  (100 ms each way, no loss configured) 21 % of the datagrams never reached the
+  receiver and 28 % of what was sent was recovery traffic. A margin of `srtt/8`
+  (nothing changes below an 80 ms round trip) cuts RTO-driven resends by 42 %
+  and the wire ratio from 1.20 to 1.09, with throughput unchanged. Related
+  repairs measured and **not** carried, with their numbers on the benchmarks
+  page: pacing the send burst to the bandwidth-delay product (35 % slower) and a
+  window byte budget (two thirds of the lossy leg's throughput).
+
 - **A KCP session no longer throttles itself for being busy.** The carrier's
   send pacer, which stands in for congestion control (`nc=1`), took its only
   signal from a keepalive PONG that arrived later than 2.5 s — and a PONG queued

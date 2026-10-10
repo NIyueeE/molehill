@@ -60,6 +60,21 @@ use log::{debug, trace};
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
+/// The RTO's headroom over the measured round trip, as a fraction of it
+/// (`srtt / this`), when the jitter-derived term is smaller.
+///
+/// The reference's timeout is `srtt + max(interval, 4·rttvar)`, so the flush
+/// interval doubles as the timeout's floor. That is fine at the reference's
+/// 100 ms default and wrong for this adapter, which sets the interval to 10 ms
+/// for latency: on a 200 ms path with netem's near-zero jitter the timeout
+/// lands at **205 ms**, the acknowledgements arrive at 200 ms *plus* the
+/// receiver's own batching, and roughly a quarter of the sender's output turns
+/// into retransmissions (measured: 4 239 RTO-driven resends against 2 163
+/// fast-retransmit ones on `rtt100`, 28 % of the datagrams sent, on a path with
+/// no loss at all). A margin that grows with the round trip keeps the timeout
+/// ahead of the acknowledgements it is waiting for, and leaves short paths
+/// exactly where they were: nothing changes below an 80 ms round trip.
+const KCP_RTO_HEADROOM_DIVISOR: u32 = 8;
 const KCP_RTO_DEF: u32 = 200;
 const KCP_RTO_MAX: u32 = 60000;
 
@@ -129,16 +144,25 @@ pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
 /// DROPPED"), so today this is an attribution counter: a rising rate is
 /// how a collapsing cell is recognized in a stats line.
 pub(crate) static KCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+/// The same events, split by what fired them: an RTO (`resendts` reached,
+/// nothing heard about the segment) or a run of later acknowledgements
+/// (`fastack`, the peer is receiving *around* a hole). The two mean opposite
+/// things about a path — a timeout is silence, a skip is a gap — so a stats
+/// line that cannot tell them apart cannot say which one a cell is paying for.
+pub(crate) static KCP_RESENDS_RTO: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_RESENDS_FAST: AtomicU64 = AtomicU64::new(0);
 /// Ack entries sent to the peer (several may share one datagram).
 pub(crate) static KCP_ACKS_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the engine-side counters, for the periodic stats line.
-pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64) {
+pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         KCP_DATAGRAMS_IN.load(Relaxed),
         KCP_DATAGRAMS_OUT.load(Relaxed),
         KCP_RETRANSMITS.load(Relaxed),
         KCP_ACKS_OUT.load(Relaxed),
+        KCP_RESENDS_RTO.load(Relaxed),
+        KCP_RESENDS_FAST.load(Relaxed),
     )
 }
 
@@ -833,7 +857,9 @@ impl<Output> Kcp<Output> {
                 self.rx_srtt = 1;
             }
         }
-        let rto = self.rx_srtt + cmp::max(self.interval, 4 * self.rx_rttval);
+        let headroom = cmp::max(self.interval, 4 * self.rx_rttval)
+            .max(self.rx_srtt / KCP_RTO_HEADROOM_DIVISOR);
+        let rto = self.rx_srtt + headroom;
         self.rx_rto = bound(self.rx_minrto, rto, KCP_RTO_MAX);
     }
 
@@ -1236,6 +1262,19 @@ impl<Output> Kcp<Output> {
         self.snd_una
     }
 
+    /// The retransmission timeout this side is currently using, in
+    /// milliseconds, and the smoothed round-trip estimate behind it. Together
+    /// they say whether a spurious-retransmission rate is the path's or the
+    /// estimator's.
+    pub fn rx_rto_ms(&self) -> u32 {
+        self.rx_rto
+    }
+
+    /// The smoothed round-trip estimate in milliseconds (see [`Self::rx_rto_ms`]).
+    pub fn rx_srtt_ms(&self) -> u32 {
+        self.rx_srtt
+    }
+
     /// Segments sitting in the receive queue, waiting for the application to
     /// take them. This is what the window this side *advertises* is computed
     /// from: a reader that falls behind shrinks the peer's send window, and
@@ -1502,6 +1541,7 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.xmit += 1;
                 self.xmit += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
+                KCP_RESENDS_RTO.fetch_add(1, Relaxed);
                 if self.flags.has(KcpFlags::NODELAY) {
                     // nodelay steps the RTO by half instead of doubling it
                     let step = snd_segment.rto;
@@ -1520,6 +1560,7 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto;
                 change += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
+                KCP_RESENDS_FAST.fetch_add(1, Relaxed);
             }
 
             if need_send {
@@ -1746,6 +1787,39 @@ mod tests {
             "a window that has stood still past the grace, with the count over the trigger, \
              must end the session"
         );
+    }
+
+    /// The timeout must stay ahead of the round trip it is timing, by a margin
+    /// that grows with it — the interval term alone leaves a long path with none
+    /// (see [`KCP_RTO_HEADROOM_DIVISOR`]).
+    #[test]
+    fn a_long_path_gets_rto_headroom() {
+        let out = SharedBuf::default();
+        let mut kcp = Kcp::new_stream(0x1234, out);
+        // The adapter's parameters: a 10 ms flush interval, nodelay.
+        kcp.set_nodelay(true, 10, 2, true);
+
+        // A steady 200 ms round trip with no jitter (a shaped path).
+        for _ in 0..8 {
+            kcp.update_ack(200);
+        }
+        assert_eq!(kcp.rx_srtt, 200);
+        assert!(
+            kcp.rx_rto >= 200 + 200 / KCP_RTO_HEADROOM_DIVISOR,
+            "a 200 ms path got an RTO of {} ms: the timeout must clear the round \
+             trip by a margin that grows with it",
+            kcp.rx_rto
+        );
+
+        // A short path is untouched: the interval term still dominates.
+        let mut lan = Kcp::new_stream(0x1234, SharedBuf::default());
+        lan.set_nodelay(true, 10, 2, true);
+        for _ in 0..8 {
+            lan.update_ack(1);
+        }
+        // Unchanged: on a short path the nodelay floor (30 ms) is what binds,
+        // exactly as it did before the headroom existed.
+        assert_eq!(lan.rx_rto, 30, "a 1 ms path keeps the nodelay floor");
     }
 
     /// `set_mtu` follows the caller in either direction and keeps a payload in
