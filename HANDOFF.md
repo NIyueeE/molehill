@@ -357,6 +357,17 @@ configuration surface is free to change — and this cycle changes it.
        writes coalesce. So it lands *with* the GSO write, as one change whose
        A/B has a win to show.
 
+     **What is still unverified** is the half the win depends on: whether the
+     kernel *coalesces* on the read side. The spike could not answer it — a UDP
+     stream arriving on a veth is fragmented, not GRO-able, and the reads came
+     back one packet each with the header all zeroes (10 169 reads of 1406 B,
+     no `gso_type`) — so the TCP case has to be measured where TCP flows exist:
+     in the bench, with the L3 arm at 1400 and at 8000, watching
+     `mean_carried_packet_b` (a frame above the MTU is a coalesced read) and
+     `syscalls_per_s`. If the read side never coalesces, the win is only the
+     inject side's, and the design has to coalesce a run in userspace — which is
+     why the two slices below are ordered that way.
+
      The design that follows, in two slices:
 
      * **Slice 1, no wire change.** Both TUNs attach with `IFF_VNET_HDR` and
