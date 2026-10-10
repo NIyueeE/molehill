@@ -1228,6 +1228,33 @@ impl<Output> Kcp<Output> {
         self.snd_buf.len() + self.snd_queue.len()
     }
 
+    /// The oldest unacknowledged sequence number: the send window's front, and
+    /// therefore the cheapest signal that the peer is still acknowledging
+    /// *something*. A window that moved is a peer that is working, whatever a
+    /// keepalive round trip looks like.
+    pub fn snd_una(&self) -> u32 {
+        self.snd_una
+    }
+
+    /// Segments sitting in the receive queue, waiting for the application to
+    /// take them. This is what the window this side *advertises* is computed
+    /// from: a reader that falls behind shrinks the peer's send window, and
+    /// the throughput of the whole session follows it.
+    pub fn wait_rcv(&self) -> usize {
+        self.rcv_queue.len()
+    }
+
+    /// The receive window this side is currently advertising to the peer, in
+    /// segments (the `wnd` field of every segment it emits).
+    pub fn advertised_wnd(&self) -> u16 {
+        self.wnd_unused()
+    }
+
+    /// The peer's receive window as this side last heard it, in segments.
+    pub fn peer_wnd(&self) -> u16 {
+        self.rmt_wnd
+    }
+
     /// Force an immediate retransmit of segment `sn` (adapter SACK
     /// support). Returns whether the segment was still in the send buffer.
     /// The resend bypasses the RTO backoff: the peer explicitly told us it

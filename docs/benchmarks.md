@@ -685,6 +685,30 @@ path the ARQ exhausts its 20-retransmit budget and declares the peer dead. That
 is a congestion collapse, self-inflicted, and it is the thing to fix before the
 carrier is worth choosing for a lossy path.
 
+**And the signal itself was wrong.** That PONG timeout is the pacer's only
+input, and it fires on *any* late PONG — including one queued behind a peer that
+is busy sending, which is exactly the state a fast path is in. The cut is 25 %
+and the recovery is 5 % per four clean PONGs, so one heavy transfer ratchets the
+rate down four times (12 → 3.8 Gbit/s, measured on the stats line) and leaves it
+there: the *next* transfer in that session reads a fraction of what the same
+transfer reads on a fresh session. Measured on a jumbo path, `bulk-n` twice in
+one session: **7.79 then 7.67 Gbit/s** after the fix, against **6.18 then 1.00**
+before it, and a `bulk-1` cell followed by `bulk-n` read 7.19 then 7.44 against
+7.1 then 2.0. The fix is the one the signal was missing: a late PONG only means
+congestion when the send window is **not** moving — a peer that is acknowledging
+data is working, whatever its keepalive looks like — so the pacer now holds its
+rate while progress is being made, and still cuts when a session stalls. The
+slow regimes confirm it costs nothing: `rtt100` 0.169 → 0.182 Gbit/s and `loss5`
+unchanged to three decimals.
+
+A window *byte* budget was tried alongside this, to stop the buffers growing 5.7×
+on a jumbo path, and it is **falsified**: it did not touch the collapse (the
+pacer was the cause) and it cost the lossy leg two thirds of its throughput —
+0.45 against 1.67 Gbit/s on `loss1` with jumbo datagrams — because a window
+barely one bandwidth-delay product wide leaves fast retransmit nothing to ride
+on. The windows stay segment-counted and, on a lossy path, wider than the BDP is
+the point.
+
 **The one place KCP won.** On the same `loss1_rate100` leg, 16 concurrent
 connections of short round trips (`rr-16`) came out *ahead* on both KCP arms —
 338.6/s for `l3-kcp` and 337.8/s for `l4-kcp` against 323.2 control, 328.0 `l4`,
@@ -722,18 +746,18 @@ run:
 
 | Arm | `bulk-1` (1 flow) | CPU per Gbit | `bulk-n` (8 flows) |
 |---|---|---|---|
-| `l3` (TCP carrier) | 7.086 Gbit/s | 0.311 s | 6.170 |
-| `l3-kcp` | **7.265 Gbit/s** | 0.723 s | 1.945 |
-| `l3~aa` (the twin) | 6.948 Gbit/s | 0.321 s | 6.230 |
-| `l4` (forwarding) | 8.443 Gbit/s | 0.218 s | 22.586 |
+| `l3` (TCP carrier) | 7.340 Gbit/s | 0.305 s | 5.460 |
+| `l3-kcp` | 6.996 Gbit/s | 0.745 s | **7.548 Gbit/s** |
+| `l3~aa` (the twin) | 6.982 Gbit/s | 0.305 s | 6.447 |
+| `l4` (forwarding) | 7.766 Gbit/s | 0.235 s | 23.170 |
 
-So on a path that carries jumbo datagrams, L3+KCP matches the TCP carrier for a
-single bulk flow (the two are inside each other's noise) at 2.3× the CPU per
-byte, and the forwarding path is 16 % ahead of both. The eight-flow cell is the
-open question: it reads anywhere between 1.9 and 6.2 Gbit/s depending on whether
-a single-flow cell ran before it in the same session — a reproducible trigger,
-diagnosed as far as "the same datagrams, carrying half the bytes", and written
-up in HANDOFF.md rather than smoothed over here.
+So on a path that carries jumbo datagrams: one bulk flow is a tie — `l3-kcp`
+6.996 against the TCP carrier's 7.340, whose own twin reads 6.982, i.e. the three
+are inside the run's 15 % noise floor — and **eight flows come out ahead of the
+TCP carrier** (7.548 against 5.460 and a twin at 6.447, so the gap clears the
+floor). The cost is CPU: 2.4× per byte, unchanged all along. What the carrier
+does not win is short round trips (28 648/s against 31 364/s, at the same p99)
+or the lossy regimes above.
 
 **The failure itself was then fixed, and it was the rule, not the size.****The failure itself was then fixed, and it was the rule, not the size.** The
 `KCP session dead link` above is the engine's reference behaviour: a segment

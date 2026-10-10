@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A KCP session no longer throttles itself for being busy.** The carrier's
+  send pacer, which stands in for congestion control (`nc=1`), took its only
+  signal from a keepalive PONG that arrived later than 2.5 s — and a PONG queued
+  behind a peer that is busy sending is exactly what a *fast* path looks like.
+  The cut is 25 % and the recovery 5 % per four clean PONGs, so one heavy
+  transfer ratcheted the rate down four times (12 → 3.8 Gbit/s, measured) and
+  left it there for the rest of the session: the next transfer in that session
+  read a fraction of the same transfer on a fresh one (**1.00 against 7.79
+  Gbit/s** on the same cell, reproducibly). A late PONG now only cuts when the
+  send window is *not* moving — a peer that is acknowledging data is working,
+  whatever its keepalive looks like — and the slow regimes confirm the fix costs
+  nothing there (`rtt100` 0.169 → 0.182 Gbit/s, `loss5` unchanged). The
+  `MOLEHILL_KCP_STATS` line also gained the gauges this needed: reader-channel
+  and spill residency, the peak send-queue depth, the advertised and peer
+  windows, and the pacer's current allowance.
+
 - **A KCP session is no longer declared dead for being slow.** The dead-link
   rule was the reference implementation's — a segment retransmitted twenty times
   ends the session — which cannot tell a peer that is *gone* from one that is

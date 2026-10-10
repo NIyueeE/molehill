@@ -421,8 +421,29 @@ configuration surface is free to change — and this cycle changes it.
      byte fell by a fifth. The one cost: a genuinely vanished peer is now
      detected up to five seconds later, which the session-level watchdogs
      (`FORWARD_IDLE_TIMEOUT`) bound anyway.
-   - **L3+KCP now matches the TCP carrier on a jumbo single flow, and collapses
-     on eight — a reproducible open finding.** With the segment size following
+   - **The collapse was the pacer, and it is fixed.** The trigger turned out to
+     be blunt: in a session's lifetime, the *first* cell of a turn runs at full
+     speed and *every later* cell runs at a fraction, whatever the scenario
+     (`bulk-n,bulk-n` 6.18 → 1.00; `bulk-n,bulk-1` 5.86 → 1.08; `bulk-1,bulk-n`
+     7.1 → 2.0). The state was the adaptive pacer's allowance, visible once a
+     gauge for it was added: 12 → 9 → 6.75 → 5.06 → 3.8 Gbit/s across the first
+     cell's PONG timeouts, held for the rest of the session because the recovery
+     is 5 % per four clean PONGs. A PONG that is late because the peer is busy
+     sending is not congestion, so `PaceState::on_ping_timeout` now cuts only
+     when the send window has not moved since the PING (`Kcp::snd_una`, sampled
+     at PING time). Measured after the fix: `bulk-n,bulk-n` **7.79 then 7.67**,
+     `bulk-1,bulk-n` **7.19 then 7.44** — no collapse — while `loss1` jumbo
+     stays at 1.67–1.71, `rtt100` is 0.169 → 0.182 and `loss5` is unchanged.
+     Two detours are recorded rather than hidden: a **window byte budget** (to
+     stop the buffers growing 5.7× at a jumbo MTU) fixed nothing and cost the
+     lossy leg two thirds of its throughput (0.45 against 1.67 Gbit/s on
+     `loss1`), so it was reverted — a lossy path wants the window *wider* than
+     the BDP, not closer to it; and a **1 ms ack-batching window** was −6 % to
+     −12 % on the clean path and was reverted. What remains open from the
+     original finding: nothing — the collapse is gone, and the numbers that
+     replaced it are on the benchmarks page.
+   - **L3+KCP matches the TCP carrier on a jumbo single flow and now leads it on
+     eight (historical note; see the entry above for the fix).** With the segment size following
      the path and the dead link fixed, one bulk flow through an L3 claim at a
      jumbo TUN MTU (8000) and a jumbo link (9000) measures **7.265 Gbit/s
      against the TCP carrier's 7.086** in the same run (A/A twin 6.948, so both

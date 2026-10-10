@@ -127,39 +127,21 @@ const KCP_FAST_RESEND: i32 = 2;
 /// them (4 × 2.8 MiB = 11.2 MiB send-side).
 const KCP_SND_WND: u16 = 2048;
 const KCP_RCV_WND: u16 = 4096;
-/// The two windows as **byte budgets**: 2048 and 4096 segments at KCP's
-/// 1400-byte default, which is what the segment counts above were tuned as.
+/// Cap on app data queued in the `Kcp` send queue, in segments. Beyond this
+/// the pump stops pulling from the writer channel, backpressuring
+/// `AsyncWrite`.
 ///
-/// KCP counts its windows in segments, so a session that follows its path up
-/// to 8 KiB datagrams multiplies every one of these buffers by 5.7 — 2.8 MiB
-/// of in-flight data becomes 16 MiB, and the app-side queue limit below
-/// becomes 32 MiB. The symptom is measurable: a session that has just carried
-/// a bulk transfer keeps the *next* transfer's data behind that backlog, and
-/// the cell reads a fraction of the same cell on a fresh session (2.0 against
-/// 6.1 Gbit/s, reproducibly). The budgets are bytes here and segments only
-/// where KCP insists on them.
-const KCP_SND_WINDOW_BYTES: usize = KCP_SND_WND as usize * 1400;
-const KCP_RCV_WINDOW_BYTES: usize = KCP_RCV_WND as usize * 1400;
-/// Cap on app data queued for the wire, as a byte budget (twice the send
-/// window, as the segment count used to be). Beyond it the pump stops pulling
-/// from the writer channel, backpressuring `AsyncWrite`.
-const SND_QUEUE_BYTES: usize = 2 * KCP_SND_WINDOW_BYTES;
-
-/// How many segments a byte budget is worth at `mtu`.
-///
-/// The floor keeps a window usable on a path whose datagrams are tiny; the
-/// ceiling is the tuned segment count, so a *small* MTU never inflates the
-/// window past what the tuning chose.
-fn segments_for_bytes(bytes: usize, mtu: usize) -> u16 {
-    let mss = mtu.saturating_sub(KCP_OVERHEAD).max(1);
-    u16::try_from((bytes / mss).clamp(32, usize::from(KCP_RCV_WND))).unwrap_or(KCP_RCV_WND)
-}
-
-/// The app-queue cap in segments at `mtu` (`wait_snd` counts segments).
-fn snd_queue_limit(mtu: usize) -> usize {
-    let mss = mtu.saturating_sub(KCP_OVERHEAD).max(1);
-    (SND_QUEUE_BYTES / mss).max(64)
-}
+/// Segment-counted, like the windows above, and that is deliberate: a byte
+/// budget was tried (the same counts' worth at the 1400-byte default, with the
+/// counts derived from the session's datagram size) to stop these buffers
+/// growing 5.7× on a jumbo path. It fixed nothing — the growth was a red
+/// herring for the one symptom it was aimed at, which turned out to be the
+/// pacer (`PaceState::on_ping_timeout`) — and it cost the lossy leg **two
+/// thirds of its throughput**: 0.45 against 1.67 Gbit/s on `loss1` with jumbo
+/// datagrams, because a window barely one bandwidth-delay product wide leaves
+/// fast retransmit nothing to ride on. A lossy path wants the window *wider*
+/// than the path's BDP, not closer to it.
+const SND_QUEUE_LIMIT: usize = 2 * KCP_SND_WND as usize;
 /// One `Kcp::send` call must stay under 128 segments (`UserBufTooBig`), so
 /// app writes are chunked well below that.
 const SEND_CHUNK: usize = 64 * 1024;
@@ -369,6 +351,16 @@ pub(crate) static KCP_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Peak `wait_snd` (unacknowledged segments) since the last stats line: the
 /// session's own queue, as the engine sees it.
 pub(crate) static KCP_WAIT_SND_PEAK: AtomicU64 = AtomicU64::new(0);
+/// The receive queue's depth and the window this side advertises, sampled once
+/// per pump round: the state a stalled reader turns into backpressure.
+pub(crate) static KCP_WAIT_RCV: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_ADVERTISED_WND: AtomicU64 = AtomicU64::new(0);
+/// The peer's advertised window, as last received.
+pub(crate) static KCP_PEER_WND: AtomicU64 = AtomicU64::new(0);
+/// The adaptive send pacer's current allowance, in bits per second. It is cut
+/// on a keepalive timeout and only raised 5 % per four clean ones, so it is the
+/// one piece of state in this path that can hold a session down for minutes.
+pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
@@ -421,6 +413,10 @@ pub(crate) struct KcpStats {
     pub reader_queued_bytes: u64,
     pub spill_bytes: u64,
     pub wait_snd_peak: u64,
+    pub wait_rcv: u64,
+    pub advertised_wnd: u64,
+    pub peer_wnd: u64,
+    pub pacer_bps: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -453,6 +449,10 @@ pub(crate) fn kcp_stats() -> KcpStats {
         reader_queued_bytes: KCP_READER_QUEUED_BYTES.load(Ordering::Relaxed),
         spill_bytes: KCP_SPILL_BYTES.load(Ordering::Relaxed),
         wait_snd_peak: KCP_WAIT_SND_PEAK.swap(0, Ordering::Relaxed),
+        wait_rcv: KCP_WAIT_RCV.load(Ordering::Relaxed),
+        advertised_wnd: KCP_ADVERTISED_WND.load(Ordering::Relaxed),
+        peer_wnd: KCP_PEER_WND.load(Ordering::Relaxed),
+        pacer_bps: KCP_PACER_BPS.load(Ordering::Relaxed),
     }
 }
 
@@ -496,6 +496,10 @@ fn spawn_kcp_stats() {
                     reader_queued_bytes = s.reader_queued_bytes,
                     spill_bytes = s.spill_bytes,
                     wait_snd_peak = s.wait_snd_peak,
+                    wait_rcv = s.wait_rcv,
+                    advertised_wnd = s.advertised_wnd,
+                    peer_wnd = s.peer_wnd,
+                    pacer_mbit = s.pacer_bps / 1_000_000,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -652,7 +656,7 @@ impl DatagramSink for DatagramOut {
 /// Apply the fixed arm-2 protocol parameters (see the module docs).
 fn configure(kcp: &mut Kcp<DatagramOut>) {
     kcp.set_nodelay(true, KCP_INTERVAL_MS, KCP_FAST_RESEND, true);
-    apply_windows(kcp);
+    kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
 }
 
 /// Add to a residency gauge (saturating: a gauge is a diagnostic, never a
@@ -676,15 +680,28 @@ fn note_wait_snd(depth: usize) {
     KCP_WAIT_SND_PEAK.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
 }
 
-/// Size both windows from the session's current datagram size (see
-/// [`KCP_SND_WINDOW_BYTES`]). Called at session start and whenever the
-/// path-MTU probe changes the datagram size.
-fn apply_windows(kcp: &mut Kcp<DatagramOut>) {
-    let mtu = kcp.mtu();
-    kcp.set_wndsize(
-        segments_for_bytes(KCP_SND_WINDOW_BYTES, mtu).min(KCP_SND_WND),
-        segments_for_bytes(KCP_RCV_WINDOW_BYTES, mtu),
+/// Record the receive-side window state for the periodic stats line: the
+/// receive queue's depth, the window this side advertises out of it, and the
+/// peer's window as last received.
+fn note_pacer(rate_bps: f64) {
+    // Saturating and lossy on purpose: this is a diagnostic gauge of a number
+    // that stays far inside u64 for any real link rate.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a diagnostic gauge; the value is a positive bit rate far below u64::MAX"
+    )]
+    let bps = rate_bps as u64;
+    KCP_PACER_BPS.store(bps, Ordering::Relaxed);
+}
+
+fn note_windows(kcp: &Kcp<DatagramOut>) {
+    KCP_WAIT_RCV.store(
+        u64::try_from(kcp.wait_rcv()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
     );
+    KCP_ADVERTISED_WND.store(u64::from(kcp.advertised_wnd()), Ordering::Relaxed);
+    KCP_PEER_WND.store(u64::from(kcp.peer_wnd()), Ordering::Relaxed);
 }
 
 /// Request large kernel buffers on a KCP socket (see
@@ -995,7 +1012,7 @@ fn drain_writer(
         // One queued write consumed: hand the capacity permit back to the
         // writer half.
         out_sem.add_permits(1);
-        if kcp.wait_snd() >= snd_queue_limit(kcp.mtu()) {
+        if kcp.wait_snd() >= SND_QUEUE_LIMIT {
             break;
         }
         match out_rx.try_recv() {
@@ -1038,6 +1055,9 @@ struct PaceState {
     last_ping_us: u64,
     ping_outstanding: bool,
     clean_pongs: u32,
+    /// The send window's front when the outstanding PING was sent. A late PONG
+    /// with a window that moved is a *busy* peer, not an over-driven path.
+    una_at_ping: u32,
     /// When this session last re-read the kernel's path MTU; `None` until the
     /// first check (see `maybe_path_mtu`).
     last_mtu_check: Option<Instant>,
@@ -1056,6 +1076,7 @@ impl PaceState {
             last_ping_us: 0,
             ping_outstanding: false,
             clean_pongs: 0,
+            una_at_ping: 0,
             last_mtu_check: None,
         }
     }
@@ -1083,9 +1104,27 @@ impl PaceState {
         }
     }
 
-    /// A PING went unanswered past the deadline: the path is over capacity,
-    /// cut the send rate (the pacer is the congestion-control stand-in).
-    fn on_ping_timeout(&mut self) {
+    /// A PING went unanswered past the deadline. That is a congestion signal
+    /// only when the session is otherwise **stalled**: a peer that is busy
+    /// answering data queues the PONG behind that data, and cutting the rate
+    /// for it is the one thing that makes the queue worse.
+    ///
+    /// The distinction is not academic. This cut is permanent in practice — the
+    /// recovery is `PACER_UP_FACTOR` per four clean PONGs, so +5 % every eight
+    /// seconds — and one heavy transfer fires it four times over (12 → 3.8
+    /// Gbit/s, measured), after which the *next* transfer in the same session
+    /// reads a fifth of what the same transfer reads on a fresh session (0.97
+    /// against 7.12 Gbit/s for `bulk-n` at a jumbo MTU, reproducibly). A send
+    /// window that moved while the PONG was late is the peer working: hold the
+    /// rate and let the data decide.
+    fn on_ping_timeout(&mut self, snd_una: u32) {
+        if snd_una != self.una_at_ping {
+            debug!(
+                "KCP pacer: late PONG with progress, rate held at {:.0} bps",
+                self.rate_bps
+            );
+            return;
+        }
         self.rate_bps = (self.rate_bps * PACER_DOWN_FACTOR).max(PACER_MIN_BPS);
         self.clean_pongs = 0;
         debug!("KCP pacer: PONG timeout, rate -> {:.0} bps", self.rate_bps);
@@ -1145,15 +1184,16 @@ async fn maybe_ping(
     // signal: cut the rate immediately instead of waiting for the next
     // keepalive tick, and allow an immediate retry.
     if pace.ping_outstanding && pace.last_ping.elapsed() >= PONG_TIMEOUT {
-        pace.on_ping_timeout();
+        pace.on_ping_timeout(kcp.snd_una());
         pace.ping_outstanding = false;
     }
     if pace.last_ping.elapsed() < Duration::from_millis(u64::from(KEEPALIVE_MS)) {
         return;
     }
     if pace.ping_outstanding {
-        pace.on_ping_timeout();
+        pace.on_ping_timeout(kcp.snd_una());
     }
+    pace.una_at_ping = kcp.snd_una();
     pace.last_ping = Instant::now();
     let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     pace.last_ping_us = us;
@@ -1363,9 +1403,6 @@ fn maybe_path_mtu(
     };
     let before = kcp.mtu();
     if kcp.set_mtu(fits) != before {
-        // The windows are byte budgets: a bigger datagram carries more of the
-        // budget per segment, so the segment counts follow it down.
-        apply_windows(kcp);
         datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
         info!(
             peer = %net.peer,
@@ -1576,7 +1613,9 @@ async fn run_session(
             // of the link rate (measured ~half the window limit at 20 ms).
             data = out_rx.recv(), if {
                 note_wait_snd(kcp.wait_snd());
-                !closing && kcp.wait_snd() < snd_queue_limit(kcp.mtu())
+                note_windows(&kcp);
+                note_pacer(pace.rate_bps);
+                !closing && kcp.wait_snd() < SND_QUEUE_LIMIT
             } => {
                 if let Some(data) = data {
                     let mut fatal = false;
