@@ -267,8 +267,9 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
    `carrier` it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy
    UDP listener) and the UDP buffer size. The channel count is not part of the
    message: the client opens the channels it configured (one per visitor for
-   TCP, `udp_workers` for UDP, one long-lived channel for transparent) and the
-   server asks for another when a visitor arrives.
+   TCP, `udp_workers` for UDP, `default_members`/`members` long-lived channels
+   for a transparent claim) and the server asks for another when a visitor
+   arrives or a channel ends.
 3. The server validates:
    - **whitelist**: the requested port must be covered by `allow_ports`;
      an empty/missing `allow_ports` rejects *every* registration (this is
@@ -462,14 +463,16 @@ address routed to the server, and a single-IP server — are in
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
+| `[transparent.data].default_members` | how many data channels one claim holds — its **member set**. Default: `1`. More than one gives the claim that many carrier connections: in `multiplex` mode the pool must be at least that wide (`[transparent.data.tcp\|kcp].tunnels`), in `direct` mode each member is a connection of its own. At most 64. **Both ends must carry member sets**: a peer without them starts one channel at a time, so a claim that holds several would only have one used |
+| `[transparent.claims.<name>].members` | the same, for one claim only: it overrides `[transparent.data].default_members` |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
-`retry_interval`, `mode`, `carrier`. `[transparent.transport]` holds one key,
-`proxy`, because what an L3 client sends is the visitor's own traffic: this hop
-is a plain link by design, so the model has no encryption keys to offer, and
-`[transparent].tun` is where a device is named.
+`retry_interval`, `mode`, `carrier`, `members`. `[transparent.transport]` holds
+one key, `proxy`, because what an L3 client sends is the visitor's own traffic:
+this hop is a plain link by design, so the model has no encryption keys to offer,
+and `[transparent].tun` is where a device is named.
 
 `mode` and `carrier` are independent for a claim as they are for a forwarding
 service: `direct` + `tcp` (the default pair) is one TCP connection per claim,
@@ -478,15 +481,22 @@ data channel, with no multiplexer above it — and `multiplex` is the pair for a
 client that serves many claims from one shared pool.
 
 `[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
-`default_mode`, `default_carrier`, `shared_pool`, and the two
-per-carrier `tunnels` counts — with **one different default**: the mode is
-`direct`, because a claim has exactly one channel and the multiplex pool
-therefore buys it nothing unless `shared_pool` is on. Measured on one host and
+`default_mode`, `default_carrier`, `shared_pool`, the two
+per-carrier `tunnels` counts, and `default_members` — with **one different
+default**: the mode is `direct`, because a claim has exactly one channel unless
+it is given a member set, and the multiplex pool therefore buys a one-channel
+claim nothing unless `shared_pool` is on. Measured on one host and
 workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
 carried 65 % more round trips per second than `multiplex`
 ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 A client that serves many claims from one pool writes `default_mode = "multiplex"`
 and `shared_pool = true`.
+
+A claim's `members` is how many data channels it holds, and the pool must be at
+least that wide in `multiplex` mode: a claim's carriers are meant to be distinct
+tunnels, so `members = 4` with `tunnels = 2` is refused with the count to write
+instead. In `direct` mode there is no pool to keep them apart — each member is a
+connection of its own — and no floor to satisfy.
 
 ### What the operator must prepare
 

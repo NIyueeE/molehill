@@ -153,37 +153,49 @@ a `Claim` value held for the lifetime of the registration — so a second client
 claiming the same endpoint is rejected with a precise reason instead of silently
 stealing the first one's visitors.
 
-The data path is **one channel per claimed endpoint**, and it moves **batches**,
-not packets: the device is drained until it runs dry, every packet is framed
-where it is read into its endpoint's buffer, and the run of frames is handed
-over and written as one unit. That is the same lever as a WireGuard
-super-packet, one layer up: the far side still reads one frame at a time, while
-the carrier pays one header, one acknowledgement and one syscall per *batch*
-instead of per packet. Because the flush happens the moment the device is
-drained, the first packet of a burst waits for nothing — the batching only
-collects what was already queued. A claim's channels run in `direct` mode by
-default for the same reason: it has exactly one channel, so a multiplexer's
-frame on every packet buys it nothing (see
+A claimed endpoint is carried by a **member set** — one or more data channels,
+each a *member* of the claim — and it moves **batches**, not packets: the device
+is drained until it runs dry, every packet is framed where it is read into its
+member's buffer, and the run of frames is handed over and written as one unit.
+That is the same lever as a WireGuard super-packet, one layer up: the far side
+still reads one frame at a time, while the carrier pays one header, one
+acknowledgement and one syscall per *batch* instead of per packet. Because the
+flush happens the moment the device is drained, the first packet of a burst
+waits for nothing — the batching only collects what was already queued. A claim
+with one member runs in `direct` mode by default for the same reason: it has
+nothing for a multiplexer to multiplex, so its frame on every packet buys
+nothing (see
 [Benchmarks](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
-The data path is **one channel per claimed endpoint**:
+How a claim's member set is opened, held and repaired:
 
-- The client opens **one** channel the moment its registration is accepted (a
-  TCP service opens none and waits to be asked; a transparent service's packets
-  all ride this one). It opens with the same four-byte service prologue as any
-  other data channel, so the server knows which service — and therefore which
-  endpoint — it carries before the first packet.
-- The server answers it with `DataChannelCmd::StartForwardTransparent` (tag 3,
-  a unit variant like the other fixed-size data commands), and from then on the
-  channel carries whole IP packets, framed `[u16 length][packet]` in both
-  directions by `IpTraffic` (`src/protocol.rs`). The packet travels verbatim —
-  there is no address tag, because the addresses are inside it — and a
-  zero-length frame is a protocol error rather than an empty packet.
-- When the channel ends the server asks for a replacement (the same
-  `DataChannelRequest` path a UDP worker's replacement takes) and keeps the
-  claim while it waits. From the second channel on, it waits 250 ms
-  (`TRANSPARENT_REPLACE_BACKOFF`) before sending the start command, so a peer
-  that cannot serve it is not polled in a tight loop.
+- The client opens the claim's **member count** in one go the moment its
+  registration is accepted — `[transparent.data].default_members`, or the
+  claim's own `members`, one channel by default (a TCP service opens none and
+  waits to be asked). In `multiplex` mode those channels are streams of the
+  claim's tunnel pool, placed on tunnels the set does not already occupy while
+  the pool has a free one, so a claim's carriers stay distinct; in `direct` mode
+  each member is a connection of its own. Every channel opens with the same
+  four-byte service prologue as any other data channel, so the server knows
+  which service — and therefore which endpoint — it carries before the first
+  packet.
+- The server answers each channel with
+  `DataChannelCmd::StartForwardTransparent` (tag 3, a unit variant like the other
+  fixed-size data commands), and from then on it carries whole IP packets, framed
+  `[u16 length][packet]` in both directions by `IpTraffic` (`src/protocol.rs`).
+  The packet travels verbatim — there is no address tag, because the addresses
+  are inside it — and a zero-length frame is a protocol error rather than an
+  empty packet.
+- The server supervises the set, and it is not told the set's width: the
+  channels the client opens *are* the set, and the hub discovers the width from
+  the members that actually join, widening by one whenever a join finds every
+  slot taken. A member that ends keeps its slot — a replacement inherits it, so
+  the packets placed in it resume there while the surviving members are
+  untouched — and every member that ends is replaced (the same
+  `DataChannelRequest` path a UDP worker's replacement takes), the claim staying
+  held while it waits. A channel that arrives after a member ended is paced:
+  250 ms (`TRANSPARENT_REPLACE_BACKOFF`) before the start command is written, so
+  a peer that cannot serve it is not polled in a tight loop.
 
 **Which end of a packet the claim is.** Both ends run the same hub
 (`src/transparent/hub.rs`): one reader per TUN device, a **member set** per
@@ -225,9 +237,10 @@ must read 0; on the server, a registration is rejected if its device is missing.
 The recipes are in [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
-and counted (`not_ipv4`), and there is no IPv6 path. One channel carries every
-flow of one claimed endpoint, so a retransmit for one flow can delay another
-flow sharing the channel — per-flow channels are not in this version. And the
+and counted (`not_ipv4`), and there is no IPv6 path. A member set is held as a
+set but is not yet a *spread*: every packet of the claim rides its first member,
+so a retransmit for one flow can still delay another flow sharing that member,
+and the claim's throughput is one member's however many it holds. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
 counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,

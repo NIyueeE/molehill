@@ -86,14 +86,19 @@ pub struct TransparentClaimConfig {
     /// valid only with `mode = "multiplex"`.
     #[cfg(feature = "multiplex")]
     pub carrier: Option<DataCarrier>,
+    /// Override `[transparent.data].default_members` for this claim only: how
+    /// many data channels this claim holds, its inner flows spread across them.
+    #[cfg(feature = "multiplex")]
+    pub members: Option<u16>,
 }
 
 /// Data-plane knobs for a claim (`[transparent.data]`).
 ///
 /// The same keys as `[client.data]`, with one measured difference: the default
-/// mode is **`direct`**, because a claim has exactly one channel and the
-/// multiplex pool therefore buys it nothing unless `shared_pool` is on. The
-/// numbers behind that default are in
+/// mode is **`direct`**, because a claim carries its flows over **one** channel
+/// unless the operator asks for a member set, and the multiplex pool buys a
+/// one-channel claim nothing unless `shared_pool` is on. The numbers behind
+/// that default are in
 /// [benchmarks.md](../../docs/benchmarks.md), "The transparent-L3 wire
 /// question": on the same host and workload, `direct` moved 6 % fewer wire
 /// bytes, took 33 % less CPU per packet and carried 65 % more round trips per
@@ -114,6 +119,17 @@ pub struct TransparentDataConfig {
     /// `tcp` (default) or `kcp`; `kcp` needs `default_mode = "multiplex"`.
     #[serde(default)]
     pub default_carrier: DataCarrier,
+    /// How many data channels one claim holds — its **member set** — unless the
+    /// claim writes its own `members`. Default: 1, one channel carrying every
+    /// flow of the claim.
+    ///
+    /// More than one member spreads the claim's inner flows over that many
+    /// carrier connections: the claim's throughput ceiling stops being one
+    /// connection's. In `multiplex` mode the pool must be at least this wide
+    /// (`[transparent.data.tcp|kcp].tunnels`), so the members land on distinct
+    /// tunnels; in `direct` mode each member is a connection of its own.
+    #[serde(default)]
+    pub default_members: Option<u16>,
     /// Serve every claim of one control session from **one** shared tunnel
     /// pool per carrier, instead of one pool per claim. Default: `false`.
     #[serde(default)]
@@ -133,6 +149,7 @@ impl Default for TransparentDataConfig {
             default_data_addr: None,
             default_mode: default_direct_mode(),
             default_carrier: DataCarrier::default(),
+            default_members: None,
             shared_pool: false,
             tcp: DataCarrierLimits::default(),
             kcp: DataCarrierLimits::default(),
@@ -185,6 +202,11 @@ impl TransparentClientConfig {
                 {
                     service.mode = claim.mode;
                     service.carrier = claim.carrier;
+                    // The claim's member count, resolved here so the engine has
+                    // one number to read: its own, the block's default, or the
+                    // one channel every claim has.
+                    service.transparent_members =
+                        claim.members.or(self.data.default_members).unwrap_or(1);
                 }
                 (name.clone(), service)
             })
@@ -277,12 +299,66 @@ token = "claim-token"
         );
         assert_eq!(service.transparent_tun, "l3test0");
         assert_eq!(&**service.token.as_ref().unwrap(), "claim-token");
+        assert_eq!(
+            service.transparent_members, 1,
+            "a claim has one member unless the operator asks for a set"
+        );
         assert_eq!(client.transport.transport_type, TransportType::Plain);
         assert!(client.transport.noise.is_none());
         assert_eq!(
             client.transport.proxy.as_ref().map(Url::as_str),
             Some("socks5://127.0.0.1:1080")
         );
+    }
+
+    /// The member count resolves the way the other per-claim overrides do: the
+    /// claim's own `members` over the block's `default_members`, and one channel
+    /// when neither was written.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn a_claims_member_count_resolves_claim_then_block_then_one() {
+        let config = |default: &str, claim: &str| {
+            Config::from_str(&format!(
+                r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data]
+default_mode = "multiplex"
+{default}
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+{claim}
+"#
+            ))
+            .unwrap()
+            .into_l3_client()
+            .unwrap()
+            .client
+            .unwrap()
+            .services
+            .remove("web")
+            .unwrap()
+            .transparent_members
+        };
+
+        assert_eq!(config("", "members = 3"), 3, "the claim's own count wins");
+        assert_eq!(
+            config("default_members = 2", ""),
+            2,
+            "the block's default applies to a claim that wrote none"
+        );
+        assert_eq!(
+            config("default_members = 2", "members = 3"),
+            3,
+            "the claim overrides the block"
+        );
+        assert_eq!(config("", ""), 1, "one channel is the default claim");
     }
 
     /// The `[transparent.control]` block is where the server is named, so a

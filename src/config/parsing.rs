@@ -189,6 +189,12 @@ pub struct ClientServiceConfig {
     /// for every forwarding service: only a claim touches a device.
     #[serde(skip)]
     pub transparent_tun: String,
+    /// How many data channels this claim holds — its **member set** — filled by
+    /// the L3 model's lowering from `[transparent.data].default_members` or the
+    /// claim's own `members`. `0` for every forwarding service, which never
+    /// reads it.
+    #[serde(skip)]
+    pub transparent_members: u16,
 }
 
 impl ClientServiceConfig {
@@ -215,6 +221,15 @@ impl ClientServiceConfig {
             .as_ref()
             .and_then(|t| t.transport_type)
             .unwrap_or(global)
+    }
+
+    /// The member count of a claim's data plane, at least one: the set a
+    /// claim's packets are placed in never has fewer slots than the one channel
+    /// every service has.
+    ///
+    /// Only a claim's value is ever read; a forwarding service answers 1.
+    pub fn claim_members(&self) -> usize {
+        usize::from(self.transparent_members.max(1))
     }
 
     /// The Noise config this service will use: its own
@@ -788,6 +803,18 @@ impl ClientModel {
     }
 }
 
+/// What asked for a pool's width floor: which knob wants one tunnel per unit.
+///
+/// The refusal names the knob the operator wrote, so it carries both the source
+/// and the count it stood for (see `Config::validate_tunnel_floor`).
+#[cfg(feature = "multiplex")]
+enum FloorCause {
+    /// A UDP service's worker set (`udp_workers`): its shards must stay apart.
+    UdpWorkers(u16),
+    /// An L3 claim's member set (`members`): its carriers must stay apart.
+    ClaimMembers(u16),
+}
+
 /// Keys a release removed, the version that removed each one, and what to
 /// write instead.
 ///
@@ -998,6 +1025,8 @@ impl Config {
         // defaults; what differs between them is which service types are
         // legal, and that is the model argument.
         if let Some(transparent) = config.transparent.as_mut() {
+            #[cfg(feature = "multiplex")]
+            Config::validate_claim_members(transparent)?;
             let mut lowered = transparent.lower();
             Config::validate_client_config(&mut lowered, ClientModel::Claiming)?;
             transparent.lowered = Some(Box::new(lowered));
@@ -1282,15 +1311,55 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse a member count a claim may not hold.
+    ///
+    /// `members` is a count like `tunnels`, and it is refused rather than
+    /// clamped for the same reason: the operator wrote a number, and a count
+    /// nobody obeys is worse than a refusal that names the key. One is the
+    /// floor (a claim always has its one channel), and the tunnel cap is the
+    /// ceiling — a claim with more members than the pool may ever hold would be
+    /// asking for carriers that cannot stay distinct.
+    ///
+    /// Run on the L3 model's own block, before it is lowered: the key the
+    /// message names is the one the reader wrote (`default_members`, or one
+    /// claim's `members`), which the lowered form no longer knows.
+    #[cfg(feature = "multiplex")]
+    fn validate_claim_members(transparent: &TransparentClientConfig) -> Result<()> {
+        let cap = usize::from(MAX_MUX_TUNNELS_CAP);
+        let check = |key: String, members: u16| -> Result<()> {
+            if members == 0 {
+                bail!("`{key}` must be at least 1");
+            }
+            if usize::from(members) > cap {
+                bail!(
+                    "`{key} = {members}` is above the {cap} data channels one claim may hold; \
+                     lower it, or split the service"
+                );
+            }
+            Ok(())
+        };
+        if let Some(members) = transparent.data.default_members {
+            check("[transparent.data].default_members".to_owned(), members)?;
+        }
+        for (name, claim) in &transparent.claims {
+            if let Some(members) = claim.members {
+                check(format!("[transparent.claims.{name}].members"), members)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Refuse a tunnel count smaller than what the services of that carrier
     /// need.
     ///
-    /// A UDP service's worker set shards across tunnels, and the pool keeps one
-    /// tunnel per worker so the shards stay apart — that is the UDP-derived
-    /// floor. An elastic pool grew to meet it; a fixed one cannot, so a count
-    /// below it is a configuration that would silently degrade the service it
-    /// was written for. The message names the count to write instead, because
-    /// an operator who has just been told "no" needs the number, not the rule.
+    /// Two things ask for one tunnel per unit of demand: a UDP service's worker
+    /// set shards across tunnels, and an L3 claim's member set spreads its
+    /// inner flows across them. A pinned pool keeps one tunnel per worker or
+    /// member so those paths stay distinct — that is the floor, and a pool that
+    /// cannot grow cannot meet it later either, so a count below it is a
+    /// configuration that would silently degrade the service it was written
+    /// for. The message names the count to write instead, because an operator
+    /// who has just been told "no" needs the number, not the rule.
     #[cfg(feature = "multiplex")]
     fn validate_tunnel_floor(client: &ClientConfig, model: ClientModel) -> Result<()> {
         for (carrier, limits) in [
@@ -1300,57 +1369,83 @@ impl Config {
             let Some(written) = limits.tunnels() else {
                 continue;
             };
-            let (needed, service) = Self::deepest_udp_floor(client, carrier);
-            if needed > written {
-                let block = model.carrier_block(carrier.as_str());
-                let workers = Self::needed_workers(client, &service);
-                bail!(
-                    "`{block}.tunnels = {written}` is below what the services of that carrier \
-                     need: service `{service}` declares {workers} UDP workers, and a pool keeps \
-                     one tunnel per worker so their shards stay on distinct tunnels. Write \
-                     `{block}.tunnels = {needed}` or more, or lower that service's `udp_workers`."
-                );
+            let Some((needed, name, cause)) = Self::deepest_floor(client, carrier) else {
+                continue;
+            };
+            if needed <= written {
+                continue;
             }
+            let block = model.carrier_block(carrier.as_str());
+            let why = match cause {
+                FloorCause::UdpWorkers(workers) => format!(
+                    "service `{name}` declares {workers} UDP workers, and a pool keeps one tunnel \
+                     per worker so their shards stay on distinct tunnels. Write `{block}.tunnels \
+                     = {needed}` or more, or lower that service's `udp_workers`."
+                ),
+                FloorCause::ClaimMembers(members) => format!(
+                    "claim `{name}` holds {members} members, and a pool keeps one tunnel per \
+                     member so a claim's carriers stay distinct tunnels. Write `{block}.tunnels \
+                     = {needed}` or more, or lower that claim's `members`."
+                ),
+            };
+            bail!(
+                "`{block}.tunnels = {written}` is below what the services of that carrier need: \
+                 {why}"
+            );
         }
         Ok(())
     }
 
-    /// The deepest UDP-derived floor among the services that would share a
-    /// pool on this carrier, and the service that owns it.
+    /// The deepest floor among the services that would share a pool on this
+    /// carrier, the service that owns it, and what asked for it.
     ///
     /// "Deepest" rather than "summed": every pool is keyed per service (or, with
     /// `shared_pool`, per session), and a service's own pool only ever has to
-    /// carry that service's workers. The floor of the largest worker set is
-    /// therefore what every pool on that carrier must be able to hold — the
-    /// conservative reading, and the one that cannot under-provision a service.
+    /// carry that service's workers — or that claim's members — at once, because
+    /// what a floor buys is distinctness *within* one set of channels. The floor
+    /// of the largest demand is therefore what every pool on that carrier must
+    /// be able to hold: the conservative reading, and the one that cannot
+    /// under-provision a service.
+    ///
+    /// Only a service that draws from a pool counts: a `direct` service opens
+    /// its own connection per channel and never touches one, so its count is no
+    /// reason to refuse a tunnel count.
     #[cfg(feature = "multiplex")]
-    fn deepest_udp_floor(client: &ClientConfig, carrier: DataCarrier) -> (usize, String) {
+    fn deepest_floor(
+        client: &ClientConfig,
+        carrier: DataCarrier,
+    ) -> Option<(usize, String, FloorCause)> {
         let stream_cap = crate::transport::multiplex::stream_cap();
-        let mut deepest = (0usize, String::new());
+        let mut deepest: Option<(usize, String, FloorCause)> = None;
         for (name, service) in &client.services {
-            if !matches!(service.service_type, ServiceType::Udp) {
+            if service.carrier.unwrap_or(client.data.default_carrier) != carrier
+                || service.mode.unwrap_or(client.data.default_mode) != DataMode::Multiplex
+            {
                 continue;
             }
-            if service.carrier.unwrap_or(client.data.default_carrier) != carrier {
-                continue;
-            }
-            let workers = usize::from(service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS));
-            let floor = crate::transport::pool::udp_floor([workers], stream_cap);
-            if floor > deepest.0 {
-                deepest = (floor, name.clone());
+            let (demand, cause) = match service.service_type {
+                ServiceType::Udp => {
+                    let workers = service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS);
+                    (usize::from(workers), FloorCause::UdpWorkers(workers))
+                }
+                ServiceType::Transparent => {
+                    let members = service.transparent_members;
+                    (
+                        usize::from(members.max(1)),
+                        FloorCause::ClaimMembers(members),
+                    )
+                }
+                ServiceType::Tcp => continue,
+            };
+            let floor = crate::transport::pool::udp_floor([demand], stream_cap);
+            if deepest
+                .as_ref()
+                .is_none_or(|(widest, _, _)| floor > *widest)
+            {
+                deepest = Some((floor, name.clone(), cause));
             }
         }
         deepest
-    }
-
-    /// The worker count of one named service (for the refusal's message).
-    #[cfg(feature = "multiplex")]
-    fn needed_workers(client: &ClientConfig, name: &str) -> u16 {
-        client
-            .services
-            .get(name)
-            .and_then(|s| s.udp_workers)
-            .unwrap_or(DEFAULT_UDP_WORKERS)
     }
 
     /// Refuse a service that asks for the KCP carrier in a binary without the
@@ -2515,5 +2610,116 @@ udp_workers = 4
         // at establishment time.
         let unset = config(4).replace("tunnels = 4\n", "");
         assert!(Config::from_str(&unset).is_ok());
+    }
+
+    /// A claim's member set draws from the pool the same way a UDP worker set
+    /// does: the pool keeps one tunnel per member so the carriers stay distinct,
+    /// and a pinned pool cannot grow to meet a count below the floor. The
+    /// refusal names the claim, the count to write and the knob — a claim's
+    /// `members`, not a UDP service's `udp_workers`.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn test_a_tunnel_count_below_a_claims_member_count_is_refused() {
+        let config = |tunnels: u16, mode: &str, members: &str| {
+            format!(
+                r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data]
+default_mode = "{mode}"
+
+[transparent.data.tcp]
+tunnels = {tunnels}
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+{members}
+"#
+            )
+        };
+
+        // Four members ask for four carriers; two tunnels cannot keep them
+        // distinct.
+        let err = format!(
+            "{:#}",
+            Config::from_str(&config(2, "multiplex", "members = 4")).unwrap_err()
+        );
+        assert!(
+            err.contains("`[transparent.data.tcp].tunnels = 2`")
+                && err.contains("`[transparent.data.tcp].tunnels = 4`")
+                && err.contains("claim `web` holds 4 members"),
+            "the refusal must name the key, the count to write and the claim: {err}"
+        );
+
+        // The floor itself is the operator's number, and the claim is accepted.
+        assert!(Config::from_str(&config(4, "multiplex", "members = 4")).is_ok());
+
+        // A claim that opens a connection per member (`direct`) never draws
+        // from the pool, so the pool's width is no reason to refuse it.
+        assert!(
+            Config::from_str(&config(2, "direct", "members = 4")).is_ok(),
+            "a direct claim has no pool and therefore no pool floor"
+        );
+    }
+
+    /// A member count is a count: at least one channel per claim, and never
+    /// more than one claim may hold. The refusal names the key the reader
+    /// wrote, which is why it runs on the L3 block rather than its lowering.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn test_a_claim_member_count_out_of_range_is_refused() {
+        let claim = |members: &str| {
+            format!(
+                r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+{members}
+"#
+            )
+        };
+
+        let zero = format!("{:#}", Config::from_str(&claim("members = 0")).unwrap_err());
+        assert!(
+            zero.contains("[transparent.claims.web].members") && zero.contains("at least 1"),
+            "zero is not a member set: {zero}"
+        );
+
+        let too_many = format!(
+            "{:#}",
+            Config::from_str(&claim("members = 65")).unwrap_err()
+        );
+        assert!(
+            too_many.contains("[transparent.claims.web].members")
+                && too_many.contains(&MAX_MUX_TUNNELS_CAP.to_string()),
+            "the refusal must name the key and the cap: {too_many}"
+        );
+
+        // The cap itself is a count this client may hold, and the block's
+        // default is validated under its own name.
+        assert!(Config::from_str(&claim("members = 64")).is_ok());
+        let block = format!(
+            "{:#}",
+            Config::from_str(&claim("").replace(
+                "[transparent.claims.web]",
+                "[transparent.data]\ndefault_members = 0\n\n[transparent.claims.web]"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            block.contains("[transparent.data].default_members"),
+            "the block's default is named as the reader wrote it: {block}"
+        );
     }
 }

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A transparent (L3) claim can hold a set of carrier connections, not just
+  one.** `[transparent.data].default_members` — or one claim's own `members` —
+  says how many data channels the claim holds: `members = 4` gives it four
+  carrier connections, four streams of its tunnel pool in `multiplex` mode
+  (placed on distinct tunnels, so the pool must be at least that wide:
+  `tunnels < members` is refused with the count to write) or four connections
+  of its own in `direct` mode. The default is `1`, so an existing configuration
+  behaves exactly as before, and the maximum is 64. A member that dies keeps
+  its slot: its replacement inherits the index, so the claim's traffic resumes
+  where it was, while the surviving members are untouched — where a
+  one-channel claim dropped every packet until its replacement came up. The
+  member set is a client-side decision and the server learns it from the
+  channels the client opens, so the wire protocol is unchanged; both ends must
+  carry member sets, since a peer without them starts one channel at a time.
+  `MOLEHILL_L3_STATS=1` now also prints one line per member slot (`live`,
+  `forwarded`, `no_channel`), which is how a set is told from a stack.
+
 - **The KCP carrier is independent of the data-plane mode: a `direct` service
   can ride a KCP session.** `carrier = "kcp"` used to require
   `mode = "multiplex"`, because a KCP session was only ever a multiplexed

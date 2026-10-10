@@ -2073,22 +2073,30 @@ impl ControlChannelHandle {
     }
 }
 
-/// How long to wait before asking for a replacement transparent channel.
+/// How long to wait before answering a replacement transparent channel with the
+/// start command.
 ///
-/// A replacement is requested when the channel for an endpoint ends; without a
-/// pause, a peer that refuses the start command instantly would be asked again
-/// just as instantly.
+/// A replacement is requested when a member of the claim ends; without a pause,
+/// a peer that refuses the start command instantly would be asked again just as
+/// instantly.
 #[cfg(all(feature = "transparent", target_os = "linux"))]
 const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Serve one transparent service: take the channel the client opened when its
-/// registration was accepted, hand the device's packets to it, and inject what
+/// Serve one transparent service: take the channels the client opened when its
+/// registration was accepted, hand the device's packets to them, and inject what
 /// comes back.
 ///
-/// One channel at a time. When it ends, a replacement is requested — the
-/// client opens on demand, the same path a UDP worker's replacement takes —
-/// and the tunnel pool places it, because the service must not give up on an
-/// address it holds.
+/// The claim is carried by a **member set**, and this task is its supervisor:
+/// every channel that arrives becomes one member, runs for its own lifetime,
+/// and its end asks for a replacement — the client opens on demand, the same
+/// path a UDP worker's replacement takes, and the tunnel pool places it.
+///
+/// The server is not told how many members the client configured (the
+/// registration carries no channel count) and does not need to be: the channels
+/// the client opens *are* the set, and the hub discovers its width from the
+/// members that actually join. A member's end does not narrow it — the slot is
+/// kept, so the surviving flows stay where they are — and the replacement
+/// inherits the slot its predecessor held.
 #[cfg(all(feature = "transparent", target_os = "linux"))]
 async fn run_transparent_service<C>(
     mut data_ch_rx: mpsc::Receiver<C>,
@@ -2113,46 +2121,70 @@ where
     // task ends, and the claim is what a second client's registration hits.
     let _claim = claim;
 
-    let start_cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTransparent)?;
-    let mut first_channel = true;
+    let start_cmd = Arc::new(postcard::to_stdvec(
+        &DataChannelCmd::StartForwardTransparent,
+    )?);
+    // How many members have ended: it is what makes an arriving channel a
+    // *replacement* (the client opening one because the claim lost one), and
+    // the only thing that is paced.
+    let mut lost = 0usize;
+    // Dropping the set aborts every member still running: a claim that goes
+    // away (shutdown, a dead control session, a deregistration) takes its
+    // channels with it.
+    let mut members = tokio::task::JoinSet::new();
+
     loop {
-        let channel = tokio::select! {
-            channel = data_ch_rx.recv() => channel,
+        tokio::select! {
+            channel = data_ch_rx.recv() => {
+                let Some(mut channel) = channel else {
+                    return Ok(());
+                };
+                let hub = Arc::clone(&hub);
+                let start_cmd = Arc::clone(&start_cmd);
+                // The first channels of a fresh claim start at once — they are
+                // the member set the client just opened, not replacements —
+                // while a channel that arrives after a member ended is paced:
+                // a client that cannot serve the start command (an older build,
+                // a broken data path of its own) must not be polled in a tight
+                // loop.
+                let paced = lost > 0;
+                members.spawn(async move {
+                    if paced {
+                        tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
+                    }
+                    if let Err(e) = write_and_flush(&mut channel, &start_cmd).await {
+                        debug!("Transparent channel for {endpoint} died before starting: {e:#}");
+                        return;
+                    }
+                    if let Err(e) = forward_transparent(channel, hub, endpoint).await {
+                        debug!("Transparent channel for {endpoint} ended: {e:#}");
+                    }
+                });
+            }
+            joined = members.join_next(), if !members.is_empty() => {
+                if let Some(Err(e)) = joined {
+                    error!("A transparent member task for {endpoint} failed: {e}");
+                }
+                lost += 1;
+                // A member ended: the claim is short one channel, so ask for a
+                // replacement and keep holding the address while the client
+                // opens it. The slot it held stays in the claim's set, so the
+                // flows placed in it resume on the replacement.
+                let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
+            }
             _ = shutdown_rx.recv() => return Ok(()),
             _ = &mut control_task => return Ok(()),
-        };
-        let Some(mut channel) = channel else {
-            return Ok(());
-        };
-
-        if !first_channel {
-            // The previous channel ended. Pace the replacement: a client that
-            // cannot serve this command (an older build, a broken data path of
-            // its own) must not be asked for a new channel in a tight loop.
-            tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
         }
-        first_channel = false;
-
-        if let Err(e) = write_and_flush(&mut channel, &start_cmd).await {
-            debug!("Transparent channel for {endpoint} died before starting: {e:#}");
-            let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
-            continue;
-        }
-        if let Err(e) = forward_transparent(channel, Arc::clone(&hub), endpoint, 1).await {
-            debug!("Transparent channel for {endpoint} ended: {e:#}");
-        }
-        // No channel for this endpoint any more: ask for one, and keep holding
-        // the address while the client opens it.
-        let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
     }
 }
 
 /// Start a transparent service's data path.
 ///
-/// Not a pool runner: there is no listener to accept on. It waits for the
-/// channel the client opened when its registration was accepted, then moves
-/// packets between the operator's TUN device and that channel until either
-/// end stops, asking for a replacement channel when one does.
+/// Not a pool runner: there is no listener to accept on. It supervises the
+/// **member set** of the endpoint the client claimed — the channels the client
+/// opened when its registration was accepted — moving packets between the
+/// operator's TUN device and whoever holds a slot, and asking for a replacement
+/// whenever one ends.
 fn spawn_transparent_service(
     service: &RegisteredService,
     data_ch_rx: mpsc::Receiver<DataChannel>,

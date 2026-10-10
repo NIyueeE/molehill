@@ -129,16 +129,13 @@ impl TunHub {
     /// Give one data channel a slot in `endpoint`'s member set and register its
     /// queue for it.
     ///
-    /// `members` is the width the caller wants the set to have — the claim's
-    /// configured member count — and it is what a set is created at. The slot
-    /// lives exactly as long as the returned guard.
-    fn join(
-        &self,
-        endpoint: Endpoint,
-        members: usize,
-        queue: mpsc::Sender<Bytes>,
-    ) -> Result<MemberGuard> {
-        let slot = self.routes.join(endpoint, members, queue)?;
+    /// The set's width is *discovered*, not declared: it is the widest the
+    /// claim has been seen to hold at once, so a channel that never becomes a
+    /// member (its start command failed, or a peer that only ever starts one
+    /// channel) leaves no slot behind that nothing could fill. The slot lives
+    /// exactly as long as the returned guard.
+    fn join(&self, endpoint: Endpoint, queue: mpsc::Sender<Bytes>) -> Result<MemberGuard> {
+        let slot = self.routes.join(endpoint, queue)?;
         Ok(MemberGuard {
             routes: Arc::clone(&self.routes),
             endpoint,
@@ -271,26 +268,20 @@ impl Routes {
 
     /// Take a slot in `endpoint`'s member set and register `queue` for it.
     ///
-    /// A set is created at `members` slots. A join that finds every slot taken
-    /// widens the set instead of refusing: the claim is holding more members at
-    /// once than it ever has, which is the one case a set must grow for — and
-    /// the reason the width, not a configured count, is what the routing rule
-    /// reads.
-    fn join(
-        &self,
-        endpoint: Endpoint,
-        members: usize,
-        queue: mpsc::Sender<Bytes>,
-    ) -> Result<usize> {
+    /// A claim starts as one slot and a join that finds every slot taken widens
+    /// the set by one: the claim is holding more members at once than it ever
+    /// has, which is the one case a set has to grow for — and the reason the
+    /// width, not a declared count, is what the routing rule reads.
+    fn join(&self, endpoint: Endpoint, queue: mpsc::Sender<Bytes>) -> Result<usize> {
         let mut table = self
             .table
             .lock()
             .map_err(|_| anyhow::anyhow!("the TUN routing table is poisoned"))?;
         if let Some(claim) = table.lookup_endpoint_mut(&endpoint) {
-            return Ok(claim.place(members, queue));
+            return Ok(claim.place(queue));
         }
-        let mut claim = ClaimSlots::with_slots(members);
-        let slot = claim.place(members, queue);
+        let mut claim = ClaimSlots::new();
+        let slot = claim.place(queue);
         table.insert(endpoint, claim);
         Ok(slot)
     }
@@ -423,21 +414,20 @@ struct MemberSlot {
 }
 
 impl ClaimSlots {
-    fn with_slots(members: usize) -> Self {
+    /// A set with the one slot every claim starts with.
+    fn new() -> Self {
         Self {
-            slots: (0..members.max(1)).map(|_| MemberSlot::default()).collect(),
+            slots: vec![MemberSlot::default()],
         }
     }
 
-    /// Take the lowest empty slot, widening the set first when every slot is
-    /// taken: to `members`, or by one when even that is not wider than the set
-    /// already is. Returns the slot's index.
-    fn place(&mut self, members: usize, queue: mpsc::Sender<Bytes>) -> usize {
+    /// Take the lowest empty slot, widening the set by one when every slot is
+    /// taken. Returns the slot's index.
+    fn place(&mut self, queue: mpsc::Sender<Bytes>) -> usize {
         let slot = if let Some(slot) = self.slots.iter().position(|slot| slot.queue.is_none()) {
             slot
         } else {
-            self.slots
-                .resize_with(members.max(self.slots.len() + 1), MemberSlot::default);
+            self.slots.push(MemberSlot::default());
             self.slots.len() - 1
         };
         if let Some(entry) = self.slots.get_mut(slot) {
@@ -479,23 +469,20 @@ impl Batch {
 /// The channel is a stream of `[u16 length][packet]` frames in both
 /// directions; everything on it for `endpoint` is injected into the local
 /// kernel, and everything the kernel routes to that endpoint is framed onto
-/// whichever of the claim's members the packet's flow is placed on. The
-/// function returns when the channel or the device ends — the caller decides
-/// whether to ask for another channel, and the member set keeps the slot the
-/// channel held so its replacement inherits it.
-pub async fn forward_transparent<T>(
-    conn: T,
-    hub: Arc<TunHub>,
-    endpoint: Endpoint,
-    members: usize,
-) -> Result<()>
+/// whichever of the claim's members the packet's flow is placed on. This
+/// channel becomes one *member* of the claim while it runs — it takes a slot of
+/// the set, and its own frames are the ones it reads back. The function returns
+/// when the channel or the device ends — the caller decides whether to ask for
+/// another channel, and the set keeps the slot the channel held so its
+/// replacement inherits it.
+pub async fn forward_transparent<T>(conn: T, hub: Arc<TunHub>, endpoint: Endpoint) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let stats = hub.stats();
     let (reader, mut writer) = tokio::io::split(conn);
     let (tx, mut rx) = mpsc::channel::<Bytes>(QUEUE);
-    let guard = hub.join(endpoint, members, tx)?;
+    let guard = hub.join(endpoint, tx)?;
 
     // The pump is one `write_all` per batch: the reader already framed every
     // packet, so a batch of N packets costs one syscall and one carrier
@@ -737,18 +724,18 @@ mod tests {
         assert_eq!(table.lookup_endpoint(&web), None);
     }
 
-    /// A member set is created at the caller's width, members take the lowest
-    /// free slot, and a member that leaves **keeps its slot's place**: the
-    /// replacement takes the freed index, so the set's width — the modulus a
-    /// flow is placed by — does not move when a member does.
+    /// Members take the lowest free slot, and a member that leaves **keeps its
+    /// slot's place**: the replacement takes the freed index, so the set's
+    /// width — the modulus a flow is placed by — does not move when a member
+    /// does.
     #[test]
     fn a_member_takes_the_lowest_free_slot_and_a_leave_does_not_narrow_the_set() {
         let routes = Routes::new();
         let web = claim();
         let (first, _rx_first) = mpsc::channel(4);
-        assert_eq!(routes.join(web, 2, first).unwrap(), 0);
+        assert_eq!(routes.join(web, first).unwrap(), 0);
         let (second, _rx_second) = mpsc::channel(4);
-        assert_eq!(routes.join(web, 2, second).unwrap(), 1);
+        assert_eq!(routes.join(web, second).unwrap(), 1);
         assert_eq!(routes.member_stats().len(), 2);
 
         routes.vacate(&web, 0);
@@ -758,24 +745,25 @@ mod tests {
 
         let (replacement, _rx_replacement) = mpsc::channel(4);
         assert_eq!(
-            routes.join(web, 2, replacement).unwrap(),
+            routes.join(web, replacement).unwrap(),
             0,
             "the replacement inherits the slot its predecessor held"
         );
         assert_eq!(routes.member_stats().len(), 2);
     }
 
-    /// A claim holds more members at once than its set was created for: the set
+    /// A claim holds more members at once than it ever has before: the set
     /// widens by one instead of refusing the member, because refusing it would
-    /// drop a channel the caller already opened.
+    /// drop a channel the caller already opened — and the width is what the
+    /// set is *discovered* to be, not a count anyone declared.
     #[test]
     fn a_set_widens_when_every_slot_is_taken() {
         let routes = Routes::new();
         let web = claim();
         let (first, _rx_first) = mpsc::channel(4);
-        assert_eq!(routes.join(web, 1, first).unwrap(), 0);
+        assert_eq!(routes.join(web, first).unwrap(), 0);
         let (second, _rx_second) = mpsc::channel(4);
-        assert_eq!(routes.join(web, 1, second).unwrap(), 1);
+        assert_eq!(routes.join(web, second).unwrap(), 1);
         assert_eq!(routes.member_stats().len(), 2);
     }
 
@@ -788,9 +776,9 @@ mod tests {
         let routes = Routes::new();
         let web = claim();
         let (tx, mut rx) = mpsc::channel(4);
-        routes.join(web, 2, tx).unwrap();
+        routes.join(web, tx).unwrap();
         let (spare, _rx_spare) = mpsc::channel(4);
-        routes.join(web, 2, spare).unwrap();
+        routes.join(web, spare).unwrap();
 
         let packet = packet_for_claim();
         let info = ip::parse(&packet).unwrap();
@@ -839,7 +827,7 @@ mod tests {
         let routes = Routes::new();
         let web = claim();
         let (first, _rx_first) = mpsc::channel(4);
-        routes.join(web, 1, first).unwrap();
+        routes.join(web, first).unwrap();
         let info = ip::parse(&packet_for_claim()).unwrap();
         assert!(routes.pick(&info, Direction::Destination).is_some());
 
@@ -854,7 +842,7 @@ mod tests {
     fn an_unclaimed_packet_is_not_picked() {
         let routes = Routes::new();
         let (tx, _rx) = mpsc::channel(4);
-        routes.join(claim(), 1, tx).unwrap();
+        routes.join(claim(), tx).unwrap();
 
         let info = PacketInfo {
             protocol: crate::transparent::ip::TCP,

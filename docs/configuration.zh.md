@@ -261,8 +261,8 @@ tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存�
    `protocol`(tcp/udp)、`remote_bind_addr`、将要使用的数据面
    `carrier`(tcp/kcp——`kcp` carrier 会触发服务端懒绑定 UDP 监听)与
    UDP 缓冲大小。通道数不在消息里:客户端打开自己配置的通道(TCP 每个访客
-   一条,UDP 为 `udp_workers` 条,透明服务为一条长生命周期通道),服务端在
-   访客到达时再要一条。
+   一条,UDP 为 `udp_workers` 条,透明认领为 `default_members`/`members` 条
+   长生命周期通道),服务端在访客到达或某条通道结束时再要一条。
 3. 服务端校验:
    - **白名单**:请求的端口必须被 `allow_ports` 覆盖;为空/缺失的
      `allow_ports` 会拒绝*每一次*注册(这也是完全禁用该特性的方式);
@@ -407,11 +407,13 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
 | `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
 | `[transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
+| `[transparent.data].default_members` | 一条认领持有多少条数据通道——它的**成员集合**。默认:`1`。大于 1 时该认领就拥有相应数量的载体连接:`multiplex` 模式下池宽必须至少这么大(`[transparent.data.tcp\|kcp].tunnels`),`direct` 模式下每个成员都是自己的一条连接。上限 64。**两端都必须支持成员集合**:不支持的对端一次只启动一条通道,持有多个成员的认领只会用上其中一条 |
+| `[transparent.claims.<name>].members` | 同上,但只作用于这一条认领:覆盖 `[transparent.data].default_members` |
 | `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次认领都会在看任何设备之前被策略拒绝 |
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 
 按认领的键与转发服务一一对应:`token`、`remote_addr`、`retry_interval`、`mode`、
-`carrier`。`[transparent.transport]` 只有一个键 `proxy`,因为 L3 客户端发送的是访问者
+`carrier`、`members`。`[transparent.transport]` 只有一个键 `proxy`,因为 L3 客户端发送的是访问者
 自己的流量:这一跳按设计就是明文链路,所以这个模型没有加密键可给;设备名写在
 `[transparent].tun`。
 
@@ -421,13 +423,19 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 客户端。
 
 `[transparent.data]` 接受与 `[client.data]` 相同的键——`default_data_addr`、
-`default_mode`、`default_carrier`、`shared_pool`,以及两个按载体的
-`tunnels` 条数——但有**一处不同的默认值**:模式默认 `direct`,因为一条认领只有
-一条通道,除非打开 `shared_pool`,多路复用池对它没有任何好处。在同一主机、同一负载下
+`default_mode`、`default_carrier`、`shared_pool`、两个按载体的
+`tunnels` 条数,以及 `default_members`——但有**一处不同的默认值**:模式默认 `direct`,
+因为除非给它一个成员集合,一条认领就只有一条通道,除非打开 `shared_pool`,
+多路复用池对它没有任何好处。在同一主机、同一负载下
 实测:`direct` 的线上字节少 6%,每包 CPU 少 33%,每秒往返次数多 65%
 (见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
 若一个客户端要用一个池服务多条认领,就写 `default_mode = "multiplex"` 与
 `shared_pool = true`。
+
+认领的 `members` 是它持有的数据通道数;`multiplex` 模式下池宽必须至少这么大:
+认领的各个载体本应落在互不相同的隧道上,所以 `members = 4` 配 `tunnels = 2` 会被
+拒绝,并在信息里给出应当写入的条数。`direct` 模式没有池来把它们分开——每个成员
+都是自己的一条连接——也就没有下限要满足。
 
 ### 运维方需要准备什么
 

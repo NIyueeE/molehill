@@ -764,6 +764,12 @@ class Arm:
     TUN queue length decides whether an L3 arm measures the architecture or the
     kernel's default queue.
 
+    `members` is the third such setting, and it is L3-only: the number of data
+    channels one transparent claim holds, which is what its inner flows are
+    spread across (`[transparent.data].default_members`). `0` leaves the key out
+    of the generated config — the product's one-channel claim — so an arm states
+    the set it measured instead of inheriting whatever the default is this week.
+
     `carrier` is the transport the data plane rides: `tcp` (the control
     channel's own wire stack) or `kcp` (KCP-over-UDP sessions, feature `kcp`).
     It is the difference between a congestion-controlled stream and a
@@ -777,6 +783,9 @@ class Arm:
     mode: str = "multiplex"
     carrier: str = "tcp"
     pool_cap: int = 0
+    #: L3 only: data channels one claim holds (`[transparent.data].default_members`).
+    #: 0 leaves the key unset (the product's one-channel claim).
+    members: int = 0
     txqueuelen: int = 1000
     binary: str = ""
     #: Free-form label recorded in the results (e.g. "A"/"B" for a build pair).
@@ -903,6 +912,13 @@ ARM_CATALOG: dict = {
     "l4-direct": Arm("l4-direct", "l4", mode="direct"),
     "l3": Arm("l3", "l3", mode="direct"),
     "l3-mux": Arm("l3-mux", "l3", mode="multiplex"),
+    # The member-set axis: one L3 claim holding four data channels, so its inner
+    # flows can be spread over four carrier connections instead of one. `l3-mux4`
+    # takes four streams of a four-tunnel pool (`pool_cap` is the pool's width,
+    # `members` the claim's channel count), `l3-raw4` opens four direct channels
+    # and never touches a pool — the two ways a member can be a carrier.
+    "l3-mux4": Arm("l3-mux4", "l3", mode="multiplex", pool_cap=4, members=4),
+    "l3-raw4": Arm("l3-raw4", "l3", mode="direct", members=4),
     "l3-deep": Arm("l3-deep", "l3", mode="direct", txqueuelen=DEEP_TXQUEUELEN),
     # The carrier axis: `kcp` rides UDP, `mode` says whether a yamux pool sits
     # above the carrier (multiplex) or the carrier's own session *is* the
@@ -970,6 +986,7 @@ def parse_arm_spec(spec: str) -> Arm:
         "mode",
         "carrier",
         "pool_cap",
+        "members",
         "txqueuelen",
         "binary",
         "side",
@@ -979,7 +996,7 @@ def parse_arm_spec(spec: str) -> Arm:
     unknown = sorted(set(fields) - known)
     if unknown:
         raise ValueError(f"unknown arm key(s) {unknown}; known: {sorted(known)}")
-    for numeric in ("pool_cap", "txqueuelen"):
+    for numeric in ("pool_cap", "members", "txqueuelen"):
         if numeric in fields:
             fields[numeric] = int(fields[numeric])
     if "carrier" in fields and fields["carrier"] not in ("tcp", "kcp"):
