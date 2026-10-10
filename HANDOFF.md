@@ -220,6 +220,94 @@ configuration surface is free to change — and this cycle changes it.
    also its acceptance test. The 5 Gbit/s UDP ladder cell and the loopback
    ceiling remain the two places where a single run cannot order the arms.
 
+7. **The carrier axis and the L3 data path, measured (2026-10-10, unreleased).**
+   The hypothesis on the table was "L3 + KCP is better overall, and the
+   multiplexer should not cost much". The model answered both, and the answers
+   are *no* and *it costs 28 %* — with one exception each way, and with the
+   real L3 lever showing up in the same campaign.
+
+   **The carrier is now independent of the mode** (`08e72aa`): a `direct`
+   service or claim can ride KCP — one session per channel, no yamux above it —
+   where the config used to refuse the pair. The server's KCP listener reads the
+   data-channel hello beside the tunnel hello, the client dials the carrier its
+   service declared, and the model gained the axis to measure it (`fd4c9aa`):
+   arms `l3` / `l3-mux` / `l3-kcp` / `l3-mux-kcp` / `l4-kcp`, the carrier in the
+   generated config and in the evidence, and the condition `loss1_rate100` (a
+   100 Mbit/s, 20 ms, 1 %-loss leg — the lossy WAN the choice is about).
+
+   What the model measured (`--profile smoke`, two rounds, A/A twin in every
+   run, conditions on the **tunnel** leg, tables in
+   [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)):
+
+   | Condition | control | tcp carrier | kcp carrier |
+   |---|---|---|---|
+   | clean, `l3` (direct) | 41.8 | 4.17 Gbit/s, 0.855 s/Gbit | 2.19 Gbit/s, 2.554 s/Gbit |
+   | clean, `l3-mux` | — | 2.99 Gbit/s, 1.435 | 2.51 Gbit/s, 2.310 |
+   | `loss1`, `l4` / `l4-kcp` | 4.43 | 2.51 | 0.40 |
+   | `loss1`, `l3` / `l3-kcp` | 4.43 | 2.03 | 0.41 |
+   | `loss1_rate100`, bulk | 0.096 | 0.093 (`l4`), 0.089 (`l3`) | 0.059 (`l3-kcp`), **failed 3/3** (`l4-kcp`) |
+   | `loss1_rate100`, `rr-16` | 323.2/s | 328.0 (`l4`), 335.3 (`l3`) | **337.8 (`l4-kcp`)**, **338.6 (`l3-kcp`)** |
+
+   Read: the multiplexer costs **28 %** of the bulk throughput and 68 % more CPU
+   per byte; KCP costs **48 %** and 3× the CPU per byte *on a clean path*; under
+   loss KCP is **five to six times behind TCP** in both architectures; and on a
+   rate-limited lossy leg the multiplexed KCP arm does not finish its test at
+   all — `KCP session dead link`, which kills the visitor's connection with it.
+   The mechanism came out of the carrier's own counters
+   (`MOLEHILL_KCP_STATS=1`): **22 % of the datagrams it sent were
+   retransmissions**, because with `nc=1` there is no congestion control and the
+   pacer's only signal is a PONG that does not arrive within 2.5 s — a
+   window-sized burst goes into whatever queue the path has, the standing queue
+   delays the acks past the escalating RTO, and the retransmissions enlarge the
+   queue until the ARQ declares a live-but-rate-limited peer dead.
+
+   **The obvious fix was tried and is wrong**: `nc=0` (KCP's own congestion
+   control) as an A/B against the shipped build on `loss1_rate100` measured
+   **0.002 Gbit/s against 0.043** on bulk and 256/s against 344/s on `rr-16` —
+   KCP's built-in control collapses the window on a lossy path and never
+   recovers. So the fix is not a flag: it is a pacer that reacts to the path's
+   delivery rate or to RTT inflation, in the adapter, with this A/B as its
+   gate. The one place KCP won is worth keeping in view: on the same leg,
+   many short interactions (`rr-16`) were fastest on both KCP arms with the best
+   p99 — fast retransmit pays, and it is the bulk path where the missing control
+   costs more.
+
+   **The larger finding is about L3 itself.** The same campaigns measured the
+   data path against the forwarding path on one host
+   ([table](docs/benchmarks.md#the-l3-data-path-what-limits-it-2026-10-10-this-model)):
+
+   | Arm | `bulk-1`, TUN MTU 1400 | `bulk-n` (8 flows) | `bulk-1`, TUN MTU 8000 |
+   |---|---|---|---|
+   | `l3` | 4.34 Gbit/s | 3.93 | **8.00** |
+   | `l4` | 8.99 | 22.33 | 8.00 |
+
+   Two conclusions, both actionable. **L3 does not scale with flows** (eight
+   flows move less than one) — the ceiling is a serialized per-packet path, not
+   a window, so more connections through a claim cannot raise it. And **packet
+   size is the lever**: an 8000-byte TUN MTU (link MTU to match) took the same
+   flow to 8.00 Gbit/s (+84 %) at a **third** of the CPU per byte, matching the
+   forwarding path at one flow. That is an operator setting, and
+   [deployment.md](docs/deployment.md#transparent-services) now carries the
+   number.
+
+   Open, in the order the measurements argue for them:
+
+   - **A device path that carries more than one packet per syscall.** The
+     remaining per-packet cost is the TUN read and the TUN write; a virtio-net
+     header with GSO/GRO would let one syscall carry a 64 KB run, which is the
+     same amortization the channel side already has. It needs an arm of its own
+     (the packets on the device differ, so `mean_carried_packet_b` and the wire
+     ratios are the readings to watch) and it changes how the device is
+     attached, so it is a design decision before it is a patch.
+   - **A rate-aware pacer for the KCP carrier** (above), gated on the
+     `loss1_rate100` A/B.
+   - **What the multiplexer's 28 % actually is.** The earlier per-cell model
+     measured 6 % of wire and 33 % of CPU per packet for `direct` over
+     `multiplex`; this model measures 28 % of throughput and 68 % of CPU per
+     Gbit. The two are not the same reading and the difference is worth
+     attributing (yamux frame copies vs the pool's stream machinery) before
+     anything is changed for it.
+
 **Pre-registered criteria (kept as written, for the record).** Small packets
 (≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
 (1400 B): throughput down ≤ 2 %. The small-packet and the bulk conditions must

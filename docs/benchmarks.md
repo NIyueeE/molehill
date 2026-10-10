@@ -548,6 +548,45 @@ against the sweeps that followed.
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
 | `[server.data].stripe_count` | `K = 4` (a striped group spreads one visitor connection over K data channels; see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
 
+### The L3 data path: what limits it (2026-10-10, this model)
+
+The transparent path carries **packets**, where the forwarding path carries
+bytes: a claim hands every IP packet to the device, so the cost is per packet
+rather than per byte, and the model measures what that costs. All four rows are
+one host, `--profile smoke --condition clean`, two measured rounds, the A/A twin
+in the run. `bulk-1` is one TCP flow through the tunnel, `bulk-n` is eight.
+
+| Arm | `bulk-1`, 1400-byte TUN MTU | `bulk-n` (8 flows), 1400 | `bulk-1`, 8000-byte TUN MTU | `bulk-n` (8 flows), 8000 |
+|---|---|---|---|---|
+| control (no tool) | 40.640 Gbit/s | 49.159 | 39.951 | 50.853 |
+| `l3` | 4.335 Gbit/s | 3.934 | **8.000** | 5.772 |
+| `l3~aa` (same arm twice) | 4.214 | 3.847 | 7.214 | 5.961 |
+| `l4` (forwarding, same topology) | 8.991 | 22.333 | 7.996 | 22.629 |
+
+Two things are worth reading off it:
+
+* **The L3 path does not scale with flows.** Eight flows move *less* than one
+  (3.9 against 4.3 Gbit/s), while the forwarding path nearly triples
+  (9.0 → 22.3). The ceiling is a serialized per-packet path — one claim is one
+  device reader and one injector — not a per-flow window, so opening more
+  connections through a claim cannot raise it.
+* **Packet size is the lever that does move it.** Raising the TUN MTU from 1400
+  to 8000 (with the link MTU to match) took the same bulk flow from 4.335 to
+  **8.000 Gbit/s** — 1.84× — and CPU per Gbit from 0.852 to 0.313 s, a third of
+  what it was. At that packet size a single L3 flow matches the forwarding path
+  on the same host (8.00 against 8.00) and its CPU per byte is within 35 % of
+  it (0.313 against 0.231).
+
+The same effect shows up in the wire accounting: at 1400 bytes, 7.5 % of the
+bytes on the visitor's leg were tunnel overhead (`wire_per_visitor_byte` 1.0755);
+at 8000 it is 1.5 % (1.0152), because the carrier's own header and
+acknowledgements are paid once per 8000-byte packet instead of once per 1400.
+
+The operator's copy of this finding, with the recipe, is
+[deployment.md](deployment.md#transparent-services); what is left on the table —
+a device path that can carry more than one packet per syscall — is the next
+lever, and it needs its own arm before it is a claim.
+
 ### The carrier axis: TCP versus KCP (2026-10-10, this model)
 
 `mode` and `carrier` are independent, so the two axes are measured apart:
