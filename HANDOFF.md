@@ -421,6 +421,32 @@ configuration surface is free to change — and this cycle changes it.
      byte fell by a fifth. The one cost: a genuinely vanished peer is now
      detected up to five seconds later, which the session-level watchdogs
      (`FORWARD_IDLE_TIMEOUT`) bound anyway.
+   - **L3+KCP now matches the TCP carrier on a jumbo single flow, and collapses
+     on eight — a reproducible open finding.** With the segment size following
+     the path and the dead link fixed, one bulk flow through an L3 claim at a
+     jumbo TUN MTU (8000) and a jumbo link (9000) measures **7.265 Gbit/s
+     against the TCP carrier's 7.086** in the same run (A/A twin 6.948, so both
+     are inside the noise of each other) at 2.3× the CPU per byte — the
+     user-facing claim "L3+KCP can be as fast as L3+TCP" now has a measurement.
+     What does *not* hold is the eight-flow cell, and the trigger is
+     reproducible and narrow:
+     - `--arms l3-kcp --scenarios bulk-n` (alone): **5.9–6.2 Gbit/s** across
+       four runs;
+     - `--arms l3-kcp --scenarios bulk-1,bulk-n` (a bulk cell first): **1.99 and
+       3.54 Gbit/s** in two runs — and in a 4-arm, 3-round campaign, 2.06 in
+       every measured round while the TCP carrier beside it read 5.6–5.9;
+     - the engine's own counters are *identical* in both cases (server
+       retransmits ~15–18 % of its datagrams either way, client `ms_input`
+       1.5–1.9 s, `ms_output` per datagram 7.5 µs), and the difference is the
+       **bytes per datagram**: 6.2 KB when it is fast, 3.4 KB when it collapses
+       — the sender is producing smaller datagrams, not more work per datagram.
+     So the next step is to find why a preceding bulk cell makes the carrier
+     emit half-full datagrams: the candidates are the hub's batching (it flushes
+     "the moment the device runs dry", and eight flows drain the device
+     differently from one) and the KCP writer's chunking downstream of it.
+     Reproduce with `sudo -n uv run benches/scripts/bench/bench.py run --profile
+     smoke --arms l3-kcp --scenarios bulk-1,bulk-n --condition clean
+     --link-mtu 9000 --tun-mtu 8000 --rounds 1 --warmup-rounds 0`.
    - **A rate-aware pacer for the KCP carrier** (above) — **attempted
      2026-10-10, measured, reverted.** The design: sample the peer's
      acknowledged progress every 20 ms, convert it to segments per second, and

@@ -715,7 +715,27 @@ the probe rather than by raising a constant: on a 1500-byte path the datagram
 stays at what that path carries, so the change is neutral there, while the wire
 ratio improves in every jumbo row (1.1483 → 1.0892 on clean).
 
-**The failure itself was then fixed, and it was the rule, not the size.** The
+**With both fixes, a jumbo path brings the two carriers level — for one flow.**
+The same cell that the table above measures at a pinned 1400, re-measured with
+the TUN MTU at 8000 *and* the link at 9000, one bulk flow, the A/A twin in the
+run:
+
+| Arm | `bulk-1` (1 flow) | CPU per Gbit | `bulk-n` (8 flows) |
+|---|---|---|---|
+| `l3` (TCP carrier) | 7.086 Gbit/s | 0.311 s | 6.170 |
+| `l3-kcp` | **7.265 Gbit/s** | 0.723 s | 1.945 |
+| `l3~aa` (the twin) | 6.948 Gbit/s | 0.321 s | 6.230 |
+| `l4` (forwarding) | 8.443 Gbit/s | 0.218 s | 22.586 |
+
+So on a path that carries jumbo datagrams, L3+KCP matches the TCP carrier for a
+single bulk flow (the two are inside each other's noise) at 2.3× the CPU per
+byte, and the forwarding path is 16 % ahead of both. The eight-flow cell is the
+open question: it reads anywhere between 1.9 and 6.2 Gbit/s depending on whether
+a single-flow cell ran before it in the same session — a reproducible trigger,
+diagnosed as far as "the same datagrams, carrying half the bytes", and written
+up in HANDOFF.md rather than smoothed over here.
+
+**The failure itself was then fixed, and it was the rule, not the size.****The failure itself was then fixed, and it was the rule, not the size.** The
 `KCP session dead link` above is the engine's reference behaviour: a segment
 retransmitted twenty times ends the session. That conflates two different
 things — a peer that is *gone* and a peer that is *slow*. On a rate-limited
