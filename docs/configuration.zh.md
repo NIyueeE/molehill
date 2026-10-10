@@ -103,15 +103,15 @@
 
 ### 迁移到 0.10:已移除的键
 
-隧道池现在是每个会话、每个 carrier 一个弹性池,并且**冷启动**——因此那些描述
-「池的初始大小」「按服务的池」或 0.8 后期健康检查的键都已移除。仍带着这些键的
+隧道池现在是每个会话、每个 carrier 一个池,并**固定**在配置写明的条数上——因此
+那些描述「池的初始大小」「按服务的池」或 0.8 后期健康检查的键都已移除。仍带着这些键的
 配置不会启动:拒绝信息会列出它找到的每一个键以及该改写成什么(只写「未知字段」
 能告诉你有东西不对,却不能告诉你该写什么)。请改写为:
 
 | 已移除的键 | 改写成 |
 |---|---|
-| `[client.data].default_count` | 无需填写:池冷启动、按需增长。`[client.data.tcp].max_tunnels`(或 `[client.data.kcp].max_tunnels`)是它可增长到的上限,默认 4 |
-| `[client.services.<name>].count` | 无需填写:同样是冷启动,而且池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].max_tunnels` 是上限 |
+| `[client.data].default_count` | 无需填写:池的宽度是 `[client.data.tcp].tunnels`(或 `[client.data.kcp].tunnels`),默认 4 |
+| `[client.services.<name>].count` | 无需填写:池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].tunnels` 是它的宽度 |
 | `[client.services.<name>].pool_size` | UDP 服务写 `[client.services.<name>].udp_workers`(默认 2)。TCP 服务按访客即时打开数据通道 |
 | `[client.services.<name>].heartbeat_timeout` | 无需填写:服务端在会话确认里声明自己的心跳节奏,客户端据此推导超时。`[client.control].default_heartbeat_timeout` 仍作为可选下限保留 |
 | `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限) |
@@ -126,22 +126,22 @@
 (见[透明(L3)服务](#透明l3服务))——这是关于**进程**的选择,不是关于某个服务的,
 所以它排在下面所有内容之前。
 
-默认配置——`mode = "multiplex"`、`max_tunnels = 4`、`carrier = "tcp"`、
+默认配置——`mode = "multiplex"`、`tunnels = 4`、`carrier = "tcp"`、
 明文传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离;每次只改一项,
 并在**你自己的路径上**测量结果:已发布的运行、它们的数字以及如何复现,见
 [基准测试](benchmarks.zh.md)。本页负责的是**每个设置做了什么**:
 
 ```mermaid
 flowchart TD
-    A["起点:默认配置<br/>multiplex、max_tunnels=4、<br/>carrier=tcp、明文"] --> B{"流量经过不可信网络?"}
+    A["起点:默认配置<br/>multiplex、tunnels=4、<br/>carrier=tcp、明文"] --> B{"流量经过不可信网络?"}
     B -- 是 --> C["transport type = noise<br/>+ 密钥(见传输层文档)"]
     B -- 否 --> D{"单个服务或少数<br/>长连接?"}
     C --> D
     D -- "是,且原始吞吐优先" --> E["mode = direct"]
     D -- "否:多服务、多用户、<br/>高连接频率" --> F{"并发连接很多?"}
     E --> Z["完成——按需用<br/>[client.services.*] 覆盖"]
-    F -- "> ~256 并发" --> G["max_tunnels = 8 或更高"]
-    F -- 一般 --> H["保持 max_tunnels = 4"]
+    F -- "> ~256 并发" --> G["tunnels = 8 或更高"]
+    F -- 一般 --> H["保持 tunnels = 4"]
     G --> I{"路径质量?"}
     H --> I
     I -- "高纯延迟 + UDP 游戏<br/>(100ms+ RTT)" --> J["A/B 测试 carrier = kcp"]
@@ -155,14 +155,14 @@ flowchart TD
 |---|---|---|
 | `mode` | `"multiplex"`(默认) | 每个 FD、每个 NAT 映射承载最多连接;一条慢流会和同隧道其它流共享隧道 |
 | `mode` | `"direct"` | 每条流一条物理连接:原始单流吞吐,代价是每条流一个 FD / 端口 / NAT 映射 |
-| `max_tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住 |
-| `max_tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
-| `max_tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限 |
+| `tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住。实测为所有路径上最差的配置 |
+| `tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
+| `tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限;在干净快速路径上实测从一条隧道到八条吞吐 +77% |
 | `carrier` | `"tcp"`(默认) | 有损与限速路径上表现良好的默认值;前提是网络不封锁 TCP 隧道 |
 | `carrier` | `"kcp"` | 在 TCP 被封锁、限速或有损的路径上改用 UDP 传输;它与 `mode` 相互独立,既能承载多路复用池(`multiplex` + `kcp`),也能做到每条通道一个会话(`direct` + `kcp`)。路径干净时它会损失吞吐,所以它是按路径选,而不是默认选 |
 | transport | `"plain"` | 不加密;每字节开销最低 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
-| 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节,之后池就热了,并可按需长到 `max_tunnels` |
+| 池的建立 | (没有对应的键) | 池的 `tunnels` 条连接在服务启动时拨出,而不是在第一个访客到来时:请求时不需要付任何代价,成本是 `tunnels` 条空闲连接(实测每条 0.5–0.8 MiB RSS 与 2.6 个 FD,不占线程) |
 | `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断) |
 
 各选项的**实测代价**——这些取舍所依据的数字及其来源——见
@@ -188,11 +188,10 @@ default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:�
 default_mode = "multiplex" # 可选。默认数据面模式:"multiplex"(默认)或 "direct"(每个访问者连接一条数据通道,各自一条物理连接)。它与 `default_carrier` 相互独立:任何 `mode`/`carrier` 组合都成立
 default_carrier = "tcp" # 可选。默认数据载体:"tcp"(默认)复用控制通道的传输栈;"kcp" 使用 KCP-over-UDP 会话(特性 `kcp`;服务端在第一条 `kcp` 注册到达时才打开 KCP 监听,无需服务端配置)。两种传输都可与 KCP 组合:transport 为 `noise` 时同样的 Noise 握手包裹每个 KCP 会话,`plain` 时会话保持明文。`mode = "multiplex"` 时会话就是池里的隧道;`mode = "direct"` 时每条数据通道就是一个 KCP 会话,多路复用器的成帧完全不在这条路径上
 # shared_pool = false # 可选。把一条控制会话的所有服务放进每个 carrier 一个共享隧道池(true),而不是每个服务一个池(false,默认)。两者是同一套代码路径,只有池的 key 不同
-# idle_timeout = 60 # 可选。池在没有 stream、没有待打开、也没有被钉住的 UDP peer 的情况下要空闲多少秒才移除一条隧道。默认:60。池永远不会缩到少于一条隧道,也不会低于 UDP 推导出的下限
-[client.data.tcp] # 可选。TCP carrier 的弹性池上限
-# max_tunnels = 4 # 可选。该 carrier 的池可增长到的上限;池冷启动、按需增长到它为止。校验 `>= 1`,收敛到 1..=64。默认:4
-[client.data.kcp] # 可选。KCP carrier 的上限,键与规则相同
-# max_tunnels = 4
+[client.data.tcp] # 可选。TCP carrier 的隧道条数
+# tunnels = 4 # 可选。该 carrier 的池在服务启动时建立并保持多少条隧道。校验 `>= 1`,且 `>=` 共享该池的服务所推导出的 UDP 下限;收敛到 1..=64。默认:4
+[client.data.kcp] # 可选。KCP carrier 的条数,键与规则相同
+# tunnels = 4
 
 [client.transport] # 可选。指定传输层如何封装;对控制面与数据面都生效
 type = "plain" # 可选。可选值:["plain", "noise"]。默认:"plain"
@@ -239,7 +238,7 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
 # stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
-# max_tunnels_per_client = 0 # 可选。运维方对弹性池的阀门:一个客户端在其会话的所有服务上一共可持有多少条多路复用数据隧道。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
+# max_tunnels_per_client = 0 # 可选。运维方对多路复用隧道的阀门:一个客户端在其会话的所有服务上一共可持有多少条数据隧道。配置的 `tunnels` 超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
 
 [server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
@@ -282,8 +281,8 @@ tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存�
 ## 多路复用(`multiplex` 特性)
 
 `multiplex` 特性是默认特性集的一部分。`mode = "multiplex"`(默认)时,
-注册的服务跑在一个**弹性隧道池**上(上限
-`[client.data.tcp|kcp].max_tunnels`,默认 4),之后每条数据通道都变成其中
+注册的服务跑在一个**固定的隧道池**上
+(`[client.data.tcp|kcp].tunnels`,默认 4),之后每条数据通道都变成其中
 一条隧道内的 yamux 流。这消除了每条连接的握手延迟
 (TCP 连接,以及 `noise` 下的 Noise 握手),并在大量并发访客下大幅减少
 FD 占用。
@@ -293,21 +292,29 @@ FD 占用。
 - 每条隧道的缓冲由内部固定默认值约束(32 MiB yamux 接收窗口、64 条流):
   丢包积压有界且吞吐无损;这两个值固定是因为 yamux 将两者耦合(见
   internals.md)。
-- **池是冷启动的。** 在真的需要隧道之前什么都不会拨:某个服务的第一个访客
-  会同步把池撑起来,因此这位访客要先付一次隧道建连才开始过字节(回环上
-  2.0-3.2 ms,M2a);之后的访客都能用上热隧道,池也会按需继续长到
-  `max_tunnels`。空闲的池在 `[client.data].idle_timeout`(默认 60 秒)之后
-  归还隧道,但不会少于一条,也不会低于某 UDP 服务的 worker 所需的下限。
-- `max_tunnels = N` 是该 carrier 的池可增长到的上限。独立 TCP 流
+- **池在服务启动时建立并固定。** 全部 `tunnels` 条连接在服务激活时就拨出,
+  因此第一个访客不需要付任何代价(建连成本在它到来之前就已支付),而一个部署
+  提供的容量不取决于它一分钟前恰好在做什么。池永远不会为负载调整大小,空闲
+  隧道也永远不会被回收。
+- **修复是唯一的例外**,而且它不是增长:死亡的隧道会被替换,直到重新满足条数,
+  因此单次故障不会永久缩小一个部署。*不*被修复的是条数本身——池需要更宽就得
+  提高 `tunnels` 并重启客户端,这正是重点:容量是配置决策,不是运行时决策。
+- `tunnels = N` 是该 carrier 的池持有多少条 carrier 连接。独立 TCP 流
   隔离队头阻塞(丢段只停滞自己的隧道),并可超越单条流的拥塞窗口聚合吞吐。
-  某条隧道死亡时,开启请求会透明地落到存活隧道,直到常规心跳重连重建整个
-  池。默认:4;`1` 恢复单隧道行为。
+  某条隧道死亡时,开启请求会透明地落到存活隧道,修复 tick 会拨一条替代。
+  默认:4(当某个 UDP 服务的 worker 数更大时提高到该数);`1` 恢复单隧道行为,
+  但要付实测代价——在模型的各格子里,一条隧道是所有路径上最差的配置,因为
+  此时每条流共享同一个拥塞窗口。
+- **负载超过池时**发生的是分担,不是增长:流会摊到现有的隧道上,每条隧道最多
+  56 条,而当所有隧道都到该上限时到来的访客会短暂等待某条流退出,若没有流
+  退出就被拒绝。按你预期的并发量为 `tunnels` 定容;定容所依据的实测见
+  [基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
 - **实验性(传输层对比选项):** `carrier = "kcp"` 把数据面换成 KCP-over-UDP
   会话而不是 TCP 连接(特性 `kcp`,属于默认特性集)。KCP 是用户态 ARQ 协议,
   用吞吐换 UDP 会话质量,所以它是 A/B 对比选项而不是默认:与 TCP carrier 的实测
   对比见[基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
   加密栈不变——transport 为 `noise` 时同样的
-  Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`max_tunnels` 照常生效。
+  Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`tunnels` 照常生效。
   服务端在第一条声明 `kcp` carrier 的注册到达时才打开 UDP 监听——绑定失败
   会变成精确的注册拒绝;没有 KCP 客户端的服务端永远不会打开 UDP socket。
   监听绑定在数据地址上(`[server.data].bind_addr`,默认 = 控制地址),每个
@@ -329,8 +336,8 @@ FD 占用。
 `[client.services.<name>]` 块里单独覆盖 `mode` 与 `carrier`。
 合并后的视图遵循与全局块相同的规则:`carrier` 只在
 `mode = "multiplex"` 时有效,`carrier = "kcp"` 还额外需要 `kcp` 特性。
-服务的 carrier 决定它的池长到哪个上限
-(`[client.data.tcp|kcp].max_tunnels`);开启 `[client.data].shared_pool` 时,
+服务的 carrier 决定它的池用两个条数中的哪一个来建立
+(`[client.data.tcp|kcp].tunnels`);开启 `[client.data].shared_pool` 时,
 同一会话的所有服务共用每个 carrier 一个池。于是同一个客户端可以混合:
 交互式服务走 mux(握手少、对 NAT 友好),大流量传输服务走 `direct`
 (原始吞吐优先),服务端无需任何配置改动:服务端按连接自动适配,并在第一条
@@ -414,8 +421,8 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 客户端。
 
 `[transparent.data]` 接受与 `[client.data]` 相同的键——`default_data_addr`、
-`default_mode`、`default_carrier`、`shared_pool`、`idle_timeout`,以及两个按载体的
-`max_tunnels` 上限——但有**一处不同的默认值**:模式默认 `direct`,因为一条认领只有
+`default_mode`、`default_carrier`、`shared_pool`,以及两个按载体的
+`tunnels` 条数——但有**一处不同的默认值**:模式默认 `direct`,因为一条认领只有
 一条通道,除非打开 `shared_pool`,多路复用池对它没有任何好处。在同一主机、同一负载下
 实测:`direct` 的线上字节少 6%,每包 CPU 少 33%,每秒往返次数多 65%
 (见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
@@ -530,13 +537,13 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
 | `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain 与 ARQ update 的粗粒度分相计时 |
-| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、上限、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+load:1->2`、`-idle:2->1`) |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
 | `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors` |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
-就能算出每秒速率与单位成本。pool 与 placement 两行就是共享弹性 pool 的 S1
+就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
 观测(它做什么,以及为什么这些数字是聚合而不是逐个事件:
 [internals.md](internals.md#the-tunnel-pool))。`MOLEHILL_STRIPE_COUNT` 是唯一
 一个改变行为而不是观测行为的开关,它记录在 `stripe_count` 旁边——也就是它所
@@ -544,7 +551,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 
 ## 调优
 
-按负载选择 `mode`/`max_tunnels`/`carrier`/transport 的方法就是上面的
+按负载选择 `mode`/`tunnels`/`carrier`/transport 的方法就是上面的
 [决策树](#选择配置决策树)(含实测花费与验证方式)。本节讲逐连接层面的
 旋钮。
 

@@ -1,7 +1,8 @@
-# The shared elastic pool (M2a): two services of one client share one pool
-# when `[client.data].shared_pool` is on, and the pool's own state — growth,
-# shrink, pinned peers — is what the assertions read. The pool starts cold
-# (there is no initial size any more) and `max_tunnels = 4` is its cap.
+# The shared pinned pool (M2a): two services of one client share one pool
+# when `[client.data].shared_pool` is on, and the pool's own state — its
+# establishment, its placement, its pinned peers — is what the assertions
+# read. `tunnels = 4` is the count the pool establishes at service start and
+# keeps: it neither grows for load nor shrinks when idle.
 #
 # One client per process: the client's live pools are a process-global
 # registry, so running two scenarios in one process would mix their pools.
@@ -21,10 +22,9 @@ type = "plain"
 default_mode = "multiplex"
 default_carrier = "tcp"
 shared_pool = true
-idle_timeout = 2
 
 [client.data.tcp]
-max_tunnels = 4
+tunnels = 4
 
 [client.services.alpha]
 local_addr = "127.0.0.1:8090"

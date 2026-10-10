@@ -87,28 +87,38 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 32 * 1024 * 1024;
 /// guarded by a unit test (the reservation must stay under half the
 /// window). 64 streams reserve 16 MiB of the 32 MiB window and still
 /// leave 16 MiB (50%) auto-tunable, while doubling the per-client
-/// connection ceiling at the default `max_tunnels = 4` (128 -> 256).
+/// connection ceiling at the default `tunnels = 4` (128 -> 256).
 /// Measured on the `mux1` arm across the full matrix: see HANDOFF.md,
 /// "Phase 4: L2 landed".
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
 
-/// Upper bound for `[client.data.tcp|kcp].max_tunnels`.
+/// Upper bound for `[client.data.tcp|kcp].tunnels`.
 ///
-/// `max_tunnels` is the cap the elastic pool may grow to, so it is validated
-/// (`>= 1`) and clamped, never silently obeyed with an absurd value.
+/// `tunnels` is how many carrier connections a pool establishes at service
+/// start and keeps for its lifetime, so it is validated (`>= 1`) and clamped,
+/// never silently obeyed with an absurd value.
 #[cfg(feature = "multiplex")]
 pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
 
-/// Default cap for `[client.data.tcp|kcp].max_tunnels`.
+/// Default `[client.data.tcp|kcp].tunnels`.
+///
+/// Four is the number the pool carried as its elastic cap's default, and the
+/// measurements behind the sizing guidance are unchanged by the pool being
+/// fixed instead of elastic: one tunnel is the worst configuration on every
+/// path (an L3 claim on one carrier connection measures the same for one inner
+/// flow and for eight), two captures most of the lossy-path gain
+/// (8 flows: 3.34 → 5.92 Gbit/s on `loss1`), and more keeps paying on a clean
+/// fast path (12.85 → 22.81 Gbit/s from one tunnel to eight). An explicit
+/// `tunnels` overrides it, and a UDP service's declared worker set raises it
+/// (see `udp_floor`).
 #[cfg(feature = "multiplex")]
-pub const DEFAULT_MAX_TUNNELS: u16 = 4;
+pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 
-/// Default `[client.data].idle_timeout` (seconds): how long a client tunnel
-/// pool with no streams, no pending opens and no pinned UDP peers must stay
-/// that way before the elastic pool removes one tunnel.
-#[cfg(feature = "multiplex")]
-pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
+// The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this
+// constant are gone with the elastic model): a pool's tunnels are established
+// at service start and kept, so that the capacity a deployment offers does not
+// depend on what it happened to be doing a minute ago.
 
 /// Default idle timeout (seconds) after which an inactive UDP peer mapping is
 /// cleaned up on the client side.

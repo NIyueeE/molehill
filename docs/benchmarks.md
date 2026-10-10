@@ -548,21 +548,22 @@ Stated so a reader does not ask a chart for something it never measured:
 
 ## What each configuration choice costs (per-decision measurements)
 
-The elastic pool's own thresholds — grow at 12 % of a tunnel's stream capacity
-(7 of 64), refuse placement at 56, reap a forward that moves nothing for 5
-minutes — are internal constants, not settings, and they change only with a
-measurement behind them: the growth threshold came out of a two-stage
-reproduction (a pool that never grew past one tunnel because the rule needed
-51 of 64 streams, where the workloads peak at 20-21), and each was re-checked
-against the sweeps that followed.
+The pool's own thresholds — refuse placement at 56 streams of the engine's 64,
+repair a dead tunnel, reap a forward that moves nothing for 5 minutes — are
+internal constants, not settings, and they change only with a measurement
+behind them. The pool's width is not one of them: it is `tunnels`, and the
+measurements behind its guidance are the `count` rows below (re-measured with
+the pinned pool: one tunnel 12.85 Gbit/s against eight tunnels' 22.81 on a
+clean jumbo path, 8 flows; 3.34 against 5.92 Gbit/s on `loss1` from one tunnel
+to two).
 
 | Decision | Option | Measured basis (retired per-cell model) |
 |---|---|---|
 | `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at count = 4; loss5 head-of-line max 2.5 s vs 1.6 s) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at count = 1); yamux ceiling `count × 64` concurrent connections |
-| `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
+| `tunnels` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at four tunnels; loss5 head-of-line max 2.5 s vs 1.6 s; and on the pinned pool's own cells 8 flows read 3.34 Gbit/s on `loss1` against 5.92 at two) |
+| `tunnels` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at one tunnel); yamux ceiling `count × 64` concurrent connections, `count × 56` after placement's own ceiling |
+| `tunnels` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8), and on a clean jumbo path 22.81 Gbit/s against 12.85 at one |
 | `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
 | `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
@@ -1010,10 +1011,12 @@ your own host.
   closes with the same `clean` condition, so `clean#2` of one run is compared
   with `clean#2` of another: the return stage — the recovery axis — is judged
   against the baseline's *return*, not against its fresh start.
-- **The tunnel pool is elastic, so the pool's size is a *result*, not a
-  setting.** A build with the shared elastic pool starts **cold** and grows and
-  shrinks on its own up to `max_tunnels`; the `MOLEHILL_POOL_STATS` timeline is
-  what records the size a run actually used.
+- **The tunnel pool is pinned, so its size *is* a setting.** A build
+  establishes `[client.data.tcp|kcp].tunnels` connections at service start and
+  keeps them (a dead one is repaired). The `MOLEHILL_POOL_STATS` line reports
+  the configured `count` beside the live `size`: a `size` below `count` is a
+  pool whose repair is being refused, and an arm's width is a method parameter
+  exactly like its carrier.
 
 ## Reproduce it yourself
 

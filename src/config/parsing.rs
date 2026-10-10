@@ -9,9 +9,7 @@ use tokio::fs;
 use url::Url;
 
 #[cfg(feature = "multiplex")]
-use crate::common::constants::{
-    DEFAULT_MAX_TUNNELS, DEFAULT_POOL_IDLE_TIMEOUT_SECS, MAX_MUX_TUNNELS_CAP,
-};
+use crate::common::constants::{DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS_CAP};
 use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
     DEFAULT_UDP_WORKERS,
@@ -417,11 +415,6 @@ pub struct ClientDataConfig {
     /// path; they differ only in the pool's key.
     #[serde(default)]
     pub shared_pool: bool,
-    /// Seconds a tunnel pool with no streams, no pending opens and no pinned
-    /// UDP peers must stay idle before the pool removes one tunnel.
-    /// Default: 60. The pool never shrinks to zero while a service is
-    /// registered, and never below the UDP-derived floor.
-    pub idle_timeout: Option<u64>,
     /// `[client.data.tcp]`: the TCP carrier's tunnel ceiling.
     #[serde(default)]
     pub tcp: DataCarrierLimits,
@@ -430,32 +423,46 @@ pub struct ClientDataConfig {
     pub kcp: DataCarrierLimits,
 }
 
-/// One carrier's elastic-pool limits (`[client.data.tcp]` / `[client.data.kcp]`).
+/// One carrier's tunnel count (`[client.data.tcp]` / `[client.data.kcp]`).
+///
+/// The pool established at service start, held for the service's lifetime and
+/// never resized: a deployment's capacity is a function of its configuration,
+/// not of what it happened to be doing a minute ago. Failure repair is the one
+/// exception — a dead tunnel is replaced so the count survives — and it is not
+/// growth.
 #[cfg(feature = "multiplex")]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DataCarrierLimits {
-    /// The cap the pool may grow to for this carrier. The pool starts cold
-    /// and grows on demand up to it. Must be `>= 1`; values above
+    /// How many tunnels this carrier's pool establishes at service start.
+    /// Unset: the default ([`DEFAULT_MUX_TUNNELS`]), raised by the UDP-derived
+    /// floor of the services that share the pool. Must be `>= 1`; values above
     /// [`MAX_MUX_TUNNELS_CAP`] are clamped.
-    pub max_tunnels: Option<u16>,
-}
-
-#[cfg(feature = "multiplex")]
-impl Default for DataCarrierLimits {
-    fn default() -> Self {
-        Self {
-            max_tunnels: Some(DEFAULT_MAX_TUNNELS),
-        }
-    }
+    pub tunnels: Option<u16>,
 }
 
 #[cfg(feature = "multiplex")]
 impl DataCarrierLimits {
-    /// The effective cap, clamped into `1..=MAX_MUX_TUNNELS_CAP`.
-    pub fn max_tunnels(&self) -> usize {
-        usize::from(self.max_tunnels.unwrap_or(DEFAULT_MAX_TUNNELS))
-            .clamp(1, usize::from(MAX_MUX_TUNNELS_CAP))
+    /// The count the operator asked for, clamped into `1..=MAX_MUX_TUNNELS_CAP`,
+    /// or `None` for "the default, raised by the floor".
+    pub fn tunnels(&self) -> Option<usize> {
+        self.tunnels
+            .map(|n| usize::from(n).clamp(1, usize::from(MAX_MUX_TUNNELS_CAP)))
+    }
+
+    /// The count to establish, given the UDP-derived floor of the services
+    /// that share this pool: the operator's number when they wrote one, else
+    /// the default raised to the floor.
+    ///
+    /// A floor *above* an explicit count is a configuration the pool refuses to
+    /// reconcile silently (the services need more tunnels than the operator
+    /// allows them), so the caller validates it first; this function only has
+    /// to be total.
+    pub fn resolved_tunnels(&self, floor: usize) -> usize {
+        match self.tunnels() {
+            Some(n) => n,
+            None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
+        }
     }
 }
 /// The TUN device a transparent (L3) service attaches to.
@@ -533,23 +540,14 @@ impl ClientConfig {
         self.data.shared_pool
     }
 
-    /// `[client.data].idle_timeout`, the elastic pool's shrink clock.
+    /// One carrier's configured tunnel count, clamped into
+    /// `1..=MAX_MUX_TUNNELS_CAP`, or `None` when the operator left it to the
+    /// default (which the UDP-derived floor raises).
     #[cfg(feature = "multiplex")]
-    pub fn pool_idle_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(
-            self.data
-                .idle_timeout
-                .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
-        )
-    }
-
-    /// The elastic pool's ceiling for one carrier: the carrier's
-    /// `max_tunnels`, clamped into `1..=MAX_MUX_TUNNELS_CAP`.
-    #[cfg(feature = "multiplex")]
-    pub fn max_tunnels(&self, carrier: DataCarrier) -> usize {
+    pub fn tunnels(&self, carrier: DataCarrier) -> Option<usize> {
         match carrier {
-            DataCarrier::Tcp => self.data.tcp.max_tunnels(),
-            DataCarrier::Kcp => self.data.kcp.max_tunnels(),
+            DataCarrier::Tcp => self.data.tcp.tunnels(),
+            DataCarrier::Kcp => self.data.kcp.tunnels(),
         }
     }
 
@@ -608,13 +606,12 @@ pub struct ServerDataConfig {
     /// know the `StartForwardStripedTcp` command on both sides). See
     /// `docs/internals.md` ("Data-channel striping").
     pub stripe_count: Option<u16>,
-    /// The operator's valve on the elastic tunnel pool: how many multiplexed
+    /// The operator's valve on the client's tunnel pools: how many multiplexed
     /// data tunnels **one client** may hold across every service of its
     /// session. `0` (the default) is unlimited. A tunnel over the cap is
     /// refused with a typed answer and a `debug` line naming the cap; the
-    /// session itself is never touched (D14). A v3 client, whose registration
-    /// carries a channel count of its own, has that count clamped to this
-    /// value — one valve for both dialects.
+    /// session itself is never touched (D14). It bounds every establishment a
+    /// client's pools make — at service start and on repair alike.
     pub max_tunnels_per_client: Option<u16>,
 }
 
@@ -806,16 +803,55 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     (
         "client.data.default_count",
         "v0.10.0",
-        "the tunnel pool now starts cold and grows on demand, so a service has no initial tunnel \
-         count to write; `[client.data.tcp].max_tunnels` (or `[client.data.kcp].max_tunnels`) is \
-         the cap it grows to",
+        "a service has no initial tunnel count to write; the pool's width is \
+         `[client.data.tcp].tunnels` (or `[client.data.kcp].tunnels`), established at service \
+         start and kept",
     ),
     (
         "client.services.*.count",
         "v0.10.0",
-        "the tunnel pool now starts cold and grows on demand, and a pool belongs to the session \
-         and carrier rather than to one service; write `[client.data.tcp].max_tunnels` (or \
-         `[client.data.kcp].max_tunnels`) for the cap",
+        "a pool belongs to the session and carrier rather than to one service; its width is \
+         `[client.data.tcp].tunnels` (or `[client.data.kcp].tunnels`)",
+    ),
+    (
+        "client.data.tcp.max_tunnels",
+        "the next release",
+        "the pool is pinned now: write `[client.data.tcp].tunnels`, the number of connections that \
+         carrier's pool establishes at service start and keeps; the old key was the cap an elastic \
+         pool grew to",
+    ),
+    (
+        "client.data.kcp.max_tunnels",
+        "the next release",
+        "the pool is pinned now: write `[client.data.kcp].tunnels`, the number of connections that \
+         carrier's pool establishes at service start and keeps; the old key was the cap an elastic \
+         pool grew to",
+    ),
+    (
+        "client.data.idle_timeout",
+        "the next release",
+        "the pool is pinned: its tunnels are established at service start and kept, so there is no \
+         shrink clock to write; remove the key",
+    ),
+    (
+        "transparent.data.tcp.max_tunnels",
+        "the next release",
+        "the pool is pinned now: write `[transparent.data.tcp].tunnels`, the number of connections \
+         that carrier's pool establishes at service start and keeps; the old key was the cap an \
+         elastic pool grew to",
+    ),
+    (
+        "transparent.data.kcp.max_tunnels",
+        "the next release",
+        "the pool is pinned now: write `[transparent.data.kcp].tunnels`, the number of connections \
+         that carrier's pool establishes at service start and keeps; the old key was the cap an \
+         elastic pool grew to",
+    ),
+    (
+        "transparent.data.idle_timeout",
+        "the next release",
+        "the pool is pinned: its tunnels are established at service start and kept, so there is no \
+         shrink clock to write; remove the key",
     ),
     (
         "client.services.*.pool_size",
@@ -1214,20 +1250,19 @@ impl Config {
         let data = &client.data;
         let block = model.data_block();
 
-        if data.idle_timeout == Some(0) {
-            bail!("`{block}.idle_timeout` must be greater than 0");
-        }
-        // The elastic pool's per-carrier ceiling. `0` would mean "a pool that
-        // may never have a tunnel"; the value is validated rather than clamped
-        // so a typo is refused with the carrier's name in it.
+        // The pool's per-carrier tunnel count. `0` would mean "a pool with no
+        // tunnel"; the value is validated rather than clamped so a typo is
+        // refused with the carrier's name in it, and a count *below* what the
+        // services need is refused below (the pool no longer grows to fit).
         for (carrier, limits) in [("tcp", &data.tcp), ("kcp", &data.kcp)] {
-            if limits.max_tunnels == Some(0) {
+            if limits.tunnels == Some(0) {
                 bail!(
-                    "`{}.max_tunnels` must be at least 1",
+                    "`{}.tunnels` must be at least 1",
                     model.carrier_block(carrier)
                 );
             }
         }
+        Self::validate_tunnel_floor(client, model)?;
         if let Some(addr) = data.default_data_addr.as_deref()
             && addr.rfind(':').is_none()
         {
@@ -1245,6 +1280,77 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Refuse a tunnel count smaller than what the services of that carrier
+    /// need.
+    ///
+    /// A UDP service's worker set shards across tunnels, and the pool keeps one
+    /// tunnel per worker so the shards stay apart — that is the UDP-derived
+    /// floor. An elastic pool grew to meet it; a fixed one cannot, so a count
+    /// below it is a configuration that would silently degrade the service it
+    /// was written for. The message names the count to write instead, because
+    /// an operator who has just been told "no" needs the number, not the rule.
+    #[cfg(feature = "multiplex")]
+    fn validate_tunnel_floor(client: &ClientConfig, model: ClientModel) -> Result<()> {
+        for (carrier, limits) in [
+            (DataCarrier::Tcp, &client.data.tcp),
+            (DataCarrier::Kcp, &client.data.kcp),
+        ] {
+            let Some(written) = limits.tunnels() else {
+                continue;
+            };
+            let (needed, service) = Self::deepest_udp_floor(client, carrier);
+            if needed > written {
+                let block = model.carrier_block(carrier.as_str());
+                let workers = Self::needed_workers(client, &service);
+                bail!(
+                    "`{block}.tunnels = {written}` is below what the services of that carrier \
+                     need: service `{service}` declares {workers} UDP workers, and a pool keeps \
+                     one tunnel per worker so their shards stay on distinct tunnels. Write \
+                     `{block}.tunnels = {needed}` or more, or lower that service's `udp_workers`."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The deepest UDP-derived floor among the services that would share a
+    /// pool on this carrier, and the service that owns it.
+    ///
+    /// "Deepest" rather than "summed": every pool is keyed per service (or, with
+    /// `shared_pool`, per session), and a service's own pool only ever has to
+    /// carry that service's workers. The floor of the largest worker set is
+    /// therefore what every pool on that carrier must be able to hold — the
+    /// conservative reading, and the one that cannot under-provision a service.
+    #[cfg(feature = "multiplex")]
+    fn deepest_udp_floor(client: &ClientConfig, carrier: DataCarrier) -> (usize, String) {
+        let stream_cap = crate::transport::multiplex::stream_cap();
+        let mut deepest = (0usize, String::new());
+        for (name, service) in &client.services {
+            if !matches!(service.service_type, ServiceType::Udp) {
+                continue;
+            }
+            if service.carrier.unwrap_or(client.data.default_carrier) != carrier {
+                continue;
+            }
+            let workers = usize::from(service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS));
+            let floor = crate::transport::pool::udp_floor([workers], stream_cap);
+            if floor > deepest.0 {
+                deepest = (floor, name.clone());
+            }
+        }
+        deepest
+    }
+
+    /// The worker count of one named service (for the refusal's message).
+    #[cfg(feature = "multiplex")]
+    fn needed_workers(client: &ClientConfig, name: &str) -> u16 {
+        client
+            .services
+            .get(name)
+            .and_then(|s| s.udp_workers)
+            .unwrap_or(DEFAULT_UDP_WORKERS)
     }
 
     /// Refuse a service that asks for the KCP carrier in a binary without the
@@ -1526,19 +1632,14 @@ mod tests {
                 "streams per tunnel"
             );
             assert_eq!(
-                std::hint::black_box(DEFAULT_MAX_TUNNELS),
+                std::hint::black_box(DEFAULT_MUX_TUNNELS),
                 4,
-                "carrier max_tunnels"
+                "the carrier's tunnel count"
             );
             assert_eq!(
                 std::hint::black_box(MAX_MUX_TUNNELS_CAP),
                 64,
-                "max_tunnels clamp"
-            );
-            assert_eq!(
-                std::hint::black_box(DEFAULT_POOL_IDLE_TIMEOUT_SECS),
-                60,
-                "pool idle_timeout"
+                "the tunnel count clamp"
             );
         }
     }
@@ -2146,7 +2247,7 @@ default_mode = "multiplex"
 "#,
         );
         config.push_str(if cfg!(feature = "kcp") {
-            "default_carrier = \"kcp\"\n\n[client.data.kcp]\nmax_tunnels = 6\n"
+            "default_carrier = \"kcp\"\n\n[client.data.kcp]\ntunnels = 6\n"
         } else {
             "default_carrier = \"tcp\"\n"
         });
@@ -2341,7 +2442,7 @@ carrier = "kcp"
             );
         }
 
-        // `max_tunnels = 0` is rejected, with the carrier named.
+        // `tunnels = 0` is rejected, with the carrier named.
         let bad = r#"
 [client]
 default_token = "t"
@@ -2350,7 +2451,7 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [client.data.tcp]
-max_tunnels = 0
+tunnels = 0
 
 [client.services.test]
 local_addr = "127.0.0.1:80"
@@ -2358,8 +2459,61 @@ remote_bind_addr = "0.0.0.0:6080"
 "#;
         let err = Config::from_str(bad).unwrap_err();
         assert!(
-            format!("{err:#}").contains("max_tunnels"),
+            format!("{err:#}").contains("tunnels"),
             "the refusal must name the key: {err:#}"
         );
+    }
+
+    /// An explicit tunnel count below the UDP-derived floor is refused: a
+    /// pinned pool cannot grow to meet it, so the configuration would silently
+    /// under-provision the workers the service declared.
+    #[cfg(feature = "multiplex")]
+    #[test]
+    fn test_a_tunnel_count_below_the_udp_floor_is_refused() {
+        let config = |tunnels: u16| {
+            format!(
+                r#"
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.data.tcp]
+tunnels = {tunnels}
+
+[client.services.dns]
+protocol = "udp"
+local_addr = "127.0.0.1:53"
+remote_bind_addr = "0.0.0.0:5353"
+udp_workers = 4
+"#
+            )
+        };
+
+        // Four workers ask for four paths; two tunnels cannot hold them, and
+        // the refusal names the number to write instead.
+        let err = format!("{:#}", Config::from_str(&config(2)).unwrap_err());
+        assert!(
+            err.contains("`[client.data.tcp].tunnels = 2`")
+                && err.contains("`[client.data.tcp].tunnels = 4`")
+                && err.contains("udp_workers"),
+            "the refusal must name the key, the count to write and the knob: {err}"
+        );
+
+        // The floor itself (and anything above it) is accepted: the operator's
+        // number is the pool.
+        for tunnels in [4u16, 8] {
+            let cfg = Config::from_str(&config(tunnels)).unwrap();
+            assert_eq!(
+                cfg.client.unwrap().tunnels(DataCarrier::Tcp),
+                Some(usize::from(tunnels))
+            );
+        }
+
+        // Leaving it unset is always fine: the default is raised to the floor
+        // at establishment time.
+        let unset = config(4).replace("tunnels = 4\n", "");
+        assert!(Config::from_str(&unset).is_ok());
     }
 }

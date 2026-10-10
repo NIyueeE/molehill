@@ -551,7 +551,71 @@ both hold; a difference inside the variance counts as *no difference*, and
 either failure removes the feature. The small-packet arm failed on the ceiling
 alone, so the other arms were not run for the verdict.
 
-### Open threads
+#
+## The tunnel pool is pinned (2026-10-10, this session)
+
+The client's multiplex pool is no longer elastic. It establishes
+`[client.data.tcp|kcp].tunnels` (default 4, raised to a UDP service's declared
+worker count) at service start, keeps them, and **repairs** a dead one back to
+the count; it never grows for load and never reaps for idleness. `max_tunnels`
+and `idle_timeout` are refused with upgrade messages, the floor is validated at
+config time, and the server's `max_tunnels_per_client` valve now bites at
+startup.
+
+The reasoning, in the order it was established:
+
+- An elastic pool's width is a *result*: it depends on what the process was
+  doing. That is a capacity-planning problem for an operator and a
+  comparability problem for this repository's measurements (§10) — the same
+  arm, run twice, can describe two different pools.
+- The measurements that size the key are unchanged by pinning it: one tunnel is
+  the worst configuration on every path measured (3.34 against 5.92 Gbit/s for
+  8 flows on `loss1` from one tunnel to two; 12.85 against 22.81 on a clean
+  jumbo path from one to eight), and an L3 claim on one carrier connection
+  carries the same for one inner flow and for eight.
+- Establishment is cheap and belongs at startup: **0.5–0.8 MiB RSS and 2.6 file
+  descriptors per tunnel, no threads** (measured by varying the pool's width on
+  a fixed workload), so a deployment can afford the count its concurrency
+  needs, and the first visitor pays nothing.
+- `mux` retains its purpose in that model: it decouples the count of *carrier
+  connections* (fixed, configured) from the count of *logical connections*
+  (unbounded, per visitor — a stream on an established connection costs no
+  round trip). Where the logical count is known at configuration time and does
+  not exceed the count — a single L3 claim — a raw channel is measurably
+  cheaper (7.599 against 6.620 Gbit/s single-flow, 0.277 against 0.578 s/Gbit),
+  which is why `direct` survives there.
+
+What this changed, mechanically: `GrowReason` has one variant (`Repair`) and
+`ShrinkReason` one (`Dead`); `grow_before_placing`, `grow_for_stripes`, the
+floor-driven growth loop, `shrink_if_idle`, `may_shrink`, `GROW_PERCENT`,
+`grow_threshold`, `tunnel_grow_at`, `MIN_WARM_HOLD`, `SHRINK_COOLDOWN` and
+`OPEN_WAIT_BUDGET` are gone; placement's per-tunnel ceiling
+(`TUNNEL_STREAM_CEILING`, 56) is now the *only* oversubscription bound, and the
+UDP-derived floor became a validation input rather than a growth target. The
+one invariant to keep in mind: the engine's own stream cap (64) is no longer
+backstopped by growth, so the pool's ceiling has to stay strictly below it —
+`tunnel_ceiling` does that, and the `pool_test` suite asserts it.
+
+Still open from this work (next steps, in the order agreed):
+
+1. ~~**A saturation notice.**~~ **Landed with the change.** A pinned pool
+   cannot grow, so the refusal that used to trigger growth now reports itself:
+   the first time a visitor is refused because every tunnel is at placement's
+   stream ceiling, the pool emits one INFO line
+   (`pool-stats: pool at its stream ceiling; raise [client.data.<carrier>].tunnels`)
+   with the configured count and the ceiling, and every later refusal is DEBUG
+   (`logging::RepeatNotice`). `OpenError::AtCapacity`'s text now names the
+   setting instead of a growth that can no longer happen.
+2. **Member kinds and L3 flow hashing.** The pool has one member kind (a yamux
+   tunnel). The design that follows from the numbers: a member may also be a
+   *raw* channel (for a logical connection whose count is known and fits), and a
+   transparent claim should hold a *set* of members with its inner flows hashed
+   across them — per flow, never per packet, so ordering survives. That is what
+   would let an L3 claim use more than one carrier connection (today it uses
+   exactly one, which is why its throughput is flat from one inner flow to
+   eight).
+
+## Open threads
 
 - **One instrument, and the boundary is a profile (closed 2026-10-10).**
   The earlier decision — a sibling instrument for L3, the sweep left alone —

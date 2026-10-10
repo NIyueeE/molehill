@@ -118,9 +118,6 @@ pub struct TransparentDataConfig {
     /// pool per carrier, instead of one pool per claim. Default: `false`.
     #[serde(default)]
     pub shared_pool: bool,
-    /// Seconds a tunnel pool with no streams must stay idle before it removes
-    /// one tunnel. Default: 60.
-    pub idle_timeout: Option<u64>,
     /// `[transparent.data.tcp]`: the TCP carrier's tunnel ceiling.
     #[serde(default)]
     pub tcp: DataCarrierLimits,
@@ -137,7 +134,6 @@ impl Default for TransparentDataConfig {
             default_mode: default_direct_mode(),
             default_carrier: DataCarrier::default(),
             shared_pool: false,
-            idle_timeout: None,
             tcp: DataCarrierLimits::default(),
             kcp: DataCarrierLimits::default(),
         }
@@ -203,7 +199,6 @@ impl TransparentClientConfig {
                 default_mode: self.data.default_mode,
                 default_carrier: self.data.default_carrier,
                 shared_pool: self.data.shared_pool,
-                idle_timeout: self.data.idle_timeout,
                 tcp: self.data.tcp.clone(),
                 kcp: self.data.kcp.clone(),
             },

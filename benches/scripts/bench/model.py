@@ -756,11 +756,13 @@ class Arm:
     * `l3` — the transparent client: whole IP packets over a TUN device.
 
     `binary` is the build under test; two arms differing only in it are the A/B
-    axis. `pool_cap` and `txqueuelen` are the two settings this model prices
-    separately, because both are architectural choices rather than tuning: a
-    capped pool separates the multiplexer's framing cost from its pool's, and
-    the TUN queue length decides whether an L3 arm measures the architecture or
-    the kernel's default queue.
+    axis. `pool_cap` (the configured `[client.data.tcp].tunnels`) and
+    `txqueuelen` are the two settings this model prices separately, because both
+    are architectural choices rather than tuning: the pool's width separates the
+    multiplexer's framing cost from its pool's — the pool is pinned at that
+    count, so an arm's width is a method parameter and not a result — and the
+    TUN queue length decides whether an L3 arm measures the architecture or the
+    kernel's default queue.
 
     `carrier` is the transport the data plane rides: `tcp` (the control
     channel's own wire stack) or `kcp` (KCP-over-UDP sessions, feature `kcp`).
@@ -895,6 +897,9 @@ ARM_CATALOG: dict = {
     "l4-mux1": Arm("l4-mux1", "l4", pool_cap=1),
     "l4-mux2": Arm("l4-mux2", "l4", pool_cap=2),
     "l4-mux8": Arm("l4-mux8", "l4", pool_cap=8),
+    # `pool_cap` writes `[client.data.tcp].tunnels`, so these arms are the pool
+    # *pinned* at 1 / 2 / 8 connections — the arm's width, not a cap it may
+    # grow to.
     "l4-direct": Arm("l4-direct", "l4", mode="direct"),
     "l3": Arm("l3", "l3", mode="direct"),
     "l3-mux": Arm("l3-mux", "l3", mode="multiplex"),

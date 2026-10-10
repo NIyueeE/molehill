@@ -132,20 +132,10 @@ fn spawn_framing_stats() {
     });
 }
 /// The stream cap of one tunnel, from the same constant `mux_config` sets: the
-/// growth rule needs it to keep every tunnel strictly below the cap, because a
-/// cap hit makes the vendored engine log an unguarded `error!`.
+/// placement ceiling derives from it to keep every tunnel strictly below the
+/// cap, because a cap hit makes the vendored engine log an unguarded `error!`.
 pub(crate) fn stream_cap() -> usize {
     crate::common::constants::DEFAULT_MUX_MAX_STREAMS
-}
-
-/// Microseconds since the process's first use of the pool clock: the base the
-/// reservation-age metric is measured against (a monotonic clock, so it never
-/// jumps backwards).
-fn now_us() -> u64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// The next tunnel id: unique per process, so two pools' tunnels can never be
@@ -178,12 +168,12 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// The elastic pool: bookkeeping, placement, growth and shrink.
+// The pinned tunnel pool: bookkeeping, placement and repair.
 // ---------------------------------------------------------------------------
 use crate::transport::pool::{GrowReason, Placement, ShrinkReason, TunnelLoad};
 
-/// One tunnel's bookkeeping counters, shared by the pool's placement, shrink
-/// and telemetry code.
+/// One tunnel's bookkeeping counters, shared by the pool's placement and
+/// telemetry code.
 ///
 /// All three are atomics because placement reads them while it holds only a
 /// shared borrow of the tunnel list: inserting an entry would otherwise need a
@@ -195,10 +185,6 @@ pub(crate) struct TunnelCounters {
     streams: std::sync::atomic::AtomicUsize,
     /// Opens requested but not yet completed on this tunnel.
     pending: std::sync::atomic::AtomicUsize,
-    /// When the oldest *current* reservation was taken, as micros since the
-    /// process's first pool. An open that has waited longer than
-    /// `OPEN_WAIT_BUDGET` is the pool's "grow now" signal (`GrowReason::Wait`).
-    oldest_pending_us: std::sync::atomic::AtomicU64,
 }
 
 impl TunnelCounters {
@@ -213,38 +199,23 @@ impl TunnelCounters {
         }
     }
 
-    /// Charge one open to this tunnel before it is awaited. The reservation's
-    /// age is what the wait rule reads, so the first of a burst sets it and
-    /// the last one to clear it resets it.
+    /// Charge one open to this tunnel before it is awaited.
     fn reserve(&self) {
         use std::sync::atomic::Ordering;
-        if self.pending.fetch_add(1, Ordering::Relaxed) == 0 {
-            self.oldest_pending_us.store(now_us(), Ordering::Relaxed);
-        }
+        self.pending.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The open failed or was abandoned: the reservation comes back.
     fn release(&self) {
         use std::sync::atomic::Ordering;
-        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.oldest_pending_us.store(0, Ordering::Relaxed);
-        }
+        self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// The open completed: the reservation becomes a live stream.
     fn charge(&self) {
         use std::sync::atomic::Ordering;
         self.streams.fetch_add(1, Ordering::Relaxed);
-        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.oldest_pending_us.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// How long the oldest reservation on this tunnel has been waiting.
-    fn oldest_wait(&self) -> Option<std::time::Duration> {
-        use std::sync::atomic::Ordering;
-        let since = self.oldest_pending_us.load(Ordering::Relaxed);
-        (since != 0).then(|| std::time::Duration::from_micros(now_us().saturating_sub(since)))
+        self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -254,7 +225,7 @@ impl TunnelCounters {
 /// wrapping it keeps the charge exact, because the stream is a `Drop` point no
 /// matter which task ends up holding it (a forwarded visitor, a stripe group,
 /// a pre-opened channel). A tunnel's stream count can therefore never leak past
-/// the stream's life, which is what the shrink predicate reads.
+/// the stream's life, which is what the placement ceiling reads.
 ///
 /// The lease *is* the stream the client's forwarding code carries (it
 /// implements both IO traits), so the charge lives exactly as long as the data
@@ -356,7 +327,7 @@ impl Carrier {
 /// One pool timeline entry: a size change and the reason for it.
 #[derive(Debug, Clone, Copy)]
 struct PoolEvent {
-    /// `true` for a growth, `false` for a shrink.
+    /// `true` for a repair, `false` for a death.
     grow: bool,
     /// `GrowReason::as_str` / `ShrinkReason::as_str`.
     reason: &'static str,
@@ -374,13 +345,16 @@ pub struct PoolSnapshot {
     pub carrier: &'static str,
     /// The number of live tunnels.
     pub size: usize,
-    /// The cap the pool may grow to (`[client.data.tcp|kcp].max_tunnels`).
-    pub max_tunnels: usize,
-    /// The UDP-derived floor the pool must not shrink below (D7).
+    /// How many tunnels the pool establishes (`[client.data.tcp|kcp].tunnels`).
+    /// A pool at this size is complete; one below it is repairing.
+    pub count: usize,
+    /// The UDP-derived floor the pool's configured count must cover (D7).
     pub udp_floor: usize,
-    /// Cumulative growths since the pool was created.
+    /// Cumulative establishments since the pool was created.
     pub grows: u64,
-    /// Cumulative shrinks since the pool was created.
+    /// Cumulative removals since the pool was created: tunnels that died (and
+    /// are therefore being repaired). A pinned pool has no policy shrink, so
+    /// this counts losses, not decisions.
     pub shrinks: u64,
     /// Per-tunnel `(streams, pending, pinned)`, in pool order.
     pub tunnels: Vec<(usize, usize, usize)>,
@@ -407,17 +381,17 @@ struct PoolState {
     entries: Vec<PoolEntry>,
     /// Round-robin cursor: the tie-break of the least-loaded rule.
     next_cursor: usize,
-    /// Set while an open could not be answered immediately; the next
-    /// maintenance tick turns it into a growth.
-    demand: bool,
-    max_tunnels: usize,
+    /// The count this pool establishes and keeps. `entries.len() < count` means
+    /// a tunnel is missing and the repair tick will dial one; nothing else moves
+    /// this number.
+    count: usize,
 }
 
 /// One live tunnel of a pool.
 struct PoolEntry {
     tunnel: ClientTunnel,
     /// Dropping this ends the driver; the pool holds it for the tunnel's whole
-    /// life so a shrink can actually release the connection.
+    /// life, so removal actually releases the connection.
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
@@ -466,8 +440,8 @@ pub(crate) enum OpenError {
     /// Every candidate tunnel refused the stream.
     Refused(crate::mux::ConnectionError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
-    /// the pool could not grow past it (its own `max_tunnels`, or the server's
-    /// `max_tunnels_per_client` valve).
+    /// the pool could not reach its count (its own `tunnels`, or the server's
+    /// `max_tunnels_per_client` valve), or the carrier's dial failed.
     ///
     /// A typed refusal rather than a queued open: the engine's cap is *fatal*
     /// to a tunnel, so the pool refuses one visitor instead of risking every
@@ -484,7 +458,8 @@ impl std::fmt::Display for OpenError {
             Self::Refused(e) => write!(f, "every tunnel refused the stream: {e}"),
             Self::AtCapacity => write!(
                 f,
-                "every tunnel is at its stream ceiling and the pool cannot grow"
+                "every tunnel is at its stream ceiling; this pool is at its configured tunnel \
+                 count (`tunnels`)"
             ),
         }
     }
@@ -497,18 +472,10 @@ struct PoolShared {
     /// The pool's key within its session: `session` (shared) or
     /// `service:<name>`.
     key: String,
-    /// Streams per tunnel (`DEFAULT_MUX_MAX_STREAMS`), the growth ceiling.
+    /// Streams per tunnel (`DEFAULT_MUX_MAX_STREAMS`): the engine cap the
+    /// placement ceiling leaves headroom below.
     stream_cap: usize,
-    /// `[client.data].idle_timeout`.
-    idle_timeout: std::time::Duration,
-    /// When the pool last had work (a stream, a reserved open or a pinned
-    /// peer): the shrink clock.
-    last_activity: std::sync::Mutex<std::time::Instant>,
-    /// The last growth: shrink waits the warm hold out from here.
-    last_grown: std::sync::Mutex<std::time::Instant>,
-    /// The last shrink: the next one waits the cooldown out from here.
-    last_shrunk: std::sync::Mutex<std::time::Instant>,
-    /// When a growth attempt last failed: the pool stops growing until
+    /// When a repair attempt last failed: the pool stops dialing until
     /// `GROW_FAILURE_COOLDOWN` has passed, or a tunnel dies (D14).
     grow_failed_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// The UDP-derived floor (D7). The session maintains it from its active
@@ -520,11 +487,12 @@ struct PoolShared {
     shrinks: std::sync::atomic::AtomicU64,
     /// The pool timeline, drained once per second by the telemetry task.
     events: std::sync::Mutex<Vec<PoolEvent>>,
-    /// Set while the pool is growing or shrinking, so the two cannot overlap.
+    /// Set while the pool is establishing a tunnel, so two repair dials cannot
+    /// overlap.
     resizing: std::sync::atomic::AtomicBool,
-    /// Signalled when one growth attempt ends, worked or not. A cold pool's
-    /// losing opens wait on it for the tunnel the winner is dialing, instead
-    /// of reserving against an empty pool.
+    /// Signalled when one repair attempt ends, worked or not. An open that
+    /// found the pool empty waits on it for the tunnel the winner is dialing,
+    /// instead of reserving against an empty pool.
     grown: tokio::sync::Notify,
     /// Signalled when a tunnel's stream count drops, so an open that found
     /// every tunnel at its ceiling can re-read the pool instead of failing
@@ -537,14 +505,6 @@ struct PoolShared {
 }
 
 impl PoolShared {
-    /// Note that the pool has work now: the shrink clock restarts.
-    fn touch(&self) {
-        *self
-            .last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
-    }
-
     /// Record one size change for the telemetry timeline. Bounded: a pool
     /// that flaps cannot grow the buffer without bound.
     fn push_event(&self, event: PoolEvent) {
@@ -641,7 +601,7 @@ impl PinRegistry {
 }
 
 /// A pool of parallel client tunnels (arm 1 of the transport comparison:
-/// N physical connections instead of one), with elastic size.
+/// N physical connections instead of one), pinned at its configured count.
 ///
 /// `open_stream` picks the least-loaded tunnel (by `streams + pending`), with
 /// the round-robin cursor as the tie-break; a tunnel whose driver died returns
@@ -651,10 +611,11 @@ impl PinRegistry {
 /// re-establishes the tunnels).
 ///
 /// `open_streams(n)` reserves all `n` before awaiting any, so a stripe group
-/// of K lands on K distinct tunnels whenever the pool has K (D24).
+/// of K lands on K distinct tunnels whenever the pool has K and shares them
+/// when it has fewer (D24).
 ///
-/// Clones share one state, so placement, growth and shrink see every service
-/// that uses the pool — which is the whole point of a shared pool.
+/// Clones share one state, so placement and repair see every service that uses
+/// the pool — which is the whole point of a shared pool.
 #[derive(Clone)]
 pub struct TunnelPool {
     inner: std::sync::Arc<TunnelPoolInner>,
@@ -663,43 +624,39 @@ pub struct TunnelPool {
 struct TunnelPoolInner {
     shared: std::sync::Arc<PoolShared>,
     state: parking_lot::Mutex<PoolState>,
-    /// Creates a new tunnel for a growth. `None` on a pool built without one.
+    /// Creates a new tunnel for a repair. `None` on a pool built without one.
     dial: Option<Dialer>,
-    /// The client's UDP pin accounting: a tunnel whose tunnel id appears here
-    /// with a non-zero count is pinned and must never be shrunk (D30).
+    /// The client's UDP pin accounting: which peers end on which tunnel (D30).
     pins: std::sync::Arc<PinRegistry>,
 }
 
 impl TunnelPool {
     /// Wrap the tunnels an establishment pass already produced, on a pool that
-    /// cannot grow (no dialer).
+    /// cannot repair (no dialer).
     #[must_use]
     pub fn new(
         carrier: Carrier,
         key: String,
         initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
-        max_tunnels: usize,
-        idle_timeout: std::time::Duration,
+        tunnels: usize,
     ) -> TunnelPool {
         Self::with_dialer(
             carrier,
             key,
             initial,
-            max_tunnels,
-            idle_timeout,
+            tunnels,
             None,
             std::sync::Arc::new(PinRegistry::new()),
         )
     }
 
-    /// The same, with the dialer a growth uses (`None` on a pool that cannot
-    /// grow) and the client's UDP pin registry.
+    /// The same, with the dialer a repair uses (`None` on a pool that cannot
+    /// replace a dead tunnel) and the client's UDP pin registry.
     pub fn with_dialer(
         carrier: Carrier,
         key: String,
         initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
-        max_tunnels: usize,
-        idle_timeout: std::time::Duration,
+        tunnels: usize,
         dial: Option<Dialer>,
         pins: std::sync::Arc<PinRegistry>,
     ) -> TunnelPool {
@@ -707,10 +664,6 @@ impl TunnelPool {
             carrier,
             key,
             stream_cap: stream_cap(),
-            idle_timeout,
-            last_activity: std::sync::Mutex::new(std::time::Instant::now()),
-            last_grown: std::sync::Mutex::new(std::time::Instant::now()),
-            last_shrunk: std::sync::Mutex::new(std::time::Instant::now()),
             grow_failed_at: std::sync::Mutex::new(None),
             udp_floor: std::sync::atomic::AtomicUsize::new(0),
             grows: std::sync::atomic::AtomicU64::new(0),
@@ -724,8 +677,7 @@ impl TunnelPool {
         let mut state = PoolState {
             entries: Vec::new(),
             next_cursor: 0,
-            demand: false,
-            max_tunnels: max_tunnels.max(1),
+            count: tunnels.max(1),
         };
         for (tunnel, shutdown) in initial {
             state.entries.push(PoolEntry {
@@ -741,9 +693,9 @@ impl TunnelPool {
                 pins,
             }),
         };
-        // The "cold + demand -> +1" rule has to be evaluated even when nothing
-        // else happens, and the shrink clock needs a heartbeat: one task per
-        // pool, exiting when the pool drops.
+        // The repair tick has to run even when nothing else happens, so a
+        // missing tunnel is dialed without a visitor arriving first: one task
+        // per pool, exiting when the pool drops.
         pool.spawn_maintenance();
         pool_stats::register(&pool.inner);
         LIVE_POOLS
@@ -773,7 +725,7 @@ impl TunnelPool {
         self.inner.state.lock().entries.len()
     }
 
-    /// The UDP-derived floor (D7) this pool must not shrink below.
+    /// The UDP-derived floor (D7) the pool's configured count must cover.
     pub fn set_udp_floor(&self, floor: usize) {
         self.inner
             .shared
@@ -790,7 +742,7 @@ impl TunnelPool {
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: 0,
-            max_tunnels: 0,
+            count: 0,
             udp_floor: 0,
             grows: 0,
             shrinks: 0,
@@ -807,7 +759,7 @@ impl TunnelPool {
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: state.entries.len(),
-            max_tunnels: state.max_tunnels,
+            count: state.count,
             udp_floor: self.inner.shared.udp_floor.load(Ordering::Relaxed),
             grows: self.inner.shared.grows.load(Ordering::Relaxed),
             shrinks: self.inner.shared.shrinks.load(Ordering::Relaxed),
@@ -852,38 +804,36 @@ impl TunnelPool {
 
     /// Open one stream, on the least-loaded tunnel.
     ///
-    /// A cold pool grows synchronously here, so the first open of a cold pool
-    /// answers with a fresh tunnel instead of failing; every other growth
-    /// happens on the maintenance tick. The reservation is charged before the
-    /// first `await`, which is what makes back-to-back opens land on distinct
-    /// tunnels while the pool has them.
+    /// An empty pool repairs synchronously here — the state a start whose
+    /// establishment dials all failed leaves — so the first open answers with a
+    /// fresh tunnel instead of failing; every other repair happens on the
+    /// maintenance tick. The reservation is charged before the first `await`,
+    /// which is what makes back-to-back opens land on distinct tunnels while the
+    /// pool has them.
     pub(crate) async fn open_stream(&self) -> Result<StreamLease, OpenError> {
         self.open_avoiding(&[]).await
     }
 
     /// Open one stream for a stripe of a group, on a tunnel the group does not
-    /// already occupy (D24 structural).
+    /// already occupy *while one is left* (D24 structural).
     ///
     /// `used` are the process-unique tunnel ids the group's earlier stripes
     /// took and `stripes` is the group's K — the server names the group before
     /// its channels are opened, which is what lets the client do what the
     /// placement rule alone never could.
     ///
-    /// The pool grows to `min(stripes, max_tunnels)` *first*: a pool with fewer
-    /// tunnels than the group has stripes cannot place two of them apart
-    /// however placement chooses, and a cold pool — the elastic pool's default
-    /// state — has *none*, while a group's K streams sit below the growth
-    /// rule's per-tunnel threshold (7 on the shipped cap), so nothing else in
-    /// this path would ever have asked for a second tunnel. The growth is
-    /// bounded by the group's own K and by `max_tunnels`, and a refusal (D14) or
-    /// a pool that cannot grow stops it; the placement below then shares what
-    /// there is.
+    /// A pinned pool cannot dial a tunnel per stripe. The exclusion is a
+    /// preference with a floor: the group spreads over the tunnels that exist
+    /// and, when it has more stripes than the pool has members, its extra
+    /// stripes share them rather than failing.
     pub(crate) async fn open_stream_on_distinct(
         &self,
         used: &[usize],
         stripes: usize,
     ) -> Result<StreamLease, OpenError> {
-        self.grow_for_stripes(stripes).await;
+        // `stripes` stays in the signature because the caller still sizes the
+        // request by it; placement reads only the group's occupied tunnels.
+        let _ = stripes;
         self.open_avoiding(used).await
     }
 
@@ -892,8 +842,8 @@ impl TunnelPool {
     /// list — see [`Self::open_stream_on_distinct`]).
     async fn open_avoiding(&self, avoid: &[usize]) -> Result<StreamLease, OpenError> {
         if self.size() == 0 {
-            self.grow(GrowReason::Cold).await;
-            // The growth above is a no-op when another task already holds the
+            self.grow(GrowReason::Repair).await;
+            // The repair above is a no-op when another task already holds the
             // resize flag, so a *concurrent* first open would reserve against
             // a still-empty pool and fail (`NoTunnel`) while the winner is
             // dialing the very tunnel it needs. Wait for that attempt instead;
@@ -903,11 +853,6 @@ impl TunnelPool {
                     .await;
         }
         let ceiling = self.ceiling();
-        // Grow *before* placing, not (only) after: a burst that arrives while
-        // every tunnel already sits at the growth threshold must spread over
-        // the tunnels it will use, not land all of it on one and queue its
-        // interactive and control streams behind that bulk.
-        self.grow_before_placing().await;
         let avoid = self.indices_of(avoid);
         let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
@@ -917,12 +862,10 @@ impl TunnelPool {
             if self.size() == 0 {
                 return Err(OpenError::NoTunnel);
             }
-            // Every tunnel carries as many streams as it may. Growth is the
-            // rule's answer, so ask for it and give a retiring stream (or the
-            // tick) a moment before refusing this visitor: without the wait a
-            // pool that cannot grow would fail whichever open happened to
-            // arrive while every tunnel sat exactly at the ceiling.
-            self.demand();
+            // Every tunnel carries as many streams as it may, and a pinned pool
+            // cannot dial its way out: give a retiring stream a moment before
+            // refusing this visitor, so a burst that meets a full pool is
+            // served by the streams retiring under it.
             let freed = self.inner.shared.capacity_freed.notified();
             tokio::pin!(freed);
             // Register before the second look, or a retirement landing in
@@ -932,6 +875,10 @@ impl TunnelPool {
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
             }
             let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
+                // The final refusal: every tunnel is at the ceiling and no
+                // stream retired inside the budget. A pinned pool cannot dial
+                // its way out of this, so the operator has to widen it.
+                self.report_saturation();
                 return Err(OpenError::AtCapacity);
             };
             return self.complete(reservation, &avoid).await;
@@ -949,79 +896,41 @@ impl TunnelPool {
         crate::transport::pool::tunnel_ceiling(self.inner.shared.stream_cap)
     }
 
-    /// Grow one tunnel when the next open would add to a tunnel that is already
-    /// at the growth threshold, so the burst spreads *before* it is placed.
+    /// Say once, per process, that placement is what refused a visitor: a
+    /// pinned pool cannot dial its way out, so the fix is a wider
+    /// `[client.data.<carrier>].tunnels`.
     ///
-    /// The maintenance tick grows too, but it samples at 50 ms intervals: a
-    /// burst of K back-to-back opens (a 20-stream bulk test) completes long
-    /// before the first tick sees it, so every one of them places on the same
-    /// tunnel and the tick can only fix the *next* burst. Growing in the open
-    /// path is what makes the spreading synchronous, at the cost of one dial
-    /// for the opens that trip the rule — the same dial the cold path already
-    /// pays, and never one for an open that does not need it.
-    ///
-    /// Every guard turns this into a no-op, and they are all conditions under
-    /// which growing is wrong or already happening: a growth is in flight, a
-    /// refused growth is still holding the pool back (D14), the pool is at its
-    /// own `max_tunnels`, or the pool is cold (which [`Self::open_stream`]
-    /// grew synchronously above). The dial is bounded by the carrier's own
-    /// establish timeout, exactly like the cold path's.
-    async fn grow_before_placing(&self) {
-        use std::sync::atomic::Ordering;
-        if self.inner.shared.resizing.load(Ordering::Acquire) || self.growth_held_off() {
-            return;
-        }
-        let grow_at = crate::transport::pool::tunnel_grow_at(self.inner.shared.stream_cap);
-        let busy = {
-            let state = self.inner.state.lock();
-            let size = state.entries.len();
-            size > 0
-                && size < state.max_tunnels
-                && state.entries.iter().any(|e| e.load().total() >= grow_at)
-        };
-        if busy {
-            self.grow(GrowReason::Load).await;
-        }
-    }
-
-    /// Grow until the pool can place `target` tunnels apart, one dial at a
-    /// time and never past `max_tunnels`.
-    ///
-    /// Every stripe group pays this once: K stripes need K tunnels to be spread
-    /// over, and the pool's other growth rules are load-based, so a group whose
-    /// K streams sit below the per-tunnel threshold would never trigger one
-    /// (that is exactly how a cold pool ended up carrying a whole group on one
-    /// tunnel). The one-at-a-time shape is the pool's own: `grow` is guarded by
-    /// a resize flag, so K concurrent stripe placements take turns dialing
-    /// instead of racing, and each turn is one dial rather than a storm.
-    ///
-    /// Terminating by construction: every iteration either returns or leaves
-    /// the pool bigger, and the target is capped by `max_tunnels`. A refused
-    /// growth holds the loop off for its cooldown (D14), and a pool whose dialer
-    /// cannot add a tunnel returns instead of spinning.
-    async fn grow_for_stripes(&self, target: usize) {
-        let target = target.max(1);
-        loop {
-            let (size, cap) = {
-                let state = self.inner.state.lock();
-                (state.entries.len(), state.max_tunnels)
-            };
-            let target = target.min(cap);
-            if size >= target || self.growth_held_off() {
-                return;
-            }
-            self.grow(GrowReason::Stripe).await;
-            // Wait for the growth in flight — someone else's as much as ours —
-            // before re-reading the size: placing against the still-small pool
-            // is the very thing this loop exists to avoid.
-            self.await_growth(target).await;
-            if self.size() <= size {
-                // No tunnel was added and none is being dialed any more: the
-                // pool cannot grow (no dialer, or a refusal that now holds it
-                // back). The placement that follows shares what there is.
-                return;
-            }
-        }
+    /// INFO on the first report and DEBUG afterwards — a saturated pool under
+    /// load would otherwise repeat the line for every refused visitor — and the
+    /// line names the configured count, the ceiling and the key to raise.
+    /// Returns which of the two this call was, so a test can pin the once-only
+    /// semantics.
+    fn report_saturation(&self) -> bool {
+        let count = self.inner.state.lock().count;
+        let ceiling = self.ceiling();
+        let carrier = self.inner.shared.carrier.as_str();
+        POOL_SATURATED.report(
+            || {
+                info!(
+                    pool = %self.inner.shared.key,
+                    carrier,
+                    count,
+                    ceiling,
+                    "pool-stats: pool at its stream ceiling; raise [client.data.{carrier}].tunnels"
+                );
+                true
+            },
+            || {
+                debug!(
+                    pool = %self.inner.shared.key,
+                    carrier,
+                    count,
+                    ceiling,
+                    "pool-stats: pool still at its stream ceiling"
+                );
+                false
+            },
+        )
     }
 
     /// The pool indices of the tunnels named by `ids`, as of now.
@@ -1098,8 +1007,8 @@ impl TunnelPool {
         let candidates = crate::transport::pool::order_candidates_for(&order, tried, avoid);
         // The least-loaded untried tunnel with pending budget left; when every
         // candidate is at its budget, the least-loaded untried one still takes
-        // the open — refusing a visitor outright is worse, and a full budget is
-        // exactly the demand the growth rule reads.
+        // the open — refusing a visitor outright is worse than queueing it
+        // behind the driver's own bounded request queue.
         //
         // The stream ceiling is a hard bound, unlike the pending budget, and it
         // has no fallback: a tunnel at the ceiling is *never* given another
@@ -1157,12 +1066,12 @@ impl TunnelPool {
     /// so a refused stripe still prefers a tunnel its group does not have (see
     /// [`Self::open_stream_on_distinct`]).
     ///
-    /// `TooManyStreams` means "the pool should grow", never "the tunnel is
-    /// dead": it is counted as a refusal, the reservation is released, and the
-    /// demand flag makes the next maintenance tick add a tunnel. The growth
-    /// rule keeps every tunnel strictly below its cap precisely so this path
-    /// stays rare — the vendored engine logs an unguarded `error!` on a cap
-    /// hit, and `tests/log_budget_test.rs` fails a healthy run with one ERROR.
+    /// `TooManyStreams` means "this tunnel is full", never "the tunnel is
+    /// dead": it is counted as a refusal and the open falls through to the
+    /// next candidate. The placement ceiling keeps every tunnel strictly below
+    /// the engine's cap precisely so this path stays rare — the vendored engine
+    /// logs an unguarded `error!` on a cap hit, and `tests/log_budget_test.rs`
+    /// fails a healthy run with one ERROR.
     async fn complete(
         &self,
         reservation: Reservation,
@@ -1185,7 +1094,6 @@ impl TunnelPool {
                 // measured against a value the open itself changed (it went
                 // negative on a single-tunnel pool, which is what caught this).
                 placement.chosen_load = counters.load();
-                self.inner.shared.touch();
                 PlacementStats::record(placement, started.elapsed(), None);
                 Ok(StreamLease {
                     stream,
@@ -1202,10 +1110,8 @@ impl TunnelPool {
                     "pool-stats: tunnel refused an open: {e}"
                 );
                 let note = if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
-                    // A cap hit is a growth signal, never a death: record it
-                    // and stop here so the caller (and the maintenance tick)
-                    // sees the demand.
-                    self.demand();
+                    // A cap hit is a refusal of this open, never a death:
+                    // record it and report it back to the caller.
                     PlacementStats::record(placement, started.elapsed(), Some("too_many_streams"));
                     return Err(OpenError::Refused(e));
                 } else {
@@ -1234,7 +1140,6 @@ impl TunnelPool {
                             let counters = std::sync::Arc::clone(&next.tunnel.counters);
                             counters.charge();
                             next.placement.chosen_load = counters.load();
-                            self.inner.shared.touch();
                             PlacementStats::record(
                                 next.placement,
                                 started.elapsed(),
@@ -1249,9 +1154,7 @@ impl TunnelPool {
                         }
                         Err(e) => {
                             next.tunnel.counters.release();
-                            if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
-                                self.demand();
-                            } else if matches!(e, crate::mux::ConnectionError::Closed) {
+                            if matches!(e, crate::mux::ConnectionError::Closed) {
                                 // Another dead tunnel: same as above (D14).
                                 next.tunnel.mark_dead();
                                 self.release_growth_hold();
@@ -1260,17 +1163,10 @@ impl TunnelPool {
                         }
                     }
                 }
-                self.demand();
                 PlacementStats::record(placement, started.elapsed(), Some(note));
                 Err(OpenError::Refused(last))
             }
         }
-    }
-
-    /// Note that an open was not answered immediately: the next maintenance
-    /// tick grows the pool.
-    fn demand(&self) {
-        self.inner.state.lock().demand = true;
     }
 
     /// Add one tunnel.
@@ -1281,7 +1177,7 @@ impl TunnelPool {
         }
         let result = self.grow_locked(reason).await;
         self.inner.shared.resizing.store(false, Ordering::Release);
-        // Whoever waited on a cold pool re-reads the size here and either
+        // Whoever waited on an empty pool re-reads the size here and either
         // places its open or fails on its own.
         self.inner.shared.grown.notify_waiters();
         match result {
@@ -1335,17 +1231,17 @@ impl TunnelPool {
         let Some(dial) = self.inner.dial.clone() else {
             return Err("the pool has no dialer".to_owned());
         };
-        let (size, max) = {
+        let (size, count) = {
             let state = self.inner.state.lock();
-            (state.entries.len(), state.max_tunnels)
+            (state.entries.len(), state.count)
         };
-        if size >= max {
-            return Err(format!("already at max_tunnels ({max})"));
+        if size >= count {
+            return Err(format!("already at the configured tunnel count ({count})"));
         }
         let (tunnel, shutdown) = dial().await?;
         let mut state = self.inner.state.lock();
-        if state.entries.len() >= state.max_tunnels {
-            return Err("the pool reached max_tunnels while dialing".to_owned());
+        if state.entries.len() >= state.count {
+            return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
         state.entries.push(PoolEntry {
@@ -1354,12 +1250,6 @@ impl TunnelPool {
         });
         let to = state.entries.len();
         drop(state);
-        *self
-            .inner
-            .shared
-            .last_grown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
         self.inner.shared.grows.fetch_add(1, Ordering::Relaxed);
         self.inner.shared.push_event(PoolEvent {
             grow: true,
@@ -1367,46 +1257,39 @@ impl TunnelPool {
             from,
             to,
         });
-        // Growth is a lifecycle event: one INFO line per size change.
+        // A repair is a lifecycle event: one INFO line per size change.
         info!(
             pool = %self.inner.shared.key,
             carrier = self.inner.shared.carrier.as_str(),
             reason = reason.as_str(),
             from,
             to,
-            "pool-stats: tunnel pool grew"
+            "pool-stats: tunnel pool repaired"
         );
-        self.inner.shared.touch();
         Ok(())
     }
 
-    /// Remove one tunnel when the whole pool is idle, unpinned and past its
-    /// idle timeout. Returns whether one was removed.
     /// Remove every tunnel whose driver has ended.
     ///
-    /// [`Self::shrink_if_idle`] is the pool's only other removal path, and it
-    /// needs the *whole* pool quiet: one stream that outlives its connection
-    /// keeps a dead tunnel — and its slot against `max_tunnels` — in the pool
-    /// for the life of the session. The measured shape is a stage transition
-    /// where the connection dies but its last stream is still held, so
-    /// `streams > 0` blocks the idle rule indefinitely while placement keeps
-    /// handing the corpse new opens, every one of which fails with `Closed`.
+    /// A dead tunnel is removed whatever it carries: the alternative (a
+    /// removal gated on the whole pool being quiet) keeps a corpse — and its
+    /// slot against the configured count — in the pool for as long as one
+    /// stream outlives its connection, while placement keeps handing the
+    /// corpse new opens, every one of which fails with `Closed`.
     ///
-    /// Reaping is therefore not policy: it has no idle, warm or cooldown gate
+    /// Reaping is therefore not policy: it has no idle or cooldown gate
     /// and the dead tunnel's load is irrelevant (those streams are already
-    /// broken). What it owes the pool afterwards is a replacement, so a reap
-    /// raises `demand` when the dead tunnel was carrying something and the
-    /// next tick grows; D14's growth hold is released too, because a death is
-    /// the event that makes a retry meaningful.
+    /// broken). What it owes the pool afterwards is a replacement — the repair
+    /// tick dials one for every missing member, whether or not the corpse was
+    /// carrying — and D14's dial hold is released, because a death is the event
+    /// that makes a retry meaningful.
     fn reap_dead(&self) -> bool {
-        use std::sync::atomic::Ordering;
         let (from, to) = {
             let mut state = self.inner.state.lock();
             if state.entries.iter().all(|e| e.tunnel.is_alive()) {
                 return false;
             }
             let from = state.entries.len();
-            let mut carried = false;
             let mut index = 0;
             while index < state.entries.len() {
                 if state.entries[index].tunnel.is_alive() {
@@ -1414,22 +1297,27 @@ impl TunnelPool {
                 } else {
                     // Dropping the entry drops the driver's shutdown sender:
                     // whatever the task was still doing ends here.
-                    let entry = state.entries.remove(index);
-                    carried |= entry.load().total() > 0;
+                    state.entries.remove(index);
                 }
             }
-            state.demand |= carried;
             (from, state.entries.len())
         };
         self.release_growth_hold();
-        self.inner.shared.shrinks.fetch_add(1, Ordering::Relaxed);
+        if to < from {
+            self.inner
+                .shared
+                .shrinks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.inner.shared.push_event(PoolEvent {
             grow: false,
             reason: ShrinkReason::Dead.as_str(),
             from,
             to,
         });
-        // A death is a lifecycle event: one INFO line per size change.
+        // A death is a lifecycle event: one INFO line per size change. It is
+        // not a shrink — a pinned pool replaces what it lost, and the repair
+        // that follows is logged as the establishment it is.
         info!(
             pool = %self.inner.shared.key,
             carrier = self.inner.shared.carrier.as_str(),
@@ -1441,212 +1329,37 @@ impl TunnelPool {
         true
     }
 
-    fn shrink_if_idle(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        let now = std::time::Instant::now();
-        {
-            let state = self.inner.state.lock();
-            let busy = state.entries.iter().any(|e| {
-                let load = e.load();
-                load.total() > 0 || self.inner.pins.pinned_on(e.tunnel.id()) > 0
-            });
-            if busy {
-                drop(state);
-                self.inner.shared.touch();
-                return false;
-            }
-        }
-        let idle = self
-            .inner
-            .shared
-            .last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= self.inner.shared.idle_timeout;
-        let warm = self
-            .inner
-            .shared
-            .last_grown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= crate::transport::pool::MIN_WARM_HOLD;
-        let cooled = self
-            .inner
-            .shared
-            .last_shrunk
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= crate::transport::pool::SHRINK_COOLDOWN;
-        let floor = self.inner.shared.udp_floor.load(Ordering::Relaxed).max(1);
-        let victim = {
-            let state = self.inner.state.lock();
-            let size = state.entries.len();
-            if size <= floor {
-                return false;
-            }
-            state.entries.iter().position(|e| {
-                let mut load = e.load();
-                // The client's own pin count is the authoritative one (the
-                // server's affinity table is the same fact, seen from the
-                // other end).
-                load.pinned = self.inner.pins.pinned_on(e.tunnel.id());
-                crate::transport::pool::may_shrink(size, floor, load, idle, warm, cooled)
-            })
-        };
-        let Some(victim) = victim else {
-            return false;
-        };
-        if self.inner.shared.resizing.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let removed = {
-            let mut state = self.inner.state.lock();
-            let from = state.entries.len();
-            if victim >= from {
-                None
-            } else {
-                let entry = state.entries.remove(victim);
-                Some((entry, from, state.entries.len()))
-            }
-        };
-        self.inner.shared.resizing.store(false, Ordering::Release);
-        let Some((entry, from, to)) = removed else {
-            return false;
-        };
-        // Dropping the entry drops the driver's shutdown sender: the physical
-        // connection goes away with the tunnel.
-        drop(entry);
-        // The pool is smaller than it was, so a refused growth is worth
-        // re-attempting (D14).
-        self.release_growth_hold();
-        *self
-            .inner
-            .shared
-            .last_shrunk
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
-        self.inner.shared.touch();
-        self.inner.shared.shrinks.fetch_add(1, Ordering::Relaxed);
-        self.inner.shared.push_event(PoolEvent {
-            grow: false,
-            reason: ShrinkReason::Idle.as_str(),
-            from,
-            to,
-        });
-        // Shrink is a lifecycle event: one INFO line per size change.
-        info!(
-            pool = %self.inner.shared.key,
-            carrier = self.inner.shared.carrier.as_str(),
-            reason = ShrinkReason::Idle.as_str(),
-            from,
-            to,
-            "pool-stats: tunnel pool shrank"
-        );
-        true
+    /// The maintenance tick, in repair form.
+    ///
+    /// A pinned pool has exactly one thing to reconcile: how many tunnels it
+    /// holds against how many it was configured to hold. A dead one is reaped
+    /// and replaced in the same tick — that is *repair*, not growth, and it is
+    /// the only establishment that happens after service start. Everything
+    /// else that used to live here (grow on load, grow for a stripe group,
+    /// grow to the UDP floor, shrink when idle) is gone: capacity is a function
+    /// of configuration, so it cannot depend on what the pool was doing a
+    /// minute ago.
+    async fn maintain(&self) {
+        self.reap_dead();
+        self.repair().await;
     }
 
-    /// The maintenance tick: the growth and shrink rules of
-    /// [`crate::transport::pool`], evaluated for one pool.
-    async fn maintain(&self) {
-        // A dead tunnel leaves before any growth or shrink decision reads the
-        // pool: freeing its slot is what lets the replacement be dialed in
-        // this same tick. Unlike a shrink, the reap does not end the tick.
-        self.reap_dead();
-        if self.shrink_if_idle() {
-            return;
-        }
-        let reason = {
-            let mut state = self.inner.state.lock();
-            let loads: Vec<TunnelLoad> = state.entries.iter().map(PoolEntry::load).collect();
-            let size = loads.len();
-            let busy = loads.iter().any(|l| l.total() > 0)
-                || state
-                    .entries
-                    .iter()
-                    .any(|e| self.inner.pins.pinned_on(e.tunnel.id()) > 0);
-            let floor = self
-                .inner
-                .shared
-                .udp_floor
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let demand = std::mem::take(&mut state.demand);
-            if size == 0 {
-                // Cold: nothing to place a stream on. Grow only when a service
-                // asked for one (or the UDP floor requires it).
-                (demand || floor > size).then_some(GrowReason::Cold)
-            } else if floor > size {
-                // The UDP-derived floor is a requirement, not a suggestion.
-                Some(GrowReason::UdpFloor)
-            } else if demand {
-                Some(GrowReason::Demand)
-            } else if state.entries.iter().any(|e| {
-                e.tunnel
-                    .counters
-                    .oldest_wait()
-                    .is_some_and(|w| w > crate::transport::pool::OPEN_WAIT_BUDGET)
-            }) {
-                // An open that has been waiting longer than the budget means
-                // the pool has no ready stream for it: grow.
-                Some(GrowReason::Wait)
-            } else if !busy {
-                None
-            } else {
-                // Both questions matter, and the per-tunnel one is the stricter
-                // of the two above size 1: the pool's total threshold scales
-                // with its size (a tunnel of a 4-tunnel pool reaches 4x its
-                // share before the total crosses), while the placement ceiling
-                // does not. Growing on the per-tunnel rule is what keeps
-                // `TUNNEL_STREAM_CEILING` from ever being placement's answer.
-                let used: usize = loads.iter().map(|l| l.total()).sum();
-                let cap = self.inner.shared.stream_cap;
-                let total_busy = used > crate::transport::pool::grow_threshold(size, cap);
-                let tunnel_busy = loads
-                    .iter()
-                    .any(|l| l.total() >= crate::transport::pool::tunnel_grow_at(cap));
-                (total_busy || tunnel_busy).then_some(GrowReason::Load)
-            }
+    /// Dial until the pool holds its configured count again.
+    ///
+    /// One dial per call, guarded by the same resize flag a cold open used: the
+    /// next tick continues where this one stopped, and a refusal (the server's
+    /// valve, an unreachable endpoint) holds the pool back for
+    /// [`crate::transport::pool::GROW_FAILURE_COOLDOWN`] rather than letting a
+    /// 50 ms tick become a dial storm.
+    async fn repair(&self) {
+        let (size, target) = {
+            let state = self.inner.state.lock();
+            (state.entries.len(), state.count)
         };
-        // An idle pool just keeps its shrink clock running.
-        let Some(reason) = reason else {
-            return;
-        };
-        if self.growth_held_off() {
-            // D14: a refused growth stops growth. The demand flag was consumed
-            // above, so this tick does nothing; the next attempt waits the
-            // cooldown out, or a tunnel's death releases the hold. The cold
-            // path in `open_stream` is deliberately not gated — it is driven by
-            // an arriving visitor, not by this tick, so it cannot become a
-            // storm.
+        if size >= target || self.growth_held_off() {
             return;
         }
-        if reason == GrowReason::UdpFloor {
-            // Grow straight to the floor, one tunnel at a time (each step
-            // re-reads the size, so a racing shrink cannot overshoot).
-            loop {
-                let (size, floor, max) = {
-                    let state = self.inner.state.lock();
-                    (
-                        state.entries.len(),
-                        self.inner
-                            .shared
-                            .udp_floor
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        state.max_tunnels,
-                    )
-                };
-                if size >= floor || size >= max {
-                    break;
-                }
-                if self.grow_locked(GrowReason::UdpFloor).await.is_err() {
-                    break;
-                }
-            }
-            return;
-        }
-        self.grow(reason).await;
+        self.grow(GrowReason::Repair).await;
     }
 
     /// Start the per-pool maintenance task; it exits with the pool.
@@ -1673,6 +1386,12 @@ impl TunnelPool {
 /// A refused growth: INFO once per process, DEBUG after (the maintenance tick
 /// re-attempts it, so it can repeat — see `GROW_FAILURE_COOLDOWN`).
 static GROW_REFUSED: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
+
+/// A pool whose every tunnel is at its stream ceiling and whose count is
+/// already established: the one refusal a pinned pool cannot dial its way out
+/// of, so it is worth one INFO line naming the key to raise. INFO once per
+/// process, DEBUG afterwards — see [`TunnelPool::report_saturation`].
+static POOL_SATURATED: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
 
 /// Every live pool of this process, weak: the integration suite reads the
 /// pool's own state here instead of guessing it from the telemetry text, and
@@ -1973,7 +1692,7 @@ impl TunnelPool {
             pool = %snapshot.key,
             carrier = snapshot.carrier,
             size = snapshot.size,
-            max_tunnels = snapshot.max_tunnels,
+            count = snapshot.count,
             udp_floor = snapshot.udp_floor,
             streams = snapshot.streams(),
             pinned = snapshot.pinned(),
@@ -2457,10 +2176,10 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// A pool over `n` in-memory tunnels. The caller keeps the shutdown
-    /// senders; the pool drops its own copy of each tunnel's when it removes
-    /// the tunnel.
-    fn duplex_pool(n: usize, max_tunnels: usize) -> (TunnelPool, Vec<mpsc::Receiver<MuxStream>>) {
+    /// A pool over `n` in-memory tunnels, pinned at its configured `count`.
+    /// The caller keeps the shutdown senders; the pool drops its own copy of
+    /// each tunnel's when it removes the tunnel.
+    fn duplex_pool(n: usize, count: usize) -> (TunnelPool, Vec<mpsc::Receiver<MuxStream>>) {
         let mut tunnels = Vec::new();
         let mut rxs = Vec::new();
         for _ in 0..n {
@@ -2476,18 +2195,12 @@ mod tests {
             ));
             rxs.push(rx);
         }
-        let pool = TunnelPool::new(
-            Carrier::Tcp,
-            "test".to_owned(),
-            tunnels,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
-        );
+        let pool = TunnelPool::new(Carrier::Tcp, "test".to_owned(), tunnels, count);
         (pool, rxs)
     }
 
     /// One in-memory tunnel whose server side drains every stream it is sent:
-    /// the unit these pool fixtures are built from, and the unit a *growth*
+    /// the unit these pool fixtures are built from, and the unit a *repair*
     /// dials.
     fn duplex_tunnel() -> ClientTunnel {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -2499,9 +2212,9 @@ mod tests {
         ClientTunnel::start(client_io, mux_config(), shutdown_rx)
     }
 
-    /// A pool that starts with `n` in-memory tunnels and can grow up to
-    /// `max_tunnels`: every growth dials one more.
-    fn growable_pool(n: usize, max_tunnels: usize) -> TunnelPool {
+    /// A pool that starts with `n` in-memory tunnels and is configured for
+    /// `count`: every repair dials one more, until the count is reached.
+    fn growable_pool(n: usize, count: usize) -> TunnelPool {
         let dial: Dialer = std::sync::Arc::new(|| {
             Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
         });
@@ -2512,18 +2225,17 @@ mod tests {
             Carrier::Tcp,
             "stripes".to_owned(),
             initial,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
+            count,
             Some(dial),
             std::sync::Arc::new(PinRegistry::new()),
         )
     }
 
-    /// The same, with the dialer counted: how many times the pool grew, as a
-    /// number a test can assert on.
+    /// The same, with the dialer counted: how many times the pool repaired, as
+    /// a number a test can assert on.
     fn counting_pool(
         n: usize,
-        max_tunnels: usize,
+        count: usize,
         dials: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> TunnelPool {
         let dial: Dialer = std::sync::Arc::new(move || {
@@ -2540,8 +2252,7 @@ mod tests {
             Carrier::Tcp,
             "stripes".to_owned(),
             initial,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
+            count,
             Some(dial),
             std::sync::Arc::new(PinRegistry::new()),
         )
@@ -2567,96 +2278,92 @@ mod tests {
         used
     }
 
-    /// The eager stripe growth's price, which HANDOFF recorded as a cost with
-    /// no test behind it: the *first* group to meet a pool with fewer tunnels
-    /// than the group has stripes dials the difference, and it is `K-1` extra
-    /// dials on a pool that already has one — the cold dial a plain visitor
-    /// would have paid anyway is the K-th.
+    /// A stripe group larger than its pool shares the tunnels that exist
+    /// instead of dialing: `k > count` distinct-stripe opens all succeed, the
+    /// pool stays exactly `count`, and the dialer is never called.
     ///
-    /// Exact, because the dialer is this test's: between the opens below, only
-    /// the pool's own growth rules can call it, and the count is what they
-    /// cost. It would catch the guarantee being dropped (the group then places
-    /// on the tunnels that exist, and no dial happens) and the growth being
-    /// paid per *stripe request* instead of once per pool (K² dials).
+    /// The group's exclusion is a preference, not a constraint (D24), and a
+    /// pinned pool cannot dial a tunnel per stripe: capacity is what the
+    /// configuration says, so the extra stripes ride the tunnels the group
+    /// already has.
     #[tokio::test]
-    async fn a_stripe_group_dials_a_cold_pool_up_to_its_stripe_count_once() {
+    async fn a_stripe_group_larger_than_the_pool_shares_it_without_dialing() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
 
-        // A cold pool: no tunnels at all, the elastic pool's default state.
-        let cold_dials = Arc::new(AtomicUsize::new(0));
-        let pool = counting_pool(0, 4, Arc::clone(&cold_dials));
-        assert_eq!(pool.size(), 0, "the pool starts cold");
+        const COUNT: usize = 2;
+        const STRIPES: usize = 5;
+        let dials = Arc::new(AtomicUsize::new(0));
+        let pool = counting_pool(COUNT, COUNT, Arc::clone(&dials));
+        assert_eq!(
+            pool.snapshot().count,
+            COUNT,
+            "the configured count is reported"
+        );
 
-        let used = open_one_stripe_group(&pool, 4).await;
+        let used = open_one_stripe_group(&pool, STRIPES).await;
+        assert_eq!(used.len(), STRIPES, "every stripe of the group opened");
         assert_eq!(
-            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "a cold pool must dial once per stripe: K dials, of which K-1 are the group's own"
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a pinned pool never dials for a stripe group"
         );
-        assert_eq!(
-            pool.snapshot().grows,
-            4,
-            "the same number through the counter the telemetry and the suite read"
-        );
-        assert_eq!(pool.size(), 4, "the group grew the pool to its own count");
+        assert_eq!(pool.size(), COUNT, "the pool stays at its configured count");
+        assert_eq!(pool.snapshot().grows, 0, "no establishment was recorded");
         assert_eq!(
             used.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "the four stripes must be on four distinct tunnels: {used:?}"
-        );
-
-        // A second group of the same pool: warm for `idle_timeout`, so the
-        // growth is once per pool, not once per group.
-        let used2 = open_one_stripe_group(&pool, 4).await;
-        assert_eq!(
-            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "a warm pool's second group must dial nothing"
-        );
-        assert_eq!(
-            used2.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "the second group must also be spread over four tunnels: {used2:?}"
-        );
-
-        // The same growth on a pool that already has one tunnel: three dials,
-        // which is the K-1 every operator pays on the first striped visitor.
-        let warm_dials = Arc::new(AtomicUsize::new(0));
-        let warm = counting_pool(1, 4, Arc::clone(&warm_dials));
-        let used3 = open_one_stripe_group(&warm, 4).await;
-        assert_eq!(
-            warm_dials.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "one existing tunnel plus a group of K costs K-1 dials"
-        );
-        assert_eq!(
-            used3.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "K-1 dials must have left K tunnels to spread over: {used3:?}"
+            COUNT,
+            "the group spreads over the tunnels it has, sharing them: {used:?}"
         );
     }
 
-    /// D14's other half: a refused growth *stops* growth. The maintenance tick
-    /// runs every 50 ms, so without the hold a client at the server's
-    /// `max_tunnels_per_client` cap would dial-and-be-refused twenty times a
-    /// second against the server's accept path.
+    /// D14's other half: a refused repair *stops* the repair dials. The
+    /// maintenance tick runs every 50 ms, so without the hold a client at the
+    /// server's `max_tunnels_per_client` cap would dial-and-be-refused twenty
+    /// times a second against the server's accept path.
     #[tokio::test]
-    async fn a_refused_growth_holds_the_pool_back() {
-        // No dialer: every growth attempt fails, which is the shape the
-        // server's tunnel refusal takes at the pool.
-        let (pool, _rxs) = duplex_pool(0, 4);
+    async fn a_refused_repair_holds_the_pool_back() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A dialer that always refuses, counted: the shape the server's
+        // `max_tunnels_per_client` valve takes at the pool.
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let dial: Dialer = Arc::new(move || {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err("refused by the server's tunnel valve".to_owned())
+            })
+        });
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "refused".to_owned(),
+            Vec::new(),
+            4,
+            Some(dial),
+            Arc::new(PinRegistry::new()),
+        );
         assert!(!pool.growth_held_off(), "nothing has failed yet");
 
-        pool.grow(GrowReason::Cold).await;
+        pool.grow(GrowReason::Repair).await;
         assert!(
             pool.growth_held_off(),
-            "a failed growth must hold growth off"
+            "a failed repair must hold the next one off"
         );
 
-        // With demand behind it, the tick still does not dial again.
-        pool.demand();
-        pool.maintain().await;
+        // While the hold stands, no tick dials again.
+        let attempts = dials.load(Ordering::SeqCst);
+        assert!(attempts >= 1, "the refused repair was attempted");
+        for _ in 0..5 {
+            pool.maintain().await;
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            attempts,
+            "no dial while the repair is held off"
+        );
         assert_eq!(pool.snapshot().size, 0, "no tunnel appeared while held");
 
         // A tunnel dying (or one being removed) is what makes a retry
@@ -2671,7 +2378,7 @@ mod tests {
     /// **distinct** tunnels whenever the pool has K.
     #[tokio::test]
     async fn back_to_back_opens_land_on_distinct_tunnels() {
-        let (pool, _rxs) = duplex_pool(4, 8);
+        let (pool, _rxs) = duplex_pool(4, 4);
         let mut streams = Vec::new();
         for _ in 0..3 {
             streams.push(pool.open_stream().await.expect("an open"));
@@ -2692,12 +2399,14 @@ mod tests {
             3,
             "one stream per tunnel, none doubled up: {used:?}"
         );
+        assert_eq!(pool.size(), 4, "the pool is exactly its count: {used:?}");
+        assert_eq!(pool.snapshot().count, 4);
         drop(streams);
     }
 
-    /// More opens than tunnels still all produce a stream: the pool reuses
-    /// what it has (and the maintenance rule grows it when the demand is real)
-    /// instead of failing a visitor.
+    /// More opens than tunnels still all produce a stream: a pinned pool
+    /// reuses what it has instead of failing a visitor, and the extra opens
+    /// never push it past its configured count.
     #[tokio::test]
     async fn more_opens_than_tunnels_still_answer_every_open() {
         let (pool, _rxs) = duplex_pool(2, 2);
@@ -2713,58 +2422,14 @@ mod tests {
             .map(|(streams, _, _)| *streams)
             .collect();
         assert_eq!(used, vec![2, 2], "the pool reuses both tunnels: {used:?}");
-        drop(streams);
-    }
-
-    /// D24 structural, at the pool's own level: a stripe group's K opens land
-    /// on K *distinct* tunnels even from a pool that has fewer — one, here,
-    /// which is the state a cold pool reaches after its first visitor. The
-    /// group-aware open grows the pool to its K first and then avoids the
-    /// tunnels its earlier stripes took; the load rule alone could not have
-    /// done it, because K concurrent streams sit below the growth threshold.
-    #[tokio::test]
-    async fn a_stripe_group_grows_the_pool_and_spreads_over_distinct_tunnels() {
-        const STRIPES: usize = 3;
-        let pool = growable_pool(1, 4);
-        let mut used: Vec<usize> = Vec::new();
-        let mut streams = Vec::new();
-        for _ in 0..STRIPES {
-            let lease = pool
-                .open_stream_on_distinct(&used, STRIPES)
-                .await
-                .expect("a stripe open");
-            used.push(lease.tunnel_id());
-            streams.push(lease);
-        }
-        assert_eq!(
-            pool.size(),
-            STRIPES,
-            "the group must have grown the pool to one tunnel per stripe"
-        );
-        let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
-        assert_eq!(
-            distinct.len(),
-            STRIPES,
-            "{STRIPES} stripes must occupy {STRIPES} distinct tunnels: {used:?}"
-        );
-        let per_tunnel: Vec<usize> = pool
-            .snapshot()
-            .tunnels
-            .iter()
-            .map(|(streams, _, _)| *streams)
-            .collect();
-        assert_eq!(
-            per_tunnel,
-            vec![1; STRIPES],
-            "one stripe per tunnel, none doubled up: {per_tunnel:?}"
-        );
+        assert_eq!(pool.size(), 2, "the pool never grows for load");
         drop(streams);
     }
 
     /// Correctness first: a group the pool cannot spread over still opens
-    /// every stripe. `max_tunnels` is the cap, so the third and fourth stripe
-    /// reuse the two tunnels — exactly the behaviour a striped visitor had
-    /// before the group had a name, and the reason the exclusion is a
+    /// every stripe. `count` is the pool's width, so the third and fourth
+    /// stripe reuse the two tunnels — exactly the behaviour a striped visitor
+    /// had before the group had a name, and the reason the exclusion is a
     /// preference rather than a constraint.
     #[tokio::test]
     async fn a_stripe_group_the_pool_cannot_spread_over_still_opens() {
@@ -2779,12 +2444,13 @@ mod tests {
             used.push(lease.tunnel_id());
             streams.push(lease);
         }
-        assert_eq!(pool.size(), 2, "the cap bounds the growth");
+        assert_eq!(pool.size(), 2, "the count bounds the spread");
+        assert_eq!(pool.snapshot().count, 2);
         let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             2,
-            "the group can only spread as far as the cap allows: {used:?}"
+            "the group can only spread as far as the pool allows: {used:?}"
         );
         let per_tunnel: Vec<usize> = pool
             .snapshot()
@@ -2811,139 +2477,143 @@ mod tests {
         assert_eq!(pool.snapshot().streams(), 0);
     }
 
-    /// A cold pool grows on the first open when it has a dialer, instead of
-    /// refusing it: `max_tunnels` is the cap, and the growth respects it.
+    /// The placement ceiling is the only oversubscription protection a pinned
+    /// pool has: a pool at its count whose every tunnel sits at the ceiling
+    /// waits [`crate::transport::pool::CAPACITY_WAIT`] out and then refuses the
+    /// visitor — telling the operator once, at INFO, which key widens the pool
+    /// — and a stream retiring under the wait lets the next one in.
     #[tokio::test]
-    async fn a_cold_pool_grows_up_to_its_cap() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        let dial: Dialer = std::sync::Arc::new(move || {
-            let counter = std::sync::Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                let (tx, rx) = mpsc::channel(8);
-                std::mem::forget(rx);
-                let server = tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-                std::mem::forget(server);
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                std::mem::forget(shutdown_tx);
-                Ok((
-                    ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                    tokio::sync::watch::channel(false).0,
-                ))
-            })
-        });
-        let pool = TunnelPool::with_dialer(
-            Carrier::Tcp,
-            "cold".to_owned(),
-            Vec::new(),
-            2,
-            std::time::Duration::from_secs(60),
-            Some(dial),
-            std::sync::Arc::new(PinRegistry::new()),
-        );
-        assert_eq!(pool.size(), 0);
-        let first = pool.open_stream().await.expect("the cold pool must grow");
-        assert_eq!(pool.size(), 1, "one open grows the pool by one tunnel");
-        assert_eq!(pool.snapshot().grows, 1);
-        // The cap: even a second cold open cannot push it past `max_tunnels`.
-        drop(first);
-        let second = pool.open_stream().await.expect("the pool still serves");
-        assert!(pool.size() <= 2, "the cap is max_tunnels");
-        drop(second);
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            pool.size(),
-            "the dialer is called once per tunnel"
-        );
-    }
+    async fn a_pool_at_its_placement_ceiling_waits_then_refuses() {
+        // The saturation notice is process-wide, and this is the only test that
+        // drives a pool into saturation.
+        POOL_SATURATED.clear();
+        let (pool, _rxs) = duplex_pool(1, 1);
+        let ceiling = pool.ceiling();
+        assert_eq!(pool.size(), 1, "the pool is its configured count");
 
-    /// A burst spreads *while it is placed*, not on the next maintenance tick.
-    ///
-    /// The rule this pins: an open that would add to a tunnel already at the
-    /// growth threshold grows first, so a K-open burst (a 20-stream bulk test)
-    /// lands on the tunnels it will use instead of stacking all of it on one —
-    /// the head-of-line blocking that queue a shared tunnel's interactive and
-    /// control streams behind the bulk. The maintenance tick would fix the
-    /// *next* burst 50 ms later; this makes the first one spread too.
-    ///
-    /// Falsified by reverting to place-then-grow: the whole burst stacks on
-    /// the one cold tunnel (10 streams on one tunnel against a threshold of
-    /// 7), which is the shape the two-stage rate reproduction measured.
-    #[tokio::test]
-    async fn a_burst_spreads_over_tunnels_while_it_is_placed() {
-        const OPENS: usize = 10;
-        // One live duplex tunnel to start from, its inbound drained so every
-        // stream the pool opens is accepted by the tunnel's server side.
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (tx, mut first_rx) = mpsc::channel::<MuxStream>(8);
-        tokio::spawn(async move { while first_rx.recv().await.is_some() {} });
-        tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        std::mem::forget(shutdown_tx);
-
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        // A dialer that mints a live duplex tunnel per call: the burst's growth
-        // is a real dial, drained so the tunnel can accept every stream.
-        let dial: Dialer = std::sync::Arc::new(move || {
-            let counter = std::sync::Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                let (tx, mut rx) = mpsc::channel::<MuxStream>(8);
-                tokio::spawn(async move { while rx.recv().await.is_some() {} });
-                tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                std::mem::forget(shutdown_tx);
-                Ok((
-                    ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                    tokio::sync::watch::channel(false).0,
-                ))
-            })
-        });
-        let pool = TunnelPool::with_dialer(
-            Carrier::Tcp,
-            "burst".to_owned(),
-            vec![(
-                ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                tokio::sync::watch::channel(false).0,
-            )],
-            4,
-            std::time::Duration::from_secs(60),
-            Some(dial),
-            std::sync::Arc::new(PinRegistry::new()),
-        );
-
-        let mut live = Vec::new();
-        for _ in 0..OPENS {
-            live.push(pool.open_stream().await.expect("burst open"));
+        let mut held = Vec::new();
+        for _ in 0..ceiling {
+            held.push(pool.open_stream().await.expect("an open under the ceiling"));
         }
-        // Read immediately: the maintenance tick (50 ms) would grow the pool
-        // anyway, so a *late* read cannot distinguish the two rules.
-        let snap = pool.snapshot();
-        let streams: Vec<usize> = snap.tunnels.iter().map(|(s, _, _)| *s).collect();
-        assert!(
-            snap.size >= 2,
-            "the burst must grow the pool while it is placed, not on the next tick: {streams:?}"
-        );
-        assert!(
-            streams.iter().copied().max().unwrap_or(0) < OPENS,
-            "no tunnel may carry the whole burst: {streams:?}"
-        );
         assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            snap.size - 1,
-            "one dial per tunnel the burst added"
+            pool.snapshot()
+                .tunnels
+                .iter()
+                .map(|(streams, _, _)| *streams)
+                .sum::<usize>(),
+            ceiling,
+            "every stream slot this pool has is taken"
         );
-        drop(live);
+
+        let refusal = pool.open_stream().await;
+        assert!(
+            matches!(&refusal, Err(OpenError::AtCapacity)),
+            "a pool at its ceiling must refuse with AtCapacity after the wait: {:?}",
+            refusal.map(|_| ())
+        );
+
+        // That refusal reported the saturation (INFO); the notice fires once
+        // per process, so the next ones are DEBUG-only.
+        assert!(
+            !pool.report_saturation(),
+            "the refusal above must have been the first report"
+        );
+        assert!(
+            !pool.report_saturation(),
+            "the notice must not fire twice per process"
+        );
+        POOL_SATURATED.clear();
+        assert!(
+            pool.report_saturation(),
+            "a cleared notice reports the next saturation again"
+        );
+        assert!(!pool.report_saturation(), "and only once each time");
+
+        // One stream retires: the next visitor is served by the pool that
+        // exists, with no dial and no new tunnel.
+        held.pop();
+        let next = pool
+            .open_stream()
+            .await
+            .expect("a retiring stream must let the next visitor in");
+        assert_eq!(pool.size(), 1, "the pool never dialed for the visitor");
+        drop(next);
+        drop(held);
     }
 
-    /// The client's pin count is what gates the shrink (D30): a tunnel with a
-    /// pinned peer is not removable even when it has no streams.
+    /// A pool that came up short of its configured count repairs to it: the
+    /// dialer is called once per missing tunnel and never past `count`.
+    ///
+    /// The pool starts with no tunnel at all — the state a service start whose
+    /// establishment dials all failed leaves — so the open path dials one to
+    /// answer its visitor and the maintenance tick finishes the repair.
     #[tokio::test]
-    async fn a_pinned_tunnel_is_not_shrinkable() {
+    async fn a_pool_short_of_its_count_repairs_up_to_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const COUNT: usize = 3;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        let dial: Dialer = std::sync::Arc::new(move || {
+            let counter = std::sync::Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            })
+        });
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "short".to_owned(),
+            Vec::new(),
+            COUNT,
+            Some(dial),
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+        assert_eq!(pool.size(), 0, "the pool started with no tunnel");
+        assert_eq!(
+            pool.snapshot().count,
+            COUNT,
+            "but it is configured for its count"
+        );
+
+        let first = pool
+            .open_stream()
+            .await
+            .expect("the first open repairs a tunnel");
+        assert_eq!(pool.size(), 1, "the open dialed exactly one tunnel");
+        assert_eq!(pool.snapshot().grows, 1);
+        drop(first);
+
+        // The tick keeps repairing, one dial at a time, until the count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.size() < COUNT && std::time::Instant::now() < deadline {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), COUNT, "the repair stopped at the count");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            COUNT,
+            "one dial per missing tunnel, never more"
+        );
+
+        // A complete pool has nothing to repair.
+        for _ in 0..5 {
+            pool.maintain().await;
+        }
+        assert_eq!(pool.size(), COUNT, "a complete pool stays at its count");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            COUNT,
+            "a complete pool dials nothing"
+        );
+    }
+
+    /// The client's pin count is the UDP affinity accounting the hub and the
+    /// snapshot read: a bound, active peer shows up against its tunnel, and
+    /// releasing it takes the count back to zero.
+    #[tokio::test]
+    async fn pin_accounting_tracks_the_tunnels_peers() {
         let (pool, _rxs) = duplex_pool(2, 2);
         let id = pool
             .inner
@@ -2996,7 +2666,9 @@ mod tests {
         // Two tunnels, four opens: the least-loaded rule must place two
         // streams on each tunnel, and every stream must survive a full round
         // trip. Each stream carries its own payload, so the assertions do not
-        // depend on which tunnel the placement picked.
+        // depend on which tunnel the placement picked. A second burst then
+        // takes the stream count past the pool's width: the extra streams
+        // spread over the same two tunnels and the pool never grows.
         const TUNNELS: usize = 2;
         const OPENS: usize = 4;
 
@@ -3032,12 +2704,11 @@ mod tests {
             per_tunnel_counts.push((counter, server));
         }
 
-        let pool = TunnelPool::new(
-            Carrier::Tcp,
-            "test".to_owned(),
-            tunnels,
-            4,
-            std::time::Duration::from_secs(60),
+        let pool = TunnelPool::new(Carrier::Tcp, "test".to_owned(), tunnels, TUNNELS);
+        assert_eq!(
+            pool.snapshot().count,
+            TUNNELS,
+            "the pinned count is reported"
         );
 
         let mut live = Vec::new();
@@ -3063,6 +2734,28 @@ mod tests {
             vec![OPENS / TUNNELS; TUNNELS],
             "the least-loaded rule must spread four opens evenly over two tunnels"
         );
+
+        // More opens than the pool is wide: they are placed on the tunnels
+        // that exist, and the pinned pool never dials a third.
+        for i in 0..OPENS {
+            let mut s = pool.open_stream().await.unwrap();
+            s.write_all(format!("more{i:04}").as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+            let mut ok = [0u8; 2];
+            s.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, b"ok");
+            live.push(s);
+        }
+        assert_eq!(pool.size(), TUNNELS, "the pool never grows for load");
+        assert_eq!(
+            pool.snapshot()
+                .tunnels
+                .iter()
+                .map(|(s, _, _)| *s)
+                .collect::<Vec<_>>(),
+            vec![2 * OPENS / TUNNELS; TUNNELS],
+            "the extra streams spread over the same tunnels"
+        );
         drop(live);
         drop(pool);
         drop(shutdown_senders);
@@ -3073,7 +2766,7 @@ mod tests {
                 .await
                 .expect("tunnel counter did not finish")
                 .unwrap();
-            assert_eq!(count, OPENS / TUNNELS, "streams were not spread evenly");
+            assert_eq!(count, 2 * OPENS / TUNNELS, "streams were not spread evenly");
         }
     }
 
@@ -3097,8 +2790,7 @@ mod tests {
             Carrier::Tcp,
             "test".to_owned(),
             vec![(t1, shutdown1.clone()), (t2, shutdown2)],
-            4,
-            std::time::Duration::from_secs(60),
+            2,
         );
 
         // Sanity: both tunnels work.
@@ -3148,17 +2840,19 @@ mod tests {
         tx.send(true).unwrap();
     }
 
-    /// A tunnel whose connection dies must leave the pool even while it still
-    /// "holds" a stream, and the pool must dial a replacement.
+    /// A tunnel whose connection dies leaves the pool even while it still
+    /// "holds" a stream, and the pool dials its replacement.
     ///
-    /// `shrink_if_idle` requires the *whole* pool to be quiet, so before the
-    /// reap one stream that outlives its connection kept a corpse placeable
-    /// for the session's life. `max_tunnels = 1` makes the assertion sharp:
-    /// while the corpse occupies the only slot there is no room for a
-    /// replacement, so an open after the death can only succeed if the dead
-    /// tunnel was actually removed.
+    /// The old pool asked for a replacement only when the dead tunnel had
+    /// carried something, and its idle shrink needed the *whole* pool quiet —
+    /// so a stream that outlived its connection kept a corpse placeable for
+    /// the session's life. Repair is by count alone. `count = 1` makes the
+    /// assertion sharp: there is no room for the replacement until the corpse
+    /// has actually been removed.
     #[tokio::test]
-    async fn a_dead_tunnel_is_reaped_and_replaced() {
+    async fn a_dead_tunnel_holding_a_stream_is_reaped_and_repaired() {
+        use std::sync::atomic::Ordering;
+
         let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // The initial tunnel, plus the server task whose abort kills it.
@@ -3174,7 +2868,7 @@ mod tests {
         let dialer: Dialer = std::sync::Arc::new(move || {
             let dials = std::sync::Arc::clone(&dials_for_dialer);
             Box::pin(async move {
-                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dials.fetch_add(1, Ordering::Relaxed);
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
                 let (tx, rx) = mpsc::channel(8);
                 // Keep the receiver: a dropped one ends the server task and
@@ -3193,42 +2887,130 @@ mod tests {
             Carrier::Tcp,
             "test".to_owned(),
             vec![(t0, shutdown0)],
-            1, // no room for a replacement until the dead one is gone
-            std::time::Duration::from_secs(60),
+            1,
             Some(dialer),
             std::sync::Arc::new(PinRegistry::new()),
         );
 
-        // Hold a stream, so the tunnel is not "idle" and `may_shrink` can
-        // never be the path that removes it.
+        // Hold a stream, so the tunnel is busy when its peer goes away: a
+        // death is repaired whether or not the tunnel was carrying, and the
+        // held stream must not keep the corpse in the pool.
         let held = pool.open_stream().await.unwrap();
         assert_eq!(pool.size(), 1);
-        assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(dials.load(Ordering::Relaxed), 0);
 
         // The peer goes away: the driver observes the closed duplex and ends.
         server0.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut served = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if pool.open_stream().await.is_ok() {
-                served = true;
+            let dead = pool
+                .inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| !e.tunnel.is_alive());
+            if dead {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(served, "the pool never replaced the dead tunnel");
-        assert!(
-            dials.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-            "the replacement must be dialed, not conjured"
+
+        // The tick reaps the corpse and dials exactly one replacement, whoever
+        // gets there first (the pool's own task or this call).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.size() < 1 && std::time::Instant::now() < deadline {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), 1, "the count is restored");
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            1,
+            "exactly one replacement is dialed for one death"
         );
         assert!(
-            pool.snapshot().shrinks >= 1,
-            "a reap is a recorded size change"
+            pool.inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| e.tunnel.is_alive()),
+            "the only member of the pool is the live replacement"
         );
+        assert!(pool.snapshot().grows >= 1, "the repair is recorded");
+
+        // The replacement serves visitors.
+        let served = pool
+            .open_stream()
+            .await
+            .expect("the replacement must serve the next visitor");
+        drop(served);
 
         drop(held);
         drop(pool);
+    }
+
+    /// A tunnel that never carried a stream is replaced just the same.
+    ///
+    /// The old pool only raised `demand` when the dead tunnel had carried
+    /// something, so an idle corpse — the common case, a carrier connection
+    /// that died between visitors — stayed in the pool. Repair is by count
+    /// alone, so idleness changes nothing.
+    #[tokio::test]
+    async fn an_idle_dead_tunnel_is_replaced_too() {
+        use std::sync::atomic::Ordering;
+
+        const COUNT: usize = 2;
+        let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = counting_pool(COUNT, COUNT, std::sync::Arc::clone(&dials));
+        assert_eq!(pool.size(), COUNT);
+        assert_eq!(pool.snapshot().streams(), 0, "both tunnels are idle");
+
+        // Kill one from the pool's side: the state a peer that went away
+        // leaves behind (an open that saw `Closed` marks it exactly so).
+        let victim = pool
+            .inner
+            .state
+            .lock()
+            .entries
+            .first()
+            .map(|e| e.tunnel.clone())
+            .expect("two tunnels");
+        victim.mark_dead();
+
+        // The tick reaps it and dials one replacement, up to the count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            pool.maintain().await;
+            if pool.size() >= COUNT && dials.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), COUNT, "the count is restored");
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "one idle death, one replacement"
+        );
+        assert!(pool.snapshot().grows >= 1, "the repair is recorded");
+        assert!(
+            pool.inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| e.tunnel.is_alive()),
+            "every member of the pool is live again"
+        );
+        assert_eq!(
+            pool.snapshot().tunnels.len(),
+            COUNT,
+            "the replacement is a live member of the pool"
+        );
     }
 }

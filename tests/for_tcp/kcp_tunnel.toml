@@ -1,7 +1,7 @@
 # Arm 2 fixture: the data tunnels are KCP-over-UDP sessions wrapped in Noise
 # (same keys as the TCP+Noise control channel); the control channel itself
-# stays TCP+Noise. The pool starts cold, so the tunnel count is not
-# configured — `[client.data.kcp].max_tunnels` caps it, default 4. Requires a
+# stays TCP+Noise. The count is not written here, so the pool establishes the
+# default (`DEFAULT_MUX_TUNNELS`, 4) at service start and keeps it. Requires a
 # binary built with the `kcp` feature.
 
 [client]

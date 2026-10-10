@@ -102,17 +102,17 @@ A typical setup:
 
 ### Migrating to 0.10: removed keys
 
-The tunnel pool is one elastic, per-carrier pool per session now, and it starts
-cold — so the keys that described a pool's *initial* size, a per-service pool,
-or a late-0.8 health check are gone. A config that still carries one does not
+The tunnel pool is one per-carrier pool per session, pinned at the count its
+configuration names — so the keys that described a pool's *initial* size, a
+per-service pool, or a late-0.8 health check are gone. A config that still carries one does not
 start: the refusal names every key it found and what to write instead (a bare
 "unknown field" tells you *that* something is wrong without telling you what to
 write). Write this instead:
 
 | Removed key | Write instead |
 |---|---|
-| `[client.data].default_count` | Nothing: the pool starts cold and grows on demand. `[client.data.tcp].max_tunnels` (or `[client.data.kcp].max_tunnels`) is the cap it grows to, default 4 |
-| `[client.services.<name>].count` | Nothing: same cold start, and the pool belongs to the session and carrier rather than to one service. `[client.data.tcp\|kcp].max_tunnels` is the cap |
+| `[client.data].default_count` | Nothing: the pool's width is `[client.data.tcp].tunnels` (or `[client.data.kcp].tunnels`), default 4 |
+| `[client.services.<name>].count` | Nothing: the pool belongs to the session and carrier rather than to one service. `[client.data.tcp\|kcp].tunnels` is its width |
 | `[client.services.<name>].pool_size` | `[client.services.<name>].udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
 | `[client.services.<name>].heartbeat_timeout` | Nothing: the server declares its cadence in the session ack and the client derives the timeout from it. `[client.control].default_heartbeat_timeout` remains as an optional floor |
 | `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the tunnels one client may hold; 0 = unlimited) |
@@ -128,7 +128,7 @@ The first choice is the mode: `[client]` forwards to a local application,
 [Transparent (L3) services](#transparent-l3-services)) — and it is a choice
 about the process, not about a service, so it comes before anything below.
 
-The defaults — `mode = "multiplex"`, `max_tunnels = 4`, `carrier = "tcp"`,
+The defaults — `mode = "multiplex"`, `tunnels = 4`, `carrier = "tcp"`,
 plain transport — are the right starting point for almost everyone. Deviate
 only when the tree says so, change one thing at a time, and measure the result
 on your own path: the published runs, their numbers and how to reproduce them are
@@ -136,15 +136,15 @@ in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
-    A["Start: defaults<br/>multiplex, max_tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
+    A["Start: defaults<br/>multiplex, tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
     B -- Yes --> C["transport type = noise<br/>+ keypair (Transport doc)"]
     B -- No --> D{"One service or a few<br/>long-lived connections?"}
     C --> D
     D -- "Yes, raw throughput first" --> E["mode = direct"]
     D -- "No: many services,<br/>many users, churn" --> F{"Many concurrent<br/>connections?"}
     E --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
-    F -- "> ~256 concurrent" --> G["max_tunnels = 8 or higher"]
-    F -- Typical --> H["keep max_tunnels = 4"]
+    F -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
+    F -- Typical --> H["keep tunnels = 4"]
     G --> I{"Path quality?"}
     H --> I
     I -- "High pure latency +<br/>UDP game (100ms+ RTT)" --> J["A/B test carrier = kcp"]
@@ -158,14 +158,14 @@ flowchart TD
 |---|---|---|
 | `mode` | `"multiplex"` (default) | highest connection count per FD and per NAT mapping; one slow stream shares its tunnel with the others |
 | `mode` | `"direct"` | one physical connection per stream: raw single-flow throughput, at an FD / port / NAT mapping per stream |
-| `max_tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain |
-| `max_tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
-| `max_tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
+| `tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain. Measured as the worst configuration on every path |
+| `tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
+| `tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling; measured worth +77 % throughput from one tunnel to eight on a clean fast path |
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
 | `carrier` | `"kcp"` | UDP transport for paths where TCP is blocked, throttled or lossy; independent of `mode`, so it can carry a multiplexed pool (`multiplex` + `kcp`) or one session per channel (`direct` + `kcp`). It costs throughput where the path is clean, so choose it for the path, not by default |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
-| cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move, then the pool is warm again up to `max_tunnels` |
+| pool establishment | (no key) | the pool's `tunnels` connections are dialed at service start, not on the first visitor: nothing is paid at request time, and the cost is `tunnels` idle connections (measured at 0.5–0.8 MiB RSS and 2.6 FDs each, no threads) |
 | `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic) |
 
 The measured cost of each option — including the figures these trade-offs come
@@ -193,11 +193,10 @@ default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed
 default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one data channel per visitor connection, its own physical connection). Independent of `default_carrier`: every `mode`/`carrier` pair is valid
 default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted. With `mode = "multiplex"` the sessions are the pool's tunnels; with `mode = "direct"` each data channel is one KCP session, so the multiplexer's framing is not in the path at all
 # shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool per carrier (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
-# idle_timeout = 60 # Optional. Seconds a tunnel pool with no streams, no pending opens and no pinned UDP peers must stay idle before it removes one tunnel. Default: 60. The pool never shrinks below one tunnel, nor below the UDP-derived floor
-[client.data.tcp] # Optional. The TCP carrier's elastic-pool cap
-# max_tunnels = 4 # Optional. The cap the pool may grow to for this carrier; it starts cold and grows on demand up to it. Validated `>= 1`, clamped to 1..=64. Default: 4
-[client.data.kcp] # Optional. The KCP carrier's cap, the same key and rules
-# max_tunnels = 4
+[client.data.tcp] # Optional. The TCP carrier's tunnel count
+# tunnels = 4 # Optional. How many tunnels this carrier's pool establishes at service start and keeps. Validated `>= 1` and `>= ` the UDP-derived floor of the services that share it; clamped to 1..=64. Default: 4
+[client.data.kcp] # Optional. The KCP carrier's count, the same key and rules
+# tunnels = 4
 
 [client.transport] # Optional. How the wire is wrapped; applies to both planes
 type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
@@ -244,7 +243,7 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 [server.data] # Optional. Data-plane listener (feature `multiplex`)
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
 # stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `[transparent]` client's claims: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
-# max_tunnels_per_client = 0 # Optional. The operator's valve on the elastic pool: how many multiplexed data tunnels ONE client may hold across every service of its session. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running
+# max_tunnels_per_client = 0 # Optional. The operator's valve on multiplexed tunnels: how many data tunnels ONE client may hold across every service of its session. A client whose configured `tunnels` exceeds it has the extra establishments refused at startup (and retried by the repair tick), so it serves on what it got. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap; the session keeps running
 
 [server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector); placing the keys lets the server accept Noise connections in addition to plain ones
 [server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
@@ -292,12 +291,12 @@ restarting client takes over cleanly.
 ## Multiplexing (`multiplex` feature)
 
 The `multiplex` feature is part of the default feature set. With
-`mode = "multiplex"` (the default), a registered service runs over an
-**elastic pool of tunnel connections** (up to
-`[client.data.tcp|kcp].max_tunnels`, default 4), and every subsequent data
-channel becomes a yamux stream inside one of them. This removes the
-per-connection handshake latency (TCP connect plus, with `noise`, the Noise
-handshake) and cuts FD usage under many concurrent visitors.
+`mode = "multiplex"` (the default), a registered service runs over a
+**fixed pool of tunnel connections** (`[client.data.tcp|kcp].tunnels`,
+default 4), and every subsequent data channel becomes a yamux stream inside one
+of them. This removes the per-connection handshake latency (TCP connect plus,
+with `noise`, the Noise handshake) and cuts FD usage under many concurrent
+visitors.
 
 - The decision belongs to the client alone (`[client.data].default_mode`); the server
   adapts per connection automatically.
@@ -305,19 +304,30 @@ handshake) and cuts FD usage under many concurrent visitors.
 - Per-tunnel buffering is bounded by internal defaults (32 MiB yamux receive
   window, 64 streams) — bounded loss backlog without throughput loss; the
   values are fixed because yamux couples them (see internals.md).
-- **The pool starts cold.** Nothing is dialed until something needs a tunnel:
-  a service's first visitor grows the pool synchronously, so that visitor pays
-  one tunnel setup before its bytes move (2.0-3.2 ms on loopback, M2a); every
-  later visitor finds a warm tunnel, and the pool keeps growing on demand up to
-  `max_tunnels`. An idle pool gives tunnels back after
-  `[client.data].idle_timeout` (default 60 s), never below one and never below
-  the floor a UDP service's workers need.
-- `max_tunnels = N` is the cap the pool may grow to for that carrier.
+- **The pool is established at service start and pinned.** All `tunnels`
+  connections are dialed when the service activates, so the first visitor pays
+  nothing (the setup cost is paid before it arrives) and the capacity a
+  deployment offers does not depend on what it happened to be doing a minute
+  ago. The pool is never resized for load, and idle tunnels are never reaped.
+- **Repair is the one exception**, and it is not growth: a tunnel that dies is
+  replaced until the count is met again, so a single failure cannot shrink a
+  deployment permanently. What is *not* repaired is the count itself — a pool
+  that needs to be wider needs `tunnels` raised and the client restarted, which
+  is the point: capacity is a configuration decision, not a runtime one.
+- `tunnels = N` is how many carrier connections that carrier's pool holds.
   Independent TCP flows isolate head-of-line blocking (a lost segment stalls
   only its own tunnel) and aggregate beyond a single flow's congestion window.
-  If one tunnel dies, opens transparently fall through to the survivors until
-  the usual heartbeat-driven reconnect re-establishes the pool. Default: 4;
-  `1` reproduces single-tunnel behavior.
+  If a tunnel dies, opens transparently fall through to the survivors and the
+  repair tick dials a replacement. Default: 4 (raised to a UDP service's worker
+  count when that is larger); `1` reproduces single-tunnel behavior at a
+  measured cost — one tunnel was the worst configuration on every path in the
+  model's cells, because every stream then shares one congestion window.
+- **What happens when the load exceeds the pool** is sharing, not growth: the
+  streams spread over the tunnels that exist, up to 56 per tunnel, and a
+  visitor that arrives when every tunnel is at that ceiling waits briefly for a
+  stream to retire and is refused if none does. Size `tunnels` for the
+  concurrency you expect; the measurements behind the sizing are in
+  [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 - **Experimental (transport comparison arms):** `carrier = "kcp"` runs the
   data plane as KCP-over-UDP sessions instead of TCP connections (feature
   `kcp`, in the default set). KCP is a userspace ARQ protocol that trades
@@ -326,7 +336,7 @@ handshake) and cuts FD usage under many concurrent visitors.
   [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
   The crypto stack is unchanged — with
   transport `noise` the same Noise handshake wraps each KCP session — and
-  yamux still carries the data channels, so `max_tunnels` applies as usual. The
+  yamux still carries the data channels, so `tunnels` applies as usual. The
   server opens its UDP listener lazily — the first registration that
   declares the `kcp` carrier triggers the bind, and a bind failure is a
   precise registration rejection; servers whose clients never use KCP never
@@ -361,8 +371,8 @@ can override `mode` and `carrier` individually on its own
 `[client.services.<name>]` block. The same rules as the global block apply
 to the merged view: `carrier` is only valid with `mode = "multiplex"`, and
 `carrier = "kcp"` additionally needs the `kcp` feature. A service's carrier
-selects which of the two caps (`[client.data.tcp|kcp].max_tunnels`) its pool
-grows to; with `[client.data].shared_pool` every service of the session shares
+selects which of the two counts (`[client.data.tcp|kcp].tunnels`) its pool is
+established with; with `[client.data].shared_pool` every service of the session shares
 one pool per carrier. So one client can mix a multiplexed interactive service
 (few handshakes, NAT-friendly) with a `direct` bulk service (raw throughput)
 without any server configuration change: the server adapts per connection and
@@ -468,8 +478,8 @@ data channel, with no multiplexer above it — and `multiplex` is the pair for a
 client that serves many claims from one shared pool.
 
 `[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
-`default_mode`, `default_carrier`, `shared_pool`, `idle_timeout`, and the two
-per-carrier `max_tunnels` caps — with **one different default**: the mode is
+`default_mode`, `default_carrier`, `shared_pool`, and the two
+per-carrier `tunnels` counts — with **one different default**: the mode is
 `direct`, because a claim has exactly one channel and the multiplex pool
 therefore buys it nothing unless `shared_pool` is on. Measured on one host and
 workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
@@ -589,22 +599,22 @@ raise `RUST_LOG` to see never reaches anything:
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | one line per second per tunnel | cumulative yamux framing counters (`written`, `read`, `bytes`) — frames per second, and with a CPU sample, CPU per frame |
 | `MOLEHILL_KCP_STATS=1` | one line per second per process | the KCP adapter's cumulative counters (`datagrams_in`/`out`, `retransmits`, `acks_out`, `sacks_sent`, `blobs_out`, pump rounds) and the coarse per-phase timings that split a segment's userspace cost into intake, delivery, writer drain, wire drain and ARQ update |
-| `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, cap, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+load:1->2`, `-idle:2->1`) |
+| `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, configured count, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+repair:1->2`, `-dead:2->1`) — in a healthy run there are none, and a pool whose `size` sits below its `count` is a pool whose repair is being refused |
 | `MOLEHILL_PLACEMENT_STATS=1` | one line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
 | `MOLEHILL_UDP_STATS=1` | one line per second per process | the UDP affinity table's size, its evictions, and each worker's pinned peers |
 | `MOLEHILL_L3_STATS=1` | one line per second per transparent data path | the transparent data path's cumulative counters: `forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)` and `channel_errors` |
 
 The counters are cumulative, so a reader that knows the window — or takes the
 first and the last line of a run — gets per-second rates and cost per unit. The
-pool and placement lines are the S1 observation of the shared elastic pool
-(what it does, and why the numbers are aggregated rather than per event:
+pool and placement lines are the S1 observation of the shared pool (what it
+does, and why the numbers are aggregated rather than per event:
 [internals.md](internals.md#the-tunnel-pool)). `MOLEHILL_STRIPE_COUNT` is the
 one switch that changes behaviour rather than observing it; it is documented
 beside `stripe_count`, the value it replaces.
 
 ## Tuning
 
-The step-by-step way to pick `mode`/`max_tunnels`/`carrier`/transport for
+The step-by-step way to pick `mode`/`tunnels`/`carrier`/transport for
 your workload is the [decision tree](#choosing-your-configuration-decision-tree)
 above (with the trade-offs and how to validate them). This section covers
 the per-connection knobs.

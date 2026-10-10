@@ -17,7 +17,7 @@ default_mode = "multiplex"
 default_carrier = "kcp"
 
 [transparent.data.kcp]
-max_tunnels = 6
+tunnels = 6
 
 [transparent.transport]
 proxy = "socks5://127.0.0.1:1080"

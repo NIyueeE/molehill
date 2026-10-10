@@ -1,8 +1,10 @@
 # The operator's valve (`[server.data].max_tunnels_per_client`) against a
-# client that wants more: the client's own cap is 2, the server's is 1, so the
-# pool's growth attempt is refused while the tunnel it already holds keeps
-# forwarding. `tests/pool_test.rs` asserts the pool never reaches 2 and that
-# the session survives the refusal.
+# client that asks for more: the client's own count is 2, the server's valve
+# is 1, so one of the two startup establishments is refused while the tunnel
+# the client got keeps forwarding. `tests/pool_test.rs` asserts the pool holds
+# at one tunnel and that the session survives the refusal; the refusal's own
+# report (once, not per attempt) is asserted on the real binary in the same
+# file.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
@@ -16,10 +18,9 @@ type = "plain"
 [client.data]
 default_mode = "multiplex"
 default_carrier = "tcp"
-idle_timeout = 2
 
 [client.data.tcp]
-max_tunnels = 2
+tunnels = 2
 
 [client.services.valve]
 local_addr = "127.0.0.1:8090"

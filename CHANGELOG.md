@@ -23,6 +23,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   combination. What it costs and what it buys is measured, per path condition,
   in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
 
+### Changed
+
+- **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`, established at
+  service start.** The client's data plane used to run an *elastic*
+  per-carrier pool: it started cold, grew on load, for a stripe group and to a
+  UDP service's worker count, and gave tunnels back after an idle timeout. A
+  pool's width is now a configuration decision (`[client.data.tcp].tunnels` /
+  `[client.data.kcp].tunnels`, default 4, raised to a UDP service's declared
+  worker count) and nothing moves it at runtime: all of them are dialed when the
+  service activates, none is reaped for idleness, and a tunnel that dies is
+  **repaired** back to the count — repair is the one establishment after
+  startup, and it is not growth.
+
+  Why: an elastic pool's width is a *result*, and a result depends on the
+  history of the process — which makes capacity unpredictable for an operator
+  and a run incomparable for a measurement. The measurements that size the new
+  key are unchanged and on [docs/benchmarks.md](docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements):
+  one tunnel is the worst configuration on every path measured (an L3 claim on
+  one carrier connection carries the same for one inner flow and for eight),
+  two captures most of the lossy-path gain (8 flows: 3.34 → 5.92 Gbit/s on the
+  model's `loss1` cell), and more keeps paying on a clean fast path (12.85 →
+  22.81 Gbit/s from one tunnel to eight). Establishment is paid at startup
+  rather than by the first visitor, and the cost of a tunnel is 0.5–0.8 MiB
+  RSS and 2.6 file descriptors, with no threads.
+
+  What changed for a config: `[client.data.tcp|kcp].max_tunnels` is refused with
+  an upgrade message naming `tunnels`; `[client.data].idle_timeout` is refused
+  because there is nothing to reap; an explicit `tunnels` below what the
+  carrier's UDP services need is refused with the number to write instead. The
+  server-side valve `[server.data].max_tunnels_per_client` is unchanged — it now
+  bites at a client's *startup* (the extra establishments are refused and
+  retried) rather than during growth. `MOLEHILL_POOL_STATS` reports the
+  configured `count` beside the live `size`, and the timeline's reasons are
+  `+repair` / `-dead`. A pinned pool cannot grow, so the refusal that used to
+  trigger growth now reports itself: the first time a visitor is refused
+  because every tunnel is at placement's ceiling (56 streams of the engine's
+  64), one INFO line names the count and the key to raise, and later refusals
+  are DEBUG. The wire protocol is unchanged.
+
 ### Fixed
 
 - **A refused KCP datagram is held, not dropped.** The send path discarded

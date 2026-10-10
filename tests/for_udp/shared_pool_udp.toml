@@ -1,11 +1,10 @@
-# The UDP side of the shared elastic pool: one UDP service whose affinity peer
-# must survive the pool's grow/shrink cycle with its source port intact.
+# The UDP side of the shared pinned pool: one UDP service whose affinity peer
+# must keep its source port for as long as it talks, whatever the pool does.
 #
-# The numbers are chosen so the cycle is observable: the pool starts cold and
-# grows for the service's channels — `udp_workers = 2` is the UDP-derived
-# floor, and `max_tunnels = 3` leaves room above it — then holds that floor
-# once a tunnel is idle, where the tunnel the visitor's peer is pinned to must
-# survive (D30).
+# The numbers are chosen so the floor is visible in the state: `udp_workers = 2`
+# is the UDP-derived floor, and `tunnels = 3` starts the pool one tunnel above
+# it — the pool is established at that count and never resizes, so the tunnel
+# the visitor's peer is pinned to is never given back (D30).
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
@@ -20,10 +19,9 @@ type = "plain"
 default_mode = "multiplex"
 default_carrier = "tcp"
 shared_pool = true
-idle_timeout = 2
 
 [client.data.tcp]
-max_tunnels = 3
+tunnels = 3
 
 [client.services.game]
 protocol = "udp"

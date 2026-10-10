@@ -1,8 +1,10 @@
-# A TCP tunnel pool with nothing to keep it warm: no service opens channels
-# up front (a TCP service opens one per visitor, on demand), the pool starts
-# cold, and `idle_timeout = 2` is its shrink clock. `max_tunnels = 2` is the
-# cap the assertions drive it to: the load rule grows the pool for 52+
-# concurrent streams, and an idle pool gives one tunnel back.
+# A TCP tunnel pool with a visitor ceiling and nothing to resize it: no
+# service opens channels up front (a TCP service opens one per visitor, on
+# demand), and `tunnels = 2` is the count the pool establishes at service
+# start and keeps — for the whole service lifetime, under load and while
+# idle. Two tunnels at the placement ceiling carry 112 concurrent visitors;
+# the ones past that are refused rather than paid for with a third tunnel or
+# a terminated one.
 #
 # `tests/pool_test.rs` reads the pool's own state (`live_pools()`), so the
 # numbers here are the ones those assertions expect.
@@ -19,10 +21,9 @@ type = "plain"
 [client.data]
 default_mode = "multiplex"
 default_carrier = "tcp"
-idle_timeout = 2
 
 [client.data.tcp]
-max_tunnels = 2
+tunnels = 2
 
 [client.services.idle]
 local_addr = "127.0.0.1:8090"

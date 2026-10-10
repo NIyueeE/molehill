@@ -528,11 +528,7 @@ default_carrier = "{arm.data_carrier}"
 
 {claims}"""
     else:
-        cap = (
-            f"\n[client.data.tcp]\nmax_tunnels = {arm.pool_cap}\n"
-            if arm.pool_cap
-            else ""
-        )
+        cap = f"\n[client.data.tcp]\ntunnels = {arm.pool_cap}\n" if arm.pool_cap else ""
         services = []
         for port in SERVICE_PORTS:
             block = [f"[client.services.s{port}]"]

@@ -43,6 +43,8 @@ use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 #[cfg(feature = "multiplex")]
 use crate::transport::multiplex::{Carrier, ClientTunnel, Dialer, StreamLease, TunnelPool};
 
+#[cfg(feature = "multiplex")]
+use crate::common::constants::DEFAULT_MUX_TUNNELS;
 use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
     DEFAULT_UDP_WORKERS, FORWARD_IDLE_TIMEOUT, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
@@ -83,15 +85,39 @@ struct DataOpts {
     /// Which carrier carries the data plane.
     #[cfg(feature = "multiplex")]
     carrier: DataCarrier,
-    /// The cap the pool may grow to for this service's carrier
-    /// (`[client.data.tcp|kcp].max_tunnels`). The pool starts cold and grows
-    /// up to it on demand.
+    /// How many tunnels this service's carrier pool establishes at start
+    /// (`[client.data.tcp|kcp].tunnels`), or `None` when the operator left it
+    /// to the default — which the pool raises to the UDP-derived floor of the
+    /// services sharing it.
     #[cfg(feature = "multiplex")]
-    max_tunnels: usize,
+    tunnels: Option<usize>,
+    /// How many data channels this service opens itself (a UDP service's
+    /// worker set; 0 for the others). It is the service's own contribution to
+    /// the pool's UDP-derived floor.
+    #[cfg(feature = "multiplex")]
+    channels: u16,
     /// Noise key config, `Some` iff the control transport is `noise`; KCP
     /// tunnels wrap it on top (the crypto stack is kept).
     #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
     noise: Option<NoiseConfig>,
+}
+
+#[cfg(feature = "multiplex")]
+impl DataOpts {
+    /// How many tunnels to establish, given the UDP-derived floor of the
+    /// services that will share this pool.
+    ///
+    /// The operator's number when they wrote one (the configuration is
+    /// validated against the floor before a client ever gets here), else the
+    /// default raised to it — so a deployment that declares four UDP workers
+    /// gets at least four tunnels without the operator having to repeat the
+    /// arithmetic, and a TCP-only deployment keeps the plain default.
+    fn tunnel_target(&self, floor: usize) -> usize {
+        match self.tunnels {
+            Some(n) => n,
+            None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
+        }
+    }
 }
 
 /// Placeholder so the channel-opening code keeps one shape without the
@@ -100,9 +126,9 @@ struct DataOpts {
 #[cfg(not(feature = "multiplex"))]
 struct Tunnels;
 
-/// A data-channel open the elastic pool refused. Reported once per process,
+/// A data-channel open the tunnel pool refused. Reported once per process,
 /// then DEBUG: the visitor's failure is per-connection, the condition behind it
-/// is the operator's to see (the pool at its ceiling, or a growth the server's
+/// is the operator's to see (the pool at its ceiling, or a repair the server's
 /// valve refuses).
 #[cfg(feature = "multiplex")]
 static OPEN_REFUSED: RepeatNotice = RepeatNotice::new();
@@ -295,7 +321,12 @@ impl DataOpts {
             #[cfg(feature = "multiplex")]
             carrier: s.carrier.unwrap_or(c.data.default_carrier),
             #[cfg(feature = "multiplex")]
-            max_tunnels: c.max_tunnels(s.carrier.unwrap_or(c.data.default_carrier)),
+            tunnels: c.tunnels(s.carrier.unwrap_or(c.data.default_carrier)),
+            #[cfg(feature = "multiplex")]
+            channels: match s.service_type {
+                ServiceType::Udp => s.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS),
+                ServiceType::Tcp | ServiceType::Transparent => 0,
+            },
             #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
             noise: match s.transport_type_with(c.transport.transport_type) {
                 TransportType::Noise => s.noise_config_with(c.transport.noise.as_ref()).cloned(),
@@ -615,8 +646,6 @@ impl Client {
             #[cfg(feature = "multiplex")]
             shared_pool: self.config.shared_pool(),
             #[cfg(feature = "multiplex")]
-            idle_timeout: self.config.pool_idle_timeout(),
-            #[cfg(feature = "multiplex")]
             pins: Arc::new(crate::transport::multiplex::PinRegistry::new()),
         };
         tokio::spawn(
@@ -742,10 +771,10 @@ const MAX_TRACKED_STRIPE_GROUPS: usize = 64;
 /// The server names the group in every `CreateDataChannelForStripe`, so the
 /// client knows what the placement rule alone never could: which of its opens
 /// belong together. It remembers the tunnels a group's stripes already took and
-/// hands the list to the pool, which grows to the group's K and avoids them —
-/// so the group's K data channels land on K distinct tunnels, a cold pool
-/// included. Without it, K requests were K indistinguishable opens and a cold
-/// pool (whose default state is *zero* tunnels) put the whole group on one.
+/// hands the list to the pool, which avoids them — so the group's K data
+/// channels land on K distinct tunnels while the pool has that many and share
+/// them when it does not. Without it, K requests were K indistinguishable opens
+/// and the whole group stacked on one tunnel.
 ///
 /// The map is per service (`RunDataChannelArgs` is one service's), so the group
 /// id alone is the key: a group belongs to one service of one session.
@@ -985,7 +1014,7 @@ enum Tunnels {
 
 #[cfg(feature = "multiplex")]
 impl Tunnels {
-    /// Open the next data channel: a stream from the elastic pool, placed
+    /// Open the next data channel: a stream from the tunnel pool, placed
     /// least-loaded-first over the physical tunnels.
     async fn open_stream(&self) -> Result<TunnelStream> {
         match self {
@@ -1391,13 +1420,14 @@ async fn establish_tunnel(
     Ok((tunnel, shutdown_tx))
 }
 
-/// Establish one tunnel's pool: **cold**, plus the dialer every growth uses.
+/// Establish one service's tunnel pool: its configured count, plus the dialer
+/// every repair uses.
 ///
-/// There is no initial size any more (`default_count` / `count` are gone): the
-/// pool starts at zero and its first open grows it synchronously
-/// (`GrowReason::Cold`), so the client pays one tunnel setup on the first
-/// visitor after an idle period instead of keeping N connections warm for
-/// every configured service.
+/// All `tunnels` connections are dialed here, at service start, and kept for
+/// the service's lifetime; a tunnel that dies is replaced by the pool's repair
+/// tick, which is the only establishment after this point. The count is the
+/// operator's `[client.data.tcp|kcp].tunnels`, or the default raised to the
+/// UDP-derived floor (`floor`) of the services sharing the pool.
 ///
 /// The carrier follows `[client.data].default_carrier`: `tcp` dials the data
 /// endpoint with the control-channel wire stack, `kcp` opens KCP-over-UDP
@@ -1414,7 +1444,7 @@ async fn establish_tunnels(
     session_nonce: Nonce,
     opts: &DataOpts,
     key: &str,
-    idle_timeout: Duration,
+    floor: usize,
     pins: Arc<crate::transport::multiplex::PinRegistry>,
 ) -> Result<Tunnels> {
     let carrier = match opts.carrier {
@@ -1422,24 +1452,73 @@ async fn establish_tunnels(
         DataCarrier::Kcp => Carrier::Kcp,
     };
     let dialer = tunnel_dialer(transport, data_addr, session_nonce, opts).await?;
-    // Cold by construction: resolve the dialer (a KCP growth must not block on
-    // DNS later) and leave the pool empty until an open asks for a tunnel.
-    let initial = Vec::new();
-    debug!(
+    // The pool's tunnels are established here, together, and kept for the
+    // service's lifetime: a deployment's capacity is what its configuration
+    // says it is, not what it happened to be doing a minute ago. The dialer
+    // stays with the pool for repair — a tunnel that dies is replaced so the
+    // count survives — which is the only runtime establishment left.
+    let target = opts.tunnel_target(floor);
+    let initial = establish_initial(&dialer, target, key, carrier).await;
+    let established = initial.len();
+    info!(
         pool = %key,
         carrier = carrier.as_str(),
-        max_tunnels = opts.max_tunnels,
-        "Multiplexed data tunnel pool established cold"
+        tunnels = target,
+        established,
+        "pool-stats: tunnel pool established"
     );
     Ok(Tunnels::Yamux(TunnelPool::with_dialer(
         carrier,
         key.to_owned(),
         initial,
-        opts.max_tunnels,
-        idle_timeout,
+        target,
         Some(dialer),
         pins,
     )))
+}
+
+/// Dial the pool's tunnels, concurrently, and hand back the ones that came up.
+///
+/// A partial result is not a failure: the pool repairs what is missing (its
+/// dialer is the same closure), and a service that cannot reach *any* tunnel
+/// says so on its first open — which is a better answer than refusing to start
+/// a service whose server is briefly unreachable.
+#[cfg(feature = "multiplex")]
+async fn establish_initial(
+    dialer: &crate::transport::multiplex::Dialer,
+    target: usize,
+    key: &str,
+    carrier: Carrier,
+) -> Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> {
+    let mut dials = tokio::task::JoinSet::new();
+    for _ in 0..target {
+        let dial = Arc::clone(dialer);
+        dials.spawn(async move { dial().await });
+    }
+    let mut initial = Vec::with_capacity(target);
+    let mut failures = 0usize;
+    while let Some(joined) = dials.join_next().await {
+        match joined {
+            Ok(Ok(tunnel)) => initial.push(tunnel),
+            Ok(Err(e)) => {
+                failures += 1;
+                debug!(pool = %key, carrier = carrier.as_str(), "tunnel establishment failed: {e}");
+            }
+            Err(e) => {
+                failures += 1;
+                debug!(pool = %key, carrier = carrier.as_str(), "tunnel establishment panicked: {e}");
+            }
+        }
+    }
+    if failures > 0 {
+        debug!(
+            pool = %key,
+            carrier = carrier.as_str(),
+            failures,
+            "some of the pool's tunnels did not come up; the pool will repair them"
+        );
+    }
+    initial
 }
 
 /// The closure a pool calls to add a tunnel.
@@ -2213,7 +2292,7 @@ enum ServiceState {
     /// Handed to the session, not yet answered by the server.
     Registering,
     /// Registered: the server bound the public endpoint and this side keeps
-    /// the configured channel pool warm.
+    /// its configured data channels open.
     Active(Box<ActiveService>),
     /// The server refused the registration. Terminal for this service: only a
     /// human can fix the config or the server's `allow_ports`.
@@ -2308,9 +2387,6 @@ struct ClientSession {
     /// `[client.data].shared_pool`.
     #[cfg(feature = "multiplex")]
     shared_pool: bool,
-    /// `[client.data].idle_timeout`, applied to every pool of this session.
-    #[cfg(feature = "multiplex")]
-    idle_timeout: Duration,
     /// The client's UDP pin accounting, shared by every hub of this session's
     /// services: a tunnel with pinned peers is never shrunk (D30).
     #[cfg(feature = "multiplex")]
@@ -2768,13 +2844,20 @@ impl ClientSession {
             debug!(service = %name, pool = %key, "Reusing the session's tunnel pool");
             return Ok((pool.clone(), key));
         }
+        // This service's own contribution to the pool's floor: a UDP worker
+        // set shards across tunnels, so the pool must be at least that wide
+        // before the first channel is placed.
+        let floor = crate::transport::pool::udp_floor(
+            [usize::from(slot.data.channels)],
+            crate::transport::multiplex::stream_cap(),
+        );
         let tunnel = establish_tunnels(
             &slot.transport,
             data_addr,
             *nonce,
             &slot.data,
             &key,
-            self.idle_timeout,
+            floor,
             Arc::clone(&self.pins),
         )
         .await
@@ -2881,11 +2964,7 @@ impl ClientSession {
             if !matches!(entry.slot.service.service_type, ServiceType::Udp) {
                 continue;
             }
-            let floor = crate::transport::pool::udp_floor_capped(
-                [entry.slot.channels],
-                cap,
-                entry.slot.data.max_tunnels,
-            );
+            let floor = crate::transport::pool::udp_floor([entry.slot.channels], cap);
             let slot = floors.entry(key).or_insert(0);
             *slot = (*slot).max(floor);
         }
@@ -2971,8 +3050,8 @@ impl ClientSession {
         // rebuilds both.
         debug!(service = %entry.slot.service.name, "Service dropped by the server, re-registering");
         entry.state = ServiceState::Registering;
-        // The service's data plane is gone with its registration, so its
-        // demand on the pools goes with it.
+        // The service's data plane is gone with its registration, so the floor
+        // its channels contributed goes with it.
         #[cfg(feature = "multiplex")]
         self.refresh_pool_floors();
         self.register(id, nonce, rd, wr).await
@@ -2984,8 +3063,8 @@ impl ClientSession {
         if self.services.remove(&id).is_some() {
             debug!("Deregistering service {id}");
             write_session_cmd(wr, &SessionCmd::Deregister(id)).await?;
-            // A service that is gone asks for nothing: the pools it drew from
-            // may shrink now that its channels are no longer a floor (D7).
+            // A service that is gone asks for nothing: the floor its channels
+            // contributed is recomputed for the pools it drew from (D7).
             #[cfg(feature = "multiplex")]
             self.refresh_pool_floors();
         }

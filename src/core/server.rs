@@ -86,11 +86,11 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 /// How long the visitor-pairing loop waits for a data channel before asking
 /// for another one.
 ///
-/// It has to be comfortably above a *legitimate* slow open — a cold pool dials
-/// a tunnel, and the client's own cold-growth budget is 15 s — so that ordinary
-/// work is never re-requested. Its job is not to time a healthy open out; it is
-/// to stop one unanswerable request from parking the accept loop, which stalls
-/// the whole service (see `pair_visitor`).
+/// It has to be comfortably above a *legitimate* slow open — opening a channel
+/// on an empty pool dials a tunnel, and the client's own wait budget for that
+/// is 15 s — so that ordinary work is never re-requested. Its job is not to
+/// time a healthy open out; it is to stop one unanswerable request from parking
+/// the accept loop, which stalls the whole service (see `pair_visitor`).
 const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// How many `PAIR_WAIT_BUDGET` waits one visitor gets before it is shed.
@@ -1133,9 +1133,9 @@ impl SessionCtx {
             // turns its pool's requests into tagged commands.
             0,
             // v4 registrations carry no `pool_size`: the tunnel pool is a
-            // client-side, per-carrier concern and grows on demand — one
-            // request per visitor, or one per stripe for a striped gather
-            // (see `pair_striped_group`).
+            // client-side, per-carrier concern sized by the client's own
+            // configuration — one request per visitor, or one per stripe for a
+            // striped gather (see `pair_striped_group`).
             0,
             stripe_count(&self.server_config),
         );
@@ -2726,8 +2726,8 @@ where
         // One striped request per stripe, before the first wait: the
         // unstriped path asks for its channel this way, and a striped gather
         // that does not ask simply waits for channels nobody was told to
-        // open — the shape of the original defect (a cold pool never
-        // pre-opened anything, so the gather hung until the visitor's own
+        // open — the shape of the original defect (the client used to
+        // pre-open nothing, so the gather hung until the visitor's own
         // read timed out). A request the client refuses is answered with
         // nothing at all, which is why the wait below re-asks.
         for index in 0..stripes {
