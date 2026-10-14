@@ -859,12 +859,6 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
          shrink clock to write; remove the key",
     ),
     (
-        "transparent.data.idle_timeout",
-        "the next release",
-        "the pool is pinned: its tunnels are established at service start and kept, so there is no \
-         shrink clock to write; remove the key",
-    ),
-    (
         "client.services.*.pool_size",
         "v0.10.0",
         "write `udp_workers` for a UDP service: it is the number of data channels the service's \
@@ -1022,6 +1016,11 @@ const UNRELEASED_KEYS: &[(&str, &str)] = &[
         "transparent.data.shared_pool",
         "a transparent client has no pool to share: every claim's channels are connections of its \
          own, drawn from the carrier's lane budget; remove the key",
+    ),
+    (
+        "transparent.data.idle_timeout",
+        "a claim's lanes are pinned: they are established when the claim starts and kept, so there \
+         is no shrink clock to write; remove the key",
     ),
 ];
 
@@ -2781,7 +2780,7 @@ udp_workers = 4
     /// ceiling's behaviour, and a claim's lanes are connections rather than
     /// streams, so the two are deliberately different keys with different
     /// bounds.
-    #[cfg(feature = "multiplex")]
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     #[test]
     fn test_a_lane_budget_above_the_guard_is_refused() {
         let config = |tunnels: u16| {

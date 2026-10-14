@@ -1782,7 +1782,7 @@ async fn upgrade_to_tunnel<S>(
             reason = "without multiplex there are no tunnels to report on"
         )
     )]
-    health: Option<Arc<crate::kcp::SessionHealth>>,
+    health: Option<Arc<crate::transport::health::SessionHealth>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1951,7 +1951,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingTunnel<S> {
 /// with it rather than leaving one polling a number nobody owns.
 #[cfg(feature = "multiplex")]
 fn spawn_tunnel_health_reporter(
-    health: Option<Arc<crate::kcp::SessionHealth>>,
+    health: Option<Arc<crate::transport::health::SessionHealth>>,
     handed: Arc<std::sync::atomic::AtomicU64>,
     tunnel_id: Arc<std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>>,
     sessions: Arc<RwLock<SessionMap>>,

@@ -81,7 +81,7 @@ A typical setup:
 > (`default_data_addr`, `tunnels`) — so they read
 > distinctly from the per-service overlay keys on
 > `[client.services.<name>]` (`protocol`, `remote_addr`, `token`,
-> `retry_interval`, `carrier`, `transport`, `udp_workers`,
+> `retry_interval`, `transport`, `udp_workers`,
 > `udp_forwarder_ipv6`, `udp_send_queue_size`, ...; new in 0.8).
 > `[client.transport]` keeps `type`/`noise` unprefixed: its per-service
 > overrides live in the nested `transport` table, so there is no same-name
@@ -158,6 +158,22 @@ moved 6 % fewer wire bytes, took 33 % less CPU per packet and carried 65 % more
 round trips per second
 ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
+### Migrating to 0.11: the carrier and the pool's clock
+
+Which carrier works is a property of the network, not of the deployment, so the
+data plane chooses it at runtime (KCP first, falling back to TCP) and the keys
+that used to state it are gone. The pool is **pinned** too — it is established
+at service start and repaired, never grown on load or reaped for idleness — so
+there is no shrink clock to configure:
+
+| Removed key | Write instead |
+|---|---|
+| `[client.data].default_carrier` | Nothing: the data plane dials KCP and falls back to TCP when a session cannot be established. `MOLEHILL_DATA_CARRIER=tcp\|kcp` forces one apart, for a measurement or a test that needs the two paths separated |
+| `[client.services.<name>].carrier` | Nothing — the same reason. A service's own `tunnels` is the data-plane key it may still write |
+| `[client.data.tcp]` | `[client.data].tunnels`: one pool and one width, whichever carrier it rides |
+| `[client.data.kcp]` | `[client.data].tunnels` — the same |
+| `[client.data].idle_timeout` | Nothing: a pinned pool is never reaped for idleness, so there is no timeout to set |
+
 ## Choosing your configuration (decision tree)
 
 The first choice is the mode: `[client]` forwards to a local application,
@@ -165,17 +181,17 @@ The first choice is the mode: `[client]` forwards to a local application,
 [Transparent (L3) services](#transparent-l3-services)) — and it is a choice
 about the process, not about a service, so it comes before anything below.
 
-The defaults — a pinned pool of `tunnels = 4` multiplexed connections, plain
-transport, and a data plane that tries KCP before falling back to TCP — are the
-right starting point for almost everyone. Deviate only when the tree says so, change one thing at a time, and
+The defaults — a pinned pool of `tunnels = 4` multiplexed connections, a Noise
+control channel (required), and a data plane that tries KCP before falling back
+to TCP — are the right starting point for almost everyone. Deviate only when the tree says so, change one thing at a time, and
 measure the result on your own path: the published runs, their numbers and how
 to reproduce them are
 in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 
 ```mermaid
 flowchart TD
-    A["Start: defaults<br/>tunnels=4,<br/>carrier=tcp, plain"] --> B{"Traffic crosses an<br/>untrusted network?"}
-    B -- Yes --> C["transport type = noise<br/>+ keypair (Transport doc)"]
+    A["Start: defaults<br/>tunnels=4,<br/>control Noise (required)"] --> B{"Does a service's payload<br/>carry its own crypto<br/>(TLS, SSH, WireGuard)?"}
+    B -- Yes --> C["that service: transport = { type = \"plain\" }<br/>- cheaper, and no less protected"]
     B -- No --> D{"Many concurrent<br/>visitor connections?"}
     C --> D
     D -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
@@ -194,8 +210,7 @@ flowchart TD
 | `tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain. Measured as the worst configuration on every path |
 | `tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
 | `tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling; measured worth +77 % throughput from one tunnel to eight on a clean fast path |
-| `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
-| `carrier` | `"kcp"` | UDP transport for paths where TCP is blocked, throttled or lossy. It costs throughput where the path is clean, so choose it for the path, not by default |
+| carrier | (no key) | the data plane dials KCP and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement. Measured, TCP is ahead in every unflagged cell and KCP's one win is UDP session quality at 100 ms RTT ([Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)) |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
 | pool establishment | (no key) | the pool's `tunnels` connections are dialed at service start, not on the first visitor: nothing is paid at request time, and the cost is `tunnels` idle connections (measured at 0.5–0.8 MiB RSS and 2.6 FDs each, no threads) |
@@ -500,7 +515,7 @@ address routed to the server, and a single-IP server — are in
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
-`retry_interval`, `carrier`. `[transparent.transport]` decides how the two
+`retry_interval`, `tunnels`. `[transparent.transport]` decides how the two
 wire stacks of an L3 client are built:
 
 - **The control channel is Noise, always.** The session nonce it publishes is
@@ -520,9 +535,10 @@ wire stacks of an L3 client are built:
 
 and `[transparent].tun` is where a device is named.
 
-`carrier` is the only data-plane choice a claim has: `tcp` (the default) is one
-TCP connection per lane, `kcp` is one KCP session per lane — the carrier's
-session *is* the data channel, with no multiplexer above it. A claim never
+A claim has no carrier key, and one fewer thing to get wrong: each lane rides
+whatever the data plane dials (KCP, falling back to TCP), and the carrier's
+session *is* the data channel, with no multiplexer above it. What a claim does
+choose is how many lanes it gets (`[transparent.data].tunnels`). A claim never
 multiplexes: its lanes are its carrier connections, and its throughput is the
 sum of them. On one host and workload the same claim on its own connection
 moved 6 % fewer wire bytes, took 33 % less CPU per packet and carried 65 % more
@@ -686,7 +702,7 @@ beside `stripe_count`, the value it replaces.
 
 ## Tuning
 
-The step-by-step way to pick `tunnels`/`carrier`/transport for
+The step-by-step way to pick `tunnels` and the transport for
 your workload is the [decision tree](#choosing-your-configuration-decision-tree)
 above (with the trade-offs and how to validate them). This section covers
 the per-connection knobs.

@@ -332,7 +332,7 @@ impl TransparentClientConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transparent", target_os = "linux"))]
 mod tests {
     #![expect(
         clippy::unwrap_used,
@@ -457,6 +457,7 @@ remote_bind_addr = "10.99.0.1:8443"
         assert_eq!(lanes.noise.clone(), client.transport.noise.clone());
     }
 
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claims_lanes_are_an_equal_share_of_the_carriers_budget() {
         let lanes = |budget: &str, claims: &str| {
@@ -589,6 +590,7 @@ remote_bind_addr = "10.99.0.1:2222"
     /// The `[transparent.control]` block is where the server is named, so a
     /// block without one is refused — and the message names the block the
     /// reader actually wrote, not `[client.control]`.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_needs_a_server_to_dial() {
         let err = Config::from_str(
@@ -614,6 +616,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// An L3 client has claims and nothing else: a forwarding key has no home
     /// in the model, and the parse says so rather than ignoring it.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_has_no_home_for_forwarding_keys() {
         let err = Config::from_str(
@@ -642,7 +645,12 @@ local_addr = "127.0.0.1:8080"
     }
 }
 
-#[cfg(all(test, feature = "multiplex"))]
+#[cfg(all(
+    test,
+    feature = "multiplex",
+    feature = "transparent",
+    target_os = "linux"
+))]
 mod data_tests {
     #![expect(
         clippy::unwrap_used,
@@ -653,6 +661,7 @@ mod data_tests {
     /// A claim never multiplexes: its data channels are carrier connections of
     /// its own, which is what `ClientServiceConfig::uses_pool` derives from the
     /// service type — the shape is a property of the model, not a key.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_never_multiplexes() {
         let config = Config::from_str(
@@ -679,6 +688,7 @@ remote_bind_addr = "10.99.0.1:8443"
     /// connections of its own and `tunnels` is a budget rather than a width.
     /// The carrier is not a key anywhere, which is what this pins: a claim over
     /// KCP is what the runtime chooses when the path carries it.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_kcp_carrier_is_not_a_key_a_claim_can_write() {
         let config = r#"
@@ -792,6 +802,7 @@ remote_bind_addr = "10.99.0.1:2222"
     /// The `[transparent.control]` block is where the server is named, so a
     /// block without one is refused — and the message names the block the
     /// reader actually wrote, not `[client.control]`.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_needs_a_server_to_dial() {
         let err = Config::from_str(
@@ -817,6 +828,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// An L3 client has claims and nothing else: a forwarding key has no home
     /// in the model, and the parse says so rather than ignoring it.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_has_no_home_for_forwarding_keys() {
         let err = Config::from_str(

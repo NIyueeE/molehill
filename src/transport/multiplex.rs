@@ -195,11 +195,11 @@ pub(crate) struct TunnelCounters {
     /// Bytes the forwarding code handed to this tunnel's streams.
     written: std::sync::atomic::AtomicU64,
     /// The KCP session's own ARQ counters, when this tunnel rides KCP (see
-    /// [`crate::kcp::SessionHealth`]): the retransmit share of the pair is
+    /// [`crate::transport::health::SessionHealth`]): the retransmit share of the pair is
     /// the per-tunnel signal a carrier policy judges. `None` on a TCP tunnel
     /// — the kernel's TCP has no userspace retransmit counter to offer, which
     /// is also why the carrier rule is one-sided by construction.
-    health: Option<std::sync::Arc<crate::kcp::SessionHealth>>,
+    health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
     /// What the **peer's** session for this tunnel has emitted and re-sent, as
     /// the peer reports it (`ControlChannelCmd::TunnelHealth`).
     ///
@@ -228,7 +228,7 @@ struct PeerHealth {
 impl TunnelCounters {
     /// The tunnel's counters, with the KCP session's health when it rides KCP.
     fn with_health(
-        health: Option<std::sync::Arc<crate::kcp::SessionHealth>>,
+        health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             streams: std::sync::atomic::AtomicUsize::new(0),
@@ -977,11 +977,17 @@ impl TunnelPool {
             grown: tokio::sync::Notify::new(),
             capacity_freed: tokio::sync::Notify::new(),
             alive: std::sync::Arc::new(()),
+            #[cfg(feature = "client")]
             health_sample: std::sync::Mutex::new(None),
+            #[cfg(feature = "client")]
             rule_streak: std::sync::Mutex::new(0),
+            #[cfg(feature = "client")]
             probe: std::sync::Mutex::new(ProbeState::default()),
+            #[cfg(feature = "client")]
             rule_tick: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "client")]
             rule_enabled,
+            #[cfg(feature = "client")]
             carrier_choice,
         });
         let mut state = PoolState {
@@ -1128,7 +1134,7 @@ impl TunnelPool {
     /// tunnel over to TCP when its session is measurably losing traffic.
     ///
     /// The signal is the tunnel's own ARQ counters (see
-    /// [`crate::kcp::SessionHealth`]): the retransmit share of what the
+    /// [`crate::transport::health::SessionHealth`]): the retransmit share of what the
     /// session emits. Measured before this existed (S1, round 37): a healthy
     /// carrier re-sends ~nothing (`retransmits` 1 against `datagrams_out` in
     /// the hundreds of thousands per cell), a carrier losing its traffic
@@ -2055,6 +2061,7 @@ impl TunnelPool {
         // tunnel, not a verdict). A stream here is one open; the probe's
         // budget is seconds, and the drain hands its streams back if the
         // verdict is Revert.
+        #[cfg(feature = "client")]
         if let Some((probed, _)) = self
             .inner
             .shared
@@ -3038,6 +3045,7 @@ fn carrier_rule_suspicion(previous: &HealthSample, now: &HealthSample) -> Option
     worst
 }
 
+#[cfg(feature = "client")]
 fn carrier_rule_verdict(previous: &HealthSample, now: &HealthSample) -> Option<(usize, f64)> {
     let mut worst: Option<(usize, f64)> = None;
     for (id, (_, _, delivered_now, handed_now)) in now {
@@ -3224,14 +3232,14 @@ impl ClientTunnel {
     }
 
     /// The same, carrying the KCP session's ARQ health when the tunnel's
-    /// connection is a KCP session (see [`crate::kcp::SessionHealth`]): the
+    /// connection is a KCP session (see [`crate::transport::health::SessionHealth`]): the
     /// counters live on the tunnel's own bookkeeping, so the pool reads this
     /// tunnel's retransmit share apart from every other tunnel's. A TCP
     /// tunnel passes `None` — the kernel keeps its retransmit state where
     /// userspace cannot read it.
     pub fn start_with_health<I>(
         io: I,
-        health: Option<std::sync::Arc<crate::kcp::SessionHealth>>,
+        health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
         config: Config,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> ClientTunnel
@@ -4206,7 +4214,7 @@ mod tests {
             tunnels.push((
                 ClientTunnel::start_with_health(
                     client_io,
-                    Some(crate::kcp::SessionHealth::new()),
+                    Some(crate::transport::health::SessionHealth::new()),
                     mux_config(),
                     shutdown_rx,
                 ),
@@ -4244,7 +4252,7 @@ mod tests {
                 tunnels.push((
                     ClientTunnel::start_with_health(
                         client_io,
-                        Some(crate::kcp::SessionHealth::new()),
+                        Some(crate::transport::health::SessionHealth::new()),
                         mux_config(),
                         shutdown_rx,
                     ),

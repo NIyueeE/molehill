@@ -245,6 +245,38 @@ expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
 expect "just bench-doctor documented" docs/benchmarks.md 'just bench-doctor'
 expect "just bench-compare documented" docs/benchmarks.md 'just bench-compare'
 
+# 16) a key the parser refuses must be in the configuration page's removed-keys
+#     tables. The parser carries the registry (REMOVED_KEYS: the keys it refuses,
+#     with the advice it hands back), and a refusal the page does not document is
+#     an upgrade that dead-ends: the user is told what to remove and never what
+#     to write. The reverse drift is what makes this worth having at all — a page
+#     that still lists `carrier` among the keys to write, for a carrier that is
+#     chosen at runtime, passes every other gate here because `carrier` shows up
+#     in prose and in a diagram rather than in a TOML block.
+#
+#     The page writes a key as `[client.data].default_carrier`, so both sides are
+#     normalised before they are compared: brackets dropped, and the page's
+#     `<name>` read as the parser's `*`.
+#     The comparison is made against a normalised copy of the page rather than
+#     by massaging the pattern, so a pattern keeps its own spelling.
+normalised=$(mktemp)
+sed -e 's/\[//g' -e 's/\]//g' -e 's/<name>/*/g' docs/configuration.md > "$normalised"
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  if grep -qF -- "$key" "$normalised"; then
+    echo "  ok    removed key documented: $key"
+  else
+    echo "  FAIL  removed key $key is refused by the parser but has no row in the configuration page's removed-keys tables" >&2
+    errors=$((errors + 1))
+  fi
+done < <(awk '/^const REMOVED_KEYS/{f=1;next} f&&/^\];/{exit} f{
+  if ($0 ~ /^[[:space:]]*\([[:space:]]*$/) { want=1; next }
+  if (want && $0 ~ /^[[:space:]]*"[a-z][a-zA-Z0-9_.*]*",[[:space:]]*$/) {
+    gsub(/[^a-zA-Z0-9_.*]/,"",$0); print; want=0
+  }
+}' src/config/parsing.rs)
+rm -f "$normalised"
+
 # soft notice: stale upstream references are expected only in provenance docs
 if grep -qiF 'rathole-org' README.md README.zh.md 2>/dev/null; then
   echo "  note: upstream 'rathole-org' references present (expected: provenance links only)"

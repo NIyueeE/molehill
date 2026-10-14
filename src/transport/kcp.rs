@@ -710,11 +710,11 @@ struct DatagramOut {
     staging: BytesMut,
     /// One span per staged datagram, in emission order.
     spans: Vec<Span>,
-    /// This session's own counter pair (see `crate::kcp::SessionHealth`):
+    /// This session's own counter pair (see `crate::transport::health::SessionHealth`):
     /// every datagram the engine stages here counts once, so the owner can
     /// read the session's retransmit share apart from the process's total.
     /// `None` in the engine-unit-test constructor — no evidence, no cost.
-    health: Option<std::sync::Arc<crate::kcp::SessionHealth>>,
+    health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
 }
 
 impl DatagramOut {
@@ -734,7 +734,7 @@ impl DatagramOut {
     /// both add to the same pair (see `spawn_session`).
     fn with_health(
         tx: mpsc::UnboundedSender<DgramBatch>,
-        health: Arc<crate::kcp::SessionHealth>,
+        health: Arc<crate::transport::health::SessionHealth>,
     ) -> Self {
         DatagramOut {
             tx,
@@ -2323,7 +2323,7 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     // both add to this pair, and the stream hands it to whoever owns the
     // session's life (a carrier policy reads it per tunnel; the global
     // counters cannot answer "this tunnel").
-    let health = crate::kcp::SessionHealth::new();
+    let health = crate::transport::health::SessionHealth::new();
     let mut kcp = Kcp::new_stream(
         conv,
         DatagramOut::with_health(dgram_tx, Arc::clone(&health)),
@@ -2375,10 +2375,10 @@ pub struct KcpStream {
     out_sem: Arc<Semaphore>,
     /// The pump's current datagram size in bytes (see `datagram_bytes`).
     datagram_bytes: Arc<AtomicUsize>,
-    /// This session's own ARQ counters (see [`crate::kcp::SessionHealth`]):
+    /// This session's own ARQ counters (see [`crate::transport::health::SessionHealth`]):
     /// shared with the engine and its staging writer, read by the tunnel
     /// owner for the carrier policy.
-    health: Arc<crate::kcp::SessionHealth>,
+    health: Arc<crate::transport::health::SessionHealth>,
     /// Parked permit acquisition, kept across `poll_write` calls. Tokio
     /// does not export the future type, so it is type-erased here.
     out_acquire: Option<Pin<Box<AcquirePermitFuture>>>,
@@ -2406,7 +2406,7 @@ impl KcpStream {
         out_sem: Arc<Semaphore>,
         in_rx: mpsc::Receiver<ReadBatch>,
         datagram_bytes: Arc<AtomicUsize>,
-        health: Arc<crate::kcp::SessionHealth>,
+        health: Arc<crate::transport::health::SessionHealth>,
     ) -> KcpStream {
         KcpStream {
             out_tx: Some(out_tx),
@@ -2422,8 +2422,8 @@ impl KcpStream {
     /// This session's own ARQ counters, cumulative: `(datagrams_out,
     /// retransmits)`. The retransmit share of the pair is the per-tunnel
     /// degradation signal a carrier policy reads (see
-    /// [`crate::kcp::SessionHealth`]).
-    pub(crate) fn health(&self) -> Arc<crate::kcp::SessionHealth> {
+    /// [`crate::transport::health::SessionHealth`]).
+    pub(crate) fn health(&self) -> Arc<crate::transport::health::SessionHealth> {
         Arc::clone(&self.health)
     }
 
@@ -2652,10 +2652,10 @@ impl std::fmt::Debug for KcpTunnelStream {
 
 impl KcpTunnelStream {
     /// This session's own ARQ counters, cumulative (see
-    /// [`crate::kcp::SessionHealth`]): the per-tunnel degradation signal a
+    /// [`crate::transport::health::SessionHealth`]): the per-tunnel degradation signal a
     /// carrier policy reads. The same pair under both shapes — the Noise
     /// wrapper exposes the session it wraps.
-    pub(crate) fn health(&self) -> Arc<crate::kcp::SessionHealth> {
+    pub(crate) fn health(&self) -> Arc<crate::transport::health::SessionHealth> {
         match self {
             KcpTunnelStream::Plain(s) => s.health(),
             #[cfg(feature = "noise")]

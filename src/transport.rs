@@ -82,6 +82,8 @@ pub use tcp::TcpTransport;
 ///
 /// Multiplex-gated because the carrier is: KCP rides on the multiplexed data
 /// plane's runtime, and a build without it has exactly one carrier, TCP.
+pub mod health;
+
 #[cfg(feature = "multiplex")]
 pub mod carrier;
 

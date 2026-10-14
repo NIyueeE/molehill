@@ -132,6 +132,8 @@ const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use crate::transport::health::SessionHealth;
+
 /// Datagrams accepted from the peer (one `input` call each).
 pub(crate) static KCP_DATAGRAMS_IN: AtomicU64 = AtomicU64::new(0);
 /// Datagrams the engine emitted (`flush`/`update` output writes).
@@ -164,41 +166,6 @@ pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
         KCP_RESENDS_RTO.load(Relaxed),
         KCP_RESENDS_FAST.load(Relaxed),
     )
-}
-
-/// One session's own ARQ counters: what a *per-tunnel* view of the carrier's
-/// health reads.
-///
-/// The process-global counters above answer "how is this process doing"; a
-/// carrier policy has to answer "how is **this tunnel's** connection doing" —
-/// a pool's tunnels are independent sessions, and only the retransmit share
-/// of the degraded one rises (measured: 1 vs ~5,000 retransmits per cell
-/// between the healthy and the lossy carrier, HANDOFF.md round 37's S1). The
-/// adapter hands one of these to each engine it spawns; a session without one
-/// (tests, tooling) costs nothing — the `Option` keeps the field free until a
-/// caller asks for per-session evidence.
-#[derive(Debug, Default)]
-pub struct SessionHealth {
-    /// Datagrams the engine emitted, ARQ payload and its own probes alike.
-    pub datagrams_out: AtomicU64,
-    /// Segments the engine re-sent: an RTO (silence) or a fast re-send (a gap
-    /// the peer's later acks exposed). The share of these in `datagrams_out`
-    /// is the degradation signal.
-    pub retransmits: AtomicU64,
-}
-
-impl SessionHealth {
-    pub fn new() -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self::default())
-    }
-
-    /// The cumulative `(datagrams_out, retransmits)` pair.
-    pub fn counts(&self) -> (u64, u64) {
-        (
-            self.datagrams_out.load(Relaxed),
-            self.retransmits.load(Relaxed),
-        )
-    }
 }
 
 /// Read `conv` from raw buffer

@@ -86,7 +86,7 @@
 > `default_retry_interval`)与 `[client.data]`(`default_data_addr`、
 > `tunnels`)——以便与
 > `[client.services.<name>]` 上的按服务覆盖键(`protocol`、`remote_addr`、
-> `token`、`retry_interval`、`carrier`、`transport`、
+> `token`、`retry_interval`、`transport`、
 > `udp_workers`、`udp_forwarder_ipv6`、`udp_send_queue_size` 等;
 > 0.8 新增)清晰区分。`[client.transport]` 的 `type`/`noise` 保持无前缀:
 > 它的按服务覆盖在嵌套的 `transport` 表里,服务层不存在同名冲突
@@ -148,21 +148,35 @@
 字节少 6%、每包 CPU 少 33%、每秒往返次数多 65%
 ([基准测试](./benchmarks.zh.md#the-transparent-l3-wire-question-the-acceptance-harness))。
 
+### 迁移到 0.11:carrier 与池的时钟
+
+哪一种 carrier 能用是网络的性质,不是部署的性质,所以数据面在运行时选择它
+(先 KCP,回退 TCP),而那些用来声明它的键已经移除。池也**固定**了——它在服务启动时
+建立、之后只做修复,既不按负载增长、也不因空闲回收——于是没有收缩时钟可配:
+
+| 已移除的键 | 改写成 |
+|---|---|
+| `[client.data].default_carrier` | 什么都不写:数据面先拨 KCP,会话建立不起来时回退 TCP。需要把两条路径分开做测量或测试时用 `MOLEHILL_DATA_CARRIER=tcp\|kcp` 强制其一 |
+| `[client.services.<name>].carrier` | 什么都不写 —— 理由同上。服务自己的 `tunnels` 是它仍能写的数据面键 |
+| `[client.data.tcp]` | `[client.data].tunnels`:无论跑在哪个 carrier 上,都是一个池、一个宽度 |
+| `[client.data.kcp]` | `[client.data].tunnels` —— 同上 |
+| `[client.data].idle_timeout` | 什么都不写:固定池不会因空闲被回收,没有超时可设 |
+
 ## 选择配置(决策树)
 
 第一个选择是模式:`[client]` 转发到本地应用,`[transparent]` 则自己拥有公网地址
 (见[透明(L3)服务](#透明l3服务))——这是关于**进程**的选择,不是关于某个服务的,
 所以它排在下面所有内容之前。
 
-默认配置——`tunnels = 4` 的固定多路复用连接池、明文传输,以及先试 KCP、建立不起来
-再回退 TCP 的数据面——对绝大多数人是正确的起点。只有树上有明确分支时才偏离;每次只改一项,
+默认配置——`tunnels = 4` 的固定多路复用连接池、Noise 控制通道(必需),以及先试
+KCP、建立不起来再回退 TCP 的数据面——对绝大多数人是正确的起点。只有树上有明确分支时才偏离;每次只改一项,
 并在**你自己的路径上**测量结果:已发布的运行、它们的数字以及如何复现,见
 [基准测试](benchmarks.zh.md)。本页负责的是**每个设置做了什么**:
 
 ```mermaid
 flowchart TD
-    A["起点:默认配置<br/>tunnels=4、<br/>明文"] --> B{"流量经过不可信网络?"}
-    B -- 是 --> C["transport type = noise<br/>+ 密钥(见传输层文档)"]
+    A["起点:默认配置<br/>tunnels=4、<br/>控制通道 Noise(必需)"] --> B{"该服务的载荷自带加密吗?<br/>(TLS、SSH、WireGuard)"}
+    B -- 是 --> C["该服务:transport = { type = \"plain\" }<br/>- 更省,且防护不减"]
     B -- 否 --> D{"并发访客连接很多?"}
     C --> D
     D -- "> ~256 并发" --> G["tunnels = 8 或更高"]
@@ -181,9 +195,8 @@ flowchart TD
 | `tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住。实测为所有路径上最差的配置 |
 | `tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
 | `tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限;在干净快速路径上实测从一条隧道到八条吞吐 +77% |
-| `carrier` | `"tcp"`(默认) | 有损与限速路径上表现良好的默认值;前提是网络不封锁 TCP 隧道 |
-| `carrier` | `"kcp"` | 在 TCP 被封锁、限速或有损的路径上改用 UDP 传输。路径干净时它会损失吞吐,所以它是按路径选,而不是默认选 |
-| transport | `"plain"` | 不加密;每字节开销最低 |
+| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价按决策的测量)) |
+| transport | `"plain"` | 不加密,每字节开销最低 —— 只适用于载荷自带加密的**单个服务**;控制通道始终加密 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
 | 池的建立 | (没有对应的键) | 池的 `tunnels` 条连接在服务启动时拨出,而不是在第一个访客到来时:请求时不需要付任何代价,成本是 `tunnels` 条空闲连接(实测每条 0.5–0.8 MiB RSS 与 2.6 个 FD,不占线程) |
 | `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断) |
@@ -428,7 +441,7 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 
 按认领的键与转发服务一一对应:`token`、`remote_addr`、`retry_interval`、
-`carrier`。`[transparent.transport]` 决定 L3 客户端两条线栈怎么建:
+`tunnels`。`[transparent.transport]` 决定 L3 客户端两条线栈怎么建:
 
 - **控制通道永远是 Noise。** 它发布的会话 nonce 是每条 lane 认证所用的
   凭证,明文控制段等于把该凭证交给路径上的所有人。其密钥对写在
@@ -443,7 +456,9 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 
 设备名写在 `[transparent].tun`。
 
-`carrier` 是认领在数据面上唯一的选择:`tcp`(默认)是每条车道一条 TCP 连接,
+认领没有 carrier 键,因此少了一件会写错的事:每条车道跑在数据面拨到的任何载体上
+(KCP,回退 TCP),载体的会话**就是**数据通道,其上没有多路复用器。认领真正要选的是它
+拿到几条车道(`[transparent.data].tunnels`)。`tcp` 是每条车道一条 TCP 连接,
 `kcp` 是每条车道一个 KCP 会话——载体自己的会话**就是**数据通道,上面没有多路复用器。
 认领永远不做多路复用:它的车道就是它的载体连接,其吞吐是这些连接之和。在同一主机、
 同一负载下实测:同一条认领走自己的连接时线上字节少 6%、每包 CPU 少 33%、
@@ -598,7 +613,7 @@ carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧�
 
 ## 调优
 
-按负载选择 `tunnels`/`carrier`/transport 的方法就是上面的
+按负载选择 `tunnels` 与 transport 的方法就是上面的
 [决策树](#选择配置决策树)(含实测花费与验证方式)。本节讲逐连接层面的
 旋钮。
 
