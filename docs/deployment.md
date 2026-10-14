@@ -394,6 +394,34 @@ client claims — it carries it, and its application binds it. Afterwards,
 `ip route get <public-ip> mark 0x1` must name the TUN device, and `ip rule
 show` must list the mark rule above the local lookup.
 
+### What each run mode needs
+
+The three modes ask the host for different things, and only one of them asks
+for anything unusual:
+
+| What is needed | `molehill --server` (forwarding) | `molehill --client` (forwarding) | An L3 pair (`--server` + `--transparent`) |
+|---|---|---|---|
+| `CAP_NET_ADMIN` | no | no | **yes, both ends** — each attaches to a TUN device |
+| A TUN device | no | no | **yes, both ends** — created by the operator, not the daemon |
+| `net.ipv4.ip_forward = 1` | no | no | **yes, on the server** — the packets it routes into the TUN are forwarded |
+| `rp_filter = 0` on the TUN and `all` | no | no | **yes** — injected packets carry the visitor's source |
+| Ports below 1024 | only if a service asks for one | no | only if a claim asks for one |
+
+Two of those are worth stating precisely, because they are the ones a working
+deployment fails on:
+
+- **A server that serves L3, and only such a server, needs `CAP_NET_ADMIN`.**
+  The capability is asked for by the `[server.transparent]` table, so a
+  `molehill --server` whose config does not carry it runs without it and
+  refuses L3 registrations by policy. A forwarding-only server needs nothing
+  special, which is why the capability belongs to the unit that needs it
+  (see [systemd](#systemd)).
+- **`ip_forward` is checked, not assumed.** With it off, the kernel drops
+  every packet addressed to a claim before the daemon reads a byte: the
+  process sees a healthy TUN and a silent device, which is the one failure
+  mode that looks like nothing at all. The daemon refuses the first
+  transparent registration with the exact `sysctl` line to run.
+
 ### Operational notes
 
 - The `ip` and `sysctl` commands are runtime state. Make them persistent with

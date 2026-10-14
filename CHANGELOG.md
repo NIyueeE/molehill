@@ -10,680 +10,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **BREAKING: the control channel must use Noise.** The session hello that
-  publishes the nonce every data channel of that session authenticates with
-  was itself unencrypted on a plain control channel — an on-path reader got
-  the data plane's credential for free, and the registration frames (which
-  carry no auth digest over their own body) were rewritable in flight. Both
-  ends now refuse to start without a Noise key pair (`molehill --genkey
-  noise` prints one): the server without `[server.transport.noise]`, the
-  client without `[client.transport] type = "noise"` and its keys, the
+  publishes the nonce every data channel of that session authenticates with was
+  itself unencrypted on a plain control channel — an on-path reader got the data
+  plane's credential for free, and the registration frames were rewritable in
+  flight. Both ends now refuse to start without a Noise key pair (`molehill
+  --genkey` prints one): the server without `[server.transport.noise]`, the
+  client without `[client.transport].type = "noise"` and its keys, the
   transparent client without `[transparent.transport.noise]`. The
-  per-connection selector stays for the data plane, so a service or a lane
-  may still run plain where the operator decides the payload carries its own
-  crypto — what ended is the unencrypted *control* leg, the one connection
-  the whole data plane trusts. Existing plain deployments add one key-pair
-  block per end; forwarding clients that already ran Noise change nothing.
-
-### Added
-
-
-- **The client can answer "what am I carrying" over an optional status
-  API.** A `[client.status]` block with a `bind_addr` and a required
-  `token` starts one read-only HTTP endpoint — `GET /status`, the only
-  path and the only method — answering `application/json`: every service
-  with its registration state, every live tunnel pool with per-tunnel
-  bytes and KCP ARQ health, and a transparent client's claims and lanes.
-  The frontend is deliberately someone else's program (mihomo's
-  external-controller split): the response carries
-  `Access-Control-Allow-Origin: *`, a panel lives on another origin and
-  reads with the token. Absent, the block is off — no listener, no port,
-  nothing to probe; present, the token is required and compared by digest,
-  because an unauthenticated topology view on the machine that is itself
-  how the traffic gets in would hand an attacker the map of what to
-  attack. It lives on the **client** and on its **own** listener: the pool
-  and the lane allocator are the client's (the server's per-tunnel health
-  already arrives there as the tunnel report), and the control port
-  carries the client's protocol and its authentication — teaching it to
-  sniff HTTP would put a parser on the one connection the data plane
-  trusts.
-- **The tunnel pool's carrier rule probes the other carrier instead of
-  trusting its own counters.** A suspicion — a tunnel re-sending 4 % or more
-  of a window it carried real traffic in — hands one tunnel to the carrier the
-  pool is not riding (the pool's own no-disruption handover), routes new
-  streams to it while the probe runs, and compares carried bytes per second
-  per tunnel past the lane policy's 1.5x edge: materially more moves the
-  endpoint's carrier under the same switch cooldown as every other move,
-  materially less gives the tunnel back and parks the pool in a 600 s backoff,
-  and a probe whose window carried nothing is held rather than judged — an
-  idle tunnel against a busy incumbent reads "carries less" on zero evidence.
-  The share suspicion is what makes the rule fire at all on a UDP-policed
-  path, where reliable ARQ keeps delivery at 99-100 % while the policer
-  starves the carrier (measured: share 27-31 % per window, delivery pinned) —
-  the one local signal the path admits, earning the comparison that decides.
-  Still opt-in: `MOLEHILL_TUNNEL_CARRIER_RULE=1`.
-- **The bench model's verdicts are statistics now, not a silent heuristic.**
-  What was "every paired round agreed in sign" — a rule whose error rate at
-  the round counts the profiles actually run was 25–50 % and never stated —
-  is an **exact sign test** whose p-value prints beside `alpha_eff`, the
-  level the run's own length can honestly test at (`2/2^n`; six rounds reach
-  p ≤ 0.05). A **bootstrap confidence interval** over the paired difference
-  (seeded from the run's fingerprint, so re-analysing a stored run
-  reproduces it) separates three things one undifferentiated "no claim" used
-  to hide: an effect *entirely beyond* the floors, one *entirely inside*
-  them (bounded evidence there is nothing worth calling), and one
-  *straddling* them (a direction, and nothing more). Claims are
-  **pre-registered** (`--primary metric=…,scenario=…`, in the fingerprint;
-  the scenario's headline metric by default) — everything else is
-  exploratory and directional at best — and the primary family goes through
-  a Benjamini-Hochberg correction. A verdict that flips when any single
-  round is dropped is marked **FRAGILE**; a cell that lost more than half
-  its rounds is refused outright (`drowned`) by the verdicts and the gate;
-  the report now also prints, per unresolvable cell, how many rounds would
-  reach the metric's floor. Results files carry the analysis version in
-  their method, so a run reduced by an older analysis is refused as a
-  baseline rather than silently compared (`schema` 3). `--normalize control`
-  divides tool arms' per-round readings by the same round's control reading,
-  for host-bound cells where that cancels drift rather than signal; and the
-  iperf3 version travels in the method (a version can change the summary
-  fields the model reads — measured across a reinstall).
-- **The server reports each multiplexed tunnel's ARQ health back to the client**
-  (`ControlChannelCmd::TunnelHealth`): emitted and re-sent datagrams per tunnel,
-  fixed-width like the transparent lane's carrier report, on the session's own
-  control writer. It is the L4 half of the evidence chain — the client dials the
-  tunnels and chooses their carrier, and on a path that polices UDP the loss that
-  matters is the *server's* sends, which the client's own counters cannot see
-  (measured: 22.9 % re-sent on the server against 0.04 % on the client). The
-  client sums both ends, so the carrier rule's share is direction-independent,
-  and the pool-stats line prints that sum.
-
-
-- **A path condition that polices UDP instead of refusing it**
-  (`--condition udp_throttled`): an `iptables -m limit` accept-then-drop for UDP
-  on the carrier's leg, 10 000 packets/s (the module's ceiling, ≈ 117 Mbit/s of
-  1472-byte datagrams). It is the shape a middlebox actually imposes on a
-  second-class protocol, and the only one where a carrier can be losing most of
-  its traffic while its own sender's counters still look calm. Measured through
-  it (`l4`, `udp-ladder`): the UDP-riding carrier delivers 78–101 Mbit/s with
-  44–93 % inner loss where the one that does not rides at 200–1047 Mbit/s with
-  0–71 %. It is a bench-model condition, tunnel leg only (the refusal says so).
-
-
-- **The multiplexed pool's carrier rule is wired — on a sender-side signal
-  the first wiring run measured as rate-dependent, so it ships off by
-  default.** Each KCP session now keeps its own ARQ counters (what it
-  emitted, what it re-sent), the pool differences two samples per
-  maintenance tick, and a tunnel whose retransmit share clears the floor for
-  three consecutive windows starts the no-disruption handover to TCP and
-  moves the endpoint's carrier decision with it under the switch cooldown.
-  The rule is one-sided by construction (a TCP tunnel's retransmit state
-  stays in the kernel). **Why off by default — the wiring run's own
-  measurement:** the S1 cells that saturated into the lossy path showed a
-  5.7 % retransmit share, but the paced cell at the same 1 % path loss
-  showed **0.6 %** — under the floor — because most of the delivered-loss
-  difference is the *peer's* queue refusing segments, which a sender's ARQ
-  counters cannot see; the same asymmetry the L3 evidence chain was built
-  around, now measured on the L4 half. `MOLEHILL_TUNNEL_CARRIER_RULE=1`
-  arms the rule for an operator or a measurement that knows its signal; the
-  peer-side tunnel report (the lane `CarrierReport`'s L4 analogue) is the
-  recorded instrument that would make it honest. The same change surfaces
-  per-tunnel KCP health in the pool snapshot (`kcp_health`, also on the
-  pool-stats line) and accepts a carrier-choice handle at pool construction
-  (`with_choice`). The `MOLEHILL_TUNNEL_SWITCH_AT` hatch is independent.
-
-- **A multiplexed pool can hand one tunnel over to the other carrier without
-  disturbing the flows on it.** The pool-level analogue of the transparent
-  lane's two-sided drain: the client excludes one unpinned tunnel of the
-  carrier its tunnels ride from new placements, the streams already on it run
-  to the end (a stream cannot move without reordering it), and only once the
-  tunnel holds no stream and no pinned UDP peer is it retired and its slot
-  refilled by the repair dial on the other carrier. At most one tunnel is
-  handed over at a time, both of its waits are bounded — a tunnel that never
-  quiets returns to service, and a replacement that cannot be established
-  releases the handover to ordinary repair — so a pool is never left one tunnel
-  short for ever, and a placement refusal inside the window is not reported as
-  pool saturation. The mechanism has no trigger of its own yet; it is reachable
-  through the new `MOLEHILL_TUNNEL_SWITCH_AT=<seconds>` diagnostic hatch, the
-  L4 counterpart of `MOLEHILL_CARRIER_SWITCH_AT`, and its state is visible in
-  the `MOLEHILL_POOL_STATS` line (per-tunnel `phase`, a `handover` field, and
-  `-handover` in the size timeline). No speedup claimed — this is the machinery
-  a per-tunnel quality rule needs, priced by the same A/B discipline before any
-  rule acts on it. The hatch's value is read **per pool**, at the moment that
-  pool starts (a process-wide cache briefly pinned the first pool's answer
-  onto every pool built after it, and an invalid value is reported once per
-  process rather than at every pool creation).
-
-- **A transparent claim's lanes move to the other carrier when the one in use is
-  measured to be losing its traffic.** Each lane now carries its own identity
-  (named by the client in the channel's prologue), the server reports what it
-  offered each lane and what that lane's queue refused there, and the client
-  decides on that pair against what it injected off the lane — the end that
-  chooses the carrier can finally see the loss, which happens where the packets
-  are *offered* (the peer's device) and reads as zero in its own counters. A lane
-  whose peer-side queue refuses a material share of what it was offered, for
-  three consecutive one-second samples, is handed over: the client asks the peer
-  to stop placing new flows in it, and retires it only once **both** ends agree
-  it holds nothing — so a running flow finishes where it is and is never
-  reordered, while the replacement lane rides the carrier now preferred. A drain
-  the peer never answers is called off, and a handover in flight outranks lending
-  a lane to another claim. `MOLEHILL_L3_STATS=1` prints each lane's own counters
-  (`offered`, `enqueued`, `overflow`, `disconnected`, `injected`) beside the
-  peer's view (`peer_offered`, `peer_refused`).
-  **Measured** (bench model, `l3`, 1 %-loss path with a finite buffer, ladder
-  first so the policy fires, 4 rounds, the run's own A/A twin): in the rounds
-  whose handover completed before the 5 Gbit/s ladder cell began, that cell read
-  **13.7 % and 7.4 % loss at 2.9-3.1 Gbit/s** against the held carrier's
-  **65.5-67.0 % at ~1.04 Gbit/s** — 3x the delivery, in exactly the rounds the
-  handover's timestamps name and untouched in the others. The price is stated
-  beside it: `syscalls_per_s` +31 % on that cell (a claim by the model's own
-  floors), TCP's per-datagram work against KCP's batched send, while
-  `cpu_s_per_gbit` in the captured rounds improves (carrying 3x on a carrier
-  whose per-byte cost is lower). Carrier reports are matched to their claim
-  before the lane id is consulted (every claim mints its lane ids from 1 in one
-  shared hub, so the first lookup landed a report on whichever claim held that
-  number), and a lane being handed over retires on the same 3-second quiet
-  window the peer's drain answers — the flow table's own 60-second idle
-  eviction used to hold a handover past the end of a measured round.
-
-- **A transparent (L3) claim's carrier connections come from its carrier's
-  budget, and its inner flows are spread across them.**
-  `[transparent.data.tcp|kcp].tunnels` is a **lane budget** for a transparent
-  client: one lane *is* one carrier connection (a claim never multiplexes),
-  divided equally among the claims that draw on that carrier and never below one
-  each. A client that writes no budget keeps exactly the old shape — one
-  connection per claim — and `tunnels = 4` with two claims gives each of them
-  two connections. A budget below the claim count is refused with the number to
-  write, and its bound is 1024 rather than the pool's 64, because a lane is a
-  connection rather than a stream. The claim's inner flows are **spread across
-  its lanes**, one flow per lane, by a hash of the flow's five-tuple — computed
-  on the canonical (sorted) endpoint pair, so both directions of a flow ride the
-  same lane — which is what stops a claim's throughput from being one
-  connection's ceiling; a flow is never split, so nothing is reordered. A lane
-  that dies keeps its slot: its replacement inherits the index and the flows
-  placed in it resume there, while the surviving lanes are untouched. A flow
-  whose lane is gone is dropped rather than moved onto a survivor (moving it
-  would reorder it against what the dead lane had already delivered);
-  `MOLEHILL_L3_STATS=1` counts those drops on the dead lane's own line, and
-  prints one line per lane slot (`live`, `forwarded`, `no_channel`), which is
-  how a set is told from a stack. On a jumbo path with eight inner flows, four
-  lanes carry 13.9 Gbit/s against one lane's 7.0 while a single flow is
-  unchanged; the method, the numbers and the run's own noise floor are in
-  [docs/benchmarks.md](docs/benchmarks.md).
-
-- **The KCP carrier can carry one channel with no multiplexer above it.** A
-  transparent claim's lane may ride KCP: the client opens one KCP session per
-  lane and the server's KCP listener reads the data-channel hello exactly as its
-  TCP listener does, so `carrier = "kcp"` costs a claim nothing but the
-  carrier's own behaviour. The previous refusal (a KCP session was only ever a
-  multiplexed tunnel) is gone, in the client model and in the transparent (L3)
-  model alike. What the carrier costs and what it buys is measured, per path
-  condition, in
-  [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
-
-### Added
-
-- **A diagnostic carrier switch, to measure what switching is worth.**
-  `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` moves every transparent claim to the
-  other carrier that many seconds after its pool starts and drains each claim's
-  busiest lane so the replacement is dialed on the new carrier — a lane keeps the
-  flows already on it and takes no new ones, so nothing is reordered. Measured
-  with it: on a 1 %-loss path the 2 Gbit/s UDP ladder cell goes from 1057.6
-  Mbit/s with 40.7 % loss to 1883.5 with 4.5 % (+78 %), and the 5 Gbit/s cell
-  from 1041.8 / 62.0 % to 3067.5 / 7.9 % (+194 %), while the cells where the two
-  carriers are level do not move. It is a measurement hatch, not a deployment
-  knob: the shipping behaviour stays the runtime decision in `CarrierChoice`,
-  and the policy that acts on that evidence is the next change.
-
-### Changed
-
-- **A peer arm's tool version travels with its numbers.** The method record
-  now carries `peer_versions` — the resolved version of every reference tool
-  a run measured (rathole, frp, nps), read through the tool's own `--version`
-  output with the fetcher's release marker as fallback. The function existed
-  and the fetcher wrote the marker, but nothing called it at run time, so a
-  peer's numbers arrived without the version that produced them — the one
-  provenance line a published peers chart could not self-verify (the iperf3
-  version has traveled in the same record since the statistics reform).
-  Found by a rehearsal run of the release ritual, not by review.
-
-- **The gate chain classifies bench-only changes, and the feature table became
-  a registry.** `githooks/benches-only` mirrors `githooks/docs-only` for
-  `benches/scripts/**`: the scripts are runtime tooling — `uv run` entries and
-  shell helpers, never compiled, linked or depended on by a Rust target — so a
-  commit touching only them runs the gates it can move (secret scan, docs
-  check, both ruff gates, the bench-model self-check) and skips the cargo
-  gates it cannot; a push carrying only such commits skips the heavy gates
-  too (audit, deny, outdated and tests cannot move either), running the docs
-  check alone. CI keeps the full chain for such a change, so the hooks are a
-  latency split, never a coverage split. And `githooks/check-docs` now
-  checks every public feature name in `[features]` against
-  [docs/build-guide.md](docs/build-guide.md) (the two names the page had
-  never mentioned, `embedded` and `console`, are documented now): a name in
-  the table that no page documents is either a dead pipeline row — the gate
-  side of the same rule is already caught by rustc's `unexpected_cfgs` — or a
-  feature nobody can discover.
-
-- **The feature names are intent names only.** `hot-reload` no longer exists
-  as two spellings: its 22 code gates read `feature = "hot-reload"` instead of
-  the implementation dependency's name (`notify`), so `--features hot-reload`
-  is the only spelling the table and the code share. `noise` now pulls its
-  three dependencies through `dep:` aliases (`base64`, `snow`,
-  `pin-project`), which removes them from the public feature surface —
-  previously every one was a selectable `--features` name that gated no code
-  of its own. No supported build changes what it compiles: every combination
-  the CI matrix and the docs name is spelled with the intent names and
-  resolves to the same dependency set as before.
-
-- **The KCP send window is 8192 segments, not 2048.** The window is the
-  carrier's throughput ceiling as soon as a path's bandwidth-delay product
-  exceeds it, and on a lossy path it did: 2048 segments ≈ 2.8 MiB carried
-  **533 Mbit/s at the ~44 ms round trip** those paths settle at, which is what
-  the per-second counters showed (`wait_snd` pinned at its limit while neither
-  end's CPU was busy). Measured as a two-binary A/B on a 1 %-loss path with a
-  10 000-packet queue, the 1 Gbit/s UDP ladder cell moves from **42.3 % inner
-  loss / 556 Mbit/s delivered to 0.2-0.7 % / +43 % delivered** (every round
-  agreeing, both floors cleared), at +47 % CPU cores on that cell. The same A/B
-  is indistinguishable on a clean path, including the four-tunnel burst cells
-  that pinned the smaller window in the first place, so this is the ceiling
-  coming off rather than a burst trade.
-
-- **The data plane's carrier is not a key: it is KCP, with TCP as its built-in
-  fallback.** `[client.data].default_carrier`, `[client.services.<name>].carrier`
-  and the never-released `[transparent.data].default_carrier` /
-  `[transparent.claims.<name>].carrier` are gone, and with them the per-carrier
-  rows: `[client.data.tcp]`/`[client.data.kcp]` and
-  `[transparent.data.tcp]`/`[transparent.data.kcp]` collapse into one table,
-  where `tunnels` is the only key they held. Which carrier carries the data
-  plane is a property of the network between the two ends — UDP may be blocked,
-  shaped, or fine today and blocked tomorrow — so the client tries KCP (feature
-  `kcp`) and falls back to TCP when a session cannot be established at all:
-  one bounded attempt (2 s), remembered per data endpoint, re-probed after 60 s,
-  announced once at `INFO` and then at `DEBUG`. A forced carrier
-  (`MOLEHILL_DATA_CARRIER=tcp|kcp`) is a *measurement* switch, not a
-  deployment choice; it also disables the fallback, which is what makes it
-  usable as an arm. Migration: move `tunnels` up one level
-  (`[client.data.tcp].tunnels = 4` → `[client.data].tunnels = 4`), delete every
-  `carrier` / `default_carrier` line, and leave the rest alone.
-
-- **The bench model can tell a carrier's loss recovery from the shaper's own
-  drops.** The new `loss1_deep` condition is the same 1 % loss with a
-  100 000-packet queue; without it, the `loss1` class runs on netem's default
-  1000-packet queue and tail-drops on top of the loss it emulates, which the KCP
-  ladder cell read as the carrier losing packets (384.6 Mbit/s / 59.5 % became
-  545.0 / 42.5 % on the deeper queue, against the TCP fallback's 988.4 / 0.051 %).
-
-- **The bench model lost its carrier axis with the key it described.** An arm can
-  no longer name a carrier (`force_carrier`, `l3-kcp`, `l3-tcp`, `l4-kcp`,
-  `l4-tcp` are gone): naming one would describe a setting the product no longer
-  has. The contrast moved to the *path*, where the product's own decision
-  actually lives — the new `udp_blocked` condition drops UDP on the leg the
-  carrier crosses, so the KCP attempt cannot be established and the run measures
-  the **TCP fallback** (the fallback line and `carrier="tcp"` in the pool's
-  output are its evidence), while a clean run carries KCP. The condition is
-  refused on any leg but `tunnel`, because on the visitor's leg it would drop
-  the payload and the carrier would come up as usual — a run whose method said
-  "fallback" while every packet rode KCP. Isolating one carrier (say KCP under
-  loss, with no fallback) is now the inherited `MOLEHILL_DATA_CARRIER` switch,
-  which every results file records as instrumentation.
-
-- **A transparent claim's lanes are lent to the claim that needs them.** The
-  lane budget (`[transparent.data.tcp|kcp].tunnels`) used to be split equally at
-  startup and left that way, so a claim carrying sixteen flows on two
-  connections and a claim carrying nothing held the same number. The client now
-  looks once a second and moves at most one lane: from a claim that has a lane
-  with no flow in it and more than one lane, to the claim furthest from *a lane
-  per talking flow*. Three properties make it safe rather than clever — a lane
-  is asked to end only when it holds no flow at all, the receiver's lane is
-  dialled only after the donor's has actually ended (so the number of carrier
-  connections the operator pays for never grows, it moves), and a claim is never
-  reduced below one lane, which is what keeps it reachable. What it cannot do is
-  worth saying too: a *single* flow cannot be spread over two lanes — its
-  packets have to stay in order — so the gain is per flow, and a one-flow
-  workload is unaffected by design. Lending is observable: the client logs
-  `Lane allocator: lent lane N of claim A to claim B`, and
-  `MOLEHILL_L3_STATS=1` shows each lane's `flows`, and
-  `[transparent.data].lend = false` turns the mechanism off (the equal split
-  held static) for a deployment that would rather not trade connections for
-  throughput.
-  **Measured** (bench model, `bulk-n`, ten rounds, A/A twin beside it, the two
-  catalog arms `l3-budget10-lending` and `l3-budget10-nolend`): on a path whose
-  *carrier connections* are the limit — a 100 ms tunnel leg here — lending is
-  worth **+27 % throughput** for one claim (2.395 against 1.754 Gbit/s, a claim
-  by the model's rules: 10 % materiality, sign agreement 1.0), at +8 % CPU per
-  byte and +32 % CPU cores, because it carries more of the same traffic over more
-  connections. Under 1 % loss the same comparison is +12 % and directional; on a
-  clean fast loopback the L3 path is limited per packet instead and the
-  difference is inside the noise. The mechanism is a trade, not a free win, and
-  it is one the operator prices twice: with the lane budget, and with
-  `lend = false`.
+  per-connection selector stays for the *data* plane, so a service or a lane may
+  still run plain where the payload carries its own crypto. Existing plain
+  deployments add one key-pair block per end; forwarding clients that already
+  ran Noise change nothing.
 
 - **The data plane's shape is derived from the service type: `mode` is gone.**
   A forwarding service always multiplexes over its pinned pool; a transparent
   claim never does, because its channels *are* its carrier connections.
-  `[client.data].default_mode` and `[client.services.<name>].mode` — and their
-  `[transparent.data]`/`[transparent.claims.*]` counterparts, which were never
-  released — are refused with an upgrade message naming the key, as are
-  `[transparent.data].shared_pool` and the transparent
-  `members`/`default_members` (a claim's connections come from its lane budget
-  now). Why: multiplexing a claim is framing for nothing — on one host and
-  workload the same claim on its own connection moved 6 % fewer wire bytes, took
-  33 % less CPU per packet and carried 65 % more round trips per second than the
-  same claim as one stream of a pool, and one stream on a two-tunnel pool
-  carries 9.15 Gbit/s against 18.95 on a connection of its own, at +87 % CPU per
-  byte, against that run's own 15.35 % A/A floor
-  ([HANDOFF.md](HANDOFF.md), "The mux×1 gap, measured before touching it"). The
-  wire protocol is unchanged.
+  `[client.data].default_mode` is refused with what the service type already
+  decides.
+
+- **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`.** The pool used
+  to be elastic — it started cold, grew on load and gave tunnels back when idle,
+  so its width was a *result* rather than a setting. It is now dialed at the
+  configured width (`[client.data].tunnels`, default 4) and never resized for
+  load; a dead tunnel is repaired back to the count. `[client.data].max_tunnels`
+  and `[client.data].idle_timeout` are refused with the replacement / the
+  reason. Measured: one tunnel is the worst configuration on every path, two
+  captures most of the lossy-path gain, and more keeps paying on a clean fast
+  path ([benchmarks](docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)).
+
+- **The data plane's carrier is not a key: it is KCP, with TCP as its built-in
+  fallback.** `[client.data].default_carrier` and the per-service `carrier` are
+  gone — which carrier works is a property of the network, not of the
+  deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement or a
+  test.
+
+- **The KCP send window is 8192 segments, not 2048**, and **the KCP carrier's
+  datagram size follows the path** (it was pinned at 1400 and could only
+  shrink). Both were throughput ceilings on exactly the paths where they
+  mattered.
+
+- **A transparent claim's lanes move to the other carrier when the one in use is
+  measured to be losing its traffic.** Each lane carries its own identity; the
+  server reports what it offered each lane and what that lane's queue refused
+  there, and the client decides on that pair — the end that chooses the carrier
+  can finally see the loss, which happens where the packets are *offered* and
+  reads as zero in its own counters. A lane is retired only once both ends agree
+  it holds nothing, so a running flow finishes where it is.
 
 - **`[server.data].max_tunnels_per_client` now counts a transparent claim's
-  lanes too.** The valve was checked on the tunnel hello, so it bounded
-  multiplexed data tunnels and nothing else — and a claim's lane is a plain data
-  channel of its own, which made a claim's carrier connections the one kind of
-  establishment no server-side policy bounded. The cap now covers both, because
-  both are what it says: the carrier connections ONE client may hold across the
-  services of its session. A lane over the cap is dropped with one `INFO` line
-  naming the cap (then `DEBUG`), and the claim keeps serving on the lanes it
-  got. Deployments that set the key *and* run transparent services with a lane
-  budget may need to raise it; `0` (the default) is unlimited and unaffected.
-  A build without the `multiplex` feature has no session counter, so its lanes
-  stay unbounded.
+  lanes too**, so the operator's valve bounds every carrier connection a client
+  holds, not just the multiplexed ones.
 
-- **A claim's flow placement is remembered, so a lane change cannot reorder a
-  flow.** The hub used to route every packet by `hash % width`, which meant a
-  lane *joining* re-placed every established flow — the one event that could
-  deliver a flow's packets out of order. Placement is now a table: a flow is
-  placed once, on its first packet, into the least-loaded live lane (ties broken
-  by the same one-hash-of-the-five-tuple rule, which is what lets both
-  directions, and both ends of a claim, agree without anything on the wire), and
-  its entry routes every later packet. Two consequences are observable: a new
-  flow never lands in an empty slot, whose packets would be dropped while a live
-  lane could carry them, and an entry is forgotten only after 60 s of silence in
-  either direction — safe, because a flow that quiet has nothing in flight left
-  to reorder. The table is bounded; a flow past the bound is placed by the hash
-  alone, which is stable for as long as the set's width is.
-  `MOLEHILL_L3_STATS=1` prints each lane's `flows` count beside `live`,
-  `forwarded` and `no_channel`, which is how an idle lane is told from a busy
-  one.
+- **The feature names are intent names only.** `hot-reload` no longer exists as
+  two spellings (its 22 code gates read the feature, not the dependency's
+  name), and the feature table is a registry: every `[features]` row except
+  `default` must be documented in the build guide.
 
-- **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`, established at
-  service start.** The client's data plane used to run an *elastic*
-  per-carrier pool: it started cold, grew on load, for a stripe group and to a
-  UDP service's worker count, and gave tunnels back after an idle timeout. A
-  pool's width is now a configuration decision (`[client.data.tcp].tunnels` /
-  `[client.data.kcp].tunnels`, default 4, raised to a UDP service's declared
-  worker count) and nothing moves it at runtime: all of them are dialed when the
-  service activates, none is reaped for idleness, and a tunnel that dies is
-  **repaired** back to the count — repair is the one establishment after
-  startup, and it is not growth.
-
-  Why: an elastic pool's width is a *result*, and a result depends on the
-  history of the process — which makes capacity unpredictable for an operator
-  and a run incomparable for a measurement. The measurements that size the new
-  key are unchanged and on [docs/benchmarks.md](docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements):
-  one tunnel is the worst configuration on every path measured (an L3 claim on
-  one carrier connection carries the same for one inner flow and for eight),
-  two captures most of the lossy-path gain (8 flows: 3.34 → 5.92 Gbit/s on the
-  model's `loss1` cell), and more keeps paying on a clean fast path (12.85 →
-  22.81 Gbit/s from one tunnel to eight). Establishment is paid at startup
-  rather than by the first visitor, and the cost of a tunnel is 0.5–0.8 MiB
-  RSS and 2.6 file descriptors, with no threads.
-
-  What changed for a config: `[client.data.tcp|kcp].max_tunnels` is refused with
-  an upgrade message naming `tunnels`; `[client.data].idle_timeout` is refused
-  because there is nothing to reap; an explicit `tunnels` below what the
-  carrier's UDP services need is refused with the number to write instead. The
-  server-side valve `[server.data].max_tunnels_per_client` is unchanged — it now
-  bites at a client's *startup* (the extra establishments are refused and
-  retried) rather than during growth. `MOLEHILL_POOL_STATS` reports the
-  configured `count` beside the live `size`, and the timeline's reasons are
-  `+repair` / `-dead`. A pinned pool cannot grow, so the refusal that used to
-  trigger growth now reports itself: the first time a visitor is refused
-  because every tunnel is at placement's ceiling (56 streams of the engine's
-  64), one INFO line names the count and the key to raise, and later refusals
-  are DEBUG. The wire protocol is unchanged.
-
-### Fixed
-
-- **The `embedded`, `noise` and `transparent` feature combinations compile
-  again.** The `NoiseConfig` re-export was gated on `multiplex` *and* `noise`
-  (two stacked cfg attributes), so a build with `noise` but without
-  `multiplex` — the documented `embedded` release set among them — failed on
-  the noise transport's own import; and the transparent module referenced the
-  multiplex-only `Carrier` type from paths its own cfg gates do not cover
-  (the stats line used a fully-qualified path past the gated import, and the
-  carrier policy's types had no non-multiplex shape). The re-export is now
-  gated on `noise` alone; the transparent module carries the empty `Carrier`
-  stub its own documentation always promised (every `Option<Carrier>` is
-  `None` without `multiplex`, and the carrier policy compiles only where a
-  choice exists); the KCP `connect_stream` takes the noise options in every
-  build so its call sites do not fork on the feature. Verified with
-  `cargo hack check --feature-powerset`.
-
-- **The tunnel byte counters no longer take a process-wide lock on the IO
-  path.** Counting what every multiplexed channel read and wrote lived in a
-  global `Mutex<HashMap>` that *every* data-channel poll locked — an
-  always-on cost for an opt-in diagnostic. The counters are two relaxed
-  atomics on each tunnel's own bookkeeping now, and the pool snapshot
-  carries them (`MOLEHILL_TUNNEL_STATS` reads the same registry every pool is
-  already in; its line is `index:delivered/written` in pool order). The A/B
-  on the clean l4 cells reads no claim on throughput and CPU (all inside the
-  run's own A/A floors) and a directional RSS drop on the many-tunnel cells
-  (rr-16 −5.2 %, bulk-n −6.8 %, floor 4.9 %) — consistent with the registry
-  no longer growing with every tunnel a process ever built.
-
-- **A tunnel pool's repair now follows the endpoint's carrier preference.** A
-  pool's dialer was built for the carrier the pool was created on, so a pool that
-  came up on KCP kept repairing into KCP after UDP stopped working: it served on
-  whatever tunnels survived, for the process's life, while the client's own
-  carrier choice had already fallen back to TCP. A repair now asks which carrier
-  to establish — the same choice the fallback and the lane policy drive — and
-  each tunnel records what it actually rides, so the pool's telemetry says what
-  is true rather than what the pool was born as.
-
-- **A KCP control frame that shared a datagram batch with payload is no longer
-  fed to the ARQ and dropped.** Only the first datagram of a batch was
-  classified, so a `PING`/`PONG`/`SACK`/`CLOSE` frame arriving behind data — the
-  shape a keepalive or a close has whenever it shares a readiness wake with the
-  payload it was sent with — was handed to the state machine as a short KCP
-  segment and rejected. A `CLOSE` lost that way is the retired-lane black hole
-  again, reachable from ordinary bursty traffic.
-
-- **A deliberate carrier switch is no longer undone by a reachability
-  re-probe.** Moving to TCP pushed the KCP re-probe out by 60 s while promising
-  to hold the decision for 120 s, so a session that came up in between switched
-  the endpoint back — an event that says only "UDP connects now", not that KCP
-  carries more. The re-probe now waits at least as long as the switch is held,
-  and a successful session does not clear a held decision.
-
-- **A transparent lane's handover completes.** A peer's drain waited for the
-  placement table to forget a flow (a minute) rather than for the lane to go
-  quiet (three seconds), which is longer than any dialer waits — so on a
-  workload that changes flows every few seconds every drain was called off. A
-  peer's drain now waits for `active_flows == 0`; the local retirement and the
-  lending path keep the stricter emptiness rule.
-
-- **A forced carrier (`MOLEHILL_DATA_CARRIER`) now stops the lane policy.** The
-  switch was refused (a forced carrier is the run's answer) but the peer was
-  still asked to drain a lane, taking it out of service for a switch that could
-  not happen.
-
-- **A retired or lost transparent lane no longer leaves the peer writing into a
-  channel that carries nothing.** A KCP session has no close handshake, so the
-  side whose lane ended went away silently: the peer kept forwarding a visitor's
-  traffic into it and never found out, because its dead-link rule wants 20
-  retransmits *and* a send window that has stood still for five seconds — and a
-  lane with traffic never has a still window. Measured while reproducing it: in
-  30 s the peer sent 7876 datagrams of which **7288 were retransmissions** and it
-  still held the session open. The adapter now sends a **CLOSE control frame**
-  (the same 16-byte vocabulary as PING/PONG/SACK) when both halves of a stream
-  are gone and the ARQ tail is flushed, and a session that receives one ends at
-  once, so the peer's lane task sees the end, vacates its slot, and the flows
-  pinned to it are re-placed onto the lanes that remain. The bench cell that
-  showed the defect — `l3-budget10` over `udp-ladder,udp-pace` on a 1 %-loss path
-  — goes from whole rounds of **100 % loss** to 0.8-1.4 %.
-
-### Fixed
-
-- **A refused KCP datagram is held, not dropped.** The send path discarded
-  anything the pacer would not admit or the kernel would not take (a denied
-  span, a partial `sendmmsg`, an `EAGAIN`) and let the ARQ re-send it a round
-  trip later — so every act of rate control and every full socket buffer became
-  packet loss. Refusals are now parked, in order and bounded by half the
-  retransmission timeout, and retried: **+12 % throughput on the benchmark's
-  lossy leg** (1.824 against 1.627 Gbit/s, disjoint ranges) at an identical wire
-  ratio, neutral on the clean and long-haul cells. Pacing the send burst to the
-  bandwidth-delay product on top of that is worth another +21 % on the
-  long-haul cell but costs 14 % more wire bytes there; it is measured, recorded
-  and **not** carried.
-
-- **A KCP retransmission timeout now clears the round trip it is timing.** The
-  reference's timeout is `srtt + max(interval, 4·rttvar)`, and this adapter sets
-  the flush interval to 10 ms for latency — which left a 200 ms path with a
-  **205 ms** timeout, so acknowledgements that arrived at 200 ms plus the
-  receiver's own batching were treated as losses: on the model's `rtt100` cell
-  (100 ms each way, no loss configured) 21 % of the datagrams never reached the
-  receiver and 28 % of what was sent was recovery traffic. A margin of `srtt/8`
-  (nothing changes below an 80 ms round trip) cuts RTO-driven resends by 42 %
-  and the wire ratio from 1.20 to 1.09, with throughput unchanged. Related
-  repairs measured and **not** carried, with their numbers on the benchmarks
-  page: pacing the send burst to the bandwidth-delay product (35 % slower) and a
-  window byte budget (two thirds of the lossy leg's throughput).
-
-- **A KCP session no longer throttles itself for being busy.** The carrier's
-  send pacer, which stands in for congestion control (`nc=1`), took its only
-  signal from a keepalive PONG that arrived later than 2.5 s — and a PONG queued
-  behind a peer that is busy sending is exactly what a *fast* path looks like.
-  The cut is 25 % and the recovery 5 % per four clean PONGs, so one heavy
-  transfer ratcheted the rate down four times (12 → 3.8 Gbit/s, measured) and
-  left it there for the rest of the session: the next transfer in that session
-  read a fraction of the same transfer on a fresh one (**1.00 against 7.79
-  Gbit/s** on the same cell, reproducibly). A late PONG now only cuts when the
-  send window is *not* moving — a peer that is acknowledging data is working,
-  whatever its keepalive looks like — and the slow regimes confirm the fix costs
-  nothing there (`rtt100` 0.169 → 0.182 Gbit/s, `loss5` unchanged). The
-  `MOLEHILL_KCP_STATS` line also gained the gauges this needed: reader-channel
-  and spill residency, the peak send-queue depth, the advertised and peer
-  windows, and the pacer's current allowance.
-
-- **A KCP session is no longer declared dead for being slow.** The dead-link
-  rule was the reference implementation's — a segment retransmitted twenty times
-  ends the session — which cannot tell a peer that is *gone* from one that is
-  *slow*. On a rate-limited path the acknowledgements queue behind the shaper,
-  so a segment collects its twenty retransmissions while the peer is answering
-  everything else, and the session (and the visitor's connection with it) is
-  closed: measured on the benchmark's 100 Mbit/s, 20 ms, 1 %-loss leg, the
-  multiplexed KCP arm failed its bulk cell in **every** round before this change
-  and completes **both** rounds after it. A session now ends only when the count
-  is reached *and* the send window has not moved for five seconds — a gone peer
-  stops acknowledging, a slow one keeps acknowledging something
-  ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
-
-### Changed
-
-- **The KCP carrier's datagram size follows the path.** It was pinned at KCP's
-  1400-byte default, and the adaptation that existed was shrink-only: a small
-  path lowered the size, a jumbo path never raised it. Since the carrier's cost
-  is per *datagram* — a UDP send, a receive, a header, an acknowledgement and a
-  loss event — a jumbo path paid that 5.7× more often than it had to. The
-  carrier now sizes its segments from the kernel's path-MTU answer, from 1400 up
-  to an 8 KiB ceiling, re-read once a second, so a session on a 1500-byte path
-  behaves exactly as before (measured neutral) while one on a jumbo path
-  measures **+39 % throughput and −28 % CPU per byte** on a clean path, and
-  **4.2×** on a lossy one ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
-  No configuration changes; the kernel's own answer is the policy.
-
-- **The benchmark model is one runner again: the soak sweep is a profile of
-  it.** `benches/scripts/bench/` now owns everything a performance number is
-  produced by — the metric registry, the topology, the workloads, the scripted
-  conditions and timelines, the reference tools (frp, rathole, nps) as arms,
-  the noise floor, the verdicts, the charts and the release gate — and the
-  retired sweep's scripts are gone. What that means for a reader of the
-  numbers: the staged schedule and the load ramp travel in one results file
-  under one schema (`--profile sweep`), a chart is rendered from that file by
-  `just bench-plot`, a release run is gated by `just bench-gate` (coverage, the
-  endpoint invariant, the SLO on the clean stages, the drift and wedge axes,
-  the ramp, and the regression half against a baseline), and the published
-  records of the previous model stay in `benches/records/` as history — never a
-  regression baseline, because the gate refuses a baseline whose method record
-  does not match. The method, the metric definitions and the profiles are on
-  [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard).
-  An arm now states its **carrier** as well as its mode (`l3`, `l3-mux`,
-  `l3-kcp`, `l3-mux-kcp`, `l4-kcp`), so the two axes are measured apart, and the
-  condition vocabulary gained `loss1_rate100` — a 100 Mbit uplink that also
-  loses packets, the lossy WAN the carrier choice is actually about. First
-  measurements of that axis: [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model).
-  Two metrics changed scope after an audit of their instrument:
-  `bytes_per_syscall` and `syscalls_per_s` are **device-I/O** readings
-  (`/proc/<pid>/io` does not account socket payload — 200 MB through a
-  socketpair moves `rchar` by 105 KB, the same bytes through a pipe by 209 MB),
-  so only an L3 arm publishes them now and a forwarding arm records a typed
-  absence instead of a number that described the runtime's plumbing.
+- **The benchmark model is one runner again.** `benches/scripts/bench/` owns
+  everything a performance number is produced by, and the soak sweep is a
+  profile of it. Records measured with the model it replaced stay in
+  `benches/records/` as published history.
 
 ### Added
 
 - **Transparent (L3) clients: the client owns the public `ip:port`.** A
   `[transparent]` block is a run mode of its own, and every entry it has is a
   claim: the client owns a public `ip:port` on a TUN device, the server routes
-  whole IP packets into the tunnel, and the client's own kernel answers the
-  visitor. Choosing a mode is choosing what the *process* is — its capabilities,
-  its device — so the block is a peer of `[server]` and `[client]`
-  (`--transparent`, or the block alone), a file carrying two of them is refused,
-  and a host that both forwards and claims runs two processes. That is also why
-  a claim has no `protocol` key and no home for `local_addr`, `nodelay` or the
-  UDP-only keys: they cannot be written, rather than being written and refused,
-  and `protocol = "transparent"` inside a `[client]` service is refused with a
-  message naming the entry's new home. The model is a front end, not a second
-  engine: it lowers into the same `ClientConfig` the forwarding path runs on, so
-  the client, the data path and the wire are unchanged. The L3 data path moves
-  **batches**: the TUN device is drained and every packet is framed where it is
-  read, so a run of frames leaves as one write — the carrier pays one header and
-  one acknowledgement per batch instead of per packet, and a batch is flushed
-  the moment the device runs dry, so nothing waits for company. Measured on one
-  host and workload, that took 12 % off the wire on a bulk flow, and its
-  `[transparent.data]` defaults to `mode = "direct"` (a claim has exactly one
-  channel) for another 6 % of the wire, a third of the CPU per packet and 65 %
-  more small round trips per second than `multiplex`. Both halves of the data
-  path batch, reads as well as writes: one socket read carries a run of frames
-  and the inject loop walks the run, so a burst costs one read and then a run of
-  device writes instead of two awaits per packet (bulk: +27 % throughput, −56 %
-  CPU per packet on the arm those were measured on). Numbers, the build they
-  came from, and the no-tunnel controls that keep them honest are in
-  docs/benchmarks.md, "The transparent-L3 wire question". The backend therefore sees the visitor's real
-  source address, TCP keeps its end-to-end semantics, and the server holds no
-  socket and no per-flow state for the connection. Both ends attach to an
-  **existing** TUN device named by `[client.transparent].tun` /
-  `[server.transparent].tun` (default `molehill0`) — the daemon never creates,
-  addresses or routes it — and a prerequisite that is missing (the device, an
-  address the client does not carry, a non-zero `rp_filter`) is refused with
-  the exact command to run instead of silent packet loss. Linux only, with
-  `CAP_NET_ADMIN` on the client and on any server that serves it; the `transparent` feature is in the default
-  set, and a config that asks for the type on another platform, or in a build
-  without the feature, is refused with a precise reason. Serving L3 is the
-  **server operator's** decision: the `[server.transparent]` table is that
-  switch, and without it a registration is refused by policy before any device
-  is looked at — so a client can never be what makes the server reach for
-  `/dev/net/tun` or ask for `CAP_NET_ADMIN`, and a server that only forwards
-  `tcp`/`udp` needs no capability for this feature at all. `local_addr` and
-  `nodelay` are refused for the type — the local application binds the claimed
-  address itself, so nothing is dialed — as are the UDP-only keys. The wire
-  moves to **protocol v5** (one service type and one data-channel command,
-  `StartForwardTransparent`, whose channel carries `[u16 length][packet]`
-  frames), so both ends upgrade together as with every protocol change.
-  `MOLEHILL_L3_STATS=1` prints the data path's cumulative counters. Such a
-  service is **never encrypted**: the visitor's own end-to-end protection is
-  the content's and this hop is a plain link by design, so both a per-service
-  `transport` and a client-wide `[client.transport].type = "noise"` are refused
-  for it. Enabling the server switch therefore means that server accepts
-  plaintext connections from such a client, whatever its `[server.transport]`
-  says; the Noise keys keep applying to the clients that do negotiate them. Not
-  in this
-  version: IPv6 (dropped and counted), per-flow channels (every flow of one
-  claimed endpoint shares the service's single channel), and any automatic
-  network configuration. Keys and the two operator recipes are in
-  `docs/configuration.md` ("Transparent (L3) services") and
-  `docs/deployment.md` ("Transparent services"); the acceptance harness is
-  `just l3-accept` (root-only, Linux-only, outside the check chain), which also
-  runs the negative half: a server without `[server.transparent]` refuses a
-  claim by policy, with its own device deleted for that run so the ordering is
-  proven rather than asserted.
+  whole IP packets into the tunnel, and the **client's own kernel answers the
+  visitor** — so the backend sees the visitor's real source address and the
+  server holds no socket and no per-flow state for the connection. It lowers
+  into the same client engine the forwarding path runs on, so the wire and the
+  data path are shared. Linux only, `CAP_NET_ADMIN` on the client and on any
+  server that serves it; the daemon never creates, addresses or routes the TUN
+  device, and a missing prerequisite is refused with the exact command to run
+  instead of failing as silent packet loss. Serving L3 is the server
+  operator's decision: `[server.transparent]` is that switch, and without it a
+  registration is refused **by policy, before any device is looked at**. The
+  wire moves to **protocol v5**, so both ends upgrade together. IPv6 is not
+  carried (dropped and counted). Keys, the two operator recipes and the
+  privileges each mode needs: [Configuration](docs/configuration.md#transparent-l3-services)
+  and [Deployment](docs/deployment.md#transparent-services).
+
+- **A transparent claim's lanes are lent to the claim that needs them.** The
+  lane budget used to be split equally and left that way, so a claim carrying
+  sixteen flows and a claim carrying nothing held the same number. The client
+  now moves an idle lane to the claim furthest from a lane per talking flow —
+  never below one lane, and only after the donor's lane has actually ended, so
+  the connection count the operator pays for moves rather than grows. A single
+  flow cannot be spread over two lanes (its packets have to stay in order), so
+  the gain is per flow. Measured on a path whose carrier connections are the
+  limit: **+27 % throughput** for one claim, at +8 % CPU per byte; on a clean
+  fast loopback the difference is inside the noise.
+  `[transparent.data].lend = false` holds the equal split static.
+
+- **A claim's flow placement is remembered, so a lane change cannot reorder a
+  flow.** The hub used to route every packet by `hash % width`, which meant a
+  lane *joining* re-placed every established flow.
+
+- **The client can answer "what am I carrying" over an optional status API.** A
+  `[client.status]` block with a `bind_addr` and a required `token` starts one
+  read-only HTTP endpoint — `GET /status`, the only path and the only method —
+  answering JSON: every service with its registration state, every live tunnel
+  pool with per-tunnel bytes and KCP ARQ health, and a transparent client's
+  claims and lanes. It carries `Access-Control-Allow-Origin: *` so a panel on
+  another origin can read it (the split mihomo's external-controller made
+  standard). It lives on the **client** and on its **own** listener: the pool
+  and the lane allocator are the client's, and the control port carries the
+  client's protocol — teaching it to sniff HTTP would put a parser on the one
+  connection the data plane trusts. Absent, the block is off.
+
+- **The server reports each multiplexed tunnel's ARQ health back to the
+  client**, and **the tunnel pool's carrier rule can probe the other carrier
+  instead of trusting its own counters**: a suspicion hands one tunnel to the
+  carrier the pool is not riding, and compares carried bytes before deciding.
+  Still opt-in (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), because the wiring run
+  measured its trigger as rate-dependent; a probe whose window carried nothing
+  is held rather than judged.
+
+- **The bench model's verdicts are statistics, not a silent heuristic.** An
+  exact sign test with its p-value beside the level the run's own length can
+  test at, a bootstrap confidence interval over the paired difference, and
+  **pre-registered** primary endpoints (`--primary`) so choosing the winner
+  after seeing the numbers changes the file's identity. A cell that lost more
+  than half its rounds is refused outright; a verdict that flips when one round
+  is dropped is marked FRAGILE.
+
+- **A path condition that polices UDP instead of refusing it**
+  (`--condition udp_throttled`), **a `loss1_deep` condition** that separates a
+  carrier's loss recovery from the shaper's own drops, and **a peer arm's tool
+  version recorded beside its numbers** (`peer_versions`).
+
+- **The gate chain classifies bench-only changes** (`benches/scripts/**`): the
+  scripts are runtime tooling, never compiled, so the fast gate skips the cargo
+  gates for them and pre-push skips the heavy ones. CI keeps the full chain —
+  it is a latency split, never a coverage split.
+
+### Fixed
+
+- **The `embedded`, `noise` and `transparent` feature combinations compile
+  again** (the `NoiseConfig` re-export was gated on two stacked cfg
+  attributes), and **the tunnel byte counters no longer take a process-wide
+  lock on the IO path**.
+
+- **KCP: a refused datagram is held, not dropped** (the pacer's denial, a
+  partial `sendmmsg` and `EAGAIN` no longer wait a round trip for the ARQ), **a
+  retransmission timeout clears the round trip it is timing**, **a session is
+  no longer declared dead for being slow** (the reference's twenty-retransmit
+  rule cannot tell a gone peer from a slow one), **a session no longer
+  throttles itself for being busy** (its pacer read a queued keepalive PONG as
+  congestion), and **a control frame sharing a datagram batch with payload is
+  no longer fed to the ARQ and dropped**.
+
+- **A tunnel pool's repair follows the endpoint's carrier preference**, and **a
+  deliberate carrier switch is no longer undone by a reachability re-probe**.
+
+- **Transparent lanes: a handover completes** (a peer's drain waited for the
+  placement table to forget a flow — a minute — rather than for the lane to go
+  quiet), **a retired or lost lane no longer leaves the peer writing into a
+  channel that carries nothing** (a KCP session has no close handshake), **a
+  forced carrier now stops the lane policy** instead of draining a lane for a
+  switch that cannot happen, and **carrier reports are matched to their claim**
+  before the lane id is consulted.
 
 ## [0.10.0] - 2026-10-01
 

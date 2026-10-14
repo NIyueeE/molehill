@@ -16,11 +16,23 @@
   <img src="https://img.shields.io/github/last-commit/NIyueeE/molehill.svg">
 </p>
 
-<p align="center">A secure, stable, high-performance reverse proxy for NAT traversal.</p>
+<p align="center">A secure, stable, high-performance reverse proxy for NAT traversal — now with transparent (L3) clients, where the device behind NAT owns its own public IP.</p>
 
 [English](README.md) | [简体中文](README.zh.md)
 
 molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
+
+**Two ways to expose a service**, and the choice is the client's:
+
+- **Forwarding (L4)** — the server binds a public port and relays connections
+  into the tunnel. The usual shape, and what every tool in this space does.
+- **Transparent (L3)** — the client **owns the public `ip:port` itself**. The
+  server routes whole IP packets into the tunnel and the client's own kernel
+  answers the visitor, so the backend sees the visitor's real source address
+  and the server holds no connection state for the flow at all. This is the
+  mode you want when the real source address matters — a mail server, a game
+  server, anything that logs or rate-limits by peer — and it is the reason a
+  reverse proxy in front of it is not a compromise. Linux only.
 
 <!-- TOC -->
 
@@ -38,12 +50,26 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 
 ## Features
 
+- **Transparent (L3) clients: the device behind NAT owns its public IP (Linux).**
+  A `[transparent]` block is a run mode of its own: the server binds nothing,
+  routes whole IP packets into the tunnel, and the **client's kernel answers the
+  visitor** — so the backend sees the visitor's real source address, TCP keeps
+  its end-to-end semantics, and the server holds no socket and no per-flow state
+  for the connection. Nothing is translated. It lowers into the same engine the
+  forwarding path uses, so the wire and the data path are shared. The daemon
+  configures no network itself: it attaches to a TUN device you created and
+  refuses a missing prerequisite with the exact command to run, instead of
+  failing as silent packet loss. Serving L3 is the *server operator's* decision
+  (`[server.transparent]`), and without it a claim is refused by policy before
+  any device is looked at. See [Configuration](./docs/configuration.md#transparent-l3-services)
+  and [Deployment](./docs/deployment.md#transparent-services) for the two
+  recipes and the privileges each mode needs.
 - **High Performance** Much higher throughput can be achieved than frp, and more stable when handling a large volume of connections.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Client-Authoritative Services** Since v0.7 the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
-- **Transparent (L3) Clients (Linux)** a `[transparent]` block makes the client own a public `ip:port`: the server routes whole IP packets into the tunnel and the client's kernel answers the visitor, so the backend sees the visitor's real source address and the server holds no connection state for the flow. It is a run mode of its own (`--transparent`), so a host that also forwards runs two processes; the client needs a TUN device and `CAP_NET_ADMIN`, and a server needs them only when its own `[server.transparent]` table asks for it. See [Configuration](./docs/configuration.md#transparent-l3-services).
 - **Multiplexing** Every data channel of a forwarding service rides as a yamux stream over one of a fixed pool of tunnel connections (`[client.data].tunnels`, default 4) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The pool is established at service start and never resized for load (a dead tunnel is repaired); the data plane itself runs over KCP (feature `kcp`) and falls back to TCP when a KCP session cannot be established, which is what `MOLEHILL_DATA_CARRIER` forces apart for a measurement. A transparent (L3) claim is the one shape that does not multiplex — its channels *are* its carrier connections, allotted by the lane budget and lent between claims as their flows come and go (`[transparent.data].lend`) — and the `[client.data]` knobs are covered in [Configuration](./docs/configuration.md).
-- **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The optional Noise Protocol encrypts the wire with a single pre-shared X25519 keypair — no PKI, no CA — and, with `resume = true`, proves a reconnect with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 -> 38.5 us per pair). `plain` forwards unencrypted.
+- **Security** A shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The control channel **always** speaks Noise: it carries the credential every data channel authenticates with, so a plain control leg would publish it to the path, and both ends refuse to start without a key pair (`molehill --genkey`). One pre-shared X25519 keypair, no PKI, no CA; with `resume = true` a reconnect proves itself with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 -> 38.5 us per pair). A *service* or an L3 lane may still run plain where the payload carries its own crypto.
+- **An optional status API** — a token-gated `GET /status` on its own listener, answering what the client is carrying as JSON, so a panel or a script can read it. See [Configuration](./docs/configuration.md).
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file.
 
 ## Benchmarks
