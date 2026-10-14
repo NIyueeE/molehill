@@ -100,7 +100,10 @@ fn a_server_whose_control_port_is_taken_exits_with_the_reason() {
              default_token = \"startup_failure_token\"\n\
              \n\
              [server.control]\n\
-             bind_addr = \"{addr}\"\n"
+             bind_addr = \"{addr}\"\n\
+             \n\
+             [server.transport.noise]\n\
+             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

@@ -485,9 +485,24 @@ address routed to the server, and a single-IP server — are in
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
-`retry_interval`, `carrier`. `[transparent.transport]` holds
-one key, `proxy`, because what an L3 client sends is the visitor's own traffic:
-this hop is a plain link by design, so the model has no encryption keys to offer,
+`retry_interval`, `carrier`. `[transparent.transport]` decides how the two
+wire stacks of an L3 client are built:
+
+- **The control channel is Noise, always.** The session nonce it publishes is
+  the credential every lane authenticates with, so a plain control leg would
+  hand that credential to everyone on the path. Its key pair lives in
+  `[transparent.transport.noise]` — required, and the same pair the lanes
+  inherit below. This is not configurable: it is what keeps the data plane's
+  credential off the wire.
+- **The lanes are plain by default.** What a lane carries is the visitor's own
+  IP packets — the visitor's TLS is the end-to-end protection, and per-packet
+  encryption spends CPU the carried flows did not ask for. `type = "noise"`
+  turns lane encryption on, using the control channel's key pair and pattern
+  (one key pair per host, inherited); a `[transparent.transport.noise]` block
+  written beside `type` overrides the keys for deployments where the lanes
+  must not share the control pair.
+- `proxy` applies to every connection this client dials (control and lanes).
+
 and `[transparent].tun` is where a device is named.
 
 `carrier` is the only data-plane choice a claim has: `tcp` (the default) is one

@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: the control channel must use Noise.** The session hello that
+  publishes the nonce every data channel of that session authenticates with
+  was itself unencrypted on a plain control channel — an on-path reader got
+  the data plane's credential for free, and the registration frames (which
+  carry no auth digest over their own body) were rewritable in flight. Both
+  ends now refuse to start without a Noise key pair (`molehill --genkey
+  noise` prints one): the server without `[server.transport.noise]`, the
+  client without `[client.transport] type = "noise"` and its keys, the
+  transparent client without `[transparent.transport.noise]`. The
+  per-connection selector stays for the data plane, so a service or a lane
+  may still run plain where the operator decides the payload carries its own
+  crypto — what ended is the unencrypted *control* leg, the one connection
+  the whole data plane trusts. Existing plain deployments add one key-pair
+  block per end; forwarding clients that already ran Noise change nothing.
+
 ### Added
+
 
 - **The client can answer "what am I carrying" over an optional status
   API.** A `[client.status]` block with a `bind_addr` and a required

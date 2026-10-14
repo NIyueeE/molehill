@@ -15,7 +15,11 @@ default_remote_addr = "127.0.0.1:2378"
 default_heartbeat_timeout = 20
 
 [client.transport]
-type = "plain"
+type = "noise"
+
+
+[client.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
 
 [client.services.echo]
 local_addr = "127.0.0.1:8080"
@@ -29,3 +33,7 @@ allow_ports = ["2379"]
 [server.control]
 bind_addr = "127.0.0.1:2378"
 heartbeat_interval = 30
+
+
+[server.transport.noise]
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml

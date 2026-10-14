@@ -1100,6 +1100,66 @@ fn stop(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// The two config files the pool-stats scenarios run: control and data both
+/// Noise (the mandatory rule), the shared pool pinned at `tunnels`.
+fn write_stats_pair(
+    control: &str,
+    exposed_port: u16,
+    tunnels: u16,
+    valve_block: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "molehill-pool-stats-{}-{tunnels}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let server_cfg = dir.join("server.toml");
+    let client_cfg = dir.join("client.toml");
+    std::fs::write(
+        &server_cfg,
+        format!(
+            "[server]\n\
+             default_token = \"pool_stats_token\"\n\
+             allow_ports = [\"{exposed_port}\"]\n\
+             \n\
+             [server.control]\n\
+             bind_addr = \"{control}\"\n\
+             \n\
+             [server.transport.noise]\n\
+             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n\
+             {valve_block}"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &client_cfg,
+        format!(
+            "[client]\n\
+             default_token = \"pool_stats_token\"\n\
+             \n\
+             [client.control]\n\
+             default_remote_addr = \"{control}\"\n\
+             \n\
+             [client.transport]\n\
+             type = \"noise\"\n\
+             \n\
+             [client.transport.noise]\n\
+             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+             \n\
+             [client.data]\n\
+             shared_pool = true\n\
+             tunnels = {tunnels}\n\
+             \n\
+             [client.services.echo]\n\
+             local_addr = \"{STATS_BACKEND}\"\n\
+             remote_bind_addr = \"127.0.0.1:{exposed_port}\"\n"
+        ),
+    )
+    .unwrap();
+    (server_cfg, client_cfg)
+}
+
 /// Run the compiled binary as a server+client pair over its own ports, force a
 /// visitor through it, and return everything the client printed.
 ///
@@ -1123,47 +1183,8 @@ async fn run_binary_pair(
         format!("\n[server.data]\nmax_tunnels_per_client = {n}\n")
     });
 
-    let dir = std::env::temp_dir().join(format!(
-        "molehill-pool-stats-{}-{stats}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    let server_cfg = dir.join("server.toml");
-    let client_cfg = dir.join("client.toml");
-    std::fs::write(
-        &server_cfg,
-        format!(
-            "[server]\n\
-             default_token = \"pool_stats_token\"\n\
-             allow_ports = [\"{exposed_port}\"]\n\
-             \n\
-             [server.control]\n\
-             bind_addr = \"{control}\"\n\
-             {valve_block}"
-        ),
-    )?;
-    std::fs::write(
-        &client_cfg,
-        format!(
-            "[client]\n\
-             default_token = \"pool_stats_token\"\n\
-             \n\
-             [client.control]\n\
-             default_remote_addr = \"{control}\"\n\
-             \n\
-             [client.transport]\n\
-             type = \"plain\"\n\
-             \n\
-             [client.data]\n\
-             shared_pool = true\n\
-             tunnels = {tunnels}\n\
-             \n\
-             [client.services.echo]\n\
-             local_addr = \"{STATS_BACKEND}\"\n\
-             remote_bind_addr = \"{exposed}\"\n"
-        ),
-    )?;
+    let (server_cfg, client_cfg) = write_stats_pair(&control, exposed_port, tunnels, &valve_block);
+    let dir = server_cfg.parent().unwrap().to_path_buf();
 
     // The reservation held the ports; the children need them now, so it is
     // released first. A run that loses the race fails the readiness probe
@@ -1360,7 +1381,10 @@ fn write_handover_fixture(control_port: u16, exposed_port: u16) -> (String, Stri
              default_remote_addr = \"{control}\"\n\
              \n\
              [client.transport]\n\
-             type = \"plain\"\n\
+             type = \"noise\"\n\
+             \n\
+             [client.transport.noise]\n\
+             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              \n\
              [client.data]\n\
              tunnels = 2\n\
@@ -1374,7 +1398,10 @@ fn write_handover_fixture(control_port: u16, exposed_port: u16) -> (String, Stri
              allow_ports = [\"{exposed_port}\"]\n\
              \n\
              [server.control]\n\
-             bind_addr = \"{control}\"\n"
+             bind_addr = \"{control}\"\n\
+             \n\
+             [server.transport.noise]\n\
+             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

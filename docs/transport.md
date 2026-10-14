@@ -1,6 +1,8 @@
 # Transport
 
-By default, `molehill` forwards traffic as it is (plain TCP). The client's
+The control channel always speaks Noise (it publishes the session nonce the
+data channels authenticate with, so a plain control leg would hand the data
+plane's credential to the path). The client's
 `[client.transport]` block supports two types — `plain` and `noise` — and
 **the client decides**: every connection starts with a one-byte transport selector
 byte, and the server accepts whatever the client speaks (its

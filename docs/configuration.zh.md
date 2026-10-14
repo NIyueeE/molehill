@@ -418,9 +418,20 @@ device, and this platform is not Linux`,或指明缺少 `transparent` 特性。�
 | `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
 
 按认领的键与转发服务一一对应:`token`、`remote_addr`、`retry_interval`、
-`carrier`。`[transparent.transport]` 只有一个键 `proxy`,因为 L3 客户端发送的是访问者
-自己的流量:这一跳按设计就是明文链路,所以这个模型没有加密键可给;设备名写在
-`[transparent].tun`。
+`carrier`。`[transparent.transport]` 决定 L3 客户端两条线栈怎么建:
+
+- **控制通道永远是 Noise。** 它发布的会话 nonce 是每条 lane 认证所用的
+  凭证,明文控制段等于把该凭证交给路径上的所有人。其密钥对写在
+  `[transparent.transport.noise]`——必填,lane 默认继承的也是这一对。
+  这一项不可配置:它就是"数据面凭证不上线"的保障。
+- **lane 默认明文。** lane 承载的是访客自己的 IP 包——访客的 TLS 是
+  端到端的保护,逐包加密花费的是被承载流量没有要求的 CPU。`type = "noise"`
+  打开 lane 加密,使用控制通道的密钥对与模式(每主机一对,继承);
+  在 `type` 旁边另写一个 `[transparent.transport.noise]` 块即可覆盖密钥,
+  供 lane 不与控制通道共享密钥对的部署使用。
+- `proxy` 作用于该客户端拨出的每一条连接(控制与 lane)。
+
+设备名写在 `[transparent].tun`。
 
 `carrier` 是认领在数据面上唯一的选择:`tcp`(默认)是每条车道一条 TCP 连接,
 `kcp` 是每条车道一个 KCP 会话——载体自己的会话**就是**数据通道,上面没有多路复用器。

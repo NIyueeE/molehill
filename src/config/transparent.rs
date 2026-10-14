@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use url::Url;
 
 use crate::config::parsing::{
-    ClientConfig, ClientControlConfig, ClientServiceConfig, MaskedString, ServiceType,
-    TransportConfig, TransportType, default_tun_name,
+    ClientConfig, ClientControlConfig, ClientServiceConfig, ClientServiceTransportConfig,
+    MaskedString, NoiseConfig, ServiceType, TransportConfig, TransportType, default_tun_name,
 };
 #[cfg(feature = "multiplex")]
 use crate::config::parsing::{ClientDataConfig, DataCarrierLimits};
@@ -151,15 +151,34 @@ impl Default for TransparentDataConfig {
 
 /// How this client reaches its server (`[transparent.transport]`).
 ///
-/// One key, on purpose: what an L3 client sends is whole IP packets whose
-/// content is the visitor's own, so it is a plain link by design and there are
-/// no encryption keys for the schema to hold. What is left is the *dialing*
-/// half, which is a property of the path to the server and not of the payload.
+/// What an L3 client sends is whole IP packets whose content is the visitor's
+/// own, so a **lane** is plain unless the operator turns the crypto on — the
+/// visitor's TLS is the end-to-end protection, and per-packet encryption
+/// spends CPU the carried flows may not have asked for. The control channel
+/// is a different matter and not this table's to turn off: it always speaks
+/// Noise, because the session nonce it publishes is the credential every lane
+/// authenticates with.
+///
+/// `type = "noise"` encrypts the lanes with the **control channel's key pair
+/// and pattern** by default — one key pair per host, inherited, so a config
+/// that asks for encrypted lanes writes no key material of its own. A claim
+/// whose keys differ from the control channel's overrides with its own
+/// `[transparent.transport.noise]` block instead.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentTransportConfig {
     /// Proxy used to reach the server (`http` / `socks5`).
     pub proxy: Option<Url>,
+    /// The lanes' transport. `plain` (the default) sends the visitor's
+    /// packets as they are; `noise` wraps every lane in the Noise session the
+    /// control channel's keys define. The *control* channel is always Noise
+    /// and is not configurable here.
+    #[serde(rename = "type")]
+    pub transport_type: Option<TransportType>,
+    /// Key material for `type = "noise"`. Absent, the control channel's keys
+    /// are inherited — the common case, one key pair per host. Present, these
+    /// keys define the lanes' Noise session instead.
+    pub noise: Option<NoiseConfig>,
 }
 
 #[cfg(feature = "multiplex")]
@@ -214,6 +233,36 @@ impl TransparentClientConfig {
     /// default but the only value this model has.
     #[must_use]
     pub fn lower(&self) -> ClientConfig {
+        // The wire stacks, from `[transparent.transport]`:
+        //
+        // - the **control** channel is Noise, always — the session nonce it
+        //   publishes is the credential every lane authenticates with, so a
+        //   plain control leg would hand that credential to the path. The
+        //   keys are this table's (`[transparent.transport.noise]`): one key
+        //   pair per host, and the mandatory-Noise rule is what makes them
+        //   required.
+        // - the **lanes** are plain unless the operator turned the crypto on
+        //   (`type = "noise"`); on, they inherit the control channel's keys
+        //   by default. The resolved pair travels per service, so the
+        //   engine's `effective_config` overlays it on the client-wide
+        //   transport and a lane dials with exactly what this table said.
+        let control_transport = TransportConfig {
+            transport_type: TransportType::Noise,
+            proxy: self.transport.proxy.clone(),
+            noise: self.transport.noise.clone(),
+        };
+        let lane_transport = TransportConfig {
+            transport_type: self
+                .transport
+                .transport_type
+                .unwrap_or(TransportType::Plain),
+            proxy: self.transport.proxy.clone(),
+            noise: match self.transport.transport_type {
+                Some(TransportType::Noise) => self.transport.noise.clone(),
+                _ => None,
+            },
+        };
+
         let services = self
             .claims
             .iter()
@@ -226,6 +275,14 @@ impl TransparentClientConfig {
                 service.token.clone_from(&claim.token);
                 service.remote_addr.clone_from(&claim.remote_addr);
                 service.retry_interval = claim.retry_interval;
+                // The lanes' wire stack travels per service: the engine's
+                // `effective_config` overlays this on the client-wide
+                // transport, so a claim's lanes dial with exactly what this
+                // table said — plain or the inherited/overridden Noise.
+                service.transport = Some(ClientServiceTransportConfig {
+                    transport_type: Some(lane_transport.transport_type),
+                    noise: lane_transport.noise.clone(),
+                });
                 #[cfg(feature = "multiplex")]
                 {
                     // The claim's lane count, resolved here so the engine has one
@@ -257,11 +314,7 @@ impl TransparentClientConfig {
             },
             services,
             status: None,
-            transport: TransportConfig {
-                transport_type: TransportType::Plain,
-                proxy: self.transport.proxy.clone(),
-                noise: None,
-            },
+            transport: control_transport,
         }
     }
 
@@ -294,8 +347,10 @@ mod tests {
     /// The lowering is the whole of the model difference, so it is pinned key
     /// by key: a claim becomes a service whose *claimed* address stands in for
     /// `local_addr` (nothing is dialed), carrying the device the data path
-    /// attaches to, and the transport is plain because this model has nowhere
-    /// to say otherwise.
+    /// attaches to. The wire stacks split here: the control channel is Noise
+    /// (its keys are this table's), the lanes are plain by default — the
+    /// visitor's TLS is the end-to-end protection — and the resolved pair
+    /// travels per service so the engine's overlay dials each with its own.
     #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_lowers_to_a_transparent_service() {
@@ -310,6 +365,10 @@ default_remote_addr = "example.com:2333"
 
 [transparent.transport]
 proxy = "socks5://127.0.0.1:1080"
+
+[transparent.transport.noise]
+local_private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+remote_public_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -340,8 +399,14 @@ token = "claim-token"
             "lending is on unless the client turns it off: `[transparent.data].lend` defaults \
              to true, so a config that never mentions it gets the mechanism"
         );
-        assert_eq!(client.transport.transport_type, TransportType::Plain);
-        assert!(client.transport.noise.is_none());
+        // The control leg is Noise, always: its keys are the table's, and the
+        // session nonce it publishes is what every lane authenticates with.
+        assert_eq!(client.transport.transport_type, TransportType::Noise);
+        assert!(client.transport.noise.is_some());
+        // The lanes default to plain: the visitor's packets go as they are.
+        let lanes = service.transport.as_ref().unwrap();
+        assert_eq!(lanes.transport_type, Some(TransportType::Plain));
+        assert!(lanes.noise.is_none());
         assert_eq!(
             client.transport.proxy.as_ref().map(Url::as_str),
             Some("socks5://127.0.0.1:1080")
@@ -352,6 +417,46 @@ token = "claim-token"
     /// when the key is unwritten (the shape a claim had before the budget), and
     /// the written budget divided among the claims that draw on that carrier.
     #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    /// `type = "noise"` on the lanes: the table's keys are the control
+    /// channel's and the lanes' at once (one pair per host), and the per-service
+    /// overlay carries the resolved pair so a lane dials Noise without the
+    /// engine knowing this model exists.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn noise_lanes_inherit_the_table_keys() {
+        let config = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.transport]
+type = "noise"
+
+[transparent.transport.noise]
+local_private_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+remote_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap();
+
+        let client = config.into_l3_client().unwrap().client.unwrap();
+        // Control: Noise with the table's keys (the same pair the lanes use).
+        assert_eq!(client.transport.transport_type, TransportType::Noise);
+        assert!(client.transport.noise.is_some());
+        // Lanes: Noise with the same keys, traveling per service.
+        let service = client.services.get("web").unwrap();
+        let lanes = service.transport.as_ref().unwrap();
+        assert_eq!(lanes.transport_type, Some(TransportType::Noise));
+        assert_eq!(lanes.noise.clone(), client.transport.noise.clone());
+    }
+
     #[test]
     fn a_claims_lanes_are_an_equal_share_of_the_carriers_budget() {
         let lanes = |budget: &str, claims: &str| {

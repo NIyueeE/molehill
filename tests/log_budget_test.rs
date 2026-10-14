@@ -189,7 +189,10 @@ impl Scenario {
                  allow_ports = [\"{exposed}\"]\n\
                  {server_extra}\n\
                  [server.control]\n\
-                 bind_addr = \"127.0.0.1:{control}\"\n"
+                 bind_addr = \"127.0.0.1:{control}\"\n\
+                 \n\
+                 [server.transport.noise]\n\
+                 local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
             ),
         )
         .unwrap();
@@ -204,7 +207,10 @@ impl Scenario {
                  \n\
                  {data_block}\
                  [client.transport]\n\
-                 type = \"plain\"\n\
+                 type = \"noise\"\n\
+                 \n\
+                 [client.transport.noise]\n\
+                 remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
                  \n\
                  [client.services.echo]\n\
                  local_addr = \"127.0.0.1:{backend}\"\n\
@@ -525,6 +531,10 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              default_token = \"{TOKEN}\"\n\
              [client.control]\n\
              default_remote_addr = \"127.0.0.1:{control}\"\n\
+             [client.transport]\n\
+             type = \"noise\"\n\
+             [client.transport.noise]\n\
+             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              [client.services.echo]\n\
              local_addr = \"127.0.0.1:{backend}\"\n\
              remote_bind_addr = \"0.0.0.0:{exposed}\"\n\
@@ -546,7 +556,10 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              max_pool_size = 16\n\
              allow_ports = [\"{exposed}\"]\n\
              [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n"
+             bind_addr = \"127.0.0.1:{control}\"\n\
+             \n\
+             [server.transport.noise]\n\
+             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

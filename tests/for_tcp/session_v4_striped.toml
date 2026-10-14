@@ -12,5 +12,9 @@ heartbeat_interval = 5
 # gathered over 2 data channels, and the gather asks for them with
 # `CreateDataChannelForStripe` — the group and the stripe's place in it — so the
 # client can reserve one tunnel per stripe.
+
+[server.transport.noise]
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+
 [server.data]
 stripe_count = 2

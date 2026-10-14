@@ -969,6 +969,16 @@ async fn register_service(
                 warn!(service = %reg.name, "Registration failed: {reason}");
                 return Ok(Registration::Rejected(reason));
             }
+            // The kernel must forward the claimed addresses into the device;
+            // off, every claim's packets die in the kernel and the operator
+            // sees silence. Checked here (the first transparent registration)
+            // rather than at startup: serving L3 is this table's switch, and
+            // a server that never serves it never needs the sysctl.
+            if let Err(e) = crate::transparent::check::check_server() {
+                let reason = format!("{e:#}");
+                warn!(service = %reg.name, "Registration failed: {reason}");
+                return Ok(Registration::Rejected(reason));
+            }
             let Some(held) = Claim::acquire(reg.bind_addr) else {
                 let reason = format!(
                     "Address {} is already claimed by another transparent service on this server",

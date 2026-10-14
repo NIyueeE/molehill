@@ -23,6 +23,35 @@ pub fn require_interface(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The server's contract for serving claims: it must be willing to *forward*.
+///
+/// The visitor's packets reach this host addressed to the claimed address and
+/// are routed into the TUN device — that is forwarding, and the kernel does
+/// it only when `net.ipv4.ip_forward` is on. With it off, every packet for
+/// every claim is dropped by the kernel before this process reads a byte: the
+/// daemon sees a healthy TUN and a silent device, which is exactly the
+/// "one precise message instead of silent packet loss" failure this module
+/// exists to prevent. Checked at the first transparent registration, where
+/// the interface check already runs.
+pub fn check_server() -> Result<()> {
+    const PATH: &str = "/proc/sys/net/ipv4/ip_forward";
+    let Ok(value) = std::fs::read_to_string(PATH) else {
+        // Unreadable (a container without /proc, a sandbox): not this check's
+        // to fail — the interface check above is the hard prerequisite, and a
+        // host that runs a TUN server has networking already.
+        return Ok(());
+    };
+    if value.trim() != "1" {
+        bail!(
+            "IP forwarding is off (net.ipv4.ip_forward = {}), so the kernel drops every \
+             packet addressed to a claim before it reaches the TUN device. Turn it on:\n  \
+             sudo sysctl -w net.ipv4.ip_forward=1",
+            value.trim()
+        );
+    }
+    Ok(())
+}
+
 /// The client's contract: it owns the claimed addresses, and the kernel is
 /// willing to accept packets whose source is not on the local network.
 pub fn check_client(tun: &str, claimed: &[IpAddr]) -> Result<()> {
