@@ -16,6 +16,7 @@ cd "$(git rev-parse --show-toplevel)"
 pushed_any=0
 tag_pushed=0
 docs_only=1
+benches_only=1
 if [ ! -t 0 ]; then
   zeros="0000000000000000000000000000000000000000"
   while read -r local_ref local_sha remote_ref remote_sha; do
@@ -30,23 +31,38 @@ if [ ! -t 0 ]; then
     esac
     # Classify the commits this push carries: a branch push whose commits only
     # touch markdown/docs/assets cannot move audit/deny/outdated/test, so it
-    # runs the doc gate instead (the same split CI makes). A tag push never
-    # takes the shortcut.
+    # runs the doc gate instead (the same split CI makes). The same holds for
+    # benches/scripts/** (githooks/benches-only): the scripts are runtime
+    # tooling, never compiled, so no Rust gate can move and the doc gate — the
+    # one gate a bench-script change CAN move (the metric registry) — runs
+    # alone. A push mixing docs with benches (or either with code) fails both
+    # classifiers and takes the full chain: the safe direction. A tag push
+    # never takes the shortcut.
     if [ "$local_sha" != "$zeros" ] && [ "$remote_sha" != "$zeros" ]; then
       pushed_any=1
       git diff --name-only "$remote_sha" "$local_sha" | githooks/docs-only || docs_only=0
+      git diff --name-only "$remote_sha" "$local_sha" | githooks/benches-only || benches_only=0
     elif [ "$local_sha" != "$zeros" ]; then
       pushed_any=1
-      docs_only=0   # a new branch: nothing to compare against, run everything
+      docs_only=0    # a new branch: nothing to compare against, run everything
+      benches_only=0
     fi
   done
 fi
 
-if [ "$pushed_any" -eq 1 ] && [ "$docs_only" -eq 1 ] && [ "$tag_pushed" -eq 0 ]; then
-  echo "==> docs-only push: skipping audit / deny / outdated / test"
+if [ "$pushed_any" -eq 1 ] && [ "$tag_pushed" -eq 0 ] && { [ "$docs_only" -eq 1 ] || [ "$benches_only" -eq 1 ]; }; then
+  if [ "$docs_only" -eq 1 ]; then
+    echo "==> docs-only push: skipping audit / deny / outdated / test"
+  else
+    echo "==> benches-only push: skipping audit / deny / outdated / test (no Rust gate can move)"
+  fi
   echo "==> docs alignment (githooks/check-docs)"
   githooks/check-docs
-  echo "pre-push checks passed (docs-only)"
+  if [ "$docs_only" -eq 1 ]; then
+    echo "pre-push checks passed (docs-only)"
+  else
+    echo "pre-push checks passed (benches-only)"
+  fi
   exit 0
 fi
 

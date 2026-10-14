@@ -141,15 +141,54 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   names (`--aa`; on by default in `dev`, `full` and `stage`), and the paired
   difference between those two halves is the smallest difference the run can
   believe. Every verdict raises the metric's own materiality floor to it, and
-  the run prints the floors beside its tables. A resolution of 16 % is a
-  statement about the run, not an excuse: it says what to change (longer
-  workloads, more rounds) to resolve more.
-- **A verdict has five states, and "no claim" is one of them.** `claim` needs
-  every paired round to agree in sign *and* both floors cleared; `directional`
-  is a direction with a disagreement or a floor in the way; `indistinguishable`
-  is inside the run's own scatter; `single-round` refuses to read a direction
-  into one measurement; `unavailable` names what was not measured. A metric no
-  arm could produce is reported with the instrument's reason, never as zero.
+  the run prints the floors beside its tables — and, under the verdicts, a
+  planning line for every cell the run *cannot* resolve: how many rounds
+  would reach the metric's floor, or that the cell is too noisy for rounds to
+  fix. A resolution of 16 % is a statement about the run, not an excuse: it
+  now comes with the number that acts on it.
+- **A claim is pre-registered, tested, and interval-checked.** Three legs,
+  each reported in the verdict line instead of hidden:
+  - *materiality* — the median difference clears the metric's floor and the
+    run's own, as before;
+  - *consistency* — the paired rounds go through an **exact sign test** at
+    the level the run's length can honestly support: at three rounds that is
+    `p = 0.25`, and the verdict prints `p` beside `alpha_eff`, so a
+    short-run claim is *labelled* as the 25 %-error statement it is instead
+    of passing silently as a 5 % one (six rounds reach p ≤ 0.05; the
+    smallest p a run of n rounds can produce is `2/2^n`);
+  - *the interval* — a **bootstrap CI** over the paired difference
+    (reproducible: seeded from the run's fingerprint) says whether the
+    effect lies *entirely beyond* the threshold (a claim's shape), *entirely
+    inside* it (bounded evidence there is nothing worth calling), or
+    *straddling* it (a direction, and nothing more).
+- **Only a pre-registered endpoint can claim.** By default that is each
+  scenario's headline metric; `--primary metric=…,scenario=…[,arm=…][,cell=…]`
+  declares more (or narrower) ones *before the run*, and the declaration is
+  part of the fingerprint — picking the winner after seeing the numbers
+  changes the file's identity, not just its story. Every other comparison is
+  **exploratory**: reported with its numbers, never a claim. The primary
+  family's p-values go through a Benjamini-Hochberg correction and a claim
+  must also survive it.
+- **A verdict has five states, and "no claim" is now three of them.**
+  `claim`; `directional` (a direction the interval straddles or the design
+  cannot confirm); `indistinguishable` — which now means one of two *stated*
+  things: the interval sits **inside** the threshold (bounded evidence of no
+  difference worth calling) or it **straddles** it (under-resolved, and the
+  line says which); `single-round` refuses to read a direction into one
+  measurement; `unavailable` names what was not measured. A verdict that
+  flips when any single paired round is dropped is marked **FRAGILE** in the
+  line — reported, never silently repaired. A cell that lost more than half
+  its rounds is refused outright (`drowned`), by the verdicts and by the
+  gate.
+- **Two more method keys travel in the fingerprint.** `primary` (the
+  pre-registered endpoints above) and `normalize` — `--normalize control`
+  divides each tool arm's per-round reading by the control's reading of the
+  *same round*, which cancels the host's round-to-round drift where the cell
+  is host-bound, and would manufacture invariance where the tool is what
+  limits the path, so it is a stated design choice, not a default. The
+  iperf3 version is recorded beside the instrument cadences: a version can
+  change the summary fields the model reads, and a number from the other
+  side of that boundary is not comparable with one from this side.
 - **Evidence stays with the number.** Each cell records the commands it ran,
   the counters it read, the endpoint the probe dialed, the peers the backend
   saw, the raw per-round sample arrays and the log its probe left behind. The
@@ -356,6 +395,7 @@ same vocabulary without the schedule: one cell, one condition, one number.
 | `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms | 120 s |
 | `loss1_buf` | a lossy path with a large but finite buffer: deep enough that tail drops are not the story, shallow enough not to inflate RTT (10 000 packets ≈ 14.7 MB, ≈ 27 ms of standing queue at 545 Mbit/s) | 10 ms delay, 1 % loss, 10 000-packet queue | focused cell only |
 | `loss1_deep` | the same 1 % loss with a queue deep enough not to tail-drop — it tells a carrier's loss recovery apart from the shaper's own drops | 10 ms delay, 1 % loss, 100 000-packet queue | focused cell only |
+| `udp_throttled` | a path that **polices** UDP instead of refusing it: the carrier riding UDP still establishes, but only carries what the policer admits (10 000 packets/s ≈ 117 Mbit/s of 1472-byte datagrams) while a carrier that does not ride UDP is untouched | `iptables -m limit` accept-then-drop for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
 | `udp_blocked` | a path that drops UDP: the data plane's first carrier cannot be established, so the run measures the **TCP fallback** | `iptables -j DROP` for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
 | `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
 
@@ -542,6 +582,12 @@ Stated so a reader does not ask a chart for something it never measured:
   can order two architectures — the probe must record *why* a connection failed
   before its rate is quoted. The pattern is recorded in HANDOFF.md as an open
   thread, not as a result.
+
+  *(Update 2026-10-12: the cause is named — see the history note below. The
+  probe now counts failed connects (`connect_errors` in every churn cell's
+  evidence), so new runs distinguish "slow" from "port-starved"; every churn
+  number measured before that fix stays unquoted, and the degenerate cells
+  above are instrument artefacts, not architecture findings.)*
 
 - **A number from another host.** The host identity and the two calibration
   probes travel in every file; two runs on different machines are refused, and
@@ -952,17 +998,22 @@ terms:
   therefore has to be long enough to contain the three-tick confirmation, the
   peer's quiet window (three seconds) and several fresh flows after them.
 
-**What is measured so far, and what is not.** The mechanism is: with the policy
-live and no diagnostic hatch, one run shows the whole chain — the rule fires on
-a lane whose peer-side queue refused 44 % of what it was offered, the endpoint's
-preference moves, the peer is asked to drain that lane, and the lane is retired
-3.001 s later when the peer answers that it holds nothing. The **benefit is not
-measured**: on the ladder as it stands a round is shorter than that chain plus
-the flows after it, and three campaigns (forced-KCP against policy-live, at the
-`smoke` and `dev` profiles, three rounds plus a warm-up with `--aa`) all came
-back with no claim. Until a workload whose flows start after a switch is run,
-this stays a decision the model has not priced — the method above is what that
-run has to follow.
+**What is measured now.** With the chain fixed (reports matched to their claim
+before the lane id, and a handover retiring on the 3-second quiet window rather
+than the flow table's 60-second eviction), the measurement this section asks
+for has been run: `l3`, `loss1_buf` on the tunnel leg, ladder first so the
+policy fires, 4 rounds with `--aa`, forced-KCP control against policy-live.
+The policy fired on the loaded claim in **every** candidate round and the
+handover completed inside the round; the 5 Gbit/s cell read **13.7 % and 7.4 %
+loss at 2.9-3.1 Gbit/s** in exactly the two rounds whose handover finished
+before that cell began, against the held carrier's **65.5-67.0 % at ~1.04
+Gbit/s** in the others — 3x the delivery, with the round timestamps naming the
+split. The cost is stated beside it: `syscalls_per_s` +31 % on that cell (a
+claim by the model's own floors; TCP's per-datagram work against KCP's batched
+send), while `cpu_s_per_gbit` in the captured rounds improves. Churn after the
+switch is level. The earlier three "no claim" campaigns are superseded: their
+runs predate the report-matching fix, so their evidence was partially
+misattributed, and their handovers did not complete inside a round.
 
 ## The transparent-L3 wire question (the acceptance harness)
 

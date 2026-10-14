@@ -30,7 +30,7 @@ server = []
 # Run as a client
 client = []
 
-# Noise support. The `snow` feature pulls the ring-accelerated resolver:
+# Noise support. The `snow` dependency pulls the ring-accelerated resolver:
 # the ChaCha20-Poly1305 data path runs ring's hardware-dispatched
 # implementation for every pattern (the handshake hash — BLAKE2s by
 # default, SHA-256/SHA-512 for other patterns — falls back to the
@@ -38,10 +38,10 @@ client = []
 # record stream is vendored in-repo (src/transport/noise_stream.rs,
 # ported from the unmaintained snowstorm crate, adapted to snow 0.10),
 # which needs pin-project.
-noise = ["base64", "snow", "pin-project"]
+noise = ["dep:base64", "dep:snow", "dep:pin-project"]
 
 # Configuration hot-reload support
-hot-reload = ["notify"]
+hot-reload = ["dep:notify"]
 
 # Multiplex many data channels over one physical connection (yamux engine,
 # maintained in-repo under src/mux)
@@ -63,9 +63,6 @@ kcp = [ "multiplex"]
 # and CAP_NET_ADMIN on both ends); a config that asks for one on another
 # platform is refused with a precise reason.
 transparent = []
-snow = ["dep:snow"]
-pin-project = ["dep:pin-project"]
-base64 = ["dep:base64"]
 
 [profile.release]
 panic = "abort"

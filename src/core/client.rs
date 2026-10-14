@@ -1,8 +1,7 @@
 use crate::common::helper::{datagram_len, udp_connect};
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
-#[cfg(feature = "multiplex")]
 #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
 use crate::config::NoiseConfig;
 use crate::config::{
@@ -17,6 +16,9 @@ use crate::protocol::{
     SessionCmd, SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd,
     read_hello, read_register_result, write_session_cmd, write_stream_prologue,
 };
+// The mux prologue is written only where multiplexed tunnels exist.
+#[cfg(feature = "multiplex")]
+use crate::protocol::write_tunnel_prologue;
 // The lane *prologue* is what only a transparent+multiplex build writes; the
 // `LaneId` type itself is imported above for every build, because a data
 // channel's signature carries `Option<LaneId>` wherever it is compiled.
@@ -442,6 +444,68 @@ enum SessionRequest {
     },
 }
 
+/// What every tunnel of this process has carried so far, as
+/// `(delivered, written)` pairs in pool order.
+///
+/// **Delivered** is read out of the tunnel; **written** is handed into it. This
+/// is the L4 quality signal: a carrier that is slow shows up as a low
+/// per-tunnel rate, and backpressure makes both ends observe the same rate — so
+/// the deciding end can measure it here, with no peer report. (L3 could not:
+/// there the *loss* is on the peer's offering side, which this end never sees.)
+///
+/// The counters live in each tunnel's own
+/// [`TunnelCounters`](crate::transport::multiplex::TunnelCounters) — two
+/// relaxed adds per IO poll, no lock — and the pool snapshot carries them, so
+/// this reads the same registry every pool is already in. The predecessor was
+/// a process-wide `Mutex<HashMap>` the *same* IO poll took on every read and
+/// write, which serialized every multiplexed byte behind one lock whether or
+/// not anyone had asked for the diagnostic.
+///
+/// Cumulative for a tunnel's life: a policy compares *windows*, so it takes
+/// two snapshots and differences them, exactly as the lane policy does.
+#[cfg(feature = "multiplex")]
+pub(crate) fn tunnel_bytes() -> Vec<(u64, u64)> {
+    crate::transport::multiplex::live_pools()
+        .into_iter()
+        .flat_map(|pool| pool.bytes)
+        .collect()
+}
+
+/// Print each tunnel's cumulative bytes once a second, while
+/// `MOLEHILL_TUNNEL_STATS` is set.
+///
+/// The instrument has to be readable in a run to be worth having: it exists to
+/// answer one question the L4 work is falsifiable on — **do tunnels on different
+/// carriers carry materially different rates?** — which is the same shape the
+/// lane counters had (S1 measured before S2 decided).
+#[cfg(feature = "multiplex")]
+fn spawn_tunnel_stats() {
+    if std::env::var_os("MOLEHILL_TUNNEL_STATS").is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let mut counts = tunnel_bytes();
+            if counts.is_empty() {
+                continue;
+            }
+            // Pool order, numbered: the line has no tunnel ids (they live in
+            // the pool-stats line beside it), but the position is stable
+            // between lines of the same run, so a reader can difference two.
+            let line: Vec<String> = counts
+                .drain(..)
+                .enumerate()
+                .map(|(i, (delivered, written))| format!("{i}:{delivered}/{written}"))
+                .collect();
+            tracing::info!(
+                "tunnel-stats: delivered/written bytes per tunnel {}",
+                line.join(" ")
+            );
+        }
+    });
+}
+
 /// One lane's cumulative counters as of the previous tick.
 ///
 /// `(peer offered, peer refused, this end injected)`: the peer's two are what its
@@ -557,11 +621,11 @@ impl Client {
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        #[cfg(feature = "notify")]
+                        #[cfg(feature = "hot-reload")]
                         self.handle_hot_reload(e);
                         // Without the `notify` feature the config never
                         // changes at runtime; nothing can arrive here.
-                        #[cfg(not(feature = "notify"))]
+                        #[cfg(not(feature = "hot-reload"))]
                         warn!("Ignored {e:?} since running as a client");
                     }
                 }
@@ -739,7 +803,7 @@ impl Client {
     }
 
     /// Apply one client-service config change (add or remove a service).
-    #[cfg(feature = "notify")]
+    #[cfg(feature = "hot-reload")]
     fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
             ConfigChange::ClientChange(client_change) => match *client_change {
@@ -1213,6 +1277,15 @@ impl TunnelStream {
             TunnelStream::Yamux(lease) => lease.tunnel_id(),
         }
     }
+
+    /// Record what one IO poll moved across this channel's tunnel (see
+    /// [`StreamLease::count_bytes`]): the counters are the tunnel's own, so
+    /// the poll pays two relaxed adds and no lock.
+    fn count_bytes(&self, delivered: u64, written: u64) {
+        match self {
+            TunnelStream::Yamux(lease) => lease.count_bytes(delivered, written),
+        }
+    }
 }
 
 #[cfg(feature = "multiplex")]
@@ -1272,10 +1345,14 @@ async fn run_mux_data_channel(
     };
     trace!("Multiplexed data channel opened");
     // A v4 tunnel belongs to the session, so each of its streams names the
-    // service it carries: the server reads these four bytes before its
-    // forwarding command. Several services may share the tunnel — that is
-    // what a shared pool produces — so the routing is per stream.
-    write_stream_prologue(&mut stream, args.service_id).await?;
+    // service it carries: the server reads these bytes before its forwarding
+    // command. Several services may share the tunnel — that is what a shared
+    // pool produces — so the routing is per stream. The stream also names the
+    // **tunnel** it rides, which is what lets the server say what it offered
+    // that connection (see `TunnelId`).
+    let tunnel =
+        crate::protocol::TunnelId::new(u32::try_from(stream.tunnel_id()).unwrap_or(u32::MAX));
+    write_tunnel_prologue(&mut stream, args.service_id, tunnel).await?;
     // The channel belongs to one tunnel now: the client's UDP pin accounting
     // keys on the channel, so a peer's route can move a tunnel's pinned count.
     let channel = args
@@ -1366,7 +1443,17 @@ impl tokio::io::AsyncRead for ClientDataChannel {
         match self.get_mut() {
             ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "multiplex")]
-            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ClientDataChannel::Mux(s) => {
+                let before = buf.filled().len();
+                let ready = std::pin::Pin::new(&mut *s).poll_read(cx, buf);
+                if let std::task::Poll::Ready(Ok(())) = ready {
+                    let got = buf.filled().len().saturating_sub(before);
+                    if got > 0 {
+                        s.count_bytes(u64::try_from(got).unwrap_or(u64::MAX), 0);
+                    }
+                }
+                ready
+            }
         }
     }
 }
@@ -1380,7 +1467,15 @@ impl tokio::io::AsyncWrite for ClientDataChannel {
         match self.get_mut() {
             ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "multiplex")]
-            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ClientDataChannel::Mux(s) => {
+                let ready = std::pin::Pin::new(&mut *s).poll_write(cx, buf);
+                if let std::task::Poll::Ready(Ok(n)) = ready
+                    && n > 0
+                {
+                    s.count_bytes(0, u64::try_from(n).unwrap_or(u64::MAX));
+                }
+                ready
+            }
         }
     }
 
@@ -1591,6 +1686,10 @@ async fn establish_tunnel(
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tunnel = ClientTunnel::start(conn, config, shutdown_rx);
+    // The per-tunnel byte counters start with the first tunnel, like the KCP
+    // adapter's own stats task: no entry point has to know about it, and a
+    // run that never multiplexes pays nothing.
+    spawn_tunnel_stats();
     Ok((tunnel, shutdown_tx))
 }
 
@@ -1687,7 +1786,7 @@ async fn establish_tunnels(
         let choice = Arc::clone(choice);
         Arc::new(move || choice.carrier())
     };
-    Ok(Tunnels::Yamux(TunnelPool::with_preference(
+    Ok(Tunnels::Yamux(TunnelPool::with_choice(
         carrier,
         key.to_owned(),
         initial,
@@ -1695,6 +1794,7 @@ async fn establish_tunnels(
         Some(dialer),
         preferred,
         pins,
+        Some(Arc::clone(choice)),
     )))
 }
 
@@ -1911,6 +2011,10 @@ async fn establish_one_kcp_tunnel(
     #[cfg(not(feature = "noise"))]
     let noise = None;
     let mut io = crate::transport::kcp::connect_stream(remote_addr, noise).await?;
+    // The session's ARQ counters travel with the tunnel: the pool reads this
+    // tunnel's retransmit share for the carrier rule (the KCP-side signal; a
+    // TCP tunnel has none, which is why the rule is one-sided by construction).
+    let health = io.health();
 
     let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_nonce);
     io.write_all(&postcard::to_stdvec(&hello)?).await?;
@@ -1922,7 +2026,10 @@ async fn establish_one_kcp_tunnel(
 
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    Ok((ClientTunnel::start(io, config, shutdown_rx), shutdown_tx))
+    Ok((
+        ClientTunnel::start_with_health(io, Some(health), config, shutdown_rx),
+        shutdown_tx,
+    ))
 }
 
 // Runtime-resolved per-service UDP options. Validation fills the defaults;
@@ -3586,6 +3693,18 @@ impl ClientSession {
                     ControlChannelCmd::CarrierReport(id, lane, offered, refused, seq) => {
                         self.note_lane_report(id, lane, offered, refused, seq);
                     }
+                    // The peer's half of a tunnel's ARQ health: what the
+                    // server's session for that tunnel emitted and re-sent.
+                    // Without it the carrier rule sees only what this end sent,
+                    // which on a downstream workload is nothing (HANDOFF.md).
+                    #[cfg(feature = "multiplex")]
+                    ControlChannelCmd::TunnelHealth(id, tunnel, out, resent, handed, seq) => {
+                        self.note_tunnel_report(id, tunnel, out, resent, handed, seq);
+                    }
+                    // No tunnels exist without `multiplex`, so no report can
+                    // arrive: the arm exists for exhaustiveness alone.
+                    #[cfg(not(feature = "multiplex"))]
+                    ControlChannelCmd::TunnelHealth(..) => {}
                     // The peer's half of a lane retirement: it holds no flow in
                     // the lane, or it does not know the lane at all. Recorded
                     // for the allocator, which is what may now retire it.
@@ -3878,6 +3997,14 @@ impl ClientSession {
                 ControlChannelCmd::CarrierReport(id, lane, offered, refused, seq) => {
                     self.note_lane_report(id, lane, offered, refused, seq);
                 }
+                // See the other control loop: the peer's half of a tunnel's ARQ
+                // health, routed to the pool that owns the tunnel.
+                #[cfg(feature = "multiplex")]
+                ControlChannelCmd::TunnelHealth(id, tunnel, out, resent, handed, seq) => {
+                    self.note_tunnel_report(id, tunnel, out, resent, handed, seq);
+                }
+                #[cfg(not(feature = "multiplex"))]
+                ControlChannelCmd::TunnelHealth(..) => {}
                 // A drain answer that arrives while a registration is in flight
                 // is still the peer's half of a retirement: recorded the same
                 // way, so a claim does not lose the answer to a reload.
@@ -3889,6 +4016,65 @@ impl ClientSession {
                      on a v{CURRENT_PROTO_VERSION} control session"
                 ),
             }
+        }
+    }
+
+    /// Record the peer's health report for one tunnel of one of this session's
+    /// pools: what the server's session for that tunnel emitted and re-sent.
+    ///
+    /// Routed by the tunnel id the client itself assigned (`next_tunnel_id`), so
+    /// no per-service ambiguity can arise: the same id is what the tunnel's
+    /// stream prologue carries, which is how the server learned to attribute the
+    /// report in the first place.
+    #[cfg(feature = "multiplex")]
+    fn note_tunnel_report(
+        &self,
+        id: ServiceId,
+        tunnel: [u8; 4],
+        out: [u8; 4],
+        resent: [u8; 4],
+        handed: [u8; 4],
+        seq: u8,
+    ) {
+        // Every step that can drop a report says so at debug: a peer's evidence
+        // is what the carrier rule acts on, and "the rule never fires" has to be
+        // distinguishable from "the evidence never landed" without a rebuild.
+        let Some(entry) = self.services.get(&id) else {
+            debug!(service = %hex::encode(id.0), "tunnel report for an unknown service");
+            return;
+        };
+        let ServiceState::Active(active) = &entry.state else {
+            debug!(service = %hex::encode(id.0), "tunnel report for a service that is not active");
+            return;
+        };
+        let Some(key) = active.pool_key.as_ref() else {
+            debug!(service = %hex::encode(id.0), "tunnel report for a service with no pool");
+            return;
+        };
+        let Some(Tunnels::Yamux(pool)) = self.pools.get(key) else {
+            debug!(pool = %key, "tunnel report for a pool this session does not hold");
+            return;
+        };
+        let recorded = pool.note_peer_health(
+            crate::protocol::TunnelId(tunnel),
+            (
+                u64::from(u32::from_be_bytes(out)),
+                u64::from(u32::from_be_bytes(resent)),
+            ),
+            u64::from(u32::from_be_bytes(handed)),
+            seq,
+        );
+        // A heartbeat rather than one line per report (they arrive every 50 ms):
+        // every twentieth frame shows the summed counters the rule reads, which
+        // is what makes "the rule never fires" distinguishable from "the
+        // evidence never reached the counters it reads".
+        if seq.is_multiple_of(20) {
+            debug!(
+                tunnel = %hex::encode(tunnel),
+                pool = %key,
+                summed = ?recorded,
+                "tunnel health recorded"
+            );
         }
     }
 
@@ -3921,7 +4107,24 @@ impl ClientSession {
         let Ok(hub) = TunHub::get_or_spawn(tun, Direction::Source) else {
             return;
         };
+        // The report is matched to the **claim** the service owns — its claimed
+        // endpoint — before the lane id is consulted: every claim mints its lane
+        // ids from 1 in one shared hub, so a report keyed by lane id alone
+        // landed on the first claim holding that number (measured: the ladder's
+        // claim's report read as an idle sibling's `peer_offered`), and the
+        // carrier policy was reading evidence about nothing.
+        let Some(claimed) = entry
+            .slot
+            .service
+            .remote_bind_addr
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|addr| Endpoint::new(addr.ip(), addr.port()))
+        else {
+            return;
+        };
         hub.note_remote(
+            claimed,
             LaneId(lane),
             u32::from_be_bytes(offered),
             u32::from_be_bytes(refused),
@@ -4364,6 +4567,22 @@ mod tests {
         reason = "tests unwrap and expect on values they just constructed"
     )]
     use super::*;
+
+    /// A tunnel's byte counts accumulate per tunnel, and the snapshot is cumulative
+    /// so a policy can difference two of them into a window.
+    ///
+    /// The accumulator itself is covered by the multiplex module's tests (the
+    /// counters live on the pool's tunnels there); the *wiring* (counting every
+    /// read and write of a mux channel) is exercised by the mux end-to-end
+    /// suites, which carry traffic through it.
+    #[cfg(all(feature = "multiplex", test))]
+    #[test]
+    fn tunnel_stats_thread_starts_without_env() {
+        // The spawn call is what the old registry's `STARTED.once` did; a run
+        // with `MOLEHILL_TUNNEL_STATS` unset must start no thread and never
+        // panic — the reporter is strictly opt-in.
+        spawn_tunnel_stats();
+    }
 
     /// The literal the interop matrix greps for: a client that meets a server
     /// too old to answer has to *say* which dialect it speaks, and stop.

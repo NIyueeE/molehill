@@ -90,6 +90,22 @@ if [ -n "$channel" ]; then
   expect "toolchain channel documented: $channel" README.zh.md "channel = \"$channel\""
 fi
 
+# 4b) the feature table is a registry: every public feature name (every row
+#     except `default`) must be documented in the build guide — the page that
+#     owns "what can be compiled". A name documented nowhere is either a dead
+#     pipeline row (a `--features` name that gates no code — the rustc
+#     `unexpected_cfgs` warning catches the gate side, this catches the table
+#     side) or a real feature whose existence is undiscoverable; both fail.
+#     This is what keeps the rule "a feature is named by intent, and every
+#     name in the table is public API" mechanical.
+while IFS= read -r feature; do
+  [ -n "$feature" ] || continue
+  expect "feature documented: $feature" docs/build-guide.md '`'"$feature"'`'
+done < <(awk '/^\[features\]/{f=1;next} /^\[/{f=0}
+              f && /=/ && $0 !~ /^[ \t]*#/ {
+                split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "" && k != "default") print k
+              }' Cargo.toml)
+
 # 5) justfile recipes documented on the landing pages
 expect "just setup documented" README.md 'just setup'
 expect "just setup documented" README.zh.md 'just setup'

@@ -221,6 +221,45 @@ impl std::fmt::Display for LaneId {
     }
 }
 
+/// The identity of one **multiplexed tunnel**, as the end that dialed it names
+/// it.
+///
+/// Four raw bytes, never a varint, for the reason [`ServiceId`] states. A tunnel
+/// is a physical connection the client's pool holds, and its id is what lets the
+/// server attribute what it offered and what that tunnel's streams refused —
+/// per *tunnel*, not per pool, because a pool's tunnels can end up on different
+/// carriers (a repair rides the one the endpoint prefers now).
+///
+/// It rides in a stream's prologue rather than in the tunnel hello, which is
+/// where it started: the hello has no length prefix and every variant is the
+/// same size, so a field there would have to be added to all three, while the
+/// prologue is one path that already exists on both ends.
+#[cfg(feature = "multiplex")]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TunnelId(pub [u8; 4]);
+
+#[cfg(feature = "multiplex")]
+impl TunnelId {
+    /// Wrap a numeric id as its big-endian wire form.
+    #[must_use]
+    pub fn new(raw: u32) -> Self {
+        TunnelId(raw.to_be_bytes())
+    }
+
+    /// The numeric form, for logs and for the client's own bookkeeping.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl std::fmt::Display for TunnelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
 /// One service registration inside a v4 session: the service's own credential
 /// (`digest(service_token ‖ nonce)`) plus the registration it authorizes.
 ///
@@ -432,6 +471,35 @@ pub enum ControlChannelCmd {
     ///
     /// Fixed width: four raw bytes of service id, four of lane id, one of state.
     LaneDrainAck(ServiceId, [u8; 4], u8),
+    /// What the **server's** session for one tunnel has emitted and re-sent.
+    ///
+    /// The L4 half of [`Self::CarrierReport`], and for the same reason: the
+    /// client dials the tunnels and decides their carrier, while on a path that
+    /// polices UDP the loss happens where the traffic is *offered* — the
+    /// server's sends into a policed carrier never arrive, so its ARQ re-sends
+    /// them, and the client's own counters (which only see what arrived) read
+    /// nothing. Measured on the policed condition: the server's sessions
+    /// re-sent **22.9 %** of what they emitted while the client's own read
+    /// 0.04 % — a separation the deciding end cannot see without this frame.
+    ///
+    /// Fixed width, like every other session command: four raw byte-array fields
+    /// rather than `u32`s (postcard varints integers), so the tag alone decides
+    /// that exactly 21 bytes follow — service, tunnel id, datagrams out,
+    /// retransmits, **bytes handed to the tunnel** and the sample's sequence. The service is what the client
+    /// routes by (a session's pools are per service, and a shared pool serves
+    /// several), exactly as [`Self::CarrierReport`]'s is; the tunnel id is the
+    /// same number that tunnel's stream prologue carries. The counters are
+    /// cumulative for the tunnel connection's life and saturate; the sequence
+    /// tells a fresh report from one that overtook it.
+    ///
+    /// The byte count is the field that makes a **delivery ratio** possible, and
+    /// it is what the ARQ counters failed to be: a share of re-sent datagrams
+    /// cannot tell a policed path from a merely lossy one — measured, the two
+    /// classes overlap (healthy median 3.5 %, policed 28.7 %) and a rule on that
+    /// signal fires on both (HANDOFF.md, round 6). What the deciding end can
+    /// compare is what the peer *handed* this tunnel against what it *received*
+    /// from it: policed ~10-20 %, healthy ~95-100 %.
+    TunnelHealth(ServiceId, [u8; 4], [u8; 4], [u8; 4], [u8; 4], u8),
 }
 
 /// [`ControlChannelCmd::LaneDrainAck`] states: the server is draining the lane
@@ -882,6 +950,45 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(
     Ok((version, hello))
 }
 
+/// The prologue a stream of a **multiplexed tunnel** opens with: the service it
+/// serves, and the tunnel carrying it.
+///
+/// Eight raw bytes, the same shape [`write_lane_prologue`] uses for a claim's
+/// lane, and for the same reason: the receiving end has to be able to talk about
+/// the *connection* a stream arrived on, and a service id alone cannot say which
+/// one it was.
+#[cfg(all(feature = "client", feature = "multiplex"))]
+pub async fn write_tunnel_prologue<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    service_id: ServiceId,
+    tunnel: TunnelId,
+) -> Result<()> {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&service_id.0);
+    buf[4..].copy_from_slice(&tunnel.0);
+    conn.write_all(&buf)
+        .await
+        .with_context(|| "Failed to write the v5 tunnel prologue")?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Read the prologue written by [`write_tunnel_prologue`].
+#[cfg(all(feature = "server", feature = "multiplex"))]
+pub async fn read_tunnel_prologue<T: AsyncRead + Unpin>(
+    conn: &mut T,
+) -> Result<(ServiceId, TunnelId)> {
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read the v5 tunnel prologue")?;
+    let mut service = [0u8; 4];
+    let mut tunnel = [0u8; 4];
+    service.copy_from_slice(&buf[..4]);
+    tunnel.copy_from_slice(&buf[4..]);
+    Ok((ServiceId(service), TunnelId(tunnel)))
+}
+
 /// Write the 4-byte service prologue that opens every stream of a v4 data
 /// plane: a direct data channel (right after its hello) and every stream
 /// inside a multiplexed tunnel alike.
@@ -1076,9 +1183,9 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
 /// same reason as [`read_register_result`].
 #[cfg(feature = "client")]
 pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
-    // 1 tag byte + the largest suffix below (the carrier report's 17 bytes:
-    // service, lane, offered, refused, sequence).
-    let mut buf = [0u8; 18];
+    // 1 tag byte + the largest suffix below (the tunnel health report's 21
+    // bytes: service, tunnel, emitted, re-sent, handed over, sequence).
+    let mut buf = [0u8; 22];
     conn.read_exact(&mut buf[..1])
         .await
         .with_context(|| "Failed to read cmd")?;
@@ -1087,7 +1194,10 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
         1 => return Ok(ControlChannelCmd::HeartBeat),
         2 | 3 => 4,
         4 => 10,
+        // The lane report is 17 bytes (service + four fields + sequence); the
+        // tunnel report is 21 (the same, plus the bytes handed over).
         5 => 17,
+        7 => 21,
         6 => 9,
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     };
@@ -1127,8 +1237,30 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
             lane.copy_from_slice(&buf[5..9]);
             ControlChannelCmd::LaneDrainAck(ServiceId(service), lane, buf[9])
         }
+        // The tunnel health report: tunnel, emitted, re-sent, sequence — the
+        // same hand-decoded fixed-width form the lane report uses.
+        7 => {
+            let mut service = [0u8; 4];
+            let mut tunnel = [0u8; 4];
+            let mut out = [0u8; 4];
+            let mut resent = [0u8; 4];
+            let mut handed = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            tunnel.copy_from_slice(&buf[5..9]);
+            out.copy_from_slice(&buf[9..13]);
+            resent.copy_from_slice(&buf[13..17]);
+            handed.copy_from_slice(&buf[17..21]);
+            ControlChannelCmd::TunnelHealth(
+                ServiceId(service),
+                tunnel,
+                out,
+                resent,
+                handed,
+                buf[21],
+            )
+        }
         // The only tag left is 4, the stripe request: the dispatch above
-        // returned on 0 and 1 and bailed on everything but 2, 3, 4, 5 and 6.
+        // returned on 0 and 1 and bailed on everything but 2, 3, 4, 5, 6 and 7.
         // Parsed with postcard as one tuple rather than field by field, so the
         // reader and the writer agree on the layout by construction: a
         // reordered or resized field fails here instead of silently reading the
@@ -1717,6 +1849,29 @@ mod tests {
                 "unexpected error for version {version}: {msg}"
             );
         }
+    }
+
+    /// A tunnel's prologue is eight fixed bytes — the service, then the tunnel
+    /// — and it round-trips as the pair the server attributes a stream by.
+    ///
+    /// The width is the contract: the server reads exactly this many bytes, and
+    /// a field added here without a matching reader would reframe every
+    /// following byte of the stream.
+    #[cfg(all(feature = "client", feature = "server", feature = "multiplex"))]
+    #[tokio::test]
+    async fn a_tunnel_prologue_carries_the_service_and_the_tunnel() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        let service = ServiceId::new(0x0BAD_F00D);
+        let tunnel = TunnelId::new(0x0000_1234);
+        write_tunnel_prologue(&mut tx, service, tunnel)
+            .await
+            .unwrap();
+        let (read_service, read_tunnel) = read_tunnel_prologue(&mut rx).await.unwrap();
+        assert_eq!(read_service, service);
+        assert_eq!(read_tunnel, tunnel);
+        assert_eq!(read_tunnel.get(), 0x1234);
     }
 
     /// A lane's prologue is eight fixed bytes — the service, then the lane —

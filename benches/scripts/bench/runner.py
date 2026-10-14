@@ -49,9 +49,10 @@ import peers
 import topology
 import workloads
 
-#: The engine's schema version. It changes when the *shape* of a results file
-#: changes; the fingerprint covers the meaning (see `method_record`).
-SCHEMA = 2
+#: The results file's schema version. It changes when the *shape* of a file
+#: changes — the analysis version (`method.analysis_version`) covers the
+#: statistics instead, and the fingerprint covers the meaning.
+SCHEMA = 3
 HERE = Path(__file__).resolve().parent
 
 
@@ -121,18 +122,34 @@ def method_record(
     scenarios: list,
     args,
     profile_name: str,
+    arms: list,
 ) -> dict:
-    """Everything that decides *what a number means* — and nothing else."""
+    """Everything that decides *what a number means* — and nothing else.
+
+    The primary endpoints are part of the method, deliberately: a comparison
+    designated before the run is a different *design* from the same comparison
+    picked out afterwards, and the fingerprint is what makes the distinction
+    checkable rather than a matter of trust. Two files whose endpoints differ
+    are refused by `comparability`, which is the point — choosing the winner
+    after seeing the numbers must change the file's identity, not just its
+    story. The iperf3 version travels with it for the same reason: a version
+    can change the summary fields the model reads (measured across a
+    reinstall), so a number from the other side of that boundary is not
+    comparable with one from this side.
+    """
     return {
         "profile": profile_name,
         "engine_hash": engine_hash(),
         "metrics_hash": metrics_hash(),
+        "analysis_version": analysis.ANALYSIS_VERSION,
         "rounds": profile["rounds"],
         "warmup_rounds": profile["warmup_rounds"],
         "tun_mtu": args.tun_mtu,
         "link_mtu": args.link_mtu,
         "condition": args.condition,
         "condition_leg": args.condition_leg,
+        "primary": primary_endpoints(getattr(args, "primary", None), scenarios),
+        "normalize": getattr(args, "normalize", "") or "",
         "slo": {
             "rtt_p99_ms": model.SLO_RTT_P99_MS,
             "error_rate_pct": model.SLO_ERROR_RATE_PCT,
@@ -146,6 +163,19 @@ def method_record(
             "drain_quiet_polls": topology.DRAIN_QUIET_POLLS,
             "clk_tck": topology.CLK_TCK,
             "iperf_omit_default": 2,
+            "iperf_version": iperf_version(),
+        },
+        # The peer tools' resolved versions, beside the numbers they produced:
+        # a reference-tool version is as much a part of what a peer number
+        # means as the iperf3 version is for the samples it instruments (the
+        # fetcher resolves it from the tool's own output, falling back to its
+        # release marker; an unreadable version is an empty string rather
+        # than a guess). Molehill's own version is the binary's provenance
+        # line, not the method's, so it is not repeated here.
+        "peer_versions": {
+            arm.tool: _peer_version(arm.tool)
+            for arm in arms
+            if getattr(arm, "tool", None)
         },
         "scenarios": [
             {"id": s.id, "kind": s.kind, "params": s.params_for(profile)}
@@ -153,6 +183,98 @@ def method_record(
         ],
         "udp_probe_rcvbuf": 4 << 20,
     }
+
+
+def primary_endpoints(specs, scenarios: list) -> list:
+    """The run's pre-registered comparisons, as data, validated against the run.
+
+    `--primary metric=throughput_gbps,scenario=bulk-n[,arm=l4][,cell=P1]` may
+    be repeated. Every name is checked against what this run will actually
+    measure — a typo would otherwise pre-register a comparison that never
+    happens and silence the honest ones. Empty (the default): the scenarios'
+    headline metrics are the primary set, which is the model's standing
+    declaration and needs no command line to say it.
+    """
+    if not specs:
+        return []
+    known_metrics = set(model.metric_ids())
+    known_scenarios = {s.id for s in scenarios}
+    out: list = []
+    for spec in specs:
+        fields: dict = {}
+        for part in str(spec).split(","):
+            if "=" not in part:
+                raise SystemExit(
+                    f"--primary {spec!r}: every field is key=value "
+                    "(metric=, scenario=, arm=, cell=)"
+                )
+            key, value = (s.strip() for s in part.split("=", 1))
+            fields[key] = value
+        metric = fields.get("metric", "")
+        if metric not in known_metrics:
+            raise SystemExit(
+                f"--primary {spec!r}: unknown metric {metric!r}; "
+                f"known: {', '.join(sorted(known_metrics))}"
+            )
+        scenario = fields.get("scenario", "")
+        if scenario not in known_scenarios:
+            raise SystemExit(
+                f"--primary {spec!r}: scenario {scenario!r} is not in this run; "
+                f"known: {', '.join(sorted(known_scenarios))}"
+            )
+        out.append(
+            {
+                "metric": metric,
+                "scenario": scenario,
+                "arm": fields.get("arm", ""),
+                "cell": fields.get("cell", ""),
+                "direction": fields.get("direction", ""),
+            }
+        )
+    return out
+
+
+def iperf_version() -> str:
+    """What iperf3 this run would use, or `""` when none is installed.
+
+    Recorded in the method: iperf3 changed the UDP summary fields the model
+    reads across a version boundary (measured, HANDOFF's environment notes),
+    so the version is as much a part of what a UDP number means as the
+    workload's parameters are.
+    """
+    if shutil.which("iperf3") is None:
+        return ""
+    try:
+        r = subprocess.run(
+            ["iperf3", "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        first = (r.stdout or r.stderr).strip().splitlines()
+        return first[0][:60] if first else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _peer_version(tool: str) -> str:
+    """One peer tool's resolved version, through its own adapter.
+
+    The adapter reads the tool's own `--version` output and falls back to the
+    fetcher's release marker, so the version beside a peer's numbers is the
+    one that actually ran — not the one the run assumed.
+    """
+    try:
+        adapter = _peer_adapter(tool)
+    except SystemExit:
+        return ""
+    binaries = adapter.binaries(adapter.peer_dir)
+    if not binaries:
+        return ""
+    # One binary names the tool's version for all of them (rathole's server
+    # and client are the same file; nps's two halves print the same line).
+    return adapter.describe_version(next(iter(binaries.values())))
 
 
 def fingerprint(method: dict) -> str:
@@ -578,6 +700,29 @@ def build_results(camp: Campaign, pre: dict, provenance: dict, started: str) -> 
             "warmup_rounds": camp.profile["warmup_rounds"],
             "budget_s": camp.profile["budget_s"],
             "hypothesis": camp.args.hypothesis,
+            # The diagnostic switches this run inherited (`MOLEHILL_*`): a
+            # forced carrier or a scheduled switch is part of what the numbers
+            # *mean*, so it is recorded beside the method — deliberately not
+            # inside it, because a declared treatment (like `--ab-arm`'s two
+            # binaries) is exactly what a between-file comparison contrasts,
+            # while a method key difference names files that measured
+            # different things. The reader decides; the file has to say.
+            "molehill_switches": {
+                name: os.environ[name]
+                for name in sorted(
+                    {
+                        "MOLEHILL_DATA_CARRIER",
+                        "MOLEHILL_CARRIER_SWITCH_AT",
+                        "MOLEHILL_TUNNEL_SWITCH_AT",
+                        "MOLEHILL_L3_STATS",
+                        "MOLEHILL_KCP_STATS",
+                        "MOLEHILL_TUNNEL_STATS",
+                        "MOLEHILL_POOL_STATS",
+                        "MOLEHILL_STRIPE_COUNT",
+                    }
+                    & set(os.environ)
+                )
+            },
             "started": started,
             "finished": "",
             "elapsed_s": 0.0,
@@ -622,7 +767,7 @@ def _prepare(args) -> Campaign:
     work = Path(args.work or (home / "tmp" / f"bench-{stamp}"))
     out = Path(args.out or (home / "tmp" / f"bench-{stamp}.json"))
     work.mkdir(parents=True, exist_ok=True)
-    method = method_record(profile, scenarios, args, profile_name)
+    method = method_record(profile, scenarios, args, profile_name, arms)
     camp = Campaign(
         args=args,
         profile=profile,

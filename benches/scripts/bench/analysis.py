@@ -17,7 +17,10 @@ Three rules, and they are the reason a number from this model can be quoted:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import random
 import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +37,38 @@ HOST_LOOPBACK_TOLERANCE_PCT = 15.0
 #: The fewest measured rounds a claim may rest on: one round is an anecdote,
 #: and the model says so instead of reading a direction into it.
 MIN_ROUNDS_FOR_CLAIM = 2
+#: The fewest paired rounds a bootstrap confidence interval may be estimated
+#: over. Below this the interval is not printed at all (`ci_low`/`ci_high`
+#: stay `None`) rather than printed with a width that would be a guess:
+#: resampling two points cannot say how wide the effect's distribution is.
+MIN_PAIRS_FOR_CI = 3
+#: The nominal significance level of a claim's sign test, and the level the
+#: Benjamini-Hochberg step-up controls the primary family at. A run whose
+#: rounds cannot reach it is not silent about that: the verdict carries
+#: `min_attainable_p`, and the effective level degrades to it (see
+#: `alpha_eff`), so a three-round claim is *labelled* a 25 %-error statement
+#: instead of passing silently as a 5 % one.
+ALPHA = 0.05
+#: The bootstrap: resamples per interval, and the percentile interval's
+#: coverage. Seeded from the results file's fingerprint, so re-analysing a
+#: stored run reproduces the same interval byte for byte.
+BOOTSTRAP_REPS = 2000
+BOOTSTRAP_LEVEL = 0.95
+#: The largest fraction of a cell's rounds that may fail and still leave a
+#: median worth reading. Above it the arm's cell reads `unavailable` with the
+#: count, never a median over the survivors — a 1-of-4 median is an anecdote
+#: promoted by dropping the rounds that disagreed with it.
+MAX_FAILED_FRACTION = 0.5
+#: The planning cutoff for `resolution_lines`: at or below this many rounds
+#: the scatter is not what stands between the run and its floor (doubling
+#: would not reach it), so the advice changes to "longer workloads".
+MIN_ROUNDS_FOR_PLAN = 2
+#: The analysis layer's own version, recorded in every results file's method:
+#: the statistics are part of what a number means, and two files reduced by
+#: different versions are not *compared* (either may be re-rendered by the
+#: current code — `load` recomputes the summary from the stored samples — but
+#: a comparison needs one reduction).
+ANALYSIS_VERSION = 3
 #: Values are rounded to this many decimals in the results file, which is more
 #: than any of these instruments resolves and keeps a file diffable.
 ROUND_TO = 6
@@ -45,11 +80,18 @@ METHOD_VALUE_CHARS = 60
 class Comparison:
     """The two measured sets one verdict compares.
 
+    `values_a`/`values_b` are the rounds' readings in round order, and
+    `rounds_a`/`rounds_b` are the round indexes those readings came from —
+    paired by index, never by position, because a failed round on one side
+    must shift neither side's pairing (the positional zip silently paired
+    round 1 against round 2 and called the difference a replicate).
+
     `noise` is the run's own resolution for this metric in *both* units - a
     relative one and the metric's own - because a verdict must compare like
     with like: a loss floor is a fraction of a percent, a throughput floor is a
     fraction of a rate, and mixing them would let one metric's scale decide
-    another's claim.
+    another's claim. `seed` makes the verdict's bootstrap reproducible: the
+    same stored run analysed twice produces the same interval.
     """
 
     metric: str
@@ -58,6 +100,9 @@ class Comparison:
     label_a: str = "A"
     label_b: str = "B"
     noise: dict | None = None
+    rounds_a: tuple = ()
+    rounds_b: tuple = ()
+    seed: int = 0
 
 
 @dataclass
@@ -110,6 +155,12 @@ def _stats_of(bucket: dict) -> dict:
     arms: dict = {}
     for arm, data in bucket["arms"].items():
         rows = data["rounds"]
+        # A median over the survivors is a median over the rounds that
+        # happened to agree with it. Past half the rounds failed, the cell
+        # says why instead of quoting what is left: the gate and the verdicts
+        # both read this flag.
+        total = len(rows) + data["failed"]
+        drowned = bool(rows) and data["failed"] / max(total, 1) > MAX_FAILED_FRACTION
         metrics: dict = {}
         for metric in model.metric_ids():
             values = [
@@ -122,6 +173,7 @@ def _stats_of(bucket: dict) -> dict:
         arms[arm] = {
             "rounds": len(rows),
             "failed": data["failed"],
+            "drowned": drowned,
             "metrics": metrics,
             "unavailable": _unavailable_of(rows),
         }
@@ -405,15 +457,225 @@ def _sign_agreement(values_a: list, values_b: list):
     return round(max(positive, len(diffs) - positive) / len(diffs), 3)
 
 
+# --- the statistics a verdict is made of ------------------------------------
+def round_readings(
+    results: dict, arm: str, scenario: str, cell: str, metric: str
+) -> dict:
+    """One metric's readings by **round index**, for one arm and cell.
+
+    The round index is the pairing key, not position: a failed round on one
+    side must shift neither side's pairing. The positional zip this replaces
+    paired round 1 against round 2 and called the difference a replicate.
+    """
+    readings: dict = {}
+    for sample in results.get("samples", []):
+        if sample.get("warmup") or not sample.get("ok"):
+            continue
+        if sample["arm"] != arm or sample["scenario"] != scenario:
+            continue
+        if sample["cell"] != cell:
+            continue
+        value = sample.get("metrics", {}).get(metric)
+        if value is not None:
+            readings[sample["round"]] = value
+    return readings
+
+
+def _aligned(values_a: list, rounds_a: tuple, values_b: list, rounds_b: tuple):
+    """Two sides' readings paired by round index.
+
+    Falls back to positional pairing when round indexes were not supplied (the
+    verdict's direct callers in the selfcheck pass bare lists), which is exact
+    whenever both sides measured every round - and the caller says so.
+    """
+    if rounds_a and rounds_b:
+        common = sorted(set(rounds_a) & set(rounds_b))
+        index_a = dict(zip(rounds_a, values_a, strict=True))
+        index_b = dict(zip(rounds_b, values_b, strict=True))
+        return [(index_a[r], index_b[r]) for r in common]
+    return list(zip(values_a, values_b, strict=False))
+
+
+def sign_test_p(diffs: list) -> float:
+    """The two-sided **exact sign test** p-value of the paired differences.
+
+    The null is "a round is as likely to move either way": under it the number
+    of positive differences is Binomial(n, 1/2), and the p-value doubles the
+    tail at or beyond the observed count. Computed from `math.comb`, so the
+    model carries no dependency for it.
+
+    This replaces the silent `sign agreement == 1.0` the verdict used before:
+    same information, but now the test's own error rate is *stated* — at three
+    rounds a perfectly consistent reading has p = 0.25, which is the false
+    positive rate that verdict had all along and never printed.
+    """
+    n = len(diffs)
+    if n == 0:
+        return 1.0
+    positives = sum(1 for d in diffs if d > 0)
+    tails = sum(math.comb(n, k) for k in range(max(positives, n - positives), n + 1))
+    return min(1.0, 2.0 * tails / 2**n)
+
+
+def min_attainable_p(rounds: int) -> float:
+    """The smallest p-value `rounds` paired rounds can produce: `2 / 2**n`.
+
+    The exact sign test cannot go below perfect consistency, so this is the
+    strongest evidence a run of this length can offer - and it is the reason a
+    claim at n < 6 is a statement with a 25 %, 12.5 %, ... error rate rather
+    than a 5 % one. `alpha_eff` degrades to it so the verdict says what its
+    own design permits instead of pretending a threshold was met.
+    """
+    if rounds < 1:
+        return 1.0
+    return 2.0 / 2**rounds
+
+
+def alpha_eff(rounds: int) -> float:
+    """The significance level a run of this length can honestly test at."""
+    return max(ALPHA, min_attainable_p(rounds))
+
+
+def _stable_seed(*parts) -> int:
+    """A deterministic seed from the comparison's identity.
+
+    The bootstrap must be reproducible: re-analysing a stored run produces the
+    same interval, so a published CI is a property of the run rather than of
+    the afternoon it was recomputed in. No global random state is touched.
+    """
+    digest = hashlib.sha256("|".join(str(p) for p in parts).encode())
+    return int.from_bytes(digest.digest()[:8], "big")
+
+
+def bootstrap_ci(pairs: list, seed: int) -> tuple:
+    """A percentile bootstrap CI over the **difference of medians**.
+
+    Resamples the paired rounds with replacement — both sides of a pair
+    together, so the pairing survives the resample — and recomputes
+    `median(a) - median(b)` per resample: the same statistic the verdict
+    reports, so the interval brackets the number the reader is shown. Returns
+    `(None, None)` below [`MIN_PAIRS_FOR_CI`]: resampling one or two points
+    cannot say how wide the effect's distribution is, and a guessed width is
+    worse than an honest absence.
+    """
+    if len(pairs) < MIN_PAIRS_FOR_CI:
+        return (None, None)
+    # Not cryptographic: the seed exists so re-analysing a stored run
+    # reproduces the same interval, and the generator's quality bar is
+    # "resamples a median without a pattern a reader could guess".
+    rng = random.Random(seed)  # noqa: S311 - reproducible bootstrap, not security
+    samples: list = []
+    for _ in range(BOOTSTRAP_REPS):
+        picks = [rng.randrange(len(pairs)) for _ in range(len(pairs))]
+        a = [pairs[i][0] for i in picks]
+        b = [pairs[i][1] for i in picks]
+        samples.append(statistics.median(a) - statistics.median(b))
+    samples.sort()
+    alpha = 1.0 - BOOTSTRAP_LEVEL
+    low = inst.pct(samples, alpha / 2.0)
+    high = inst.pct(samples, 1.0 - alpha / 2.0)
+    return (low, high)
+
+
+def benjamini_hochberg(p_values: list, q: float = ALPHA) -> list:
+    """BH step-up adjusted q-values, in the input's order.
+
+    Controls the false discovery rate across the family of primary endpoints:
+    with several pre-registered comparisons, some will clear their floors by
+    chance, and this says which of the claims survive the correction. The
+    adjusted value is the smallest family-wise level at which that comparison
+    still reads significant; a claim survives when `p <= q_value`.
+    """
+    m = len(p_values)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: p_values[i])
+    adjusted: list = [1.0] * m
+    running = 1.0
+    for rank in range(m, 0, -1):
+        index = order[rank - 1]
+        running = min(running, p_values[index] * m / rank)
+        adjusted[index] = min(1.0, running)
+    return [round(v, 4) if v * q < 1.0 else 1.0 for v in adjusted]
+
+
+def rounds_needed(sd_pct: float, effect_pct: float) -> int | None:
+    """The paired rounds that resolve `effect_pct` at this scatter, stated.
+
+    A normal approximation over the paired differences: `n = (1.96 s / d)²`.
+    A *planning* number, printed beside the exact one the sign test gives
+    (`min_attainable_p` — six rounds reach p ≤ 0.05 whatever the scatter, so
+    consistency is cheap and magnitude is what rounds buy). `None` when either
+    side is zero or the effect is already inside one round's resolution.
+    """
+    if sd_pct <= 0 or effect_pct <= 0:
+        return None
+    n = (1.96 * sd_pct / effect_pct) ** 2
+    return max(1, math.ceil(n))
+
+
+def resolution_lines(results: dict) -> list:
+    """What this run could resolve, and what it would take to resolve more.
+
+    One line per cell where the run's resolution is *worse* than the metric's
+    floor — the cells where a claim is currently unreachable, with the round
+    count that would reach it (`rounds_needed` from the run's own A/A
+    scatter). A run that already resolves its metrics' floors prints nothing:
+    there is nothing to plan for, and a page of "1 rounds would reach it"
+    would just be noise.
+    """
+    noise = (results.get("summary", {}).get("noise", {}) or {}).get("by_cell", {})
+    lines: list = []
+    for cell_id, entries in sorted(noise.items()):
+        for metric_id, entry in entries.items():
+            metric = model.METRICS.get(metric_id)
+            if metric is None or metric.materiality[0] != "rel":
+                continue
+            floor = entry.get("floor_pct")
+            if floor is None or floor <= metric.materiality[1]:
+                continue
+            # The A/A scatter is the run's own spread for this cell: it is
+            # what more rounds would narrow.
+            scatter = entry.get("aa_scatter_pct") or floor
+            need = rounds_needed(scatter, metric.materiality[1])
+            if need is None or need <= MIN_ROUNDS_FOR_PLAN:
+                # Two or fewer rounds means the scatter is not the thing
+                # standing between the run and its floor — say what is.
+                lines.append(
+                    f"  {cell_id} {metric_id}: the run resolves {floor:.1f} % "
+                    f"against a {metric.materiality[1]:g} % floor — "
+                    "the cell is too noisy for rounds to fix (longer workloads, "
+                    "not more of them)"
+                )
+            else:
+                lines.append(
+                    f"  {cell_id} {metric_id}: the run resolves {floor:.1f} % "
+                    f"against a {metric.materiality[1]:g} % floor — about "
+                    f"{need} rounds would reach it"
+                )
+    return lines[:12]
+
+
 # --- verdicts ---------------------------------------------------------------
 def verdict(cmp: Comparison) -> dict:
     """One metric's verdict between two measured sets of rounds.
 
-    `claim` requires every paired round to agree in sign *and* the median
-    difference to clear both the metric's materiality floor and the run's noise
-    floor. Everything else is `directional` (a direction, but a disagreement or
-    a floor is in the way), `single-round`, or `indistinguishable` - and
-    `unavailable` when one side has no reading at all.
+    The state is decided by three legs, each reported rather than hidden:
+
+    * **materiality** — the median difference clears both the metric's own
+      floor and the run's noise floor (as before);
+    * **consistency** — the paired rounds are tested with the *exact sign
+      test* at the level the run's length can honestly support
+      (`alpha_eff`): at three rounds that is 0.25, and the verdict says so,
+      instead of a silent "every round agreed" that was a 25 %-error rule;
+    * **the interval** — a bootstrap CI over the paired difference says
+      whether the effect is *entirely beyond* the threshold (a claim's
+      shape), *entirely inside* it (bounded evidence of no difference), or
+      *straddling* it (a direction, and nothing more).
+
+    Only a **primary** endpoint may read `claim`: the scenario's headline
+    metric, or an explicit hypothesis declaration. Everything else is
+    exploratory and is reported with its numbers, never as a claim.
     """
     metric = model.METRICS[cmp.metric]
     if not cmp.values_a or not cmp.values_b:
@@ -436,52 +698,132 @@ def verdict(cmp: Comparison) -> dict:
                 f"{cmp.label_b}: {len(cmp.values_b)}"
             ),
         }
-    base = _verdict_base(cmp, metric)
-    base["verdict"] = _verdict_state(cmp, metric, base)
+    pairs = _aligned(cmp.values_a, cmp.rounds_a, cmp.values_b, cmp.rounds_b)
+    base = _verdict_base(pairs, metric, cmp.noise, cmp.seed)
+    base |= {"metric": cmp.metric, "a": cmp.label_a, "b": cmp.label_b}
+    base["verdict"] = _verdict_state(base)
     if base["verdict"] in ("claim", "directional") and metric.direction != "none":
         improved = (base["delta_abs"] > 0) == (metric.direction == "higher")
         base["better"] = cmp.label_a if improved else cmp.label_b
+    base["fragile"] = _fragile(pairs, metric, cmp.noise, cmp.seed, base)
     return base
 
 
-def _verdict_base(cmp: Comparison, metric: model.Metric) -> dict:
-    med_a, med_b = statistics.median(cmp.values_a), statistics.median(cmp.values_b)
+def _verdict_base(pairs: list, metric: model.Metric, noise: dict, seed: int) -> dict:
+    """The verdict's measured legs, from one set of paired rounds.
+
+    A pure function of the pairs: leave-one-out fragility calls it again on
+    each subset, so the reported verdict and the fragility check are the same
+    computation rather than two that could drift apart.
+    """
+    values_a = [a for a, _ in pairs]
+    values_b = [b for _, b in pairs]
+    med_a, med_b = statistics.median(values_a), statistics.median(values_b)
     delta_abs = med_a - med_b
     delta_pct = (delta_abs / abs(med_b) * 100.0) if med_b else None
-    noise = cmp.noise or {}
+    noise = noise or {}
     relative = metric.materiality[0] == "rel"
     floor = (noise.get("pct") if relative else noise.get("abs")) or 0.0
     threshold = max(metric.materiality[1], floor)
     measured = (delta_pct or 0.0) if relative else delta_abs
+    diffs = [a - b for a, b in pairs]
+    p = sign_test_p(diffs)
+    level = alpha_eff(len(diffs))
+    ci_low, ci_high = bootstrap_ci(pairs, seed)
+    # The threshold in the difference's own unit, so the interval and the
+    # floor are compared like with like: a relative floor is a percentage of
+    # the reference, which is exactly what delta_pct divides by.
+    threshold_abs = threshold / 100.0 * abs(med_b) if relative and med_b else threshold
+    # The interval read on the improvement scale: positive means a is better.
+    a_better = metric.direction == "higher"
+    imp = (
+        (ci_low, ci_high)
+        if a_better
+        else ((None, None) if ci_low is None else (-ci_high, -ci_low))
+    )
     return {
-        "metric": cmp.metric,
+        "metric": metric.id,
         "unit": "pct" if relative else metric.unit,
-        "a": cmp.label_a,
-        "b": cmp.label_b,
         "median_a": round(med_a, ROUND_TO),
         "median_b": round(med_b, ROUND_TO),
         "delta_abs": round(delta_abs, ROUND_TO),
         "delta_pct": None if delta_pct is None else round(delta_pct, 3),
-        "sign_agreement": _sign_agreement(cmp.values_a, cmp.values_b),
+        "sign_agreement": _sign_agreement(values_a, values_b),
         "threshold": round(threshold, 3),
         "noise": {k: (None if v is None else round(v, 3)) for k, v in noise.items()},
         "material": abs(measured) >= threshold,
-        "rounds": [len(cmp.values_a), len(cmp.values_b)],
+        "rounds": [len(values_a), len(values_b)],
+        "p": round(p, 4),
+        "alpha_eff": round(level, 4),
+        "min_attainable_p": round(min_attainable_p(len(diffs)), 4),
+        "n_pairs": len(diffs),
+        "ci_low": None if ci_low is None else round(ci_low, ROUND_TO),
+        "ci_high": None if ci_high is None else round(ci_high, ROUND_TO),
+        "ci_level": BOOTSTRAP_LEVEL if ci_low is not None else None,
+        "ci": _ci_state(imp[0], imp[1], threshold_abs),
+        "equivalent": False,
+        "fragile": False,
         "better": None,
     }
 
 
-def _verdict_state(cmp: Comparison, metric: model.Metric, base: dict) -> str:
-    del cmp  # the state is a function of the metric and the computed base
-    if metric.direction == "none":
+def _ci_state(imp_low, imp_high, threshold_abs) -> str:
+    """What the improvement interval says, or `""` when none was estimable."""
+    if imp_low is None:
+        return ""
+    if imp_low > threshold_abs:
+        return "beyond"
+    if imp_high < threshold_abs and imp_low > -threshold_abs:
+        return "within"
+    return "straddling"
+
+
+def _decide(material: bool, p: float, level: float, ci: str) -> str:
+    """The verdict state from its three legs, on one set of paired rounds.
+
+    `ci == ""` (no interval estimable) keeps the pre-interval behaviour: the
+    materiality and consistency legs decide, and the verdict text carries the
+    `min_attainable_p` caveat that says how strong that is.
+    """
+    significant = p <= level
+    if material and significant and ci in ("", "beyond"):
+        return "claim"
+    if ci == "within":
+        return "indistinguishable"
+    if material:
+        return "directional"
+    return "indistinguishable"
+
+
+def _verdict_state(base: dict) -> str:
+    if base["metric"] in model.METRICS and model.METRICS[base["metric"]].direction == (
+        "none"
+    ):
         return "context"
     if min(base["rounds"]) < MIN_ROUNDS_FOR_CLAIM:
         return "single-round"
-    if not base["material"]:
-        return "indistinguishable"
-    if base["sign_agreement"] == 1.0:
-        return "claim"
-    return "directional"
+    return _decide(base["material"], base["p"], base["alpha_eff"], base["ci"])
+
+
+def _fragile(pairs, metric, noise, seed, base) -> bool:
+    """Whether the verdict survives dropping any single paired round.
+
+    A leave-one-out check, reported and never applied: a reading that flips
+    when one round is removed is exactly the shape the P3 re-test hit (the
+    baseline's own first round sat above the candidate's median). Not computed
+    below three pairs — every two-pair verdict is fragile by construction, and
+    the `single-round` state already says what one round is worth.
+    """
+    if base["n_pairs"] < MIN_PAIRS_FOR_CI:
+        return False
+    for i in range(len(pairs)):
+        subset = pairs[:i] + pairs[i + 1 :]
+        sub = _verdict_base(subset, metric, noise, seed)
+        if _decide(sub["material"], sub["p"], sub["alpha_eff"], sub["ci"]) != (
+            _decide(base["material"], base["p"], base["alpha_eff"], base["ci"])
+        ):
+            return True
+    return False
 
 
 def verdicts(results: dict) -> list:
@@ -491,6 +833,18 @@ def verdicts(results: dict) -> list:
     backend with no tool in the path, so "the arm differs from the control" is a
     statement about the architecture, while "one arm differs from another" is a
     statement about a choice.
+
+    Two rules come with the scale this loop runs at — a small run emits well
+    over a hundred verdicts — and both are reported per entry:
+
+    * **primary** marks the family the false-discovery correction is applied
+      over: the run's declared hypothesis endpoints (`--hypothesis`), or the
+      scenario's headline metric when nothing was declared. Every other
+      comparison is exploratory: it is reported with its numbers and never
+      reads `claim`, because a claim picked out of a hundred comparisons is
+      not a finding, it is a selection.
+    * **q** is the Benjamini-Hochberg adjusted value over the primary family
+      (per comparison pair, per cell): a primary claim must also survive it.
     """
     out: list = []
     noise = (results.get("summary", {}).get("noise", {}) or {}).get("metrics", {})
@@ -502,22 +856,78 @@ def verdicts(results: dict) -> list:
         for a in results.get("meta", {}).get("arms", [])
         if a.get("against")
     }
+    fingerprint = (results.get("meta", {}) or {}).get("fingerprint", "")
     for summary_cell in results.get("summary", {}).get("cells", []):
         scenario, cell = summary_cell["scenario"], summary_cell["cell"]
         for label_a, label_b in _pairs_of(summary_cell, twins, declared):
+            family: list = []
             for metric_id in model.metric_ids():
-                values_a = round_values(results, label_a, scenario, cell, metric_id)
-                values_b = round_values(results, label_b, scenario, cell, metric_id)
-                if not values_a and not values_b:
+                readings_a = round_readings(results, label_a, scenario, cell, metric_id)
+                readings_b = round_readings(results, label_b, scenario, cell, metric_id)
+                if not readings_a and not readings_b:
                     continue
+                if any(
+                    summary_cell["arms"].get(a, {}).get("drowned")
+                    for a in (label_a, label_b)
+                ):
+                    out.append(
+                        {
+                            "metric": metric_id,
+                            "unit": model.METRICS[metric_id].unit,
+                            "a": label_a,
+                            "b": label_b,
+                            "verdict": "unavailable",
+                            "reason": (
+                                "more than half of this cell's rounds failed; "
+                                "the surviving median is not quoted"
+                            ),
+                            "rounds": [
+                                summary_cell["arms"].get(label_a, {}).get("rounds", 0),
+                                summary_cell["arms"].get(label_b, {}).get("rounds", 0),
+                            ],
+                            "scenario": scenario,
+                            "cell": cell,
+                            "aa": label_b.endswith(AA_SUFFIX),
+                            "twin": label_b.endswith(TWIN_SUFFIXES),
+                            "primary": False,
+                            "fragile": False,
+                        }
+                    )
+                    continue
+                control_readings = round_readings(
+                    results, "control", scenario, cell, metric_id
+                )
+                rounds_a = tuple(sorted(readings_a))
+                rounds_b = tuple(sorted(readings_b))
+                # Normalize only where the run asked for it (`--normalize
+                # control`): dividing by the control is right when the cell is
+                # host-bound and the control shares that bound, and circular
+                # when the tool is what limits the path — a judgement the run
+                # states, not one the analysis guesses at.
+                normalize = (results.get("meta", {}).get("method", {}) or {}).get(
+                    "normalize", ""
+                )
+                pair = _Pair(
+                    a=readings_a,
+                    b=readings_b,
+                    rounds_a=rounds_a,
+                    rounds_b=rounds_b,
+                    control=control_readings,
+                )
+                norm_a, norm_b, normalized = _normalized(pair, normalize == "control")
                 entry = verdict(
                     Comparison(
                         metric=metric_id,
-                        values_a=values_a,
-                        values_b=values_b,
+                        values_a=norm_a,
+                        values_b=norm_b,
                         label_a=label_a,
                         label_b=label_b,
                         noise=floor_for(noise, scenario, cell, metric_id),
+                        rounds_a=rounds_a,
+                        rounds_b=rounds_b,
+                        seed=_stable_seed(
+                            fingerprint, label_a, label_b, scenario, cell, metric_id
+                        ),
                     )
                 )
                 entry |= {
@@ -525,9 +935,122 @@ def verdicts(results: dict) -> list:
                     "cell": cell,
                     "aa": label_b.endswith(AA_SUFFIX),
                     "twin": label_b.endswith(TWIN_SUFFIXES),
+                    "normalized": normalized,
                 }
+                family.append(entry)
                 out.append(entry)
+            declared = (results.get("meta", {}).get("method", {}) or {}).get(
+                "primary", []
+            )
+            _apply_family(family, scenario, declared)
     return out
+
+
+@dataclass(frozen=True)
+class _Pair:
+    """One cell's two sides and the control that may normalize them."""
+
+    a: dict
+    b: dict
+    rounds_a: tuple
+    rounds_b: tuple
+    control: dict
+
+
+def _normalized(pair: _Pair, wanted: bool):
+    """Both sides' readings as ratios to the control's reading of their round.
+
+    Opt-in (`--normalize control`), because it is only honest where the cell
+    is host-bound: the ratio cancels the host's round-to-round drift, but it
+    also cancels any real difference that moves the *control* the same way —
+    so on a loopback-ceiling cell the division would manufacture invariance
+    the path does not have. A metric whose readings are zero-or-negative is
+    left raw (the ratio is meaningless there), and so is a comparison where
+    either side has no control reading to divide by; the fallback is recorded,
+    not silent, by the `normalized` flag the verdict carries.
+    """
+    raw = (
+        [pair.a[r] for r in pair.rounds_a],
+        [pair.b[r] for r in pair.rounds_b],
+        False,
+    )
+    if not wanted:
+        return raw
+    common_a = [r for r in pair.rounds_a if r in pair.control]
+    common_b = [r for r in pair.rounds_b if r in pair.control]
+    usable = (
+        all(pair.a[r] > 0 for r in pair.rounds_a)
+        and all(pair.b[r] > 0 for r in pair.rounds_b)
+        and all(pair.control[r] > 0 for r in common_a + common_b)
+        and len(common_a) == len(pair.rounds_a)
+        and len(common_b) == len(pair.rounds_b)
+    )
+    if not usable:
+        return raw
+    return (
+        [pair.a[r] / pair.control[r] for r in pair.rounds_a],
+        [pair.b[r] / pair.control[r] for r in pair.rounds_b],
+        True,
+    )
+
+
+def _apply_family(family: list, scenario: str, declared: list) -> None:
+    """Mark primary endpoints and BH-adjust the family's p-values.
+
+    Primary is the run's pre-registered set: the endpoints `--primary`
+    declared for this scenario (metric, and arm/cell when they name one), or
+    — when nothing was declared — the scenario's headline metric, which is
+    the model's standing declaration. The correction covers that set only:
+    adjusting the hundred-odd exploratory comparisons too would drive every
+    q to 1 and make the correction a way of never seeing anything, which is
+    not control, it is refusal. Exploratory entries are capped at
+    `directional` below, before they reach the text.
+    """
+    if not family:
+        return
+    headline = (model.SCENARIOS.get(scenario) or model.Scenario("", "", "")).headline
+    here = [d for d in declared if not d.get("scenario") or d["scenario"] == scenario]
+    for entry in family:
+        if here:
+            entry["primary"] = any(
+                d["metric"] == entry["metric"]
+                and (not d.get("arm") or d["arm"] == entry["a"])
+                and (not d.get("cell") or d["cell"] == entry["cell"])
+                for d in here
+            )
+        else:
+            entry["primary"] = bool(headline) and entry["metric"] == headline
+    # A drowned cell has no statistics to correct — it is already
+    # `unavailable`, and the family math passes it by.
+    measurable = [e for e in family if "p" in e]
+    primaries = [e for e in measurable if e["primary"]]
+    adjusted = benjamini_hochberg([e["p"] for e in primaries])
+    for entry, q in zip(primaries, adjusted, strict=True):
+        entry["q"] = q
+    for entry in measurable:
+        entry.setdefault("q", entry["p"])
+    # The two claims-gates the family carries: exploratory comparisons never
+    # read claim (a claim picked from a hundred is a selection, not a
+    # finding), and a primary claim must survive the family correction — at
+    # the level the run's own design can test at, the same `alpha_eff` the
+    # consistency leg used. Gate at the nominal level when the design can
+    # reach it, and at `min_attainable_p` when it cannot, so a three-round
+    # claim is labelled 25 % rather than silently impossible.
+    for entry in family:
+        if not entry["primary"] and entry["verdict"] == "claim":
+            entry["verdict"] = "directional"
+            entry["downgraded"] = (
+                "exploratory: not a pre-registered endpoint of this run"
+            )
+        elif (
+            entry["primary"]
+            and entry["verdict"] == "claim"
+            and entry["q"] > (entry["alpha_eff"])
+        ):
+            entry["verdict"] = "directional"
+            entry["downgraded"] = (
+                f"q {entry['q']} above the family level {entry['alpha_eff']}"
+            )
 
 
 def _pairs_of(summary_cell: dict, twins: list, declared: dict) -> list:
@@ -572,6 +1095,18 @@ def _method_blockers(meta_a: dict, meta_b: dict) -> list:
         for key in sorted(set(method_a) | set(method_b))
         if method_a.get(key) != method_b.get(key)
     ]
+    # The statistics are part of the method now (`analysis_version` travels in
+    # it), so name the actionable remedy when that is the only difference:
+    # both files can be re-rendered by one code path, but the comparison of
+    # two reductions is refused rather than assumed.
+    if blockers and all(
+        key in ("analysis_version", "engine_hash")
+        for key in (k.split("'")[1] for k in blockers if k.startswith("method key"))
+    ):
+        blockers.append(
+            "only the analysis version differs: re-analyse both files with the "
+            "current code (`bench.py report`) before comparing them"
+        )
     return blockers or ["method fingerprints differ"]
 
 
@@ -770,11 +1305,15 @@ def verdicts_text(results: dict) -> str:
 
     A claim or a direction is printed in full; the metrics that merely agreed
     with the control are counted, not listed - a page of "indistinguishable"
-    lines hides the one line that matters.
+    lines hides the one line that matters. Under it, the resolution statement:
+    what this run could resolve and what more rounds would buy, so a no-claim
+    carries its own diagnosis.
     """
     header = (
-        "verdicts (each tool arm against the control; a claim needs every round "
-        "to agree in sign and both the materiality and noise floors cleared):"
+        "verdicts (a claim needs the effect beyond its floors, the paired "
+        "rounds consistent at the level this run's length can test, and a "
+        "pre-registered endpoint; exploratory comparisons are directional at "
+        "best):"
     )
     lines = [header]
     claims = 0
@@ -800,6 +1339,7 @@ def verdicts_text(results: dict) -> str:
         )
     lines.append(f"  ({quiet} further metric comparisons were indistinguishable)")
     lines += _aa_lines(results)
+    lines += resolution_lines(results)
     return "\n".join(lines)
 
 
@@ -852,18 +1392,40 @@ def _verdict_text_line(entry: dict) -> str:
         return f"{head}: unavailable ({entry.get('reason', '')})"
     detail = (
         f"{_delta_cell(entry)} (threshold {_threshold_cell(entry)}, "
-        f"sign agreement {entry['sign_agreement']}, n={entry['rounds']})"
+        f"{_ci_cell(entry)}p {entry.get('p')} vs alpha_eff "
+        f"{entry.get('alpha_eff')}, n={entry['rounds']}"
     )
+    if entry.get("downgraded"):
+        detail += f"; {entry['downgraded']}"
+    if entry.get("fragile"):
+        detail += "; FRAGILE: dropping any one round flips this"
+    detail += ")"
     state = entry["verdict"]
     if state == "claim":
         return f"{head}: CLAIM {entry['better']} better, {detail}"
-    if state == "directional":
-        return f"{head}: directional ({entry['better'] or '?'} better), {detail}"
-    if state == "single-round":
-        return f"{head}: single-round, not a verdict ({detail})"
+    if state in ("directional", "single-round"):
+        suffix = (
+            f"({entry['better'] or '?'} better), {detail}"
+            if state == "directional"
+            else f"not a verdict ({detail})"
+        )
+        return f"{head}: {state}, {suffix}"
     if state == "context":
         return f"{head}: context only, {detail}"
+    if state == "indistinguishable" and entry.get("ci") == "within":
+        return (
+            f"{head}: indistinguishable — the interval sits inside the "
+            f"threshold ({detail})"
+        )
     return f"{head}: indistinguishable, {detail}"
+
+
+def _ci_cell(entry: dict) -> str:
+    """The interval in the verdict line, or `""` when none was estimable."""
+    low, high = entry.get("ci_low"), entry.get("ci_high")
+    if low is None or high is None:
+        return ""
+    return f"CI[{low:.3g}..{high:.3g}] "
 
 
 def _verdict_head(entry: dict) -> str:
@@ -1123,13 +1685,16 @@ def load(path) -> dict:
 
     The samples are the evidence and the summary is derived, so a report is
     always produced by the analysis the reader is running - and a stored file
-    from an older engine still renders. Two files may only be *compared* when
-    their engine hashes match (`comparability`), which is what keeps that
-    recomputation from comparing two different methods.
+    from an older engine still renders. The reduction that produced what a
+    reader sees is stamped on (`reduced_by`), so a re-analysis is never
+    mistaken for the file's own; two files may only be *compared* when their
+    methods match (`comparability`), which is what keeps a recomputation from
+    quietly comparing two different reductions of two different methods.
     """
     results = json.loads(Path(path).read_text())
     if results.get("samples"):
         results["summary"] = summarize(results)
+        results["reduced_by"] = ANALYSIS_VERSION
     return results
 
 
@@ -1177,6 +1742,7 @@ def gate(results: dict, baseline: dict | None = None) -> tuple:
     failures += _coverage(results, lines)
     failures += _endpoints(results, lines)
     failures += _slo(results, lines)
+    failures += _drowned(results, lines)
     failures += _drift(results, lines)
     failures += _ramp(results, lines)
     failures += _baseline(results, baseline, lines)
@@ -1303,6 +1869,29 @@ def _arm_kind(results: dict, arm_id: str) -> str:
         if arm["id"] == arm_id:
             return arm["kind"]
     return ""
+
+
+def _drowned(results: dict, lines: list) -> list:
+    """A cell that lost more than half its rounds is not quoted, it is refused.
+
+    The verdicts already read the flag and report `unavailable`; the gate
+    fails the run on it, because a published table with a median that half the
+    rounds disagreed with is worse than a hole — it looks like agreement.
+    """
+    failures: list = []
+    drowned = 0
+    for summary_cell in results.get("summary", {}).get("cells", []):
+        for arm, stats in summary_cell["arms"].items():
+            if not stats.get("drowned"):
+                continue
+            drowned += 1
+            failures.append(
+                f"drowned: {arm} / {summary_cell['scenario']}"
+                f"[{summary_cell['cell']}] lost {stats['failed']} of "
+                f"{stats['failed'] + stats['rounds']} rounds — not quoted"
+            )
+    lines.append(f"drowned cells: {drowned} refused")
+    return failures
 
 
 def _drift(results: dict, lines: list) -> list:

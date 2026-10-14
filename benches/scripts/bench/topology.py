@@ -89,6 +89,11 @@ LEGS: dict[str, tuple] = {
 VISITOR_IFACE = f"{VIS_NS}/v-vis"
 TUNNEL_IFACE = f"{CLI_NS}/v-cli"
 
+#: The comment that marks this module's UDP-policer rules, so the block
+#: condition and the limit condition never delete each other's (their drop rules
+#: are otherwise the same shape).
+UDP_LIMIT_COMMENT = "molehill-udp-limit"
+
 #: The kernel's default device queue length. Every arm states it explicitly,
 #: because an L3 arm's is a measured lever and a leftover from a previous arm
 #: would be a silent second variable.
@@ -280,6 +285,7 @@ class Topology:
             else:
                 self.ns_run(ns, ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
             self.set_udp_block(ns, dev, condition.block_udp)
+            self.set_udp_limit(ns, dev, condition.udp_limit)
             if condition.mtu is not None:
                 self.set_link_mtu(ns, dev, condition.mtu)
 
@@ -301,6 +307,77 @@ class Topology:
             self.ns_run(ns, ["iptables", "-I", "OUTPUT", "1", *rule[1:]])
         elif not blocked and present:
             self.ns_run(ns, ["iptables", "-D", *rule])
+
+    def set_udp_limit(self, ns: str, dev: str, limit: int | None) -> None:
+        """Police UDP leaving one device to `limit` packets per second.
+
+        `set_udp_block`'s soft sibling, and the only shape in which a carrier can
+        be *losing* traffic while its own sender looks healthy: the packets the
+        policer drops never reach the peer's acks, so a userspace ARQ sees the
+        retransmissions but not the delivery the path refused. Imposed as the
+        two-rule idiom — accept up to the rate, drop the rest — in that order,
+        checked before changed and removed by the condition that follows, like
+        every other rule here. `limit`'s rate ceiling is 10 000/s (its own
+        grammar), which is what the conditions that use it stay under.
+        """
+        # The comment marker is not decoration: `set_udp_block`'s rule is
+        # `-p udp -j DROP` and this policer's drop is the same shape, so without
+        # a marker the two conditions delete each other's rules.
+        marker = UDP_LIMIT_COMMENT
+        # Removal goes through the *listing*, not through a spec rebuilt here:
+        # the clean stage is called with `limit = None`, so a spec built from the
+        # argument would read `--limit None/sec` and match nothing (measured —
+        # the first version left both rules behind on every `clean`). `-S` prints
+        # each rule in exactly the form `-D` accepts, which makes the deletion
+        # independent of the rate the stage was imposed with.
+        if limit is None:
+            listed = self.ns_run(ns, ["iptables", "-S", "OUTPUT"], check=False).stdout
+            for line in listed.splitlines():
+                if marker not in line:
+                    continue
+                parts = line.split()
+                # `-A OUTPUT <spec>` → `-D OUTPUT <spec>`.
+                if parts[:1] == ["-A"]:
+                    self.ns_run(ns, ["iptables", "-D", *parts[1:]], check=False)
+            return
+        accept = [
+            "OUTPUT",
+            "-o",
+            dev,
+            "-p",
+            "udp",
+            "-m",
+            "comment",
+            "--comment",
+            marker,
+            "-m",
+            "limit",
+            "--limit",
+            f"{limit}/sec",
+            "--limit-burst",
+            str(limit),
+            "-j",
+            "ACCEPT",
+        ]
+        drop = [
+            "OUTPUT",
+            "-o",
+            dev,
+            "-p",
+            "udp",
+            "-m",
+            "comment",
+            "--comment",
+            marker,
+            "-j",
+            "DROP",
+        ]
+        installed = (
+            marker in self.ns_run(ns, ["iptables", "-S", "OUTPUT"], check=False).stdout
+        )
+        if not installed:
+            self.ns_run(ns, ["iptables", "-I", "OUTPUT", "1", *accept[1:]])
+            self.ns_run(ns, ["iptables", "-I", "OUTPUT", "2", *drop[1:]])
 
     def set_link_mtu(self, ns: str, dev: str, mtu: int) -> None:
         """Change one interface's MTU, remembering the original to restore it.

@@ -58,6 +58,19 @@ use crate::transport::multiplex::Carrier;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Carrier {}
 
+#[cfg(not(feature = "multiplex"))]
+impl Carrier {
+    /// The stub is never constructed: a build without `multiplex` has no
+    /// carrier a lane could ride, so every `Option<Carrier>` in this module is
+    /// `None`. The method exists only so the carrier-aware call sites (the
+    /// stats line's `map_or("-", Carrier::as_str)`) compile unchanged — the
+    /// match is exhaustive because the type is uninhabited.
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {}
+    }
+}
+
 /// Batches waiting for one service's channel. Small on purpose: the point of
 /// the queue is to absorb a burst while the channel is busy, not to buffer a
 /// second of traffic. A batch is many packets, so this is a byte budget as much
@@ -190,8 +203,23 @@ impl TunHub {
 
     /// Record what the peer reported offering one of this end's lanes (see
     /// [`Routes::note_remote`]).
-    pub fn note_remote(&self, lane: LaneId, offered: u32, refused: u32, seq: u8) {
-        self.routes.note_remote(lane, offered, refused, seq);
+    ///
+    /// The report is named to a **claim** (`endpoint`) as well as a lane: the
+    /// hub is shared by every claim on the device, each claim mints its lane
+    /// ids from 1, and a lane id alone does not name a lane — a report keyed
+    /// only by id landed on the first claim holding a lane with that number
+    /// (measured: a report for the ladder's claim read as another claim's
+    /// `peer_offered`), which is evidence about nothing.
+    pub fn note_remote(
+        &self,
+        endpoint: Endpoint,
+        lane: LaneId,
+        offered: u32,
+        refused: u32,
+        seq: u8,
+    ) {
+        self.routes
+            .note_remote(endpoint, lane, offered, refused, seq);
     }
 
     /// The lanes claims let go after their last lane left, with what they
@@ -760,34 +788,38 @@ impl Routes {
     /// Record what the peer reported offering one of this end's lanes, and what
     /// that lane's queue refused there.
     ///
-    /// The lookup is by **lane id**, not by slot: the peer names the connection
-    /// it offered traffic to, and this end's slot is its own bookkeeping (it
-    /// gets reused). A report for a lane this end no longer holds — one that
-    /// retired between the peer's sample and its arrival — is dropped, which is
-    /// the safe direction: stale evidence must never be read as the current
-    /// lane's.
-    fn note_remote(&self, lane: LaneId, offered: u32, refused: u32, seq: u8) {
+    /// The lookup is by **claim and lane id**: the peer names the connection it
+    /// offered traffic to, and this end's slot is its own bookkeeping (it gets
+    /// reused). The claim comes from the report's service — its claimed
+    /// endpoint — because lane ids are minted per service session and every
+    /// claim's first lane is id 1: a hub shared by several claims cannot tell
+    /// them apart by id alone. A report for a lane this end no longer holds —
+    /// one that retired between the peer's sample and its arrival — is dropped,
+    /// which is the safe direction: stale evidence must never be read as the
+    /// current lane's.
+    fn note_remote(&self, endpoint: Endpoint, lane: LaneId, offered: u32, refused: u32, seq: u8) {
         let Ok(mut table) = self.table.lock() else {
             return;
         };
-        for (_, claim) in table.iter_mut() {
-            for slot in &mut claim.slots {
-                if slot.lane.is_some_and(|key| key.id == lane) {
-                    // A report older than the one already held is not news:
-                    // the sequence is per lane, so a wrap or a reorder is
-                    // visible rather than silently applied.
-                    let fresh = slot
-                        .remote
-                        .is_none_or(|held| seq.wrapping_sub(held.seq) < 128);
-                    if fresh {
-                        slot.remote = Some(RemoteLane {
-                            offered,
-                            refused,
-                            seq,
-                        });
-                    }
-                    return;
+        let Some(claim) = table.lookup_endpoint_mut(&endpoint) else {
+            return;
+        };
+        for slot in &mut claim.slots {
+            if slot.lane.is_some_and(|key| key.id == lane) {
+                // A report older than the one already held is not news:
+                // the sequence is per lane, so a wrap or a reorder is
+                // visible rather than silently applied.
+                let fresh = slot
+                    .remote
+                    .is_none_or(|held| seq.wrapping_sub(held.seq) < 128);
+                if fresh {
+                    slot.remote = Some(RemoteLane {
+                        offered,
+                        refused,
+                        seq,
+                    });
                 }
+                return;
             }
         }
     }
@@ -1251,10 +1283,19 @@ impl ClaimSlots {
 
     /// Whether the lane in `slot` was asked to end and has nothing left to
     /// carry.
+    ///
+    /// "Nothing left" is the **quiet window** ([`DRAIN_QUIET`]), not an empty
+    /// flow table: the table keeps a flow for [`FLOW_IDLE_EVICTION`] (60 s)
+    /// after its last packet, and a carrier move that waited for the table to
+    /// drain would hang a handover for a minute of silence — measured: the
+    /// ladder's flows held a draining lane for the whole measured round, the
+    /// replacement never joined, and the cells read level because nothing had
+    /// moved. The peer's drain already answers the same question this way
+    /// ([`Self::drain_ready`]); the lane's own end now does too.
     fn should_retire(&self, slot: usize) -> bool {
         self.slots
             .get(slot)
-            .is_some_and(|entry| entry.draining && entry.flows == 0)
+            .is_some_and(|entry| entry.draining && self.active_flows(slot, DRAIN_QUIET) == 0)
     }
 
     /// Which lane one packet belongs to, remembering a new flow's placement.
@@ -1559,7 +1600,7 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                     // Which carrier the lane actually rides: the fact a policy
                     // compares, and the one a slot cannot be asked for (a slot
                     // outlives the connection that held it).
-                    member.carrier.map_or("-", crate::transport::multiplex::Carrier::as_str),
+                    member.carrier.map_or("-", Carrier::as_str),
                     member.flows,
                     member.forwarded,
                     member.no_channel,
@@ -1747,6 +1788,71 @@ mod tests {
                 .all(|gone| gone.lane.id != LaneId::new(8)),
             "and it is not credited with the lane it replaced"
         );
+    }
+
+    /// A report is matched to its **claim**, then its lane.
+    ///
+    /// The defect this pins: every claim mints its lane ids from 1 in one hub
+    /// shared by all of them, so a report keyed by lane id alone matched the
+    /// first claim holding that number — measured on the bench, the ladder
+    /// claim's report read as an idle sibling's `peer_offered`, and the carrier
+    /// policy was judging evidence attached to the wrong claim.
+    #[test]
+    fn a_report_lands_on_the_claim_that_owns_the_lane() {
+        let routes = Routes::new();
+        let loaded = claim();
+        let idle = Endpoint::new(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 1)), 9999);
+        let (q1, held1) = mpsc::channel::<Bytes>(4);
+        let (q2, held2) = mpsc::channel::<Bytes>(4);
+        // Both claims' first lanes are id 1 — that is the collision.
+        routes.join(loaded, q1, Some(LaneId::new(1)), None).unwrap();
+        routes.join(idle, q2, Some(LaneId::new(1)), None).unwrap();
+
+        // The peer reports what it offered the LOADED claim's lane.
+        routes.note_remote(loaded, LaneId::new(1), 1_549_173, 637_950, 1);
+
+        // `join`'s return is the slot index *within the claim*; member_stats is
+        // a flat vector over every claim, so the entries are found by endpoint.
+        let stat_of = |stats: &[MemberStat], endpoint: Endpoint| {
+            stats
+                .iter()
+                .find(|member| member.endpoint == endpoint)
+                .unwrap()
+                .clone()
+        };
+        let stats = routes.member_stats();
+        let loaded_stat = stat_of(&stats, loaded);
+        assert_eq!(
+            loaded_stat.remote.map(|remote| remote.offered),
+            Some(1_549_173),
+            "the report lands on the claim the service named"
+        );
+        assert_eq!(
+            loaded_stat.remote.map(|remote| remote.refused),
+            Some(637_950),
+            "with both halves of the pair"
+        );
+        assert_eq!(
+            stat_of(&stats, idle).remote,
+            None,
+            "the sibling holding the same lane id gets nothing"
+        );
+
+        // And a report for the sibling's own lane goes to it, not back to the
+        // loaded one.
+        routes.note_remote(idle, LaneId::new(1), 10, 0, 1);
+        let stats = routes.member_stats();
+        assert_eq!(
+            stat_of(&stats, idle).remote.map(|remote| remote.offered),
+            Some(10)
+        );
+        assert_eq!(
+            stat_of(&stats, loaded).remote.map(|remote| remote.offered),
+            Some(1_549_173),
+            "the first report is untouched"
+        );
+        drop(held1);
+        drop(held2);
     }
 
     /// A drain is asked for **by lane**, and it answers whether this end still

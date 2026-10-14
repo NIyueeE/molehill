@@ -26,8 +26,10 @@
 #![cfg(all(feature = "multiplex", feature = "client", feature = "server"))]
 #![expect(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::panic,
-    reason = "integration tests unwrap and assert on values they just produced"
+    reason = "integration tests unwrap, expect and assert on values they just \
+              produced"
 )]
 
 use anyhow::{Ok, Result, anyhow};
@@ -554,9 +556,7 @@ async fn a_burst_past_the_stream_cap_never_costs_a_tunnel() -> Result<()> {
     );
 
     drop(held);
-    client_shutdown_tx.send(true)?;
-    server_shutdown_tx.send(true)?;
-    let _ = tokio::join!(client, server);
+    shutdown_pair(client_shutdown_tx, server_shutdown_tx, client, server).await;
     Ok(())
 }
 
@@ -1325,6 +1325,252 @@ async fn one_unanswerable_visitor_does_not_park_the_service() -> Result<()> {
 
     drop(held);
     drop(waiting);
+    client_shutdown_tx.send(true)?;
+    server_shutdown_tx.send(true)?;
+    let _ = tokio::join!(client, server);
+    Ok(())
+}
+
+/// Send both shutdowns and wait for the pair's tasks to end.
+async fn shutdown_pair(
+    client_shutdown_tx: tokio::sync::broadcast::Sender<bool>,
+    server_shutdown_tx: tokio::sync::broadcast::Sender<bool>,
+    client: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<()>,
+) {
+    client_shutdown_tx.send(true).ok();
+    server_shutdown_tx.send(true).ok();
+    let _ = tokio::join!(client, server);
+}
+
+/// Write the handover scenario's own config: a two-tunnel pool over a TCP
+/// echo service, on ports nothing else in the suite owns.
+fn write_handover_fixture(control_port: u16, exposed_port: u16) -> (String, String, String) {
+    let control = format!("127.0.0.1:{control_port}");
+    let exposed = format!("127.0.0.1:{exposed_port}");
+    let fixture =
+        std::env::temp_dir().join(format!("molehill-handover-{}.toml", std::process::id()));
+    std::fs::write(
+        &fixture,
+        format!(
+            "[client]\n\
+             default_token = \"default_token_if_not_specify\"\n\
+             \n\
+             [client.control]\n\
+             default_remote_addr = \"{control}\"\n\
+             \n\
+             [client.transport]\n\
+             type = \"plain\"\n\
+             \n\
+             [client.data]\n\
+             tunnels = 2\n\
+             \n\
+             [client.services.idle]\n\
+             local_addr = \"{POOL_BACKEND_A}\"\n\
+             remote_bind_addr = \"{exposed}\"\n\
+             \n\
+             [server]\n\
+             default_token = \"default_token_if_not_specify\"\n\
+             allow_ports = [\"{exposed_port}\"]\n\
+             \n\
+             [server.control]\n\
+             bind_addr = \"{control}\"\n"
+        ),
+    )
+    .unwrap();
+    (control, exposed, fixture.to_string_lossy().into_owned())
+}
+
+/// Open one visitor stream and prove it echoes, returning it held.
+async fn hold_visitor_stream(exposed: &str) -> TcpStream {
+    let mut conn = TcpStream::connect(exposed).await.unwrap();
+    echo_visitor(&mut conn).await;
+    conn
+}
+
+/// One ping/pong exchange on the held stream: the connection stays up.
+async fn echo_visitor(conn: &mut TcpStream) {
+    conn.write_all(PING.as_bytes()).await.unwrap();
+    let mut echo = [0u8; 4];
+    time::timeout(Duration::from_secs(5), conn.read_exact(&mut echo))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echo, PING.as_bytes(), "the held stream works");
+}
+
+/// Wait up to 15 s for the scenario's pool to reach its configured count.
+async fn wait_for_pool(
+    this_pool: impl Fn() -> Option<molehill_rathole::PoolSnapshot> + Copy,
+) -> molehill_rathole::PoolSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(pool) = this_pool()
+            && pool.size == pool.count
+        {
+            return pool;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the pool must exist and be complete within 15 s: {:?}",
+            molehill_rathole::live_pools()
+        );
+        settle(0.2).await;
+    }
+}
+
+/// Wait up to 30 s for the scenario's pool to hold tunnels on two carriers
+/// with no handover pending — the handover having landed its replacement.
+async fn wait_for_cross_carrier(
+    this_pool: impl Fn() -> Option<molehill_rathole::PoolSnapshot> + Copy,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        settle(0.5).await;
+        let Some(pool) = this_pool() else {
+            continue;
+        };
+        let carriers: std::collections::HashSet<&str> =
+            pool.tunnels.iter().map(|t| t.3.as_str()).collect();
+        if carriers.len() > 1 && pool.handover.is_none() {
+            return true;
+        }
+    }
+    false
+}
+
+/// A carrier handover on a live pool keeps the flows it carries.
+///
+/// The pool starts on the carrier the loopback path gives it (KCP first), a
+/// visitor holds a stream open, and the diagnostic hatch
+/// (`MOLEHILL_TUNNEL_SWITCH_AT`) excludes one tunnel from new placements at
+/// three seconds. What the scenario asserts is the no-disruption contract and
+/// the move itself:
+///
+/// - the held stream echoes **after** the handover, and again after the
+///   replacement has joined — a flow is never moved, so it must not notice;
+/// - the pool ends with a tunnel riding the **other** carrier and its
+///   configured count intact (the replacement is dialed only after the drained
+///   tunnel has released its slot, so the server's valve never sees an
+///   overlap);
+/// - the handover record is gone once the replacement is in (a handover that
+///   cannot finish is called off by the pool itself, never left pending).
+///
+/// Runs as part of the serial suite: the hatch's environment is read per
+/// pool at creation (no process-wide cache), which was the round-34 defect
+/// that made this scenario fail as the suite's second test.
+#[tokio::test]
+async fn a_live_pool_hands_a_tunnel_over_without_dropping_its_flows() -> Result<()> {
+    init();
+    spawn_tcp_backends();
+
+    // The scenario owns its fixture: the idle-pool fixture is shared with two
+    // other scenarios, and a pool outliving one of them would make this
+    // scenario's pool lookup ambiguous (`live_pools()` is process-wide). Its
+    // own control and exposed ports make the key unambiguous.
+    let (ports, held_ports) = free_ports::<2>();
+    let (control, exposed, fixture) = write_handover_fixture(ports[0], ports[1]);
+
+    #[expect(
+        unsafe_code,
+        reason = "edition 2024 makes env mutation unsafe; this suite is serial, the \
+                  variable is read once per pool at creation, and no other \
+                  scenario in this binary consults it"
+    )]
+    // SAFETY: single-threaded test process; the variable is read per pool at
+    // that pool's creation, which for this scenario happens below.
+    unsafe {
+        std::env::set_var("MOLEHILL_TUNNEL_SWITCH_AT", "3");
+    };
+
+    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
+    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
+    // The reservation held the ports; the children need them now.
+    drop(held_ports);
+    // The server's control listener first: the client is started second, so
+    // the run has no "connection refused, retrying" in it — and no pool built
+    // on a session that is about to be retried (a retry clears the pools and
+    // the replacement would race this scenario's assertions).
+    let server_fixture = fixture.clone();
+    let server = tokio::spawn(async move {
+        run_molehill_server(&server_fixture, server_shutdown_rx)
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if TcpStream::connect(&control).await.is_ok() {
+            break;
+        }
+        settle(0.05).await;
+    }
+    let client_fixture = fixture.clone();
+    let client = tokio::spawn(async move {
+        run_molehill_client(&client_fixture, client_shutdown_rx)
+            .await
+            .unwrap();
+    });
+
+    // The env must still be set: the hatch reads it when the pool is created,
+    // and a scenario that cannot see it would wait forever for a handover the
+    // pool will never attempt.
+    assert_eq!(
+        std::env::var("MOLEHILL_TUNNEL_SWITCH_AT").ok().as_deref(),
+        Some("3"),
+        "the hatch's environment must survive to the pool's creation"
+    );
+
+    // The fixture's pool, by its key: the suite is serial but a scenario that
+    // ran earlier may leave a pool registered while its Arc drains, and
+    // `live_pools()` is process-wide — this scenario's pool is the one whose
+    // data endpoint is the fixture's control address and whose count is the
+    // fixture's two tunnels.
+    let this_pool = || {
+        molehill_rathole::live_pools()
+            .into_iter()
+            .find(|pool| pool.key.ends_with(&control) && pool.count == 2)
+    };
+    let this = this_pool;
+    let pool = wait_for_pool(this).await;
+    assert_eq!(pool.count, 2, "the fixture's pool is two tunnels: {pool:?}");
+    assert!(
+        pool.handover.is_none(),
+        "nothing has asked for a handover yet: {pool:?}"
+    );
+
+    // One visitor holds a stream across the whole scenario: the flow the
+    // handover must not disturb.
+    let mut held = hold_visitor_stream(&exposed).await;
+
+    // The hatch fires three seconds after the pool started; the drain waits
+    // for the old tunnel's streams (a held flow keeps it until the pool's own
+    // budget calls the drain off) and the replacement is dialed once the
+    // drained tunnel is idle.
+    let this = this_pool;
+    let moved = wait_for_cross_carrier(this).await;
+    let all = molehill_rathole::live_pools();
+    assert!(
+        moved,
+        "the handover must land a tunnel on the other carrier within 30 s; \
+         pools at timeout: {all:?}"
+    );
+
+    // The held stream never noticed: it still echoes, on the same connection.
+    echo_visitor(&mut held).await;
+
+    // The pool is whole again: the replacement took the drained tunnel's slot.
+    let pool = this_pool().expect("the pool outlives the scenario");
+    assert_eq!(pool.size, pool.count, "the count is intact: {pool:?}");
+
+    #[expect(
+        unsafe_code,
+        reason = "as above: serial suite, and every pool this scenario creates \
+                  has already read the variable at its own creation"
+    )]
+    // SAFETY: as above.
+    unsafe {
+        std::env::remove_var("MOLEHILL_TUNNEL_SWITCH_AT");
+    };
+    drop(held);
     client_shutdown_tx.send(true)?;
     server_shutdown_tx.send(true)?;
     let _ = tokio::join!(client, server);

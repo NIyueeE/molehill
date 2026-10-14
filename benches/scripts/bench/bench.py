@@ -551,6 +551,400 @@ def _check_summary(c: Checker) -> None:
     c.check("the verdict text renders", "CLAIM" in text, text[:200])
 
 
+def _cell_sample(arm, rnd, value, warmup=False, ok=True):
+    """One sample row for the statistics fixtures (same shape as a run's)."""
+    return {
+        "arm": arm,
+        "round": rnd,
+        "warmup": warmup,
+        "scenario": "bulk-1",
+        "kind": "bulk",
+        "cell": "P1",
+        "ok": ok,
+        "reason": "" if ok else "typed",
+        "metrics": {"throughput_gbps": value} if ok else {},
+        "unavailable": {},
+        "evidence": {},
+    }
+
+
+def _check_statistics(c: Checker) -> None:
+    """Every new verdict rule, on data with a known answer."""
+    # Sign test: perfectly consistent readings at n rounds are labelled with
+    # the error rate they carry, not silently treated as 5 % evidence.
+    c.equal("sign test of nothing", analysis.sign_test_p([]), 1.0)
+    c.equal("3/3 same sign is p 0.25", analysis.sign_test_p([1, 1, 1]), 0.25)
+    c.equal(
+        "2/3 same sign is p 1.0",
+        analysis.sign_test_p([1, 1, -1]),
+        1.0,
+    )
+    c.equal("min attainable p at 3 rounds", analysis.min_attainable_p(3), 0.25)
+    c.equal(
+        "six rounds reach the nominal level",
+        analysis.alpha_eff(6),
+        analysis.ALPHA,
+    )
+    c.equal(
+        "three rounds degrade to what they can test",
+        analysis.alpha_eff(3),
+        0.25,
+    )
+    c.equal(
+        "the planning estimate scales with the scatter",
+        analysis.rounds_needed(20.0, 5.0),
+        62,
+    )
+    c.equal(
+        "a tighter scatter needs fewer rounds", analysis.rounds_needed(10.0, 5.0), 16
+    )
+    c.equal("no scatter needs no rounds", analysis.rounds_needed(0.0, 5.0), None)
+
+    # Interval: resampling a stored run must reproduce the same interval.
+    pairs = [(4.0, 4.1), (4.4, 4.3), (4.2, 4.15)]
+    first = analysis.bootstrap_ci(pairs, seed=7)
+    c.equal(
+        "the bootstrap is reproducible",
+        analysis.bootstrap_ci(pairs, seed=7),
+        first,
+    )
+    c.equal(
+        "too few pairs say so instead of guessing",
+        analysis.bootstrap_ci(pairs[:2], seed=7),
+        (None, None),
+    )
+
+    # BH: one pre-registered endpoint is unadjusted; two consistent ones both
+    # survive; a straggler is named.
+    c.equal(
+        "a single-endpoint family adjusts nothing",
+        analysis.benjamini_hochberg([0.04]),
+        [0.04],
+    )
+    c.equal(
+        "two endpoints at the same p survive together",
+        analysis.benjamini_hochberg([0.04, 0.04]),
+        [0.04, 0.04],
+    )
+    c.check(
+        "the weaker endpoint is corrected upward",
+        analysis.benjamini_hochberg([0.04, 0.04, 0.30])[2]
+        > analysis.benjamini_hochberg([0.04, 0.04, 0.30])[0],
+        str(analysis.benjamini_hochberg([0.04, 0.04, 0.30])),
+    )
+
+
+def _check_verdict_shapes(c: Checker) -> None:
+    """The verdict states on data with a known answer, at a real length."""
+
+    # them (5 rounds: p 0.0625 vs the degraded level 0.0625 — exactly at it).
+    def five(base, treated):
+        return [base + d for d in treated]
+
+    # A 20 % effect with a 1 % floor: entirely beyond, consistent, stable.
+    beyond = analysis.verdict(
+        analysis.Comparison(
+            metric="throughput_gbps",
+            values_a=five(10.0, [2.0, 2.2, 1.9, 2.1, 2.0]),
+            values_b=[10.0] * 5,
+            noise={"pct": 1.0},
+        )
+    )
+    c.equal(
+        "a consistent effect beyond the floor is a claim",
+        beyond["verdict"],
+        "claim",
+    )
+    c.equal(
+        "the claim's interval lies entirely beyond the threshold",
+        beyond["ci"],
+        "beyond",
+    )
+    c.equal("the claim is not fragile", beyond["fragile"], False)
+
+    # A boundary case worth naming: the median exactly at the floor. The
+    # interval straddles it (half the resamples clear, half do not), so the
+    # verdict is directional — "at the threshold" is not "beyond it", and the
+    # verdict text is where a reader finds out.
+    at_floor = analysis.verdict(
+        analysis.Comparison(
+            metric="throughput_gbps",
+            values_a=five(10.0, [1.0, 1.2, 0.9, 1.1, 1.0]),
+            values_b=[10.0] * 5,
+            noise={"pct": 1.0},
+        )
+    )
+    c.equal(
+        "a median exactly at the floor straddles it",
+        at_floor["ci"],
+        "straddling",
+    )
+
+    straddling = analysis.verdict(
+        analysis.Comparison(
+            metric="throughput_gbps",
+            values_a=[12.0, 9.0, 13.0, 11.8, 9.4],
+            values_b=[10.0] * 5,
+            noise={"pct": 1.0},
+        )
+    )
+    c.equal(
+        "an inconsistent effect is directional with a straddling interval",
+        (straddling["verdict"], straddling["ci"]),
+        ("directional", "straddling"),
+    )
+    c.check(
+        "the straddling verdict is fragile",
+        straddling["fragile"],
+        str(straddling["ci"]),
+    )
+
+    within = analysis.verdict(
+        analysis.Comparison(
+            metric="throughput_gbps",
+            values_a=[10.02, 9.98, 10.01, 9.99, 10.0],
+            values_b=[10.0] * 5,
+            noise={"pct": 1.0},
+        )
+    )
+    c.equal(
+        "an effect inside the threshold reads indistinguishable",
+        within["verdict"],
+        "indistinguishable",
+    )
+    c.equal(
+        "the indistinguishable interval sits within the threshold",
+        within["ci"],
+        "within",
+    )
+
+    # Pairing by round index, not position: a failed round on one side must
+    # not pair round 1 with round 2 and call it a replicate.
+    shifted = analysis.verdict(
+        analysis.Comparison(
+            metric="throughput_gbps",
+            values_a=[10.0, 20.0, 30.0],
+            values_b=[15.0, 25.0],
+            rounds_a=(1, 2, 3),
+            rounds_b=(1, 3),
+            noise={"pct": 1.0},
+        )
+    )
+    c.equal(
+        "round-index pairing drops the unmatched round",
+        shifted["n_pairs"],
+        2,
+    )
+
+
+def _check_run_rules(c: Checker) -> None:
+    """The rules that read a whole run: families, drowning, normalization."""
+    sample = _cell_sample
+    results_exploratory = {
+        "meta": {"method": {"primary": []}, "arms": [{"id": "control"}, {"id": "l3"}]},
+        "samples": [
+            sample("l3", 1, 4.0),
+            sample("l3", 2, 4.4),
+            sample("control", 1, 40.0),
+            sample("control", 2, 41.0),
+        ],
+    }
+    results_exploratory["summary"] = analysis.summarize(results_exploratory)
+    exploratory = analysis.verdicts(results_exploratory)
+    headline = [
+        v for v in exploratory if v["metric"] == "throughput_gbps" and not v.get("twin")
+    ]
+    c.check(
+        "the headline stays primary when nothing was declared",
+        headline and all(v["primary"] for v in headline),
+        str(headline),
+    )
+    for entry in exploratory:
+        if not entry["primary"]:
+            c.check(
+                "an exploratory comparison is never a claim",
+                entry["verdict"] != "claim",
+                f"{entry['metric']}: {entry['verdict']}",
+            )
+
+    # A declared endpoint survives the family gate; the correction applies to
+    # it and not to the exploratory rest.
+    results_declared = {
+        "meta": {
+            "method": {
+                "primary": [
+                    {"metric": "throughput_gbps", "scenario": "bulk-1"},
+                    {"metric": "rss_peak_mib", "scenario": "bulk-1"},
+                ]
+            },
+            "arms": [{"id": "control"}, {"id": "l3"}],
+        },
+        "samples": [
+            sample("l3", 1, 4.0),
+            sample("l3", 2, 4.4),
+            sample("control", 1, 40.0),
+            sample("control", 2, 41.0),
+        ],
+    }
+    results_declared["summary"] = analysis.summarize(results_declared)
+    declared_verdicts = analysis.verdicts(results_declared)
+    throughput = next(
+        v
+        for v in declared_verdicts
+        if v["metric"] == "throughput_gbps" and not v.get("twin")
+    )
+    c.check(
+        "the declared metric is primary",
+        throughput["primary"],
+        str(throughput.get("primary")),
+    )
+    c.check(
+        "the declared family is corrected (both endpoints read the same p)",
+        throughput["q"] == throughput["p"],
+        f"p {throughput['p']} q {throughput['q']}",
+    )
+    c.check(
+        "the undeclared metrics are exploratory",
+        all(
+            not v["primary"]
+            for v in declared_verdicts
+            if v["metric"] not in ("throughput_gbps", "rss_peak_mib")
+        ),
+        "an undeclared metric was primary",
+    )
+
+    # Drowned cells: past half the rounds failed, the median is not quoted.
+    results_drowned = {
+        "meta": {"arms": [{"id": "control"}, {"id": "l3"}]},
+        "samples": [
+            sample("l3", 1, 4.0),
+            sample("l3", 2, 0.0, ok=False),
+            sample("l3", 3, 0.0, ok=False),
+            sample("l3", 4, 0.0, ok=False),
+            sample("control", 1, 40.0),
+            sample("control", 2, 41.0),
+        ],
+    }
+    results_drowned["summary"] = analysis.summarize(results_drowned)
+    l3_drowned = results_drowned["summary"]["cells"][0]["arms"]["l3"]
+    c.check(
+        "a cell that lost most rounds is marked drowned",
+        l3_drowned["drowned"],
+        str(l3_drowned),
+    )
+    verdicts_drowned = analysis.verdicts(results_drowned)
+    c.check(
+        "a drowned cell's comparison is unavailable, never a median",
+        all(
+            v["verdict"] == "unavailable"
+            for v in verdicts_drowned
+            if v["metric"] == "throughput_gbps"
+        ),
+        str([(v["verdict"], v.get("reason", "")) for v in verdicts_drowned]),
+    )
+    _gate_lines, gate_failures = analysis.gate(results_drowned)
+    c.check(
+        "the gate refuses a drowned cell",
+        any("drowned" in f for f in gate_failures),
+        str(gate_failures),
+    )
+
+    # Normalization: opt-in per run (`--normalize control`), and only honest
+    # between two tool arms — each divided by its own round's control. An
+    # arm against the control itself is circular (it would divide by itself),
+    # so that pair always stays raw.
+    def nsample(arm, rnd, value):
+        row = sample(arm, rnd, value)
+        row["metrics"]["throughput_gbps"] = value
+        return row
+
+    samples_normalized = [
+        # The host halves between rounds; both tool arms track it exactly, so
+        # raw their difference is the drift, normalized it cancels.
+        nsample("control", 1, 10.0),
+        nsample("control", 2, 20.0),
+        nsample("a", 1, 5.0),
+        nsample("a", 2, 10.0),
+        nsample("b", 1, 6.0),
+        nsample("b", 2, 12.0),
+    ]
+    results_normalized = {
+        "meta": {
+            "method": {"normalize": "control", "primary": []},
+            "arms": [
+                {"id": "control"},
+                {"id": "a"},
+                {"id": "b", "against": "a"},
+            ],
+        },
+        "samples": list(samples_normalized),
+    }
+    results_normalized["summary"] = analysis.summarize(results_normalized)
+    verdicts_normalized = analysis.verdicts(results_normalized)
+    pair = next(
+        v
+        for v in verdicts_normalized
+        if v["metric"] == "throughput_gbps" and v["a"] == "a" and v["b"] == "b"
+    )
+    c.check(
+        "a declared A/B pair is normalized by round",
+        pair.get("normalized"),
+        str(pair),
+    )
+    c.check(
+        "the drift cancels: the ratio is what the verdict reads",
+        pair["delta_pct"] is not None
+        and round(pair["delta_pct"], 3) == round(-100.0 / 6.0, 3),
+        f"delta_pct {pair['delta_pct']} (expected the true -16.67 %, not the "
+        "host's 2x swing)",
+    )
+    # The default run does none of that: raw readings, both because the run
+    # did not ask and because an arm-against-control pair would be circular.
+    results_raw = {
+        "meta": {"arms": [{"id": "control"}, {"id": "a"}, {"id": "b", "against": "a"}]},
+        "samples": list(samples_normalized),
+    }
+    results_raw["summary"] = analysis.summarize(results_raw)
+    raw_verdicts = analysis.verdicts(results_raw)
+    pair_raw = next(
+        v for v in raw_verdicts if v["metric"] == "throughput_gbps" and v["a"] == "a"
+    )
+    c.check(
+        "the default comparison stays raw",
+        not pair_raw.get("normalized"),
+        str(pair_raw.get("normalized")),
+    )
+    c.equal(
+        "an arm-against-control pair reads the true gap (2x), raw",
+        pair_raw["delta_abs"],
+        -7.5,
+    )
+
+
+def _check_statistics_registry(c: Checker) -> None:
+    """The statistics layer's own invariants, independent of any run."""
+    c.check(
+        "the analysis version is declared",
+        isinstance(analysis.ANALYSIS_VERSION, int),
+        "not an int",
+    )
+    c.check(
+        "the bootstrap level is a probability",
+        0 < analysis.BOOTSTRAP_LEVEL < 1,
+        str(analysis.BOOTSTRAP_LEVEL),
+    )
+    c.check(
+        "the nominal level is a probability",
+        0 < analysis.ALPHA < 1,
+        str(analysis.ALPHA),
+    )
+    c.check(
+        "the drowned threshold admits a majority of rounds",
+        0 < analysis.MAX_FAILED_FRACTION < 1,
+        str(analysis.MAX_FAILED_FRACTION),
+    )
+
+
 def _check_comparability(c: Checker) -> None:
     def meta(fingerprint="abc", host_id="h1", calibration=100.0, loopback=20.0):
         return {
@@ -610,15 +1004,22 @@ def _check_fingerprint(c: Checker) -> None:
         condition_leg = "visitor"
 
     scenarios = [model.SCENARIOS["bulk-1"]]
-    method = runner.method_record(model.PROFILES["smoke"], scenarios, Args(), "smoke")
-    same = runner.method_record(model.PROFILES["smoke"], scenarios, Args(), "smoke")
+    no_arms: list = []  # a model-only run: the peer-version block is empty
+    method = runner.method_record(
+        model.PROFILES["smoke"], scenarios, Args(), "smoke", no_arms
+    )
+    same = runner.method_record(
+        model.PROFILES["smoke"], scenarios, Args(), "smoke", no_arms
+    )
     c.equal(
         "the same method fingerprints the same",
         runner.fingerprint(method),
         runner.fingerprint(same),
     )
     Args.tun_mtu = 8000
-    changed = runner.method_record(model.PROFILES["smoke"], scenarios, Args(), "smoke")
+    changed = runner.method_record(
+        model.PROFILES["smoke"], scenarios, Args(), "smoke", no_arms
+    )
     c.check(
         "a topology change fingerprints differently",
         runner.fingerprint(method) != runner.fingerprint(changed),
@@ -702,6 +1103,10 @@ def cmd_selfcheck(args) -> int:
     _check_device_io(c)
     _check_analysis(c)
     _check_summary(c)
+    _check_statistics(c)
+    _check_verdict_shapes(c)
+    _check_run_rules(c)
+    _check_statistics_registry(c)
     _check_comparability(c)
     _check_fingerprint(c)
     _check_probes(c)
@@ -777,6 +1182,26 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--work", default="", help="artifact directory")
     run.add_argument("--force", action="store_true", help="overwrite an existing --out")
     run.add_argument("--hypothesis", default="", help="what you expect, stated first")
+    run.add_argument(
+        "--primary",
+        action="append",
+        default=[],
+        help=(
+            "a pre-registered endpoint as data: "
+            "metric=throughput_gbps,scenario=bulk-n[,arm=l4][,cell=P1] "
+            "(repeatable; default: every scenario's headline metric)"
+        ),
+    )
+    run.add_argument(
+        "--normalize",
+        default="",
+        choices=("", "control"),
+        help=(
+            "divide each arm's per-round reading by the control's reading of "
+            "the same round (host-bound cells only: it cancels the host's "
+            "drift, and on a ceiling-bound cell it would cancel real signal)"
+        ),
+    )
     run.add_argument("--no-host-probes", action="store_true")
     run.set_defaults(func=cmd_run)
 

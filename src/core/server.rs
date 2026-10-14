@@ -6,6 +6,9 @@ use crate::config::ConfigChange;
 use crate::config::{Config, ServerConfig, ServiceType};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
+// Read only where multiplexed tunnels exist (the mux stream path).
+#[cfg(feature = "multiplex")]
+use crate::protocol::read_tunnel_prologue;
 use crate::protocol::{
     self, Ack, CURRENT_PROTO_VERSION, Carrier, ControlChannelCmd, DataChannelCmd,
     HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, ServiceId,
@@ -1619,6 +1622,9 @@ async fn do_v4_tunnel(
             nonce,
         },
         Some(slot),
+        // A TCP tunnel has no userspace ARQ to report: its retransmit state is
+        // the kernel's, which is also why the carrier rule is one-sided.
+        None,
     )
     .await
 }
@@ -1759,6 +1765,14 @@ async fn upgrade_to_tunnel<S>(
     mut conn: S,
     owner: TunnelOwner,
     session: Option<SessionTunnel>,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without multiplex there are no tunnels to report on"
+        )
+    )]
+    health: Option<Arc<crate::kcp::SessionHealth>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1766,6 +1780,17 @@ where
     write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
     let config = crate::transport::multiplex::mux_config();
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<crate::transport::MuxStream>(64);
+    // What this end hands the tunnel, counted above the wire: the delivery ratio
+    // needs the offered bytes, and a policer drops them in flight, so counting
+    // lower down would count what arrived instead (see `CountingTunnel`).
+    #[cfg(feature = "multiplex")]
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(feature = "multiplex")]
+    let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The reporter outlives this scope and the driver task owns the adapter's
+    // reference, so the count is shared by clone rather than moved twice.
+    #[cfg(feature = "multiplex")]
+    let reported_written = Arc::clone(&written);
     tokio::spawn(async move {
         // Held until this tunnel's IO ends — the slot's term in the session's
         // tunnel count is exactly the tunnel's own lifetime — and ended by the
@@ -1778,7 +1803,15 @@ where
             None => (None, None),
         };
         let _slot = slot;
-        let tunnel = crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx);
+        let tunnel = crate::transport::multiplex::run_server_tunnel(
+            CountingTunnel {
+                inner: conn,
+                written: Arc::clone(&written),
+                read: Arc::clone(&read),
+            },
+            config,
+            bridge_tx,
+        );
         match ended.as_mut() {
             Some(ended) => {
                 tokio::select! {
@@ -1790,9 +1823,32 @@ where
         }
         debug!("Multiplexed data tunnel closed");
     });
+    // The identity a health report is attributed by: the client's own name for
+    // this connection, which its stream prologue carries. The mux driver cannot
+    // read it (it owns the connection but not the streams) and the dispatch
+    // cannot read the health (it owns the streams but not the connection), so the
+    // two meet in this slot, and the reporter below waits on it.
+    #[cfg(feature = "multiplex")]
+    let tunnel_id: Arc<std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>> =
+        Arc::new(std::sync::OnceLock::new());
+    #[cfg(feature = "multiplex")]
+    spawn_tunnel_health_reporter(
+        health,
+        reported_written,
+        Arc::clone(&tunnel_id),
+        Arc::clone(&owner.sessions),
+        owner.nonce,
+    );
     tokio::spawn(async move {
         while let Some(mut stream) = bridge_rx.recv().await {
-            let Some(queue) = route_tunnel_stream(&mut stream, &owner.sessions, &owner.nonce).await
+            let Some(queue) = route_tunnel_stream(
+                &mut stream,
+                &owner.sessions,
+                &owner.nonce,
+                #[cfg(feature = "multiplex")]
+                &tunnel_id,
+            )
+            .await
             else {
                 // A stream this session may not carry: dropped here, never the
                 // tunnel or the session.
@@ -1804,6 +1860,161 @@ where
         }
     });
     Ok(())
+}
+
+/// A tunnel connection that counts what passes through it.
+///
+/// The **written** count is what this end handed the tunnel, and it is the
+/// numerator the delivery ratio does not have: a policer drops those bytes in
+/// flight, so counting them anywhere below the wire would count what arrived
+/// instead of what was offered — which is the whole distinction the carrier rule
+/// needs (HANDOFF.md, round 6). The read count rides along for symmetry and for
+/// the pool-stats line's sake.
+#[cfg(feature = "multiplex")]
+struct CountingTunnel<S> {
+    inner: S,
+    written: Arc<std::sync::atomic::AtomicU64>,
+    read: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "multiplex")]
+impl<S: AsyncRead + Unpin> AsyncRead for CountingTunnel<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            let moved = buf.filled().len().saturating_sub(before);
+            self.read
+                .fetch_add(u64::try_from(moved).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingTunnel<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &polled {
+            self.written
+                .fetch_add(u64::try_from(*n).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Report one tunnel's KCP health back to the end that dialed it.
+///
+/// The deciding end chooses a tunnel's carrier, and on a path that polices UDP
+/// the evidence it needs is here: the packets this server sends into a policed
+/// carrier never arrive, so this session's ARQ re-sends them, and the client —
+/// which only ever sees what arrived — reads nothing of it. Measured on the
+/// `udp_throttled` condition: this end re-sent **22.9 %** of what it emitted
+/// while the client's own counters read 0.04 %. One frame per change, on the
+/// session's own control writer, so nothing new is opened for it.
+///
+/// The report starts once the tunnel's identity is known — its first stream's
+/// prologue carries it — and the task ends with the session it reports on: the
+/// `Weak` is all it holds of the health, so a dead tunnel takes its reporter
+/// with it rather than leaving one polling a number nobody owns.
+#[cfg(feature = "multiplex")]
+fn spawn_tunnel_health_reporter(
+    health: Option<Arc<crate::kcp::SessionHealth>>,
+    handed: Arc<std::sync::atomic::AtomicU64>,
+    tunnel_id: Arc<std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>>,
+    sessions: Arc<RwLock<SessionMap>>,
+    nonce: Nonce,
+) {
+    const SAMPLE: std::time::Duration = std::time::Duration::from_millis(50);
+    let Some(health) = health.map(|h| Arc::downgrade(&h)) else {
+        // A TCP tunnel: the kernel holds its retransmit state and there is
+        // nothing here to report.
+        return;
+    };
+    tokio::spawn(async move {
+        let mut sent: Option<(u64, u64, u64)> = None;
+        let mut seq: u8 = 0;
+        let mut announced = false;
+        loop {
+            tokio::time::sleep(SAMPLE).await;
+            let Some(health) = health.upgrade() else {
+                // The session is gone: so is the tunnel this reported on.
+                return;
+            };
+            let counters = health.counts();
+            let handed = handed.load(Ordering::Relaxed);
+            if sent == Some((counters.0, counters.1, handed)) {
+                continue;
+            }
+            sent = Some((counters.0, counters.1, handed));
+            let Some((service_id, tunnel)) = tunnel_id.get().copied() else {
+                // No stream has named this tunnel yet: there is no identity to
+                // attribute a report to, and no traffic to have lost either.
+                continue;
+            };
+            seq = seq.wrapping_add(1);
+            let cmd = ControlChannelCmd::TunnelHealth(
+                service_id,
+                tunnel.0,
+                u32::try_from(counters.0).unwrap_or(u32::MAX).to_be_bytes(),
+                u32::try_from(counters.1).unwrap_or(u32::MAX).to_be_bytes(),
+                u32::try_from(handed).unwrap_or(u32::MAX).to_be_bytes(),
+                seq,
+            );
+            let Ok(frame) = postcard::to_stdvec(&cmd) else {
+                return;
+            };
+            let write_tx = sessions
+                .read()
+                .await
+                .get(&nonce)
+                .map(|session| session.write_tx.clone());
+            let Some(write_tx) = write_tx else {
+                return;
+            };
+            if !announced {
+                // Once per tunnel: the report is a fact about this connection,
+                // and its first frame is what proves the path end to end.
+                announced = true;
+                debug!(
+                    service = %hex::encode(service_id.0),
+                    tunnel = tunnel.0.iter().fold(String::new(), |mut acc, b| {
+                        use std::fmt::Write as _;
+                        let _ = write!(acc, "{b:02x}");
+                        acc
+                    }),
+                    emitted = counters.0,
+                    resent = counters.1,
+                    "Reporting a tunnel's session health to its dialing end"
+                );
+            }
+            if write_tx.send(frame).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// Resolve one inbound v4 tunnel stream to the queue of the service it names.
@@ -1822,16 +2033,33 @@ async fn route_tunnel_stream<S>(
     stream: &mut S,
     sessions: &RwLock<SessionMap>,
     nonce: &Nonce,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without multiplex there are no tunnels to report on"
+        )
+    )]
+    tunnel_id: &std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>,
 ) -> Option<mpsc::Sender<DataChannel>>
 where
     S: AsyncRead + Unpin,
 {
-    let Ok(service_id) = read_stream_prologue(stream).await else {
+    let Ok((service_id, tunnel)) = read_tunnel_prologue(stream).await else {
         // The stream ended before naming a service (a client that opened it
         // and hung up): nothing to route it to.
         debug!("Dropped a tunnel stream with no prologue");
         return None;
     };
+    // The tunnel a stream arrived on is the connection the *client's* pool
+    // holds, and it is the key a per-tunnel report is attributed by — the
+    // identity that lets this end say what it offered that connection rather
+    // than the pool it belongs to.
+    // The tunnel's identity, recorded once and never overwritten: a tunnel's
+    // first stream names it, and every later stream of the same connection names
+    // the same pair.
+    let _ = tunnel_id.set((service_id, tunnel));
+    tracing::trace!("Stream for service {service_id} arrived on tunnel {tunnel}");
     let queue = sessions
         .read()
         .await
@@ -1987,7 +2215,8 @@ async fn serve_kcp_tunnel(
         }
     };
 
-    upgrade_to_tunnel(io, owner, session).await
+    let health = io.health();
+    upgrade_to_tunnel(io, owner, session, Some(health)).await
 }
 
 /// Resolve the session a validated tunnel hello names.
@@ -4172,8 +4401,13 @@ mod tests {
 
     /// Write a stream's 4-byte service prologue.
     #[cfg(feature = "multiplex")]
+    /// The prologue a stream of a multiplexed tunnel opens with: the service,
+    /// then the tunnel it rides (see `write_tunnel_prologue`).
     async fn write_prologue(tx: &mut tokio::io::DuplexStream, id: u32) {
-        tx.write_all(&id.to_be_bytes()).await.unwrap();
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&id.to_be_bytes());
+        buf[4..].copy_from_slice(&1u32.to_be_bytes());
+        tx.write_all(&buf).await.unwrap();
         tx.flush().await.unwrap();
     }
 
@@ -4209,7 +4443,7 @@ mod tests {
         // A registered service's stream lands on *that* service's queue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 1).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("a registered service must route");
         assert!(routed.same_channel(&queue_a));
@@ -4219,7 +4453,7 @@ mod tests {
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 9).await;
         assert!(
-            route_tunnel_stream(&mut rx, &sessions, &nonce)
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
                 .await
                 .is_none()
         );
@@ -4228,7 +4462,7 @@ mod tests {
         let (tx, mut rx) = tokio::io::duplex(64);
         drop(tx);
         assert!(
-            route_tunnel_stream(&mut rx, &sessions, &nonce)
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
                 .await
                 .is_none()
         );
@@ -4238,7 +4472,7 @@ mod tests {
         // streams of several services, each routed by its own prologue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 2).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("the sibling service must route too");
         assert!(routed.same_channel(&queue_b));

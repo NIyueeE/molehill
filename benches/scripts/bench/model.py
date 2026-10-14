@@ -661,6 +661,13 @@ class Condition:
     netem: tuple = ()
     mtu: int | None = None
     block_udp: bool = False
+    #: Packets per second of UDP the leg admits, when the condition polices the
+    #: protocol rather than refusing it (`None` = not policed). `block_udp` is
+    #: the hard case — the carrier cannot be established at all and the product
+    #: falls back; a *limit* is the soft one, where the carrier still works but
+    #: only at the rate the policer allows, which is the only shape in which a
+    #: carrier can be losing traffic while looking healthy to its own sender.
+    udp_limit: int | None = None
 
 
 CONDITIONS: dict[str, Condition] = {
@@ -702,6 +709,17 @@ CONDITIONS: dict[str, Condition] = {
         "≈ 27 ms of standing queue at 545 Mbit/s): tail drops are out of the "
         "way without the hundred-megabyte standing queue that inflates RTT",
         ("delay", "10ms", "loss", "1%", "limit", "10000"),
+    ),
+    "udp_throttled": Condition(
+        "udp_throttled",
+        "a path that polices UDP to a fraction of its capacity: the carrier "
+        "the data plane prefers still establishes, but only carries what the "
+        "policer admits (and pays its ARQ for what the policer drops)",
+        # 10 000 packets/s is the `limit` module's own ceiling (~117 Mbit/s of
+        # 1472-byte datagrams), which is the point: the policer has to bite
+        # hard enough that the carrier riding UDP is starved while the one
+        # that does not is untouched.
+        udp_limit=10_000,
     ),
     "udp_blocked": Condition(
         "udp_blocked",
@@ -1106,7 +1124,7 @@ def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
     whose method says "the fallback" while every packet rode KCP. The refusal
     names the leg to use rather than letting the number lie.
     """
-    if condition.block_udp and leg != "tunnel":
+    if (condition.block_udp or condition.udp_limit is not None) and leg != "tunnel":
         raise ValueError(
             f"the {condition.name} condition drops UDP on the leg the carrier crosses; "
             f"impose it on the `tunnel` leg (got {leg!r}), or it blocks the payload "
@@ -1188,8 +1206,12 @@ def expected_cells(scenario_id: str, params: dict) -> list:
     The gate checks this list, so "the run covered what it claimed" is a
     declared expectation rather than a guess from whatever arrived. A staged
     scenario expects one cell per stage *occurrence* (`clean`, `clean#2`), a
-    capacity ramp expects one per level plus its summary, and every other
-    scenario expects exactly one.
+    capacity ramp expects one per level plus its summary, and the scenarios
+    that name their operating point (`bulk-n`'s `P8`, `rr-16`'s `c16`, the
+    ladder's `1000M`) expect exactly the cell their own parameters name —
+    the workload builds the cell name from the same parameters, so
+    expectation and sample cannot disagree unless this rule is wrong, which
+    is what the gate exists to catch.
     """
     scenario = SCENARIOS[scenario_id]
     if scenario.kind == Kind.STAGED:
@@ -1204,6 +1226,10 @@ def expected_cells(scenario_id: str, params: dict) -> list:
         return [*cells, "run"]
     if scenario.kind == Kind.CAPACITY:
         return [f"L{n}" for n in range(1, params["streams_max"] + 1)] + ["ramp"]
+    if scenario.id == "udp-ladder":
+        return [f"{rate:g}M" for rate in params["rates_mbit"]]
+    if named := CELL_NAMING.get(scenario.kind):
+        return [named(params)]
     return [""]
 
 
@@ -1569,6 +1595,23 @@ class Kind:
         CAPACITY,
         RECONNECT,
     )
+
+
+#: How the parameterized *kinds* name the cells they produce — by kind, not
+#: by scenario id, because several scenarios share a runner (bulk-1 and
+#: bulk-n are the same workload at different widths, rr-1 and rr-16 likewise)
+#: and the runner names the cell from its own parameters. The workload builds
+#: the cell from these same parameters, so the gate's expectation and the
+#: sample cannot disagree unless this table is wrong — which is the failure
+#: the coverage check exists to catch.
+CELL_NAMING: dict = {
+    Kind.BULK: lambda p: f"P{p['streams']}",
+    Kind.BULK_PAIR: lambda _p: "pair",
+    Kind.RR: lambda p: f"c{p['connections']}",
+    Kind.UDP: lambda p: (
+        "blast" if not p.get("datagrams_per_s") else f"{p['datagrams_per_s']:g}/s"
+    ),
+}
 
 
 def validate_scenarios(names: list) -> list:

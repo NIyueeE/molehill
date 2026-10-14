@@ -166,6 +166,41 @@ pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
+/// One session's own ARQ counters: what a *per-tunnel* view of the carrier's
+/// health reads.
+///
+/// The process-global counters above answer "how is this process doing"; a
+/// carrier policy has to answer "how is **this tunnel's** connection doing" —
+/// a pool's tunnels are independent sessions, and only the retransmit share
+/// of the degraded one rises (measured: 1 vs ~5,000 retransmits per cell
+/// between the healthy and the lossy carrier, HANDOFF.md round 37's S1). The
+/// adapter hands one of these to each engine it spawns; a session without one
+/// (tests, tooling) costs nothing — the `Option` keeps the field free until a
+/// caller asks for per-session evidence.
+#[derive(Debug, Default)]
+pub struct SessionHealth {
+    /// Datagrams the engine emitted, ARQ payload and its own probes alike.
+    pub datagrams_out: AtomicU64,
+    /// Segments the engine re-sent: an RTO (silence) or a fast re-send (a gap
+    /// the peer's later acks exposed). The share of these in `datagrams_out`
+    /// is the degradation signal.
+    pub retransmits: AtomicU64,
+}
+
+impl SessionHealth {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// The cumulative `(datagrams_out, retransmits)` pair.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.datagrams_out.load(Relaxed),
+            self.retransmits.load(Relaxed),
+        )
+    }
+}
+
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
     assert!(buf.len() >= KCP_OVERHEAD);
@@ -403,6 +438,12 @@ pub struct Kcp<Output> {
     /// Maximum payload size
     incr: usize,
 
+    /// This session's own counters, when its owner asked for them (see
+    /// [`SessionHealth`]): the per-tunnel view the process-global counters
+    /// cannot give. `None` costs nothing — a session that will not be judged
+    /// never allocates the pair.
+    health: Option<std::sync::Arc<SessionHealth>>,
+
     snd_queue: VecDeque<KcpSegment>,
     rcv_queue: VecDeque<KcpSegment>,
     snd_buf: VecDeque<KcpSegment>,
@@ -450,6 +491,8 @@ impl<Output> Debug for Kcp<Output> {
             .field("dead_link", &self.dead_link)
             .field("last_progress", &self.last_progress)
             .field("incr", &self.incr)
+            // the health pair is the owner's to read; its presence is the fact
+            .field("health", &self.health.is_some())
             .field("snd_queue.len", &self.snd_queue.len())
             .field("rcv_queue.len", &self.rcv_queue.len())
             .field("snd_buf.len", &self.snd_buf.len())
@@ -482,7 +525,6 @@ impl<Output> Kcp<Output> {
 
     /// Set the maximum datagram size, and the payload capacity that follows
     /// from it. Returns the size now in force.
-    ///
     /// **The engine does not have an opinion about the path; the caller
     /// does.** It probes, and this follows it in either direction. Growth is
     /// allowed because a segment size is what every byte of traffic pays for
@@ -501,6 +543,14 @@ impl<Output> Kcp<Output> {
             self.mss = mtu - KCP_OVERHEAD;
         }
         self.mtu
+    }
+
+    /// Hand the engine a per-session counter pair to keep (see
+    /// [`SessionHealth`]): every datagram it emits and every segment it
+    /// re-sends is added to the pair, so the owner can read this session's
+    /// ARQ health apart from every other session's.
+    pub fn set_health(&mut self, health: std::sync::Arc<SessionHealth>) {
+        self.health = Some(health);
     }
 
     fn construct(conv: u32, output: Output, stream: bool) -> Self {
@@ -526,6 +576,8 @@ impl<Output> Kcp<Output> {
             },
 
             buf: BytesMut::with_capacity((KCP_MTU_DEF + KCP_OVERHEAD) * 3),
+
+            health: None,
 
             snd_queue: VecDeque::new(),
             rcv_queue: VecDeque::new(),
@@ -1542,6 +1594,9 @@ impl<Output: DatagramSink> Kcp<Output> {
                 self.xmit += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
                 KCP_RESENDS_RTO.fetch_add(1, Relaxed);
+                if let Some(health) = &self.health {
+                    health.retransmits.fetch_add(1, Relaxed);
+                }
                 if self.flags.has(KcpFlags::NODELAY) {
                     // nodelay steps the RTO by half instead of doubling it
                     let step = snd_segment.rto;
@@ -1561,6 +1616,9 @@ impl<Output: DatagramSink> Kcp<Output> {
                 change += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
                 KCP_RESENDS_FAST.fetch_add(1, Relaxed);
+                if let Some(health) = &self.health {
+                    health.retransmits.fetch_add(1, Relaxed);
+                }
             }
 
             if need_send {

@@ -1,36 +1,36 @@
 use crate::Config;
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use crate::config::{ClientConfig, ClientServiceConfig};
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use anyhow::Context;
 use anyhow::{Result, anyhow};
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use std::collections::HashMap;
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use std::env;
 use std::path::{Path, PathBuf};
 use tokio::sync::{broadcast, mpsc};
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use tracing::{error, info, instrument};
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use notify::{EventKind, RecursiveMode, Watcher};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ConfigChange {
     General(Box<Config>), // Trigger a full restart
-    #[cfg(feature = "notify")]
+    #[cfg(feature = "hot-reload")]
     ClientChange(Box<ClientServiceChange>),
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientServiceChange {
     Add(Box<ClientServiceConfig>),
     Delete(String),
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 trait InstanceConfig: Clone {
     type ServiceConfig: PartialEq + Eq + Clone;
     fn equal_without_service(&self, rhs: &Self) -> bool;
@@ -39,7 +39,7 @@ trait InstanceConfig: Clone {
     fn get_services(&self) -> &HashMap<String, Self::ServiceConfig>;
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 impl InstanceConfig for ClientConfig {
     type ServiceConfig = ClientServiceConfig;
     fn equal_without_service(&self, rhs: &Self) -> bool {
@@ -92,7 +92,7 @@ impl ConfigWatcherHandle {
 }
 
 // Fake config watcher when compiling without `notify`
-#[cfg(not(feature = "notify"))]
+#[cfg(not(feature = "hot-reload"))]
 async fn config_watcher(
     _path: PathBuf,
     mut shutdown_rx: broadcast::Receiver<bool>,
@@ -104,7 +104,7 @@ async fn config_watcher(
     Ok(())
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 #[instrument(skip(shutdown_rx, event_tx, old))]
 async fn config_watcher(
     path: PathBuf,
@@ -174,7 +174,7 @@ async fn config_watcher(
     Ok(())
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     if old == new {
         return None;
@@ -211,7 +211,7 @@ fn calculate_events(old: &Config, new: &Config) -> Option<Vec<ConfigChange>> {
     Some(ret)
 }
 
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 // None indicates a General change needed
 fn calculate_instance_config_events<T: InstanceConfig>(
     old: &T,
@@ -237,7 +237,7 @@ fn calculate_instance_config_events<T: InstanceConfig>(
     Some(deletions.chain(addition).collect())
 }
 
-#[cfg(all(test, feature = "notify"))]
+#[cfg(all(test, feature = "hot-reload"))]
 mod test {
     use super::*;
     use crate::config::ServerConfig;

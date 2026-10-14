@@ -9,6 +9,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The tunnel pool's carrier rule probes the other carrier instead of
+  trusting its own counters.** A suspicion — a tunnel re-sending 4 % or more
+  of a window it carried real traffic in — hands one tunnel to the carrier the
+  pool is not riding (the pool's own no-disruption handover), routes new
+  streams to it while the probe runs, and compares carried bytes per second
+  per tunnel past the lane policy's 1.5x edge: materially more moves the
+  endpoint's carrier under the same switch cooldown as every other move,
+  materially less gives the tunnel back and parks the pool in a 600 s backoff,
+  and a probe whose window carried nothing is held rather than judged — an
+  idle tunnel against a busy incumbent reads "carries less" on zero evidence.
+  The share suspicion is what makes the rule fire at all on a UDP-policed
+  path, where reliable ARQ keeps delivery at 99-100 % while the policer
+  starves the carrier (measured: share 27-31 % per window, delivery pinned) —
+  the one local signal the path admits, earning the comparison that decides.
+  Still opt-in: `MOLEHILL_TUNNEL_CARRIER_RULE=1`.
+- **The bench model's verdicts are statistics now, not a silent heuristic.**
+  What was "every paired round agreed in sign" — a rule whose error rate at
+  the round counts the profiles actually run was 25–50 % and never stated —
+  is an **exact sign test** whose p-value prints beside `alpha_eff`, the
+  level the run's own length can honestly test at (`2/2^n`; six rounds reach
+  p ≤ 0.05). A **bootstrap confidence interval** over the paired difference
+  (seeded from the run's fingerprint, so re-analysing a stored run
+  reproduces it) separates three things one undifferentiated "no claim" used
+  to hide: an effect *entirely beyond* the floors, one *entirely inside*
+  them (bounded evidence there is nothing worth calling), and one
+  *straddling* them (a direction, and nothing more). Claims are
+  **pre-registered** (`--primary metric=…,scenario=…`, in the fingerprint;
+  the scenario's headline metric by default) — everything else is
+  exploratory and directional at best — and the primary family goes through
+  a Benjamini-Hochberg correction. A verdict that flips when any single
+  round is dropped is marked **FRAGILE**; a cell that lost more than half
+  its rounds is refused outright (`drowned`) by the verdicts and the gate;
+  the report now also prints, per unresolvable cell, how many rounds would
+  reach the metric's floor. Results files carry the analysis version in
+  their method, so a run reduced by an older analysis is refused as a
+  baseline rather than silently compared (`schema` 3). `--normalize control`
+  divides tool arms' per-round readings by the same round's control reading,
+  for host-bound cells where that cancels drift rather than signal; and the
+  iperf3 version travels in the method (a version can change the summary
+  fields the model reads — measured across a reinstall).
+- **The server reports each multiplexed tunnel's ARQ health back to the client**
+  (`ControlChannelCmd::TunnelHealth`): emitted and re-sent datagrams per tunnel,
+  fixed-width like the transparent lane's carrier report, on the session's own
+  control writer. It is the L4 half of the evidence chain — the client dials the
+  tunnels and chooses their carrier, and on a path that polices UDP the loss that
+  matters is the *server's* sends, which the client's own counters cannot see
+  (measured: 22.9 % re-sent on the server against 0.04 % on the client). The
+  client sums both ends, so the carrier rule's share is direction-independent,
+  and the pool-stats line prints that sum.
+
+
+- **A path condition that polices UDP instead of refusing it**
+  (`--condition udp_throttled`): an `iptables -m limit` accept-then-drop for UDP
+  on the carrier's leg, 10 000 packets/s (the module's ceiling, ≈ 117 Mbit/s of
+  1472-byte datagrams). It is the shape a middlebox actually imposes on a
+  second-class protocol, and the only one where a carrier can be losing most of
+  its traffic while its own sender's counters still look calm. Measured through
+  it (`l4`, `udp-ladder`): the UDP-riding carrier delivers 78–101 Mbit/s with
+  44–93 % inner loss where the one that does not rides at 200–1047 Mbit/s with
+  0–71 %. It is a bench-model condition, tunnel leg only (the refusal says so).
+
+
+- **The multiplexed pool's carrier rule is wired — on a sender-side signal
+  the first wiring run measured as rate-dependent, so it ships off by
+  default.** Each KCP session now keeps its own ARQ counters (what it
+  emitted, what it re-sent), the pool differences two samples per
+  maintenance tick, and a tunnel whose retransmit share clears the floor for
+  three consecutive windows starts the no-disruption handover to TCP and
+  moves the endpoint's carrier decision with it under the switch cooldown.
+  The rule is one-sided by construction (a TCP tunnel's retransmit state
+  stays in the kernel). **Why off by default — the wiring run's own
+  measurement:** the S1 cells that saturated into the lossy path showed a
+  5.7 % retransmit share, but the paced cell at the same 1 % path loss
+  showed **0.6 %** — under the floor — because most of the delivered-loss
+  difference is the *peer's* queue refusing segments, which a sender's ARQ
+  counters cannot see; the same asymmetry the L3 evidence chain was built
+  around, now measured on the L4 half. `MOLEHILL_TUNNEL_CARRIER_RULE=1`
+  arms the rule for an operator or a measurement that knows its signal; the
+  peer-side tunnel report (the lane `CarrierReport`'s L4 analogue) is the
+  recorded instrument that would make it honest. The same change surfaces
+  per-tunnel KCP health in the pool snapshot (`kcp_health`, also on the
+  pool-stats line) and accepts a carrier-choice handle at pool construction
+  (`with_choice`). The `MOLEHILL_TUNNEL_SWITCH_AT` hatch is independent.
+
+- **A multiplexed pool can hand one tunnel over to the other carrier without
+  disturbing the flows on it.** The pool-level analogue of the transparent
+  lane's two-sided drain: the client excludes one unpinned tunnel of the
+  carrier its tunnels ride from new placements, the streams already on it run
+  to the end (a stream cannot move without reordering it), and only once the
+  tunnel holds no stream and no pinned UDP peer is it retired and its slot
+  refilled by the repair dial on the other carrier. At most one tunnel is
+  handed over at a time, both of its waits are bounded — a tunnel that never
+  quiets returns to service, and a replacement that cannot be established
+  releases the handover to ordinary repair — so a pool is never left one tunnel
+  short for ever, and a placement refusal inside the window is not reported as
+  pool saturation. The mechanism has no trigger of its own yet; it is reachable
+  through the new `MOLEHILL_TUNNEL_SWITCH_AT=<seconds>` diagnostic hatch, the
+  L4 counterpart of `MOLEHILL_CARRIER_SWITCH_AT`, and its state is visible in
+  the `MOLEHILL_POOL_STATS` line (per-tunnel `phase`, a `handover` field, and
+  `-handover` in the size timeline). No speedup claimed — this is the machinery
+  a per-tunnel quality rule needs, priced by the same A/B discipline before any
+  rule acts on it. The hatch's value is read **per pool**, at the moment that
+  pool starts (a process-wide cache briefly pinned the first pool's answer
+  onto every pool built after it, and an invalid value is reported once per
+  process rather than at every pool creation).
+
 - **A transparent claim's lanes move to the other carrier when the one in use is
   measured to be losing its traffic.** Each lane now carries its own identity
   (named by the client in the channel's prologue), the server reports what it
@@ -25,6 +131,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a lane to another claim. `MOLEHILL_L3_STATS=1` prints each lane's own counters
   (`offered`, `enqueued`, `overflow`, `disconnected`, `injected`) beside the
   peer's view (`peer_offered`, `peer_refused`).
+  **Measured** (bench model, `l3`, 1 %-loss path with a finite buffer, ladder
+  first so the policy fires, 4 rounds, the run's own A/A twin): in the rounds
+  whose handover completed before the 5 Gbit/s ladder cell began, that cell read
+  **13.7 % and 7.4 % loss at 2.9-3.1 Gbit/s** against the held carrier's
+  **65.5-67.0 % at ~1.04 Gbit/s** — 3x the delivery, in exactly the rounds the
+  handover's timestamps name and untouched in the others. The price is stated
+  beside it: `syscalls_per_s` +31 % on that cell (a claim by the model's own
+  floors), TCP's per-datagram work against KCP's batched send, while
+  `cpu_s_per_gbit` in the captured rounds improves (carrying 3x on a carrier
+  whose per-byte cost is lower). Carrier reports are matched to their claim
+  before the lane id is consulted (every claim mints its lane ids from 1 in one
+  shared hub, so the first lookup landed a report on whichever claim held that
+  number), and a lane being handed over retires on the same 3-second quiet
+  window the peer's drain answers — the flow table's own 60-second idle
+  eviction used to hold a handover past the end of a measured round.
 
 - **A transparent (L3) claim's carrier connections come from its carrier's
   budget, and its inner flows are spread across them.**
@@ -76,6 +197,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the policy that acts on that evidence is the next change.
 
 ### Changed
+
+- **A peer arm's tool version travels with its numbers.** The method record
+  now carries `peer_versions` — the resolved version of every reference tool
+  a run measured (rathole, frp, nps), read through the tool's own `--version`
+  output with the fetcher's release marker as fallback. The function existed
+  and the fetcher wrote the marker, but nothing called it at run time, so a
+  peer's numbers arrived without the version that produced them — the one
+  provenance line a published peers chart could not self-verify (the iperf3
+  version has traveled in the same record since the statistics reform).
+  Found by a rehearsal run of the release ritual, not by review.
+
+- **The gate chain classifies bench-only changes, and the feature table became
+  a registry.** `githooks/benches-only` mirrors `githooks/docs-only` for
+  `benches/scripts/**`: the scripts are runtime tooling — `uv run` entries and
+  shell helpers, never compiled, linked or depended on by a Rust target — so a
+  commit touching only them runs the gates it can move (secret scan, docs
+  check, both ruff gates, the bench-model self-check) and skips the cargo
+  gates it cannot; a push carrying only such commits skips the heavy gates
+  too (audit, deny, outdated and tests cannot move either), running the docs
+  check alone. CI keeps the full chain for such a change, so the hooks are a
+  latency split, never a coverage split. And `githooks/check-docs` now
+  checks every public feature name in `[features]` against
+  [docs/build-guide.md](docs/build-guide.md) (the two names the page had
+  never mentioned, `embedded` and `console`, are documented now): a name in
+  the table that no page documents is either a dead pipeline row — the gate
+  side of the same rule is already caught by rustc's `unexpected_cfgs` — or a
+  feature nobody can discover.
+
+- **The feature names are intent names only.** `hot-reload` no longer exists
+  as two spellings: its 22 code gates read `feature = "hot-reload"` instead of
+  the implementation dependency's name (`notify`), so `--features hot-reload`
+  is the only spelling the table and the code share. `noise` now pulls its
+  three dependencies through `dep:` aliases (`base64`, `snow`,
+  `pin-project`), which removes them from the public feature surface —
+  previously every one was a selectable `--features` name that gated no code
+  of its own. No supported build changes what it compiles: every combination
+  the CI matrix and the docs name is spelled with the intent names and
+  resolves to the same dependency set as before.
 
 - **The KCP send window is 8192 segments, not 2048.** The window is the
   carrier's throughput ceiling as soon as a path's bandwidth-delay product
@@ -245,6 +404,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are DEBUG. The wire protocol is unchanged.
 
 ### Fixed
+
+- **The `embedded`, `noise` and `transparent` feature combinations compile
+  again.** The `NoiseConfig` re-export was gated on `multiplex` *and* `noise`
+  (two stacked cfg attributes), so a build with `noise` but without
+  `multiplex` — the documented `embedded` release set among them — failed on
+  the noise transport's own import; and the transparent module referenced the
+  multiplex-only `Carrier` type from paths its own cfg gates do not cover
+  (the stats line used a fully-qualified path past the gated import, and the
+  carrier policy's types had no non-multiplex shape). The re-export is now
+  gated on `noise` alone; the transparent module carries the empty `Carrier`
+  stub its own documentation always promised (every `Option<Carrier>` is
+  `None` without `multiplex`, and the carrier policy compiles only where a
+  choice exists); the KCP `connect_stream` takes the noise options in every
+  build so its call sites do not fork on the feature. Verified with
+  `cargo hack check --feature-powerset`.
+
+- **The tunnel byte counters no longer take a process-wide lock on the IO
+  path.** Counting what every multiplexed channel read and wrote lived in a
+  global `Mutex<HashMap>` that *every* data-channel poll locked — an
+  always-on cost for an opt-in diagnostic. The counters are two relaxed
+  atomics on each tunnel's own bookkeeping now, and the pool snapshot
+  carries them (`MOLEHILL_TUNNEL_STATS` reads the same registry every pool is
+  already in; its line is `index:delivered/written` in pool order). The A/B
+  on the clean l4 cells reads no claim on throughput and CPU (all inside the
+  run's own A/A floors) and a directional RSS drop on the many-tunnel cells
+  (rr-16 −5.2 %, bulk-n −6.8 %, floor 4.9 %) — consistent with the registry
+  no longer growing with every tunnel a process ever built.
 
 - **A tunnel pool's repair now follows the endpoint's carrier preference.** A
   pool's dialer was built for the carrier the pool was created on, so a pool that

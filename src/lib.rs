@@ -218,7 +218,7 @@ pub async fn run(args: Cli, shutdown_rx: broadcast::Receiver<bool>) -> Result<()
                 service_update = Some(service_update_tx);
                 running = true;
             }
-            #[cfg(feature = "notify")]
+            #[cfg(feature = "hot-reload")]
             ev => {
                 info!("Service change detected. {:?}", ev);
                 if let Some(service_update_tx) = &service_update {

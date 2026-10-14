@@ -152,6 +152,14 @@ as published history and are never a regression baseline for a `bench` run:
 the two schemas are different instruments, and `bench-gate` refuses a baseline
 whose method record does not match.
 
+The same refusal now operates inside `bench` itself, on two keys: the
+**analysis version** (the statistics are part of what a number means — a
+results file reduced by an older analysis is refused as a baseline, though
+either file can still be re-rendered by the current code) and the
+**pre-registered endpoints** (`--primary`). After a model revision, the
+records measured under the previous one must be re-measured before they can
+gate anything — which is the point of recording the version.
+
 ## Comparing two builds (development screening)
 
 Outside the release ritual, the question is usually *"is this direction worth

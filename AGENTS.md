@@ -221,12 +221,18 @@ Details: [docs/release.md](docs/release.md).
   release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
   runs the identical chain when the change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
-  docs-alignment check instead — the one gate such a change can break. **The
-  hooks mirror that split** (`githooks/docs-only` classifies the staged paths
-  or the pushed range): pre-commit keeps only the secret scan and the docs
-  check, pre-push keeps only the docs check, and anything ambiguous — an empty
-  change set, a new branch, a tag push, a commit mixing docs with code — falls
-  back to the full chain. Deleting the classifier restores the full chain,
+  docs-alignment check instead — the one gate such a change can break. A
+  benches-only change (`benches/scripts/**`) skips the cargo gates of the
+  fast gate for the same reason — the scripts are runtime tooling, never
+  compiled — and pre-push skips the heavy gates for it too (audit, deny,
+  outdated and tests cannot move), while CI keeps the full chain.
+  **The hooks mirror that split** (`githooks/docs-only` and
+  `githooks/benches-only` classify the staged paths or the pushed range):
+  pre-commit keeps the secret scan and the docs check, plus the two ruff
+  gates and the bench-model self-check for a benches-only change; pre-push
+  keeps only the docs check; and anything ambiguous — an empty change set, a
+  new branch, a tag push, a commit mixing docs or benches with code — falls
+  back to the full chain. Deleting a classifier restores the full chain,
   which is the safe direction. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by

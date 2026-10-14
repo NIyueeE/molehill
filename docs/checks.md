@@ -47,6 +47,21 @@ running anything and take a two-gate path instead:
 | `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, both ruff gates, the bench-model self-check, both clippy passes |
 | `githooks/pre-push` | `githooks/check-docs` | audit, deny, outdated, tests |
 
+A change limited to `benches/scripts/**` takes the same shortcut, in both
+hooks (classified by `githooks/benches-only`): the scripts are runtime
+tooling — `uv run` entries and shell helpers — never compiled, linked or
+depended on by any Rust target, so fmt, machete, both clippy passes and the
+whole heavy chain cannot move. The gates that can move all still run: the
+secret scan, the docs check, both ruff gates and the bench-model self-check
+in pre-commit; the docs check in pre-push. A push mixing docs with benches —
+or either with code — fails both classifiers and takes the full chain. CI
+does **not** take
+this shortcut (`ci.yml`'s only ignore-list is the docs one), so a benches-only
+change still runs the full Rust chain there — the hook path is a latency
+split, never a coverage split, and the classification is deliberately wider
+than "python": the shell helpers under `benches/scripts/` are equally
+compile-free.
+
 Three properties make this safe rather than a bypass:
 
 - the classifier reads the **actual change set** — the staged paths for a
@@ -74,7 +89,7 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 | 1 | fmt | `cargo fmt --all -- --check` | code style |
 | 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
 | 3 | machete | `cargo machete` | unused dependencies |
-| 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
+| 4 | docs | `githooks/check-docs` | docs ↔ code alignment (includes the feature-name registry: every `[features]` row must be documented in docs/build-guide.md) |
 | 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
 | 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
 | 7 | bench model | `uv run benches/scripts/bench/bench.py selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |

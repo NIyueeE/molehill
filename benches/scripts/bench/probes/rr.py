@@ -82,6 +82,7 @@ class Worker(threading.Thread):
         latencies: list = []
         setups: list = []
         errors: list = []
+        connect_errors = 0
         sock = None
         stopped_early = False
         try:
@@ -91,7 +92,23 @@ class Worker(threading.Thread):
                     break
                 if sock is None:
                     t0 = time.perf_counter()
-                    sock = self._connect()
+                    try:
+                        sock = self._connect()
+                    except OSError as exc:
+                        # A refused connect is a reading, not a crash. The
+                        # churn shape (a fresh connection per request) can
+                        # exhaust the visitor namespace's ephemeral ports:
+                        # 16 workers x thousands of connections a minute
+                        # against a ~28 k port range with 60 s of TIME_WAIT,
+                        # which surfaced as EADDRNOTAVAIL raised out of this
+                        # line — every worker thread dying uncounted, a
+                        # round reporting ok=0 failed=0 and a rate of zero.
+                        # Count it, back off long enough for a port to
+                        # leave TIME_WAIT, and keep issuing.
+                        connect_errors += 1
+                        errors.append(f"connect: {type(exc).__name__}: {exc}")
+                        time.sleep(0.05)
+                        continue
                     setups.append((time.perf_counter() - t0) * 1e6)
                 want = payload_for(
                     self.index * self.args.requests + seq, self.args.size
@@ -118,6 +135,7 @@ class Worker(threading.Thread):
         self.out[self.index] = {
             "ok": ok,
             "failed": failed,
+            "connect_errors": connect_errors,
             "mismatched": mismatched,
             "latencies_us": latencies,
             "setup_us": setups,
@@ -162,6 +180,7 @@ def main() -> int:
         "wall_s": round(wall, 4),
         "ok": sum(r["ok"] for r in out.values()),
         "failed": sum(r["failed"] for r in out.values()),
+        "connect_errors": sum(r["connect_errors"] for r in out.values()),
         "mismatched": sum(r["mismatched"] for r in out.values()),
         "latencies_us": [v for r in out.values() for v in r["latencies_us"]],
         "setup_us": [v for r in out.values() for v in r["setup_us"]],
@@ -169,6 +188,7 @@ def main() -> int:
     }
     print(
         f"RR ok={merged['ok']} failed={merged['failed']} "
+        f"connect_errors={merged['connect_errors']} "
         f"mismatched={merged['mismatched']} wall={merged['wall_s']}s",
         flush=True,
     )

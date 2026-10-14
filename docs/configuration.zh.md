@@ -541,19 +541,23 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 ### 诊断开关(按需开启)
 
 六个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`;另有一个用于强制数据面的
-carrier,还有一个用于安排一次诊断性的 carrier 切换。前六个默认关闭,从不
-改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
+carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧道一个)。前六个默认关闭,
+从不改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
 永远不会落到任何地方:
 
 | 开关 | 输出 | 内容 |
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
-| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
-| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
+| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 |
+| `MOLEHILL_TUNNEL_STATS=1` | 每进程每秒一行 | 每条多路复用隧道承载的字节数,格式 `序号:已交付/已写入`,按 pool 的 tunnel 顺序编号(旁边的 pool-stats 行才有 tunnel 名)——车道计数在 L4 的对应物,用来判断不同 carrier 上的隧道速率是否有材料性差异。计数本身是每条隧道上每轮 IO 两次 relaxed 原子加;该开关只启动报告线程 |
+ KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned/carrier/phase`、进行中的切换(`id/target:phase`)、carrier 规则所判定的每条隧道累计 KCP `datagrams_out/retransmits`(非 KCP 隧道为 `-`),以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`、`-handover:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
 | `MOLEHILL_DATA_CARRIER=tcp\|kcp` | 不打印(它改变行为) | 强制数据面拨号使用的 carrier,供需要把两条路径分开的测试或测量使用:`kcp` 让 KCP 失败即终结而不再回退,`tcp` 直接跳过那次尝试。它不是部署选项——carrier 在运行时决定,因为哪一种能用是网络的性质——取值不是这两个时会报告并忽略。要**测量回退**而不是强制它,应该在路径上封掉 UDP:基准模型里的 `udp_blocked` 条件做的就是这件事,量的正是产品自己的决策 |
 | `MOLEHILL_CARRIER_SWITCH_AT=<秒>` | 触发时每个认领一行 | 在该客户端的数据池启动这么多秒之后,把每条透明认领切到另一条 carrier,并请求对端排空它最忙的一条车道,于是补位的那条车道会用新 carrier 拨号。排空与自动策略用的是同一个双端约定:两端的该车道都不再接受新流、保留已在它上面的流(所以不会重排序),并且只有两端都确认其中已无流时才退役——因此仍承载长流的车道不会被夺走,切换的效果体现在随后的新流上。它的用途是**测量**一次 carrier 切换能换来什么、代价是什么——生产行为是客户端内部的、由实测驱动的决策,不是旋钮——取值不是整数秒时会报告并忽略 |
+| `MOLEHILL_TUNNEL_SWITCH_AT=<秒>` | 触发时每个 pool 一行 | 上一个开关在 L4 的对应物:多路复用 pool 启动这么多秒之后,把该 pool 当前 carrier 的一条隧道移出新的放置,保留已在它上面的流(所以不会重排序),并只有当它既无 stream 也无 pinned UDP peer 时才退役——随后修复会按另一条 carrier 拨补位。一直不安静(承载长流)的隧道在排空预算到期后回到服务,补位无法建立时切换被放弃、交给普通修复——pool 永远不会一直缺一条隧道。它的用途是**测量**逐隧道切换的代价与其补位能接住什么,与 L3 的诊断开关对认领做的事一样;它不是部署旋钮,取值不是整数秒时会报告并忽略 |
+| `MOLEHILL_TUNNEL_CARRIER_RULE=1` | 每次探测事件或迁移每个 pool 一行 | 为本进程**开启**多路复用 pool 的载体规则(默认关闭,原因见下)。该规则读取每条 KCP 隧道在一秒窗口内的重传份额,凡在窗口内携带过真实流量、且份额越过 4% 的隧道即**怀疑**当前载体:它通过 hatch 驱动的同一种无扰动 handover 把一条隧道交给另一载体,在探测运行期间把新流路由到探测隧道,并在携带字节上比较两个载体——显著更多则切换端点的 carrier 决策(受同样的切换冷却约束),显著更少则归还隧道并退避十分钟,而窗口内没有携带任何流量的探测按"未测量"处理而不是下判。真正**停止交付**的隧道(交付率 < 对端移交量的 60%)无需探测,直接迁移。阈值与单侧形状(KCP → TCP;TCP 隧道的重传状态留在内核里)见 [internals.md](internals.md#the-tunnel-pool)。**为何默认关闭**:规则在它为之设计的路径上能够诚实地触发并比较,但其 Move 路径尚未在 bench 工作负载上端到端演示——UDP 工作负载的通道在服务激活时一次性打开,运行中启动的探测拿不到被路由的新流量,而现有场景没有一个既能武装怀疑、又会在探测启动之后重新拨号的(HANDOFF.md,"the sighting protocol")。在补上这一缺口的工作负载出现之前,是否启用由操作者自行决定,并了解探测能看见什么、看不见什么。
 | `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个车道槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`flows`、`forwarded` 与 `no_channel`——即哪个车道承载了多少、有多少条流落在它上面,以及替换窗口让哪个车道丢了多少。这是区分「车道集合」与「全部堆在一个车道上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该车道死亡期间被丢弃的流量 |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——

@@ -198,14 +198,6 @@ impl<V> EndpointTable<V> {
             .map(|((ip, port), value)| (Endpoint::new(*ip, *port), value))
     }
 
-    /// The same, mutably: a lookup by something *inside* a value (a lane id the
-    /// peer named) has no endpoint to start from, so it has to walk the table.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Endpoint, &mut V)> {
-        self.entries
-            .iter_mut()
-            .map(|((ip, port), value)| (Endpoint::new(*ip, *port), value))
-    }
-
     /// The value a packet belongs to, looking at the end this side owns.
     ///
     /// The rule lives in [`Self::endpoint_for`]; this is the same answer with

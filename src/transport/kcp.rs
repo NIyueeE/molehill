@@ -485,6 +485,13 @@ pub(crate) struct KcpStats {
     pub srtt_ms: u64,
     /// The last adapted datagram size, or 0 when no session has adapted yet.
     pub datagram_bytes: u64,
+    /// The process's own CPU time (user + system) as of this line, in ms.
+    ///
+    /// The attribution field: a reader that wants to know how much of
+    /// `ms_out_send` is the kernel's and how much is ours differences two of
+    /// these and lays the delta beside `ms_out_send`'s delta (the round-19
+    /// named test). Linux only — other platforms report 0.
+    pub proc_cpu_ms: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -529,7 +536,67 @@ pub(crate) fn kcp_stats() -> KcpStats {
         rto_ms: KCP_RTO_MS.load(Ordering::Relaxed),
         srtt_ms: KCP_SRTT_MS.load(Ordering::Relaxed),
         datagram_bytes: KCP_DATAGRAM_BYTES.load(Ordering::Relaxed),
+        proc_cpu_ms: proc_cpu_ms(),
     }
+}
+
+/// The process's own CPU time (user + system), in milliseconds.
+///
+/// Read from `/proc/self/stat` on Linux — the fields are clock ticks (the
+/// kernel's `_SC_CLK_TCK`, 100/s on every supported target), so the
+/// conversion is exact via the constant libc exports. `None` off Linux or on
+/// a read failure: the stats line reports 0 rather than guessing.
+#[cfg(target_os = "linux")]
+fn proc_cpu_ms() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
+    // The comm field is parenthesized and may itself contain spaces and
+    // parentheses, so parsing starts after its last ')'.
+    let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return 0;
+    };
+    // After the comm field the stat's fields are 1-based as listed without
+    // comm: utime is field 14, stime 15 — offsets 12 and 13 in `rest`.
+    let ticks: Vec<&str> = rest.split_whitespace().collect();
+    let Some(utime) = ticks.get(11).and_then(|v| v.parse::<u64>().ok()) else {
+        return 0;
+    };
+    let Some(stime) = ticks.get(12).and_then(|v| v.parse::<u64>().ok()) else {
+        return 0;
+    };
+    #[expect(
+        unsafe_code,
+        reason = "audited FFI: `sysconf(_SC_CLK_TCK)` reads a constant the kernel \
+                  defines; it takes no pointers and cannot fault — the same \
+                  one-value read the socket-buffer sizing already makes"
+    )]
+    // SAFETY: no pointers, no buffers: the call queries one system constant.
+    let ticks_per_s = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    // The clock's tick rate is 100/s on every supported target, so the f64
+    // conversion loses nothing that matters; the ms result stays integral in
+    // practice, and a rounding drop of under one tick is the read's noise.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "tick rate and tick counts are small integers; the conversions \
+                  cannot lose a value the field's ms resolution cares about"
+    )]
+    let ms_per_tick = 1000.0 / (ticks_per_s.max(1) as f64);
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "ticks × ms_per_tick is integral in practice; a sub-tick drop \
+                  is below the field's resolution"
+    )]
+    let cpu_ms = (f64::from(u32::try_from(utime + stime).unwrap_or(u32::MAX)) * ms_per_tick) as u64;
+    cpu_ms
+}
+
+/// Off Linux there is no `/proc` to read: the field is a fixed 0 (see its
+/// doc comment).
+#[cfg(not(target_os = "linux"))]
+fn proc_cpu_ms() -> u64 {
+    0
 }
 
 /// Guards the one-time spawn of the stats task (see `spawn_kcp_stats`).
@@ -583,6 +650,7 @@ fn spawn_kcp_stats() {
                     rto_ms = s.rto_ms,
                     srtt_ms = s.srtt_ms,
                     datagram_b = s.datagram_bytes,
+                    proc_cpu_ms = s.proc_cpu_ms,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -642,14 +710,37 @@ struct DatagramOut {
     staging: BytesMut,
     /// One span per staged datagram, in emission order.
     spans: Vec<Span>,
+    /// This session's own counter pair (see `crate::kcp::SessionHealth`):
+    /// every datagram the engine stages here counts once, so the owner can
+    /// read the session's retransmit share apart from the process's total.
+    /// `None` in the engine-unit-test constructor — no evidence, no cost.
+    health: Option<std::sync::Arc<crate::kcp::SessionHealth>>,
 }
 
 impl DatagramOut {
+    /// The constructor without session evidence — the engine-unit tests'
+    /// shape (a live session always carries its pair; see `with_health`).
+    #[cfg(test)]
     fn new(tx: mpsc::UnboundedSender<DgramBatch>) -> Self {
         DatagramOut {
             tx,
             staging: BytesMut::with_capacity(BATCH_STAGE_BYTES),
             spans: Vec::with_capacity(BATCH),
+            health: None,
+        }
+    }
+
+    /// The constructor a live session uses: the staging writer and the engine
+    /// both add to the same pair (see `spawn_session`).
+    fn with_health(
+        tx: mpsc::UnboundedSender<DgramBatch>,
+        health: Arc<crate::kcp::SessionHealth>,
+    ) -> Self {
+        DatagramOut {
+            tx,
+            staging: BytesMut::with_capacity(BATCH_STAGE_BYTES),
+            spans: Vec::with_capacity(BATCH),
+            health: Some(health),
         }
     }
 
@@ -687,6 +778,9 @@ impl io::Write for DatagramOut {
             len: buf.len(),
         });
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
+        if let Some(health) = &self.health {
+            health.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        }
         if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
         }
@@ -729,6 +823,9 @@ impl DatagramSink for DatagramOut {
             });
         }
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
+        if let Some(health) = &self.health {
+            health.datagrams_out.fetch_add(1, Ordering::Relaxed);
+        }
         if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
         }
@@ -2222,7 +2319,16 @@ fn probe_path_mtu(local: Option<SocketAddr>, peer: SocketAddr) -> Option<usize> 
 /// ingress side must hold (dropping it ends the session).
 fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>) {
     let (dgram_tx, dgram_rx) = mpsc::unbounded_channel();
-    let mut kcp = Kcp::new_stream(conv, DatagramOut::new(dgram_tx));
+    // The session's own ARQ counters: the engine and its datagram staging
+    // both add to this pair, and the stream hands it to whoever owns the
+    // session's life (a carrier policy reads it per tunnel; the global
+    // counters cannot answer "this tunnel").
+    let health = crate::kcp::SessionHealth::new();
+    let mut kcp = Kcp::new_stream(
+        conv,
+        DatagramOut::with_health(dgram_tx, Arc::clone(&health)),
+    );
+    kcp.set_health(Arc::clone(&health));
     configure(&mut kcp);
     // The engine's datagram size, published here so it has exactly one
     // writer: the pump (below) lowers it when the path asks for it. The
@@ -2252,7 +2358,7 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
         Arc::clone(&datagram_bytes),
     ));
     (
-        KcpStream::new(out_tx, out_sem, in_rx, datagram_bytes),
+        KcpStream::new(out_tx, out_sem, in_rx, datagram_bytes, health),
         pkt_tx,
     )
 }
@@ -2269,6 +2375,10 @@ pub struct KcpStream {
     out_sem: Arc<Semaphore>,
     /// The pump's current datagram size in bytes (see `datagram_bytes`).
     datagram_bytes: Arc<AtomicUsize>,
+    /// This session's own ARQ counters (see [`crate::kcp::SessionHealth`]):
+    /// shared with the engine and its staging writer, read by the tunnel
+    /// owner for the carrier policy.
+    health: Arc<crate::kcp::SessionHealth>,
     /// Parked permit acquisition, kept across `poll_write` calls. Tokio
     /// does not export the future type, so it is type-erased here.
     out_acquire: Option<Pin<Box<AcquirePermitFuture>>>,
@@ -2296,15 +2406,25 @@ impl KcpStream {
         out_sem: Arc<Semaphore>,
         in_rx: mpsc::Receiver<ReadBatch>,
         datagram_bytes: Arc<AtomicUsize>,
+        health: Arc<crate::kcp::SessionHealth>,
     ) -> KcpStream {
         KcpStream {
             out_tx: Some(out_tx),
             out_sem,
             datagram_bytes,
+            health,
             out_acquire: None,
             in_rx: Some(in_rx),
             read_queue: std::collections::VecDeque::new(),
         }
+    }
+
+    /// This session's own ARQ counters, cumulative: `(datagrams_out,
+    /// retransmits)`. The retransmit share of the pair is the per-tunnel
+    /// degradation signal a carrier policy reads (see
+    /// [`crate::kcp::SessionHealth`]).
+    pub(crate) fn health(&self) -> Arc<crate::kcp::SessionHealth> {
+        Arc::clone(&self.health)
     }
 
     /// The datagram size this session currently sends, in bytes.
@@ -2530,6 +2650,20 @@ impl std::fmt::Debug for KcpTunnelStream {
     }
 }
 
+impl KcpTunnelStream {
+    /// This session's own ARQ counters, cumulative (see
+    /// [`crate::kcp::SessionHealth`]): the per-tunnel degradation signal a
+    /// carrier policy reads. The same pair under both shapes — the Noise
+    /// wrapper exposes the session it wraps.
+    pub(crate) fn health(&self) -> Arc<crate::kcp::SessionHealth> {
+        match self {
+            KcpTunnelStream::Plain(s) => s.health(),
+            #[cfg(feature = "noise")]
+            KcpTunnelStream::Noise(s) => s.get_inner().health(),
+        }
+    }
+}
+
 impl AsyncRead for KcpTunnelStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -2588,7 +2722,18 @@ impl AsyncWrite for KcpTunnelStream {
 #[cfg(all(feature = "client", feature = "multiplex"))]
 pub async fn connect_stream(
     remote: SocketAddr,
-    #[cfg(feature = "noise")] noise: Option<&crate::config::NoiseConfig>,
+    // Accepted in every build so the call sites do not fork on the feature:
+    // a build without `noise` has no Noise configuration to pass, and the
+    // argument is consumed only by the wrapper arm below.
+    #[cfg_attr(
+        not(feature = "noise"),
+        expect(
+            unused_variables,
+            reason = "the noise options are meaningful only to a build with the \
+                      `noise` feature; every caller passes the same shape"
+        )
+    )]
+    noise: Option<&crate::config::parsing::NoiseConfig>,
 ) -> Result<KcpTunnelStream> {
     use rand::TryRng;
 

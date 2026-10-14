@@ -34,11 +34,13 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 
 | Path | Purpose |
 |------|---------|
-| `githooks/pre-commit` | fast gates: fmt, secret scan, machete, docs alignment, ruff lint + format, bench-model self-check, clippy ×2 |
+| `githooks/pre-commit` | fast gates: fmt, secret scan, machete, docs alignment, ruff lint + format, bench-model self-check, clippy ×2 (benches-only changes take a compile-free path via `githooks/benches-only`) |
 | `githooks/pre-push` | heavy gates: audit, deny, outdated, tests; runs the release review (pre-tag) on `v*` tag pushes |
 | `githooks/pre-tag` | light release review (via `just tag` + on tag pushes): tag↔version, changelog section, bench assets, container-job greps, advisory checklist |
+| `githooks/docs-only` | change-set classifier: all docs paths → pre-commit/pre-push take the two-gate docs-only path |
+| `githooks/benches-only` | change-set classifier: all paths under `benches/scripts/` → pre-commit skips the cargo gates, pre-push skips the heavy gates (runtime tooling, never compiled) |
 | `githooks/check-secrets` | staged-changes secret scan (`security-scan:allow` marker to waive a line) |
-| `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, edition, channel, README index, CI entry) |
+| `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, feature-name registry, edition, channel, README index, CI entry) |
 | `.github/workflows/ci.yml` | `just check` chain + feature powerset + per-feature test matrix + minimal-size check + musl check + 4-platform builds (skipped for docs-only changes) |
 | `.github/workflows/docs.yml` | the docs-only half: `githooks/check-docs` for changes limited to markdown, `docs/`, `assets/` |
 | `.github/workflows/release.yml` | tag-driven release: version/changelog gates, 9-target matrix, direct release, GHCR, crates.io |
