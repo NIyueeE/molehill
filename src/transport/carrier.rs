@@ -346,6 +346,9 @@ mod tests {
 
     /// A deliberate switch moves the carrier, is rate-limited, and holds the
     /// new carrier against the re-probe.
+    /// Needs both carriers: [`CarrierChoice::prefer`] is a no-op in a build
+    /// without `kcp`, where there is only one carrier to be on.
+    #[cfg(feature = "kcp")]
     #[test]
     fn a_deliberate_switch_is_rate_limited_and_moves_both_ways() {
         let choice = CarrierChoice::new("data.example:2343");
@@ -412,6 +415,9 @@ mod tests {
     /// `reached_kcp` — which stores KCP and clears the cooldown. A decision
     /// made on measured evidence was undone by an event that only ever said
     /// "UDP connects now".
+    /// Needs both carriers: [`CarrierChoice::prefer`] is a no-op in a build
+    /// without `kcp`, where there is only one carrier to be on.
+    #[cfg(feature = "kcp")]
     #[test]
     fn a_reachable_kcp_does_not_undo_a_held_switch() {
         let choice = CarrierChoice::new("data.example:2343");

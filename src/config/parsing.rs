@@ -1835,6 +1835,15 @@ mod tests {
             let blocks = doc_toml_blocks(path)?;
             assert!(!blocks.is_empty(), "no toml code blocks found in {path}");
             for b in &blocks {
+                // An L3 example can only be validated where the feature is
+                // compiled and the platform is Linux. Elsewhere the refusal is
+                // the contract, so the block is skipped rather than read as
+                // drift — every other block on the page is still checked.
+                if !cfg!(all(feature = "transparent", target_os = "linux"))
+                    && b.contains("[transparent]")
+                {
+                    continue;
+                }
                 Config::from_str(b).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
                 total += 1;
             }

@@ -3576,6 +3576,9 @@ mod tests {
     /// The other half of the same lifecycle: a probe whose carrier carries
     /// clearly less gives the tunnel back and parks the pool in its backoff,
     /// so a merely lossy path pays one split tunnel and then nothing.
+    /// Needs both carriers: a probe hands a tunnel to the carrier the pool is
+    /// not riding, and a build without `kcp` has only one to ride.
+    #[cfg(feature = "kcp")]
     #[tokio::test]
     #[expect(
         unsafe_code,
