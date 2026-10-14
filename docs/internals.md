@@ -68,14 +68,16 @@ With `[server.data]stripe_count = K` (default `1`), the server pairs every visit
 - A channel that ends mid-frame (not at a frame boundary) breaks the group instead of leaving the reassembler waiting for a sequence number that will never arrive.
 
 The gather asks for its channels *before* its first wait, because a
-registration opens none itself: the tunnel pool starts cold, so a gather that
+registration opens none itself: the tunnel pool's tunnels are established at
+service start, so a gather that
 waited for channels nobody was told to open would simply time out. What it asks *with* is the
 whole of the stripe-group change: instead of K plain `CreateDataChannelFor`
 requests (which the client cannot tell from K unrelated visitors, so their
 placement is whatever the pool happens to have) it sends one
 `CreateDataChannelForStripe(service, group, index, count)` per stripe, so the
 client knows which opens belong together and reserves one tunnel per stripe —
-growing the pool to the group's own count first, bounded by `max_tunnels`, and
+spreading over the tunnels the pool holds (sharing them when the group is
+wider), and
 falling back to sharing when it cannot reach that many. That is what makes D24
 structural rather than a property of arrival timing. The wait is a budget that
 re-requests only the stripes still missing, and a gather the client refuses for
@@ -96,48 +98,65 @@ A pool is the client's unit of connection management. Its **ownership** is one s
 
 Both are the same code path; only the key differs, and the session owns the pools (a shared pool must outlive any single service). A service joins the pool its key names, creating it if this is the first service of that key to become active, and dropping a service never tears the pool down. The carrier and the data endpoint are part of the key because two carriers cannot share a physical connection and two endpoints cannot share a tunnel.
 
-**Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests that *name the group*: the client grows the pool to the group's count first (bounded by `max_tunnels`) and then reserves, for each stripe, a tunnel the group does not already hold — a preference with a floor, so a pool that cannot spread still forwards. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
+**Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests that *name the group*: the client reserves, for each stripe, a tunnel the group does not already hold — a preference with a floor, so a group wider than the pool still forwards by sharing. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
 
-**Growth and shrink** are the client's own decisions; the server is not consulted. The pool grows by one tunnel when
+**Size is a configuration decision; repair is the runtime one.** The pool establishes `[client.data.tcp|kcp].tunnels` connections when the service activates and keeps them. It is never resized for load and idle tunnels are never reaped, so the capacity a deployment offers is a function of its configuration rather than of what it happened to be doing a minute ago — which is also what makes a run's numbers comparable: an elastic pool's size is a *result*, and a result depends on history.
 
-- it is cold (no tunnel at all) and a service asks for a stream — this one is synchronous, so a cold pool answers its first open instead of failing;
-- any one tunnel reaches 12 % of the stream cap — **7 concurrent streams of 64** — or the pool's total usage passes the same fraction of `size × streams-per-tunnel`. The number is about how much one shared TCP tunnel should carry, not about how close it is to the engine's cap: past roughly seven streams an interactive or control stream starts queueing behind bulk traffic, which is the head-of-line blocking the pool exists to avoid (a 100 ms path measured 20-stream bulk leaving `iperf3`'s control channel to time out; see HANDOFF.md). `[client.data.tcp|kcp].max_tunnels` bounds the result;
-- an open has been waiting longer than 100 ms;
-- the UDP-derived floor is above the current size — the floor is `max over active UDP services of max(udp_workers, ceil(udp_workers / streams-per-tunnel))`, capped by `max_tunnels`, and it is what keeps a UDP service's configured workers from being stacked onto fewer tunnels than they need (it survives a tunnel's death, because it describes the service, not the pool).
+The count itself is the operator's: the default is 4, raised to a UDP service's declared worker set (`udp_workers`) when that is larger. The floor is `max over active UDP services of max(udp_workers, ceil(udp_workers / streams-per-tunnel))`, and it exists because a UDP worker set shards across tunnels — stacking its workers on fewer tunnels than they need would put two shards on one connection, which is the opposite of what the fan-out is for. An explicit `tunnels` below that floor is refused at configuration time, with the number to write in the message: the pool cannot grow to meet it any more.
 
-The two load rules are read in **both** places: on the 50 ms maintenance tick, and in the open path itself. The in-path read is what makes a burst spread *while it is placed*: a K-open burst (a 20-stream bulk test opens its streams back to back) finishes long before the first tick would see it, so without the in-path growth every stream of the burst lands on the same tunnel and queues that tunnel's interactive and control streams behind the bulk — the tick can only fix the *next* burst. An open whose chosen tunnel is already at the threshold therefore grows first and places second, and every guard keeps that a no-op when growing is wrong: a growth in flight, a refused growth still holding the pool back (D14), the pool at its own `max_tunnels`, or a cold pool (which the first bullet grows already). The dial the in-path rule may start is the same dial the cold path pays.
+**Repair** is the only establishment after startup: the 50 ms maintenance tick reaps dead tunnels and dials one replacement per tick while the pool is short of its count. It is deliberately not growth — a dead tunnel is replaced whether or not it was carrying streams, so a single failure cannot shrink a deployment permanently — and the number of *established* tunnels is what a reader watches: `size` below `count` in the pool-stats line is a pool whose repair is being refused. A refusal (the server's `[server.data].max_tunnels_per_client` valve, or a dial that cannot be established) holds repair back for a cooldown rather than letting a 50 ms tick become a dial storm; a tunnel's death releases that hold, because a retry is meaningful again exactly then.
 
-**Reaching the engine's stream cap costs one stream, not the tunnel.** The mux engine carries at most `DEFAULT_MUX_MAX_STREAMS` (64) streams; a 65th is answered with a **reset of that stream**, which fails the open that asked for it and leaves every other stream on the connection running. (The first v0.10.0 build answered it with a session-terminating goaway instead, which took the whole tunnel and every visitor on it down — that is what a shaped sweep measured; see HANDOFF.md.) Placement still refuses a tunnel at `TUNNEL_STREAM_CEILING` (56 of the 64, counting reserved-but-unfinished opens as well as established ones), because refusing a stream is worse than placing it elsewhere — but the ceiling is now a preference, not the only thing standing between a burst and a dead tunnel. It sits well above the growth point (7), so a pool that *can* grow always grows long before placement refuses; when every tunnel is at the ceiling and the pool cannot grow — its own `max_tunnels`, or the server's valve — an open waits briefly for a stream to retire and is then refused with a typed error.
+**Oversubscription is answered by sharing, not by width.** Placement refuses a tunnel at `TUNNEL_STREAM_CEILING` (56 of the engine's 64, counting reserved-but-unfinished opens as well as established ones), so the pool's ceiling is `count × 56` streams. An open that finds every tunnel at the ceiling waits briefly (`CAPACITY_WAIT`, 250 ms) for a stream to retire and is then refused with a typed error — a failure the operator can act on by raising `tunnels`, rather than a silently degraded pool. The sizing guidance and the measurements behind it are in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
+
+**Reaching the engine's stream cap costs one stream, not the tunnel.** The mux engine carries at most `DEFAULT_MUX_MAX_STREAMS` (64) streams; a 65th is answered with a **reset of that stream**, which fails the open that asked for it and leaves every other stream on the connection running. (The first v0.10.0 build answered it with a session-terminating goaway instead, which took the whole tunnel and every visitor on it down — that is what a shaped sweep measured; see HANDOFF.md.) Placement still refuses a tunnel at `TUNNEL_STREAM_CEILING` (56 of the 64, counting reserved-but-unfinished opens as well as established ones), because refusing a stream is worse than placing it elsewhere — but the ceiling is now a preference, not the only thing standing between a burst and a dead tunnel. With a pinned pool it is the *only* bound: when every tunnel is at the ceiling an open waits briefly for a stream to retire and is then refused with a typed error, which is the pool asking for a larger `tunnels` rather than a failure nobody can attribute.
 
 **A forward that moves nothing is reaped.** How the ceiling gets tested is a stalled connection: under loss a visitor's socket stops draining, so its copy task blocks on the write, stops polling its reader, and the peer's flow-control window closes behind it — and nothing in TCP ends that, because the application waiting for a reply has no timeout of its own. Both copy sites therefore run `copy_bidirectional_with_idle`, which closes a connection that has moved no bytes in *either* direction for `FORWARD_IDLE_TIMEOUT` (5 minutes) and reports it. Activity, not direction or age, is what the deadline measures: a slow trickle is never reaped however long it lives.
 
-Growth never exceeds `[client.data.tcp|kcp].max_tunnels`, and at most one tunnel is added per growth — whether the growth was asked for by a maintenance tick, or in the open path by an arriving burst. A growth that *fails* — the server's `[server.data].max_tunnels_per_client` valve refusing the tunnel, or a dial that could not be established — stops growth for a cooldown instead of being retried on the next 50 ms tick, which is what keeps a capped client from dialing the server's accept path twenty times a second. A tunnel dying, or the pool shrinking, releases that hold: a retry is meaningful again exactly then. The pool shrinks by one tunnel when the **whole** pool has no streams and no pending opens, no peer is pinned to the tunnel being considered, it has been idle for `[client.data].idle_timeout` seconds, and its size is still above the UDP floor. Hysteresis is what keeps that from flapping: a minimum warm period after a growth and a cooldown after a shrink. The constants are internal until the S1 observation has measured them; they live in one place (`src/transport/pool.rs`) and are the *policy* only — the pool's runtime is in `src/transport/multiplex.rs`.
+Three UDP invariants ride along:
 
-Three UDP invariants ride along (they are the reason shrink is this conservative):
-
-- **A peer pins its tunnel.** The server's affinity table points a peer at one data channel; the client's own route table points the same peer at the channel its traffic arrives on, which is a stream of one tunnel. A tunnel with pinned peers is never shrunk (`pinned_peers`), so a live UDP session is not re-sharded onto another tunnel — which would change the local source port the service sees. A tunnel that dies anyway ends those peers' sessions, UDP semantics.
+- **A peer pins its tunnel.** The server's affinity table points a peer at one data channel; the client's own route table points the same peer at the channel its traffic arrives on, which is a stream of one tunnel. A pinned peer therefore keeps its channel for the session's life, so a live UDP session is never re-sharded onto another tunnel — which would change the local source port the service sees. A tunnel that dies anyway ends those peers' sessions, UDP semantics.
 - **A new source never creates a channel.** The worker set of a UDP service is exactly the channel count the client opened for it; a datagram from an address with no affinity entry is assigned to a live worker (or dropped when none is ready), never answered by dialing a new channel.
-- **A channel with live routes is not idle.** Shrink reads streams and pins, so a UDP channel carrying peers keeps its tunnel.
+- **A channel with live routes keeps its tunnel.** Repair replaces a *dead* tunnel, never a live one, so a UDP channel carrying peers is never moved.
 
 The **S1 observation** is opt-in and aggregated, so a normal run stays silent and a measured run stays readable:
 
-- `MOLEHILL_POOL_STATS=1` — one INFO line per live pool per second: the pool's key, carrier, size, cap, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with their reason.
+- `MOLEHILL_POOL_STATS=1` — one INFO line per live pool per second: the pool's key, carrier, size, configured count, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with their reason (`+repair`, `-dead`).
 - `MOLEHILL_PLACEMENT_STATS=1` — one INFO line per second per process aggregating that interval's placements: how many, how many fell back, the candidate and chosen load sums, `mean_spread` (the average gap between the best and the worst candidate — what a smarter rule could have won, and the number the S2 decision reads), and the open latency's mean and maximum. INFO like every other switch in the family: the switch is the consent, so no extra log level is needed.
 
 `MOLEHILL_MUX_STATS=1` (the framing counters) is unchanged and independent.
 
 ### Multiplexing
 
-With the `multiplex` feature (part of the default feature set) and `mode = "multiplex"` (the default), a registered service runs over an elastic tunnel pool that starts **cold**: the first open dials a connection (each announced with a distinct hello so the server upgrades it to a yamux session), and later growth is the client's own decision up to `max_tunnels`. Data-channel opens take the least-loaded tunnel, and a dead tunnel is skipped transparently. The pool's size is elastic and its ownership depends on `[client.data].shared_pool`; both are described in "The tunnel pool" below. The tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr` when set, else `[client.data].default_data_addr`, else the control endpoint) and are accepted by the server's data listener — the control listener itself when the addresses match, otherwise `[server.data].bind_addr`. From then on:
+With the `multiplex` feature (part of the default feature set), a registered
+**forwarding** service runs over a **fixed pool of tunnels**, established when
+the service activates (each announced with a distinct hello so the server
+upgrades it to a yamux session) and held for its lifetime; a dead one is
+repaired back to the count. The shape is not a key: a forwarding service always
+multiplexes, and a [transparent claim](#transparent-l3-services) never does,
+because a claim's channels *are* its carrier connections. Data-channel opens
+take the least-loaded tunnel, and a dead tunnel is skipped transparently. The
+pool's width is `[client.data.tcp|kcp].tunnels` and its ownership depends on
+`[client.data].shared_pool`; both are described in "The tunnel pool" below. The
+tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr`
+when set, else `[client.data].default_data_addr`, else the control endpoint) and
+are accepted by the server's data listener — the control listener itself when
+the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 - `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel, and the stream's prologue names the service it carries.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
-- Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps both modes testable against each other.
+- Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps the stream path and the connection path testable against each other.
 - The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 - A stream's two users park on the connection's per-stream command channel independently, so each has its own waker slot: a *reader* waiting to queue a window update and a *writer* waiting for send credit would otherwise share one slot, and the later park would erase the earlier one's waker — a writer that then never wakes until an unrelated resize happens to notify, which stalls every visitor on that tunnel. The reader's park lives in its own slot (`Shared::reader_park`) and the connection wakes both when a command leaves the channel.
 
-`mode = "direct"` restores the one-connection-per-channel behavior: every data channel is its own transport connection, so nothing is multiplexed and each visitor connection pays the full connection setup (TCP connect plus, with `noise`, the Noise handshake). That is a design trade-off, not a performance claim — the measured comparison lives in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements), and the choice between the two is the decision tree in [Configuration](configuration.md).
+A plain (unmultiplexed) data channel is a transport connection of its own: nothing
+is multiplexed and each visitor connection pays the full connection setup (TCP
+connect plus, with `noise`, the Noise handshake). That is a design trade-off, not
+a performance claim — the measured comparison lives in
+[Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
+Two things still open such channels: a transparent claim's lanes, and every
+channel of a build without the `multiplex` feature; a forwarding service in the
+default build always multiplexes.
 
 ### Transparent (L3) services
 
@@ -154,42 +173,72 @@ a `Claim` value held for the lifetime of the registration — so a second client
 claiming the same endpoint is rejected with a precise reason instead of silently
 stealing the first one's visitors.
 
-The data path is **one channel per claimed endpoint**, and it moves **batches**,
-not packets: the device is drained until it runs dry, every packet is framed
-where it is read into its endpoint's buffer, and the run of frames is handed
-over and written as one unit. That is the same lever as a WireGuard
-super-packet, one layer up: the far side still reads one frame at a time, while
-the carrier pays one header, one acknowledgement and one syscall per *batch*
-instead of per packet. Because the flush happens the moment the device is
-drained, the first packet of a burst waits for nothing — the batching only
-collects what was already queued. A claim's channels run in `direct` mode by
-default for the same reason: it has exactly one channel, so a multiplexer's
-frame on every packet buys it nothing (see
+A claimed endpoint is carried by a **lane set** — one or more data channels, each
+a *lane* of the claim, and each a carrier connection of its own (a claim never
+multiplexes) — and it moves **batches**, not packets: the device
+is drained until it runs dry, every packet is framed where it is read into its
+lane's buffer, and the run of frames is handed over and written as one unit.
+That is the same lever as a WireGuard super-packet, one layer up: the far side
+still reads one frame at a time, while the carrier pays one header, one
+acknowledgement and one syscall per *batch* instead of per packet. Because the
+flush happens the moment the device is drained, the first packet of a burst
+waits for nothing — the batching only collects what was already queued. A claim
+with one lane pays that batching and nothing else: it has nothing for a
+multiplexer to multiplex, so a frame on every packet would buy nothing (see
 [Benchmarks](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
-The data path is **one channel per claimed endpoint**:
+How a claim's lane set is opened, held and repaired:
 
-- The client opens **one** channel the moment its registration is accepted (a
-  TCP service opens none and waits to be asked; a transparent service's packets
-  all ride this one). It opens with the same four-byte service prologue as any
-  other data channel, so the server knows which service — and therefore which
-  endpoint — it carries before the first packet.
-- The server answers it with `DataChannelCmd::StartForwardTransparent` (tag 3,
-  a unit variant like the other fixed-size data commands), and from then on the
-  channel carries whole IP packets, framed `[u16 length][packet]` in both
-  directions by `IpTraffic` (`src/protocol.rs`). The packet travels verbatim —
-  there is no address tag, because the addresses are inside it — and a
-  zero-length frame is a protocol error rather than an empty packet.
-- When the channel ends the server asks for a replacement (the same
-  `DataChannelRequest` path a UDP worker's replacement takes) and keeps the
-  claim while it waits. From the second channel on, it waits 250 ms
-  (`TRANSPARENT_REPLACE_BACKOFF`) before sending the start command, so a peer
-  that cannot serve it is not polled in a tight loop.
+- The client opens the claim's **lane count** in one go the moment its
+  registration is accepted. The count is derived, not written per claim: each
+  carrier's `[transparent.data.tcp|kcp].tunnels` is a budget of connections,
+  divided equally among the claims that draw on that carrier and never below one
+  (`TransparentClientConfig::claim_lanes`), so a client that writes no budget at
+  all gets the one connection per claim it always had. No multiplexer sits above
+  a lane: a `tcp` lane is a TCP connection, a `kcp` lane a KCP session. Every
+  channel opens with the same
+  four-byte service prologue as any other data channel, so the server knows
+  which service — and therefore which endpoint — it carries before the first
+  packet.
+- The server answers each channel with
+  `DataChannelCmd::StartForwardTransparent` (tag 3, a unit variant like the other
+  fixed-size data commands), and from then on it carries whole IP packets, framed
+  `[u16 length][packet]` in both directions by `IpTraffic` (`src/protocol.rs`).
+  The packet travels verbatim — there is no address tag, because the addresses
+  are inside it — and a zero-length frame is a protocol error rather than an
+  empty packet.
+- The server supervises the set, and it is not told the set's width: the
+  channels the client opens *are* the set, and the hub discovers the width from
+  the lanes that actually join, widening by one whenever a join finds every
+  slot taken. A lane that ends keeps its slot — a replacement inherits it, so
+  the packets placed in it resume there while the surviving lanes are
+  untouched — and every lane that ends is replaced (the same
+  `DataChannelRequest` path a UDP worker's replacement takes), the claim staying
+  held while it waits. A channel that arrives after a lane ended is paced:
+  250 ms (`TRANSPARENT_REPLACE_BACKOFF`) before the start command is written, so
+  a peer that cannot serve it is not polled in a tight loop.
+- Which lane a packet rides is decided **per flow**, by one hash of its
+  five-tuple (`src/transparent/flow.rs`): the protocol, then the two endpoints
+  sorted (address bytes, then port), so both directions of a flow — and both
+  ends of a claim, which see opposite ones — place it on the same lane. A set
+  of one has one answer; otherwise the slot is `hash % width`. Per *flow*, never
+  per packet: each lane is one ordered carrier, so a flow that stays on one
+  lane arrives in the order its sender wrote it, while a flow dealt out packet
+  by packet would be interleaved across carriers that drain at their own speeds
+  and injected — by the far end, which injects what it reads — out of order. A
+  flow whose lane dies is **not moved**: the dead lane's slot stays in the
+  set, so its flows are dropped (and counted `no_channel` on that slot) until the
+  replacement joins it. Moving them would reorder them against what the dead
+  lane had already delivered.
 
 **Which end of a packet the claim is.** Both ends run the same hub
-(`src/transparent/hub.rs`): one reader per TUN device, a bounded queue per
-endpoint, and an endpoint table that decides which packet belongs to which
-service. They differ in the end they look at, which is the heart of the design:
+(`src/transparent/hub.rs`): one reader per TUN device, a **lane set** per
+claimed endpoint — the data channels carrying it, one bounded queue each, one
+slot of the set each — and an endpoint table that decides which packet belongs
+to which claim. A slot outlives the lane that held it: a replaced channel
+takes the slot its predecessor left, so the routing target of a packet never
+moves when a channel does. They differ in the end they look at, which is the
+heart of the design:
 
 - the **server** routes by **destination**: its host routes the claimed address
   into its device, so the packet the kernel hands it is one whose *destination*
@@ -222,14 +271,20 @@ must read 0; on the server, a registration is rejected if its device is missing.
 The recipes are in [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
-and counted (`not_ipv4`), and there is no IPv6 path. One channel carries every
-flow of one claimed endpoint, so a retransmit for one flow can delay another
-flow sharing the channel — per-flow channels are not in this version. And the
+and counted (`not_ipv4`), and there is no IPv6 path. A claim's lane set is
+spread **per flow**, so the claim's throughput is the sum of its lanes while
+one flow still cannot exceed one lane; a lane that dies takes its flows'
+packets with it until its replacement joins the slot, and a portless packet
+(ICMP, a later fragment) hashes on its addresses alone, so the fragments of one
+datagram can take different lanes — IP reassembly is order-insensitive, which
+is what makes that safe. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
 counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,
-`channel_errors`) once a second per data path, which is how a run is observed
-without logging per packet.
+`channel_errors`) once a second per data path, and one line per lane slot of
+every claim on that device (`live`, `forwarded`, `no_channel`), which is how a
+run is observed without logging per packet and how a lane set is told from a
+stack.
 
 ## UDP
 

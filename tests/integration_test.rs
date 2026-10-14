@@ -226,11 +226,9 @@ async fn settle(secs: f64) {
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Default)]
 struct ClientOverrides {
-    /// `"multiplex"` or `"direct"`.
-    mode: Option<&'static str>,
-    /// `[client.data.tcp].max_tunnels`: the elastic pool's cap (it starts
-    /// cold, so this is a ceiling, not an initial size).
-    max_tunnels: Option<u16>,
+    /// `[client.data.tcp].tunnels`: the pinned pool's count — the tunnels it
+    /// establishes at service start and keeps, not a cap it grows to.
+    tunnels: Option<u16>,
 }
 
 /// Placeholder so `test()` keeps its signature without the `multiplex`
@@ -242,10 +240,9 @@ struct ClientOverrides;
 /// Materialize a copy of `config_path` with the requested `[client.data]`
 /// fields applied.
 ///
-/// Fixtures intentionally omit `[client.data]` so they follow the
-/// compiled-in defaults (`mode = "multiplex"`, `max_tunnels = 4`, with the
-/// `multiplex` feature). Explicit copies are what give the integration
-/// matrix its non-multiplexed and wider-cap legs. The copy lives in the
+/// Fixtures intentionally omit `[client.data]` so they follow the compiled-in
+/// defaults (`tunnels = 4`, with the `multiplex` feature). Explicit copies are
+/// what give the integration matrix its wider-count legs. The copy lives in the
 /// system temp dir and is removed after the scenario.
 #[cfg(feature = "multiplex")]
 fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Result<PathBuf> {
@@ -256,7 +253,7 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
         .get_mut("client")
         .and_then(toml::Value::as_table_mut)
         .ok_or_else(|| anyhow::anyhow!("Test fixture {config_path} has no [client] table"))?;
-    if overrides.mode.is_some() || overrides.max_tunnels.is_some() {
+    if overrides.tunnels.is_some() {
         if !client.contains_key("data") {
             client.insert("data".to_owned(), toml::Value::Table(toml::map::Map::new()));
         }
@@ -266,13 +263,7 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
             .ok_or_else(|| {
                 anyhow::anyhow!("Test fixture {config_path} has a non-table [client.data]")
             })?;
-        if let Some(mode) = overrides.mode {
-            data.insert(
-                "default_mode".to_owned(),
-                toml::Value::String(mode.to_owned()),
-            );
-        }
-        if let Some(max) = overrides.max_tunnels {
+        if let Some(count) = overrides.tunnels {
             let tcp = data
                 .entry("tcp".to_owned())
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
@@ -280,10 +271,7 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
                 .ok_or_else(|| {
                     anyhow::anyhow!("Test fixture {config_path} has a non-table [client.data.tcp]")
                 })?;
-            tcp.insert(
-                "max_tunnels".to_owned(),
-                toml::Value::Integer(i64::from(max)),
-            );
+            tcp.insert("tunnels".to_owned(), toml::Value::Integer(i64::from(count)));
         }
     }
 
@@ -300,30 +288,19 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
     Ok(variant)
 }
 
-/// Run one transport fixture through the full lifecycle with the default
-/// data-plane mode, then (when the feature is compiled in) again in
-/// `direct` mode. This is the `{transport} × {multiplex|direct}` matrix.
+/// Run one transport fixture through the full lifecycle. A forwarding service
+/// always multiplexes now, so a transport fixture's own carrier stack is the
+/// only axis left to vary.
 async fn test_transport(config_path: &'static str, t: Type) -> Result<()> {
     test(config_path, t, None).await?;
-
-    #[cfg(feature = "multiplex")]
-    test(
-        config_path,
-        t,
-        Some(ClientOverrides {
-            mode: Some("direct"),
-            ..Default::default()
-        }),
-    )
-    .await?;
 
     Ok(())
 }
 
-/// Arm 1 of the transport comparison: a multiplexed pool whose cap is 3
-/// tunnels per control session (a stream takes the least-loaded one), full
-/// lifecycle including client/server restarts and concurrent load. The pool
-/// itself starts cold and grows on demand up to the cap.
+/// Arm 1 of the transport comparison: a multiplexed pool pinned at 3 tunnels
+/// per control session (a stream takes the least-loaded one), full lifecycle
+/// including client/server restarts and concurrent load. The three tunnels are
+/// established when the service starts and kept for its lifetime.
 #[cfg(feature = "multiplex")]
 #[tokio::test]
 async fn multiplex_tunnel_pool() -> Result<()> {
@@ -334,10 +311,7 @@ async fn multiplex_tunnel_pool() -> Result<()> {
     test(
         "tests/for_tcp/tcp_transport.toml",
         Type::Tcp,
-        Some(ClientOverrides {
-            mode: Some("multiplex"),
-            max_tunnels: Some(3),
-        }),
+        Some(ClientOverrides { tunnels: Some(3) }),
     )
     .await?;
 
@@ -398,10 +372,8 @@ async fn noise_session_resume() -> Result<()> {
     Ok(())
 }
 
-/// Per-service data-plane overrides: the fixture keeps
-/// `mode = "multiplex"` (count 1) as the client-wide default while one
-/// service forces `mode = "direct"` — both data paths must work side by
-/// side on one client through the full lifecycle.
+/// Per-service data-plane overrides: the fixture keeps a pinned pool as the
+/// client-wide shape and gives one service its own carrier.
 #[cfg(feature = "multiplex")]
 #[tokio::test]
 async fn per_service_data_modes() -> Result<()> {
@@ -409,7 +381,7 @@ async fn per_service_data_modes() -> Result<()> {
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/per_service_modes.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/per_service_carriers.toml", Type::Tcp, None).await?;
 
     Ok(())
 }
@@ -502,11 +474,17 @@ type PoolShape = (usize, Vec<(usize, usize, usize)>);
 /// a transfer cannot see: four streams on three tunnels (with the fourth
 /// empty) is the same pool size as the spread.
 ///
+/// The four tunnels are already there: a fixture with no `[client.data.tcp]`
+/// block gets the default count (`DEFAULT_MUX_TUNNELS`, 4), established at
+/// service start. What is waited for is therefore the *group's* placement —
+/// each of its four channels landing on a distinct tunnel — not the pool
+/// growing to receive it.
+///
 /// Bounded by a deadline rather than a fixed sleep, so the assertion is on a
 /// state that is polled for, not on a guess about how long a placement takes;
 /// the observed `(size, per-tunnel streams)` vectors travel in the failure
-/// message, because "the spread never happened" and "the pool never grew" are
-/// different defects.
+/// message, because "the spread never happened" and "the pool never came up"
+/// are different defects.
 #[cfg(feature = "multiplex")]
 async fn wait_for_a_stream_on_every_stripe_tunnel(deadline: Duration) -> Result<()> {
     let start = std::time::Instant::now();
@@ -589,20 +567,22 @@ async fn striped_data_channels() -> Result<()> {
     drop(visitor_rd);
 
     // The structural half of the claim (D24), on the real client and a real
-    // cold pool: the group's four channels grew the pool to four tunnels.
-    // Before the group was named on the wire the pool stayed at *one* — four
-    // concurrent streams sit below the growth rule's per-tunnel threshold (7 on
-    // the shipped cap), so no other rule could have asked for the second
-    // tunnel, and placement can only spread over tunnels that exist. The pool
-    // stays warm for `idle_timeout` (60 s by default), so this reads the state
-    // the group left rather than racing a shrink.
+    // pinned pool: the group's four channels are spread over the four tunnels
+    // the pool established at service start. Before the group was named on the
+    // wire the pool stayed at *one* (the elastic rule's business was demand,
+    // and the group's four concurrent streams sat below its per-tunnel growth
+    // threshold — 7 on the shipped cap), so the assertion below is what catches
+    // channels silently sharing a tunnel.
+    //
+    // The size is the configured count, not a number the group produced: the
+    // pool was already at four before the first visitor, and it stays there.
     let sizes: Vec<usize> = molehill_rathole::live_pools()
         .iter()
         .map(|pool| pool.size)
         .collect();
     assert!(
-        sizes.contains(&4),
-        "the stripe group must have grown the client's pool to its 4 stripes: {sizes:?}"
+        sizes.iter().all(|size| *size == 4),
+        "the stripe group's client must keep its four pinned tunnels: {sizes:?}"
     );
 
     info!("a second visitor gets its own stripe group");
@@ -876,8 +856,8 @@ async fn mixed_transports() -> Result<()> {
 }
 
 /// Arm 2 of the transport comparison: data tunnels are KCP-over-UDP sessions
-/// (Noise-wrapped with the control transport's keys, capped by
-/// `[client.data.kcp].max_tunnels` and dialed on demand from a cold pool);
+/// (Noise-wrapped with the control transport's keys, `[client.data.kcp]`
+/// `tunnels` established at service start — the default 4 when unwritten);
 /// the control channel stays TCP+Noise. Full lifecycle.
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 #[tokio::test]
@@ -891,19 +871,23 @@ async fn kcp_tunnel() -> Result<()> {
     Ok(())
 }
 
-/// The other half of the carrier axis: `mode = "direct"` with
-/// `carrier = "kcp"` — one KCP session per visitor, no multiplexer above it.
-/// The session *is* the data channel, so the KCP listener must read the
-/// data-channel hello (not only the tunnel hello) and hand the stream to the
-/// service's pool like any other direct channel. Full lifecycle, over Noise.
+/// The KCP carrier is orthogonal to a service's *shape*: this fixture pins a
+/// KCP pool, and the KCP listener must accept the tunnel hello and carry the
+/// service's data channels as streams of those sessions. Full lifecycle, over
+/// Noise.
+///
+/// The *direct*-channel-over-KCP leg this used to cover is gone with the `mode`
+/// key: after it, a direct data channel is only ever a transparent claim's lane,
+/// and a claim's lanes need a TUN device on both ends — the root-only acceptance
+/// script (`just l3-accept`), not this suite.
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 #[tokio::test]
-async fn kcp_direct_channel() -> Result<()> {
+async fn kcp_tunnel_carries_streams() -> Result<()> {
     init();
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/kcp_direct.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/kcp_tunnel.toml", Type::Tcp, None).await?;
 
     Ok(())
 }

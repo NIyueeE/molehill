@@ -8,7 +8,8 @@ Not part of the Soak model: this is the scenario check that the tunnel still
 carries a visitor round trip at all (it began as the reproduction script for
 the 0.7.0 stall). Requires target/release/molehill built with the default
 features (which include `multiplex`). Starts a local echo backend plus a
-molehill server+client pair using the default `mode = "multiplex"`, waits for
+molehill server+client pair using the product's default shape (a forwarding
+service multiplexes over a pinned pool), waits for
 the registration, then requires three visitor echo round-trips.
 
 Usage: uv run repro_e2e.py

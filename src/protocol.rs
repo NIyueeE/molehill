@@ -35,9 +35,9 @@ const PROTO_V5: u8 = 5u8;
 /// [`ControlChannelCmd::CreateDataChannelForStripe`], carrying the group's
 /// fixed 4-byte id and the stripe's index and count, so the client knows which
 /// opens belong together and reserves one tunnel per stripe. Before this the K
-/// requests were indistinguishable from K separate visitors, and a cold pool —
-/// the elastic pool's default state is *zero* tunnels — placed the whole group
-/// on one tunnel: the group still worked, but the spread D24 asks for was gone.
+/// requests were indistinguishable from K separate visitors, and the whole group
+/// landed on one tunnel: the group still worked, but the spread D24 asks for
+/// was gone.
 /// The data plane (hellos, prologue, the striping frames) is unchanged.
 ///
 /// v4's number, kept for the refusal tests: this build speaks v5 and a v4
@@ -114,8 +114,8 @@ impl Carrier {
 /// client and validated against the server-side policy (`allow_ports`).
 ///
 /// It carries no channel count: the tunnel pool is the client's own,
-/// per-carrier concern and grows on demand (D5), so a registration asks for
-/// the service and nothing about how it will be carried.
+/// per-carrier concern, sized there (D5), so a registration asks for the
+/// service and nothing about how it will be carried.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ServiceRegistration {
     pub name: String,
@@ -314,7 +314,7 @@ pub enum ControlChannelCmd {
     ///
     /// The point of the command is that the client learns *which opens belong
     /// together* before it places them, so it can reserve one tunnel per stripe
-    /// instead of letting a cold pool put the whole group on one tunnel (D24).
+    /// instead of stacking the whole group on one tunnel (D24).
     /// A plain visitor's request keeps the 4-byte form: only a stripe group
     /// carries the group and its index.
     ///

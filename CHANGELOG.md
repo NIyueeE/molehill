@@ -9,19 +9,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The KCP carrier is independent of the data-plane mode: a `direct` service
-  can ride a KCP session.** `carrier = "kcp"` used to require
-  `mode = "multiplex"`, because a KCP session was only ever a multiplexed
-  tunnel. It is now also a **direct data channel**: the client opens one KCP
-  session per channel and the server's KCP listener reads the
-  data-channel hello exactly as its TCP listener does, so
-  `mode = "direct"` + `carrier = "kcp"` carries one channel with no yamux
-  framing above it. Configuring the pair is what this changes — the previous
-  refusal is gone, in the client model and in the transparent (L3) model alike,
-  and both `[client.data]`/`[client.services.*]` and
-  `[transparent.data]`/`[transparent.claims.*]` accept every mode/carrier
-  combination. What it costs and what it buys is measured, per path condition,
-  in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
+- **A transparent (L3) claim's carrier connections come from its carrier's
+  budget, and its inner flows are spread across them.**
+  `[transparent.data.tcp|kcp].tunnels` is a **lane budget** for a transparent
+  client: one lane *is* one carrier connection (a claim never multiplexes),
+  divided equally among the claims that draw on that carrier and never below one
+  each. A client that writes no budget keeps exactly the old shape — one
+  connection per claim — and `tunnels = 4` with two claims gives each of them
+  two connections. A budget below the claim count is refused with the number to
+  write, and its bound is 1024 rather than the pool's 64, because a lane is a
+  connection rather than a stream. The claim's inner flows are **spread across
+  its lanes**, one flow per lane, by a hash of the flow's five-tuple — computed
+  on the canonical (sorted) endpoint pair, so both directions of a flow ride the
+  same lane — which is what stops a claim's throughput from being one
+  connection's ceiling; a flow is never split, so nothing is reordered. A lane
+  that dies keeps its slot: its replacement inherits the index and the flows
+  placed in it resume there, while the surviving lanes are untouched. A flow
+  whose lane is gone is dropped rather than moved onto a survivor (moving it
+  would reorder it against what the dead lane had already delivered);
+  `MOLEHILL_L3_STATS=1` counts those drops on the dead lane's own line, and
+  prints one line per lane slot (`live`, `forwarded`, `no_channel`), which is
+  how a set is told from a stack. On a jumbo path with eight inner flows, four
+  lanes carry 13.9 Gbit/s against one lane's 7.0 while a single flow is
+  unchanged; the method, the numbers and the run's own noise floor are in
+  [docs/benchmarks.md](docs/benchmarks.md).
+
+- **The KCP carrier can carry one channel with no multiplexer above it.** A
+  transparent claim's lane may ride KCP: the client opens one KCP session per
+  lane and the server's KCP listener reads the data-channel hello exactly as its
+  TCP listener does, so `carrier = "kcp"` costs a claim nothing but the
+  carrier's own behaviour. The previous refusal (a KCP session was only ever a
+  multiplexed tunnel) is gone, in the client model and in the transparent (L3)
+  model alike. What the carrier costs and what it buys is measured, per path
+  condition, in
+  [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
+
+### Changed
+
+- **The data plane's shape is derived from the service type: `mode` is gone.**
+  A forwarding service always multiplexes over its pinned pool; a transparent
+  claim never does, because its channels *are* its carrier connections.
+  `[client.data].default_mode` and `[client.services.<name>].mode` — and their
+  `[transparent.data]`/`[transparent.claims.*]` counterparts, which were never
+  released — are refused with an upgrade message naming the key, as are
+  `[transparent.data].shared_pool` and the transparent
+  `members`/`default_members` (a claim's connections come from its lane budget
+  now). Why: multiplexing a claim is framing for nothing — on one host and
+  workload the same claim on its own connection moved 6 % fewer wire bytes, took
+  33 % less CPU per packet and carried 65 % more round trips per second than the
+  same claim as one stream of a pool, and one stream on a two-tunnel pool
+  carries 9.15 Gbit/s against 18.95 on a connection of its own, at +87 % CPU per
+  byte, against that run's own 15.35 % A/A floor
+  ([HANDOFF.md](HANDOFF.md), "The mux×1 gap, measured before touching it"). The
+  wire protocol is unchanged.
+
+- **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`, established at
+  service start.** The client's data plane used to run an *elastic*
+  per-carrier pool: it started cold, grew on load, for a stripe group and to a
+  UDP service's worker count, and gave tunnels back after an idle timeout. A
+  pool's width is now a configuration decision (`[client.data.tcp].tunnels` /
+  `[client.data.kcp].tunnels`, default 4, raised to a UDP service's declared
+  worker count) and nothing moves it at runtime: all of them are dialed when the
+  service activates, none is reaped for idleness, and a tunnel that dies is
+  **repaired** back to the count — repair is the one establishment after
+  startup, and it is not growth.
+
+  Why: an elastic pool's width is a *result*, and a result depends on the
+  history of the process — which makes capacity unpredictable for an operator
+  and a run incomparable for a measurement. The measurements that size the new
+  key are unchanged and on [docs/benchmarks.md](docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements):
+  one tunnel is the worst configuration on every path measured (an L3 claim on
+  one carrier connection carries the same for one inner flow and for eight),
+  two captures most of the lossy-path gain (8 flows: 3.34 → 5.92 Gbit/s on the
+  model's `loss1` cell), and more keeps paying on a clean fast path (12.85 →
+  22.81 Gbit/s from one tunnel to eight). Establishment is paid at startup
+  rather than by the first visitor, and the cost of a tunnel is 0.5–0.8 MiB
+  RSS and 2.6 file descriptors, with no threads.
+
+  What changed for a config: `[client.data.tcp|kcp].max_tunnels` is refused with
+  an upgrade message naming `tunnels`; `[client.data].idle_timeout` is refused
+  because there is nothing to reap; an explicit `tunnels` below what the
+  carrier's UDP services need is refused with the number to write instead. The
+  server-side valve `[server.data].max_tunnels_per_client` is unchanged — it now
+  bites at a client's *startup* (the extra establishments are refused and
+  retried) rather than during growth. `MOLEHILL_POOL_STATS` reports the
+  configured `count` beside the live `size`, and the timeline's reasons are
+  `+repair` / `-dead`. A pinned pool cannot grow, so the refusal that used to
+  trigger growth now reports itself: the first time a visitor is refused
+  because every tunnel is at placement's ceiling (56 streams of the engine's
+  64), one INFO line names the count and the key to raise, and later refusals
+  are DEBUG. The wire protocol is unchanged.
 
 ### Fixed
 

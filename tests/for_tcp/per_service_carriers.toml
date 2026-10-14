@@ -1,20 +1,19 @@
-# Carrier and mode are independent: `default_mode = "direct"` means one data
-# channel per visitor with no multiplexer above the carrier, and
-# `default_carrier = "kcp"` makes that channel a KCP-over-UDP session instead of
-# a TCP connection. The control channel stays TCP+Noise, so the KCP sessions
-# are Noise-wrapped with the same keys — the crypto stack follows the service's
-# transport, not the carrier.
+# Per-service data-plane overrides: `[client.data]` provides the default
+# carrier, and `[client.services.*]` overrides it per service. Here echo rides
+# the default (TCP) and pingpong its own KCP-over-UDP sessions — one client,
+# two carriers, two pools, no server-side configuration beyond the usual
+# policy (the server opens its KCP listener on the first `kcp` registration).
+# Requires a binary built with the `kcp` feature.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
 
 [client.control]
-default_remote_addr = "127.0.0.1:2333"
+default_remote_addr = "127.0.0.1:2345"
 
 [client.data]
-default_mode = "direct"
-default_carrier = "kcp"
-default_data_addr = "127.0.0.1:2343"
+default_carrier = "tcp"
+default_data_addr = "127.0.0.1:2344"
 
 [client.transport]
 type = "noise"
@@ -29,16 +28,17 @@ remote_bind_addr = "0.0.0.0:2334"
 [client.services.pingpong]
 local_addr = "127.0.0.1:8081"
 remote_bind_addr = "0.0.0.0:2335"
+carrier = "kcp"
 
 [server]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
 allow_ports = ["2334-2337"]
 
 [server.control]
-bind_addr = "0.0.0.0:2333"
+bind_addr = "0.0.0.0:2345"
 
 [server.data]
-bind_addr = "127.0.0.1:2343"
+bind_addr = "127.0.0.1:2344"
 
 [server.transport.noise]
 local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="

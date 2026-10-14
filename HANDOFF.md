@@ -85,6 +85,13 @@ configuration surface is free to change — and this cycle changes it.
 | L9 | A claim's address key stays `remote_bind_addr`, and `proxy` stays in `[transparent.transport]` (the only key there — no encryption key has a home in that table) |
 | L10 | Header compression is an **intermediate state**: keep it when the measurement shows benefit, remove it when it does not, against criteria written down *before* the run |
 | L11 | No startup INFO for the switch; the plaintext consequence lives in the docs instead |
+| L12 | `tunnels` is one quantity in both models — **how many carrier connections this client holds for that carrier**: L4 spends them on a pool that carries unbounded per-visitor streams, L3 hands them to claims as lanes |
+| L13 | The data plane's shape is **derived from the service type**, not configured: a forwarding service always multiplexes, a transparent claim never does. `mode` is deleted, and a config that still carries it is refused by name |
+| L14 | A claim's lane count is `max(1, floor(tunnels / claims on that carrier))`, and `tunnels` unset means one lane per claim; a budget below the claim count is refused with the number to write |
+| L15 | A lane **is** a connection, so reclamation moves **idle lanes only** — at most one per tick, never below one per claim: taking a busy lane would drop that claim's packets while its replacement was dialled anyway |
+| L16 | Flow placement is a **per-flow table**, not a hash modulus: assignment happens once, into a *live* slot; established flows never move; entries expire after silence in either direction, so a lane change cannot reorder a flow |
+| L17 | `[server.data].max_tunnels_per_client` counts a client's **carrier connections**: a transparent claim's direct lane registers against it, a per-visitor channel (the no-`multiplex` build's shape) does not |
+| L18 | The mux×1-versus-direct gap is attributed with the model before it is optimised, and each optimisation lands only if it clears that run's own noise floor. No reorder buffer, no mid-stream framing switch, no compact single-stream mode |
 
 ### Next, in order
 
@@ -551,7 +558,230 @@ both hold; a difference inside the variance counts as *no difference*, and
 either failure removes the feature. The small-packet arm failed on the ceiling
 alone, so the other arms were not run for the verdict.
 
-### Open threads
+#
+## An L3 claim holds a member set (2026-10-10, this session)
+
+The transparent path's claim used to be one data channel, and one carrier
+connection is a hard ceiling — measured flat at ~7.1 Gbit/s for one inner flow
+and eight alike, while the forwarding path's per-connection channels reached
+22-28 through the pool. A claim now holds **K data channels (its members)**, and
+its inner flows are hashed across them by their canonical 5-tuple. Landed in
+slices, each with its own acceptance:
+
+- **S1 (`6a4c751`)** — the hub routes by *member slot* instead of one queue per
+  endpoint: a fixed slot set per claim, batches keyed `(endpoint, slot)`, and
+  slots that **outlive their members** (a replacement inherits its predecessor's
+  index), so the routing target of a flow never moves when a channel does.
+  Pure refactor at width 1; `MOLEHILL_L3_STATS` gained a per-member line, which
+  is the instrument the feature has to be measured with.
+- **S2a (`a804f6e`)** — `members` / `[transparent.data].default_members`
+  (default 1, max 64; `tunnels < members` refused next to the UDP-workers
+  floor). The client opens that many channels, placed on distinct tunnels in
+  `multiplex` mode; the server supervises them as a set and replaces each one
+  that ends. Acceptance was **indistinguishability**: `members = 4` against
+  `members = 1` showed no claim above the run's 9.8 % floor, `fds_peak`
+  identical at 69 (members in mux mode are streams on tunnels that already
+  exist), RSS +1.3 MiB for 20 extra streams.
+- **S2b (`229d3a4`)** — the flow hash: `src/transparent/flow.rs`, FNV-1a with a
+  **splitmix64 finalizer**, fixed seed, over protocol + the two `(address, port)`
+  endpoints sorted (portless packets hash on the address pair alone). Jumbo path,
+  four rounds an arm, twin in the run, 8 flows: **one member 6.989 Gbit/s →
+  four members 13.924 [11.528..15.091]**, the same configuration's twin at
+  13.598 — **1.99x**, on a run whose own floors were 3.34 % (throughput) and
+  0.17 % (the twin pair). `bulk-1` indistinguishable (6.201/6.244/6.299),
+  `churn-16` +22 %, `rr-16` −1.8 %, `fds_peak` identical at 69,
+  `wire_per_visitor_byte` unchanged, and the one-member claim's carrier
+  retransmits 518 → 0. The fan-out is proven per member: 3-4 of 4 slots carry
+  traffic in every round, and both ends report the same split to within a point
+  (23/52/24/0 against 23/53/24/0).
+- **S3 (`6ee0038`)** — a member's death is proven not to move the others: the
+  slot stays, the survivors keep forwarding, only the dead slot counts
+  `no_channel`, its replacement inherits the index, and the modulus never moves.
+
+**The finding inside S2b is worth keeping.** The first run of the slice read
+11.282/13.142 instead of 13.924: FNV-1a's low bits are weak, the byte that
+varies between eight `iperf3` streams is its ephemeral port, every one of those
+ports was even, and `h % width` reads exactly those bits — so eight flows landed
+on two of four members. The splitmix64 finalizer fixes it and the regression
+test pins the measured port set and every stride. The lesson generalises: a
+modulo over a hash whose *low* bits are weak is a placement bug waiting for a
+traffic pattern, and per-member counters are what make it visible.
+
+**What this does not do, and the two facts to carry forward.** The claim still
+trails the forwarding path (13.9 against 29.2 Gbit/s), which is the pre-stated
+band that means *the constraint has moved to the device path* — one server TUN
+reader, one client injection path, one syscall per packet. That is the next
+lever, and it needs its own arm before it is a claim.
+Also unclosed: there is **no server-side valve on concurrent members** in
+`direct` mode (in `multiplex` mode the surface is streams on tunnels the pool
+already bounds; in direct mode K connections per claim are held for the claim's
+life), and the model has **no fault-injection axis** for a member's death, so
+the slot-retention semantics are proven by unit and loopback tests rather than
+by a measured recovery number.
+
+## The tunnel pool is pinned (2026-10-10, this session)
+
+The client's multiplex pool is no longer elastic. It establishes
+`[client.data.tcp|kcp].tunnels` (default 4, raised to a UDP service's declared
+worker count) at service start, keeps them, and **repairs** a dead one back to
+the count; it never grows for load and never reaps for idleness. `max_tunnels`
+and `idle_timeout` are refused with upgrade messages, the floor is validated at
+config time, and the server's `max_tunnels_per_client` valve now bites at
+startup.
+
+The reasoning, in the order it was established:
+
+- An elastic pool's width is a *result*: it depends on what the process was
+  doing. That is a capacity-planning problem for an operator and a
+  comparability problem for this repository's measurements (§10) — the same
+  arm, run twice, can describe two different pools.
+- The measurements that size the key are unchanged by pinning it: one tunnel is
+  the worst configuration on every path measured (3.34 against 5.92 Gbit/s for
+  8 flows on `loss1` from one tunnel to two; 12.85 against 22.81 on a clean
+  jumbo path from one to eight), and an L3 claim on one carrier connection
+  carries the same for one inner flow and for eight.
+- Establishment is cheap and belongs at startup: **0.5–0.8 MiB RSS and 2.6 file
+  descriptors per tunnel, no threads** (measured by varying the pool's width on
+  a fixed workload), so a deployment can afford the count its concurrency
+  needs, and the first visitor pays nothing.
+- `mux` retains its purpose in that model: it decouples the count of *carrier
+  connections* (fixed, configured) from the count of *logical connections*
+  (unbounded, per visitor — a stream on an established connection costs no
+  round trip). Where the logical count is known at configuration time and does
+  not exceed the count — a single L3 claim — a raw channel is measurably
+  cheaper (7.599 against 6.620 Gbit/s single-flow, 0.277 against 0.578 s/Gbit),
+  which is why `direct` survives there.
+
+What this changed, mechanically: `GrowReason` has one variant (`Repair`) and
+`ShrinkReason` one (`Dead`); `grow_before_placing`, `grow_for_stripes`, the
+floor-driven growth loop, `shrink_if_idle`, `may_shrink`, `GROW_PERCENT`,
+`grow_threshold`, `tunnel_grow_at`, `MIN_WARM_HOLD`, `SHRINK_COOLDOWN` and
+`OPEN_WAIT_BUDGET` are gone; placement's per-tunnel ceiling
+(`TUNNEL_STREAM_CEILING`, 56) is now the *only* oversubscription bound, and the
+UDP-derived floor became a validation input rather than a growth target. The
+one invariant to keep in mind: the engine's own stream cap (64) is no longer
+backstopped by growth, so the pool's ceiling has to stay strictly below it —
+`tunnel_ceiling` does that, and the `pool_test` suite asserts it.
+
+Still open from this work (next steps, in the order agreed):
+
+1. ~~**A saturation notice.**~~ **Landed with the change.** A pinned pool
+   cannot grow, so the refusal that used to trigger growth now reports itself:
+   the first time a visitor is refused because every tunnel is at placement's
+   stream ceiling, the pool emits one INFO line
+   (`pool-stats: pool at its stream ceiling; raise [client.data.<carrier>].tunnels`)
+   with the configured count and the ceiling, and every later refusal is DEBUG
+   (`logging::RepeatNotice`). `OpenError::AtCapacity`'s text now names the
+   setting instead of a growth that can no longer happen.
+2. ~~**Member kinds and L3 flow hashing.**~~ **Landed 2026-10-10 (S1/S2a/S2b).**
+   A claim now holds a *set* of members — `[transparent.data].default_members`,
+   or a claim's own `members`, default 1 — and its inner flows are spread across
+   them, one flow per member, by a hash of the flow's five-tuple. Both carrier
+   kinds are members: a stream of the claim's tunnel pool in `multiplex` mode,
+   a connection of its own in `direct` mode. The set is discovered by the hub
+   (the channels that actually join), so nothing about it is on the wire; a
+   member that dies keeps its slot and its replacement inherits the index.
+   Measured (dev profile, jumbo path, A/A twin in the run, `bulk-n` = 8 inner
+   flows): one member 6.989 Gbit/s, four members **13.924 / 13.598** (two
+   copies, A/A throughput floor 3.34 %) against the L4 pool's 29.17 — the claim
+   nearly doubles, at 0.653 against 0.560 s/Gbit, with `fds_peak` identical
+   (69) and RSS +12–19 % for the 20 extra streams. `bulk-1` is unchanged (one
+   flow, one member), `churn-16` gains ~22 %, `rr-16` loses ~2 %.
+   **What is not covered yet, in the order it should be picked up:**
+   - **No server-side valve on a claim's concurrent members in `direct` mode.**
+     `[server.data].max_tunnels_per_client` counts *tunnels*, and a direct
+     member is a data channel, not a tunnel, so a client may hold `members`
+     connections per claim with nothing bounding the total. In `multiplex` mode
+     the surface is streams on tunnels the operator already caps (and the pool's
+     56-per-tunnel ceiling bounds it), so this is a direct-mode gap.
+   - **No fault-injection axis in the bench model for member death.** The
+     failure semantics — a dead member's slot keeps its index, its flows are
+     dropped and counted `no_channel` on that slot until the replacement joins,
+     the survivors untouched — are unit- and loopback-tested only; the model
+     cannot yet price a member dying during a measured cell.
+   - **Member kinds, measured (S4).** `l3-raw4` (four *direct* members, one
+     connection each) against `l3-mux4` (four streams of a four-tunnel pool),
+     same run, dev profile, jumbo path, A/A twin: `bulk-n` **15.013 / 16.196**
+     against 13.187 Gbit/s, at **0.516 / 0.502 against 0.658 s/Gbit**; `bulk-1`
+     7.316 / 7.189 against 6.640 at **0.337 / 0.321 against 0.561 s/Gbit**;
+     `rr-16` +2-3 %, `churn-16` indistinguishable (11.9 % floor). `fds_peak` is
+     identical (69) — the mux arm holds four *tunnels* per claim and the raw arm
+     four *connections*, so the count matches when `members == tunnels` — and
+     RSS is **lower** for raw (19.2 against 26.15 MiB at `bulk-n`, floor 9.17 %)
+     because there is no yamux session state per member. So a raw member is the
+     cheaper carrier per byte whenever the claim's member count is what the
+     deployment is paying for; the multiplexed pool remains what lets *unbounded*
+     per-visitor channels ride a bounded count of connections (the L4 path),
+     which is not a claim's shape. The cost stands as recorded below: nothing
+     bounds a claim's concurrent direct members server-side.
+   - **The flow hash needed a finalizer, and that was found by a run, not by
+     review.** A bare FNV-1a `% width` aliases with the *low* bits of the ports
+     (its last step is a multiplication by a prime, which preserves their
+     residue structure). The measured `iperf3` ports
+     `52044, 52052, 52054, 52058, 52070, 52082, 52088, 52094` — all even,
+     several four apart — took two of the four members, which is why the first
+     measurement read 11.28/13.14 instead of 13.92/13.60. The per-member
+     counters (`MOLEHILL_L3_STATS=1`) plus the iperf3 JSON's `local_port` list
+     diagnosed it; splitmix64's finalizer fixes it, and the regression test
+     pins both the measured port set and every port stride. The lesson for the
+     next hash-shaped decision: `% width` on a raw FNV value is not a placement
+     rule, and the per-member counters are the instrument that says so.
+
+## The mux×1 gap, measured before touching it (2026-10-10, this session)
+
+The decision to derive the data plane (L12–L18) rests on two facts, and the
+second one was measured before any of it was written, because the comparison
+stops being configurable the moment `mode` is deleted.
+
+**The gap, on the pristine tree.** `l4-mux2` is one flow on a two-tunnel pool —
+one stream on one session, the shape a sparse visitor or a lane gets — against
+`l4-direct`, the same flow on a connection of its own. Both arms in one run,
+the A/A twin on the mux arm as the run's own noise floor, `smoke` profile
+(two measured rounds per arm), loopback, host `d764f9da9c7e5b2a`:
+
+```
+sudo -n just bench --profile smoke --arms l4-mux2,l4-direct,control --aa \
+  --binary ~/tmp/molehill-c0-baseline --out ~/tmp/bench-c0-mux-vs-direct.json
+```
+
+| arm | bulk-1 throughput | bulk-1 CPU | rr-1 rate |
+|---|---|---|---|
+| `control` (no tool) | 40.65 Gbit/s | — | 32 000/s |
+| `l4-direct` | **18.95** Gbit/s [17.52..20.37] | **0.110** s/Gbit | **15 885/s** |
+| `l4-mux2` | **9.15** Gbit/s [9.00..9.29] | **0.207** s/Gbit | 13 357/s |
+| `l4-mux2~aa` (twin) | 7.93 Gbit/s [7.19..8.67] | 0.250 s/Gbit | 13 583/s |
+
+Read: the multiplexer costs **2.07× the throughput and +87 % of the CPU per
+byte** on one stream, and this run's own A/A floor is **15.35 %** on that
+metric — so the gap is real at this profile, resolvable, and worth attacking
+(which is why L18 gates the engine work on this number rather than on a hunch).
+Provenance is exact: the binary is the pristine `80b0e62` build
+(`v0.10.0-47-g80b0e62`, sha256 `94549863c4f6392d`), run from a worktree at that
+commit with that commit's model. The symbol-level attribution (which of the
+per-write allocation, the 32 KiB frame split, the driver hand-off or the
+window updates owns the gap) is the first step of the engine work itself, not
+of this baseline.
+
+**A model defect found by the same run.** The catalog arm `l4-mux1`
+(`pool_cap = 1`) cannot start against the model's L4 topology at all: that
+topology carries a UDP service with `udp_workers = 2`, so `tunnels = 1` is
+below the UDP-derived floor and the client refuses to start —
+
+```
+`[client.data.tcp].tunnels = 1` is below what the services of that carrier
+need: service `game` declares 2 UDP workers, and a pool keeps one tunnel per
+worker so their shards stay on distinct tunnels. Write
+`[client.data.tcp].tunnels = 2` or more, ...
+```
+
+Its four scenarios then report `not ready: no visitor could reach
+10.10.0.254:2401` — the degenerate L4 cell recorded as an open thread in
+[benchmarks.md](docs/benchmarks.md), now with a cause for at least this arm.
+`l4-mux2` is the closest legal mux×1 shape and is what the table above uses;
+the arm's own fix (raise `udp_workers`, or drop the arm) belongs with the model
+change, not here.
+
+## Open threads
 
 - **One instrument, and the boundary is a profile (closed 2026-10-10).**
   The earlier decision — a sibling instrument for L3, the sweep left alone —

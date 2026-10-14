@@ -446,7 +446,7 @@ fn a_healthy_run_stays_within_the_log_budget() {
 }
 
 /// The migration wart, measured the same way: a config that still carries a
-/// key v0.10.0 removed does **not start**, and the refusal names the key and
+/// key a release removed does **not start**, and the refusal names the key and
 /// what to write instead — the operator runs the binary once and gets the
 /// whole list.
 ///
@@ -464,9 +464,17 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
     // backticked — so `count` cannot be satisfied by the `default_count`
     // line's text. Each end gets the keys that lived in *its* file: a server
     // config has no `[client]` tables to carry the client's keys.
-    const CLIENT_KEYS: [(&str, &str); 5] = [
-        ("client.data.default_count", "max_tunnels"),
-        ("client.services.*.count", "max_tunnels"),
+    //
+    // The pool keys are the pinned rewrite's: the elastic pool's `max_tunnels`
+    // (both carriers) and its `[client.data].idle_timeout` shrink clock are
+    // gone, and what the operator has to write instead is the count the pool
+    // establishes at service start.
+    const CLIENT_KEYS: [(&str, &str); 8] = [
+        ("client.data.default_count", "[client.data.tcp].tunnels"),
+        ("client.services.*.count", "[client.data.tcp].tunnels"),
+        ("client.data.tcp.max_tunnels", "[client.data.tcp].tunnels"),
+        ("client.data.kcp.max_tunnels", "[client.data.kcp].tunnels"),
+        ("client.data.idle_timeout", "no shrink clock"),
         ("client.services.*.pool_size", "udp_workers"),
         (
             "client.services.*.heartbeat_timeout",
@@ -475,11 +483,19 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
         ("client.services.*.health_check", "registered"),
     ];
     const SERVER_KEYS: [(&str, &str); 1] = [("server.max_pool_size", "max_tunnels_per_client")];
-    // `[client.data]` (and so the removed `default_count`) exists only with the
+    // `[client.data]` (and so the removed pool keys) exists only with the
     // `multiplex` feature; the other client keys live in tables every build
     // has, so they are asserted everywhere.
     let client_data_extra = if cfg!(feature = "multiplex") {
-        "[client.data]\ndefault_count = 4\n"
+        "[client.data]\n\
+         default_count = 4\n\
+         idle_timeout = 2\n\
+         \n\
+         [client.data.tcp]\n\
+         max_tunnels = 4\n\
+         \n\
+         [client.data.kcp]\n\
+         max_tunnels = 4\n"
     } else {
         ""
     };
@@ -567,7 +583,9 @@ fn assert_refused(who: &str, cfg: &Path, keys: &[(&str, &str)]) {
         "a refused config must not warn — the refusal is the message ({who}):\n{stderr}"
     );
     for (pattern, replacement) in keys {
-        if *pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
+        // The `[client.data]` table and its carrier tables exist only with the
+        // `multiplex` feature.
+        if pattern.starts_with("client.data.") && !cfg!(feature = "multiplex") {
             continue;
         }
         assert!(

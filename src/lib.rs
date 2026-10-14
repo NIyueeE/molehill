@@ -49,7 +49,7 @@ pub use core::control_sessions_accepted;
 #[doc(hidden)]
 pub use protocol::CURRENT_PROTO_VERSION;
 
-/// The client's elastic tunnel pool, re-exported for the integration suite:
+/// The client's pinned tunnel pool, re-exported for the integration suite:
 /// the pool's own state is what the pool tests assert on, instead of parsing
 /// the telemetry text (see `tests/integration_test.rs`).
 #[cfg(feature = "multiplex")]

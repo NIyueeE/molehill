@@ -95,6 +95,21 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 ### The rules the model enforces
 
+- **An arm states the width it measured, and the data plane's shape is not an
+  arm parameter at all.** `pool_cap` is the pool's
+  `[client.data.tcp|kcp].tunnels` for a forwarding arm and a transparent
+  claim's **lane budget** for an L3 one — one connection per lane, because a
+  claim never multiplexes — and `carrier` is the other axis. The shape itself is
+  derived from the service type (a forwarding service multiplexes, a claim never
+  does), so an arm spec that still names a `mode` is refused by
+  `just bench-selfcheck`. Records below name the arms the catalog had when each
+  run was made: where one says `l3-mux` (one stream of a pool), `l3-mux4` (four
+  streams) or `l3-raw4` (four connections), today's catalog has `l3` (one
+  connection) and `l3-lanes4` (four connections), and `l4-mux1` is gone because
+  the topology's UDP floor refuses a one-tunnel pool — one stream on a
+  two-tunnel pool is `l4-mux2` in a single-flow scenario
+  ([HANDOFF.md](../HANDOFF.md), "The mux×1 gap, measured before touching it").
+
 - **A metric is defined once, in code.** Unit, direction, the denominator it is
   a ratio over, the workload kinds that can produce it and the smallest
   difference worth calling a claim all live in `model.METRICS`; the table below
@@ -548,21 +563,22 @@ Stated so a reader does not ask a chart for something it never measured:
 
 ## What each configuration choice costs (per-decision measurements)
 
-The elastic pool's own thresholds — grow at 12 % of a tunnel's stream capacity
-(7 of 64), refuse placement at 56, reap a forward that moves nothing for 5
-minutes — are internal constants, not settings, and they change only with a
-measurement behind them: the growth threshold came out of a two-stage
-reproduction (a pool that never grew past one tunnel because the rule needed
-51 of 64 streams, where the workloads peak at 20-21), and each was re-checked
-against the sweeps that followed.
+The pool's own thresholds — refuse placement at 56 streams of the engine's 64,
+repair a dead tunnel, reap a forward that moves nothing for 5 minutes — are
+internal constants, not settings, and they change only with a measurement
+behind them. The pool's width is not one of them: it is `tunnels`, and the
+measurements behind its guidance are the `count` rows below (re-measured with
+the pinned pool: one tunnel 12.85 Gbit/s against eight tunnels' 22.81 on a
+clean jumbo path, 8 flows; 3.34 against 5.92 Gbit/s on `loss1` from one tunnel
+to two).
 
 | Decision | Option | Measured basis (retired per-cell model) |
 |---|---|---|
 | `mode` | `"multiplex"` (default) | 1-stream 10.0 Gbit/s on loopback vs 19.2 for `direct`; at 8 streams 19.5 vs 23.3; multiplex absorbs per-connection setup (churn ~4.8k connects/s) and saves FDs / ports / NAT mappings |
 | `mode` | `"direct"` | raw single-stream throughput; one physical tunnel per stream (FD / port / NAT cost scales with stream count) |
-| `count` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at count = 4; loss5 head-of-line max 2.5 s vs 1.6 s) |
-| `count` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at count = 1); yamux ceiling `count × 64` concurrent connections |
-| `count` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8) |
+| `tunnels` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at four tunnels; loss5 head-of-line max 2.5 s vs 1.6 s; and on the pinned pool's own cells 8 flows read 3.34 Gbit/s on `loss1` against 5.92 at two) |
+| `tunnels` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at one tunnel); yamux ceiling `count × 64` concurrent connections, `count × 56` after placement's own ceiling |
+| `tunnels` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8), and on a clean jumbo path 22.81 Gbit/s against 12.85 at one |
 | `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
 | `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
@@ -619,11 +635,42 @@ the link MTU at 9000, against the forwarding path with its pool capped — the
 One carrier connection tops out near 8–10 Gbit/s on this host — the one-tunnel
 arm says so directly, at one flow and at eight streams over the same tunnel —
 and the forwarding path scales past it only by spreading streams over *several*
-tunnels. A claim has exactly one channel, so it sits at that per-connection
+tunnels. A claim carried by **one** channel therefore sits at that per-connection
 ceiling by construction, which is why its `bulk-n` is *below* its `bulk-1`:
-eight flows through one channel is the same connection. Raising that ceiling
-means giving a claim more than one channel (per-flow sharding, which the model
-cannot price until it exists), and it is a design decision, not a tuning one.
+eight flows through one channel is the same connection.
+
+**A claim can now hold a member set**, and that is what finally moved the
+ceiling (`members` / `[transparent.data].default_members`, default 1 — so every
+arm above keeps its meaning). With four members, inner flows hashed across them
+by a canonical 5-tuple, jumbo path, four measured rounds an arm and the A/A twin
+in the run:
+
+| `bulk-n` (8 flows) | `l3` (direct, 1) | `l3-mux` (mux, 1) | `l3-mux4` (4 members) | twin (same config) | `l4` (forwarding pool) |
+|---|---|---|---|---|---|
+| throughput | 5.446 Gbit/s | 6.989 | **13.924** [11.528..15.091] | 13.598 | 29.166 |
+| CPU s/Gbit | 0.270 | 0.560 | 0.653 | 0.655 | 0.412 |
+| FDs | 39 | 69 | 69 | 69 | 99 |
+| RSS | 18.35 MiB | 21.45 | 25.45 | 24.35 | 25.45 |
+
+The claim **nearly doubles** — 13.924 against 6.989, with the twin at 13.598, on
+a run whose own A/A floors were 3.34 % (throughput) and 0.17 % on the twin pair,
+so this clears the noise by an order of magnitude. The rest of the cells hold:
+`bulk-1` indistinguishable (6.201 / 6.244 / 6.299), `churn-16` **+22 %**
+(6837/s against 5586/s), `rr-16` −1.8 % (inside the twin's 0.1 % pair spread),
+`fds_peak` identical at 69 (members in `multiplex` mode are streams on tunnels
+that already exist), `wire_per_visitor_byte` unchanged, and the one-member
+claim's carrier retransmits fall from 518 to **0**.
+
+Two findings ride with it. The fan-out is visible per member — every measured
+round spread its flows over 3 or 4 of 4 slots, and **both ends agreed on the
+split to within a point** (23/52/24/0 server-side against 23/53/24/0 client-side),
+which is the canonical key verified in production rather than in a unit test.
+And the first run of this slice read 11.282/13.142 instead of the table above:
+FNV-1a's low bits are weak, the byte that varies between eight `iperf3` streams
+is its ephemeral port, and every one of those ports was even — so modulo read a
+collapsed distribution and put eight flows on two members. That is why the hash
+ends with a splitmix64 finalizer, and why the regression test pins the measured
+port set and every stride.
 
 The operator's copy of the packet-size finding, with the recipe, is
 [deployment.md](deployment.md#transparent-services); what is left on the table —
@@ -1010,10 +1057,12 @@ your own host.
   closes with the same `clean` condition, so `clean#2` of one run is compared
   with `clean#2` of another: the return stage — the recovery axis — is judged
   against the baseline's *return*, not against its fresh start.
-- **The tunnel pool is elastic, so the pool's size is a *result*, not a
-  setting.** A build with the shared elastic pool starts **cold** and grows and
-  shrinks on its own up to `max_tunnels`; the `MOLEHILL_POOL_STATS` timeline is
-  what records the size a run actually used.
+- **The tunnel pool is pinned, so its size *is* a setting.** A build
+  establishes `[client.data.tcp|kcp].tunnels` connections at service start and
+  keeps them (a dead one is repaired). The `MOLEHILL_POOL_STATS` line reports
+  the configured `count` beside the live `size`: a `size` below `count` is a
+  pool whose repair is being refused, and an arm's width is a method parameter
+  exactly like its carrier.
 
 ## Reproduce it yourself
 

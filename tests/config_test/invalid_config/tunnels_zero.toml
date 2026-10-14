@@ -1,8 +1,8 @@
-# expect: `[client.data.tcp].max_tunnels` must be at least 1
+# expect: `[client.data.tcp].tunnels` must be at least 1
 # requires: multiplex
 
-# The cap is what the elastic pool may grow to, so `0` would mean "a pool
-# that may never hold a tunnel". It is refused with the carrier's name
+# The count is what the pool establishes at service start, so `0` would mean
+# "a pool that may never hold a tunnel". It is refused with the carrier's name
 # rather than clamped, so a typo is visible.
 
 [client]
@@ -12,7 +12,7 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [client.data.tcp]
-max_tunnels = 0
+tunnels = 0
 
 [client.services.test]
 local_addr = "127.0.0.1:80"

@@ -18,6 +18,12 @@ remote_public_key = "key_encoded_in_base64" # Optional
 psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
+[client.data.tcp]
+tunnels = 6 # Optional. Tunnels this carrier's pool establishes at service start and keeps. Default: 4, raised to the UDP-derived floor of the services that share the pool
+
+[client.data.kcp]
+tunnels = 2 # Optional. Same, for the KCP carrier
+
 [client.services.service1]
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
