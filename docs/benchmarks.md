@@ -926,6 +926,44 @@ Which setting to pick, and why:
 for what a per-decision figure is and is not comparable with, see
 [Comparability](#comparability).
 
+### The carrier move on a live claim (2026-10-11, this model)
+
+The product no longer only chooses a carrier when a connection is made: a
+transparent claim's lane is measured while it runs, and a lane whose carrier is
+refusing a material share of what the peer offers it is handed over to the
+other one. This is the per-decision measurement for that move, and it is
+**pre-registered here before the run that decides it**, in this page's own
+terms:
+
+- **The contrast is a path condition, not a build.** Both arms are the same
+  binary; the control pins one carrier with `MOLEHILL_DATA_CARRIER=kcp`, which
+  makes the policy inert (a forced carrier is the run's answer), and the
+  candidate leaves it unset so the policy runs. The switch is recorded as
+  instrumentation, so the two files compare.
+- **The metrics are the ones the decision would move**: `udp_recv_mbit` and
+  `udp_loss_pct` on the ladder's divergence cells (the rates at which the two
+  carriers are known to part company), with `cpu_s_per_gbit` and
+  `rss_peak_mib` as the cost the move is allowed to have.
+- **A difference is a claim only past both floors** — the metric's materiality
+  and the run's own `--aa` noise — as everywhere else on this page.
+- **The workload has to give the switch somewhere to show.** A lane change
+  cannot reorder a flow, so a running flow finishes on the carrier it started
+  on and only flows that *begin* afterwards can ride the replacement. A round
+  therefore has to be long enough to contain the three-tick confirmation, the
+  peer's quiet window (three seconds) and several fresh flows after them.
+
+**What is measured so far, and what is not.** The mechanism is: with the policy
+live and no diagnostic hatch, one run shows the whole chain — the rule fires on
+a lane whose peer-side queue refused 44 % of what it was offered, the endpoint's
+preference moves, the peer is asked to drain that lane, and the lane is retired
+3.001 s later when the peer answers that it holds nothing. The **benefit is not
+measured**: on the ladder as it stands a round is shorter than that chain plus
+the flows after it, and three campaigns (forced-KCP against policy-live, at the
+`smoke` and `dev` profiles, three rounds plus a warm-up with `--aa`) all came
+back with no claim. Until a workload whose flows start after a switch is run,
+this stays a decision the model has not priced — the method above is what that
+run has to follow.
+
 ## The transparent-L3 wire question (the acceptance harness)
 
 An L3 client carries whole IP packets, so the question "how much of the wire is

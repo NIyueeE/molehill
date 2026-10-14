@@ -1639,7 +1639,105 @@ the loss is the **peer's lane queues refusing**, not a missing lane
 
 3. **L4's version** (a per-tunnel handover), which the report does not cover
    yet: a multiplexed tunnel's streams are not lanes, and the pool's repair
-   dialer still pins the carrier a pool was established on.
+   dialer still pins the carrier a pool was established on. The design it needs,
+   so the next round does not re-derive it:
+
+   - **One logical pool, N physical tunnels, a carrier per tunnel.** `PoolEntry`
+     gains its own `Carrier` and a `Serving`/`Draining`/`Dialing` state; the
+     pool's single carrier becomes a summary the telemetry prints. Placement
+     already reasons per tunnel (`order_candidates`, the per-tunnel ceiling, the
+     round-robin tie-break), so it only has to skip a draining entry.
+   - **The dialer takes a target.** `tunnel_dialer` builds one closure per
+     carrier today; it becomes `dial(carrier)` and the repair tick calls it with
+     the endpoint's preferred carrier, which is what lets a replacement ride the
+     carrier the policy chose rather than the one the pool was born on.
+   - **Draining a tunnel is not "streams == 0".** A pre-opened idle TCP channel
+     and a UDP worker with no pinned peer can go at once; a tunnel whose streams
+     are a visitor's live connections keeps them to the end (a stream cannot move
+     without reordering it, exactly as a lane's flows cannot). `PinRegistry`
+     already answers the UDP half (`pinned_on`), and `StreamLease` answers the
+     rest.
+   - **The count never grows.** The server's `max_tunnels_per_client` counts
+     tunnels, so a replacement may only be dialed once the drained one has
+     released its slot — `PoolEntry::_shutdown` dropping is that moment. A
+     drain that cannot complete inside the budget is cancelled and the tunnel
+     returns to service, the same rule the lane drain follows.
+   - **The failure mode that motivates it, verified by reading the code and
+     worth a regression test of its own**: the pool's carrier is part of its
+     *identity* (`(session, carrier)`, "two pools wearing one name"), and
+     `repair` calls the dialer closure that was built for that carrier at pool
+     creation. So a pool established on KCP keeps repairing on KCP — and
+     `CarrierChoice::on_kcp_failure` is only reached from the *initial*
+     establishment (`establish_tunnels`) and from a direct L3 lane
+     (`connect_direct_channel`), never from a failed tunnel repair. The
+     consequence: **a path that carries KCP at startup and loses UDP later
+     leaves the pool repairing into a dead carrier for the process's life**,
+     serving on whatever tunnels survive, instead of following the fallback the
+     client already knows how to make. The acceptance case for the slice is
+     exactly that sequence: establish on KCP, block UDP, kill a tunnel, and the
+     replacement must come up on TCP — with the pool's reported carrier
+     following its tunnels rather than contradicting them.
+   - **The edit list, with the anchors, so the slice is one pass and not a
+     re-derivation** (verified against the tree at `41f152c`):
+     1. `src/transport/multiplex.rs:429` — `Dialer` becomes
+        `Arc<dyn Fn(Carrier) -> Pin<Box<dyn Future<Output = DialResult> + Send>> + Send + Sync>`:
+        a dialer that is *told* which carrier to establish.
+     2. `multiplex.rs:391` — `PoolEntry` gains `carrier: Carrier`, and
+        `multiplex.rs:360` — `PoolSnapshot::tunnels` carries it per tunnel
+        (`Vec<(usize, usize, usize, Carrier)>` or a small struct), because a pool
+        whose tunnels ride two carriers must report that rather than the carrier
+        it was born on.
+     3. `multiplex.rs:655` — `with_dialer` gains
+        `preferred: Arc<dyn Fn() -> Carrier + Send + Sync>` (the *decision*, not
+        `CarrierChoice`: the pool must not learn about the carrier module), and
+        `multiplex.rs:1241` — `grow_locked` dials `dial(self.inner.preferred())`
+        and records what came back on the entry. That single line is the fix for
+        the verified defect: a repair after a fallback comes up on TCP.
+     4. `src/core/client.rs:1756` and `:1781` — the two `Arc::new(move || …)`
+        closures must merge into **one** closure that takes `Carrier` and
+        branches, reusing both bodies (build `kcp_dialer: Option<Dialer>` and
+        `tcp_dialer: Dialer` first, then compose a dispatcher), and
+        `client.rs:1709` — the establishment pass's `dials.spawn(async move {
+        dial().await })` — must pass the carrier it is establishing, so the cold
+        path keeps its current behaviour. **An attempt at steps 1–3 confirmed
+        the rest of the list** (the pool compiles against a dialer that takes a
+        carrier and a snapshot that carries it per tunnel, with every existing
+        `with_dialer` caller unchanged through a delegating `with_preference`);
+        it was reverted before step 4 because that merge, plus its call sites
+        and tests, did not fit the session's remaining budget — deliberately, so
+        the branch stayed green rather than half-migrated.
+     5. The four test dialers in `multiplex.rs` (and any in `tests/pool_test.rs`)
+        take the parameter and ignore it (`|_| …`), except the one that proves
+        the slice: a dialer whose `preferred` flips to `Tcp` after the first
+        failure, asserting the replacement is `Tcp` and the snapshot says so.
+     6. **Placement skipping a draining entry is the *next* slice**, with the
+        per-entry state (`Serving`/`Draining`/`Dialing`) — keep it out of this
+        one so the diff stays about the carrier a repair rides.
+   - **Evidence — settled, by inventorying what the client can actually see.**
+     The local route was "decide from client-observable signals", and it is
+     **not viable**, which the inventory shows rather than argues: the client's
+     per-tunnel numbers are `streams`, `pending`, `pinned` and `is_alive` —
+     *occupancy*, which is exactly what placement exists to equalise. There is no
+     per-tunnel delivered-bytes, loss or RTT anywhere on this end (the bench
+     model's `retrans_segs` is host-wide, read from `/proc/net/snmp`), so two
+     tunnels can be compared only by how full they are, and a carrier judged on
+     occupancy is the mistake this cycle already made once with `no_channel`.
+
+     So L4's evidence has to be reported, like L3's: **extend `CarrierReport` to
+     name a tunnel instead of a lane** (the report's shape already carries an
+     identity, a pair of cumulative counters and a sequence, so the extension is
+     a second identity kind rather than a new message). The server can attribute
+     what it offered and what a tunnel's stream set refused, because a stream's
+     prologue already names the tunnel it arrived on — the same fact the L3 path
+     uses per lane. The wire line is unreleased v5, whose commands may be
+     extended in place, so this costs no version bump.
+
+     **The first slice's order, therefore**: the per-tunnel carrier and state in
+     the pool (`PoolEntry`), the dialer that takes a target, and placement
+     skipping a draining entry — all three testable without the report, with the
+     UDP-blocked acceptance case above as their proof; then the report extension
+     and the rule, in that order, so no rule is ever written against evidence
+     that does not exist.
 
 The round-3 policy in `src/transparent/lanes.rs` (still uncommitted) is
 **not** the basis for any of this: it reads `no_channel` as carrier loss, has
@@ -1788,6 +1886,194 @@ mux×1 gap is priced as the engine's per-byte work rather than a fixable defect
    they are published history and the page's note maps them to today's catalog —
    but a future release sweep should add today's names rather than renumber the
    old ones.
+
+### Per-byte or per-datagram: the two-size fit (2026-10-11, round 19)
+
+The split said the send half owns the phase; the next question is what that half
+charges *for*, and one run answers it without touching code — the same clean
+`bulk-1` cell at a jumbo MTU, against the 1472-byte reading above:
+
+| datagram size | `ms_out_send` per outbound datagram |
+|---|---|
+| 1472 B | **3.85 µs** |
+| 8000 B | **5.25 µs** |
+
+Fitting `cost = a + b·size` over the two points gives **a ≈ 3.5 µs fixed per
+datagram** and b ≈ 0.21 ns per byte — so at 1472 bytes the *fixed* term is 92 %
+of the cost, and the per-byte term is nearly noise. That is the opposite of a
+copy-bound shape and two orders of magnitude above per-datagram syscall
+amortisation inside a 32-message `sendmmsg`, so what it prices is the per-message
+work below our staging: the kernel's UDP send path per datagram, plus whatever
+per-span setup our side does.
+
+**What that closes, and what it leaves.** Three measured attempts now agree that
+this path's cost is not where the obvious code-level candidates were: the
+inbound copy removal was a cost (RSS), gating the diagnostics was noise, and the
+pacer is 1.7 % of the phase. The lever the numbers do point at is **datagram
+count**, which is the TUN/link MTU — an operator setting, and one this
+repository already measured at +84 % throughput and a third of the CPU per byte
+at 8000 ([deployment.md](docs/deployment.md#transparent-services)). The
+remaining code-level question — how much of the 3.5 µs is ours and how much is
+the kernel's — is answerable by comparing the pump's `ms_out_send` against the
+process's own system CPU time; if they match, the answer is "kernel", and no
+change on this path will pay.
+
+### And the split says which half (2026-10-11, round 18)
+
+The measurement the note above asked for, taken on the same cell (two
+consecutive stat lines one second apart, server side):
+
+| half of the output phase | ms in that second | share |
+|---|---|---|
+| **`ms_out_send`** (the batched wire send) | **+729.3** | **98 %** |
+| `ms_out_pace` (the pacer's per-span decision) | +12.6 | 1.7 % |
+
+with `datagrams_out` +189 396 in the same second — so **≈3.85 µs per outbound
+datagram is spent in the send half**, and the pacer costs ~0.07 µs per datagram.
+At up to 32 datagrams per batch that is ≈123 µs per `sendmmsg`, one to two
+orders of magnitude above what handing 32 iovecs to the kernel should cost.
+
+**The pacer is exonerated, and the search moves into `send_spans` and the
+`udp_batch` send path beneath it** — where the remaining candidates are the
+per-batch iovec/msghdr construction and whatever the split-span path does with
+a header plus a payload reference (a copy there would be ~276 MB/s of memcpy at
+this rate, which is real but does not by itself explain 729 ms). The two new
+fields are on the stats line (`ms_out_pace`, `ms_out_send`) so the next attempt
+starts from this split rather than from the phase total.
+
+## The clean cell's per-datagram output cost (2026-10-11, round 17)
+
+The round-15/16 exchange ended with an instruction to itself: price the carrier
+on a cell where the path keeps up, because a saturated one cannot. This is that
+reading — `l3`, `bulk-1`, `condition clean`, one round, `MOLEHILL_KCP_STATS=1`,
+two consecutive stat lines two seconds apart, on the **server**:
+
+| phase | ms per second | share of a core |
+|---|---|---|
+| `ms_output` | **748** | **75 %** |
+| `ms_input` | 46 | 4.6 % |
+| `ms_writer` | 42 | 4.2 % |
+| `ms_deliver` | 9.5 | ~1 % |
+| `ms_update` | 5.7 | 0.6 % |
+
+with `datagrams_out` ≈197 000/s (≈2.9 Gbit/s at the 1472 B datagram it had
+adapted to), **`retransmits` 0**, **`wait_snd_peak` 376** against the 16 384
+segment cap, `srtt_ms` 1–3, `peer_wnd` 4096.
+
+**This is the clean measurement the earlier rounds could not make.** The queue
+is empty and nothing is being retransmitted, so the output phase is not the cost
+of congestion — it is **≈3.8 µs per outbound datagram**, spent inside
+`drain_dgrams`: the pacer's per-span decision (which reads the clock once per
+datagram), the span staging, and the `sendmmsg` batch that carries up to 32 of
+them. 3.8 µs is one to two orders of magnitude above what staging and one
+batched syscall should cost, so the next attempt's first job is to **split that
+phase in two** — the pacer decision and the wire send — with a phase timer
+around each, and let the split say which of them owns the time. That is a
+measurement change, not an optimisation, and it is the one to make before any
+constant is touched.
+
+## Where the carrier's CPU is, measured at this commit (2026-10-11, round 15)
+
+One reading, taken so the next attempt starts from data rather than from a
+memory of older numbers: `l3`, `udp-ladder`, `loss1_buf`, tunnel leg, one round,
+`MOLEHILL_KCP_STATS=1`, the busiest second (two consecutive stat lines
+subtracted, so this is a rate and not a lifetime):
+
+| phase | ms in that second | share of the pump |
+|---|---|---|
+| `ms_output` (pacer + wire drain + retries) | **+144.2** | **62 %** |
+| `ms_writer` (app → ARQ) | +31.0 | 13 % |
+| `ms_input` (wire → ARQ) | +31.1 | 13 % |
+| `ms_update` (timers, retransmit decisions) | +25.4 | 11 % |
+| `ms_deliver` (ARQ → reader) | +1.6 | <1 % |
+
+with `datagrams_out` +53 305, `retransmits` +2 502 (4.7 % of output),
+`pump_rounds` +8 704, `wait_snd_peak` **16 395** — the send queue sitting at its
+cap (2 × 8192 segments) for the whole window — `srtt_ms` 10–17, `rto_ms` 30,
+`datagram_b` 1472.
+
+**A correction, made in the next round before anything was built on it.** The
+first reading of this table (below, kept because the correction is the useful
+part) said "the lever must be queueing". It is not, and the arithmetic says so:
+the second being measured emitted ≈53 305 × 1472 B ≈ **628 Mbit/s while the cell
+offers 1000** — the ladder's cells deliberately offer more than the path
+carries, which is what a ladder is for. At that rate the BDP over the window's
+17 ms is ≈**902 segments**, far under both the send window (8192) and the queue
+cap (16 384): **neither is the constraint; the path is.** A pump that spends its
+time trying to push a gigabit through six hundred megabits is the *intended*
+shape of that cell, so "attempts that do not go out" is the workload, not a
+defect to fix. The original reading, kept as the record of it:
+
+> The carrier's time is in the send path, and the send queue is full while it
+> is: a large part of that 144 ms looks like the cost of attempts that do not go
+> out — `send_spans` hitting a full socket, parking the remainder, paying a
+> syscall again next round.
+
+What survives the correction is what it already ruled out: **allocations on
+this path are not the lever** (this cycle's two allocation-level changes measured
+as a cost and as noise respectively), and a saturated cell cannot price a
+per-datagram change at all. The CPU-per-delivered-byte gap against TCP (1.661
+against 0.586 s/Gbit at the 1 Gbit/s cell) has to be attacked where the path
+keeps up — the **clean** cells, where the pump is not saturated — and the phases
+that matter there are the ones this table shows as secondary (`ms_writer`,
+`ms_input`, `ms_update`), not the one a congested cell makes dominant.
+
+So the next attempt should aim at the queueing, and it has three shapes worth
+pricing, in the order the reading argues for them: the socket buffer and the
+pacer's interaction with it (a parked datagram is retried, and the parked queue
+is bounded by half the RTO), the send-queue cap itself (`2 × snd_wnd` = 16 384
+segments, which is what `wait_snd_peak` is pinned to), and the retransmit share
+(4.7 % on a path losing 1 %) — each with its own A/B, and each with the caveat
+that the throughput the cell is already reaching bounds how much any of them
+can show.
+
+## Falsified: the inbound payload copy is not the cost (2026-10-11, round 14)
+
+The receive path allocated a right-sized buffer per accepted segment and copied
+the datagram's payload into it (`BytesMut::zeroed` + `read_exact`), and the
+adapter always held the datagram as a `Bytes` — so `Kcp::input_bytes` was added
+to hand the payload on as a slice instead (`8854500`), with the property pinned
+by pointer in a test. It looked like the obvious remaining CPU lever on the
+carrier.
+
+**Measured, and reverted (`e57a45b`).** Two binaries, `--ab-arm l3`, `l3`,
+`bulk-1,bulk-n`, clean, three rounds plus a warm-up with `--aa` (24 samples,
+baseline `ee9a73e004049d5b`, candidate `2753a897ab66c92d`): **one claim of
+twenty-eight comparisons, and it is a cost** — `bulk-n[P8] rss_peak_mib`
+**+18.26 %** on the candidate. Throughput and CPU per byte were inside the
+floors on every cell.
+
+The mechanism is worth keeping: a slice shares the *whole datagram allocation*
+and keeps its `Bytes` header alive, where the copy produced a right-sized buffer
+that died with the segment. At an MTU where one datagram carries one segment the
+bytes are the same but the per-segment handle is not, and eight flows' worth of
+in-flight segments is what the peak measures. So the receive-side copy is *not*
+where the carrier's CPU goes; the lever the earlier rounds pointed at (the
+per-segment work above it, and the send path's own costs) stays the one to
+attack — with a run's floors as the gate, which is what this one did.
+
+## Verified state of this branch (2026-10-11, round 9)
+
+The branch is green end to end at `c45af2b`, and the two proofs that matter for
+everything this cycle touched were re-run rather than inherited:
+
+- **`just l3-accept`: 15/15 PASS** at this commit — the transparent data plane is
+  intact *after* the two-sided drain, the automatic carrier move and the lending
+  arbitration all landed. (Its previous green run predated all three, so this is
+  the re-check, not a repeat.)
+- **The heavy chain** (audit, deny, outdated, the full serial test suite) is
+  green on this commit: it runs on every push, and the push that carried it
+  passed.
+- The suites beside them: 249 lib tests, 11 `pool_test` scenarios, 23
+  `integration_test` cases, clippy twice (default and the minimal
+  `server,client` build).
+
+What is **not** proven, stated once more because it is the thing a reader is
+most likely to assume: the automatic carrier move's **benefit**. Its mechanism
+is measured end to end (above); its effect is not, and the current model's
+workloads cannot show it (a round is shorter than the confirmation plus the
+drain plus the flows that would follow). That is a decision for the human, not
+a defect to fix quietly.
 
 ## The v0.10.0 theme
 

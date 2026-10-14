@@ -549,7 +549,7 @@ async fn a_burst_past_the_stream_cap_never_costs_a_tunnel() -> Result<()> {
     assert!(
         pool.tunnels
             .iter()
-            .all(|(streams, _, _)| *streams <= POOL_STREAM_CEILING),
+            .all(|(streams, _, _, _)| *streams <= POOL_STREAM_CEILING),
         "the placement ceiling must hold per tunnel: {pool:?}"
     );
 
@@ -875,7 +875,7 @@ async fn a_valve_held_pool_still_never_reaches_the_stream_cap() -> Result<()> {
     assert!(
         pool.tunnels
             .iter()
-            .all(|(streams, _, _)| *streams <= POOL_STREAM_CEILING),
+            .all(|(streams, _, _, _)| *streams <= POOL_STREAM_CEILING),
         "the placement ceiling must hold per tunnel: {pool:?}"
     );
 

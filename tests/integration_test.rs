@@ -460,7 +460,7 @@ async fn bulk_echo_roundtrip(addr: &'static str, len: usize) -> Result<()> {
 /// One live pool as the placement poll reads it: its size, and the
 /// `(streams, pending, pinned)` of each of its tunnels.
 #[cfg(feature = "multiplex")]
-type PoolShape = (usize, Vec<(usize, usize, usize)>);
+type PoolShape = (usize, Vec<(usize, usize, usize, molehill_rathole::Carrier)>);
 
 /// Wait until one live pool carries a stream on **every** one of its four
 /// tunnels — the per-instant half of D24, which the pool-size assertion after
@@ -488,7 +488,9 @@ async fn wait_for_a_stream_on_every_stripe_tunnel(deadline: Duration) -> Result<
             .map(|pool| (pool.size, pool.tunnels.clone()))
             .collect();
         let spread = observed.iter().any(|(size, tunnels)| {
-            *size == 4 && tunnels.len() == 4 && tunnels.iter().all(|(streams, _, _)| *streams >= 1)
+            *size == 4
+                && tunnels.len() == 4
+                && tunnels.iter().all(|(streams, _, _, _)| *streams >= 1)
         });
         if spread {
             return Ok(());

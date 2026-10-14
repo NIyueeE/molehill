@@ -356,21 +356,21 @@ pub struct PoolSnapshot {
     /// are therefore being repaired). A pinned pool has no policy shrink, so
     /// this counts losses, not decisions.
     pub shrinks: u64,
-    /// Per-tunnel `(streams, pending, pinned)`, in pool order.
-    pub tunnels: Vec<(usize, usize, usize)>,
+    /// Per-tunnel `(streams, pending, pinned, carrier)`, in pool order.
+    pub tunnels: Vec<(usize, usize, usize, Carrier)>,
 }
 
 impl PoolSnapshot {
     /// Established streams anywhere in the pool.
     #[must_use]
     pub fn streams(&self) -> usize {
-        self.tunnels.iter().map(|(s, _, _)| *s).sum()
+        self.tunnels.iter().map(|(s, _, _, _)| *s).sum()
     }
 
     /// The pool's pinned peers, summed over its tunnels.
     #[must_use]
     pub fn pinned(&self) -> usize {
-        self.tunnels.iter().map(|(_, _, p)| *p).sum()
+        self.tunnels.iter().map(|(_, _, p, _)| *p).sum()
     }
 }
 
@@ -389,6 +389,10 @@ struct PoolState {
 
 /// One live tunnel of a pool.
 struct PoolEntry {
+    /// The carrier this tunnel was established on. Per entry, not per pool: a
+    /// repair may ride a different one than the tunnels around it, and the
+    /// telemetry has to say what is true rather than what the pool was born as.
+    carrier: Carrier,
     tunnel: ClientTunnel,
     /// Dropping this ends the driver; the pool holds it for the tunnel's whole
     /// life, so removal actually releases the connection.
@@ -422,15 +426,24 @@ struct Reservation {
 
 /// What one pool needs to create a new tunnel: the dialer, plus the shutdown
 /// sender of the driver it started.
-type DialResult = Result<(ClientTunnel, tokio::sync::watch::Sender<bool>), String>;
+pub type DialResult = Result<(ClientTunnel, tokio::sync::watch::Sender<bool>), String>;
 
 /// The pool's way to add a tunnel. `ClientTunnel`s carry no index; the pool
 /// assigns one when it inserts the tunnel.
 pub type Dialer = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = DialResult> + Send>>
+    dyn Fn(Carrier) -> std::pin::Pin<Box<dyn std::future::Future<Output = DialResult> + Send>>
         + Send
         + Sync,
 >;
+
+/// Which carrier the pool should establish **next**.
+///
+/// A function rather than a value: the answer changes while the pool lives (the
+/// client's carrier choice falls back, and a quality decision can move it), and
+/// a pool that captured one carrier at birth kept repairing into a path that had
+/// stopped working — the defect this parameter exists to fix. The pool does not
+/// learn *why* the answer changed, only what it is.
+pub type PreferredCarrier = std::sync::Arc<dyn Fn() -> Carrier + Send + Sync>;
 
 /// Why an open failed.
 #[derive(Debug)]
@@ -626,6 +639,8 @@ struct TunnelPoolInner {
     state: parking_lot::Mutex<PoolState>,
     /// Creates a new tunnel for a repair. `None` on a pool built without one.
     dial: Option<Dialer>,
+    /// The carrier a repair should establish now (see [`PreferredCarrier`]).
+    preferred: PreferredCarrier,
     /// The client's UDP pin accounting: which peers end on which tunnel (D30).
     pins: std::sync::Arc<PinRegistry>,
 }
@@ -660,6 +675,33 @@ impl TunnelPool {
         dial: Option<Dialer>,
         pins: std::sync::Arc<PinRegistry>,
     ) -> TunnelPool {
+        Self::with_preference(
+            carrier,
+            key,
+            initial,
+            tunnels,
+            dial,
+            std::sync::Arc::new(move || carrier),
+            pins,
+        )
+    }
+
+    /// The same, with the carrier a repair should establish decided at dial time
+    /// rather than fixed at pool creation.
+    ///
+    /// This is the seam the resilience defect needed: a pool whose dialer is
+    /// pinned to the carrier it was born on keeps repairing into a path that has
+    /// stopped carrying it, while the client's own carrier choice has already
+    /// fallen back.
+    pub fn with_preference(
+        carrier: Carrier,
+        key: String,
+        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        tunnels: usize,
+        dial: Option<Dialer>,
+        preferred: PreferredCarrier,
+        pins: std::sync::Arc<PinRegistry>,
+    ) -> TunnelPool {
         let shared = std::sync::Arc::new(PoolShared {
             carrier,
             key,
@@ -681,6 +723,7 @@ impl TunnelPool {
         };
         for (tunnel, shutdown) in initial {
             state.entries.push(PoolEntry {
+                carrier,
                 tunnel,
                 _shutdown: shutdown,
             });
@@ -690,6 +733,7 @@ impl TunnelPool {
                 shared,
                 state: parking_lot::Mutex::new(state),
                 dial,
+                preferred,
                 pins,
             }),
         };
@@ -772,6 +816,7 @@ impl TunnelPool {
                         load.streams,
                         load.pending,
                         self.inner.pins.pinned_on(e.tunnel.id()),
+                        e.carrier,
                     )
                 })
                 .collect(),
@@ -1238,13 +1283,15 @@ impl TunnelPool {
         if size >= count {
             return Err(format!("already at the configured tunnel count ({count})"));
         }
-        let (tunnel, shutdown) = dial().await?;
+        let wanted = (self.inner.preferred)();
+        let (tunnel, shutdown) = dial(wanted).await?;
         let mut state = self.inner.state.lock();
         if state.entries.len() >= state.count {
             return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
         state.entries.push(PoolEntry {
+            carrier: wanted,
             tunnel,
             _shutdown: shutdown,
         });
@@ -1674,7 +1721,9 @@ impl TunnelPool {
         let tunnels: Vec<String> = snapshot
             .tunnels
             .iter()
-            .map(|(streams, pending, pinned)| format!("{streams}/{pending}/{pinned}"))
+            .map(|(streams, pending, pinned, carrier)| {
+                format!("{streams}/{pending}/{pinned}/{}", carrier.as_str())
+            })
             .collect();
         let timeline: Vec<String> = events
             .iter()
@@ -2215,7 +2264,7 @@ mod tests {
     /// A pool that starts with `n` in-memory tunnels and is configured for
     /// `count`: every repair dials one more, until the count is reached.
     fn growable_pool(n: usize, count: usize) -> TunnelPool {
-        let dial: Dialer = std::sync::Arc::new(|| {
+        let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
             Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
         });
         let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
@@ -2238,7 +2287,7 @@ mod tests {
         count: usize,
         dials: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> TunnelPool {
-        let dial: Dialer = std::sync::Arc::new(move || {
+        let dial: Dialer = std::sync::Arc::new(move |_: Carrier| {
             let dials = std::sync::Arc::clone(&dials);
             Box::pin(async move {
                 dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2330,7 +2379,7 @@ mod tests {
         // `max_tunnels_per_client` valve takes at the pool.
         let dials = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&dials);
-        let dial: Dialer = Arc::new(move || {
+        let dial: Dialer = Arc::new(move |_: Carrier| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -2387,7 +2436,7 @@ mod tests {
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(
             used.iter().filter(|n| **n > 0).count(),
@@ -2419,7 +2468,7 @@ mod tests {
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(used, vec![2, 2], "the pool reuses both tunnels: {used:?}");
         assert_eq!(pool.size(), 2, "the pool never grows for load");
@@ -2456,7 +2505,7 @@ mod tests {
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(
             per_tunnel,
@@ -2499,7 +2548,7 @@ mod tests {
             pool.snapshot()
                 .tunnels
                 .iter()
-                .map(|(streams, _, _)| *streams)
+                .map(|(streams, _, _, _)| *streams)
                 .sum::<usize>(),
             ceiling,
             "every stream slot this pool has is taken"
@@ -2554,7 +2603,7 @@ mod tests {
         const COUNT: usize = 3;
         let calls = std::sync::Arc::new(AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&calls);
-        let dial: Dialer = std::sync::Arc::new(move || {
+        let dial: Dialer = std::sync::Arc::new(move |_: Carrier| {
             let counter = std::sync::Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -2729,7 +2778,7 @@ mod tests {
             pool.snapshot()
                 .tunnels
                 .iter()
-                .map(|(s, _, _)| *s)
+                .map(|(s, _, _, _)| *s)
                 .collect::<Vec<_>>(),
             vec![OPENS / TUNNELS; TUNNELS],
             "the least-loaded rule must spread four opens evenly over two tunnels"
@@ -2751,7 +2800,7 @@ mod tests {
             pool.snapshot()
                 .tunnels
                 .iter()
-                .map(|(s, _, _)| *s)
+                .map(|(s, _, _, _)| *s)
                 .collect::<Vec<_>>(),
             vec![2 * OPENS / TUNNELS; TUNNELS],
             "the extra streams spread over the same tunnels"
@@ -2843,6 +2892,52 @@ mod tests {
     /// A tunnel whose connection dies leaves the pool even while it still
     /// "holds" a stream, and the pool dials its replacement.
     ///
+    /// **A repair asks for the carrier the endpoint prefers now, not the one the
+    /// pool was born on.**
+    ///
+    /// The pool's carrier is part of its identity, and its dialer used to be
+    /// built for that one carrier at pool creation — so a pool that came up on
+    /// KCP kept repairing into KCP after UDP stopped working, which is the
+    /// defect this seam exists for. The fixture makes the two answers differ on
+    /// purpose: born on TCP, preferring KCP, and the *first* repair must ask for
+    /// KCP.
+    #[tokio::test]
+    async fn a_repair_establishes_the_preferred_carrier() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&asked);
+        let dial: Dialer = std::sync::Arc::new(move |carrier: Carrier| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.lock().unwrap().push(carrier);
+                Err("no server in this test".to_owned())
+            })
+        });
+        let preferred: PreferredCarrier = std::sync::Arc::new(|| Carrier::Kcp);
+        // Empty pool, count 1: the maintenance tick's first act is a repair.
+        let _pool = TunnelPool::with_preference(
+            Carrier::Tcp,
+            "preferred".to_owned(),
+            Vec::new(),
+            1,
+            Some(dial),
+            preferred,
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !asked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let seen = asked.lock().unwrap().clone();
+        assert_eq!(
+            seen.first().copied(),
+            Some(Carrier::Kcp),
+            "the repair must ask for the preferred carrier, not the pool's birth one: {seen:?}"
+        );
+    }
+
     /// The old pool asked for a replacement only when the dead tunnel had
     /// carried something, and its idle shrink needed the *whole* pool quiet —
     /// so a stream that outlived its connection kept a corpse placeable for
@@ -2865,7 +2960,7 @@ mod tests {
         let t0 = ClientTunnel::start(client_io, mux_config(), shutdown0_rx);
 
         let dials_for_dialer = std::sync::Arc::clone(&dials);
-        let dialer: Dialer = std::sync::Arc::new(move || {
+        let dialer: Dialer = std::sync::Arc::new(move |_: Carrier| {
             let dials = std::sync::Arc::clone(&dials_for_dialer);
             Box::pin(async move {
                 dials.fetch_add(1, Ordering::Relaxed);

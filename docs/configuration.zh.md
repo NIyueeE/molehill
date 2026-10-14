@@ -548,7 +548,7 @@ carrier,还有一个用于安排一次诊断性的 carrier 切换。前六个默
 | 开关 | 输出 | 内容 |
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
-| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain 与 ARQ update 的粗粒度分相计时 |
+| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
 | `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |

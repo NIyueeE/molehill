@@ -1632,7 +1632,7 @@ async fn establish_tunnels(
     // TCP (its repair included), because a pool whose tunnels rode two carriers
     // would be two pools wearing one name.
     let (carrier, dialer, initial) = if choice.try_kcp() {
-        match dial.dialer(Carrier::Kcp).await {
+        match dial.dialer().await {
             Ok(dialer) => {
                 let attempt = tokio::time::timeout(
                     KCP_ATTEMPT_BUDGET,
@@ -1680,12 +1680,20 @@ async fn establish_tunnels(
         established,
         "pool-stats: tunnel pool established"
     );
-    Ok(Tunnels::Yamux(TunnelPool::with_dialer(
+    // The pool is told how to ask which carrier to establish *now*: a repair
+    // after a fallback comes up on the carrier the endpoint prefers, instead of
+    // dialing the one the pool was born on forever.
+    let preferred: crate::transport::multiplex::PreferredCarrier = {
+        let choice = Arc::clone(choice);
+        Arc::new(move || choice.carrier())
+    };
+    Ok(Tunnels::Yamux(TunnelPool::with_preference(
         carrier,
         key.to_owned(),
         initial,
         target,
         Some(dialer),
+        preferred,
         pins,
     )))
 }
@@ -1706,7 +1714,7 @@ async fn establish_initial(
     let mut dials = tokio::task::JoinSet::new();
     for _ in 0..target {
         let dial = Arc::clone(dialer);
-        dials.spawn(async move { dial().await });
+        dials.spawn(async move { dial(carrier).await });
     }
     let mut initial = Vec::with_capacity(target);
     let mut failures = 0usize;
@@ -1746,13 +1754,28 @@ async fn tunnel_dialer(
     data_addr: &AddrMaybeCached,
     session_nonce: Nonce,
     opts: &DataOpts,
-    carrier: Carrier,
+    choice: &Arc<CarrierChoice>,
 ) -> Result<Dialer> {
-    match carrier {
-        Carrier::Tcp => {
+    // Both carriers are built, and the pool says which one to use **per call**:
+    // a repair asks for the carrier the endpoint prefers *now*, which is what
+    // lets a pool that came up on KCP bring its replacement up on TCP after UDP
+    // stops working.
+    /// One carrier's dial, before the choice of which to call: the composite
+    /// below is what the pool holds.
+    type OneDialer = std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::transport::multiplex::DialResult>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    >;
+    let tcp: OneDialer = {
+        {
             let transport = Arc::clone(transport);
             let data_addr = data_addr.clone();
-            Ok(Arc::new(move || {
+            Arc::new(move || {
                 let transport = Arc::clone(&transport);
                 let data_addr = data_addr.clone();
                 Box::pin(async move {
@@ -1760,41 +1783,61 @@ async fn tunnel_dialer(
                         .await
                         .map_err(|e| format!("{e:#}"))
                 })
-            }))
+            })
         }
-        #[cfg(feature = "kcp")]
-        Carrier::Kcp => {
-            // Resolved once, at pool creation: a KCP growth must not block on
-            // DNS inside the placement path.
-            let remote_addr = {
-                let mut probe = AddrMaybeCached::new(&opts.addr);
-                probe.resolve().await.with_context(|| {
-                    format!("Failed to resolve the KCP data endpoint {}", opts.addr)
-                })?;
-                probe.socket_addr.ok_or_else(|| {
-                    anyhow!("The KCP data endpoint {} resolved to nothing", opts.addr)
-                })?
-            };
+    };
+    #[cfg(feature = "kcp")]
+    let kcp: OneDialer = {
+        // Resolved once, at pool creation: a KCP growth must not block on
+        // DNS inside the placement path.
+        let remote_addr = {
+            let mut probe = AddrMaybeCached::new(&opts.addr);
+            probe.resolve().await.with_context(|| {
+                format!("Failed to resolve the KCP data endpoint {}", opts.addr)
+            })?;
+            probe
+                .socket_addr
+                .ok_or_else(|| anyhow!("The KCP data endpoint {} resolved to nothing", opts.addr))?
+        };
+        let opts = opts.clone();
+        let choice = Arc::clone(choice);
+        Arc::new(move || {
             let opts = opts.clone();
-            Ok(Arc::new(move || {
-                let opts = opts.clone();
-                Box::pin(async move {
-                    tokio::time::timeout(
-                        KCP_ESTABLISH_TIMEOUT,
-                        establish_one_kcp_tunnel(remote_addr, session_nonce, &opts, "pool"),
-                    )
-                    .await
+            let choice = Arc::clone(&choice);
+            Box::pin(async move {
+                let attempt = tokio::time::timeout(
+                    KCP_ESTABLISH_TIMEOUT,
+                    establish_one_kcp_tunnel(remote_addr, session_nonce, &opts, "pool"),
+                )
+                .await;
+                let result = attempt
                     .map_err(|_| "KCP tunnel establishment timed out".to_owned())?
-                    .map_err(|e| format!("{e:#}"))
-                })
-            }))
-        }
-        // Unreachable: a build without the feature has no way to choose KCP
-        // (`CarrierChoice::try_kcp` answers false), and the TCP arm above is
-        // then the only one taken.
+                    .map_err(|e| format!("{e:#}"));
+                if let Err(e) = &result {
+                    // A repair that cannot bring KCP up is the same news the
+                    // *initial* establishment reports, and it is the only
+                    // news the endpoint's choice would otherwise never get:
+                    // the pool's dialer is fixed to the carrier the pool was
+                    // born on, so without this the client keeps believing a
+                    // path that has since stopped carrying UDP is fine —
+                    // and every other pool, lane and future session that
+                    // dials that endpoint keeps paying for the attempt.
+                    choice.on_kcp_failure(e);
+                }
+                result
+            })
+        })
+    };
+    Ok(Arc::new(move |wanted: Carrier| match wanted {
+        Carrier::Tcp => tcp(),
+        // A build without the feature has no way to be asked for KCP
+        // (`CarrierChoice::try_kcp` answers false), and TCP is then the only
+        // carrier there is.
+        #[cfg(feature = "kcp")]
+        Carrier::Kcp => kcp(),
         #[cfg(not(feature = "kcp"))]
-        Carrier::Kcp => bail!("This binary was built without the `kcp` feature"),
-    }
+        Carrier::Kcp => tcp(),
+    }))
 }
 
 /// Everything one pool's dialing needs, so the functions that build a dialer,
@@ -1806,6 +1849,10 @@ struct PoolDial<'a> {
     data_addr: &'a AddrMaybeCached,
     session_nonce: Nonce,
     opts: &'a DataOpts,
+    /// The endpoint's carrier decision, so a dialer's own failures are reported
+    /// to the one place that knows what the path is doing (see the KCP arm of
+    /// [`tunnel_dialer`]).
+    choice: &'a Arc<CarrierChoice>,
 }
 
 /// A pool's start on TCP: its dialer (which repair keeps using) and the tunnels
@@ -1820,7 +1867,7 @@ async fn tcp_pool_start(
     Dialer,
     Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
 )> {
-    let dialer = dial.dialer(Carrier::Tcp).await?;
+    let dialer = dial.dialer().await?;
     let initial = establish_initial(&dialer, target, key, Carrier::Tcp).await;
     Ok((dialer, initial))
 }
@@ -1828,13 +1875,13 @@ async fn tcp_pool_start(
 #[cfg(feature = "multiplex")]
 impl PoolDial<'_> {
     /// The dialer one carrier's tunnels are established with.
-    async fn dialer(&self, carrier: Carrier) -> Result<Dialer> {
+    async fn dialer(&self) -> Result<Dialer> {
         tunnel_dialer(
             self.transport,
             self.data_addr,
             self.session_nonce,
             self.opts,
-            carrier,
+            self.choice,
         )
         .await
     }
@@ -3973,6 +4020,7 @@ impl ClientSession {
             data_addr,
             session_nonce: *nonce,
             opts: &slot.data,
+            choice: &choice,
         };
         let tunnel = establish_tunnels(dial, &key, floor, Arc::clone(&self.pins), &choice)
             .await

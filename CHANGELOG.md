@@ -246,6 +246,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A tunnel pool's repair now follows the endpoint's carrier preference.** A
+  pool's dialer was built for the carrier the pool was created on, so a pool that
+  came up on KCP kept repairing into KCP after UDP stopped working: it served on
+  whatever tunnels survived, for the process's life, while the client's own
+  carrier choice had already fallen back to TCP. A repair now asks which carrier
+  to establish — the same choice the fallback and the lane policy drive — and
+  each tunnel records what it actually rides, so the pool's telemetry says what
+  is true rather than what the pool was born as.
+
 - **A KCP control frame that shared a datagram batch with payload is no longer
   fed to the ARQ and dropped.** Only the first datagram of a batch was
   classified, so a `PING`/`PONG`/`SACK`/`CLOSE` frame arriving behind data — the

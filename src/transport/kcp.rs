@@ -399,27 +399,55 @@ pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER_RECV: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_WRITER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_OUTPUT: AtomicU64 = AtomicU64::new(0);
+/// The output phase, split in two: the pacer's per-span decision (a clock read
+/// and a token test per datagram) and the wire send that carries a batch of
+/// them. The split exists because the phase as a whole is the carrier's largest
+/// on a clean path — 3.8 µs per outbound datagram, measured — and one number
+/// cannot say which half owns it.
+pub(crate) static KCP_NS_OUT_PACE: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_NS_OUT_SEND: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_UPDATE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the pump's diagnostic instrumentation is collected at all.
+///
+/// Every counter it feeds is only ever *read* by the periodic stats line, and
+/// that line is spawned only when `MOLEHILL_KCP_STATS` is set (`spawn_kcp_stats`).
+/// On a default run the pump was therefore paying, per phase per round, a clock
+/// read and an atomic add for a number nobody would read — and per round a
+/// handful of gauge stores beside them. The switch is read once per process,
+/// like the environment variable it follows.
+#[must_use]
+fn kcp_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MOLEHILL_KCP_STATS").is_some())
+}
 
 /// Times one pump phase into its counter on drop, so a `break`/early
 /// return mid-phase still books the elapsed time.
+///
+/// A no-op timer when the stats line is off (see [`kcp_stats_enabled`]): the
+/// clock is not read at all, which is the point — the timings describe a run
+/// that asked for them.
 struct PhaseTimer<'a> {
     stat: &'a AtomicU64,
-    start: Instant,
+    start: Option<Instant>,
 }
 
 impl<'a> PhaseTimer<'a> {
     fn new(stat: &'a AtomicU64) -> Self {
         PhaseTimer {
             stat,
-            start: Instant::now(),
+            start: kcp_stats_enabled().then(Instant::now),
         }
     }
 }
 
 impl Drop for PhaseTimer<'_> {
     fn drop(&mut self) {
-        let ns = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let Some(start) = self.start else {
+            return;
+        };
+        let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.stat.fetch_add(ns, Ordering::Relaxed);
     }
 }
@@ -443,6 +471,8 @@ pub(crate) struct KcpStats {
     pub ms_deliver_recv: f64,
     pub ms_writer: f64,
     pub ms_output: f64,
+    pub ms_out_pace: f64,
+    pub ms_out_send: f64,
     pub ms_update: f64,
     pub reader_queued_bytes: u64,
     pub spill_bytes: u64,
@@ -486,6 +516,8 @@ pub(crate) fn kcp_stats() -> KcpStats {
         ms_deliver_recv: ms(&KCP_NS_DELIVER_RECV),
         ms_writer: ms(&KCP_NS_WRITER),
         ms_output: ms(&KCP_NS_OUTPUT),
+        ms_out_pace: ms(&KCP_NS_OUT_PACE),
+        ms_out_send: ms(&KCP_NS_OUT_SEND),
         ms_update: ms(&KCP_NS_UPDATE),
         reader_queued_bytes: KCP_READER_QUEUED_BYTES.load(Ordering::Relaxed),
         spill_bytes: KCP_SPILL_BYTES.load(Ordering::Relaxed),
@@ -538,6 +570,8 @@ fn spawn_kcp_stats() {
                     ms_deliver_recv = format!("{:.3}", s.ms_deliver_recv),
                     ms_writer = format!("{:.3}", s.ms_writer),
                     ms_output = format!("{:.3}", s.ms_output),
+                    ms_out_pace = format!("{:.3}", s.ms_out_pace),
+                    ms_out_send = format!("{:.3}", s.ms_out_send),
                     ms_update = format!("{:.3}", s.ms_update),
                     reader_queued_bytes = s.reader_queued_bytes,
                     spill_bytes = s.spill_bytes,
@@ -750,6 +784,9 @@ fn note_pacer(rate_bps: f64) {
 /// state a stuck session is stuck *in*, which is what made this path's measured
 /// regressions findable at all.
 fn note_gauges(kcp: &Kcp<DatagramOut>, pacer_bps: f64) {
+    if !kcp_stats_enabled() {
+        return;
+    }
     note_wait_snd(kcp.wait_snd());
     note_windows(kcp);
     note_rto(kcp);
@@ -1490,12 +1527,15 @@ async fn drain_parked(
         let overdue = front.parked_at.elapsed() >= deadline;
         let mut take: Vec<Span> = Vec::with_capacity(front.spans.len());
         let mut rest: Vec<Span> = Vec::new();
-        for (i, span) in front.spans.iter().enumerate() {
-            if overdue || pace.pacer.allow(Instant::now(), span.len(), rate).is_ok() {
-                take.push(span.clone());
-            } else {
-                rest.extend(front.spans[i..].iter().cloned());
-                break;
+        {
+            let _t = PhaseTimer::new(&KCP_NS_OUT_PACE);
+            for (i, span) in front.spans.iter().enumerate() {
+                if overdue || pace.pacer.allow(Instant::now(), span.len(), rate).is_ok() {
+                    take.push(span.clone());
+                } else {
+                    rest.extend(front.spans[i..].iter().cloned());
+                    break;
+                }
             }
         }
         if take.is_empty() {
@@ -1510,7 +1550,11 @@ async fn drain_parked(
         } else {
             front.spans = rest;
         }
-        match send_spans(net, &buf, &take).await {
+        let sent = {
+            let _t = PhaseTimer::new(&KCP_NS_OUT_SEND);
+            send_spans(net, &buf, &take).await
+        };
+        match sent {
             Ok(k) => {
                 if k > 0 {
                     *sent_any = true;
@@ -1550,23 +1594,30 @@ async fn drain_batches(
         // itself.
         let mut allowed: Vec<Span> = Vec::with_capacity(batch.spans.len());
         let mut denied: Vec<Span> = Vec::new();
-        for span in &batch.spans {
-            let ok = denied.is_empty()
-                && pace
-                    .pacer
-                    .allow(Instant::now(), span.len(), pace.rate_bps)
-                    .is_ok();
-            if ok {
-                allowed.push(span.clone());
-            } else {
-                denied.push(span.clone());
+        {
+            let _t = PhaseTimer::new(&KCP_NS_OUT_PACE);
+            for span in &batch.spans {
+                let ok = denied.is_empty()
+                    && pace
+                        .pacer
+                        .allow(Instant::now(), span.len(), pace.rate_bps)
+                        .is_ok();
+                if ok {
+                    allowed.push(span.clone());
+                } else {
+                    denied.push(span.clone());
+                }
             }
         }
         if allowed.is_empty() {
             park(pace, &batch.buf, denied);
             return;
         }
-        match send_spans(net, &batch.buf, &allowed).await {
+        let sent = {
+            let _t = PhaseTimer::new(&KCP_NS_OUT_SEND);
+            send_spans(net, &batch.buf, &allowed).await
+        };
+        match sent {
             Ok(k) => {
                 if k > 0 {
                     *sent_any = true;
@@ -3400,18 +3451,31 @@ mod tests {
             after.recv_empty > before.recv_empty,
             "no empty receive probe was counted"
         );
-        // Every phase that ran for this transfer books time, even on a
-        // quiet loopback session.
+        // The per-phase timings are instrumentation, and instrumentation is
+        // collected only when a run asks for it: with `MOLEHILL_KCP_STATS=1`
+        // every phase that ran books time, and without it nothing is read from
+        // the clock at all — which is the property that keeps a default run
+        // from paying for numbers nobody reads. The counters above are the
+        // engine's own and are always on, which is why they are asserted
+        // unconditionally.
         let ns =
             after.ms_input + after.ms_deliver + after.ms_writer + after.ms_output + after.ms_update;
-        assert!(
-            ns > before.ms_input
-                + before.ms_deliver
-                + before.ms_writer
-                + before.ms_output
-                + before.ms_update,
-            "no phase booked time"
-        );
+        let before_ns = before.ms_input
+            + before.ms_deliver
+            + before.ms_writer
+            + before.ms_output
+            + before.ms_update;
+        if super::kcp_stats_enabled() {
+            assert!(
+                ns > before_ns,
+                "no phase booked time, and timings were asked for"
+            );
+        } else {
+            assert_eq!(
+                ns, 0.0,
+                "phase timings were collected without MOLEHILL_KCP_STATS"
+            );
+        }
     }
 
     #[tokio::test]
