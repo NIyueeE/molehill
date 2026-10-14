@@ -1087,6 +1087,13 @@ impl Config {
         let mut config: Config =
             Config::deserialize(doc).with_context(|| "Failed to parse the config")?;
 
+        // The control channel's transport rule belongs to loading, not to
+        // running: a file that cannot serve is not a loaded configuration, and
+        // putting the check here is what makes every consumer of `from_str`
+        // agree with the daemon — the fixtures, the doc examples, and a future
+        // reader that parses a config to describe it.
+        Config::validate_control_transport(&config)?;
+
         if let Some(server) = config.server.as_mut() {
             Config::validate_server_config(server)?;
         }
@@ -1143,6 +1150,56 @@ impl Config {
             client: Some(*client),
             transparent: None,
         })
+    }
+
+    /// The control channel speaks Noise, and the configuration has to say how.
+    ///
+    /// Whatever else the file carries — server, client, transparent, forwarding
+    /// or claiming — the control leg authenticates a session whose nonce is the
+    /// data plane's credential, so a plain control channel would publish that
+    /// credential to everyone on the path. This is the one transport rule the
+    /// daemon enforces rather than offers.
+    pub(crate) fn validate_control_transport(config: &Config) -> Result<()> {
+        if let Some(server) = &config.server
+            && server.transport.noise.is_none()
+        {
+            bail!(
+                "The control channel must use Noise: add a `[server.transport.noise]` block with \
+                 this server's key pair (`molehill --genkey` prints one). A plain control \
+                 channel would broadcast the session nonce the data channels authenticate with."
+            );
+        }
+        if let Some(client) = &config.client {
+            let transport = &client.transport;
+            if transport.transport_type != TransportType::Noise {
+                bail!(
+                    "The control channel must use Noise: set `[client.transport].type = \"noise\"` \
+                     and add a `[client.transport.noise]` block with a key pair \
+                     (`molehill --genkey` prints one). A plain control channel would \
+                     broadcast the session nonce the data channels authenticate with."
+                );
+            }
+            if transport.noise.is_none() {
+                bail!(
+                    "`type = \"noise\"` needs a `[client.transport.noise]` block: the key pair \
+                     the control channel authenticates with"
+                );
+            }
+        }
+        // The L3 client's control transport is decided in its own lowering (it
+        // has no `[client]` block): there the table is
+        // `[transparent.transport.noise]`, and its absence is the plain-control
+        // refusal.
+        if let Some(transparent) = &config.transparent
+            && transparent.transport.noise.is_none()
+        {
+            bail!(
+                "The control channel must use Noise: add a `[transparent.transport.noise]` block \
+                 with a key pair (`molehill --genkey` prints one). A plain control channel \
+                 would broadcast the session nonce the data lanes authenticate with."
+            );
+        }
+        Ok(())
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
@@ -1565,6 +1622,65 @@ impl Config {
     }
 }
 
+/// The control channel's Noise key pair for the configs these tests build,
+/// and the blocks that carry it.
+///
+/// The control channel must use Noise, so a config a test builds by hand needs
+/// the block like any other — otherwise the test measures the rule instead of
+/// what it is about. These are test keys, generated once and published here
+/// because a test has to be reproducible; a deployment generates its own with
+/// `molehill --genkey`.
+#[cfg(test)]
+pub(crate) const TEST_SERVER_PRIVATE: &str = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=";
+#[cfg(test)]
+pub(crate) const TEST_CLIENT_REMOTE_PUBLIC: &str = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=";
+
+/// `config` with the control channel's Noise blocks appended.
+///
+/// Which block is added follows the config's own shape: the server's private
+/// key when it carries a `[server]`, the client's `type` and the server's
+/// public key when it carries a `[client]`, and the L3 table when it carries a
+/// `[transparent]`. A test that asserts on the transport rule itself does not
+/// call this.
+#[cfg(test)]
+pub(crate) fn with_noise(config: impl AsRef<str>) -> String {
+    let config = config.as_ref();
+    let mut out = config.trim_end().to_owned();
+    // A config that already carries a block keeps its own: the two
+    // `test_noise_config_with_*` tests build their key material by hand, and
+    // appending a second `[...transport.noise]` header is a duplicate key.
+    let has_server = config.contains("[server.transport.noise]");
+    let has_client = config.contains("[client.transport.noise]");
+    let has_transparent = config.contains("[transparent.transport.noise]");
+    if config.contains("[server]") && !has_server {
+        out.push_str("\n\n[server.transport.noise]\nlocal_private_key = \"");
+        out.push_str(TEST_SERVER_PRIVATE);
+        out.push_str("\"\n");
+    }
+    if config.contains("[client]") && !has_client {
+        if config.contains("[client.transport]") {
+            // The table exists (a proxy example writes `proxy` into it), so
+            // only the type and the keys are added — a second header is a
+            // duplicate key. `type = "plain"` is what the daemon refuses, so
+            // it is rewritten rather than left beside a Noise block.
+            out = out.replace("type = \"plain\"", "type = \"noise\"");
+            out.push_str("\n\n[client.transport.noise]\nremote_public_key = \"");
+            out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
+            out.push_str("\"\n");
+        } else {
+            out.push_str("\n\n[client.transport]\ntype = \"noise\"\n\n[client.transport.noise]\nremote_public_key = \"");
+            out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
+            out.push_str("\"\n");
+        }
+    }
+    if config.contains("[transparent]") && !has_transparent {
+        out.push_str("\n\n[transparent.transport.noise]\nremote_public_key = \"");
+        out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
+        out.push_str("\"\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -1653,6 +1769,22 @@ mod tests {
     /// READMEs since the examples/ directory was folded into the
     /// documentation, and the test keeps validating that every shipped
     /// example parses.
+    /// Stand in for the `<…>` placeholders a prose example uses for an
+    /// address the reader has to supply.
+    ///
+    /// Deployment's L3 recipe writes `<public-ip>` and `<server-address>`,
+    /// which is right for a reader and unparsable for the loader. A block is
+    /// only an example if the reader's own values work, so the check fills
+    /// them in rather than skipping the block — a config that stopped
+    /// *parsing* is exactly the drift this test exists to catch, and a
+    /// placeholder is the one part of it that is not.
+    #[cfg(feature = "multiplex")]
+    fn doc_placeholders(block: &str) -> String {
+        block
+            .replace("<server-address>", "203.0.113.5")
+            .replace("<public-ip>", "198.51.100.7")
+    }
+
     /// Only used by the `multiplex`-gated doc-example test, so it shares
     /// that gate (a cfg-gated consumer must not leave it as dead code).
     #[cfg(feature = "multiplex")]
@@ -1668,7 +1800,7 @@ mod tests {
             } else if in_block && line.trim_start().starts_with("```") {
                 in_block = false;
                 if !cur.trim().is_empty() {
-                    blocks.push(cur.clone());
+                    blocks.push(doc_placeholders(&cur));
                 }
             } else if in_block {
                 cur.push_str(line);
@@ -1691,9 +1823,11 @@ mod tests {
     #[test]
     #[cfg(feature = "multiplex")]
     fn test_doc_example_config() -> Result<()> {
-        const DOC_FILES: [&str; 4] = [
+        const DOC_FILES: [&str; 6] = [
             "docs/configuration.md",
             "docs/configuration.zh.md",
+            "docs/deployment.md",
+            "docs/deployment.zh.md",
             "README.md",
             "README.zh.md",
         ];
@@ -1813,7 +1947,7 @@ default_token = "t"
 [server.control]
 bind_addr = "0.0.0.0:2333"
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 0);
 
         let config = r#"
@@ -1826,7 +1960,7 @@ bind_addr = "0.0.0.0:2333"
 [server.data]
 max_tunnels_per_client = 6
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 6);
     }
 
@@ -1844,7 +1978,7 @@ default_token = "t"
 [server.control]
 bind_addr = "0.0.0.0:2333"
 "#;
-        let cfg = Config::from_str(without).unwrap();
+        let cfg = Config::from_str(&with_noise(without)).unwrap();
         assert!(
             cfg.server.unwrap().transparent.is_none(),
             "a server that does not mention transparent must not be armed for it"
@@ -1859,7 +1993,7 @@ bind_addr = "0.0.0.0:2333"
 
 [server.transparent]
 "#;
-        let cfg = Config::from_str(with).unwrap();
+        let cfg = Config::from_str(&with_noise(with)).unwrap();
         assert_eq!(
             cfg.server.unwrap().transparent.map(|t| t.tun).as_deref(),
             Some("molehill0"),
@@ -2003,7 +2137,7 @@ udp_buffer_size = 65535
 udp_idle_timeout = 30
 udp_send_queue_size = 128
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let s = &cfg.client.unwrap().services["test"];
         assert_eq!(s.udp_workers, Some(4));
         assert_eq!(s.udp_buffer_size, Some(65535));
@@ -2046,7 +2180,7 @@ remote_bind_addr = "0.0.0.0:6080"
             "udp_forwarder_ipv6 = false",
         ] {
             let bad = config.replace("{key}", key);
-            let err = Config::from_str(&bad).unwrap_err();
+            let err = Config::from_str(&with_noise(&bad)).unwrap_err();
             let msg = format!("{err:#}");
             let name = key.split(' ').next().unwrap();
             assert!(
@@ -2059,7 +2193,7 @@ remote_bind_addr = "0.0.0.0:6080"
         let ok = config
             .replace("{key}", "protocol = \"udp\"\nudp_workers = 4")
             .replace("127.0.0.1:80", "127.0.0.1:53");
-        assert!(Config::from_str(&ok).is_ok());
+        assert!(Config::from_str(&with_noise(ok)).is_ok());
     }
 
     #[test]
@@ -2072,7 +2206,7 @@ allow_ports = ["6000-6999", "8080"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let server = cfg.server.unwrap();
         assert_eq!(
             server.allow_ports,
@@ -2096,7 +2230,7 @@ default_token = "t"
 [server.control]
 bind_addr = "0.0.0.0:2333"
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         assert!(
             cfg.server.unwrap().allow_ports.is_empty(),
             "a config that declares no allow_ports must parse with an empty whitelist"
@@ -2152,7 +2286,7 @@ pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
 psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 psk_location = 0
 "#;
-        assert!(Config::from_str(config).is_ok());
+        assert!(Config::from_str(&with_noise(config)).is_ok());
     }
 
     #[test]
@@ -2175,7 +2309,7 @@ type = "noise"
 pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
 psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 "#;
-        assert!(Config::from_str(config).is_ok());
+        assert!(Config::from_str(&with_noise(config)).is_ok());
     }
 
     #[test]
@@ -2197,7 +2331,7 @@ local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 health_check = { type = "http", interval = 5, timeout = 2, max_failed = 3 }
 "#;
-        let err = Config::from_str(config)
+        let err = Config::from_str(&with_noise(config))
             .expect_err("a removed key must not start")
             .to_string();
         assert!(
@@ -2248,7 +2382,7 @@ bind_addr = "0.0.0.0:2333"
         );
         // The `[client.data]` clause only applies where the section exists;
         // without it the key is not even an unknown field.
-        let err = Config::from_str(&config)
+        let err = Config::from_str(&with_noise(config))
             .expect_err("a config full of removed keys must not start")
             .to_string();
         for pattern in [
@@ -2292,7 +2426,7 @@ remote_bind_addr = "0.0.0.0:6080"
 "#;
         let mut doc: toml::Value = toml::from_str(config).unwrap();
         reject_removed_keys(&mut doc).expect("a current config must pass untouched");
-        assert!(Config::from_str(config).is_ok());
+        assert!(Config::from_str(&with_noise(config)).is_ok());
     }
 
     #[test]
@@ -2314,7 +2448,7 @@ local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:6080"
 udp_forwarder_ipv6 = true
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         assert_eq!(
             cfg.client.unwrap().services["test"].udp_forwarder_ipv6,
             Some(true)
@@ -2338,7 +2472,7 @@ proxy = "socks5://127.0.0.1:1080"
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 "#;
-        Config::from_str(config).unwrap();
+        Config::from_str(&with_noise(config)).unwrap();
     }
 
     #[test]
@@ -2358,7 +2492,7 @@ proxy = "http://user:pass@proxy.example.com:8080"
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 "#;
-        Config::from_str(config).unwrap();
+        Config::from_str(&with_noise(config)).unwrap();
     }
 
     #[test]
@@ -2378,7 +2512,7 @@ proxy = "https://127.0.0.1:443"
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 "#;
-        assert!(Config::from_str(config).is_err());
+        assert!(Config::from_str(&with_noise(config)).is_err());
     }
 
     #[cfg(feature = "multiplex")]
@@ -2412,7 +2546,7 @@ remote_bind_addr = "0.0.0.0:6081"
 tunnels = 2
 "#,
         );
-        let cfg = Config::from_str(&config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(services["muxed"].tunnels, None);
         assert_eq!(services["bulk"].tunnels, Some(2));
@@ -2444,7 +2578,7 @@ remote_bind_addr = "0.0.0.0:6081"
 [client.services.bulk.transport]
 type = "plain"
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(
             services["ssh"].transport_type_with(TransportType::Noise),
@@ -2475,7 +2609,7 @@ type = "noise"
 [client.services.enc.transport.noise]
 remote_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(
             services["enc"].transport_type_with(TransportType::Plain),
@@ -2535,7 +2669,7 @@ local_addr = "127.0.0.1:81"
 remote_bind_addr = "0.0.0.0:6081"
 remote_addr = "other.example.com:2444"
 "#;
-        let cfg = Config::from_str(config).unwrap();
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
         let services = &cfg.client.unwrap().services;
         assert_eq!(services["local"].remote_addr, None);
         assert_eq!(
@@ -2572,7 +2706,7 @@ local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 tunnels = 2
 "#;
-        let cfg = Config::from_str(per_service).unwrap();
+        let cfg = Config::from_str(&with_noise(per_service)).unwrap();
         let client = cfg.client.unwrap();
         assert_eq!(client.data.tunnels, Some(4));
         assert_eq!(
@@ -2582,7 +2716,7 @@ tunnels = 2
 
         // `tunnels = 0` is rejected, and the refusal names the key to fix.
         let bad = per_service.replace("tunnels = 4", "tunnels = 0");
-        let err = Config::from_str(&bad).unwrap_err();
+        let err = Config::from_str(&with_noise(&bad)).unwrap_err();
         assert!(
             format!("{err:#}").contains("tunnels"),
             "the refusal must name the key: {err:#}"
@@ -2618,7 +2752,10 @@ udp_workers = 4
 
         // Four workers ask for four paths; two tunnels cannot hold them, and
         // the refusal names the number to write instead.
-        let err = format!("{:#}", Config::from_str(&config(2)).unwrap_err());
+        let err = format!(
+            "{:#}",
+            Config::from_str(&with_noise(config(2))).unwrap_err()
+        );
         assert!(
             err.contains("`[client.data].tunnels = 2`")
                 && err.contains("`[client.data].tunnels = 4`")
@@ -2629,14 +2766,14 @@ udp_workers = 4
         // The floor itself (and anything above it) is accepted: the operator's
         // number is the pool.
         for tunnels in [4u16, 8] {
-            let cfg = Config::from_str(&config(tunnels)).unwrap();
+            let cfg = Config::from_str(&with_noise(config(tunnels))).unwrap();
             assert_eq!(cfg.client.unwrap().tunnels(), Some(usize::from(tunnels)));
         }
 
         // Leaving it unset is always fine: the default is raised to the floor
         // at establishment time.
         let unset = config(4).replace("tunnels = 4\n", "");
-        assert!(Config::from_str(&unset).is_ok());
+        assert!(Config::from_str(&with_noise(unset)).is_ok());
     }
 
     /// A lane budget is a count like any other: above the resource guard it is
@@ -2668,7 +2805,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
         let over = format!(
             "{:#}",
-            Config::from_str(&config(MAX_TRANSPARENT_LANES + 1)).unwrap_err()
+            Config::from_str(&with_noise(config(MAX_TRANSPARENT_LANES + 1))).unwrap_err()
         );
         assert!(
             over.contains("[transparent.data].tunnels")
@@ -2677,6 +2814,6 @@ remote_bind_addr = "10.99.0.1:8443"
         );
 
         // The guard itself is a budget this client may hold.
-        assert!(Config::from_str(&config(MAX_TRANSPARENT_LANES)).is_ok());
+        assert!(Config::from_str(&with_noise(config(MAX_TRANSPARENT_LANES))).is_ok());
     }
 }

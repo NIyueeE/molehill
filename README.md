@@ -146,6 +146,10 @@ Assuming you have a NAS at home behind the NAT, and want to expose its ssh servi
 1. On the server which has a public IP
 
 Create `server.toml` with the following content and accommodate it to your needs.
+The control channel is always encrypted — it carries the credential every data
+channel authenticates with — so both files carry a Noise key pair. Generate one
+with `molehill --genkey`, keep the **private** key here and give the **public**
+one to the client.
 
 ```toml
 # server.toml
@@ -157,6 +161,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333" # Port that molehill listens for clients
+
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
 ```
 
 Then run:
@@ -176,6 +184,13 @@ default_token = "use_a_secret_that_only_you_know" # Must match the server's `def
 
 [client.control]
 default_remote_addr = "myserver.com:2333" # The address of the server. The port must match `server.control.bind_addr`
+
+[client.transport]
+type = "noise"
+
+# The server's public key, from `molehill --genkey`
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # The local service to forward

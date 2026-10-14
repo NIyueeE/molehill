@@ -30,7 +30,7 @@ use cli::KeypairType;
 pub use common::constants::DEFAULT_UDP_BUFFER_SIZE;
 pub use config::Config;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
 
@@ -253,7 +253,6 @@ async fn run_instance(
     // data-plane credential off the wire. The per-connection selector stays —
     // the data plane may still be plain where the operator says so — but the
     // control leg is noise, always.
-    require_noise_control(&config)?;
 
     match determine_run_mode(&config, &args) {
         RunMode::Undetermine => Err(anyhow!("{}", undetermined_reason(&config))),
@@ -321,56 +320,6 @@ fn determine_run_mode(config: &Config, args: &Cli) -> RunMode {
         (false, false, true) => RunMode::Transparent,
         _ => RunMode::Undetermine,
     }
-}
-
-/// The control channel speaks Noise, and the configuration has to say how.
-///
-/// Whatever else the file carries — server, client, transparent, forwarding
-/// or claiming — the control leg authenticates a session whose nonce is the
-/// data plane's credential, so a plain control channel would publish that
-/// credential to everyone on the path. This is the one transport rule the
-/// daemon enforces rather than offers.
-fn require_noise_control(config: &Config) -> Result<()> {
-    if let Some(server) = &config.server
-        && server.transport.noise.is_none()
-    {
-        bail!(
-            "The control channel must use Noise: add a `[server.transport.noise]` block with \
-             this server's key pair (`molehill --genkey noise` prints one). A plain control \
-             channel would broadcast the session nonce the data channels authenticate with."
-        );
-    }
-    if let Some(client) = &config.client {
-        let transport = &client.transport;
-        if transport.transport_type != crate::config::TransportType::Noise {
-            bail!(
-                "The control channel must use Noise: set `[client.transport].type = \"noise\"` \
-                 and add a `[client.transport.noise]` block with a key pair \
-                 (`molehill --genkey noise` prints one). A plain control channel would \
-                 broadcast the session nonce the data channels authenticate with."
-            );
-        }
-        if transport.noise.is_none() {
-            bail!(
-                "`type = \"noise\"` needs a `[client.transport.noise]` block: the key pair \
-                 the control channel authenticates with"
-            );
-        }
-    }
-    // The L3 client's control transport is decided in its own lowering (it
-    // has no `[client]` block): there the table is
-    // `[transparent.transport.noise]`, and its absence is the plain-control
-    // refusal.
-    if let Some(transparent) = &config.transparent
-        && transparent.transport.noise.is_none()
-    {
-        bail!(
-            "The control channel must use Noise: add a `[transparent.transport.noise]` block \
-             with a key pair (`molehill --genkey noise` prints one). A plain control channel \
-             would broadcast the session nonce the data lanes authenticate with."
-        );
-    }
-    Ok(())
 }
 
 /// Why the mode could not be determined, naming what the file carries.

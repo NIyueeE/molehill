@@ -96,6 +96,14 @@ CONTROL_PORT=2333
 TUN_SRV=l3srv0
 TUN_CLI=l3cli0
 ROUTE_TABLE=100
+# The control channel must use Noise (it publishes the session nonce the data
+# lanes authenticate with), and this harness writes both ends' configs, so a
+# run cannot start without a pair. This one is a MEASUREMENT pair, published
+# here on purpose: it guards nothing (three throwaway namespaces) and a reader
+# reproducing the run must get the same config. A deployment generates its own
+# with `molehill --genkey`.
+NOISE_SERVER_PRIVATE="kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+NOISE_CLIENT_REMOTE_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 TUN_MTU="${TUN_MTU:-1400}"
 # The veth MTU, i.e. how large a segment the tunnel's own TCP may carry. Raising
 # it (with TUN_MTU) is the experiment that separates per-packet cost from
@@ -367,6 +375,9 @@ bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 
 [server.transparent]
 tun = "$TUN_SRV"
+
+[server.transport.noise]
+local_private_key = "$NOISE_SERVER_PRIVATE"
 TOML
     # The operator's valve is a server-side policy, so it goes in the server's
     # own table — and it counts a claim's lanes, which is what a run with
@@ -382,6 +393,9 @@ tun = "$TUN_CLI"
 
 [transparent.control]
 default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[transparent.transport.noise]
+remote_public_key = "$NOISE_CLIENT_REMOTE_PUBLIC"
 TOML
     # The claim's lane budget is the product's default (one connection per
     # claim) unless the run names one. The table has to precede the claim, or
@@ -433,6 +447,9 @@ allow_ports = ["$PUBLIC_PORT"]
 
 [server.control]
 bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[server.transport.noise]
+local_private_key = "$NOISE_SERVER_PRIVATE"
 TOML
 }
 

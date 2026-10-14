@@ -66,6 +66,26 @@ UDP_PORT = 2404
 IPERF_UDP_PORT = 2405
 SERVICE_PORTS = (ECHO_PORT, IPERF_PORT, IPERF2_PORT, UDP_PORT, IPERF_UDP_PORT)
 
+#: The control channel's Noise key pair for every arm this topology writes.
+#:
+#: The control channel must use Noise (it publishes the session nonce the data
+#: channels authenticate with, so a plain control leg would hand the data
+#: plane's credential to the path), and the harness writes both ends' configs —
+#: so a run cannot start without a pair. This one is a **measurement** pair,
+#: published in this file on purpose: it guards nothing, the topology is three
+#: throwaway namespaces, and a reader reproducing a run must get the same
+#: config. A deployment generates its own with `molehill --genkey`.
+NOISE_SERVER_PRIVATE = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+NOISE_CLIENT_REMOTE_PUBLIC = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
+#: The server's half of the control block, common to every arm. The client
+#: decides `type` per connection and the server only places its keys, so this
+#: table carries no `type`.
+NOISE_SERVER_BLOCK = f"""
+[server.transport.noise]
+local_private_key = "{NOISE_SERVER_PRIVATE}"
+"""
+
 #: The `/proc/net/dev` fields per interface: name, then 16 counters.
 DEV_COLUMNS = 16
 #: `/proc/net/snmp`'s Tcp line: algorithm parameters, then the counters read.
@@ -600,7 +620,7 @@ bind_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
 [server.transparent]
 tun = "{TUN_SRV}"
-"""
+{NOISE_SERVER_BLOCK}"""
         claims = "\n".join(
             "\n".join(
                 [
@@ -630,6 +650,9 @@ tun = "{TUN_CLI}"
 
 [transparent.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
+
+[transparent.transport.noise]
+remote_public_key = "{NOISE_CLIENT_REMOTE_PUBLIC}"
 
 [transparent.data]
 lend = {str(arm.lend).lower()}{cap}
@@ -667,12 +690,18 @@ allow_ports = {ports}
 
 [server.control]
 bind_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
-"""
+{NOISE_SERVER_BLOCK}"""
         client = f"""[client]
 default_token = "bench"
 
 [client.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "{NOISE_CLIENT_REMOTE_PUBLIC}"
 
 [client.data]{cap}
 

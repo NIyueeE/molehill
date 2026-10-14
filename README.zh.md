@@ -136,7 +136,8 @@ fd、RSS 与 CPU 斜率)、`soak-v0.10.0-udp.png`(UDP 会话的 RTT 与滑动丢
 
 1. 在有一个公网 IP 的服务器上
 
-创建 `server.toml`，内容如下，并根据你的需要调整。
+创建 `server.toml`，内容如下，并根据你的需要调整。控制通道始终加密——它携带的是每个数据通道用来鉴权的凭证——所以两个文件都要带一对 Noise
+密钥。用 `molehill --genkey` 生成一对，**私钥**留在服务端，**公钥**给客户端。
 
 ```toml
 # server.toml
@@ -148,6 +149,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333" # molehill 监听客户端连接的端口
+
+# 必需：控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
 ```
 
 然后运行:
@@ -167,6 +172,13 @@ default_token = "use_a_secret_that_only_you_know" # 必须和服务端的 `defau
 
 [client.control]
 default_remote_addr = "myserver.com:2333" # 服务器的地址，端口必须和 `server.control.bind_addr` 中的端口一致
+
+[client.transport]
+type = "noise"
+
+# 服务端的公钥，来自 `molehill --genkey`
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # 需要被转发的服务地址

@@ -8,14 +8,14 @@ default_heartbeat_timeout = 40 # Optional. Must be greater than `server.control.
 default_retry_interval = 1 # Optional. Default: 1 second
 
 [client.transport]
-type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
+type = "noise" # Required, and the only value the daemon accepts: the control channel carries the credential every data channel authenticates with
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect through a proxy
 
 [client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
+local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # Optional. This client's own key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # Required: the server's public key # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 
 [client.data]

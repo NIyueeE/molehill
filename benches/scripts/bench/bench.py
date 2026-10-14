@@ -25,8 +25,10 @@ evidence does not belong in the repository.
 
 # E402 is waived file-wide: the sys.path insert below is the bench-lib import
 # pattern and must precede the sibling imports.
+import os
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -169,6 +171,119 @@ def cmd_compare(args) -> int:
 #: A leg is shaped on both of its ends, because netem is egress-only. The
 #: selfcheck asserts it so a future leg cannot silently shape one direction.
 SHAPED_ENDS_PER_LEG = 2
+
+#: How long the selfcheck gives one binary to load one config. Loading is
+#: milliseconds; the ceiling only exists so a wedged subprocess cannot hang a
+#: commit gate.
+CONFIG_LOAD_TIMEOUT_S = 15
+
+
+def _check_config_loads(c: "Checker", arm: model.Arm, cfg: dict) -> None:
+    """Whether the product loads this arm's config, per end.
+
+    A peer arm's config belongs to another tool (frp's `frps.toml`, nps's
+    `npc.conf`), so this binary cannot read it and that is not a finding.
+    """
+    if arm.kind == "peer":
+        c.check(f"arm {arm.id} config load not applicable", True, "peer arm")
+        return
+    binary = _selfcheck_binary()
+    if not binary:
+        c.check(
+            f"arm {arm.id} config load skipped",
+            True,
+            "no built binary here (cargo build --release)",
+        )
+        return
+    for role in ("server", "client"):
+        flag = _role_flag(arm, role)
+        ok, why = _config_loads(binary, cfg[role], flag)
+        c.check(f"arm {arm.id} {role} config loads", ok, why)
+
+
+def _selfcheck_binary() -> str:
+    """The built molehill the selfcheck may ask to load a config, or `""`.
+
+    `target/release/molehill` is the default `--binary` a run uses, so it is
+    the one host a config has to work on. Missing (a fresh clone, or a tree
+    nobody has released-built), the load check is skipped rather than failed:
+    the selfcheck runs in the pre-commit gate, where a missing build is not a
+    defect.
+    """
+    binary = Path(HERE).parents[2] / "target/release/molehill"
+    return str(binary) if binary.is_file() and os.access(binary, os.X_OK) else ""
+
+
+def _config_loads(binary: str, path: Path, flag: str) -> tuple:
+    """Whether the product loads this config, and the reason when it does not.
+
+    The daemon refuses a config the schema accepts (a control channel without
+    Noise keys, say) at a point no TOML grammar can see, so an arm whose
+    config is merely well-formed can still be one that never starts. A refused
+    load is the finding; a *successful* load is not, so this stops the process
+    as soon as it reports a mode rather than waiting for it to serve.
+
+    Only the load is judged. The mode flag names the end, and anything past
+    the load — a bind that needs the topology, a transparent prerequisite that
+    needs the operator's routes — belongs to the run, not to this check.
+    """
+    # The process is read until it reports a mode and then stopped: a client
+    # that loads *stays* (it retries the server forever, which is the
+    # behaviour a run depends on), so `run(timeout=…)` would call a healthy
+    # load a failure. What is judged is the first verdict it prints — either
+    # `Running as …` or an `Error` — and nothing after it.
+    try:
+        proc = subprocess.Popen(
+            [binary, flag, str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"{type(e).__name__}: {e}"
+    deadline = time.monotonic() + CONFIG_LOAD_TIMEOUT_S
+    out: list = []
+    loaded = False
+    refused = ""
+    try:
+        for line in proc.stdout:
+            out.append(line)
+            if line.startswith("Running as"):
+                loaded = True
+                break
+            # `Failed to load <path>` is the daemon's own marker for a config
+            # it will not accept — the shape a mandatory key that was never
+            # written takes. An `Error` that is *not* that is a runtime fault
+            # (a bind address that needs the topology, a transparent
+            # prerequisite that needs the operator's routes), which belongs to
+            # the run and not to this check.
+            if line.startswith("Error: Failed to load"):
+                refused = line.strip()
+                break
+            if time.monotonic() > deadline:
+                break
+    finally:
+        proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        with contextlib.suppress(Exception):
+            proc.stdout.close()
+
+    if loaded or not refused:
+        return True, ""
+    return False, refused
+
+
+def _role_flag(arm: model.Arm, role: str) -> str:
+    """The mode flag this arm's `role` end runs under.
+
+    A server is always `--server`; a client is `--client` except for an L3
+    arm, whose file carries a `[transparent]` block and runs as
+    `--transparent`.
+    """
+    if role == "server":
+        return "--server"
+    return "--transparent" if arm.kind == "l3" else "--client"
 
 
 class Checker:
@@ -316,6 +431,15 @@ def _check_arms(c: Checker) -> None:
                 except tomllib.TOMLDecodeError as e:
                     ok, why = False, str(e)
                 c.check(f"arm {name} {role} config parses", ok, why)
+            # Parsing is not starting, and this is the half a TOML grammar
+            # cannot see: an arm whose config the product *refuses* (a
+            # mandatory key the topology writer never wrote, a value the
+            # schema accepts and the daemon does not) fails every cell of a
+            # run that has already paid for its namespaces — and, measured,
+            # it did exactly that to every arm of this model while all 620
+            # selfcheck assertions stayed green. The binary is asked to load
+            # each end's config, which is the check a run performs for real.
+            _check_config_loads(c, arm, cfg)
         except Exception as e:  # noqa: BLE001 - any failure is the finding
             c.check(f"arm {name} builds a config", False, f"{type(e).__name__}: {e}")
         for kind in ("control", "l4", "l3"):

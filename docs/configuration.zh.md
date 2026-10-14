@@ -202,15 +202,15 @@ default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:�
 # shared_pool = false # 可选。把一条控制会话的所有服务放进一个共享隧道池(true),而不是每个服务一个池(false,默认)。两者是同一套代码路径,只有池的 key 不同
 # 这里刻意**没有** carrier 键:数据面先试 KCP(特性 `kcp`),会话建立不起来时回退到 TCP,因为哪一种能用是网络的性质而不是部署的性质。透明声明还会在**运行中**搬动车道:每条车道都有独立度量(服务端向它投递了多少、该车道队列拒收了多少、客户端从它注入了多少),当所用 carrier 拒收的比例达到材料性门槛时,该车道会被换到另一条 carrier——对端停止往它放新流,两端都确认其中已无流后才退役,因此正在进行的流在原有车道上跑完、不会被重排。`MOLEHILL_DATA_CARRIER=tcp|kcp` 可以强制其一,用于需要把两条路径分开的测量或测试——它同时会关闭回退与自动搬移
 
-[client.transport] # 可选。指定传输层如何封装;对控制面与数据面都生效
-type = "plain" # 可选。可选值:["plain", "noise"]。默认:"plain"
+[client.transport] # 必需。指定传输层如何封装;对控制面与数据面都生效
+type = "noise" # 必需,且 `"noise"` 是守护进程唯一接受的值:控制通道携带的是每个数据通道用来鉴权的凭证,明文控制腿在启动时即被拒绝。单个*服务*仍可在下面覆盖为 `"plain"
 proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。仅客户端。通过 `http`/`socks5` 代理连接服务端
 
-[client.transport.noise] # Noise 协议。进一步说明见 `docs/transport.md`
+[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.md`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如所示
-local_private_key = "key_encoded_in_base64" # 可选
-remote_public_key = "key_encoded_in_base64" # 可选
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
+local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # 可选。本客户端自己的密钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # 必需:服务端的公钥 # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
@@ -248,11 +248,11 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 # stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
 # max_tunnels_per_client = 0 # 可选。运维方对「一个客户端在其会话的所有服务上一共可持有多少条承载连接」的阀门:既包括多路复用的数据隧道,也包括透明认领的车道(一条车道就是一条自己的连接——认领永不multiplex)。配置的 `tunnels`/车道预算超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝并在应答里写明上限;车道则被丢弃,并输出一行写明上限的 INFO;会话本身继续运行
 
-[server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
-[server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
+[server.transport] # 必需。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头),但服务端没有密钥就拒绝启动:控制通道必须能说 Noise
+[server.transport.noise] # 必需。密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # 必需:本服务端自己的密钥 # security-scan:allow documentation example key
+remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # 可选。客户端的公钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
@@ -484,6 +484,10 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
+# 控制通道始终使用 Noise —— 必需
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+
 [server.transparent]
 tun = "molehill0"
 ```
@@ -497,6 +501,10 @@ tun = "molehill0"
 
 [transparent.control]
 default_remote_addr = "203.0.113.5:2333"
+
+# 控制通道的密钥对 —— 必需
+[transparent.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -616,6 +624,12 @@ default_token = "服务端的-token" # security-scan:allow 文档占位
 
 [client.control]
 default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [client.status]
 bind_addr = "127.0.0.1:9090"   # 建议默认:回环地址

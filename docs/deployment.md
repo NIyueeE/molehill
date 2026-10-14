@@ -33,6 +33,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
@@ -47,6 +53,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### Noise (encrypted transport)
@@ -98,6 +108,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 protocol = "udp"
 local_addr = "127.0.0.1:80"
@@ -113,6 +129,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### Server and client in one file
@@ -128,6 +148,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
@@ -139,6 +165,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### Connect through a proxy
@@ -151,13 +181,16 @@ default_token = "123"
 [client.control]
 default_remote_addr = "127.0.0.1:2333"
 
+[client.transport]
+type = "noise"
+proxy = "socks5://myuser:mypass@127.0.0.1:1080"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
-
-[client.transport]
-type = "plain"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
 ```
 
 ### iperf3 test services
@@ -171,6 +204,12 @@ default_token = "123"
 
 [client.control]
 default_remote_addr = "localhost:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
 
 [client.services.iperf3-udp]
 protocol = "udp"
@@ -192,6 +231,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ## Transparent services
@@ -251,6 +294,10 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
+# Required: the control channel is always Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+
 [server.transparent]
 tun = "molehill0"
 ```
@@ -264,6 +311,10 @@ tun = "molehill0"
 
 [transparent.control]
 default_remote_addr = "<server-address>:2333"
+
+# Required: the control channel is always Noise
+[transparent.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"

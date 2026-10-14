@@ -469,6 +469,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
 [transparent.data]
 {budget}
 
@@ -523,7 +526,9 @@ default_remote_addr = "example.com:2333"
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
         let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
-                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n";
+                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n\
+                    [transparent.transport.noise]\n\
+                    remote_public_key = \"{TEST_CLIENT_REMOTE_PUBLIC}\"\n\n";
         let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
 
         let on = Config::from_str(&format!("{base}{claim}")).unwrap();
@@ -558,6 +563,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
 [transparent.data]
 tunnels = 1
 
@@ -588,6 +596,9 @@ remote_bind_addr = "10.99.0.1:2222"
 [transparent]
 default_token = "t"
 
+[transparent.transport.noise]
+remote_public_key = "{TEST_CLIENT_REMOTE_PUBLIC}"
+
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 "#,
@@ -612,6 +623,9 @@ default_token = "t"
 
 [transparent.control]
 default_remote_addr = "example.com:2333"
+
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -649,6 +663,9 @@ default_token = "t"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 "#,
@@ -670,6 +687,9 @@ default_token = "t"
 
 [transparent.control]
 default_remote_addr = "example.com:2333"
+
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
 [transparent.data]
 tunnels = 2
@@ -709,7 +729,9 @@ remote_bind_addr = "10.99.0.1:8443"
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
         let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
-                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n";
+                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n\
+                    [transparent.transport.noise]\n\
+                    remote_public_key = \"{TEST_CLIENT_REMOTE_PUBLIC}\"\n\n";
         let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
 
         let on = Config::from_str(&format!("{base}{claim}")).unwrap();
@@ -744,6 +766,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+
 [transparent.data]
 tunnels = 1
 
@@ -774,6 +799,9 @@ remote_bind_addr = "10.99.0.1:2222"
 [transparent]
 default_token = "t"
 
+[transparent.transport.noise]
+remote_public_key = "{TEST_CLIENT_REMOTE_PUBLIC}"
+
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 "#,
@@ -798,6 +826,9 @@ default_token = "t"
 
 [transparent.control]
 default_remote_addr = "example.com:2333"
+
+[transparent.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"

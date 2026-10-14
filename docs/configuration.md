@@ -212,15 +212,15 @@ default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed
 # shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
 # The carrier is deliberately **not** a key here: the data plane tries KCP (feature `kcp`) and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. A transparent claim goes further and moves a lane *while it runs*: each lane is measured (what the server offered it, what that lane's queue refused there, what the client injected off it), and a lane whose carrier is refusing a material share of what it is offered is handed over to the other one — the peer stops placing new flows in it, and it is retired once both ends agree it holds nothing, so a running flow finishes where it is and nothing is reordered. `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one, for a measurement or a test that needs the paths apart — it also disables the fallback and the automatic move
 
-[client.transport] # Optional. How the wire is wrapped; applies to both planes
-type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
+[client.transport] # Required. How the wire is wrapped; applies to both planes
+type = "noise" # Required, and `"noise"` is the only value the daemon accepts: the control channel carries the credential every data channel authenticates with, so a plain control leg is refused at startup. A *service* may still override it to `"plain"` below
 proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Client only. Connect to the server through an `http`/`socks5` proxy
 
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
+[client.transport.noise] # Required. Noise protocol. See `docs/transport.md` for further explanation
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "key_encoded_in_base64" # Optional
-remote_public_key = "key_encoded_in_base64" # Optional
-psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
+local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # Optional. This client's own key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # Required: the server's public key # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
@@ -258,11 +258,11 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 # stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `[transparent]` client's claims: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
 # max_tunnels_per_client = 0 # Optional. The operator's valve on the carrier connections ONE client may hold across every service of its session: a multiplexed data tunnel, or a transparent claim's lane (a lane is a connection of its own — a claim never multiplexes). A client whose configured `tunnels` / lane budget exceeds it has the extra establishments refused at startup (and retried by the repair tick), so it serves on what it got. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap, and a lane is dropped with one INFO line naming the cap; the session keeps running
 
-[server.transport] # Optional. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector); placing the keys lets the server accept Noise connections in addition to plain ones
-[server.transport.noise] # Keys. Present = the server can accept Noise (selector 0x01)
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
+[server.transport] # Required. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector), but this server refuses to start without the keys: the control channel has to be able to speak Noise
+[server.transport.noise] # Required. Keys. Present = the server can accept Noise (selector 0x01)
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # Required: this server's own key # security-scan:allow documentation example key
+remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # Optional. The client's public key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
@@ -567,6 +567,10 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
+# The control channel is always Noise — required
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+
 [server.transparent]
 tun = "molehill0"
 ```
@@ -580,6 +584,10 @@ tun = "molehill0"
 
 [transparent.control]
 default_remote_addr = "203.0.113.5:2333"
+
+# The control channel's key pair — required
+[transparent.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -691,6 +699,12 @@ default_token = "the-servers-token" # security-scan:allow documentation placehol
 
 [client.control]
 default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
 
 [client.status]
 bind_addr = "127.0.0.1:9090"   # default suggestion: the loopback
