@@ -175,7 +175,7 @@ this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
 release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
 `cargo test --test interop_test`. Three cases, all of them about a refusal
 being *local*: an old server refuses the new client's dialect, a new server
-refuses the old client's dialect (v0.10 serves v4 only), and an old server
+refuses the old client's dialect (a release serves one dialect), and an old server
 refuses an unknown dialect — each on that connection alone, while the same
 process keeps serving a client of its own version.
 

@@ -102,6 +102,21 @@ A typical setup:
 > both ends together, then; either order works, because each side refuses the
 > other's dialect instead of continuing, and the refused connection names the
 > version that was expected.
+>
+> **Upgrading to 0.11 (protocol v5)**: the wire carries transparent (L3)
+> services, so it is v5, and 0.11.0 serves **v5 only** — a 0.10 peer's
+> connection is refused on that connection alone, with nothing sent back, and
+> the same is true in the other direction. Upgrade both ends together; either
+> order works, and each side says which version it expects.
+> **The control channel must now use Noise**: add a `[server.transport.noise]`
+> block on the server, `[client.transport].type = "noise"` with a
+> `[client.transport.noise]` block on the client, or
+> `[transparent.transport.noise]` on an L3 client — one key pair per end, from
+> `molehill --genkey`. A plain control channel is refused at startup, because
+> it carries the credential every data channel authenticates with. That is the
+> only migration step for a deployment that already ran Noise; a service or an
+> L3 *lane* may still be plain, which is the per-service `transport` override
+> you already have.
 
 ### Migrating to 0.10: removed keys
 
@@ -809,7 +824,7 @@ above and follow that guide.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5 (the 0.10 line serves v4 only), so an older client *or* an older server gets this; upgrade both ends together. |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5 (the 0.10 line serves v4, the 0.11 line v5), so an older client *or* an older server gets this; upgrade both ends together. |
 | The client stops with `protocol v5` after a server's hello never arrives | The server is older than this build: it reads version 5, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |

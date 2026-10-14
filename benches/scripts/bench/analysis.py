@@ -1751,6 +1751,39 @@ def gate(results: dict, baseline: dict | None = None) -> tuple:
     return lines, failures
 
 
+def ramp_reached(results: dict) -> dict:
+    """How far each arm's ramp got: the highest level it measured.
+
+    The capacity ramp climbs until a tool breaks the SLO, so the level it
+    stopped *at* is the measurement and the levels above it are ones the run
+    never attempted. Keyed `(arm, scenario)`; absent where a scenario is not
+    a ramp.
+    """
+    reached: dict = {}
+    for sample in results.get("samples", []):
+        cell = sample.get("cell") or ""
+        if not sample.get("ok") or not cell.startswith("L"):
+            continue
+        try:
+            level = int(cell[1:])
+        except ValueError:
+            continue
+        key = (sample.get("arm"), sample.get("scenario"))
+        if key not in reached or level > reached[key]:
+            reached[key] = level
+    return reached
+
+
+def _above_ceiling(cell, ceiling: int) -> bool:
+    """Whether `cell` is a ramp level above the one the arm reached."""
+    if not cell.startswith("L"):
+        return False
+    try:
+        return int(cell[1:]) > ceiling
+    except ValueError:
+        return False
+
+
 def _coverage(results: dict, lines: list) -> list:
     """Every declared cell, for every arm, with at least one measured round."""
     failures: list = []
@@ -1767,12 +1800,22 @@ def _coverage(results: dict, lines: list) -> list:
     # A diagnostic scenario has no tool-free path, so the control arm is not
     # expected to have measured it at all.
     diagnostic = {s["id"] for s in declared if not s.get("control", True)}
+    # A capacity ramp stops at the level where a tool breaks the SLO: the
+    # levels above it were never *meant* to run, and demanding them would
+    # report "nps produced no L2" for a tool that was shown to carry L1 and
+    # nothing more — which is the finding, not a gap in the run. The ramp's
+    # own gate (`_ramp`) is what judges how far a tool got, so coverage here
+    # stops at the highest level the arm actually reached.
+    reached = ramp_reached(results)
     for arm in results.get("meta", {}).get("arms", []):
         for scenario_id, params in params_of.items():
             if arm["kind"] == "control" and scenario_id in diagnostic:
                 continue
+            ceiling = reached.get((arm["id"], scenario_id))
             for cell in model.expected_cells(scenario_id, params):
                 if (arm["id"], scenario_id, cell) in measured:
+                    continue
+                if ceiling is not None and _above_ceiling(cell, ceiling):
                     continue
                 failures.append(
                     f"coverage: {arm['id']} / {scenario_id}"

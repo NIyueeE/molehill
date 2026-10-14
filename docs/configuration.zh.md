@@ -102,6 +102,16 @@
 > 第一个**只服务 v4** 的版本:v3 客户端的连接会在它发生的那条连接上被拒绝,且
 > 不会有任何回包。因此请两端一起升级;先后顺序无所谓,因为每一端都会拒绝对方的
 > 方言而不是继续通信,而被拒绝的连接会写明它期待的版本。
+>
+> **升级到 0.11(协议 v5)**:线上要承载透明(L3)服务,所以是 v5,而 0.11.0
+> **只服务 v5**——0.10 对端的连接会在它发生的那条连接上被拒绝、不会有任何回包,
+> 反方向也是一样。请两端一起升级;先后顺序无所谓,每一端都会说出它期待的版本。
+> **控制通道现在必须使用 Noise**:服务端加 `[server.transport.noise]` 表,客户端
+> 加 `[client.transport].type = "noise"` 与 `[client.transport.noise]` 表,L3
+> 客户端加 `[transparent.transport.noise]` 表——每端一对密钥,用
+> `molehill --genkey` 生成。明文控制通道会在启动时被拒绝,因为它携带的是每个数据
+> 通道用来鉴权的凭证。对于已经跑 Noise 的部署,这就是全部的迁移动作;单个*服务*
+> 或一条 L3 *车道*仍可以是明文,也就是你已经有的按服务 `transport` 覆盖。
 
 ### 迁移到 0.10:已移除的键
 
@@ -755,7 +765,7 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5 的 molehill(0.10 系列只服务 v4),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5 的 molehill(0.10 系列服务 v4,0.11 系列服务 v5),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
 | 客户端在服务端的 hello 始终不到达后以 `protocol v5` 停止 | 服务端早于本构建:它读到版本 5、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |

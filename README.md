@@ -39,7 +39,7 @@ molehill, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github
 - [molehill](#molehill)
   - [Features](#features)
   - [Benchmarks](#benchmarks)
-    - [The v0.10.0 run](#the-v0100-run)
+    - [The v0.11.0 run](#the-v0110-run)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
   - [Deployment](#deployment)
@@ -81,54 +81,54 @@ reproduction: [Benchmarks](./docs/benchmarks.md); the decision tree behind the
 settings, and the two numbers worth measuring on your own path:
 [Configuration](./docs/configuration.md#choosing-your-configuration-decision-tree).
 
-### The v0.10.0 run
+### The v0.11.0 run
 
 Every tool is driven through the identical workload while the path follows the
-stage schedule, changed in place so a session is never rebuilt — this is the
-v0.10.0 run on one host, with the released binary's defaults (a multiplexed
-pool, plain transport); the chart legend and the schedule are in
-[Benchmarks](./docs/benchmarks.md#how-to-read-the-charts).
+stage schedule, changed in place so a session is never rebuilt. This is the
+v0.11.0 sweep on one host, with the released binary's defaults — a multiplexed
+pool of four tunnels, and **the control channel's Noise keys applied to the data
+plane too**, because that is what this release's mandatory-Noise rule means for
+a client that does not override it per service. The chart legend and the
+schedule are in [Benchmarks](./docs/benchmarks.md#how-to-read-the-charts).
 
-![Soak: molehill and the peers over the stage schedule](assets/soak-v0.10.0.png)
+![molehill and the peers over the stage schedule](assets/bench-v0.11.0-timeline.png)
 
 The same run as small multiples — one panel per stage, a lollipop per tool:
 
-![Interactive RTT per stage, per tool](assets/soak-v0.10.0-stages.png)
+![Interactive RTT per stage, per tool](assets/bench-v0.11.0-stages.png)
 
-**Interactive stream RTT p99, per stage** (ms). `~` marks a **shaped** class —
-the harness installed the queue that dominates it, so no winner is marked in
-those columns; `‡` marks a stage that also recorded a wedge. Sample counts and
-the full reading rules: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
+**Interactive stream RTT p99, per stage** (ms). Every stage after `clean` is
+shaped — the harness installed the queue or the delay that dominates it — so no
+winner is marked in those columns. Sample counts and the full reading rules:
+[Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 8.4 | ~5749‡ | ~1136 | ~3378 | ~1544 | ~7633‡ | ~6120‡ | 9.4 |
-| frp | 2.9 | ~4904 | ~1084 | ~3558 | ~2917 | ~7670‡ | ~6297‡ | 3.0 |
-| rathole | 102.3 | ~7186‡ | ~1147 | ~3716‡ | ~1595 | ~7360‡ | ~4522‡ | 104.5 |
-| nps | 64.4 | ~466 | ~1096 | ~1690 | ~1543 | ~7158‡ | ~8086‡ | 66.9 |
+| molehill | 4.7 | 402.1 | 1076.1 | 1464.4 | 197.8 | 434.0 | 275.1 | 4.5 |
+| frp | 1.8 | 401.3 | 1075.9 | 1666.9 | 196.5 | 427.1 | 271.0 | 7.6 |
+| rathole | 1.7 | 401.0 | 1066.0 | 2653.8 | 197.3 | 428.9 | 269.2 | 1.8 |
+| nps | 100.8 | 701.6 | 1083.0 | 1689.8 | 195.8 | 435.4 | 272.5 | 74.9 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
-not its best second). A `*` marks a cell read from the **receiver's** own
-window; `— †` marks a stage with no reading at all, with the reason why. Which
-side a cell uses: [Benchmarks](./docs/benchmarks.md#how-to-read-a-cell).
+not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (mux) | 16.830 | 5.261 | 9.727 | 5.272 | 0.100 | 0.019 | — † | 15.921 |
-| frp | 6.191 | 5.540 | 5.862 | 5.306 | 0.099 | 0.019 | — † | 6.181 |
-| rathole | 12.822 | 5.191 | 9.679 | 5.222 | 0.100 | 0.020 | — † | 12.867 |
-| nps | 0.134 | 0.150 | 0.142 | 0.167 | 0.100 | 0.020 | — † | 0.135 |
+| molehill | 8.495 | 3.376 | 8.146 | 1.034 | 0.094 | 0.019 | 0.019 | 8.533 |
+| frp | 6.040 | 3.377 | 6.128 | 1.148 | 0.094 | 0.019 | 0.019 | 6.048 |
+| rathole | 25.026 | 3.405 | 14.570 | 1.111 | 0.094 | 0.019 | 0.019 | 24.954 |
+| nps | 0.134 | 0.135 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **The run's own replicate.** `clean` is measured at both ends of every
-timeline, so each tool's two readings are two samples of one condition about
-an hour apart — the scale every other cell is read against:
+timeline, so each tool's two readings are two samples of one condition about an
+hour apart — the scale every other cell is read against:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (mux) | 15.921 – 16.830 Gbit/s (**5.4 %** apart) | 8.4 – 9.4 ms |
-| frp | 6.181 – 6.191 Gbit/s (**0.2 %** apart) | 2.9 – 3.0 ms |
-| rathole | 12.822 – 12.867 Gbit/s (**0.3 %** apart) | 102.3 – 104.5 ms |
-| nps | 0.134 – 0.135 Gbit/s (**0.5 %** apart) | 64.4 – 66.9 ms |
+| molehill | 8.495 – 8.533 Gbit/s (**0.5 %** apart) | 4.5 – 4.7 ms |
+| frp | 6.040 – 6.048 Gbit/s (**0.1 %** apart) | 1.8 – 7.6 ms |
+| rathole | 24.954 – 25.026 Gbit/s (**0.3 %** apart) | 1.7 – 1.8 ms |
+| nps | 0.134 – 0.134 Gbit/s (**0.1 %** apart) | 74.9 – 100.8 ms |
 
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
@@ -138,26 +138,38 @@ streams, so 8 reads as a **floor** ("at least 8"), not a maximum:
 
 | tool | sustainable streams | ceiling | headroom | reason at the break |
 |---|---|---|---|---|
-| molehill (mux) | 8 | 8 | 0.0 | never broke |
+| molehill | 8 | 8 | 0.0 | never broke |
 | frp | 8 | 8 | 0.0 | never broke |
 | rathole | 8 | 8 | 0.0 | never broke |
-| nps | 0 | 8 | 1.0 | interactive p99 204.84 > 50.0 |
+| nps | 0 | 8 | 1.0 | interactive p99 79.41 > 50.0 |
 
-These are v0.10.0 numbers from one host, and only same-schema, same-method,
+**Read the molehill row against the v0.10.0 one and the difference is the data
+plane, not the tool.** v0.10.0 published 16.83 Gbit/s on the clean stage with a
+plain data plane; this run reads 8.50 with the control channel's Noise keys
+inherited by every service — and the price list for that choice is measured at
+[Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)
+(10.0 → 5.8 Gbit/s at one stream, 19.5 → 14.9 at eight: ~42 %, against the ~49 %
+seen here). A deployment that wants the old number sets
+`transport = { type = "plain" }` per service and keeps the encrypted control
+channel. **rathole reads above this host's loopback calibration** (25.0 against
+a 21.8 Gbit/s loopback probe), which is the ceiling artefact this page has
+always flagged: two of the three fast tools sit at or above the loopback
+measurement and move with the host's state between runs, so their order is not
+stable across sweeps, while `frp` and `nps`, an order of magnitude below the
+ceiling, repeat within 1 %.
+
+These are v0.11.0 numbers from one host, and only same-schema, same-method,
 same-host runs compare directly: every results file records the host, the
 method and two tool-free calibrations, and each run is gated on its own
 completeness, endpoint and SLO checks
-([Benchmarks](./docs/benchmarks.md#comparability)). Note that **molehill and
-rathole both read at this host's loopback ceiling and move with its state
-between runs**: across three sweeps of identical code their clean readings span
-15.9-22.2 and 12.8-20.4 Gbit/s — swings of 39 % and 59 % that reverse their
-order — while `frp` (6.04-6.19) and `nps` (0.133-0.136), an order of magnitude
-below the ceiling, moved by under 3 %.
+([Benchmarks](./docs/benchmarks.md#comparability)). This is the first release
+measured by the bench model, so there is no comparable baseline for it —
+v0.10.0's record was produced by the model it replaced, and the gate refuses to
+compare across the two.
 
-The rest of the run's chart set is published beside these two:
-`soak-v0.10.0-drift.png` (open fds, RSS and CPU slopes over the run),
-`soak-v0.10.0-udp.png` (the UDP session's RTT and sliding loss *rate*) and
-`soak-v0.10.0-capacity.png` (the load ramp).
+The rest of the run's chart set: `bench-v0.11.0-capacity.png` (the load ramp),
+`bench-v0.11.0-drift.png` (RSS, fds and threads over the run, with no wedges in
+it) and `bench-v0.11.0-cost.png` (CPU-seconds per carried Gbit).
 
 ## Quickstart
 

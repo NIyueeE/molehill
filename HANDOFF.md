@@ -26,12 +26,49 @@
 
 ## Where this stands
 
-- **An unreleased cycle is in flight** on `feat/transparent-l3`: transparent
-  (L3) services, wire **v5**, based on `main` at `cf01091`. Nothing of it is in
-  `v0.10.0` (verified: the tag's tree has no transparent code at all), so its
-  configuration surface is still being shaped in place. The decision record,
-  the model it is being reshaped into, and the header-compression question are
-  in "The transparent-L3 cycle" below.
+- **v0.11.0 is prepared and waiting for a human to merge and tag.** The work is
+  on `feat/transparent-l3` as a PR; `version = "0.11.0"` is committed, the
+  CHANGELOG section is written, and the sweep has been run on the release
+  commit. What remains is the human's: review the PR, merge to `main`, then
+  `just tag` and push `v0.11.0` (AGENTS.md §5 — an agent must never create a
+  release tag on its own initiative).
+
+- **The cycle being released**: transparent (L3) services, wire **v5**, based on
+  `main` at `cf01091`. Nothing of it is in `v0.10.0` (verified: the tag's tree
+  has no transparent code at all).
+
+- **The first `bench`-model release has no baseline.** `benches/records/` holds
+  only the two *soak* files, and `analysis.comparability` refuses any file
+  whose `meta.model != "bench"` — so v0.11.0 is gated on the absolute checks
+  (coverage, the endpoint invariant, the SLO, drift, wedge, ramp) and becomes
+  the baseline for v0.12. Worth remembering when the next release's gate is
+  read.
+
+- **The branch was squashed to 13 topical commits, and the sweep re-run on
+  the result (2026-10-14).** 187 commits became 13, one per topic, each a state
+  that already passed the gate chain when it was first committed; the tree is
+  byte-identical (`b860a93`), and the backup is
+  `backup/l3-pre-squash-2026-10-14` plus the pre-squash tip on
+  `feat/transparent-l3`. The squash changed every SHA, which is why the sweep
+  was re-measured rather than carried over: `githooks/pre-tag` checks the
+  results file's recorded revision against the commit being tagged, and an
+  artifact citing a revision nobody can check out is not provenance.
+  - The re-run was not merely a re-stamp, and the reason is worth recording:
+    the first sweep's method record carried `engine_hash a08ba5c5cfd439dc`, and
+    the `analysis.py` coverage fix landed *after* it, so the new run's is
+    `1771ce182f09d566`. Same numbers' worth of code, different engine — which
+    is exactly what the engine hash exists to make visible, and exactly why a
+    file measured under the old one could not have gated this commit.
+  - The two runs agree inside the host's own spread, which is the reading the
+    README publishes: molehill's clean bulk 9.209 → 8.495, frp 6.106 → 6.040,
+    rathole 28.986 → 25.026, nps 0.135 → 0.134.
+- **The v0.11.0 pre-release checks that are not in the chain, all green**: the
+  interop matrix (`just interop`, 3 cases — both directions refuse the other's
+  dialect and keep serving a peer of their own version, against the released
+  v0.10.0 binary) and the L3 acceptance harness (`just l3-accept`, 15
+  assertions including the negative policy half). Both were broken by the
+  mandatory-Noise change and both were repaired with it; neither would have
+  been caught by `just check`.
 
 - **v0.10.0 shipped on 2026-10-01**: the release run is green on all thirteen
   jobs (nine platform builds, GitHub Release, GHCR, crates.io), and the
@@ -582,228 +619,6 @@ either failure removes the feature. The small-packet arm failed on the ceiling
 alone, so the other arms were not run for the verdict.
 
 #
-## An L3 claim holds a member set (2026-10-10, this session)
-
-The transparent path's claim used to be one data channel, and one carrier
-connection is a hard ceiling — measured flat at ~7.1 Gbit/s for one inner flow
-and eight alike, while the forwarding path's per-connection channels reached
-22-28 through the pool. A claim now holds **K data channels (its members)**, and
-its inner flows are hashed across them by their canonical 5-tuple. Landed in
-slices, each with its own acceptance:
-
-- **S1 (`6a4c751`)** — the hub routes by *member slot* instead of one queue per
-  endpoint: a fixed slot set per claim, batches keyed `(endpoint, slot)`, and
-  slots that **outlive their members** (a replacement inherits its predecessor's
-  index), so the routing target of a flow never moves when a channel does.
-  Pure refactor at width 1; `MOLEHILL_L3_STATS` gained a per-member line, which
-  is the instrument the feature has to be measured with.
-- **S2a (`a804f6e`)** — `members` / `[transparent.data].default_members`
-  (default 1, max 64; `tunnels < members` refused next to the UDP-workers
-  floor). The client opens that many channels, placed on distinct tunnels in
-  `multiplex` mode; the server supervises them as a set and replaces each one
-  that ends. Acceptance was **indistinguishability**: `members = 4` against
-  `members = 1` showed no claim above the run's 9.8 % floor, `fds_peak`
-  identical at 69 (members in mux mode are streams on tunnels that already
-  exist), RSS +1.3 MiB for 20 extra streams.
-- **S2b (`229d3a4`)** — the flow hash: `src/transparent/flow.rs`, FNV-1a with a
-  **splitmix64 finalizer**, fixed seed, over protocol + the two `(address, port)`
-  endpoints sorted (portless packets hash on the address pair alone). Jumbo path,
-  four rounds an arm, twin in the run, 8 flows: **one member 6.989 Gbit/s →
-  four members 13.924 [11.528..15.091]**, the same configuration's twin at
-  13.598 — **1.99x**, on a run whose own floors were 3.34 % (throughput) and
-  0.17 % (the twin pair). `bulk-1` indistinguishable (6.201/6.244/6.299),
-  `churn-16` +22 %, `rr-16` −1.8 %, `fds_peak` identical at 69,
-  `wire_per_visitor_byte` unchanged, and the one-member claim's carrier
-  retransmits 518 → 0. The fan-out is proven per member: 3-4 of 4 slots carry
-  traffic in every round, and both ends report the same split to within a point
-  (23/52/24/0 against 23/53/24/0).
-- **S3 (`6ee0038`)** — a member's death is proven not to move the others: the
-  slot stays, the survivors keep forwarding, only the dead slot counts
-  `no_channel`, its replacement inherits the index, and the modulus never moves.
-
-**The finding inside S2b is worth keeping.** The first run of the slice read
-11.282/13.142 instead of 13.924: FNV-1a's low bits are weak, the byte that
-varies between eight `iperf3` streams is its ephemeral port, every one of those
-ports was even, and `h % width` reads exactly those bits — so eight flows landed
-on two of four members. The splitmix64 finalizer fixes it and the regression
-test pins the measured port set and every stride. The lesson generalises: a
-modulo over a hash whose *low* bits are weak is a placement bug waiting for a
-traffic pattern, and per-member counters are what make it visible.
-
-**What this does not do, and the two facts to carry forward.** The claim still
-trails the forwarding path (13.9 against 29.2 Gbit/s), which is the pre-stated
-band that means *the constraint has moved to the device path* — one server TUN
-reader, one client injection path, one syscall per packet. That is the next
-lever, and it needs its own arm before it is a claim.
-Also unclosed: there is **no server-side valve on concurrent members** in
-`direct` mode (in `multiplex` mode the surface is streams on tunnels the pool
-already bounds; in direct mode K connections per claim are held for the claim's
-life), and the model has **no fault-injection axis** for a member's death, so
-the slot-retention semantics are proven by unit and loopback tests rather than
-by a measured recovery number.
-
-## The tunnel pool is pinned (2026-10-10, this session)
-
-The client's multiplex pool is no longer elastic. It establishes
-`[client.data.tcp|kcp].tunnels` (default 4, raised to a UDP service's declared
-worker count) at service start, keeps them, and **repairs** a dead one back to
-the count; it never grows for load and never reaps for idleness. `max_tunnels`
-and `idle_timeout` are refused with upgrade messages, the floor is validated at
-config time, and the server's `max_tunnels_per_client` valve now bites at
-startup.
-
-The reasoning, in the order it was established:
-
-- An elastic pool's width is a *result*: it depends on what the process was
-  doing. That is a capacity-planning problem for an operator and a
-  comparability problem for this repository's measurements (§10) — the same
-  arm, run twice, can describe two different pools.
-- The measurements that size the key are unchanged by pinning it: one tunnel is
-  the worst configuration on every path measured (3.34 against 5.92 Gbit/s for
-  8 flows on `loss1` from one tunnel to two; 12.85 against 22.81 on a clean
-  jumbo path from one to eight), and an L3 claim on one carrier connection
-  carries the same for one inner flow and for eight.
-- Establishment is cheap and belongs at startup: **0.5–0.8 MiB RSS and 2.6 file
-  descriptors per tunnel, no threads** (measured by varying the pool's width on
-  a fixed workload), so a deployment can afford the count its concurrency
-  needs, and the first visitor pays nothing.
-- `mux` retains its purpose in that model: it decouples the count of *carrier
-  connections* (fixed, configured) from the count of *logical connections*
-  (unbounded, per visitor — a stream on an established connection costs no
-  round trip). Where the logical count is known at configuration time and does
-  not exceed the count — a single L3 claim — a raw channel is measurably
-  cheaper (7.599 against 6.620 Gbit/s single-flow, 0.277 against 0.578 s/Gbit),
-  which is why `direct` survives there.
-
-What this changed, mechanically: `GrowReason` has one variant (`Repair`) and
-`ShrinkReason` one (`Dead`); `grow_before_placing`, `grow_for_stripes`, the
-floor-driven growth loop, `shrink_if_idle`, `may_shrink`, `GROW_PERCENT`,
-`grow_threshold`, `tunnel_grow_at`, `MIN_WARM_HOLD`, `SHRINK_COOLDOWN` and
-`OPEN_WAIT_BUDGET` are gone; placement's per-tunnel ceiling
-(`TUNNEL_STREAM_CEILING`, 56) is now the *only* oversubscription bound, and the
-UDP-derived floor became a validation input rather than a growth target. The
-one invariant to keep in mind: the engine's own stream cap (64) is no longer
-backstopped by growth, so the pool's ceiling has to stay strictly below it —
-`tunnel_ceiling` does that, and the `pool_test` suite asserts it.
-
-Still open from this work (next steps, in the order agreed):
-
-1. ~~**A saturation notice.**~~ **Landed with the change.** A pinned pool
-   cannot grow, so the refusal that used to trigger growth now reports itself:
-   the first time a visitor is refused because every tunnel is at placement's
-   stream ceiling, the pool emits one INFO line
-   (`pool-stats: pool at its stream ceiling; raise [client.data.<carrier>].tunnels`)
-   with the configured count and the ceiling, and every later refusal is DEBUG
-   (`logging::RepeatNotice`). `OpenError::AtCapacity`'s text now names the
-   setting instead of a growth that can no longer happen.
-2. ~~**Member kinds and L3 flow hashing.**~~ **Landed 2026-10-10 (S1/S2a/S2b).**
-   A claim now holds a *set* of members — `[transparent.data].default_members`,
-   or a claim's own `members`, default 1 — and its inner flows are spread across
-   them, one flow per member, by a hash of the flow's five-tuple. Both carrier
-   kinds are members: a stream of the claim's tunnel pool in `multiplex` mode,
-   a connection of its own in `direct` mode. The set is discovered by the hub
-   (the channels that actually join), so nothing about it is on the wire; a
-   member that dies keeps its slot and its replacement inherits the index.
-   Measured (dev profile, jumbo path, A/A twin in the run, `bulk-n` = 8 inner
-   flows): one member 6.989 Gbit/s, four members **13.924 / 13.598** (two
-   copies, A/A throughput floor 3.34 %) against the L4 pool's 29.17 — the claim
-   nearly doubles, at 0.653 against 0.560 s/Gbit, with `fds_peak` identical
-   (69) and RSS +12–19 % for the 20 extra streams. `bulk-1` is unchanged (one
-   flow, one member), `churn-16` gains ~22 %, `rr-16` loses ~2 %.
-   **What is not covered yet, in the order it should be picked up:**
-   - **No server-side valve on a claim's concurrent members in `direct` mode.**
-     `[server.data].max_tunnels_per_client` counts *tunnels*, and a direct
-     member is a data channel, not a tunnel, so a client may hold `members`
-     connections per claim with nothing bounding the total. In `multiplex` mode
-     the surface is streams on tunnels the operator already caps (and the pool's
-     56-per-tunnel ceiling bounds it), so this is a direct-mode gap.
-   - **No fault-injection axis in the bench model for member death.** The
-     failure semantics — a dead member's slot keeps its index, its flows are
-     dropped and counted `no_channel` on that slot until the replacement joins,
-     the survivors untouched — are unit- and loopback-tested only; the model
-     cannot yet price a member dying during a measured cell.
-   - **Member kinds, measured (S4).** `l3-raw4` (four *direct* members, one
-     connection each) against `l3-mux4` (four streams of a four-tunnel pool),
-     same run, dev profile, jumbo path, A/A twin: `bulk-n` **15.013 / 16.196**
-     against 13.187 Gbit/s, at **0.516 / 0.502 against 0.658 s/Gbit**; `bulk-1`
-     7.316 / 7.189 against 6.640 at **0.337 / 0.321 against 0.561 s/Gbit**;
-     `rr-16` +2-3 %, `churn-16` indistinguishable (11.9 % floor). `fds_peak` is
-     identical (69) — the mux arm holds four *tunnels* per claim and the raw arm
-     four *connections*, so the count matches when `members == tunnels` — and
-     RSS is **lower** for raw (19.2 against 26.15 MiB at `bulk-n`, floor 9.17 %)
-     because there is no yamux session state per member. So a raw member is the
-     cheaper carrier per byte whenever the claim's member count is what the
-     deployment is paying for; the multiplexed pool remains what lets *unbounded*
-     per-visitor channels ride a bounded count of connections (the L4 path),
-     which is not a claim's shape. The cost stands as recorded below: nothing
-     bounds a claim's concurrent direct members server-side.
-   - **The flow hash needed a finalizer, and that was found by a run, not by
-     review.** A bare FNV-1a `% width` aliases with the *low* bits of the ports
-     (its last step is a multiplication by a prime, which preserves their
-     residue structure). The measured `iperf3` ports
-     `52044, 52052, 52054, 52058, 52070, 52082, 52088, 52094` — all even,
-     several four apart — took two of the four members, which is why the first
-     measurement read 11.28/13.14 instead of 13.92/13.60. The per-member
-     counters (`MOLEHILL_L3_STATS=1`) plus the iperf3 JSON's `local_port` list
-     diagnosed it; splitmix64's finalizer fixes it, and the regression test
-     pins both the measured port set and every port stride. The lesson for the
-     next hash-shaped decision: `% width` on a raw FNV value is not a placement
-     rule, and the per-member counters are the instrument that says so.
-
-## The mux×1 gap, measured before touching it (2026-10-10, this session)
-
-The decision to derive the data plane (L12–L18) rests on two facts, and the
-second one was measured before any of it was written, because the comparison
-stops being configurable the moment `mode` is deleted.
-
-**The gap, on the pristine tree.** `l4-mux2` is one flow on a two-tunnel pool —
-one stream on one session, the shape a sparse visitor or a lane gets — against
-`l4-direct`, the same flow on a connection of its own. Both arms in one run,
-the A/A twin on the mux arm as the run's own noise floor, `smoke` profile
-(two measured rounds per arm), loopback, host `d764f9da9c7e5b2a`:
-
-```
-sudo -n just bench --profile smoke --arms l4-mux2,l4-direct,control --aa \
-  --binary ~/tmp/molehill-c0-baseline --out ~/tmp/bench-c0-mux-vs-direct.json
-```
-
-| arm | bulk-1 throughput | bulk-1 CPU | rr-1 rate |
-|---|---|---|---|
-| `control` (no tool) | 40.65 Gbit/s | — | 32 000/s |
-| `l4-direct` | **18.95** Gbit/s [17.52..20.37] | **0.110** s/Gbit | **15 885/s** |
-| `l4-mux2` | **9.15** Gbit/s [9.00..9.29] | **0.207** s/Gbit | 13 357/s |
-| `l4-mux2~aa` (twin) | 7.93 Gbit/s [7.19..8.67] | 0.250 s/Gbit | 13 583/s |
-
-Read: the multiplexer costs **2.07× the throughput and +87 % of the CPU per
-byte** on one stream, and this run's own A/A floor is **15.35 %** on that
-metric — so the gap is real at this profile, resolvable, and worth attacking
-(which is why L18 gates the engine work on this number rather than on a hunch).
-Provenance is exact: the binary is the pristine `80b0e62` build
-(`v0.10.0-47-g80b0e62`, sha256 `94549863c4f6392d`), run from a worktree at that
-commit with that commit's model. The symbol-level attribution (which of the
-per-write allocation, the 32 KiB frame split, the driver hand-off or the
-window updates owns the gap) is the first step of the engine work itself, not
-of this baseline.
-
-**A model defect found by the same run.** The catalog arm `l4-mux1`
-(`pool_cap = 1`) cannot start against the model's L4 topology at all: that
-topology carries a UDP service with `udp_workers = 2`, so `tunnels = 1` is
-below the UDP-derived floor and the client refuses to start —
-
-```
-`[client.data.tcp].tunnels = 1` is below what the services of that carrier
-need: service `game` declares 2 UDP workers, and a pool keeps one tunnel per
-worker so their shards stay on distinct tunnels. Write
-`[client.data.tcp].tunnels = 2` or more, ...
-```
-
-Its four scenarios then report `not ready: no visitor could reach
-10.10.0.254:2401` — the degenerate L4 cell recorded as an open thread in
-[benchmarks.md](docs/benchmarks.md), now with a cause for at least this arm.
-`l4-mux2` is the closest legal mux×1 shape and is what the table above uses;
-the arm's own fix (raise `udp_workers`, or drop the arm) belongs with the model
-change, not here.
-
 ## Open threads
 
 - **The mux write boundary's owned-write chain was built and REVERTED — the
@@ -2661,434 +2476,21 @@ this rate, which is real but does not by itself explain 729 ms). The two new
 fields are on the stats line (`ms_out_pace`, `ms_out_send`) so the next attempt
 starts from this split rather than from the phase total.
 
-## The clean cell's per-datagram output cost (2026-10-11, round 17)
-
-The round-15/16 exchange ended with an instruction to itself: price the carrier
-on a cell where the path keeps up, because a saturated one cannot. This is that
-reading — `l3`, `bulk-1`, `condition clean`, one round, `MOLEHILL_KCP_STATS=1`,
-two consecutive stat lines two seconds apart, on the **server**:
-
-| phase | ms per second | share of a core |
-|---|---|---|
-| `ms_output` | **748** | **75 %** |
-| `ms_input` | 46 | 4.6 % |
-| `ms_writer` | 42 | 4.2 % |
-| `ms_deliver` | 9.5 | ~1 % |
-| `ms_update` | 5.7 | 0.6 % |
-
-with `datagrams_out` ≈197 000/s (≈2.9 Gbit/s at the 1472 B datagram it had
-adapted to), **`retransmits` 0**, **`wait_snd_peak` 376** against the 16 384
-segment cap, `srtt_ms` 1–3, `peer_wnd` 4096.
-
-**This is the clean measurement the earlier rounds could not make.** The queue
-is empty and nothing is being retransmitted, so the output phase is not the cost
-of congestion — it is **≈3.8 µs per outbound datagram**, spent inside
-`drain_dgrams`: the pacer's per-span decision (which reads the clock once per
-datagram), the span staging, and the `sendmmsg` batch that carries up to 32 of
-them. 3.8 µs is one to two orders of magnitude above what staging and one
-batched syscall should cost, so the next attempt's first job is to **split that
-phase in two** — the pacer decision and the wire send — with a phase timer
-around each, and let the split say which of them owns the time. That is a
-measurement change, not an optimisation, and it is the one to make before any
-constant is touched.
-
-## Where the carrier's CPU is, measured at this commit (2026-10-11, round 15)
-
-One reading, taken so the next attempt starts from data rather than from a
-memory of older numbers: `l3`, `udp-ladder`, `loss1_buf`, tunnel leg, one round,
-`MOLEHILL_KCP_STATS=1`, the busiest second (two consecutive stat lines
-subtracted, so this is a rate and not a lifetime):
-
-| phase | ms in that second | share of the pump |
-|---|---|---|
-| `ms_output` (pacer + wire drain + retries) | **+144.2** | **62 %** |
-| `ms_writer` (app → ARQ) | +31.0 | 13 % |
-| `ms_input` (wire → ARQ) | +31.1 | 13 % |
-| `ms_update` (timers, retransmit decisions) | +25.4 | 11 % |
-| `ms_deliver` (ARQ → reader) | +1.6 | <1 % |
-
-with `datagrams_out` +53 305, `retransmits` +2 502 (4.7 % of output),
-`pump_rounds` +8 704, `wait_snd_peak` **16 395** — the send queue sitting at its
-cap (2 × 8192 segments) for the whole window — `srtt_ms` 10–17, `rto_ms` 30,
-`datagram_b` 1472.
-
-**A correction, made in the next round before anything was built on it.** The
-first reading of this table (below, kept because the correction is the useful
-part) said "the lever must be queueing". It is not, and the arithmetic says so:
-the second being measured emitted ≈53 305 × 1472 B ≈ **628 Mbit/s while the cell
-offers 1000** — the ladder's cells deliberately offer more than the path
-carries, which is what a ladder is for. At that rate the BDP over the window's
-17 ms is ≈**902 segments**, far under both the send window (8192) and the queue
-cap (16 384): **neither is the constraint; the path is.** A pump that spends its
-time trying to push a gigabit through six hundred megabits is the *intended*
-shape of that cell, so "attempts that do not go out" is the workload, not a
-defect to fix. The original reading, kept as the record of it:
-
-> The carrier's time is in the send path, and the send queue is full while it
-> is: a large part of that 144 ms looks like the cost of attempts that do not go
-> out — `send_spans` hitting a full socket, parking the remainder, paying a
-> syscall again next round.
-
-What survives the correction is what it already ruled out: **allocations on
-this path are not the lever** (this cycle's two allocation-level changes measured
-as a cost and as noise respectively), and a saturated cell cannot price a
-per-datagram change at all. The CPU-per-delivered-byte gap against TCP (1.661
-against 0.586 s/Gbit at the 1 Gbit/s cell) has to be attacked where the path
-keeps up — the **clean** cells, where the pump is not saturated — and the phases
-that matter there are the ones this table shows as secondary (`ms_writer`,
-`ms_input`, `ms_update`), not the one a congested cell makes dominant.
-
-So the next attempt should aim at the queueing, and it has three shapes worth
-pricing, in the order the reading argues for them: the socket buffer and the
-pacer's interaction with it (a parked datagram is retried, and the parked queue
-is bounded by half the RTO), the send-queue cap itself (`2 × snd_wnd` = 16 384
-segments, which is what `wait_snd_peak` is pinned to), and the retransmit share
-(4.7 % on a path losing 1 %) — each with its own A/B, and each with the caveat
-that the throughput the cell is already reaching bounds how much any of them
-can show.
-
-## Falsified: the inbound payload copy is not the cost (2026-10-11, round 14)
-
-The receive path allocated a right-sized buffer per accepted segment and copied
-the datagram's payload into it (`BytesMut::zeroed` + `read_exact`), and the
-adapter always held the datagram as a `Bytes` — so `Kcp::input_bytes` was added
-to hand the payload on as a slice instead (`8854500`), with the property pinned
-by pointer in a test. It looked like the obvious remaining CPU lever on the
-carrier.
-
-**Measured, and reverted (`e57a45b`).** Two binaries, `--ab-arm l3`, `l3`,
-`bulk-1,bulk-n`, clean, three rounds plus a warm-up with `--aa` (24 samples,
-baseline `ee9a73e004049d5b`, candidate `2753a897ab66c92d`): **one claim of
-twenty-eight comparisons, and it is a cost** — `bulk-n[P8] rss_peak_mib`
-**+18.26 %** on the candidate. Throughput and CPU per byte were inside the
-floors on every cell.
-
-The mechanism is worth keeping: a slice shares the *whole datagram allocation*
-and keeps its `Bytes` header alive, where the copy produced a right-sized buffer
-that died with the segment. At an MTU where one datagram carries one segment the
-bytes are the same but the per-segment handle is not, and eight flows' worth of
-in-flight segments is what the peak measures. So the receive-side copy is *not*
-where the carrier's CPU goes; the lever the earlier rounds pointed at (the
-per-segment work above it, and the send path's own costs) stays the one to
-attack — with a run's floors as the gate, which is what this one did.
-
-## Verified state of this branch (2026-10-11, round 9)
-
-The branch is green end to end at `c45af2b`, and the two proofs that matter for
-everything this cycle touched were re-run rather than inherited:
-
-- **`just l3-accept`: 15/15 PASS** at this commit — the transparent data plane is
-  intact *after* the two-sided drain, the automatic carrier move and the lending
-  arbitration all landed. (Its previous green run predated all three, so this is
-  the re-check, not a repeat.)
-- **The heavy chain** (audit, deny, outdated, the full serial test suite) is
-  green on this commit: it runs on every push, and the push that carried it
-  passed.
-- The suites beside them: 249 lib tests, 11 `pool_test` scenarios, 23
-  `integration_test` cases, clippy twice (default and the minimal
-  `server,client` build).
-
-What is **not** proven, stated once more because it is the thing a reader is
-most likely to assume: the automatic carrier move's **benefit**. Its mechanism
-is measured end to end (above); its effect is not, and the current model's
-workloads cannot show it (a round is shorter than the confirmation plus the
-drain plus the flows that would follow). That is a decision for the human, not
-a defect to fix quietly.
-
-## The v0.10.0 theme
-
-One control session per endpoint, one shared elastic pool per carrier,
-transparent visibility and a quiet log. Four of the milestones were independent
-and are already merged on `main` (unreleased, so they are part of this release);
-the rest ship as **v0.10.0**, because the wire protocol and the configuration
-surface both change.
-
-### Decisions
-
-| # | Decision |
-|---|---|
-| D1 | Session per `(client, remote_addr)` — in practice per `(remote_addr, effective transport)`: the selector byte is per-connection, so a plain and a Noise service on one endpoint cannot share a connection without downgrading one |
-| D2 | Per-service auth inside one session; one denied registration never kills the session |
-| D3 | Control channel direct and independent (dependency direction, liveness isolation, repair ability) |
-| D4 | Pool per carrier; `carrier` stays a per-service selector |
-| D5 | Growth needs no new control command (client-local, client-initiated — NAT-friendly) |
-| D6 | `min_tunnels` deleted; warmth is derived (warm for `idle_timeout` after activity); a pool starts cold |
-| D7 | UDP-derived floor = `ceil(channels / streams-per-tunnel)`, capped by `max_tunnels`; the worker set is maintained |
-| D8 | UDP channels are never recycled (peer affinity + the local source port the backend sees) |
-| D9 | `[server].max_pool_size` deleted → `[server.data].max_tunnels_per_client`, default `0` = unlimited |
-| D10 | `health_check` deleted (probe, state change and key) |
-| D11 | Heartbeat kept, but the server **declares** its interval in the session ack; the client derives `max(10 s, 2 × interval + 5 s)`; `interval = 0` ⇒ no client timeout |
-| D12 | `pool_size` split: TCP warmth is client-local; UDP parallelism is `udp_workers` |
-| D13 | Bounds live at the connection layer; the server does not arbitrate channel counts |
-| D14 | Over-cap ⇒ typed, non-fatal refusal; growth stops, and a retry needs a tunnel's death or a shrink |
-| D15 | Growth thresholds and hysteresis stay internal constants until measured (they still are) |
-| D16 | `direct` mode kept (sparse visitors + measurement control arm); M7 measured its role |
-| D17 | IPv6 path MTU is covered by an in-crate `Ipv6Mtu` declared with nix's exported `sockopt_impl!`/`getsockopt_impl!` — no `unsafe` |
-| D18 | Log model: level contract + aggregation + a log-budget test |
-| D19 | Config shape: client-level policy, service-level intent; no knob without evidence |
-| D20 | One commit per milestone with its own verification; docs in the same commit |
-| D21 | Scheduling is two layers: pool placement (client) and pairing/assignment (server); the server does not choose tunnels |
-| D22 | Instrument before policy (falsifiable): S1 adds only read-only accessors + telemetry; if the state spread is inside the noise, S2 does not land — **it was zero, so it does not** |
-| D23 | Placement policy = eligibility + rotation + hysteresis (never a weighted score) |
-| D24 | A stripe group's K streams must land on K distinct tunnels — **structural since the group request landed**: the server names the group before its channels are opened and the client reserves one tunnel per stripe (v4, extended in place) |
-| D25 | No RTT sampling; the algorithm may use stream count, pending opens, send credit, worker queue depth — nothing else (send credit is not exposed by the engine, so it is not used) |
-| D26 | Growth/shrink is a hysteretic, rate-limited state machine (≤ 1 tunnel per maintenance tick) |
-| D27 | UDP assigns a *new* peer to the shortest worker queue — **falsified by measurement** (2026-09-30): a single visitor never fills a queue (its own socket buffer throttles it), many visitors fill them evenly, and the drop equals the excess over a per-pool ceiling that `udp_workers` does not raise |
-| D28 | Waiting visitors stay FIFO; **spare** streams would be picked from the least-loaded tunnel — not landed (S1) |
-| D29 | Stripe pairing is atomic: K spares from K distinct tunnels, all or none — server-side today (a broken channel discards the whole group and re-requests it) |
-| D30 | Shrink requires `pinned_peers == 0`: a channel with pinned-but-idle peers is not idle |
-| D31 | New sources never create channels (invariant); floods cost affinity entries only; table size, evictions and per-tunnel `pinned_peers` are in `MOLEHILL_UDP_STATS`; no hard cap until measurement asks for one |
-
-### Rejected, with the reason (so it is not re-litigated)
-
-Configurable `min_tunnels` (warmth is derivable); keeping `[server].max_pool_size`
-(the bound belongs at the connection layer); `health_check = false` as a boolean
-axis; server-side inference of backend health (indistinguishable from a visitor
-that hangs up); the "health check avoids control-plane churn" argument;
-per-service health numbers; reversing the heartbeat direction (still a
-follow-up); cross-carrier striping (the slowest carrier gates the group);
-`carrier = "auto"`; the control channel inside the pool; a non-zero default for
-the server's tunnel cap; negotiating channel counts; weighted placement scores;
-an RTT sampler; stateful prioritisation of waiting visitors; treating "zero
-streams" as sufficient for shrinking; a whole-group `open_streams(n)` entry
-point in the client (it had no wire command to trigger it — the open thread
-above is what would give it one).
-
-## Release (v0.10.0)
-
-1. ~~Freeze~~ **done (2026-09-28)** — `version = "0.10.0"`, the `[Unreleased]`
-   content moved under a dated `## [0.10.0]` section (now dated 2026-10-01, the
-   tag day), `[Unreleased]` left empty, the withdrawn v0.9.1 artifacts deleted.
-2. ~~Sweep~~ **done (2026-10-01, at `96bda00`)** — the artifact, the charts and
-   both READMEs describe this commit: four tools, 8/8 stages each plus the
-   capacity ramp, `--test=rrul,capacity`, `shape_legs=visitor`, the bounded
-   rate-class window, `tree_clean: true`, and **`just soak-check`: `OK: no gate
-   violation`**, no waiver. The gate's own self-check is the verdict: the
-   v0.9.0 baseline is not a gate input (another host, and a method record
-   missing six keys), which is the documented behaviour for a fresh sweep.
-   Two earlier sweeps are superseded — `bbe9664` and `f34788d` — both because a
-   `tests/` change landed after them, which is exactly what the pre-tag rule
-   treats as invalidating the artifact.
-3. Before the tag: `just tag-check` must be green on the release commit (it is,
-   and its provenance line reads `results measured at v0.10.0-1-g96bda00; no
-   code changed since`). **Only docs and assets may follow the sweep** —
-   anything under `src/`, `tests/`, `Cargo.*` or `benches/scripts/soak/*.py`
-   invalidates it, and that cost this release two extra sweeps.
-4. ~~`just check`, `just interop`~~ **both green (2026-09-30)** — the full
-   chain, and the interop matrix's three cases (both cross-version directions
-   refuse, the refusing process keeps serving its own version).
-5. ~~CI green, merge, changelog date, `just tag`, push the tag~~ **the first two
-   tag pushes failed, and nothing was published either time** (2026-10-01):
-   - **The emulated legs.** The release workflow tests every target it
-     publishes, and the cycle's new `tests/noise_keys_test.rs` spawns the
-     freshly built binary — which cannot be exec'd from inside an emulated test
-     binary, so `arm-unknown-linux-musleabi` died with `Exec format error` and
-     cancelled the matrix. Second time this class has failed a release; the fix
-     is the guard the first incident introduced (`native_target`, file-level on
-     `noise_keys_test.rs`, site-level on `pool_test.rs`'s one spawning
-     scenario), verified by falsification rather than assumed.
-   - **The musl leg.** With the cross legs green, `x86_64-unknown-linux-musl`
-     stopped on `startup_failure_test`'s `Address already in use` — musl spells
-     EADDRINUSE `Address in use`. The binary was right in both; the assertion
-     was pinned to glibc's phrasing, and only the release matrix ever runs
-     these tests under musl (the native legs are glibc, the cross legs are the
-     guarded ones). Reproduced locally (`rustup target add
-     x86_64-unknown-linux-musl` + `musl-tools`, then the matrix's own command),
-     fixed to match what every spelling shares, and verified by running the
-     whole suite on both targets.
-   - **The `aarch64` cross leg, on the cache this cycle added.** With both
-     fixes in, `aarch64-unknown-linux-musl` died before compiling anything:
-     `libc`'s and `generic-array`'s build scripts, restored from a 347 MB cache
-     entry, could not run in the `cross` container (`GLIBC_2.28 not found`).
-     `Swatinem/rust-cache` keys on the job, not on the matrix value, so every
-     leg shared one entry — and the legs do not build in the same environment:
-     the native legs compile host binaries with the runner's glibc, the `cross`
-     legs execute them inside a container with an older one. `ci.yml` already
-     keys its matrices per target; `release.yml` was the outlier and now does
-     the same (`key: ${{ matrix.target }}-release`). This one is a workflow
-     change, so it does not touch the sweep's provenance.
-   Each failure was fixed, the sweep re-run where the rule demanded it, and the
-   tag deleted and re-pushed — which is what AGENTS.md §5 allows, and the
-   reason the rule exists.
-6. **Next**: push the tag → the release workflow publishes (GitHub Release,
-   GHCR, crates.io).
-7. **Open, for the next cycle**: nothing mechanically stops the next
-   spawn-based test from missing the `native_target` guard, or the next
-   assertion from pinning one libc's wording — these two failures were the
-   second and third of their kind. A cheap check would close both (fail when a
-   `tests/*.rs` contains `CARGO_BIN_EXE` without `native_target`, and when a
-   test asserts a bare libc phrase); it needs a home in the check chain and the
-   docs that go with it, so it was not added mid-release.
-
-### Release sweep (2026-10-01, `96bda00`)
-
-`v0.10.0-1-g96bda00`, tree clean, `stale: false`, binary sha256
-`228cb43cc2c1e493` (4 181 840 bytes), host `99919695eec2` / host_id
-`d764f9da9c7e5b2a`, calibration 417.8 MiB/s, loopback probe 21.59 Gbit/s,
-`shape_legs=visitor`, `rate_socket_window=256K`, `batch=2`, four tools, 8/8
-stages each plus the capacity ramp, `--test=rrul,capacity`. **`just soak-check`:
-`OK: no gate violation`**, no waiver. Charts re-rendered and both READMEs
-refilled from the plot's own tables. The peers are the ones re-downloaded for
-this release (frp 0.71.0, rathole 0.5.0, nps 0.26.10 — all still the latest).
-
-| tool | clean bulk (Gbit/s) | replicate | clean p99 (ms) | loss1 | rate100 | rate20 | ramp |
-|---|---|---|---|---|---|---|---|
-| molehill | 15.921-16.830 | 5.4 % | 8.4-9.4 | 9.727 | 0.100 | 0.019 | 8/8, never broke |
-| frp | 6.181-6.191 | 0.2 % | 2.9-3.0 | 5.862 | 0.099 | 0.019 | 8/8, never broke |
-| rathole | 12.822-12.867 | 0.3 % | 102.3-104.5 | 9.679 | 0.100 | 0.020 | 8/8, never broke |
-| nps | 0.134-0.135 | 0.5 % | 64.4-66.9 | 0.142 | 0.100 | 0.020 | 0/8, broke at 1 (p99 204.84) |
-
-What this run is worth reading for:
-
-- **Every cell is a measurement this time**, including all four ramps: three
-  arms carry the ramp's full 8 streams (the subject and both TCP peers), and
-  only `nps` breaks, at its first load level — the same shape the `bbe9664`
-  sweep had, and unlike the `f34788d` attempt whose `rathole` ramp stopped on a
-  dead iperf3 backend.
-- **The subject's SLO is met on both clean visits** (8.4 and 9.4 ms against the
-  50 ms limit, zero errors), and its completeness, endpoint invariant and drift
-  checks all pass.
-- **It is the third sample of the top pair of arms**, and the one that settled
-  what a run can say about them: across three sweeps of identical code their
-  clean readings span 15.9-22.2 and 12.8-20.4 Gbit/s — swings of 39 % and 59 %
-  that reverse their order — while `frp` (6.04-6.19) and `nps` (0.133-0.136),
-  an order of magnitude below this host's loopback ceiling, moved by under 3 %,
-  and the host's own loopback probe stayed inside 21.6-21.9 Gbit/s throughout.
-  The READMEs publish no ordering for those two rows and `docs/benchmarks.md`
-  states the limit with all three samples behind it.
-
-**Environment incident on the way here.** One attempt at this sweep produced a
-complete-looking artifact in 14 seconds: `iperf3` was no longer installed (a
-container restart had reset the filesystem and taken the runtime-installed
-package with it), so every test recorded a typed
-`No such file or directory: 'iperf3'` failure. The gate refused it, the
-superseded artifact was restored from git rather than published, `iperf3` was
-reinstalled, and the run repeated. The environment notes below now name the
-mechanism; `command -v iperf3` before a long run is the cheap guard.
-
-## The bench model's verdicts were rebuilt, then the record re-measured (2026-10-13)
-
-The model's consistency leg was "every paired round agrees in sign" — at the
-round counts the profiles run, a 25-50 % false positive rule that never
-printed its own error rate. `497b58e` replaced it with an exact sign test
-whose p prints beside `alpha_eff` (the level the run's length can honestly
-test at), a bootstrap CI over the paired difference (seeded from the
-fingerprint, so re-analysis is reproducible), pre-registered endpoints
-(`--primary`, in the fingerprint; the headline metric by default) with a
-Benjamini-Hochberg correction over that family, leave-one-out FRAGILE
-marking, drowned-cell refusal (more than half a cell's rounds failed → not
-quoted, gate fails), round-index pairing (a failed round no longer shifts a
-side's replicate), the iperf3 version and an analysis version in the method
-(schema 3), and an opt-in per-round control normalization. Two coverage
-defects fell out of the first gated screen (`09c8df3`, `700cf11`): the gate
-expected one empty-named cell from every non-staged scenario while five of
-them name their operating point, so every bulk/rr/UDP run failed coverage
-and it had never been noticed because only sweeps were gated; the naming is
-now derived per workload kind.
-
-Then the record was re-measured under the new model (all six files in
-`~/tmp/recheck-*.json`, each gated PASS):
-
-| decision | new-model read | verdict |
-|---|---|---|
-| pool width (`l4-mux2` vs `l4-mux8`, bulk-n) | 5.77 vs 12.93 Gbit/s, 2.24x, CPU/byte also better | holds, direction and magnitude far beyond the run's 0.78 % floor |
-| carrier axis (KCP vs TCP pins, `loss1_buf`, ladder) | KCP delivers more on every cell (844 vs 772 at 1000M; 906 vs 820 at 2000M; 846 vs 791 at 5000M), less inner loss | holds |
-| L3 TUN queue (`l3` vs `l3-deep`, clean) | 2.41 vs 2.38 Gbit/s, 1.5 % apart | no claim — the clean path is packet-bound, as recorded |
-| lending (+27 % claim, `rtt100` carrier leg) | both arms 0.06 Gbit/s where the record says 2.4 | **changed, not confirmed — see below** |
-| P1 lock removal (A/B binaries, rr-16 + bulk-n) | every pair `indistinguishable` with the interval *inside* the threshold (RSS ±0.2 MiB, throughput ±5 %, CPU −0.9 %) | holds, and sharpens: the old "RSS directional −5 %/−7 %" read becomes bounded evidence of no difference |
-
-**The lending claim is window-era, not wrong.** On `rtt100` on the carrier leg
-both `l3-budget10` arms now read 0.06 Gbit/s where the 2026-10-11 record says
-2.395 — while the *control* (no tool) carries 3.44 on the same path and the
-same arms carry 3.2-3.3 on a clean loopback, so the L3 data path is healthy
-and the gap is the KCP carrier itself: `KCP_RCV_WND` stays 4096 segments
-(≈ 5.8 MiB ≈ 0.47 Gbit/s at 100 ms — the constant's own doc comment says
-receive was deliberately left for its own measurement) and the +27 % was
-measured before the send window moved 2048 → 8192. The decision the record
-supports today is therefore *narrower*: lending's benefit is conditional on
-what limits the path, and at the current window on a 100 ms leg the path is
-window-limited before it is lane-limited, so the claim does not transfer.
-Re-measuring it belongs with the next KCP window change, not with lending's
-own code. (Clean-loopback lending re-read: 3.289 vs 3.239 — indistinguishable,
-as recorded.)
-
-**Why the old record read differently**: the model said "claim" at sign
-agreement 1.0 with a floor from two rounds; the new model says what the run
-can test at and puts an interval around it. Nothing above contradicts a
-direction the old model printed — it contradicts how far the old model let a
-reader carry one.
-
-**The probe-and-compare form (recorded, not landed).** The delivery signal
-measures 100 % on the policed path — reliable ARQ turns policing into
-throughput — so the rule's next form is the L3 lane policy's own move: put a
-tunnel on the other carrier and compare what the two carry. The design is
-settled and the constants are picked (a 1.5x carried-bytes-per-second edge,
-the same ratio the lane policy uses; a 30 s probe budget; a 600 s backoff
-after an inconclusive one); what stopped it landing here is the wiring it
-needs: `begin_handover` does not report *which* tunnel it took (the probe
-must follow its own tunnel's counters), and the probe's carried bytes need a
-per-window per-tunnel byte counter beside the ARQ pairs in `HealthSample`.
-Both are small, both are mechanical, and neither should be assembled at the
-end of a session — the first wiring attempt was reverted for exactly that
-(`git checkout` on a 285-line half-state-machine). The saved first draft is
-in `~/tmp/l4-probe.wip.patch` for whoever picks it up; the shape that
-survives review there is `probe_step` (start/backoff) + `probe_judge`
-(per-window verdict), with `begin_handover` returning the tunnel id.
-
-## The L4 probe landed, and the sighting protocol says what it can and cannot see (2026-10-13)
-
-The carrier rule's probe-and-compare form landed (`460acb0`, `cbc28ae`): the
-rule's suspicion — a tunnel re-sending ≥4 % of its window — hands one tunnel to
-the other carrier through the pool's own handover, routes **new** streams to
-the probe while it runs, and compares carried bytes per second per tunnel
-(incumbent averaged, probe alone) past the lane policy's 1.5x edge. A probe
-that carries materially more moves the endpoint's choice through `prefer`
-(switch cooldown included); one that carries materially less gives the tunnel
-back and parks the pool in a 600 s backoff. A probe whose window carried
-nothing is **held**, not reverted — measured, four probes in a row reverted on
-an idle-window artifact before that floor existed. The delivery-ratio verdict
-stays as the immediate move for a tunnel that actually stops delivering. Unit
-tests cover the verdict, the window arithmetic and both lifecycle outcomes on a
-real pool; the suite is 262 lib + 12 pool + 23 integration green, clippy two
-passes clean.
-
-What the sighting protocol then established on the policed condition
-(`udp_throttled`, tunnel leg, `RUST_LOG=debug`, `MOLEHILL_TUNNEL_STATS=1`):
-
-- **The suspicion is the only local signal that fires there, and the probe
-  starts on it.** Sighting 2: share 27-31 % per window while delivery stays
-  pinned at 99-100 % — the ARQ re-sends until everything arrives, so the
-  delivery verdict (60 %) never fires on a policed path at all. Sighting 3:
-  four suspicions, four probes started, four gave back (the idle-window
-  artifact, since fixed), zero false moves. Sighting 4 (after the placement
-  preference and the idle floor): four probes started, none reverted, none
-  moved — the probe tunnels sat idle their whole budget.
-- **Why the probe stayed idle: the no-disruption rule.** A handover drains
-  only an *empty* tunnel (streams == 0), so the probe never inherits traffic;
-  placement routes only *new* opens; and the ladder is a **UDP** workload whose
-  `udp_workers` channels open once at service activation, so a probe that
-  starts mid-run never sees a new open. `churn-16` produces continuous new
-  opens but too little traffic to arm the suspicion (15 KB/window against the
-  64 KiB floor — sighting 5). The two needs (heavy traffic + fresh opens) are
-  not met by any workload the model has today.
-- **The seam for a fair comparison exists and is out of scope by the
-  no-disruption rule.** `UdpHub::repin` (D30) moves a pinned peer onto another
-  channel — but mid-flight moves drop datagrams (`try_send`), and the rule
-  this cycle shipped on says a lane change routes *new* flows, never existing
-  ones. A fair probe on a static-UDP workload would need a deliberate policy
-  repin, which is a decision, not a defect.
-
-**Net state: the probe is real, wired, safe and measured; what it cannot yet
-demonstrate is a live Move on a bench workload, because no workload both arms
-the suspicion and produces opens after the probe starts.** The next
-instrument, recorded rather than promised: a ladder-flavoured churn (the
-ladder's rate with churn's re-dialing) as a bench scenario, or an explicit
-operator repin under the same audit the lane move carries. Until then the
-rule stays opt-in (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), and its Move path is
-exercised by the pool test, not by a live bench run.
-
 ## Open threads for the next cycle
 
+- **A config the product refuses was a config every check accepted
+  (2026-10-13, found while preparing v0.11.0).** The mandatory-Noise control
+  channel was enforced in `run_instance` alone, so everything that *parses* a
+  config was blind to it: 24 documented examples, every bench arm's
+  `server.toml`/`client.toml`, both ends of the L3 acceptance harness and all
+  three interop cases refused to start, while `just check` and 620 selfcheck
+  assertions stayed green. Two guards now exist (the doc-example test covers
+  the deployment pages and `from_str` carries the rule; `bench.py selfcheck`
+  asks the built binary to load each arm's config). **The general version of
+  this is still open**: any rule the daemon enforces at *runtime* rather than
+  at parse time has the same hole, and there is no check that names them. The
+  rule now lives in `from_str`, which is the right place for this one; a
+  future one should start there.
 - **Build times were decomposed (2026-10-13, host with 20 cores, rustc
   1.99); the workspace split is measured and declined for now.** The daily
   inner loop is already fast (check 1.3 s, clippy pass 1 9 s, the lib test
