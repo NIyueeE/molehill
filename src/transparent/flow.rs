@@ -55,17 +55,36 @@ const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a's 64-bit prime.
 const PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// The identity of a packet's flow, for the hub's placement table.
+///
+/// A flow is the ordered sequence of packets that must not be reordered against
+/// each other, and the table that remembers where each one was placed keys on
+/// this value: the avalanched hash of the canonical five-tuple, so both
+/// directions of a flow — and both ends of a claim — name the same flow without
+/// carrying any state on the wire. A collision between two flows would only
+/// mean they share a member, which is a placement outcome and not a
+/// correctness one.
+#[must_use]
+pub fn key(info: &PacketInfo) -> u64 {
+    avalanche(hash(info))
+}
+
 /// Which member slot of a claim's set a packet's flow belongs to.
 ///
 /// `width` is the number of slots the claim holds (its member set's width, the
 /// value the hub routes by). A set of one has one answer, and saying so up
 /// front is what keeps a one-member claim free of the hash entirely.
+///
+/// This is the *tie-break* the hub's placement uses, and the whole rule for a
+/// flow it cannot remember (see `ClaimSlots::route`): it is a pure function, so
+/// two ends that see the same set agree, and a flow placed by it stays where it
+/// is for as long as the set's width does.
 #[must_use]
 pub fn slot(info: &PacketInfo, width: usize) -> usize {
     if width <= 1 {
         return 0;
     }
-    reduce(avalanche(hash(info)), width)
+    reduce(key(info), width)
 }
 
 /// Mix every input bit into every output bit (splitmix64's finalizer).

@@ -10,15 +10,25 @@
 //!   dropped, so a compromised peer cannot steer traffic into a local address
 //!   of its choosing.
 //!
-//! A claimed endpoint is carried by a **member set**, not by one channel: each
+//! A claimed endpoint is carried by a **lane set**, not by one channel: each
 //! data channel of the claim owns a slot of the set, and every packet is placed
-//! in a slot while the device is drained. A slot whose member is gone — a
+//! in a slot while the device is drained. A slot whose lane is gone — a
 //! replacement is in flight — is *empty*, and the packets placed in it are
 //! dropped and counted exactly as the single-channel path counted the packets
-//! of a channel that had ended; the surviving members are untouched. The set's
-//! width is therefore the routing rule's modulus, and it never shrinks: a
-//! replaced member takes the slot its predecessor left, so nothing that routes
-//! by slot has to move.
+//! of a channel that had ended; the surviving lanes are untouched. A lane's slot
+//! never moves: a replaced channel takes the slot its predecessor left.
+//!
+//! **Placement is a table, not a modulus.** A flow is placed once, on its first
+//! packet, into the least-loaded live slot (ties broken by the flow hash, which
+//! is what lets the two ends of a claim agree without a word on the wire), and
+//! the entry is what routes its later packets — so a lane joining, or a lane
+//! being lent to another claim, cannot move a flow that is already talking, and
+//! a *new* flow never lands in an empty slot. Entries are forgotten after
+//! [`FLOW_IDLE_EVICTION`] of silence in either direction, which is safe because
+//! a flow that quiet has nothing in flight to reorder, and the table stops
+//! remembering past [`MAX_TRACKED_FLOWS`] (a visitor must not be able to grow it
+//! without bound) — the flows beyond that are placed by the hash alone, which is
+//! stable for as long as the set's width is.
 //!
 //! Queues are bounded and lossy on overflow, UDP semantics: a full queue drops
 //! the packet rather than stalling every other service sharing the device.
@@ -58,6 +68,26 @@ const BATCH_BYTES: usize = 16 * 1024;
 /// The largest packet a TUN read is willing to see: an IPv4 packet with
 /// options, bounded by the frame's `u16` length prefix.
 pub const MAX_PACKET: usize = u16::MAX as usize;
+
+/// How long a flow's placement is remembered after its last packet.
+///
+/// The table exists so that a flow never *moves*: its entry is the slot it was
+/// placed in for as long as it keeps talking. Idleness is therefore the only
+/// safe thing to forget — a flow silent for this long has no packet in flight
+/// on any carrier (that window is milliseconds), so re-placing it cannot
+/// reorder anything the old slot had already delivered. The value matches the
+/// UDP peer-mapping timeout, so one number describes both kinds of forgotten
+/// state.
+const FLOW_IDLE_EVICTION: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many flows one claim's placement table remembers.
+///
+/// A table without a bound is memory an unauthenticated visitor can drive (one
+/// entry per five-tuple), so past this many *live* flows a new flow is placed
+/// by [`flow::slot`] alone instead of being remembered: the hash is a pure
+/// function of the packet and the live set, so such a flow still keeps one slot
+/// while the set's width does, and the idle sweep makes room for the next one.
+const MAX_TRACKED_FLOWS: usize = 4096;
 
 /// One TUN device, its reader task, and the per-claim member sets.
 pub struct TunHub {
@@ -125,6 +155,13 @@ impl TunHub {
     /// Hand one packet to the kernel, as if it had arrived on the device.
     pub async fn inject(&self, packet: &[u8]) -> io::Result<()> {
         self.tun.write_packet(packet).await
+    }
+
+    /// Note that one flow was seen arriving from one of a claim's lanes, so its
+    /// placement is not forgotten while it is still talking (see
+    /// [`Routes::touch`]).
+    pub fn touch(&self, endpoint: &Endpoint, info: &PacketInfo) {
+        self.routes.touch(endpoint, info);
     }
 
     /// Give one data channel a slot in `endpoint`'s member set and register its
@@ -243,6 +280,15 @@ pub struct MemberStat {
     /// Packets placed in this slot while no member held it (a replacement
     /// window): the traffic the claim lost with that member.
     pub no_channel: u64,
+    /// Flows whose placement still names this slot.
+    ///
+    /// This is what says whether a lane is idle: it counts the flows the table
+    /// remembers *for this slot*, including the ones placed there while the
+    /// slot's member was gone (they keep their place and resume when the
+    /// replacement joins). A slot is idle when this is zero and nothing is
+    /// queued — the condition a lane has to meet before it can be lent
+    /// elsewhere.
+    pub flows: usize,
 }
 
 /// The routing state of one hub, without the device.
@@ -287,20 +333,34 @@ impl Routes {
         Ok(slot)
     }
 
-    /// Which claim and which of its members one packet belongs to.
+    /// Which claim and which of its lanes one packet belongs to.
     ///
     /// The endpoint lookup is the allow-list; a packet whose claimed end names
     /// no registered endpoint belongs to nobody and is counted as unclaimed by
-    /// the caller. The member is the claim's **flow placement**
-    /// ([`flow::slot`]): a pure function of the packet's five-tuple and the
-    /// set's width, so a flow keeps the member it was placed on for as long as
-    /// the width does — a member *joining* is the one thing that changes the
-    /// width, and a member leaving deliberately does not ([`Self::vacate`]).
+    /// the caller. The lane comes from the claim's **placement table**
+    /// ([`ClaimSlots::route`]): a flow is placed once, on its first packet, and
+    /// remembered — which is what makes a lane change (a lane joining, a lane
+    /// being lent) unable to move a flow that is already talking.
     fn pick(&self, info: &PacketInfo, direction: Direction) -> Option<(Endpoint, usize)> {
-        let table = self.table.lock().ok()?;
+        let mut table = self.table.lock().ok()?;
         let endpoint = table.endpoint_for(info, direction)?;
-        let width = table.lookup_endpoint(&endpoint)?.slots.len();
-        Some((endpoint, flow::slot(info, width)))
+        let slot = table.lookup_endpoint_mut(&endpoint)?.route(info)?;
+        Some((endpoint, slot))
+    }
+
+    /// Note that one flow was seen arriving from one of the claim's lanes.
+    ///
+    /// Placement is decided on the packets read *from the device*, but a lane
+    /// carries both directions: a flow whose replies keep arriving is not idle,
+    /// and forgetting where it lives would put its next outbound packet
+    /// somewhere else. Touching the entry on the way in is what makes "idle"
+    /// mean "silent in both directions".
+    fn touch(&self, endpoint: &Endpoint, info: &PacketInfo) {
+        if let Ok(mut table) = self.table.lock()
+            && let Some(claim) = table.lookup_endpoint_mut(endpoint)
+        {
+            claim.touch(info);
+        }
     }
 
     /// Hand one member's batch to its queue.
@@ -383,6 +443,7 @@ impl Routes {
                     live: entry.queue.is_some(),
                     forwarded: entry.forwarded,
                     no_channel: entry.no_channel,
+                    flows: entry.flows,
                 });
             }
         }
@@ -391,25 +452,43 @@ impl Routes {
     }
 }
 
-/// The member set of one claimed endpoint: a fixed table of slots.
+/// The lane set of one claimed endpoint: a fixed table of slots, and the flows
+/// that were placed in them.
 ///
-/// The slots are the routing targets. A slot exists whether or not a member
+/// The slots are the routing targets. A slot exists whether or not a lane
 /// holds it, which is what lets a replacement inherit its predecessor's index
-/// and the claim's flows stay where they were.
-#[derive(Default)]
+/// and the claim's flows stay where they were. The flow table is what makes
+/// that stay true when the set *changes*: placement happens once, on a flow's
+/// first packet, and is remembered — so a lane joining, or a lane being lent to
+/// another claim, cannot move a flow that is already talking, and a reordering
+/// is not something a lane change has to be careful about.
 struct ClaimSlots {
     slots: Vec<MemberSlot>,
+    /// One entry per flow that is talking, keyed by its identity
+    /// ([`flow::key`]).
+    flows: HashMap<u64, FlowEntry>,
+    /// When the idle sweep last ran, so the table does not walk itself on every
+    /// packet.
+    swept: std::time::Instant,
 }
 
-/// One member's place in a claim's set.
+/// One lane's place in a claim's set.
 #[derive(Default)]
 struct MemberSlot {
-    /// The queue of the member that holds this slot, while one does.
+    /// The queue of the lane that holds this slot, while one does.
     queue: Option<mpsc::Sender<Bytes>>,
-    /// Packets this slot handed to its member.
+    /// Packets this slot handed to its lane.
     forwarded: u64,
     /// Packets placed here while the slot was empty.
     no_channel: u64,
+    /// Flows the table remembers for this slot.
+    flows: usize,
+}
+
+/// Where one flow was placed, and when it was last seen.
+struct FlowEntry {
+    slot: usize,
+    last_seen: std::time::Instant,
 }
 
 impl ClaimSlots {
@@ -417,6 +496,8 @@ impl ClaimSlots {
     fn new() -> Self {
         Self {
             slots: vec![MemberSlot::default()],
+            flows: HashMap::new(),
+            swept: std::time::Instant::now(),
         }
     }
 
@@ -433,6 +514,112 @@ impl ClaimSlots {
             entry.queue = Some(queue);
         }
         slot
+    }
+
+    /// The slots that currently hold a lane.
+    fn live_slots(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.queue.is_some())
+            .map(|(slot, _)| slot)
+            .collect()
+    }
+
+    /// Which lane one packet belongs to, remembering a new flow's placement.
+    ///
+    /// Three cases, in this order:
+    ///
+    /// - **the flow is in the table**: it keeps its slot, whatever that slot's
+    ///   state is. A lane whose member died keeps the flows placed in it, so the
+    ///   replacement inherits them and nothing is reordered (the documented
+    ///   answer, and the reason the entry is not repointed);
+    /// - **the flow is new**: the least-loaded live slot, ties broken by the
+    ///   flow hash — the hash is what lets the two ends of a claim agree about a
+    ///   tie without a word on the wire;
+    /// - **the table is full of flows that are still talking**: the hash alone
+    ///   decides. It is a pure function of the packet and the live set, so such
+    ///   a flow still keeps one lane for as long as the set's width does.
+    fn route(&mut self, info: &PacketInfo) -> Option<usize> {
+        let key = flow::key(info);
+        let now = std::time::Instant::now();
+        if let Some(entry) = self.flows.get_mut(&key) {
+            entry.last_seen = now;
+            return Some(entry.slot);
+        }
+        let live = self.live_slots();
+        self.sweep_if_due(now);
+        let chosen = if self.flows.len() >= MAX_TRACKED_FLOWS {
+            *live.get(flow::slot(info, live.len()))?
+        } else {
+            let least = live
+                .iter()
+                .filter_map(|slot| self.slots.get(*slot))
+                .map(|slot| slot.flows)
+                .min()?;
+            let candidates: Vec<usize> = live
+                .iter()
+                .copied()
+                .filter(|slot| {
+                    self.slots
+                        .get(*slot)
+                        .is_some_and(|entry| entry.flows == least)
+                })
+                .collect();
+            *candidates.get(flow::slot(info, candidates.len()))?
+        };
+        if self.flows.len() < MAX_TRACKED_FLOWS {
+            self.flows.insert(
+                key,
+                FlowEntry {
+                    slot: chosen,
+                    last_seen: now,
+                },
+            );
+            if let Some(entry) = self.slots.get_mut(chosen) {
+                entry.flows += 1;
+            }
+        }
+        Some(chosen)
+    }
+
+    /// Note that one flow was seen on its way *in*.
+    ///
+    /// Placement is decided on the packets this end reads from its device, but
+    /// a lane carries both directions: a flow whose replies keep arriving is not
+    /// idle, and forgetting it would put its next outbound packet somewhere
+    /// else. The slot is not consulted — each end places for its own direction,
+    /// so the lane the reply arrived on is not necessarily the lane this end
+    /// chose for it, and the only thing this call has to say is "still talking".
+    /// A flow the table does not know is left alone: the other end has an entry
+    /// of its own, and inventing one here would put this end's placement under
+    /// the other end's choice.
+    fn touch(&mut self, info: &PacketInfo) {
+        let key = flow::key(info);
+        if let Some(entry) = self.flows.get_mut(&key) {
+            entry.last_seen = std::time::Instant::now();
+        }
+    }
+
+    /// Forget the flows that have been silent in both directions for
+    /// [`FLOW_IDLE_EVICTION`], at most once a second.
+    fn sweep_if_due(&mut self, now: std::time::Instant) {
+        if now.duration_since(self.swept) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.swept = now;
+        let stale: Vec<(u64, usize)> = self
+            .flows
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.last_seen) >= FLOW_IDLE_EVICTION)
+            .map(|(key, entry)| (*key, entry.slot))
+            .collect();
+        for (key, slot) in stale {
+            self.flows.remove(&key);
+            if let Some(entry) = self.slots.get_mut(slot) {
+                entry.flows = entry.flows.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -506,10 +693,11 @@ where
                 // of the packet names the claim depends on the side: the
                 // client is the destination, the server is the source of the
                 // traffic it hands back.
-                if !claims(&endpoint, packet, hub.direction()) {
+                let Some(info) = claimed_info(&endpoint, packet, hub.direction()) else {
                     stats.count_drop(DropReason::Unclaimed);
                     continue;
-                }
+                };
+                hub.touch(&endpoint, &info);
                 if let Err(e) = hub.inject(packet).await {
                     break Err(anyhow::Error::from(e))
                         .with_context(|| format!("Failed to inject a packet for {endpoint}"));
@@ -526,22 +714,25 @@ where
     result
 }
 
-/// Whether a packet off the tunnel is one this service claimed.
+/// The parsed packet, when it is one this service claimed.
 ///
 /// The claim lives at the end this side owns: the client injected a visitor's
 /// packet for the address it carries, so it matches the *destination*; the
 /// server receives that connection's replies, so it matches the *source*. A
 /// portless packet (ICMP, and the fragments after the first) matches on the
 /// address alone.
-fn claims(endpoint: &Endpoint, packet: &[u8], direction: Direction) -> bool {
-    let Ok(info) = ip::parse(packet) else {
-        return false;
-    };
+///
+/// The parse is handed back rather than thrown away: the caller needs the
+/// packet's flow identity to keep its placement entry alive (see
+/// [`Routes::touch`]), and parsing twice per packet to get it would be a tax on
+/// every packet of the path.
+fn claimed_info(endpoint: &Endpoint, packet: &[u8], direction: Direction) -> Option<PacketInfo> {
+    let info = ip::parse(packet).ok()?;
     let (addr, port) = match direction {
         Direction::Source => (info.dst, info.dst_port),
         Direction::Destination => (info.src, info.src_port),
     };
-    addr == endpoint.ip && port.is_none_or(|port| port == endpoint.port)
+    (addr == endpoint.ip && port.is_none_or(|port| port == endpoint.port)).then_some(info)
 }
 
 /// One `INFO` line per second per process while `MOLEHILL_L3_STATS=1`.
@@ -580,11 +771,12 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
             for member in hub.member_stats() {
                 tracing::info!(
                     target: "molehill::transparent",
-                    "l3-stats: role={role} claim={} member={} live={} forwarded={} \
+                    "l3-stats: role={role} claim={} member={} live={} flows={} forwarded={} \
                      no_channel={}",
                     member.endpoint,
                     member.slot,
                     member.live,
+                    member.flows,
                     member.forwarded,
                     member.no_channel,
                 );
@@ -712,6 +904,136 @@ mod tests {
         assert_eq!(
             routes.pick(&info, Direction::Destination).unwrap().1,
             slot_a
+        );
+    }
+
+    /// A flow keeps its lane when the set *grows*: placement is remembered, so
+    /// a lane joining cannot move a flow that is already talking — the one
+    /// event the old width-modulus rule could not survive.
+    #[test]
+    fn a_joining_lane_does_not_move_a_flow_that_is_already_talking() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        let info = ip::parse(&packet_on_port(40_000)).unwrap();
+        assert_eq!(
+            routes.pick(&info, Direction::Destination).unwrap().1,
+            0,
+            "one lane: every flow is in slot 0"
+        );
+
+        let (second, _rx_second) = mpsc::channel(4);
+        routes.join(web, second).unwrap();
+        assert_eq!(
+            routes.pick(&info, Direction::Destination).unwrap().1,
+            0,
+            "the flow keeps the lane it was placed in, whatever joins"
+        );
+
+        // A flow that arrives afterwards takes the empty lane, so the table is
+        // not simply pinning everything to the oldest one.
+        let fresh = ip::parse(&packet_on_port(40_001)).unwrap();
+        assert_eq!(routes.pick(&fresh, Direction::Destination).unwrap().1, 1);
+        assert_eq!(routes.member_stats()[1].flows, 1);
+    }
+
+    /// A new flow is never placed in a slot whose lane is gone: those packets
+    /// would be dropped for nothing while a live lane could carry them.
+    #[test]
+    fn a_new_flow_is_never_placed_in_an_empty_slot() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        let (second, _rx_second) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        routes.join(web, second).unwrap();
+        routes.vacate(&web, 1);
+        assert!(!routes.member_stats()[1].live);
+
+        for port in 40_000..40_020u16 {
+            let info = ip::parse(&packet_on_port(port)).unwrap();
+            assert_eq!(
+                routes.pick(&info, Direction::Destination).unwrap().1,
+                0,
+                "port {port} was placed in the empty slot"
+            );
+        }
+    }
+
+    /// A flow that has been silent for the eviction window is forgotten, and
+    /// its lane's flow count goes back with it — which is what lets a later
+    /// sweep, or a claim lending a lane, see that lane as idle.
+    #[test]
+    fn an_idle_flow_is_forgotten_and_frees_its_lane() {
+        let routes = Routes::new();
+        let web = claim();
+        let (first, _rx_first) = mpsc::channel(4);
+        routes.join(web, first).unwrap();
+        let info = ip::parse(&packet_on_port(40_000)).unwrap();
+        assert_eq!(routes.pick(&info, Direction::Destination).unwrap().1, 0);
+        assert_eq!(routes.member_stats()[0].flows, 1);
+
+        // The sweep runs on a placement, so the clock is advanced by hand: the
+        // entry is past the window, which is what a resume after a long silence
+        // looks like.
+        let later =
+            std::time::Instant::now() + FLOW_IDLE_EVICTION + std::time::Duration::from_secs(1);
+        {
+            let mut table = routes.table.lock().unwrap();
+            table.lookup_endpoint_mut(&web).unwrap().sweep_if_due(later);
+        }
+        assert_eq!(
+            routes.member_stats()[0].flows,
+            0,
+            "the lane is idle again once its flow is forgotten"
+        );
+
+        // Re-placing it is safe: it has been silent for longer than a packet can
+        // be in flight, so nothing it sent earlier can be reordered by this.
+        assert_eq!(routes.pick(&info, Direction::Destination).unwrap().1, 0);
+        assert_eq!(routes.member_stats()[0].flows, 1);
+    }
+
+    /// Past its bound the table stops remembering: a new flow is placed by the
+    /// hash alone, which is a pure function of the packet and the live set — so
+    /// it still keeps one lane for as long as the set's width does.
+    #[test]
+    fn a_full_table_places_a_new_flow_by_hash() {
+        let mut slots = ClaimSlots::new();
+        let (first, _rx_first) = mpsc::channel(4);
+        let (second, _rx_second) = mpsc::channel(4);
+        slots.place(first);
+        slots.place(second);
+        let now = std::time::Instant::now();
+        for key in 0..MAX_TRACKED_FLOWS as u64 {
+            slots.flows.insert(
+                key,
+                FlowEntry {
+                    slot: 0,
+                    last_seen: now,
+                },
+            );
+        }
+        if let Some(entry) = slots.slots.get_mut(0) {
+            entry.flows = MAX_TRACKED_FLOWS;
+        }
+
+        let info = ip::parse(&packet_on_port(40_000)).unwrap();
+        let key = flow::key(&info);
+        assert_eq!(
+            slots.route(&info).unwrap(),
+            flow::slot(&info, 2),
+            "a full table falls back to the hash over the live set"
+        );
+        assert_eq!(
+            slots.flows.len(),
+            MAX_TRACKED_FLOWS,
+            "the table did not grow past its bound"
+        );
+        assert!(
+            !slots.flows.contains_key(&key),
+            "the flow was not remembered"
         );
     }
 

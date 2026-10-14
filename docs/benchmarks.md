@@ -1011,9 +1011,12 @@ reproduce it with `just l3-accept` and read `bulk.report` / `small.report` in
 the artifact directory. Its instrument parameters are environment overrides,
 because they change what the numbers mean: `BULK_BYTES` (200 000 by default;
 raise it past a second of traffic when the CPU counters' 100 Hz resolution
-matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), and `CLAIM_MODE`
-(unset, which measures the product's own default; `multiplex` selects the other
-data-channel mode).
+matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), `CLAIM_LANES` (unset,
+which measures the product's own default of one carrier connection per claim; a
+higher number spreads the claim's flows over that many connections) and
+`CLAIM_LANE_CAP` (unset; a value below `CLAIM_LANES` measures the server's
+`[server.data].max_tunnels_per_client` valve refusing a claim's surplus lanes
+while the claim keeps serving on the rest).
 
 ## The UDP queue question (a molehill-only diagnostic)
 

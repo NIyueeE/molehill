@@ -222,6 +222,107 @@ impl Drop for TunnelGuard {
     }
 }
 
+/// The session counter a transparent service charges its lanes to, when this
+/// build has one.
+///
+/// `[server.data].max_tunnels_per_client` was checked on the tunnel hello, so it
+/// counted multiplexed tunnels and nothing else — and a transparent claim's lane
+/// is a plain data channel of its own, which made a claim's carrier connections
+/// the one kind of establishment no server-side policy bounded. The counter is
+/// the same one the tunnel valve uses. A build without the `multiplex` feature
+/// has no session counter at all (and there every data channel is a connection
+/// of its own), so its lanes are bounded by nothing — [`LaneValve::reserve`]
+/// says so rather than pretending.
+#[cfg(feature = "multiplex")]
+type LaneCounter = Option<TunnelCount>;
+#[cfg(not(feature = "multiplex"))]
+type LaneCounter = ();
+
+/// What a transparent service charges its lanes to: the session's counter and
+/// the operator's cap.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[derive(Clone, Default)]
+struct LaneValve {
+    counter: LaneCounter,
+    /// `[server.data].max_tunnels_per_client`; `0` is unlimited.
+    cap: usize,
+}
+
+/// A build without the transparent data path has no lane to charge. The type
+/// stays, so the plumbing that carries it reads the same everywhere, and it is
+/// zero-sized.
+#[cfg(not(all(feature = "transparent", target_os = "linux")))]
+#[derive(Clone, Default)]
+struct LaneValve;
+
+impl LaneValve {
+    /// The valve one session's services charge their lanes to.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    fn new(counter: LaneCounter, cap: usize) -> Self {
+        Self { counter, cap }
+    }
+
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    fn new(_counter: LaneCounter, _cap: usize) -> Self {
+        Self
+    }
+
+    /// Reserve one of a client's carrier connections for a lane.
+    ///
+    /// `Err(held)` is the number of connections the client already holds, for
+    /// the refusal line — the same contract as the tunnel valve's.
+    #[cfg(all(feature = "transparent", target_os = "linux", feature = "multiplex"))]
+    fn reserve(&self) -> std::result::Result<Option<TunnelGuard>, usize> {
+        match &self.counter {
+            Some(count) => count.try_reserve(self.cap).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// A build without the `multiplex` feature has no session counter, so it has
+    /// no lane valve either: every channel is a connection of its own there, and
+    /// nothing counts them.
+    #[cfg(all(
+        feature = "transparent",
+        target_os = "linux",
+        not(feature = "multiplex")
+    ))]
+    fn reserve(&self) -> std::result::Result<Option<()>, usize> {
+        Ok(None)
+    }
+}
+
+/// What a transparent service carries in from its registration: the address
+/// claim it holds for its lifetime, and the valve its lanes are charged to.
+///
+/// One value rather than two parameters because the two travel together and
+/// only the transparent data path reads them — without that path there is no
+/// lane to charge, and the type is just the claim.
+struct TransparentContext {
+    /// Held for the service's lifetime: the address stays claimed until this
+    /// task ends. Read only by the transparent data path.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    claim: Option<Claim>,
+    /// The session's lane valve.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    lane_valve: LaneValve,
+}
+
+impl TransparentContext {
+    /// What a registration hands the service it just accepted.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    fn new(claim: Option<Claim>, lane_valve: LaneValve) -> Self {
+        Self { claim, lane_valve }
+    }
+
+    /// A build without the transparent data path has no lane to charge and no
+    /// claim to hold, so there is nothing to carry.
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    fn new(_claim: Option<Claim>, _lane_valve: LaneValve) -> Self {
+        Self {}
+    }
+}
+
 /// v4 registry: one session per authenticated control connection, keyed by the
 /// nonce the server issued — the same value a data channel authenticates with.
 type SessionMap = HashMap<Nonce, SessionHandle>;
@@ -1120,6 +1221,20 @@ impl SessionCtx {
         // first keeps `Ok` ahead of the first `CreateDataChannelFor`.
         self.send_ack(&Ack::Ok).await?;
 
+        // A claim's lanes are charged to the session's valve as they arrive
+        // (see `LaneValve`). The counter is cloned here, so the transparent
+        // supervisor never has to reach back into the registry on the lane path.
+        #[cfg(feature = "multiplex")]
+        let lane_counter = {
+            let sessions = self.registry.sessions.read().await;
+            sessions
+                .get(&self.nonce)
+                .map(|session| session.tunnels.clone())
+        };
+        #[cfg(not(feature = "multiplex"))]
+        let lane_counter = ();
+        let lane_valve = LaneValve::new(lane_counter, self.server_config.max_tunnels_per_client());
+
         let handle = ControlChannelHandle::new(
             ControlSink::Session {
                 service_id,
@@ -1132,11 +1247,12 @@ impl SessionCtx {
             // this service's own heartbeat is off: the per-service task only
             // turns its pool's requests into tagged commands.
             0,
-            // v4 registrations carry no `pool_size`: the tunnel pool is a
+            // The valve a transparent service charges its lanes to. A v4
+            // registration carries no `pool_size`: the tunnel pool is a
             // client-side, per-carrier concern sized by the client's own
             // configuration — one request per visitor, or one per stripe for a
             // striped gather (see `pair_striped_group`).
-            0,
+            lane_valve,
             stripe_count(&self.server_config),
         );
 
@@ -1435,6 +1551,23 @@ fn report_tunnel_violation(service_id: ServiceId, why: &str) {
         || {
             debug!("Dropped a tunnel stream naming service {service_id}: {why}");
         },
+    );
+}
+
+/// Report a transparent lane the valve refused: once per process at `info` —
+/// the operator wrote the cap, so this is it biting — then at `debug`.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn report_lane_refusal(held: usize, cap: usize) {
+    static LANE_REFUSALS: RepeatNotice = RepeatNotice::new();
+    LANE_REFUSALS.report(
+        || {
+            info!(
+                "Refused a transparent lane: this client already holds {held} carrier \
+                 connections and `[server.data].max_tunnels_per_client` is {cap}. Further \
+                 refusals are logged at debug level."
+            );
+        },
+        || debug!("Refused a transparent lane over the cap of {cap} (client holds {held})"),
     );
 }
 
@@ -1945,7 +2078,7 @@ impl ControlChannelHandle {
         bound: BoundEndpoint,
         claim: Option<Claim>,
         heartbeat_interval: u64,
-        pool_size: usize,
+        lane_valve: LaneValve,
         stripe_count: usize,
     ) -> ControlChannelHandle {
         // Create a shutdown channel
@@ -1956,13 +2089,6 @@ impl ControlChannelHandle {
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
-
-        // Cache some data channels for later use
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(DataChannelRequest::Plain) {
-                debug!("Failed to request data channel {}", e);
-            }
-        }
 
         // A v4 service's pool death has to reach the client, and the session
         // owns the connection: the wrapper below reports a *failed* pool task
@@ -2062,7 +2188,7 @@ impl ControlChannelHandle {
                 data_ch_req_tx.clone(),
                 shutdown_rx_clone,
                 control_task,
-                claim,
+                TransparentContext::new(claim, lane_valve),
                 pool_died_tx,
             ),
         }
@@ -2140,7 +2266,7 @@ async fn run_transparent_service<C>(
     endpoint: SocketAddr,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
-    claim: Option<Claim>,
+    transparent: TransparentContext,
 ) -> Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -2152,9 +2278,10 @@ where
     // into the same line.
     let hub = TunHub::get_or_spawn(&tun, Direction::Destination)?;
     let endpoint = Endpoint::new(endpoint.ip(), endpoint.port());
-    // Held for the service's lifetime: the address stays claimed until this
-    // task ends, and the claim is what a second client's registration hits.
-    let _claim = claim;
+    let TransparentContext {
+        claim: _claim,
+        lane_valve,
+    } = transparent;
 
     let start_cmd = Arc::new(postcard::to_stdvec(
         &DataChannelCmd::StartForwardTransparent,
@@ -2172,6 +2299,18 @@ where
                 let Some(mut channel) = channel else {
                     return Ok(());
                 };
+                // The operator's valve counts these lanes too: a claim's channel
+                // is a carrier connection of its own, and before this it was the
+                // one kind of establishment nothing bounded. The reservation is
+                // held for as long as the lane runs (moved into the member task
+                // below), so a lane that ends gives its slot back.
+                let lane = match lane_valve.reserve() {
+                    Ok(lane) => lane,
+                    Err(held) => {
+                        report_lane_refusal(held, lane_valve.cap);
+                        continue;
+                    }
+                };
                 let hub = Arc::clone(&hub);
                 let start_cmd = Arc::clone(&start_cmd);
                 // The first channels of a fresh claim start at once — they are
@@ -2182,6 +2321,9 @@ where
                 // loop.
                 let paced = lost_members.paces_arrivals();
                 members.spawn(async move {
+                    // Held for the lane's whole life: dropping it (the lane
+                    // ending, however it ends) releases the session slot.
+                    let _lane = lane;
                     if paced {
                         tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
                     }
@@ -2217,13 +2359,23 @@ where
 /// opened when its registration was accepted — moving packets between the
 /// operator's TUN device and whoever holds a slot, and asking for a replacement
 /// whenever one ends.
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(
+        unused_variables,
+        clippy::needless_pass_by_value,
+        reason = "the transparent data path is compiled out on this build, so the task this \
+                  starts can never run; the parameters are what keep the signature and the \
+                  call site one shape in every build"
+    )
+)]
 fn spawn_transparent_service(
     service: &RegisteredService,
     data_ch_rx: mpsc::Receiver<DataChannel>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     shutdown_rx: broadcast::Receiver<bool>,
     control_task: tokio::task::JoinHandle<()>,
-    claim: Option<Claim>,
+    transparent: TransparentContext,
     pool_died_tx: mpsc::UnboundedSender<()>,
 ) {
     #[cfg(all(feature = "transparent", target_os = "linux"))]
@@ -2239,7 +2391,7 @@ fn spawn_transparent_service(
                     endpoint,
                     shutdown_rx,
                     control_task,
-                    claim,
+                    transparent,
                 )
                 .await
                 {
@@ -2260,7 +2412,6 @@ fn spawn_transparent_service(
             data_ch_req_tx,
             shutdown_rx,
             control_task,
-            claim,
             pool_died_tx,
         );
     }
@@ -3485,6 +3636,50 @@ mod tests {
 
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A lane and a tunnel draw on the **same** session counter, which is what
+    /// makes `[server.data].max_tunnels_per_client` a bound on the carrier
+    /// connections one client holds rather than on one kind of them.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    // The module-level waiver cannot carry `expect_used`: this test is gated on
+    // three cfgs, so most builds would leave the module's expectation
+    // unfulfilled.
+    #[expect(
+        clippy::expect_used,
+        reason = "the test asserts on reservations it just made"
+    )]
+    #[test]
+    fn a_lane_and_a_tunnel_share_one_session_counter() {
+        let count = TunnelCount::default();
+        let valve = LaneValve::new(Some(count.clone()), 1);
+
+        // The tunnel valve takes the only slot this cap allows.
+        let tunnel = count.try_reserve(1).expect("the tunnel holds the one slot");
+        assert!(
+            matches!(valve.reserve(), Err(1)),
+            "a lane must see the slot the tunnel holds, and the count with it"
+        );
+
+        // Releasing it lets a lane in, and the lane's own guard gives it back.
+        drop(tunnel);
+        let lane = valve.reserve().expect("the lane gets the released slot");
+        assert!(
+            matches!(valve.reserve(), Err(1)),
+            "the lane's slot is held while the lane runs"
+        );
+        drop(lane);
+        assert!(valve.reserve().is_ok(), "a released lane slot is reusable");
+
+        // A build (or a session) with no counter never refuses, and an unlimited
+        // cap is the default: `Err` is about the cap, not about the counter.
+        let unlimited = LaneValve::new(None, 0);
+        assert!(unlimited.reserve().is_ok());
+        let uncapped = LaneValve::new(Some(TunnelCount::default()), 0);
+        assert!(
+            uncapped.reserve().is_ok() && uncapped.reserve().is_ok(),
+            "0 is unlimited"
+        );
     }
 
     /// Serving L3 is the *server operator's* decision: without the table a

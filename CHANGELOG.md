@@ -63,6 +63,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([HANDOFF.md](HANDOFF.md), "The mux×1 gap, measured before touching it"). The
   wire protocol is unchanged.
 
+- **`[server.data].max_tunnels_per_client` now counts a transparent claim's
+  lanes too.** The valve was checked on the tunnel hello, so it bounded
+  multiplexed data tunnels and nothing else — and a claim's lane is a plain data
+  channel of its own, which made a claim's carrier connections the one kind of
+  establishment no server-side policy bounded. The cap now covers both, because
+  both are what it says: the carrier connections ONE client may hold across the
+  services of its session. A lane over the cap is dropped with one `INFO` line
+  naming the cap (then `DEBUG`), and the claim keeps serving on the lanes it
+  got. Deployments that set the key *and* run transparent services with a lane
+  budget may need to raise it; `0` (the default) is unlimited and unaffected.
+  A build without the `multiplex` feature has no session counter, so its lanes
+  stay unbounded.
+
+- **A claim's flow placement is remembered, so a lane change cannot reorder a
+  flow.** The hub used to route every packet by `hash % width`, which meant a
+  lane *joining* re-placed every established flow — the one event that could
+  deliver a flow's packets out of order. Placement is now a table: a flow is
+  placed once, on its first packet, into the least-loaded live lane (ties broken
+  by the same one-hash-of-the-five-tuple rule, which is what lets both
+  directions, and both ends of a claim, agree without anything on the wire), and
+  its entry routes every later packet. Two consequences are observable: a new
+  flow never lands in an empty slot, whose packets would be dropped while a live
+  lane could carry them, and an entry is forgotten only after 60 s of silence in
+  either direction — safe, because a flow that quiet has nothing in flight left
+  to reorder. The table is bounded; a flow past the bound is placed by the hash
+  alone, which is stable for as long as the set's width is.
+  `MOLEHILL_L3_STATS=1` prints each lane's `flows` count beside `live`,
+  `forwarded` and `no_channel`, which is how an idle lane is told from a busy
+  one.
+
 - **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`, established at
   service start.** The client's data plane used to run an *elastic*
   per-carrier pool: it started cold, grew on load, for a stripe group and to a

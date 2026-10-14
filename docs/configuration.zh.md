@@ -116,7 +116,7 @@
 | `[client.services.<name>].count` | 无需填写:池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].tunnels` 是它的宽度 |
 | `[client.services.<name>].pool_size` | UDP 服务写 `[client.services.<name>].udp_workers`(默认 2)。TCP 服务按访客即时打开数据通道 |
 | `[client.services.<name>].heartbeat_timeout` | 无需填写:服务端在会话确认里声明自己的心跳节奏,客户端据此推导超时。`[client.control].default_heartbeat_timeout` 仍作为可选下限保留 |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限) |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的承载连接数;0 = 不限) |
 | `[client.services.<name>].health_check` | 无需填写:只要客户端在运行,服务就保持注册;无法转发的请求只对那个访客失败 |
 
 下一节说明每个替代键做什么、代价是什么;[CHANGELOG.md](../CHANGELOG.md) 记录
@@ -249,7 +249,7 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
 # stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
-# max_tunnels_per_client = 0 # 可选。运维方对多路复用隧道的阀门:一个客户端在其会话的所有服务上一共可持有多少条数据隧道。配置的 `tunnels` 超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
+# max_tunnels_per_client = 0 # 可选。运维方对「一个客户端在其会话的所有服务上一共可持有多少条承载连接」的阀门:既包括多路复用的数据隧道,也包括透明认领的车道(一条车道就是一条自己的连接——认领永不multiplex)。配置的 `tunnels`/车道预算超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝并在应答里写明上限;车道则被丢弃,并输出一行写明上限的 INFO;会话本身继续运行
 
 [server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
 [server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
@@ -552,7 +552,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 | `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
-| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个成员槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`forwarded` 与 `no_channel`——即哪个成员承载了多少,以及替换窗口让哪个成员丢了多少。这是区分「成员集合」与「全部堆在一个成员上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该成员死亡期间被丢弃的流量 |
+| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个车道槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`flows`、`forwarded` 与 `no_channel`——即哪个车道承载了多少、有多少条流落在它上面,以及替换窗口让哪个车道丢了多少。这是区分「车道集合」与「全部堆在一个车道上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该车道死亡期间被丢弃的流量 |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
 就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
