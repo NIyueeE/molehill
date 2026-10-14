@@ -21,7 +21,8 @@ cargo build --release --no-default-features --features client,noise
 ```
 
 (Note that the default feature set is `server`, `client`, `noise`,
-`hot-reload`, `multiplex` and `kcp`.)
+`hot-reload`, `multiplex`, `kcp` and `transparent`; `transparent` needs Linux
+and a TUN device.)
 
 ## Minimalize the binary
 

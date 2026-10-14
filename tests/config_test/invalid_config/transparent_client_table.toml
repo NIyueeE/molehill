@@ -1,0 +1,20 @@
+# requires: transparent
+# expect: configuration this version moved
+#
+# `[client.transparent]` held the device when transparent was a service type.
+# It is a run mode now, so the strict parse would only say "unknown field":
+# the moved-table scan answers with what to write instead.
+
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.transparent]
+tun = "molehill0"
+
+[client.services.web]
+protocol = "tcp"
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:8081"

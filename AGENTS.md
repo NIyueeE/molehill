@@ -153,9 +153,9 @@ code-level.**
   still in development it is still being defined, so commands may be extended
   **in place** under that number; once the tag exists, the next change to the
   wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
-  — the first three read off each tag's `CURRENT_PROTO_VERSION`, 0.10 off
-  `src/protocol.rs` at HEAD, because the tag that would confirm it does not
-  exist yet.
+  — each read off its tag's `CURRENT_PROTO_VERSION`. The unreleased line on top
+  of v0.10.0 is v5; it has no tag yet, so its commands may still be extended in
+  place.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -377,20 +377,22 @@ pointers, not copies:
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
   `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels, in the default set); `embedded` (minimal).
+  KCP-over-UDP data tunnels, in the default set); `transparent` (a
+  client-owned public `ip:port` carried as whole IP packets over a TUN device,
+  Linux only, in the default set); `embedded` (minimal).
   Clippy runs twice in the pre-commit gate: the second pass covers the
   minimal no-default-features `server,client` build that the default-feature
   pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v4, one control session per endpoint; the rule and the
+- **Protocol**: v5, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
   `opt-level = "z"`, `bench`) and the scratch container image are
   [docs/build-guide.md](docs/build-guide.md).
-- **Unsafe** is denied crate-wide; the one module that opts in per item, the
+- **Unsafe** is denied crate-wide; the modules that opt in per item, the
   `src/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
 - **Bench/test entries are PEP 723 python scripts run via `uv run`**; their

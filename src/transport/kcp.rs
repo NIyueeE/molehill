@@ -1553,8 +1553,9 @@ const IPV6_UDP_HEADERS: usize = 40 + 8;
 /// type for it (its `sockopt::IpMtu` is the IPv4 `IP_MTU`).
 ///
 /// `nix`'s two exported macros supply the whole implementation without a
-/// single `unsafe` line here (the crate denies `unsafe_code`, and the one
-/// sanctioned FFI site is `transport::udp_batch`):
+/// single `unsafe` line here (the crate denies `unsafe_code`; the audited FFI
+/// sites are `transport::udp_batch` and the TUN attach in
+/// `transparent::tun`):
 ///
 /// * [`sockopt_impl!`](nix::sockopt_impl) declares this marker type (derive,
 ///   docs and all) and implements [`GetSockOpt`](nix::sys::socket::GetSockOpt)

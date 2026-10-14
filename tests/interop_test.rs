@@ -420,7 +420,10 @@ fn old_server_refuses_new_client_and_says_so() {
 
     // The client is process 1. It must not need the exposed port to exist: the
     // registration never happens, so this waits on the message alone.
-    if let Err(e) = wait_for_log(&mut case, 1, "protocol v4") {
+    // The client names *its own* dialect, which moves with the wire version;
+    // pinning a number here would fail on every bump for no reason.
+    let speaks = format!("protocol v{}", molehill_rathole::CURRENT_PROTO_VERSION);
+    if let Err(e) = wait_for_log(&mut case, 1, &speaks) {
         let msg = format!(
             "the new client never reported the protocol mismatch: {e}\n\
              --- server log (tail) ---\n{}",

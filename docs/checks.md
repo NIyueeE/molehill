@@ -169,6 +169,27 @@ the tag ritual, and `tests/interop_test.rs` **skips loudly** (never silently)
 when `MOLEHILL_OLD_BIN` is unset, so a plain `cargo test` stays honest about
 what it did not check.
 
+### Transparent-L3 acceptance (`just l3-accept`)
+
+`just l3-accept` runs `benches/scripts/l3/run.sh`: three network namespaces, a
+real `molehill` server and client, and a visitor whose connection is owned by
+the **client** namespace — the server routes the packets into its TUN while
+holding no socket and no conntrack entry for the flow, and the backend sees the
+visitor's real address.
+
+The same run also covers the server's own switch, negatively: it restarts the
+server without `[server.transparent]` **after deleting that namespace's TUN
+device**, so the refusal it asserts on must be the policy one — a server that
+checked the interface first would answer with the missing-device recipe
+instead. That ordering is the point: a client's registration must never be what
+makes a server reach for `/dev/net/tun`.
+
+It is Linux-only (a TUN device) and root-only (`CAP_NET_ADMIN`) for its veth
+pairs, TUN devices, routes and `ip rule`, so it is **not** part of `just check`
+or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
+command and exits 77, never a silent pass. The daemon configures no network
+itself; the harness is the operator.
+
 ## When a gate blocks you
 
 Fix the code first; a waiver is the last resort. The discipline that governs one

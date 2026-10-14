@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Transparent (L3) clients: the client owns the public `ip:port`.** A
+  `[transparent]` block is a run mode of its own, and every entry it has is a
+  claim: the client owns a public `ip:port` on a TUN device, the server routes
+  whole IP packets into the tunnel, and the client's own kernel answers the
+  visitor. Choosing a mode is choosing what the *process* is — its capabilities,
+  its device — so the block is a peer of `[server]` and `[client]`
+  (`--transparent`, or the block alone), a file carrying two of them is refused,
+  and a host that both forwards and claims runs two processes. That is also why
+  a claim has no `protocol` key and no home for `local_addr`, `nodelay` or the
+  UDP-only keys: they cannot be written, rather than being written and refused,
+  and `protocol = "transparent"` inside a `[client]` service is refused with a
+  message naming the entry's new home. The model is a front end, not a second
+  engine: it lowers into the same `ClientConfig` the forwarding path runs on, so
+  the client, the data path and the wire are unchanged. The backend therefore sees the visitor's real
+  source address, TCP keeps its end-to-end semantics, and the server holds no
+  socket and no per-flow state for the connection. Both ends attach to an
+  **existing** TUN device named by `[client.transparent].tun` /
+  `[server.transparent].tun` (default `molehill0`) — the daemon never creates,
+  addresses or routes it — and a prerequisite that is missing (the device, an
+  address the client does not carry, a non-zero `rp_filter`) is refused with
+  the exact command to run instead of silent packet loss. Linux only, with
+  `CAP_NET_ADMIN` on the client and on any server that serves it; the `transparent` feature is in the default
+  set, and a config that asks for the type on another platform, or in a build
+  without the feature, is refused with a precise reason. Serving L3 is the
+  **server operator's** decision: the `[server.transparent]` table is that
+  switch, and without it a registration is refused by policy before any device
+  is looked at — so a client can never be what makes the server reach for
+  `/dev/net/tun` or ask for `CAP_NET_ADMIN`, and a server that only forwards
+  `tcp`/`udp` needs no capability for this feature at all. `local_addr` and
+  `nodelay` are refused for the type — the local application binds the claimed
+  address itself, so nothing is dialed — as are the UDP-only keys. The wire
+  moves to **protocol v5** (one service type and one data-channel command,
+  `StartForwardTransparent`, whose channel carries `[u16 length][packet]`
+  frames), so both ends upgrade together as with every protocol change.
+  `MOLEHILL_L3_STATS=1` prints the data path's cumulative counters. Such a
+  service is **never encrypted**: the visitor's own end-to-end protection is
+  the content's and this hop is a plain link by design, so both a per-service
+  `transport` and a client-wide `[client.transport].type = "noise"` are refused
+  for it. Enabling the server switch therefore means that server accepts
+  plaintext connections from such a client, whatever its `[server.transport]`
+  says; the Noise keys keep applying to the clients that do negotiate them. Not
+  in this
+  version: IPv6 (dropped and counted), per-flow channels (every flow of one
+  claimed endpoint shares the service's single channel), and any automatic
+  network configuration. Keys and the two operator recipes are in
+  `docs/configuration.md` ("Transparent (L3) services") and
+  `docs/deployment.md` ("Transparent services"); the acceptance harness is
+  `just l3-accept` (root-only, Linux-only, outside the check chain), which also
+  runs the negative half: a server without `[server.transparent]` refuses a
+  claim by policy, with its own device deleted for that run so the ordering is
+  proven rather than asserted.
+
 ## [0.10.0] - 2026-10-01
 
 ### Changed

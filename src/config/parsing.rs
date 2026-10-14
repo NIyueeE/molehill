@@ -16,6 +16,7 @@ use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
     DEFAULT_UDP_WORKERS,
 };
+use crate::config::transparent::TransparentClientConfig;
 
 /// Application-layer heartbeat interval in secs
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -142,6 +143,10 @@ pub struct ClientServiceConfig {
     pub service_type: ServiceType,
     #[serde(skip)]
     pub name: String,
+    /// The local service's address, e.g. `"127.0.0.1:6022"`. Required by
+    /// `tcp`/`udp`, and refused by `transparent` — there the local service
+    /// binds the claimed public address itself, and nothing dials anything.
+    #[serde(default)]
     pub local_addr: String,
     /// The public address (e.g. `"0.0.0.0:6022"`) this service is exposed at
     /// on the server. Required.
@@ -181,6 +186,11 @@ pub struct ClientServiceConfig {
     pub udp_idle_timeout: Option<u64>,
     /// Queue size for outbound UDP datagrams per data channel. Default: 1024.
     pub udp_send_queue_size: Option<u16>,
+    /// The TUN device this service attaches to, filled for a claim by
+    /// [`crate::config::transparent::TransparentClientConfig::lower`]. Empty
+    /// for every forwarding service: only a claim touches a device.
+    #[serde(skip)]
+    pub transparent_tun: String,
 }
 
 impl ClientServiceConfig {
@@ -231,6 +241,13 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
+    /// The client *owns* the public `ip:port` instead of the server binding it:
+    /// the client's host carries the address on its own TUN device and its
+    /// kernel answers the visitor, so the backend sees the visitor's real
+    /// address and the server holds no connection state. Linux only, and it
+    /// needs `CAP_NET_ADMIN` on both ends; see `docs/configuration.md`.
+    #[serde(rename = "transparent")]
+    Transparent,
 }
 
 fn default_service_type() -> ServiceType {
@@ -441,6 +458,40 @@ impl DataCarrierLimits {
             .clamp(1, usize::from(MAX_MUX_TUNNELS_CAP))
     }
 }
+/// The TUN device a transparent (L3) service attaches to.
+///
+/// Only the *name* is configuration: the device itself, its addresses and its
+/// routes belong to the operator, and this daemon deliberately never installs
+/// one ([deployment.md](../../docs/deployment.md) owns the recipes). Both ends
+/// may need a device — the server routes the claimed address into its own, the
+/// client carries the address on its own.
+///
+/// On the **server** the table carries a second meaning: it is the operator's
+/// own switch for the feature, because serving L3 is what asks this process for
+/// `CAP_NET_ADMIN` and a device. `[server]` therefore holds this as an
+/// `Option`, and a server without the table refuses every transparent
+/// registration by policy instead of being steered into a device by a client.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentConfig {
+    /// Interface name, created and configured by the operator before the
+    /// daemon starts. Default: `molehill0`.
+    #[serde(default = "default_tun_name")]
+    pub tun: String,
+}
+
+pub(crate) fn default_tun_name() -> String {
+    "molehill0".to_owned()
+}
+
+impl Default for TransparentConfig {
+    fn default() -> Self {
+        Self {
+            tun: default_tun_name(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -589,6 +640,12 @@ pub struct ServerConfig {
     pub data: ServerDataConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
+    /// `[server.transparent]`: **the presence of this table is the switch**
+    /// that lets this server serve transparent (L3) services. Without it a
+    /// registration of that type is refused by policy before any device is
+    /// looked at, so this process never touches `/dev/net/tun` on a
+    /// client's say-so (see [`TransparentConfig`]).
+    pub transparent: Option<TransparentConfig>,
 }
 
 /// Server-side wire material (`[server.transport]`): only the Noise keys.
@@ -654,7 +711,11 @@ impl ServerConfig {
 }
 
 /// The full molehill configuration file: at least one of `[server]` /
-/// `[client]` must be present.
+/// `[client]` / `[transparent]` must be present.
+///
+/// The three blocks are three **run modes**, so a file normally carries
+/// exactly one: a host that is both a forwarding client and an L3 one is two
+/// processes, with their own capabilities and their own restarts.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -662,6 +723,52 @@ pub struct Config {
     pub server: Option<ServerConfig>,
     /// `[client]` block; `None` when absent.
     pub client: Option<ClientConfig>,
+    /// `[transparent]` block: the L3 client's own model; `None` when absent.
+    pub transparent: Option<TransparentClientConfig>,
+}
+
+/// Which configuration model a client block was written in.
+///
+/// The two models share one validator because they share everything the
+/// validator checks — addresses, tokens, retries, data-plane defaults. What
+/// they do not share is which service types are *legal*: a `[client]` service
+/// forwards and may never be transparent, while every service of an L3 block
+/// is a claim. Naming the model keeps that difference in one argument instead
+/// of forking the rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClientModel {
+    /// `[client]`: services forward to a `local_addr`.
+    Forwarding,
+    /// `[transparent]`: services own their public address.
+    Claiming,
+}
+
+impl ClientModel {
+    /// What this model calls one entry, for messages about it. An L3 client
+    /// writes `[transparent.claims.<name>]`, so calling its entries "services"
+    /// would send a reader looking for a table they never wrote.
+    const fn entry(self) -> &'static str {
+        match self {
+            Self::Forwarding => "service",
+            Self::Claiming => "claim",
+        }
+    }
+
+    /// The block this model's client-wide keys live in.
+    const fn block(self) -> &'static str {
+        match self {
+            Self::Forwarding => "[client]",
+            Self::Claiming => "[transparent]",
+        }
+    }
+
+    /// The same, for the control-channel sub-table.
+    const fn control_block(self) -> &'static str {
+        match self {
+            Self::Forwarding => "[client.control]",
+            Self::Claiming => "[transparent.control]",
+        }
+    }
 }
 
 /// Keys a release removed, the version that removed each one, and what to
@@ -746,6 +853,42 @@ fn reject_removed_keys(doc: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
+/// Tables this version moved, and what to write instead.
+///
+/// The same reasoning as [`REMOVED_KEYS`], for the one place a *table* rather
+/// than a key changed home: the strict parse would answer "unknown field
+/// `transparent`", which says that something is wrong without saying what to
+/// write. No version is named here because nothing of this surface was ever
+/// released — the transparent model is being shaped before its first tag — so
+/// there is no release for an operator to have upgraded from.
+const MOVED_TABLES: &[(&str, &str)] = &[(
+    "client.transparent",
+    "a transparent (L3) client is its own run mode now: name the device in \
+     `[transparent].tun`, write every claimed address as a `[transparent.claims.<name>]` \
+     entry, and start it with `molehill <config> --transparent`",
+)];
+
+/// Refuse a config that still carries a table this version moved, naming it
+/// and what to write instead.
+fn reject_moved_tables(doc: &toml::Value) -> Result<()> {
+    let mut found: Vec<String> = Vec::new();
+    for (pattern, advice) in MOVED_TABLES {
+        let segments: Vec<&str> = pattern.split('.').collect();
+        let mut hits = 0;
+        count_at(doc, &segments, &mut hits);
+        if hits > 0 {
+            found.push(format!("  `[{pattern}]`: {advice}"));
+        }
+    }
+    anyhow::ensure!(
+        found.is_empty(),
+        "this config still carries configuration this version moved:\n{}\n\
+         Move it, then start again.",
+        found.join("\n")
+    );
+    Ok(())
+}
+
 /// Walk `value` along `segments`, counting the leaves that are present. `*`
 /// descends into every value of a table.
 fn count_at(value: &toml::Value, segments: &[&str], hits: &mut usize) {
@@ -774,12 +917,15 @@ fn count_at(value: &toml::Value, segments: &[&str], hits: &mut usize) {
 }
 
 impl Config {
-    fn from_str(s: &str) -> Result<Config> {
+    /// Parse and validate a config document. Crate-visible because the model
+    /// modules' own tests go through it: it is the only thing that validates.
+    pub(crate) fn from_str(s: &str) -> Result<Config> {
         // Parse to a document first: a removed key has to be seen (and taken
         // out) before the strict struct parse, which rejects unknown fields.
         let mut doc: toml::Value =
             toml::from_str(s).with_context(|| "Failed to parse the config")?;
         reject_removed_keys(&mut doc)?;
+        reject_moved_tables(&doc)?;
         let mut config: Config =
             Config::deserialize(doc).with_context(|| "Failed to parse the config")?;
 
@@ -788,14 +934,55 @@ impl Config {
         }
 
         if let Some(client) = config.client.as_mut() {
-            Config::validate_client_config(client)?;
+            Config::validate_client_config(client, ClientModel::Forwarding)?;
         }
 
-        if config.server.is_none() && config.client.is_none() {
-            Err(anyhow!("Neither of `[server]` or `[client]` is defined"))
+        // An L3 block is validated in its *lowered* shape, so both models go
+        // through one set of rules about addresses, tokens, retries and data
+        // defaults; what differs between them is which service types are
+        // legal, and that is the model argument.
+        if let Some(transparent) = config.transparent.as_mut() {
+            let mut lowered = transparent.lower();
+            Config::validate_client_config(&mut lowered, ClientModel::Claiming)?;
+            transparent.lowered = Some(Box::new(lowered));
+        }
+
+        if config.server.is_none() && config.client.is_none() && config.transparent.is_none() {
+            Err(anyhow!(
+                "Neither of `[server]`, `[client]` or `[transparent]` is defined"
+            ))
         } else {
             Ok(config)
         }
+    }
+
+    /// The client block an L3 run executes on.
+    ///
+    /// The transparent block has no runtime of its own: it becomes the same
+    /// `ClientConfig` a forwarding client uses (see
+    /// [`TransparentClientConfig::lower`]), so this is the seam between "which
+    /// model was written" and "which engine runs it".
+    ///
+    /// # Errors
+    ///
+    /// Fails when the config carries no `[transparent]` block, or when it was
+    /// never validated — neither can happen through
+    /// [`Config::from_str`], which fills the lowering in.
+    pub fn into_l3_client(self) -> Result<Config> {
+        let Some(transparent) = self.transparent else {
+            return Err(anyhow!(
+                "Try to run as a transparent (L3) client, but the configuration is missing. \
+                 Please add the `[transparent]` block"
+            ));
+        };
+        let client = transparent.lowered.ok_or_else(|| {
+            anyhow!("the `[transparent]` block was not validated before it was used")
+        })?;
+        Ok(Config {
+            server: None,
+            client: Some(*client),
+            transparent: None,
+        })
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
@@ -817,26 +1004,33 @@ impl Config {
         Ok(())
     }
 
-    fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+    fn validate_client_config(client: &mut ClientConfig, model: ClientModel) -> Result<()> {
         if client.control.default_remote_addr.is_empty() {
-            bail!("`[client.control].default_remote_addr` is required");
+            bail!(
+                "`{}.default_remote_addr` is required",
+                model.control_block()
+            );
         }
         // The port is required, e.g. "example.com:2333"
         if client.control.default_remote_addr.rfind(':').is_none() {
             bail!(
-                "client.control.default_remote_addr is missing the port: {}",
+                "{}.default_remote_addr is missing the port: {}",
+                model.control_block(),
                 client.control.default_remote_addr
             );
         }
 
         if client.default_token.is_empty() {
-            bail!("`[client].default_token` must not be empty");
+            bail!("`{}.default_token` must not be empty", model.block());
         }
 
         #[cfg(feature = "multiplex")]
         Config::validate_data_config(client)?;
 
-        // Validate services
+        // Validate the entries: services in a `[client]` block, claims in a
+        // `[transparent]` one. The word follows the model, because that is
+        // the table the reader has in front of them.
+        let entry = model.entry();
         for (name, s) in &mut client.services {
             s.name.clone_from(name);
 
@@ -846,11 +1040,12 @@ impl Config {
             if let Some(addr) = s.remote_addr.as_deref()
                 && addr.rfind(':').is_none()
             {
-                bail!("service {name}: `remote_addr` is missing the port: {addr}");
+                bail!("{entry} {name}: `remote_addr` is missing the port: {addr}");
             }
             if s.token.as_ref().is_some_and(|t| t.is_empty()) {
-                bail!("service {name}: `token` must not be empty");
+                bail!("{entry} {name}: `token` must not be empty");
             }
+
             // Effective transport is client-decided per service: the
             // `transport.type` override wins over the client-wide
             // `[client.transport].type`, and effective Noise needs keys
@@ -860,48 +1055,28 @@ impl Config {
                     .is_none()
             {
                 bail!(
-                    "service {name}: Noise is the effective transport (per-service                     `transport.type = \"noise\"` or the client-wide `type = \"noise\"`)                     but no Noise keys are configured — set them in                     `[client.transport.noise]` or                     `[client.services.{name}.transport.noise]`"
+                    "{entry} {name}: Noise is the effective transport (per-service                     `transport.type = \"noise\"` or the client-wide `type = \"noise\"`)                     but no Noise keys are configured — set them in                     `[client.transport.noise]` or                     `[client.services.{name}.transport.noise]`"
                 );
             }
 
             // The public endpoint is client-declared and required.
             let bind: SocketAddr = s.remote_bind_addr.parse().with_context(|| {
                 format!(
-                    "service {}: invalid `remote_bind_addr`: {:?}. It must be a socket address like \"0.0.0.0:6022\"",
+                    "{entry} {}: invalid `remote_bind_addr`: {:?}. It must be a socket address like \"0.0.0.0:6022\"",
                     name, s.remote_bind_addr
                 )
             })?;
             if bind.port() == 0 {
-                bail!("service {name}: `remote_bind_addr` port must not be 0");
+                bail!("{entry} {name}: `remote_bind_addr` port must not be 0");
             }
 
-            // UDP-only keys on a TCP service are refused, not ignored: they
-            // used to be accepted and silently dropped, which let a config's
-            // owner believe a buffer or a worker count was in effect when
-            // nothing read it. The message names the key and the protocol.
-            if matches!(s.service_type, ServiceType::Tcp) {
-                for (key, written) in [
-                    ("udp_workers", s.udp_workers.is_some()),
-                    ("udp_buffer_size", s.udp_buffer_size.is_some()),
-                    ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
-                    ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
-                    ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
-                ] {
-                    if written {
-                        bail!(
-                            "service {name}: `{key}` is only valid for a UDP service \
-                             (`protocol = \"udp\"`), but this service is TCP. Remove the key, or \
-                             declare the service as UDP"
-                        );
-                    }
-                }
-            }
+            Config::validate_service_protocol(name, s, model)?;
 
             // Fill in runtime defaults.
             if matches!(s.service_type, ServiceType::Udp) {
                 match s.udp_workers {
                     None => s.udp_workers = Some(DEFAULT_UDP_WORKERS),
-                    Some(0) => bail!("service {name}: udp_workers must be at least 1"),
+                    Some(0) => bail!("{entry} {name}: udp_workers must be at least 1"),
                     Some(_) => {}
                 }
             }
@@ -909,25 +1084,104 @@ impl Config {
                 s.udp_buffer_size =
                     Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX));
             } else if s.udp_buffer_size == Some(0) {
-                bail!("service {name}: udp_buffer_size must be greater than 0");
+                bail!("{entry} {name}: udp_buffer_size must be greater than 0");
             }
             if s.udp_idle_timeout.is_none() {
                 s.udp_idle_timeout = Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS);
             } else if s.udp_idle_timeout == Some(0) {
-                bail!("service {name}: udp_idle_timeout must be greater than 0");
+                bail!("{entry} {name}: udp_idle_timeout must be greater than 0");
             }
             if s.udp_send_queue_size.is_none() {
                 s.udp_send_queue_size =
                     Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap_or(u16::MAX));
             } else if s.udp_send_queue_size == Some(0) {
-                bail!("service {name}: udp_send_queue_size must be greater than 0");
+                bail!("{entry} {name}: udp_send_queue_size must be greater than 0");
             }
 
             #[cfg(feature = "multiplex")]
-            Config::validate_service_data(client.data.default_mode, name, s)?;
+            Config::validate_service_data(client.data.default_mode, name, s, entry)?;
         }
 
         Config::validate_transport_config(&client.transport)?;
+
+        Ok(())
+    }
+
+    /// Per-protocol service keys: what each protocol requires, and what it
+    /// refuses because nothing would read it.
+    ///
+    /// The refusals are deliberate rather than lenient — a key that is
+    /// accepted and ignored lets its writer believe a buffer or a worker count
+    /// is in effect when nothing reads it.
+    fn validate_service_protocol(
+        name: &str,
+        s: &mut ClientServiceConfig,
+        model: ClientModel,
+    ) -> Result<()> {
+        let entry = model.entry();
+        // Which service types a model may express is the whole of the
+        // difference between them, and it is structural rather than a list of
+        // refusals: a forwarding service may never own its public address (an
+        // L3 client is a different run mode, with a different device and a
+        // different table), and a claim has nothing to forward to.
+        match (model, s.service_type) {
+            (ClientModel::Forwarding, ServiceType::Transparent) => bail!(
+                "{entry} {name}: `protocol = \"transparent\"` is not a forwarding protocol. An \
+                 L3 client is its own run mode: move this service to a \
+                 `[transparent.claims.{name}]` entry, and start the process with \
+                 `molehill <config> --transparent`"
+            ),
+            (ClientModel::Claiming, ServiceType::Tcp | ServiceType::Udp) => bail!(
+                "{entry} {name}: a `[transparent]` client claims public addresses; it has no \
+                 forwarding services. Move this one to a `[client]` block in a config of its \
+                 own, started as a client"
+            ),
+            (ClientModel::Claiming, ServiceType::Transparent) => {
+                if !cfg!(all(feature = "transparent", target_os = "linux")) {
+                    let why = if cfg!(feature = "transparent") {
+                        "this platform is not Linux"
+                    } else {
+                        "this build was compiled without the `transparent` feature"
+                    };
+                    bail!(
+                        "{entry} {name}: `[transparent]` carries whole IP packets through a \
+                         TUN device, and {why}"
+                    );
+                }
+            }
+            (ClientModel::Forwarding, ServiceType::Tcp | ServiceType::Udp) => {
+                if s.local_addr.is_empty() {
+                    let protocol = if s.service_type == ServiceType::Tcp {
+                        "tcp"
+                    } else {
+                        "udp"
+                    };
+                    bail!("{entry} {name}: `local_addr` is required for a {protocol} service");
+                }
+            }
+        }
+
+        // UDP-only keys on a TCP service are refused, not ignored: they
+        // used to be accepted and silently dropped, which let a config's
+        // owner believe a buffer or a worker count was in effect when
+        // nothing read it. The message names the key and the protocol.
+        if matches!(s.service_type, ServiceType::Tcp) {
+            for (key, written) in [
+                ("udp_workers", s.udp_workers.is_some()),
+                ("udp_buffer_size", s.udp_buffer_size.is_some()),
+                ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
+                ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
+                ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
+            ] {
+                if written {
+                    bail!(
+                        "{entry} {name}: `{key}` is only valid for a UDP service \
+                         (`protocol = \"udp\"`), but this service is TCP. Remove the \
+                         key, or declare the service as UDP"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -984,6 +1238,7 @@ impl Config {
         default_mode: DataMode,
         name: &str,
         s: &ClientServiceConfig,
+        entry: &str,
     ) -> Result<()> {
         use DataCarrier::Kcp;
         use DataMode::Direct;
@@ -991,7 +1246,7 @@ impl Config {
         let mode = s.mode.unwrap_or(default_mode);
         if matches!(mode, Direct) {
             if matches!(s.carrier, Some(Kcp)) {
-                bail!("service {name}: `carrier = \"kcp\"` requires `mode = \"multiplex\"`");
+                bail!("{entry} {name}: `carrier = \"kcp\"` requires `mode = \"multiplex\"`");
             }
             return Ok(());
         }
@@ -999,7 +1254,7 @@ impl Config {
         if matches!(s.carrier, Some(Kcp)) {
             #[cfg(not(feature = "kcp"))]
             bail!(
-                "service {name}: `carrier = \"kcp\"` requires a binary built with the `kcp` feature"
+                "{entry} {name}: `carrier = \"kcp\"` requires a binary built with the `kcp` feature"
             );
         }
 
@@ -1095,6 +1350,13 @@ mod tests {
                 let available = cfg!(feature = "multiplex");
                 if !available {
                     println!("  skip {name}: needs the `multiplex` feature");
+                }
+                available
+            }
+            "transparent" => {
+                let available = cfg!(all(feature = "transparent", target_os = "linux"));
+                if !available {
+                    println!("  skip {name}: needs a Linux build with the `transparent` feature");
                 }
                 available
             }
@@ -1303,6 +1565,43 @@ max_tunnels_per_client = 6
         assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 6);
     }
 
+    /// `[server.transparent]` is opt-in, and the *table's presence* is the
+    /// switch: a server that never mentions it parses to `None` rather than to
+    /// a default device it would then be willing to attach. Inside the table
+    /// the device name keeps its default, because writing the table already is
+    /// the operator's decision.
+    #[test]
+    fn test_server_transparent_is_opt_in() {
+        let without = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+"#;
+        let cfg = Config::from_str(without).unwrap();
+        assert!(
+            cfg.server.unwrap().transparent.is_none(),
+            "a server that does not mention transparent must not be armed for it"
+        );
+
+        let with = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+"#;
+        let cfg = Config::from_str(with).unwrap();
+        assert_eq!(
+            cfg.server.unwrap().transparent.map(|t| t.tun).as_deref(),
+            Some("molehill0"),
+            "writing the table is the decision; the device name still defaults"
+        );
+    }
+
     #[test]
     fn test_invalid_config() -> Result<()> {
         let paths = list_config_files("tests/config_test/invalid_config")?;
@@ -1393,19 +1692,19 @@ max_tunnels_per_client = 6
 
         // Missing remote_bind_addr (empty string does not parse)
         cfg.services.insert("foo1".into(), svc(""));
-        assert!(Config::validate_client_config(&mut cfg).is_err());
+        assert!(Config::validate_client_config(&mut cfg, ClientModel::Forwarding).is_err());
 
         // Invalid remote_bind_addr (missing port)
         cfg.services.insert("foo1".into(), svc("0.0.0.0"));
-        assert!(Config::validate_client_config(&mut cfg).is_err());
+        assert!(Config::validate_client_config(&mut cfg, ClientModel::Forwarding).is_err());
 
         // Port 0 is rejected
         cfg.services.insert("foo1".into(), svc("0.0.0.0:0"));
-        assert!(Config::validate_client_config(&mut cfg).is_err());
+        assert!(Config::validate_client_config(&mut cfg, ClientModel::Forwarding).is_err());
 
         // A valid config passes and gets its runtime defaults filled in
         cfg.services.insert("foo1".into(), svc("0.0.0.0:6081"));
-        Config::validate_client_config(&mut cfg)?;
+        Config::validate_client_config(&mut cfg, ClientModel::Forwarding)?;
         let s = cfg.services.get("foo1").unwrap();
         assert_eq!(s.udp_workers, Some(DEFAULT_UDP_WORKERS));
         assert_eq!(
@@ -1533,7 +1832,10 @@ default_token = "t"
 bind_addr = "0.0.0.0:2333"
 "#;
         let cfg = Config::from_str(config).unwrap();
-        assert!(cfg.server.unwrap().allow_ports.is_empty());
+        assert!(
+            cfg.server.unwrap().allow_ports.is_empty(),
+            "a config that declares no allow_ports must parse with an empty whitelist"
+        );
 
         // Malformed ranges fail validation
         let bad = r#"

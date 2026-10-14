@@ -117,14 +117,14 @@ jobs:
             cross: false
             # Full default feature set: static musl binary.
             # Used as the linux/amd64 container image artifact.
-            features: server,client,noise,hot-reload,multiplex,kcp
+            features: server,client,noise,hot-reload,multiplex,kcp,transparent
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             exe: molehill
             cross: true
             # Same feature set as x86_64 musl so the linux/arm64 container
             # image artifact is feature-consistent with linux/amd64.
-            features: server,client,noise,hot-reload,multiplex,kcp
+            features: server,client,noise,hot-reload,multiplex,kcp,transparent
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             exe: molehill

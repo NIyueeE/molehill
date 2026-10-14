@@ -113,6 +113,13 @@ struct RegisteredService {
     bind_addr: SocketAddr,
     /// Receive buffer size for UDP datagrams; ignored for TCP services.
     udp_buffer_size: usize,
+    /// The TUN device a transparent service's data path attaches to
+    /// (`[server.transparent].tun`); `None` for every other service type.
+    #[cfg_attr(
+        not(all(feature = "transparent", target_os = "linux")),
+        expect(dead_code, reason = "read only by the transparent data path")
+    )]
+    transparent_tun: Option<String>,
 }
 
 // The entrypoint of running a server
@@ -721,6 +728,9 @@ async fn handle_connection(
 struct Registered {
     service: RegisteredService,
     bound: BoundEndpoint,
+    /// A transparent service's claim on its public endpoint, held for the
+    /// service's lifetime so a second client cannot claim the same `ip:port`.
+    claim: Option<Claim>,
 }
 
 /// The outcome of one registration attempt.
@@ -731,6 +741,27 @@ enum Registration {
     /// `Ack::RegisterRejected`; a v3 connection ends after it, while a v4
     /// session rejects only that service and stays up.
     Rejected(String),
+}
+
+/// The TUN device this server routes transparent services into, or the policy
+/// refusal to answer a registration with.
+///
+/// `[server.transparent]` **is** the switch. Serving L3 is what asks this
+/// process for `CAP_NET_ADMIN` and a device, so it is the operator's decision,
+/// taken statically in the server's own configuration — never a remote
+/// client's, whose registration arrives at runtime and could otherwise be what
+/// makes this host reach for `/dev/net/tun`. A server without the table
+/// therefore refuses by policy, before any device is looked at.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
+    match server_config.transparent.as_ref() {
+        Some(transparent) => Ok(&transparent.tun),
+        None => Err(
+            "This server does not serve transparent (L3) services: `[server.transparent]` is \
+             not configured"
+                .to_string(),
+        ),
+    }
 }
 
 /// Validate one service registration against the server's policy and bind its
@@ -792,11 +823,60 @@ async fn register_service(
         }
     }
 
+    // A transparent service claims a public address this host never binds, so
+    // four things have to hold before it is accepted: this server serves L3 at
+    // all (the operator's own `[server.transparent]`, checked first so that a
+    // client's registration is never what makes this process reach for a
+    // device), the build and platform can carry it, the routing contract is
+    // satisfiable (the operator's TUN device exists), and no other service
+    // already owns that address.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    let (claim, transparent_tun) = {
+        if reg.service_type == ServiceType::Transparent {
+            let tun = match transparent_tun_for(server_config) {
+                Ok(tun) => tun,
+                Err(reason) => {
+                    warn!(service = %reg.name, "{reason}");
+                    return Ok(Registration::Rejected(reason));
+                }
+            };
+            if let Err(e) = crate::transparent::check::require_interface(tun) {
+                let reason = format!("{e:#}");
+                warn!(service = %reg.name, "Registration failed: {reason}");
+                return Ok(Registration::Rejected(reason));
+            }
+            let Some(held) = Claim::acquire(reg.bind_addr) else {
+                let reason = format!(
+                    "Address {} is already claimed by another transparent service on this server",
+                    reg.bind_addr
+                );
+                warn!(service = %reg.name, "{reason}");
+                return Ok(Registration::Rejected(reason));
+            };
+            (Some(held), Some(tun.to_string()))
+        } else {
+            (None, None)
+        }
+    };
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    let (claim, transparent_tun): (Option<Claim>, Option<String>) = {
+        if reg.service_type == ServiceType::Transparent {
+            let reason = "This server cannot serve `protocol = \"transparent\"`: it carries \
+                          whole IP packets through a TUN device, which needs a Linux build with \
+                          the `transparent` feature. This build does not have it."
+                .to_string();
+            warn!(service = %reg.name, "{reason}");
+            return Ok(Registration::Rejected(reason));
+        }
+        (None, None)
+    };
+
     let service = RegisteredService {
         name: reg.name.clone(),
         service_type: reg.service_type,
         bind_addr: reg.bind_addr,
         udp_buffer_size: reg.udp_buffer_size as usize,
+        transparent_tun,
     };
 
     // Bind the public endpoint eagerly so that conflicts are reported
@@ -805,6 +885,7 @@ async fn register_service(
         Ok(bound) => Ok(Registration::Accepted(Box::new(Registered {
             service,
             bound,
+            claim,
         }))),
         Err(e) => {
             let reason = format!("{e:#}");
@@ -1028,7 +1109,11 @@ impl SessionCtx {
                 }
                 Registration::Accepted(registered) => registered,
             };
-        let Registered { service, bound } = *registered;
+        let Registered {
+            service,
+            bound,
+            claim,
+        } = *registered;
 
         // The verdict precedes any command for this service: everything the
         // per-service task queues goes through the same writer, so answering
@@ -1042,6 +1127,7 @@ impl SessionCtx {
             },
             &service,
             bound,
+            claim,
             // The session owns the cadence (`Ack::SessionOk` declared it), so
             // this service's own heartbeat is off: the per-service task only
             // turns its pool's requests into tagged commands.
@@ -1632,6 +1718,41 @@ impl Clone for ControlChannelHandle {
 enum BoundEndpoint {
     Tcp(TcpListener),
     Udp(UdpSocket),
+    /// A transparent service binds nothing: the address lives on the client's
+    /// TUN device, and the server only routes packets into the tunnel. The
+    /// claim (`Registered::claim`) is what keeps the address unique here.
+    Transparent,
+}
+
+/// Every public endpoint a transparent service has claimed on this server.
+///
+/// The routing that feeds the tunnel is per address, so a second claimant
+/// would silently steal the first one's visitors; a claim makes that a precise
+/// rejection instead.
+static CLAIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<SocketAddr>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// A held claim on one public endpoint, released when the service ends.
+struct Claim(SocketAddr);
+
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(dead_code, reason = "transparent registrations are refused here")
+)]
+impl Claim {
+    /// `None` when another service already owns the endpoint.
+    fn acquire(addr: SocketAddr) -> Option<Self> {
+        let mut claims = CLAIMS.lock().ok()?;
+        claims.insert(addr).then_some(Claim(addr))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = CLAIMS.lock() {
+            claims.remove(&self.0);
+        }
+    }
 }
 
 /// Bind the service's public endpoint.
@@ -1643,6 +1764,8 @@ async fn bind_service_endpoint(service: &RegisteredService) -> std::io::Result<B
         ServiceType::Udp => UdpSocket::bind(service.bind_addr)
             .await
             .map(BoundEndpoint::Udp),
+        // Nothing to bind on this host: the address is the client's.
+        ServiceType::Transparent => Ok(BoundEndpoint::Transparent),
     }
 }
 
@@ -1776,6 +1899,7 @@ impl ControlChannelHandle {
         sink: ControlSink,
         service: &RegisteredService,
         bound: BoundEndpoint,
+        claim: Option<Claim>,
         heartbeat_interval: u64,
         pool_size: usize,
         stripe_count: usize,
@@ -1886,6 +2010,17 @@ impl ControlChannelHandle {
                     .instrument(Span::current()),
                 );
             }
+            // A transparent service binds nothing: its packets arrive on the
+            // operator's TUN, and this task moves them to and from the tunnel.
+            BoundEndpoint::Transparent => spawn_transparent_service(
+                service,
+                data_ch_rx,
+                data_ch_req_tx.clone(),
+                shutdown_rx_clone,
+                control_task,
+                claim,
+                pool_died_tx,
+            ),
         }
 
         ControlChannelHandle {
@@ -1896,7 +2031,142 @@ impl ControlChannelHandle {
     }
 }
 
-/// Report that a service's pool task could not serve its listener any more.
+/// How long to wait before asking for a replacement transparent channel.
+///
+/// A replacement is requested when the channel for an endpoint ends; without a
+/// pause, a peer that refuses the start command instantly would be asked again
+/// just as instantly.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Serve one transparent service: take the channel the client opened when its
+/// registration was accepted, hand the device's packets to it, and inject what
+/// comes back.
+///
+/// One channel at a time. When it ends, a replacement is requested — the
+/// client opens on demand, the same path a UDP worker's replacement takes —
+/// and the tunnel pool places it, because the service must not give up on an
+/// address it holds.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+async fn run_transparent_service<C>(
+    mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
+    tun: String,
+    endpoint: SocketAddr,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+    mut control_task: tokio::task::JoinHandle<()>,
+    claim: Option<Claim>,
+) -> Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::transparent::hub::{TunHub, forward_transparent};
+    use crate::transparent::{Endpoint, Stats};
+
+    let stats = Arc::new(Stats::default());
+    crate::transparent::spawn_stats_reporter("server", Arc::clone(&stats));
+    let hub = TunHub::get_or_spawn(
+        &tun,
+        Arc::clone(&stats),
+        crate::transparent::Direction::Destination,
+    )?;
+    let endpoint = Endpoint::new(endpoint.ip(), endpoint.port());
+    // Held for the service's lifetime: the address stays claimed until this
+    // task ends, and the claim is what a second client's registration hits.
+    let _claim = claim;
+
+    let start_cmd = postcard::to_stdvec(&DataChannelCmd::StartForwardTransparent)?;
+    let mut first_channel = true;
+    loop {
+        let channel = tokio::select! {
+            channel = data_ch_rx.recv() => channel,
+            _ = shutdown_rx.recv() => return Ok(()),
+            _ = &mut control_task => return Ok(()),
+        };
+        let Some(mut channel) = channel else {
+            return Ok(());
+        };
+
+        if !first_channel {
+            // The previous channel ended. Pace the replacement: a client that
+            // cannot serve this command (an older build, a broken data path of
+            // its own) must not be asked for a new channel in a tight loop.
+            tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
+        }
+        first_channel = false;
+
+        if let Err(e) = write_and_flush(&mut channel, &start_cmd).await {
+            debug!("Transparent channel for {endpoint} died before starting: {e:#}");
+            let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
+            continue;
+        }
+        if let Err(e) =
+            forward_transparent(channel, Arc::clone(&hub), endpoint, Arc::clone(&stats)).await
+        {
+            debug!("Transparent channel for {endpoint} ended: {e:#}");
+        }
+        // No channel for this endpoint any more: ask for one, and keep holding
+        // the address while the client opens it.
+        let _ = data_ch_req_tx.send(DataChannelRequest::Plain);
+    }
+}
+
+/// Start a transparent service's data path.
+///
+/// Not a pool runner: there is no listener to accept on. It waits for the
+/// channel the client opened when its registration was accepted, then moves
+/// packets between the operator's TUN device and that channel until either
+/// end stops, asking for a replacement channel when one does.
+fn spawn_transparent_service(
+    service: &RegisteredService,
+    data_ch_rx: mpsc::Receiver<DataChannel>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
+    shutdown_rx: broadcast::Receiver<bool>,
+    control_task: tokio::task::JoinHandle<()>,
+    claim: Option<Claim>,
+    pool_died_tx: mpsc::UnboundedSender<()>,
+) {
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    {
+        let tun = service.transparent_tun.clone().unwrap_or_default();
+        let endpoint = service.bind_addr;
+        tokio::spawn(
+            async move {
+                if let Err(e) = run_transparent_service(
+                    data_ch_rx,
+                    data_ch_req_tx,
+                    tun,
+                    endpoint,
+                    shutdown_rx,
+                    control_task,
+                    claim,
+                )
+                .await
+                {
+                    error!("{:#}", e);
+                    report_pool_death(&pool_died_tx);
+                }
+            }
+            .instrument(Span::current()),
+        );
+    }
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    {
+        // A registration is refused long before this on such a build; the
+        // parameters are consumed so the signature stays one shape.
+        let _ = (
+            service,
+            data_ch_rx,
+            data_ch_req_tx,
+            shutdown_rx,
+            control_task,
+            claim,
+            pool_died_tx,
+        );
+    }
+}
+
+/// Report that a service's pool task could not serve its listener any more./// Report that a service's pool task could not serve its listener any more.
 ///
 /// Only the *abnormal* end is reported: a pool that returns `Ok` ended
 /// orderly (shutdown, or the control channel gone), and must never tell the
@@ -2351,24 +2621,24 @@ async fn serve_tcp_visitor<C>(
                 PairOutcome::Shed | PairOutcome::Stop => return,
             }
         }
-    } else {
-        // The gather is atomic: hold the group lock for the whole attempt so
-        // concurrent visitors cannot interleave their K channels.
-        let _gather = pool.stripe_gather.lock().await;
-        // The boolean told the accept loop to stop; for one visitor both
-        // outcomes are "nothing left to do here".
-        if let Err(e) = pair_striped_group(
-            incoming,
-            pool.stripe_count,
-            &pool.data_ch_rx,
-            &pool.data_ch_req_tx,
-            &mut shutdown_rx,
-            &mut control_alive,
-        )
-        .await
-        {
-            debug!("Striped pairing failed: {e:#}");
-        }
+    }
+
+    // The gather is atomic: hold the group lock for the whole attempt so
+    // concurrent visitors cannot interleave their K channels.
+    let _gather = pool.stripe_gather.lock().await;
+    // The boolean told the accept loop to stop; for one visitor both
+    // outcomes are "nothing left to do here".
+    if let Err(e) = pair_striped_group(
+        incoming,
+        pool.stripe_count,
+        &pool.data_ch_rx,
+        &pool.data_ch_req_tx,
+        &mut shutdown_rx,
+        &mut control_alive,
+    )
+    .await
+    {
+        debug!("Striped pairing failed: {e:#}");
     }
 }
 
@@ -3115,6 +3385,32 @@ mod tests {
 
     fn peer(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Serving L3 is the *server operator's* decision: without the table a
+    /// transparent registration is refused by policy — with a reason that names
+    /// the missing switch, not a missing device — and with it the device named
+    /// there is what the data path gets. `[server.transparent]` is an `Option`
+    /// for exactly this reason: a defaulted table would leave this process
+    /// armed to attach a device the operator never asked for.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn the_server_switch_governs_transparent_registrations() {
+        let mut server = ServerConfig::default();
+        let refusal = transparent_tun_for(&server).unwrap_err();
+        assert!(
+            refusal.contains("[server.transparent]"),
+            "the refusal must name the missing switch, got: {refusal}"
+        );
+
+        server.transparent = Some(crate::config::parsing::TransparentConfig {
+            tun: "l3test0".to_string(),
+        });
+        assert_eq!(
+            transparent_tun_for(&server).unwrap(),
+            "l3test0",
+            "the device comes from the table the operator wrote"
+        );
     }
 
     /// The operator's valve, at the level the tunnel path reads it: a cap of
