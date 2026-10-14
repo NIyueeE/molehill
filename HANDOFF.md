@@ -35,8 +35,11 @@
 
 - **v0.10.0 shipped on 2026-10-01**: the release run is green on all thirteen
   jobs (nine platform builds, GitHub Release, GHCR, crates.io), and the
-  released artifact is `benches/scripts/soak/results-soak-v0.10.0.json` —
-  measured at `96bda00`, gated by `just soak-check` with no waiver.
+  released artifact is `benches/records/results-soak-v0.10.0.json` — measured
+  at `96bda00` with the model the bench model replaced, and gated by the
+  sweep's own check with no waiver. That schema is history now: the next
+  release publishes `results-bench-vX.Y.Z.json` and gates it with
+  `just bench-gate`.
 - **The release cost four tag pushes, and the three failures are worth
   remembering**: the emulated cross legs (`native_target` guard missing on a
   new spawn-based test), the musl leg (an assertion pinned to glibc's wording),
@@ -50,7 +53,7 @@
   `v0.10.0` names `104626f`.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
-  `Cargo.*`, `build.rs` or `benches/scripts/soak/*.py` changed since — the
+  `Cargo.*`, `build.rs` or the bench model's own code changed since — the
   changelog date and the README numbers may, code may not (AGENTS.md §10,
   "prove provenance").
 - **The repository-settings items are a human's to make** — branch protection
@@ -95,29 +98,145 @@ configuration surface is free to change — and this cycle changes it.
    takes the model as an argument (`ClientModel`) rather than being forked, and
    its messages follow it — a claim is a *claim*, and the block named is
    `[transparent.control]`, not `[client.control]`.
-2. **M — measure the L3 path before writing a compressor.** Mean packet size
-   (per-arm `/proc/net/dev` deltas) and wire bytes per payload byte, on a
-   small-packet arm and a bulk one, against a baseline built from a worktree at
-   the `v0.10.0` tag — same host, same run, same method (§10 comparability).
-3. **Z — only if M passes.** VJ-style (RFC 1144) per-flow header deltas, with
-   the encoder authoritative (every context change is an explicit frame, so a
-   reliable ordered stream cannot desync), self-describing `[u8 kind]` frames
-   under v5, and `MOLEHILL_L3_COMPRESS=0` as the A/B switch. No negotiation:
-   there is one dialect and both ends ship together.
-4. **V — the verdict, before any `v0.11` tag.** While unreleased a "no benefit"
-   verdict is a `git revert`; after the tag it would be a protocol version bump.
+2. ~~**M — measure the L3 path before writing a compressor.**~~ **Done**
+   (2026-10-09, `9507a7a`): the harness samples `/proc/net/dev` per arm and
+   `benches/scripts/l3/wire_report.py` reports carried packet sizes and a
+   header-compression ceiling. Campaign in `docs/benchmarks.md`, "The
+   transparent-L3 wire question".
+3. ~~**Z — only if M passes.**~~ **Not built: the measurement says no.** The
+   ceiling on the workload compression exists for (2000 round trips of 64 B) is
+   **17.9 % of the wire** — under the 20 % bar written before the run, and an
+   upper bound before exemptions. The same table says why: 196 B of wire per
+   116 B carried packet, i.e. ~80 B of tunnel transport per packet (our 2-byte
+   length, the multiplexer's frame, the carrier's TCP/IP header and its ACKs)
+   against ~35 B of compressible header. **Framing is the lever, not headers**;
+   batching several packets per frame is the next candidate and needs its own
+   measurement.
+4. ~~**V — the verdict, before any `v0.11` tag.**~~ **Recorded above, and it is
+   a no**: nothing was added to the wire, so there is nothing to remove and no
+   v6 risk.
+5. **Done after M: the L3 data path was optimised where the measurement pointed.**
+   Batching (drain the device, frame each packet where it is read, hand a run of
+   frames over as one write) took 12 % off the bulk arm's wire bytes; the L3
+   model's `[transparent.data].default_mode` is now `direct` (a claim has one
+   channel, so the multiplexer was pure per-packet cost), worth another 6 % of
+   the wire, a third of the CPU per packet and 65 % more small round trips per
+   second. Numbers and method in `docs/benchmarks.md`, "The transparent-L3 wire
+   question". What the same instrument now says is that **CPU, not the wire, is
+   the next lever** (~135 µs of daemon time per carried packet on the small
+   arm), and that it **cannot yet answer the many-flow case**: every arm is one
+   connection, so parallel TUN queues (`IFF_MULTI_QUEUE`, one reader per queue)
+   are a candidate that needs a concurrent-flow arm before it can be claimed
+   either way. That is the next measurement, not the next feature.
 
-**Pre-registered criteria.** Small packets (≤128 B payload): wire bytes down
-≥ 20%. Mid (512 B–1 KB): ≥ 5%. Bulk (1400 B): throughput down ≤ 2%. The
-small-packet and the bulk conditions must both hold; a difference inside the
-variance counts as *no difference*, and either failure removes the feature.
+   **Both of those are now answered, and neither is the next thing to build.**
+   The harness gained a multi-flow arm *and a control beside it* (the same flows
+   with the tunnel out of the path): at 16 connections the tunnel carries
+   19 900 round trips/s against the control's 23 750 (84 % of a ceiling that is
+   the probe's own), at 64 connections 27 700 against 30 900 (90 %). So parallel
+   TUN queues have no measured need — the device reader is not what limits a
+   busy host, and a control is what makes that statement checkable instead of
+   plausible. Bulk is the arm where the path *is* the limit (338 Mbit/s against
+   the control's 602), and it moved a long way by batching the read side as well
+   as the write side (+27 % throughput, −56 % CPU per packet).
+
+   **The remaining levers were then attributed, and none of them is a code
+   change.** Two instrument errors had to be fixed first, and both are worth
+   remembering: the bulk arm sent one blob and read afterwards, so any run past
+   the buffers measured a *deadlock* (two runs of 20 MB and 100 MB were reported
+   as throughput when they were five-second stalls), and the harness built
+   **debug** while the product ships release — the same arm measures 783 Mbit/s
+   in debug and 1986 Mbit/s in release. Both are fixed (`BULK_CHUNK`,
+   `PROFILE_BUILD=release`), and the numbers below are release.
+
+   Release, one host, with the no-tunnel control beside each arm: bulk 200 MB in
+   65 KB chunks **1986 Mbit/s** against the control's 12 024; a paced single flow
+   **10 362 round trips/s**; 16 flows **22 543** against the control's 23 388 —
+   **96 % of a ceiling that is python's, not the path's**.
+
+   A `perf` profile of the release build during the bulk arm puts **84 % of the
+   CPU in the kernel**, 10 % in molehill, 5 % in libc, with no symbol above 11 %:
+   the cost is four syscalls per packet (TUN read, socket write, socket read, TUN
+   write), spread thin. That retires the synchronous data path as a plan — it
+   would chase the userspace tenth, not the kernel's five sixths — and it names
+   the lever that does work: **packet size**. The same bulk bytes in 8000-byte
+   packets instead of 1400 measured **3579 Mbit/s** at half the CPU per byte, so
+   the TUN MTU (an operator setting, with a link MTU to match) is worth more than
+   any remaining code change, and the deployment recipes now say so.
+6. **One model, and it owns the sweep too (2026-10-10, unreleased).**
+   `benches/scripts/bench/` is now the only runner: the soak sweep, the
+   L3-versus-L4 comparison, the memory sampler, the HTTP latency script and the
+   peer adapters are all *this* model — its profiles, its scenarios, its arms.
+   What it grew in the migration:
+
+   - **peer arms** (`peers.py`): frp, rathole and nps are arms like any other,
+     configured per topology, with their release binaries fetched by
+     `just bench-peers` and their versions recorded in the results meta. The
+     first end-to-end peer run (one condition, `cost`, 60 s) read frp at
+     6.08 Gbit/s and molehill at 13.58 Gbit/s, with the p99 and CPU-cost
+     metrics beside them — the four-tool comparison, on the model's terms.
+   - **conditions and timelines** (`model.CONDITIONS`, `model.TIMELINES`):
+     `clean`, `rtt100`, `loss1`, `loss5`, `rate100`, `rate20`, `jitter` and the
+     two MTU classes, imposed *in place* on a veth leg (`tc qdisc replace`), so
+     the tool keeps running while the path changes. `--scale` shortens a
+     timeline's holds without changing its shape, and the scale is part of the
+     fingerprint.
+   - **the staged scenario** (`timeline`, `soak`, `cost`): a bulk spine
+     re-dialed per stage after a drain predicate (queue below a tolerance and
+     no send-capable socket, held for two polls, with a budget that is recorded
+     when it fires), three continuous series probes (interactive, datagram,
+     churn) sliced per stage, a drift sampler (RSS/fds/threads) across the
+     whole run, and wedge detection (>5 s of silence).
+   - **the capacity ramp** and **reconnect**: one cell per stream level with a
+     fresh-connection ping beside it and the SLO verdict per level, and five
+     timed cold starts.
+   - **`plot.py`**: the six figures (timeline, stages, capacity, UDP, drift,
+     cost) and five markdown tables, rendered from the new schema, each figure
+     carrying its method in the footer.
+   - **`bench.py gate`**: coverage of every declared cell, the endpoint
+     invariant, the SLO on the clean stages (the product's arms only — a peer
+     that misses it is reported, never blocked), the drift and wedge axes (a
+     slope is only judged past five minutes), the capacity ramp, and the
+     regression half against a baseline.
+
+   The retired tree (`benches/scripts/soak/`) is deleted; its published records
+   moved to `benches/records/` as history, and the release ritual now names
+   `results-bench-vX.Y.Z.json` + `assets/bench-vX.Y.Z*.png` and gates with
+   `just bench-gate`. The model is self-contained: the iperf3 conventions
+   (`iperf.py`), the provenance probes (`hostinfo.py`) and the peer adapters
+   all live in it, with no import from the retired sweep.
+
+   Not migrated, deliberately, with the reason: the **slow visitor** probe
+   (opt-in head-of-line instrument; the model's UDP and TCP shapes cover the
+   load shapes, and a HOL question would come back as a scenario), and
+   `udp_stress.py` (it reads molehill's *internal* UDP queue counters to answer
+   a molehill-only design question, which the model's externally-observable
+   rule forbids in a comparison — it stays as a diagnostic, outside the model).
+
+   What is still open: the sweep has not been run end to end on the migrated
+   engine (the pieces are validated: a staged timeline over three arms, the
+   capacity ramp with the SLO per level, a peer arm, the drift and wedge
+   metrics, the figures from a real staged file), so the first release sweep is
+   also its acceptance test. The 5 Gbit/s UDP ladder cell and the loopback
+   ceiling remain the two places where a single run cannot order the arms.
+
+**Pre-registered criteria (kept as written, for the record).** Small packets
+(≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
+(1400 B): throughput down ≤ 2 %. The small-packet and the bulk conditions must
+both hold; a difference inside the variance counts as *no difference*, and
+either failure removes the feature. The small-packet arm failed on the ceiling
+alone, so the other arms were not run for the verdict.
 
 ### Open threads
 
-- **The soak bench has no namespace support** — every arm runs on host loopback
-  — so an L3 arm cannot be expressed as a config variant there. The L3 numbers
-  come from the l3 harness instead; folding L3 into the soak is a separate
-  decision that needs netns plumbing in `soak/lib.py`.
+- **One instrument, and the boundary is a profile (closed 2026-10-10).**
+  The earlier decision — a sibling instrument for L3, the sweep left alone —
+  was a consequence of the model not existing. There is one runner now: the
+  sweep is the `sweep` profile, the staged schedule is the `timeline`
+  scenario, the drift axis is the `soak` profile, the screen is `--profile
+  screen --ab-arm`, and a peer is an arm. What stays distinct is *evidence*:
+  the model writes results outside the tree, and only a run the ritual
+  publishes lands in `benches/records/`.
 - The benchmark comparison against v0.10.0 must build that state (worktree at
   the tag): there is no released asset that speaks v5, and no two tags are
   compatible, so each side runs as a complete pair.

@@ -162,11 +162,11 @@ flowchart TD
 | `max_tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
 | `max_tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling |
 | `carrier` | `"tcp"` (default) | the well-behaved default on lossy and rate-limited paths; TCP tunnels must not be blocked by the network |
-| `carrier` | `"kcp"` | latency-first UDP transport when TCP tunnels are blocked or throttled; it does not multiplex, so pair it with `noise` + a raised `max_tunnels` for the ceiling |
+| `carrier` | `"kcp"` | UDP transport for paths where TCP is blocked, throttled or lossy; independent of `mode`, so it can carry a multiplexed pool (`multiplex` + `kcp`) or one session per channel (`direct` + `kcp`). It costs throughput where the path is clean, so choose it for the path, not by default |
 | transport | `"plain"` | no encryption; lowest per-byte cost |
 | transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
 | cold pool | (no key) | the pool starts cold: the first visitor after an idle period pays one tunnel setup before its bytes move, then the pool is warm again up to `max_tunnels` |
-| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model) |
+| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic) |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -190,8 +190,8 @@ default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed
 
 [client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_mode/default_carrier individually — see the per-service keys in `[client.services.*]` below
 # default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). With `default_carrier = "kcp"` the KCP sessions dial the control address over UDP — TCP control and UDP KCP can share one port (distinct protocols)
-default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one connection per data channel; `carrier` does not apply)
-default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted
+default_mode = "multiplex" # Optional. Default data-plane mode: "multiplex" (default) or "direct" (one data channel per visitor connection, its own physical connection). Independent of `default_carrier`: every `mode`/`carrier` pair is valid
+default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted. With `mode = "multiplex"` the sessions are the pool's tunnels; with `mode = "direct"` each data channel is one KCP session, so the multiplexer's framing is not in the path at all
 # shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool per carrier (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
 # idle_timeout = 60 # Optional. Seconds a tunnel pool with no streams, no pending opens and no pinned UDP peers must stay idle before it removes one tunnel. Default: 60. The pool never shrinks below one tunnel, nor below the UDP-derived floor
 [client.data.tcp] # Optional. The TCP carrier's elastic-pool cap
@@ -220,14 +220,14 @@ retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with th
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
 mode = "multiplex" # Optional. Override `client.data.default_mode` for this service only. "multiplex" (default) or "direct"
-carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only; valid only with `mode = "multiplex"`. Inherits the default when unset
+carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only. Inherits the default when unset; independent of `mode`
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
 
 [client.services.service2] # Multiple services can be defined
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-not-part-of-the-soak-model)
+udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic)
 udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
 udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
@@ -455,6 +455,23 @@ Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
 is a plain link by design, so the model has no encryption keys to offer, and
 `[transparent].tun` is where a device is named.
 
+`mode` and `carrier` are independent for a claim as they are for a forwarding
+service: `direct` + `tcp` (the default pair) is one TCP connection per claim,
+`direct` + `kcp` is one KCP session per claim — the carrier's session *is* the
+data channel, with no multiplexer above it — and `multiplex` is the pair for a
+client that serves many claims from one shared pool.
+
+`[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
+`default_mode`, `default_carrier`, `shared_pool`, `idle_timeout`, and the two
+per-carrier `max_tunnels` caps — with **one different default**: the mode is
+`direct`, because a claim has exactly one channel and the multiplex pool
+therefore buys it nothing unless `shared_pool` is on. Measured on one host and
+workload, `direct` moved 6 % fewer wire bytes, took 33 % less CPU per packet and
+carried 65 % more round trips per second than `multiplex`
+([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
+A client that serves many claims from one pool writes `default_mode = "multiplex"`
+and `shared_pool = true`.
+
 ### What the operator must prepare
 
 Both ends attach to an **existing** device named by their `tun` key; the daemon
@@ -510,6 +527,10 @@ default_remote_addr = "203.0.113.5:2333"
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 ```
+
+The service on the far side of that claim is the visitor's own traffic: a
+transparent client forwards nothing, so it has no `[transparent.services]` — a
+host that *also* forwards runs a second process with a `[client]` block.
 
 Two services may claim the same address when their ports differ, and a packet
 with no port to route by — ICMP, and the fragments after the first — is

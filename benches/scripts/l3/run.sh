@@ -14,8 +14,12 @@
 #   2. the service sees the VISITOR's real address (transparency);
 #   3. the server namespace holds NO connection state for the visitor's flow;
 #   4. the client namespace owns the accepted connection;
-#   5. 200 KB round-trips byte-exactly (no PMTU black hole);
-#   6. a server whose config has no `[server.transparent]` refuses the
+#   5. the bulk arm round-trips byte-exactly (no PMTU black hole), and so do 2000
+#      small request/response round trips;
+#   6. 16 concurrent flows stay byte-exact too, and the run reports what each
+#      arm costs on the wire, on the CPU and what share of it a header
+#      compressor could reach (benches/scripts/l3/wire_report.py);
+#   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
 #      deleted for that run, so the order is proven rather than asserted).
 set -euo pipefail
@@ -23,7 +27,18 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../../.." && pwd)"
 LOG="${LOG:-/tmp/l3-accept}"
-BIN="$ROOT/target/debug/molehill"
+# Which build the run measures. `debug` is the default because it builds
+# fastest; `release` is what an operator runs, and the two do not cost the same
+# per packet, so a run that is quoted as the path's cost should say which one it
+# measured (`PROFILE_BUILD=release`).
+PROFILE_BUILD="${PROFILE_BUILD:-debug}"
+if [ "$PROFILE_BUILD" = "release" ]; then
+    BUILD_ARGS="--release"
+    BIN="$ROOT/target/release/molehill"
+else
+    BUILD_ARGS=""
+    BIN="$ROOT/target/debug/molehill"
+fi
 
 # A silent pass without root would be worse than a failure: exit 77 is the
 # "skipped" status, and the exact command to run is part of the message.
@@ -67,8 +82,41 @@ CONTROL_PORT=2333
 TUN_SRV=l3srv0
 TUN_CLI=l3cli0
 ROUTE_TABLE=100
-TUN_MTU=1400
-BULK_BYTES=200000
+TUN_MTU="${TUN_MTU:-1400}"
+# The veth MTU, i.e. how large a segment the tunnel's own TCP may carry. Raising
+# it (with TUN_MTU) is the experiment that separates per-packet cost from
+# per-byte cost: the same bytes in a quarter of the packets.
+LINK_MTU="${LINK_MTU:-1500}"
+# The bulk arm's size. Long enough to resolve the CPU counters (100 Hz) when a
+# run needs that: BULK_BYTES=2000000.
+BULK_BYTES="${BULK_BYTES:-200000}"
+# The bulk arm streams in chunks of this size rather than sending one blob and
+# reading afterwards: a send-then-read workload whose size exceeds the buffers
+# deadlocks against an echo that must read to reply (the visitor waits for the
+# echo, the echo waits for the visitor to read), which is a property of that
+# workload and not of the tunnel. Chunked round trips exercise the same
+# full-size packets without it.
+BULK_CHUNK="${BULK_CHUNK:-65536}"
+# The small-packet arm's instrument: strict round trips of this size. Both are
+# recorded with the numbers, because they are what the numbers mean.
+SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
+SMALL_BYTES="${SMALL_BYTES:-64}"
+# Optional override of the claim's data-channel mode. Empty writes nothing,
+# which is how the run measures the default an operator would get; the axis
+# exists because a claim has exactly one channel, so its mode is a cost
+# decision rather than a topology one.
+CLAIM_MODE="${CLAIM_MODE:-}"
+# The multi-flow arm: N connections at once, each doing its own strict round
+# trips. This is where packets queue, so it is the arm that says what several
+# visitors through one claim cost (and the only one a queue-per-CPU change
+# could ever show up in).
+CONCURRENT_CONNS="${CONCURRENT_CONNS:-16}"
+CONCURRENT_REQUESTS="${CONCURRENT_REQUESTS:-200}"
+# Optional attribution: sample both daemons for this many seconds, starting with
+# the measurement section, and print the self-time report. The counters say what
+# an arm costs; this says where it went. Tune the arm sizes so one arm dominates
+# the window (see docs/benchmarks.md).
+PROFILE="${PROFILE:-}"
 # Long enough that the socket and conntrack snapshots are taken while the
 # visitor's connection is unmistakably live.
 HOLD_SECONDS=5
@@ -130,6 +178,40 @@ dump_log() {
     else
         echo "(no log at $file)" >&2
     fi
+}
+
+# Packet and byte counters for the interfaces a measurement arm cares about,
+# read inside the namespaces that own them. For a tun device the host's view is
+# the L3 path's: `rx` is what userspace wrote into the kernel, `tx` is what the
+# kernel routed out to userspace. The client's veth is the tunnel's wire.
+dev_snapshot() {
+    local out="$1"
+    : >"$out"
+    for ns in "$NS_CLI" "$NS_SRV"; do
+        ip netns exec "$ns" cat /proc/net/dev \
+            | awk -v ns="$ns" '/:/ { print "iface " ns " " $1, $2, $3, $10, $11 }' \
+            | sed 's/://' >>"$out"
+    done
+    # CPU the two daemons spend on the arm, in clock ticks (100/s): the
+    # difference between "this path is cheap" and "this path is a core".
+    cpu_ticks "$CLI_PID" client >>"$out"
+    cpu_ticks "$SRV_PID" server >>"$out"
+}
+
+# utime + stime of one process, in ticks. The tokio runtime's threads are all
+# in this process, so one number covers the whole data path.
+cpu_ticks() {
+    local pid="$1" who="$2"
+    if [ -r "/proc/$pid/stat" ]; then
+        awk -v who="$who" '{ print "cpu", who, $14 + $15 }' "/proc/$pid/stat"
+    fi
+}
+
+# One arm's counters, turned into carried packet sizes and the ceiling any
+# header compressor could reach (the reasoning is wire_report.py's docstring).
+wire_report() {
+    uv run "$HERE/wire_report.py" --label "$1" --before "$2" --after "$3" \
+        --client-tun "$TUN_CLI" --server-tun "$TUN_SRV" --tunnel v-cli | tee "$4"
 }
 
 # Poll a log for a readiness line instead of sleeping blind.
@@ -201,10 +283,10 @@ topology_up() {
     for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
         ip -n "$ns" link set lo up
     done
-    ip -n "$NS_VIS" link set v-vis up
-    ip -n "$NS_SRV" link set v-srv up
-    ip -n "$NS_SRV" link set v-srv2 up
-    ip -n "$NS_CLI" link set v-cli up
+    ip -n "$NS_VIS" link set v-vis up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv2 up mtu "$LINK_MTU"
+    ip -n "$NS_CLI" link set v-cli up mtu "$LINK_MTU"
 
     ip -n "$NS_VIS" route add default via "$SRV_VIS_IP"
 
@@ -262,6 +344,10 @@ default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 [transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
+    # The claim's mode is the product's default unless the run names one.
+    if [ -n "$CLAIM_MODE" ]; then
+        printf 'mode = "%s"\n' "$CLAIM_MODE" >>"$LOG/client.toml"
+    fi
 }
 
 # The same server without `[server.transparent]`: the negative half of the
@@ -280,7 +366,7 @@ TOML
 
 echo "================= BUILD ================="
 mkdir -p "$LOG"
-if ! (cd "$ROOT" && cargo build) >"$LOG/cargo-build.log" 2>&1; then
+if ! (cd "$ROOT" && cargo build $BUILD_ARGS) >"$LOG/cargo-build.log" 2>&1; then
     echo "cargo build failed; refusing to run against a stale or missing binary:" >&2
     tail -n 30 "$LOG/cargo-build.log" >&2
     exit 1
@@ -289,7 +375,7 @@ if [ ! -x "$BIN" ]; then
     echo "no executable at $BIN after the build" >&2
     exit 1
 fi
-echo "binary: $BIN"
+echo "binary: $BIN ($PROFILE_BUILD)"
 sha256sum "$BIN" | tee "$LOG/binary.sha256"
 "$BIN" --version 2>&1 | tee "$LOG/binary.version" || true
 
@@ -407,21 +493,139 @@ VISITOR_RC=0
 wait "$VISITOR_PID" || VISITOR_RC=$?
 
 echo
+
+# Attribution, when asked for: `perf record` follows both daemons for $PROFILE
+# seconds while the arms below run.
+PERF_PID=""
+if [ -n "$PROFILE" ]; then
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "PROFILE=$PROFILE was asked for, but perf is not installed" >&2
+        exit 1
+    fi
+    perf record -o "$LOG/perf.data" -F 999 -p "$SRV_PID" -p "$CLI_PID" -- sleep "$PROFILE" \
+        >"$LOG/perf-record.log" 2>&1 &
+    PERF_PID=$!
+    PIDS+=("$PERF_PID")
+    sleep 0.3
+    echo "profiling $SRV_PID and $CLI_PID for ${PROFILE}s"
+fi
+
 echo "================= BULK / MTU ================="
 # 200 KB through the tunnel: many segments. The client's TUN MTU (1400) is the
 # smallest on the path, so the MSS it advertises keeps every segment inside
 # it -- the PMTU black hole is avoided by construction, not by clamping.
+dev_snapshot "$LOG/bulk.before"
 BULK_START=$(date +%s.%N)
 BULK_RC=0
+BULK_ROUNDS=$((BULK_BYTES / BULK_CHUNK))
+[ "$BULK_ROUNDS" -ge 1 ] || BULK_ROUNDS=1
 ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
-    --size "$BULK_BYTES" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
 BULK_END=$(date +%s.%N)
+dev_snapshot "$LOG/bulk.after"
 cat "$LOG/visitor-bulk.log"
 awk -v s="$BULK_START" -v e="$BULK_END" -v n="$BULK_BYTES" 'BEGIN {
     d = e - s
     if (d <= 0) d = 0.000001
     printf "elapsed %.3fs, %.2f Mbit/s round-trip (diagnostic, not a benchmark)\n",
         d, 2 * n * 8 / d / 1e6
+}'
+wire_report "bulk ${BULK_BYTES}B" "$LOG/bulk.before" "$LOG/bulk.after" "$LOG/bulk.report"
+
+echo
+echo "================= SMALL PACKETS ================="
+# The workload a header compressor lives or dies by: one strict round trip at a
+# time, so both directions carry many small segments instead of a few full ones.
+# $SMALL_REQUESTS x $SMALL_BYTES is the instrument; it is recorded with the
+# numbers because it decides them (§10, "instrument parameters are part of the
+# method").
+dev_snapshot "$LOG/small.before"
+SMALL_START=$(date +%s.%N)
+SMALL_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$SMALL_REQUESTS" --size "$SMALL_BYTES" >"$LOG/visitor-small.log" 2>&1 \
+    || SMALL_RC=$?
+SMALL_END=$(date +%s.%N)
+dev_snapshot "$LOG/small.after"
+cat "$LOG/visitor-small.log"
+awk -v s="$SMALL_START" -v e="$SMALL_END" -v n="$SMALL_REQUESTS" -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d round trips of %d B in %.3fs, %.0f round trips/s (diagnostic, not a benchmark)\n",
+        n, b, d, n / d
+}'
+wire_report "small ${SMALL_REQUESTS}x${SMALL_BYTES}B" "$LOG/small.before" "$LOG/small.after" \
+    "$LOG/small.report"
+
+echo
+echo "================= MANY FLOWS ================="
+# The same round trips on $CONCURRENT_CONNS connections at once. Unlike the arm
+# above, packets queue here, so this is where batching pays and where a limit
+# that is per-core (one reader, one channel task per direction) shows up as a
+# rate that does not grow with the flow count.
+dev_snapshot "$LOG/many.before"
+MANY_START=$(date +%s.%N)
+MANY_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-many.log" 2>&1 || MANY_RC=$?
+MANY_END=$(date +%s.%N)
+dev_snapshot "$LOG/many.after"
+cat "$LOG/visitor-many.log"
+awk -v s="$MANY_START" -v e="$MANY_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips of %d B in %.3fs, %.0f round trips/s aggregate \
+(diagnostic, not a benchmark)\n", c, n, b, d, c * n / d
+}'
+wire_report "many ${CONCURRENT_CONNS}x${CONCURRENT_REQUESTS}x${SMALL_BYTES}B" \
+    "$LOG/many.before" "$LOG/many.after" "$LOG/many.report"
+
+echo
+echo "================= CONTROL: STRAIGHT AT THE SERVICE ================="
+# The same flows with the tunnel out of the path: the visitor runs inside the
+# client namespace, where the service is simply a local listener. Without this
+# control a slow probe and a slow tunnel are indistinguishable from the arm
+# above (the soak model's rule, and the reason its UDP probe ends with a
+# straight-at-the-sink step). It measures the probe and the echo service, not
+# molehill.
+CONTROL_RC=0
+CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-control.log" 2>&1 || CONTROL_RC=$?
+CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-control.log"
+awk -v s="$CONTROL_START" -v e="$CONTROL_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips straight at the service: %.0f round trips/s aggregate \
+(control, no tunnel, diagnostic)\n", c, n, c * n / d
+}'
+
+echo
+if [ -n "$PERF_PID" ]; then
+    wait "$PERF_PID" || true
+    perf report --stdio -i "$LOG/perf.data" --percent-limit 1 >"$LOG/perf.report" 2>&1 || true
+    echo "--- perf report (self time, by symbol) ---"
+    sed -n '/^# Overhead/,$p' "$LOG/perf.report" | head -30
+fi
+
+echo "--- control: the same $((${BULK_BYTES} / 1000)) KB straight at the service ---"
+BULK_CONTROL_RC=0
+BULK_CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk-control.log" 2>&1 \
+    || BULK_CONTROL_RC=$?
+BULK_CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-bulk-control.log"
+awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%.2f Mbit/s round-trip straight at the service (control, no tunnel, diagnostic)\n",
+        2 * n * 8 / d / 1e6
 }'
 
 echo
@@ -504,9 +708,27 @@ else
 fi
 
 if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
-    pass "200 KB round-trip (no MTU black hole)"
+    pass "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
 else
-    fail "200 KB round-trip (no MTU black hole)"
+    fail "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
+fi
+
+if [ "$SMALL_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-small.log"; then
+    pass "$SMALL_REQUESTS small round trips stay byte-exact"
+else
+    fail "$SMALL_REQUESTS small round trips stay byte-exact (exit $SMALL_RC)"
+fi
+
+if [ "$CONTROL_RC" -ne 0 ] || [ "$BULK_CONTROL_RC" -ne 0 ]; then
+    fail "a control arm passed no tunnel and still failed (exit $CONTROL_RC/$BULK_CONTROL_RC)"
+else
+    pass "control arms: the same workloads straight at the service, no tunnel"
+fi
+
+if [ "$MANY_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-many.log"; then
+    pass "$CONCURRENT_CONNS concurrent flows stay byte-exact"
+else
+    fail "$CONCURRENT_CONNS concurrent flows stay byte-exact (exit $MANY_RC)"
 fi
 
 if grep -qF "does not serve transparent (L3) services" "$LOG/no-l3-server.log"; then

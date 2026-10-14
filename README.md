@@ -107,7 +107,7 @@ an hour apart — the scale every other cell is read against:
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
 different instrument from the staged schedule
-([Benchmarks](./docs/benchmarks.md#test-types)); three arms carried its full 8
+([Benchmarks](./docs/benchmarks.md#the-scenarios)); three arms carried its full 8
 streams, so 8 reads as a **floor** ("at least 8"), not a maximum:
 
 | tool | sustainable streams | ceiling | headroom | reason at the break |

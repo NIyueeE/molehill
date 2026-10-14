@@ -554,52 +554,118 @@ pub fn digest(data: &[u8]) -> Digest {
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
 pub struct IpTraffic;
 
+/// How much room a read makes for frames it has not parsed yet. One read of
+/// this size carries a whole batch from the far side, so the per-frame cost is
+/// a slice, not a syscall.
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+const IP_READ_CHUNK: usize = 32 * 1024;
+
+/// Frames read from a transparent channel, with the reads batched.
+///
+/// The far side writes a run of frames per write, so one read can carry many
+/// packets: parsing them out of a buffer costs one syscall per *run* instead of
+/// two per frame, and the caller then walks a whole burst without awaiting
+/// between packets. Both halves of the data path are batched for the same
+/// reason — the measurement is in
+/// [benchmarks.md](../docs/benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model).
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub struct IpFrames<R> {
+    reader: R,
+    /// Bytes read ahead and not yet turned into frames.
+    buf: BytesMut,
+    /// Where the unconsumed part starts.
+    start: usize,
+}
+
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+impl<R: AsyncRead + Unpin> IpFrames<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: BytesMut::new(),
+            start: 0,
+        }
+    }
+
+    /// The next frame. The returned slice is valid until the next call.
+    ///
+    /// The end of the stream is an error, not an empty frame: this channel
+    /// exists only while its service does, and the caller answers a channel
+    /// that ended by asking for another one.
+    pub async fn next(&mut self) -> Result<&[u8]> {
+        loop {
+            if let Some(len) = IpTraffic::frame_at(&self.buf[self.start..])? {
+                let start = self.start + 2;
+                self.start = start + len;
+                return Ok(&self.buf[start..start + len]);
+            }
+            self.read_more().await?;
+        }
+    }
+
+    /// Read more from the tunnel, compacting what is left first so a part-read
+    /// frame stays at the front.
+    async fn read_more(&mut self) -> Result<()> {
+        if self.start > 0 {
+            // Inherent on `BytesMut`, and it drops exactly the consumed prefix.
+            let _consumed = self.buf.split_to(self.start);
+            self.start = 0;
+        }
+        self.buf.reserve(IP_READ_CHUNK);
+        let read = self
+            .reader
+            .read_buf(&mut self.buf)
+            .await
+            .with_context(|| "Failed to read IP frames")?;
+        if read == 0 {
+            let leftover = self.buf.len();
+            if leftover > 0 {
+                bail!("Transparent channel ended mid-frame ({leftover} bytes left)");
+            }
+            bail!("Transparent channel ended");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
 impl IpTraffic {
-    /// Frame one packet and send it with a **single** `write_all` (and so a
-    /// single Noise record). Callers reuse `scratch` across packets to avoid
-    /// per-packet allocations.
-    pub async fn write_frame<T: AsyncWrite + Unpin>(
-        writer: &mut T,
-        scratch: &mut BytesMut,
-        packet: &[u8],
-    ) -> Result<()> {
+    /// Append one packet to a batch as a `[u16 length][packet]` frame.
+    ///
+    /// Synchronous on purpose: a packet is framed where it is read, so a whole
+    /// batch of frames can be handed over and written as one unit. The frame
+    /// itself is unchanged — a batch is several of them in one write, and the
+    /// reader on the far side consumes them one frame at a time.
+    pub fn encode_into(batch: &mut BytesMut, packet: &[u8]) -> Result<()> {
         let len = u16::try_from(packet.len()).with_context(|| {
             format!(
                 "IP packet of {} bytes exceeds the wire format limit",
                 packet.len()
             )
         })?;
-        scratch.clear();
-        scratch.reserve(2 + packet.len());
-        scratch.put_u16(len);
-        scratch.extend_from_slice(packet);
-        writer.write_all(scratch).await?;
+        batch.reserve(2 + packet.len());
+        batch.put_u16(len);
+        batch.extend_from_slice(packet);
         Ok(())
     }
 
-    /// Read one frame into `scratch`, which is resized to the packet's length;
-    /// the returned value is that length.
+    /// The length of the frame at the front of `available`, when all of it is
+    /// there — the frame format's only reader, so the writer and the reader
+    /// cannot drift apart.
     ///
-    /// A zero-length frame is a protocol error and is rejected here rather
-    /// than handed to the caller as an empty packet.
-    pub async fn read<T: AsyncRead + Unpin>(
-        reader: &mut T,
-        scratch: &mut BytesMut,
-    ) -> Result<usize> {
-        let len = reader
-            .read_u16()
-            .await
-            .with_context(|| "Failed to read IP frame length")? as usize;
+    /// A zero-length frame is a protocol error rather than an empty packet.
+    pub fn frame_at(available: &[u8]) -> Result<Option<usize>> {
+        let Some(header) = available.first_chunk::<2>() else {
+            return Ok(None);
+        };
+        let len = usize::from(u16::from_be_bytes(*header));
         if len == 0 {
             bail!("Empty IP frame: the stream is corrupt");
         }
-        scratch.resize(len, 0);
-        reader
-            .read_exact(&mut scratch[..])
-            .await
-            .with_context(|| "Failed to read IP frame")?;
-        Ok(len)
+        if available.len() < 2 + len {
+            return Ok(None);
+        }
+        Ok(Some(len))
     }
 }
 
@@ -1755,15 +1821,14 @@ mod tests {
         packet.extend_from_slice(b"payload");
 
         let (mut tx, mut rx) = duplex(4096);
-        let mut scratch = BytesMut::new();
-        IpTraffic::write_frame(&mut tx, &mut scratch, &packet)
-            .await
-            .unwrap();
+        // A batch of one here; the writer hands over whole batches.
+        let mut batch = BytesMut::new();
+        IpTraffic::encode_into(&mut batch, &packet).unwrap();
+        tx.write_all(&batch).await.unwrap();
 
-        let mut got = BytesMut::new();
-        let len = IpTraffic::read(&mut rx, &mut got).await.unwrap();
-        assert_eq!(len, packet.len());
-        assert_eq!(&got[..], &packet[..], "the packet must survive verbatim");
+        let mut frames = IpFrames::new(&mut rx);
+        let got = frames.next().await.unwrap();
+        assert_eq!(got, &packet[..], "the packet must survive verbatim");
     }
 
     /// A frame longer than the reader is willing to buffer is refused by the
@@ -1776,18 +1841,20 @@ mod tests {
 
         let (mut tx, mut rx) = duplex(64);
         tx.write_u16(0).await.unwrap();
-        let mut scratch = BytesMut::new();
-        let err = IpTraffic::read(&mut rx, &mut scratch).await.unwrap_err();
+        let mut frames = IpFrames::new(&mut rx);
+        let err = frames.next().await.unwrap_err();
         assert!(format!("{err:#}").contains("Empty IP frame"));
 
-        // One byte past the wire-format ceiling must be refused at write time,
-        // before anything reaches the channel.
+        // One byte past the wire-format ceiling must be refused while the
+        // batch is built, before anything reaches the channel.
         let oversized = vec![0u8; usize::from(u16::MAX) + 1];
-        let (mut tx, _rx) = duplex(64);
-        let err = IpTraffic::write_frame(&mut tx, &mut scratch, &oversized)
-            .await
-            .unwrap_err();
+        let mut batch = BytesMut::new();
+        let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
         assert!(format!("{err:#}").contains("exceeds the wire format limit"));
+        assert!(
+            batch.is_empty(),
+            "a refused packet must not leave a partial frame in the batch"
+        );
     }
 
     /// A truncated frame (the writer died mid-packet) surfaces as an error, so
@@ -1802,7 +1869,38 @@ mod tests {
         tx.write_all(&[0x45; 8]).await.unwrap();
         drop(tx);
 
-        let mut scratch = BytesMut::new();
-        assert!(IpTraffic::read(&mut rx, &mut scratch).await.is_err());
+        let mut frames = IpFrames::new(&mut rx);
+        let err = frames.next().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ended mid-frame"),
+            "a half frame must be named as one, got: {err:#}"
+        );
+    }
+
+    /// A run of frames written together is read back as those frames, one at a
+    /// time: batching changes how many syscalls move them, not the format.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn a_run_of_frames_reads_back_frame_by_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let packets: Vec<Vec<u8>> = (0..3).map(|i| vec![0x45; 20 + i * 100]).collect();
+        let mut batch = BytesMut::new();
+        for packet in &packets {
+            IpTraffic::encode_into(&mut batch, packet).unwrap();
+        }
+
+        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        tx.write_all(&batch).await.unwrap();
+        drop(tx);
+
+        let mut frames = IpFrames::new(&mut rx);
+        for expected in &packets {
+            assert_eq!(frames.next().await.unwrap(), &expected[..]);
+        }
+        assert!(
+            frames.next().await.is_err(),
+            "the run ended, so the next read is the end of the stream"
+        );
     }
 }

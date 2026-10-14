@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The KCP carrier is independent of the data-plane mode: a `direct` service
+  can ride a KCP session.** `carrier = "kcp"` used to require
+  `mode = "multiplex"`, because a KCP session was only ever a multiplexed
+  tunnel. It is now also a **direct data channel**: the client opens one KCP
+  session per channel and the server's KCP listener reads the
+  data-channel hello exactly as its TCP listener does, so
+  `mode = "direct"` + `carrier = "kcp"` carries one channel with no yamux
+  framing above it. Configuring the pair is what this changes — the previous
+  refusal is gone, in the client model and in the transparent (L3) model alike,
+  and both `[client.data]`/`[client.services.*]` and
+  `[transparent.data]`/`[transparent.claims.*]` accept every mode/carrier
+  combination. What it costs and what it buys is measured, per path condition,
+  in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
+
+### Changed
+
+- **The benchmark model is one runner again: the soak sweep is a profile of
+  it.** `benches/scripts/bench/` now owns everything a performance number is
+  produced by — the metric registry, the topology, the workloads, the scripted
+  conditions and timelines, the reference tools (frp, rathole, nps) as arms,
+  the noise floor, the verdicts, the charts and the release gate — and the
+  retired sweep's scripts are gone. What that means for a reader of the
+  numbers: the staged schedule and the load ramp travel in one results file
+  under one schema (`--profile sweep`), a chart is rendered from that file by
+  `just bench-plot`, a release run is gated by `just bench-gate` (coverage, the
+  endpoint invariant, the SLO on the clean stages, the drift and wedge axes,
+  the ramp, and the regression half against a baseline), and the published
+  records of the previous model stay in `benches/records/` as history — never a
+  regression baseline, because the gate refuses a baseline whose method record
+  does not match. The method, the metric definitions and the profiles are on
+  [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard).
+
+### Added
+
 - **Transparent (L3) clients: the client owns the public `ip:port`.** A
   `[transparent]` block is a run mode of its own, and every entry it has is a
   claim: the client owns a public `ip:port` on a TUN device, the server routes
@@ -22,7 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `protocol = "transparent"` inside a `[client]` service is refused with a
   message naming the entry's new home. The model is a front end, not a second
   engine: it lowers into the same `ClientConfig` the forwarding path runs on, so
-  the client, the data path and the wire are unchanged. The backend therefore sees the visitor's real
+  the client, the data path and the wire are unchanged. The L3 data path moves
+  **batches**: the TUN device is drained and every packet is framed where it is
+  read, so a run of frames leaves as one write — the carrier pays one header and
+  one acknowledgement per batch instead of per packet, and a batch is flushed
+  the moment the device runs dry, so nothing waits for company. Measured on one
+  host and workload, that took 12 % off the wire on a bulk flow, and its
+  `[transparent.data]` defaults to `mode = "direct"` (a claim has exactly one
+  channel) for another 6 % of the wire, a third of the CPU per packet and 65 %
+  more small round trips per second than `multiplex`. Both halves of the data
+  path batch, reads as well as writes: one socket read carries a run of frames
+  and the inject loop walks the run, so a burst costs one read and then a run of
+  device writes instead of two awaits per packet (bulk: +27 % throughput, −56 %
+  CPU per packet on the arm those were measured on). Numbers, the build they
+  came from, and the no-tunnel controls that keep them honest are in
+  docs/benchmarks.md, "The transparent-L3 wire question". The backend therefore sees the visitor's real
   source address, TCP keeps its end-to-end semantics, and the server holds no
   socket and no per-flow state for the connection. Both ends attach to an
   **existing** TUN device named by `[client.transparent].tun` /

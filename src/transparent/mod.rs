@@ -135,49 +135,62 @@ impl<V> EndpointTable<V> {
         self.entries.len()
     }
 
-    /// The value a packet belongs to, looking at the end this side owns.
+    /// Which endpoint a packet belongs to, looking at the end this side owns.
     ///
     /// The two ends own opposite ends of every packet: the server's host
     /// routes the claimed *destination* into the tunnel, while the client's
     /// host **is** the claimed address, so its return traffic is recognised by
     /// its *source*.
-    pub fn lookup_in(&self, info: &PacketInfo, direction: Direction) -> Option<&V> {
-        match direction {
-            Direction::Destination => self.lookup(info),
-            Direction::Source => self.lookup_source(info),
-        }
-    }
-
-    /// The service that owns the *source* of this packet: the return path.
-    pub fn lookup_source(&self, info: &PacketInfo) -> Option<&V> {
-        if let Some(port) = info.src_port
+    ///
+    /// The endpoint rather than the value, because the caller batches per
+    /// endpoint: it keeps one buffer per claim while it drains the device, and
+    /// looks the queue up when it hands the batch over — a queue can be
+    /// replaced in between, and the flush must find the current one.
+    pub fn endpoint_for(&self, info: &PacketInfo, direction: Direction) -> Option<Endpoint> {
+        let (ip, port) = match direction {
+            Direction::Destination => (info.dst, info.dst_port),
+            Direction::Source => (info.src, info.src_port),
+        };
+        if let Some(port) = port
             && (info.protocol == TCP || info.protocol == UDP)
+            && self.entries.contains_key(&(ip, port))
         {
-            return self.entries.get(&(info.src, port));
+            return Some(Endpoint::new(ip, port));
         }
-        if self.per_ip.get(&info.src).copied() == Some(1)
-            && let Some((_, value)) = self.entries.iter().find(|((ip, _), _)| *ip == info.src)
+        // No port to route by — ICMP, the fragments after the first, or a
+        // transport this parser does not read ports from: only an address with
+        // a single claimant is unambiguous.
+        if self.per_ip.get(&ip).copied() == Some(1)
+            && let Some(((ip, port), _)) = self
+                .entries
+                .iter()
+                .find(|((entry_ip, _), _)| *entry_ip == ip)
         {
-            return Some(value);
+            return Some(Endpoint::new(*ip, *port));
         }
         None
+    }
+
+    /// The value registered for exactly this endpoint, if it is still
+    /// registered.
+    pub fn lookup_endpoint(&self, endpoint: &Endpoint) -> Option<&V> {
+        self.entries.get(&(endpoint.ip, endpoint.port))
+    }
+
+    /// The value a packet belongs to, looking at the end this side owns.
+    ///
+    /// The rule lives in [`Self::endpoint_for`]; this is the same answer with
+    /// the table's value attached.
+    #[cfg(test)]
+    pub fn lookup_in(&self, info: &PacketInfo, direction: Direction) -> Option<&V> {
+        let endpoint = self.endpoint_for(info, direction)?;
+        self.lookup_endpoint(&endpoint)
     }
 
     /// The value a packet belongs to, if any.
+    #[cfg(test)]
     pub fn lookup(&self, info: &PacketInfo) -> Option<&V> {
-        if let Some(port) = info.dst_port
-            && (info.protocol == TCP || info.protocol == UDP)
-        {
-            return self.entries.get(&(info.dst, port));
-        }
-        // No port to route by: only an address with a single claimant is
-        // unambiguous.
-        if self.per_ip.get(&info.dst).copied() == Some(1)
-            && let Some((_, value)) = self.entries.iter().find(|((ip, _), _)| *ip == info.dst)
-        {
-            return Some(value);
-        }
-        None
+        self.lookup_in(info, Direction::Destination)
     }
 }
 
@@ -226,13 +239,18 @@ impl Stats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn count_forwarded(&self) {
-        self.forwarded.fetch_add(1, Ordering::Relaxed);
+    /// `packets` forwarded in one batch: the counters are per packet however
+    /// packets travel, because that is what an operator compares against
+    /// traffic they can see.
+    pub fn count_forwarded_by(&self, packets: usize) {
+        self.forwarded.fetch_add(packets as u64, Ordering::Relaxed);
     }
 
-    /// A packet had nowhere to go (no channel, or a full queue).
-    pub fn count_no_channel(&self) {
-        self.dropped_no_channel.fetch_add(1, Ordering::Relaxed);
+    /// `packets` whose channel was gone or full. A batch shares one fate, and
+    /// this is where that fate is counted per packet.
+    pub fn count_no_channel_by(&self, packets: usize) {
+        self.dropped_no_channel
+            .fetch_add(packets as u64, Ordering::Relaxed);
     }
 
     /// A frame off the tunnel could not be read.

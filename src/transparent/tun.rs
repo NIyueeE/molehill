@@ -60,28 +60,43 @@ impl Tun {
         Ok(Self { fd })
     }
 
-    /// Read one packet. The buffer must be at least as large as the largest
-    /// packet the interface accepts; a short buffer truncates the packet, so
-    /// callers size it to [`super::ip::IPV4_MIN_HEADER`] plus the tunnel MTU
-    /// with room to spare.
-    pub async fn read_packet(&self, buf: &mut [u8]) -> io::Result<usize> {
+    /// Wait until at least one packet is ready, then hand **every** packet the
+    /// device has to `visit`, and return once it runs dry.
+    ///
+    /// This is the batching window. It ends the moment the device has nothing
+    /// left to give, so a batch never waits on a timer and an idle path is
+    /// handed over (and written) as promptly as a single-packet read would
+    /// have been: what changes is how many packets share one hand-over, not
+    /// when the first of them moves. A reader that returned one packet at a
+    /// time made the carrier pay a header, an acknowledgement and a syscall
+    /// per packet — the cost this exists to amortise.
+    ///
+    /// `visit` sees each packet in its own slice and cannot refuse it; a packet
+    /// it cannot use is the caller's to drop and count.
+    pub async fn drain(&self, buf: &mut [u8], visit: &mut impl FnMut(&[u8])) -> io::Result<()> {
+        let mut guard = self.fd.readable().await?;
         loop {
-            let mut guard = self.fd.readable().await?;
             match guard.try_io(|inner| {
                 let mut file = inner.get_ref();
                 file.read(buf)
             }) {
-                Ok(result) => return result,
-                // Spurious readiness: the kernel woke us for a packet another
-                // reader took, or the queue drained. The loop simply waits
-                // again.
-                Err(_would_block) => {}
+                Ok(Ok(read)) => visit(&buf[..read]),
+                // The queue is empty (or another reader took the last packet):
+                // `try_io` has already cleared the readiness, so the next call
+                // waits for the kernel again instead of spinning.
+                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => return Ok(()),
             }
         }
     }
 
     /// Write one packet. A short write would split a packet, so it is an error
     /// rather than something to retry.
+    ///
+    /// Packets cannot be batched here: a TUN device takes exactly one packet
+    /// per write, so this stays one syscall per packet however the tunnel side
+    /// is batched.
     pub async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
         loop {
             let mut guard = self.fd.writable().await?;

@@ -15,7 +15,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `Cargo.toml` | crate manifest; `[lints]` is policy documented in [lint-policy](lint-policy.md) |
 | `Cargo.lock` | locked dependency graph (committed; verified with `--locked` in CI builds) |
 | `build.rs` | build metadata injection via vergen (git SHA, timestamp, features, target) |
-| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `interop` / `l3-accept` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `soak` / `soak-peers` / `soak-plot` / `soak-check` / `container` |
+| `justfile` | task runner: `just setup` / `fmt` / `py-fmt` / `test` / `test-fast` / `check` / `interop` / `l3-accept` / `tag` / `tag-check` / `powerset` / `py-lint` / `bench-deps` / `bench` / `bench-list` / `bench-doctor` / `bench-report` / `bench-compare` / `bench-selfcheck` / `bench-peers` / `bench-plot` / `bench-gate` / `container` |
 | `rust-toolchain.toml` | `channel = "stable"` + clippy/rustfmt components; never hardcode versions |
 | `deny.toml` | cargo-deny policy: licenses, bans, advisories (pre-push + CI) |
 | `ruff.toml` | ruff configuration for the python bench/test entries: the lint set and the repo-wide waivers (see [lint-policy](lint-policy.md)) |
@@ -34,7 +34,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 
 | Path | Purpose |
 |------|---------|
-| `githooks/pre-commit` | fast gates: fmt, secret scan, machete, docs alignment, ruff lint + format, clippy ×2 |
+| `githooks/pre-commit` | fast gates: fmt, secret scan, machete, docs alignment, ruff lint + format, bench-model self-check, clippy ×2 |
 | `githooks/pre-push` | heavy gates: audit, deny, outdated, tests; runs the release review (pre-tag) on `v*` tag pushes |
 | `githooks/pre-tag` | light release review (via `just tag` + on tag pushes): tag↔version, changelog section, bench assets, container-job greps, advisory checklist |
 | `githooks/check-secrets` | staged-changes secret scan (`security-scan:allow` marker to waive a line) |
@@ -79,8 +79,9 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `tests/startup_failure_test.rs` | a process that cannot serve its instance ends instead of running deaf |
 | `tests/common/mod.rs` | echo/pingpong hitters and runner helpers |
 | `tests/for_tcp/`, `tests/for_udp/`, `tests/config_test/` | integration fixtures: transport variants, the session cases, the control-channel teardown case, valid/invalid configs |
-| `benches/` | Soak benchmark model (`scripts/soak/`: uv/PEP 723 python — `soak.py` runner, `lib.py` shared primitives, `soak_check.py` gate, `soak_plot.py` charts, `fetch_peers.py` peer fetcher) with its committed results (`scripts/soak/results-soak-vX.Y.Z.json`) and charts (`assets/soak-vX.Y.Z*.png`); side probes: mux e2e smoke (`scripts/mux/`), HTTP latency (`scripts/http/`), memory sampling (`scripts/mem/`), the interop fetcher (`scripts/interop/fetch_old.py`), the UDP stress probe (`scripts/udp_stress.py`) |
-| `benches/scripts/l3/` | the transparent-L3 acceptance harness: `run.sh` builds the real binaries and drives three network namespaces (visitor, server, client) to prove the client owns the public `ip:port` and the server holds no connection state for the flow; `visitor.py` and `echo_service.py` are its PEP 723 peers. Linux-only and root-only, outside the check chain (`just l3-accept`; see docs/checks.md) |
+| `benches/scripts/bench/` | the measurement model — the repository's one runner and its standard: `model.py` declares every metric, condition, timeline, arm, scenario and profile; `topology.py` builds the one topology and imposes conditions in place; `workloads.py` runs the workloads (bulk, round trips, UDP, the staged sweep, the capacity ramp, reconnect); `peers.py` adapts the reference tools (frp, rathole, nps) as arms and fetches their binaries; `plot.py` renders a results file's charts and tables; `analysis.py` aggregates, measures the run's own noise floor, decides verdicts and gates a release run; `runner.py` runs a campaign; `bench.py` is the entry point; `iperf.py` and `hostinfo.py` carry the iperf3 conventions and the provenance probes; `probes/` holds the traffic generators. Linux-only, root-only, outside the check chain except its own self-check (`just bench-selfcheck`; see docs/checks.md) |
+| `benches/records/` | the published results of the release sweeps (`results-soak-vX.Y.Z.json` from the retired soak model, `results-bench-vX.Y.Z.json` going forward), with their charts in `assets/`. A results file is evidence for a published number, not scratch space |
+| `benches/scripts/l3/` | the transparent-L3 *acceptance* harness: `run.sh` builds the real binaries and drives three network namespaces (visitor, server, client) to prove the client owns the public `ip:port` and the server holds no connection state for the flow; `visitor.py` and `echo_service.py` are its PEP 723 peers, and `wire_report.py` turns the per-arm `/proc/net/dev` and CPU samples into carried packet sizes, wire bytes per carried packet and the ceiling a header compressor could reach. It is an assertion tool, not a measurement: a number about an arm's *cost* is `benches/scripts/bench/`'s job, on the same three-namespace plan with its own names. Linux-only and root-only, outside the check chain (`just l3-accept`; see docs/checks.md) |
 | `docs/configuration.md` | every setting: meaning, default, allowed values, logging, tuning, troubleshooting, and the decision tree |
 | `docs/deployment.md` (+ `.zh.md`) | ready-to-run configurations for common scenarios, systemd units, container/compose/Quadlet recipes, network requirements, deployment security |
 | `docs/benchmarks.md` (+ `.zh.md`) | how the published numbers are produced, read and reproduced — the home of the benchmark method |
@@ -100,7 +101,7 @@ must never explain, and who a user page may link to).
 | `configuration.md` + `.zh.md` | users | every setting: meaning, default, allowed values, logging, tuning, troubleshooting | measured costs (→ benchmarks), release history, the recipes (→ deployment) |
 | `deployment.md` + `.zh.md` | users | how to stand it up: worked examples, systemd units, container/compose/Quadlet recipes, network requirements, deployment security | what a setting means (→ configuration), measured costs (→ benchmarks) |
 | `transport.md` + `.zh.md` | users | Noise transport setup: keys, patterns, resume | configuration reference, measured costs |
-| `benchmarks.md` + `.zh.md` | users | the benchmark method: what is measured, how to read the charts, the stage schedule, the SLO, the test types, per-decision measurements, comparability, how to reproduce a run (including the two-build screen) | the release ritual and its gate (→ release), configuration reference |
+| `benchmarks.md` + `.zh.md` | users | the benchmark method: what is measured, how to read the charts, the stage schedule, the SLO, the test types, per-decision measurements, comparability, how to reproduce a run (including the two-build screen) — and the bench model's standard: its metric registry, scenarios, profiles, verdict rules and how to run, report and compare a campaign | the release ritual and its gate (→ release), configuration reference, what each gate runs (→ checks) |
 | `build-guide.md` | contributors | building from source, feature flags, minimal binaries | gate tables, release mechanics |
 | `internals.md` | contributors | wire protocol and forwarding design (registration, muxing, UDP affinity, striping) | measured comparisons (→ benchmarks) |
 | `checks.md` | contributors | gate tables: every command a hook runs and how to handle a block | lint levels, release mechanics |

@@ -118,10 +118,16 @@ type Pins = ();
 /// One connection dialed by the client, after its v3 transport selector
 /// byte: plain TCP, or TCP wrapped in the Noise record stream. The
 /// transport is a per-service decision (see `ClientTransport`).
+///
+/// A `Kcp` variant is the carrier's own byte stream. A KCP *tunnel* is a yamux
+/// session whose channels are `TunnelStream`s, so this variant exists for the
+/// **direct** data channels, where the carrier's session is the channel.
 enum ClientStream {
     Plain(TcpStream),
     #[cfg(feature = "noise")]
     Noise(Box<crate::transport::NoiseStream<TcpStream>>),
+    #[cfg(feature = "kcp")]
+    Kcp(crate::transport::kcp::KcpTunnelStream),
 }
 
 impl std::fmt::Debug for ClientStream {
@@ -130,17 +136,25 @@ impl std::fmt::Debug for ClientStream {
             ClientStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
             #[cfg(feature = "noise")]
             ClientStream::Noise(_) => f.debug_tuple("Noise").finish(),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => f.debug_tuple("Kcp").field(s).finish(),
         }
     }
 }
 
 impl ClientStream {
     /// Apply socket options to the underlying TCP socket.
+    ///
+    /// A KCP stream has no socket of its own: its session's UDP socket is tuned
+    /// where it is created (`transport::kcp::tune_socket_buffers`), and the
+    /// per-connection TCP options have nothing to land on.
     fn hint(&self, opts: SocketOpts) {
         match self {
             ClientStream::Plain(s) => opts.apply(s),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => opts.apply(s.get_inner()),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(_) => {}
         }
     }
 }
@@ -155,6 +169,8 @@ impl tokio::io::AsyncRead for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -169,6 +185,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -179,6 +197,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -189,6 +209,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -653,6 +675,12 @@ struct RunDataChannelArgs {
     service_id: ServiceId,
     remote_addr: AddrMaybeCached,
     connector: Arc<ClientTransport>,
+    /// The carrier a **direct** channel dials with (`[client.data]
+    /// .default_carrier`, or the service's own override). The multiplex path
+    /// ignores it here: its carrier is the pool's own key, chosen when the
+    /// tunnel was established.
+    #[cfg(feature = "multiplex")]
+    carrier: DataCarrier,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
     /// Mints this service session's data-channel ids: the key the UDP pin
@@ -661,6 +689,11 @@ struct RunDataChannelArgs {
     channels: std::sync::atomic::AtomicU64,
     /// Shared UDP hub for the service; `Some` iff this is a UDP service.
     udp: Option<Arc<UdpHub>>,
+    /// The service's Noise keys, when its control transport is `noise`: a KCP
+    /// data channel carries the same record stream a TCP one does, so it is
+    /// wrapped under exactly the same rule.
+    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    noise: Option<NoiseConfig>,
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
     /// here until the group is complete (see [`crate::stripe`]).
@@ -855,14 +888,48 @@ impl RunDataChannelArgs {
     }
 }
 
-async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<ClientStream> {
+/// Dial the carrier a **direct** data channel rides.
+///
+/// TCP goes through the service's transport (`ClientTransport`, so Noise is
+/// applied where the control channel's wire stack says it should be) with the
+/// usual retry: a visitor may arrive while the server is briefly unreachable.
+/// KCP opens a session on the data endpoint directly — the carrier owns its own
+/// socket stack — and its reliability makes the retry loop meaningless: a lost
+/// datagram is KCP's business, and there is no connect error to retry on.
+async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStream> {
+    #[cfg(feature = "multiplex")]
+    if matches!(args.carrier, DataCarrier::Kcp) {
+        #[cfg(feature = "kcp")]
+        {
+            let remote_addr = {
+                let mut probe = args.remote_addr.clone();
+                probe.resolve().await.with_context(|| {
+                    format!("Failed to resolve the data endpoint {}", probe.addr)
+                })?;
+                probe.socket_addr.ok_or_else(|| {
+                    anyhow!("The data endpoint {} resolved to nothing", probe.addr)
+                })?
+            };
+            #[cfg(feature = "noise")]
+            let noise = args.noise.as_ref();
+            #[cfg(not(feature = "noise"))]
+            let noise = None;
+            return Ok(ClientStream::Kcp(
+                crate::transport::kcp::connect_stream(remote_addr, noise).await?,
+            ));
+        }
+        // Config validation refuses `carrier = "kcp"` without the feature, so
+        // this arm is unreachable in a correctly loaded configuration.
+        #[cfg(not(feature = "kcp"))]
+        bail!("This binary was built without the `kcp` feature");
+    }
+
     // Retry at least every 100ms, at most for 10 seconds
     let backoff = ExponentialBuilder::default()
         .with_max_delay(Duration::from_millis(100))
         .with_total_delay(Some(Duration::from_secs(10)));
 
-    // Connect to remote_addr
-    let mut conn: ClientStream = (|| async {
+    let conn = (|| async {
         args.connector
             .connect(&args.remote_addr)
             .await
@@ -875,6 +942,11 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Clie
         debug!("{:#}. Retry in {:?}", e, duration);
     })
     .await?;
+    Ok(conn)
+}
+
+async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<ClientStream> {
+    let mut conn = connect_direct_channel(&args).await?;
 
     conn.hint(args.socket_opts);
 
@@ -1447,35 +1519,14 @@ async fn establish_one_kcp_tunnel(
     opts: &DataOpts,
     service_name: &str,
 ) -> Result<(ClientTunnel, watch::Sender<bool>)> {
-    use crate::transport::kcp::{self, KcpTunnelStream};
-    use rand::TryRng;
-
-    // Random per-session conversation id; together with the ephemeral client
-    // port it keeps the server's session map collision-free across restarts.
-    let mut rng = rand::rngs::SysRng;
-    let mut conv_bytes = [0u8; 4];
-    rng.try_fill_bytes(&mut conv_bytes)
-        .with_context(|| "Failed to generate a KCP conversation id")?;
-    let conv = u32::from_le_bytes(conv_bytes);
-
-    let stream = kcp::connect(remote_addr, conv).await?;
-    let mut io = {
-        #[cfg(feature = "noise")]
-        if let Some(cfg) = &opts.noise {
-            let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-            // Full handshake + v3 selector byte (the wrapper owns the
-            // selector): KCP tunnels establish once per control session,
-            // so a resume attempt has nothing cached yet and would only
-            // add a round trip.
-            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator_full(stream).await?))
-        } else {
-            let mut s = stream;
-            s.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
-            KcpTunnelStream::Plain(s)
-        }
-        #[cfg(not(feature = "noise"))]
-        KcpTunnelStream::Plain(stream)
-    };
+    // Full Noise handshake + v3 selector byte (the wrapper owns the selector):
+    // KCP tunnels establish once per control session, so a resume attempt has
+    // nothing cached yet and would only add a round trip.
+    #[cfg(feature = "noise")]
+    let noise = opts.noise.as_ref();
+    #[cfg(not(feature = "noise"))]
+    let noise = None;
+    let mut io = crate::transport::kcp::connect_stream(remote_addr, noise).await?;
 
     let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_nonce);
     io.write_all(&postcard::to_stdvec(&hello)?).await?;
@@ -2775,9 +2826,13 @@ impl ClientSession {
                 service_id: id,
                 remote_addr: data_addr,
                 connector: slot.transport.clone(),
+                #[cfg(feature = "multiplex")]
+                carrier: slot.data.carrier,
                 socket_opts: SocketOpts::from_client_cfg(&slot.service),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
+                #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+                noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "multiplex")]
