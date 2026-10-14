@@ -16,10 +16,8 @@ default_remote_addr = "127.0.0.1:2385"
 type = "plain"
 
 [client.data]
-default_carrier = "tcp"
 shared_pool = true
 
-[client.data.tcp]
 tunnels = 3
 
 [client.services.game]

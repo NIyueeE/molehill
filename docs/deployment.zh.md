@@ -200,6 +200,12 @@ bind_addr = "0.0.0.0:2333"
 网络。它仅支持 Linux,两端都需要 `CAP_NET_ADMIN`(各自要打开 TUN 设备),而且
 自己不配置任何网络。
 
+在进入配方之前先给一条容量建议:认领的内部流会摊在它的车道上,而同一客户端各认领的车道会
+随流量起落互相出借——但前提是预算给某条认领留下了余量(`[transparent.data].tunnels`,
+每条认领至少两条)。实测:当**载体连接**本身是瓶颈时(长途或丢包路径)收益很大,而在快速短
+路径上什么也买不到,代价是更多连接与更多 CPU;数字与 `lend = false` 开关见
+[配置文档](./configuration.zh.md)与[基准页](./benchmarks.zh.md)。
+
 服务端只有在**它自己的**配置要求时才提供 L3:下面 `server.toml` 里的
 `[server.transparent]` 就是那个开关,没有它,注册会在碰到任何设备之前被拒绝。
 把提供 L3 的服务端放在带该能力的 unit 下,只做 L4 的服务端放在不带该能力的
@@ -430,7 +436,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
-`multiplex`、`kcp`、`transparent`),所以 `default_carrier = "kcp"` 不需要换
+`multiplex`、`kcp`、`transparent`),所以数据面的 KCP 不需要换
 镜像。想要可复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.9.0`),
 而不是用 `:latest`。
 
@@ -476,8 +482,8 @@ services:
 
 桥接网络变体(Docker Desktop,macOS/Windows):文件不变,两个服务都去掉
 `network_mode: host`,并给服务端加上 `ports:`——`"2333:2333"` 用于控制通道与
-TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(仅当某个服务使用
-`carrier = "kcp"` 时需要),再加每个对外暴露的服务端口(如 `"5202:5202"`);
+TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(数据面会优先尝试的 carrier),
+再加每个对外暴露的服务端口(如 `"5202:5202"`);
 客户端则通过 compose 的 DNS 名访问服务端,即
 `default_remote_addr = "molehill-server:2333"`。
 
@@ -516,10 +522,10 @@ WantedBy=multi-user.target
 - **服务端**必须能从互联网访问:`server.control.bind_addr`、
   `server.data.bind_addr`(设置时)和每个注册的 `remote_bind_addr` 都需要
   入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。服务使用
-  `carrier = "kcp"` 时还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
+  数据面会尝试 KCP,因此还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
   `server.data.bind_addr`,默认就是控制端口,同一端口号上 TCP 与 UDP 并存。
 - **客户端**只需要到 `server.control.bind_addr` 的出站访问(数据端点不同时
-  也包括它;TCP,`carrier = "kcp"` 时还包括 UDP);NAT 后不需要任何入站端口。
+  也包括它;TCP,数据面的 KCP 还包括 UDP);NAT 后不需要任何入站端口。
 - 容器部署:镜像以 UID 1000 运行,无法绑定 1024 以下的端口——端口与配置
   文件权限的后果见[容器](#容器)。
 - `client.control.default_remote_addr` 必须与 `server.control.bind_addr` 使用相同的

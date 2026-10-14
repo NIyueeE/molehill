@@ -1,4 +1,4 @@
-# expect: `[client.data.tcp].tunnels` must be at least 1
+# expect: `[client.data].tunnels` must be at least 1
 # requires: multiplex
 
 # The count is what the pool establishes at service start, so `0` would mean
@@ -11,7 +11,7 @@ default_token = "t"
 [client.control]
 default_remote_addr = "example.com:2333"
 
-[client.data.tcp]
+[client.data]
 tunnels = 0
 
 [client.services.test]

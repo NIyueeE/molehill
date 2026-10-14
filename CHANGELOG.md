@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A transparent claim's lanes move to the other carrier when the one in use is
+  measured to be losing its traffic.** Each lane now carries its own identity
+  (named by the client in the channel's prologue), the server reports what it
+  offered each lane and what that lane's queue refused there, and the client
+  decides on that pair against what it injected off the lane — the end that
+  chooses the carrier can finally see the loss, which happens where the packets
+  are *offered* (the peer's device) and reads as zero in its own counters. A lane
+  whose peer-side queue refuses a material share of what it was offered, for
+  three consecutive one-second samples, is handed over: the client asks the peer
+  to stop placing new flows in it, and retires it only once **both** ends agree
+  it holds nothing — so a running flow finishes where it is and is never
+  reordered, while the replacement lane rides the carrier now preferred. A drain
+  the peer never answers is called off, and a handover in flight outranks lending
+  a lane to another claim. `MOLEHILL_L3_STATS=1` prints each lane's own counters
+  (`offered`, `enqueued`, `overflow`, `disconnected`, `injected`) beside the
+  peer's view (`peer_offered`, `peer_refused`).
+
 - **A transparent (L3) claim's carrier connections come from its carrier's
   budget, and its inner flows are spread across them.**
   `[transparent.data.tcp|kcp].tunnels` is a **lane budget** for a transparent
@@ -44,7 +61,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   condition, in
   [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
 
+### Added
+
+- **A diagnostic carrier switch, to measure what switching is worth.**
+  `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` moves every transparent claim to the
+  other carrier that many seconds after its pool starts and drains each claim's
+  busiest lane so the replacement is dialed on the new carrier — a lane keeps the
+  flows already on it and takes no new ones, so nothing is reordered. Measured
+  with it: on a 1 %-loss path the 2 Gbit/s UDP ladder cell goes from 1057.6
+  Mbit/s with 40.7 % loss to 1883.5 with 4.5 % (+78 %), and the 5 Gbit/s cell
+  from 1041.8 / 62.0 % to 3067.5 / 7.9 % (+194 %), while the cells where the two
+  carriers are level do not move. It is a measurement hatch, not a deployment
+  knob: the shipping behaviour stays the runtime decision in `CarrierChoice`,
+  and the policy that acts on that evidence is the next change.
+
 ### Changed
+
+- **The KCP send window is 8192 segments, not 2048.** The window is the
+  carrier's throughput ceiling as soon as a path's bandwidth-delay product
+  exceeds it, and on a lossy path it did: 2048 segments ≈ 2.8 MiB carried
+  **533 Mbit/s at the ~44 ms round trip** those paths settle at, which is what
+  the per-second counters showed (`wait_snd` pinned at its limit while neither
+  end's CPU was busy). Measured as a two-binary A/B on a 1 %-loss path with a
+  10 000-packet queue, the 1 Gbit/s UDP ladder cell moves from **42.3 % inner
+  loss / 556 Mbit/s delivered to 0.2-0.7 % / +43 % delivered** (every round
+  agreeing, both floors cleared), at +47 % CPU cores on that cell. The same A/B
+  is indistinguishable on a clean path, including the four-tunnel burst cells
+  that pinned the smaller window in the first place, so this is the ceiling
+  coming off rather than a burst trade.
+
+- **The data plane's carrier is not a key: it is KCP, with TCP as its built-in
+  fallback.** `[client.data].default_carrier`, `[client.services.<name>].carrier`
+  and the never-released `[transparent.data].default_carrier` /
+  `[transparent.claims.<name>].carrier` are gone, and with them the per-carrier
+  rows: `[client.data.tcp]`/`[client.data.kcp]` and
+  `[transparent.data.tcp]`/`[transparent.data.kcp]` collapse into one table,
+  where `tunnels` is the only key they held. Which carrier carries the data
+  plane is a property of the network between the two ends — UDP may be blocked,
+  shaped, or fine today and blocked tomorrow — so the client tries KCP (feature
+  `kcp`) and falls back to TCP when a session cannot be established at all:
+  one bounded attempt (2 s), remembered per data endpoint, re-probed after 60 s,
+  announced once at `INFO` and then at `DEBUG`. A forced carrier
+  (`MOLEHILL_DATA_CARRIER=tcp|kcp`) is a *measurement* switch, not a
+  deployment choice; it also disables the fallback, which is what makes it
+  usable as an arm. Migration: move `tunnels` up one level
+  (`[client.data.tcp].tunnels = 4` → `[client.data].tunnels = 4`), delete every
+  `carrier` / `default_carrier` line, and leave the rest alone.
+
+- **The bench model can tell a carrier's loss recovery from the shaper's own
+  drops.** The new `loss1_deep` condition is the same 1 % loss with a
+  100 000-packet queue; without it, the `loss1` class runs on netem's default
+  1000-packet queue and tail-drops on top of the loss it emulates, which the KCP
+  ladder cell read as the carrier losing packets (384.6 Mbit/s / 59.5 % became
+  545.0 / 42.5 % on the deeper queue, against the TCP fallback's 988.4 / 0.051 %).
+
+- **The bench model lost its carrier axis with the key it described.** An arm can
+  no longer name a carrier (`force_carrier`, `l3-kcp`, `l3-tcp`, `l4-kcp`,
+  `l4-tcp` are gone): naming one would describe a setting the product no longer
+  has. The contrast moved to the *path*, where the product's own decision
+  actually lives — the new `udp_blocked` condition drops UDP on the leg the
+  carrier crosses, so the KCP attempt cannot be established and the run measures
+  the **TCP fallback** (the fallback line and `carrier="tcp"` in the pool's
+  output are its evidence), while a clean run carries KCP. The condition is
+  refused on any leg but `tunnel`, because on the visitor's leg it would drop
+  the payload and the carrier would come up as usual — a run whose method said
+  "fallback" while every packet rode KCP. Isolating one carrier (say KCP under
+  loss, with no fallback) is now the inherited `MOLEHILL_DATA_CARRIER` switch,
+  which every results file records as instrumentation.
+
+- **A transparent claim's lanes are lent to the claim that needs them.** The
+  lane budget (`[transparent.data.tcp|kcp].tunnels`) used to be split equally at
+  startup and left that way, so a claim carrying sixteen flows on two
+  connections and a claim carrying nothing held the same number. The client now
+  looks once a second and moves at most one lane: from a claim that has a lane
+  with no flow in it and more than one lane, to the claim furthest from *a lane
+  per talking flow*. Three properties make it safe rather than clever — a lane
+  is asked to end only when it holds no flow at all, the receiver's lane is
+  dialled only after the donor's has actually ended (so the number of carrier
+  connections the operator pays for never grows, it moves), and a claim is never
+  reduced below one lane, which is what keeps it reachable. What it cannot do is
+  worth saying too: a *single* flow cannot be spread over two lanes — its
+  packets have to stay in order — so the gain is per flow, and a one-flow
+  workload is unaffected by design. Lending is observable: the client logs
+  `Lane allocator: lent lane N of claim A to claim B`, and
+  `MOLEHILL_L3_STATS=1` shows each lane's `flows`, and
+  `[transparent.data].lend = false` turns the mechanism off (the equal split
+  held static) for a deployment that would rather not trade connections for
+  throughput.
+  **Measured** (bench model, `bulk-n`, ten rounds, A/A twin beside it, the two
+  catalog arms `l3-budget10-lending` and `l3-budget10-nolend`): on a path whose
+  *carrier connections* are the limit — a 100 ms tunnel leg here — lending is
+  worth **+27 % throughput** for one claim (2.395 against 1.754 Gbit/s, a claim
+  by the model's rules: 10 % materiality, sign agreement 1.0), at +8 % CPU per
+  byte and +32 % CPU cores, because it carries more of the same traffic over more
+  connections. Under 1 % loss the same comparison is +12 % and directional; on a
+  clean fast loopback the L3 path is limited per packet instead and the
+  difference is inside the noise. The mechanism is a trade, not a free win, and
+  it is one the operator prices twice: with the lane budget, and with
+  `lend = false`.
 
 - **The data plane's shape is derived from the service type: `mode` is gone.**
   A forwarding service always multiplexes over its pinned pool; a transparent
@@ -129,6 +243,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because every tunnel is at placement's ceiling (56 streams of the engine's
   64), one INFO line names the count and the key to raise, and later refusals
   are DEBUG. The wire protocol is unchanged.
+
+### Fixed
+
+- **A KCP control frame that shared a datagram batch with payload is no longer
+  fed to the ARQ and dropped.** Only the first datagram of a batch was
+  classified, so a `PING`/`PONG`/`SACK`/`CLOSE` frame arriving behind data — the
+  shape a keepalive or a close has whenever it shares a readiness wake with the
+  payload it was sent with — was handed to the state machine as a short KCP
+  segment and rejected. A `CLOSE` lost that way is the retired-lane black hole
+  again, reachable from ordinary bursty traffic.
+
+- **A deliberate carrier switch is no longer undone by a reachability
+  re-probe.** Moving to TCP pushed the KCP re-probe out by 60 s while promising
+  to hold the decision for 120 s, so a session that came up in between switched
+  the endpoint back — an event that says only "UDP connects now", not that KCP
+  carries more. The re-probe now waits at least as long as the switch is held,
+  and a successful session does not clear a held decision.
+
+- **A transparent lane's handover completes.** A peer's drain waited for the
+  placement table to forget a flow (a minute) rather than for the lane to go
+  quiet (three seconds), which is longer than any dialer waits — so on a
+  workload that changes flows every few seconds every drain was called off. A
+  peer's drain now waits for `active_flows == 0`; the local retirement and the
+  lending path keep the stricter emptiness rule.
+
+- **A forced carrier (`MOLEHILL_DATA_CARRIER`) now stops the lane policy.** The
+  switch was refused (a forced carrier is the run's answer) but the peer was
+  still asked to drain a lane, taking it out of service for a switch that could
+  not happen.
+
+- **A retired or lost transparent lane no longer leaves the peer writing into a
+  channel that carries nothing.** A KCP session has no close handshake, so the
+  side whose lane ended went away silently: the peer kept forwarding a visitor's
+  traffic into it and never found out, because its dead-link rule wants 20
+  retransmits *and* a send window that has stood still for five seconds — and a
+  lane with traffic never has a still window. Measured while reproducing it: in
+  30 s the peer sent 7876 datagrams of which **7288 were retransmissions** and it
+  still held the session open. The adapter now sends a **CLOSE control frame**
+  (the same 16-byte vocabulary as PING/PONG/SACK) when both halves of a stream
+  are gone and the ARQ tail is flushed, and a session that receives one ends at
+  once, so the peer's lane task sees the end, vacates its slot, and the flows
+  pinned to it are re-placed onto the lanes that remain. The bench cell that
+  showed the defect — `l3-budget10` over `udp-ladder,udp-pace` on a 1 %-loss path
+  — goes from whole rounds of **100 % loss** to 0.8-1.4 %.
 
 ### Fixed
 

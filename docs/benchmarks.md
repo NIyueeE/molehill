@@ -97,15 +97,27 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 - **An arm states the width it measured, and the data plane's shape is not an
   arm parameter at all.** `pool_cap` is the pool's
-  `[client.data.tcp|kcp].tunnels` for a forwarding arm and a transparent
-  claim's **lane budget** for an L3 one — one connection per lane, because a
-  claim never multiplexes — and `carrier` is the other axis. The shape itself is
+  `[client.data].tunnels` for a forwarding arm and a transparent claim's
+  **lane budget** for an L3 one — one connection per lane, because a claim never
+  multiplexes. The data plane's **carrier is not an arm axis either**: the
+  product chooses it at runtime (KCP, falling back to TCP), so there is no key
+  to write and no arm field to set. The contrast lives in the *path* —
+  `--condition udp_blocked --condition-leg tunnel` drops UDP on the leg the
+  carrier crosses, so the KCP attempt cannot be established and the run measures
+  the fallback, with the fallback line and `carrier="tcp"` in the pool's own
+  output as its evidence — while a clean run carries KCP. To isolate one carrier
+  instead (a KCP-only run under loss, say), set `MOLEHILL_DATA_CARRIER=kcp` in
+  the environment the bench is launched from: a run records the `MOLEHILL_*`
+  switches it inherited as instrumentation, so the forcing is auditable. The shape itself is
   derived from the service type (a forwarding service multiplexes, a claim never
   does), so an arm spec that still names a `mode` is refused by
   `just bench-selfcheck`. Records below name the arms the catalog had when each
   run was made: where one says `l3-mux` (one stream of a pool), `l3-mux4` (four
-  streams) or `l3-raw4` (four connections), today's catalog has `l3` (one
-  connection) and `l3-lanes4` (four connections), and `l4-mux1` is gone because
+  streams) or `l3-raw4` (four connections), today's catalog has `l3` (the
+  product's default one lane per claim) and `l3-budget10` (a carrier budget the
+  claims share — the L3 topology carries five claims, so ten lanes start at two
+  each and the allocator concentrates the spare ones on whichever claim is
+  carrying flows), and `l4-mux1` is gone because
   the topology's UDP floor refuses a one-tunnel pool — one stream on a
   two-tunnel pool is `l4-mux2` in a single-flow scenario
   ([HANDOFF.md](../HANDOFF.md), "The mux×1 gap, measured before touching it").
@@ -342,6 +354,9 @@ same vocabulary without the schedule: one cell, one condition, one number.
 | `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
 | `loss1_rate100` | a 100 Mbit uplink that also loses packets — the lossy WAN the carriers are chosen for | 100 Mbit/s, 20 ms delay, 1 % loss | focused cell only |
 | `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms | 120 s |
+| `loss1_buf` | a lossy path with a large but finite buffer: deep enough that tail drops are not the story, shallow enough not to inflate RTT (10 000 packets ≈ 14.7 MB, ≈ 27 ms of standing queue at 545 Mbit/s) | 10 ms delay, 1 % loss, 10 000-packet queue | focused cell only |
+| `loss1_deep` | the same 1 % loss with a queue deep enough not to tail-drop — it tells a carrier's loss recovery apart from the shaper's own drops | 10 ms delay, 1 % loss, 100 000-packet queue | focused cell only |
+| `udp_blocked` | a path that drops UDP: the data plane's first carrier cannot be established, so the run measures the **TCP fallback** | `iptables -j DROP` for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
 | `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
 
 The schedule, the durations, the sample rates and the SLO are recorded in every
@@ -579,8 +594,8 @@ to two).
 | `tunnels` | `1` | one tunnel for everything: no aggregation and one retransmit domain shared by every stream (loopback 8-stream aggregate 9.2 vs 19.5 Gbit/s at four tunnels; loss5 head-of-line max 2.5 s vs 1.6 s; and on the pinned pool's own cells 8 flows read 3.34 Gbit/s on `loss1` against 5.92 at two) |
 | `tunnels` | `4` (default) | aggregates beyond one flow (loss1 8-str 12.3 vs 4.5 Gbit/s) and isolates head-of-line blocking (rtt10 max gap 80.6 vs 100.1 ms at one tunnel); yamux ceiling `count × 64` concurrent connections, `count × 56` after placement's own ceiling |
 | `tunnels` | `8+` | ~512 concurrent connections (8 tunnels × 64 yamux streams); 8 physical tunnels per service (NAT mappings ×8), and on a clean jumbo path 22.81 Gbit/s against 12.85 at one |
-| `carrier` | `"tcp"` (default) | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
-| `carrier` | `"kcp"` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
+| `carrier` (forced) | `tcp` | ahead of the KCP carrier in every unflagged measurement (loopback 1-stream 5.8 vs 3.7 Gbit/s against the kcp4 arm on the noise transport), and far cheaper in memory (RSS 26 vs 85 MiB). One 8-stream loopback cell (14.9 vs 1.1 Gbit/s) is excluded here: it was bimodal across repetitions on both builds, so it is not evidence of anything |
+| `carrier` (forced) | `kcp` | only when TCP data tunnels are blocked or throttled, or to A/B a UDP game on a high-latency path: its one measured win is UDP session quality at rtt100 (0 % loss, 20 ms maximum inter-packet gap vs 100+ ms for the TCP arms) |
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
@@ -992,6 +1007,39 @@ is the **packet size**: the same bytes in 8000-byte packets instead of 1400
 measured 1.8× the throughput at half the CPU per byte. That is an operator
 setting, not a code change: the TUN MTU, with a link MTU to match
 ([deployment.md](deployment.md#transparent-services)).
+
+**What lending lanes buys, and when.** The L3 rows below are measured on claims
+that hold the lanes their share of the carrier budget gives them; the client also
+*lends* an idle lane of one claim to a claim carrying more flows than lanes
+(`docs/internals.md`, "Lanes are lent"). Whether that is worth anything is a
+question about what limits the path, and the model answers it: with the
+condition on the **carrier** leg (a 100 ms tunnel, so a claim's throughput is
+limited per connection), lending eight flows over the lanes an idle claim lends
+is worth **+27 %** for that claim (2.395 against 1.754 Gbit/s, ten rounds, a
+claim by the model's own rules: materiality 10 %, sign agreement 1.0, and the
+run's A/A floor cleared). Under 1 % loss the same comparison is +12 % and
+*directional* — the effect survives loss, ten rounds cannot separate it from the
+scatter — and on a clean loopback it is indistinguishable. It buys that with
+CPU and memory rather than efficiency (+8 % CPU per byte, +32 % CPU cores, +11 %
+peak RSS, all directional): more connections carrying more traffic. With the condition on the visitor leg, or on a clean
+loopback where the L3 path is limited per packet, the difference is inside the
+noise. Reproduce it as an arm rather than a build: the catalog carries
+`l3-budget10` (lending on) and `l3-budget10-nolend` (the same topology and the
+same binary with `[transparent.data].lend = false`), so
+`bench.py run --arms l3-budget10,l3-budget10-nolend --condition rtt100
+--condition-leg tunnel` is the whole experiment; the record is in `HANDOFF.md`.
+
+**Attributing the multiplexing overhead.** The L4 rows above say what
+multiplexing costs (a single flow on a pinned pool carries about half what a
+connection of its own does, at roughly twice the CPU per byte); where that CPU
+goes is `benches/scripts/mux/gap_profile.sh`, which samples both daemons with
+`perf` while one iperf3 flow crosses one tunnel and prints the top symbols per
+daemon. The shape it reports on this host: **~35 % kernel, ~15 % libc's memory
+routines, and the mux's own Rust code a few percent per symbol** — every leaf is
+small and the sum is in the copies and syscalls per byte, not in a hotspot. That
+is the same conclusion the TUN path reached below, and it is why the candidates
+are structural (how many times a packet is copied, how large a framed write is)
+rather than a function to optimise.
 
 **Method note: the bulk arm used to measure a deadlock.** It sent one large blob
 and only then read the echo, which cannot work past the buffers — the visitor

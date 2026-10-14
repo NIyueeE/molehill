@@ -93,7 +93,7 @@ pub const DEFAULT_MUX_RECEIVE_WINDOW: usize = 32 * 1024 * 1024;
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
 
-/// Upper bound for `[client.data.tcp|kcp].tunnels`.
+/// Upper bound for `[client.data].tunnels`.
 ///
 /// `tunnels` is how many carrier connections a pool establishes at service
 /// start and keeps for its lifetime, so it is validated (`>= 1`) and clamped,
@@ -101,7 +101,7 @@ pub const DEFAULT_MUX_MAX_STREAMS: usize = 64;
 #[cfg(feature = "multiplex")]
 pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
 
-/// Default `[client.data.tcp|kcp].tunnels`.
+/// Default `[client.data].tunnels`.
 ///
 /// Four is the number the pool carried as its elastic cap's default, and the
 /// measurements behind the sizing guidance are unchanged by the pool being
@@ -116,7 +116,7 @@ pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
 pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 
 /// Upper bound for a transparent client's lane budget
-/// (`[transparent.data.tcp|kcp].tunnels`).
+/// (`[transparent.data].tunnels`).
 ///
 /// A claim's lane **is** a carrier connection — no multiplexer sits above it —
 /// so this is not the pool ceiling ([`MAX_MUX_TUNNELS_CAP`]): a client serving

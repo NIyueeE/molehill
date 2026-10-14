@@ -14,7 +14,7 @@
 
 ## Startup and registration
 
-In client mode, molehill groups its configured services by endpoint: a service's own `remote_addr` (`[client.services.<name>]`) when it declares one, else the client-wide `[client.control].default_remote_addr`. Every group dials **one control session**, authenticates once with `[client].default_token`, and registers its services on it. The server owns no service configuration: each `Register` carries the service's name, type and public endpoint (`remote_bind_addr`), and the server validates it against its policy before exposing anything — `allow_ports` whitelist, the declared data-plane carrier, and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
+In client mode, molehill groups its configured services by endpoint: a service's own `remote_addr` (`[client.services.<name>]`) when it declares one, else the client-wide `[client.control].default_remote_addr`. Every group dials **one control session**, authenticates once with `[client].default_token`, and registers its services on it. The server owns no service configuration: each `Register` carries the service's name, type and public endpoint (`remote_bind_addr`), and the server validates it against its policy before exposing anything — `allow_ports` whitelist, the declared data-plane carrier (which only decides whether the KCP listener is opened), and port conflicts (which surface as precise rejections because the bind precedes the ack). The user-facing rules and error messages are in [Configuration](configuration.md).
 
 On success the server binds the endpoint and starts serving visitors. On failure it answers `RegisterRejected` for **that registration alone**: the client reports the exact reason once and stops that service, while the session and the services beside it keep running. A registration carries no pool size — the channel pool is the client's own concern (see "Forwarding").
 
@@ -93,10 +93,10 @@ A pool is the client's unit of connection management. Its **ownership** is one s
 
 | `[client.data].shared_pool` | Pool key | Who uses it |
 |---|---|---|
-| `false` (default) | `service:<id>/<carrier>:<data-endpoint>` | one service alone — today's shape |
-| `true` | `session/<carrier>:<data-endpoint>` | every service of that session on that carrier and data endpoint |
+| `false` (default) | `service:<id>:<data-endpoint>` | one service alone — today's shape |
+| `true` | `session:<data-endpoint>` | every service of that session on that data endpoint |
 
-Both are the same code path; only the key differs, and the session owns the pools (a shared pool must outlive any single service). A service joins the pool its key names, creating it if this is the first service of that key to become active, and dropping a service never tears the pool down. The carrier and the data endpoint are part of the key because two carriers cannot share a physical connection and two endpoints cannot share a tunnel.
+Both are the same code path; only the key differs, and the session owns the pools (a shared pool must outlive any single service). A service joins the pool its key names, creating it if this is the first service of that key to become active, and dropping a service never tears the pool down. The data endpoint is part of the key because two endpoints cannot share a tunnel; the **carrier is not**, because a pool has one carrier for its lifetime — chosen when it is established — so there is never a second pool on the same key to tell apart.
 
 **Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests that *name the group*: the client reserves, for each stripe, a tunnel the group does not already hold — a preference with a floor, so a group wider than the pool still forwards by sharing. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
 
@@ -239,6 +239,28 @@ How a claim's lane set is opened, held and repaired:
   mapping), which is safe because a flow that quiet has nothing in flight to
   reorder; past `MAX_TRACKED_FLOWS` a new flow is placed by the hash alone, so a
   visitor cannot grow the table without bound.
+- **Lanes are lent, and the flow count is what decides.** The configuration
+  gives every claim of a carrier an equal share of the budget
+  (`[transparent.data.tcp|kcp].tunnels`), which is the right starting point and
+  the wrong steady state. Once a second the client's allocator
+  (`src/transparent/lanes.rs` decides, `LanePool` in `src/core/client.rs` reads
+  the hubs and dials) moves at most **one** lane, from a claim that has a lane
+  with no flow in it and more than one lane, to the claim furthest from a lane
+  per talking flow. A lane is only asked to end when it holds **no** flow at
+  all — the condition `Routes::retire_lane` re-checks under the hub's lock — and
+  the receiver's lane is dialed only once the donor's has actually ended, so a
+  swap never holds more carrier connections than the budget at any instant (the
+  server's valve and the operator's bill both see a swap, not a growth).
+  `[transparent.data].lend = false` turns the moving off and leaves the equal
+  split static; everything else about the claim — its lanes, its placement, its
+  replacement bookkeeping — is the same, which is what makes the key a usable
+  control in a measurement rather than a second code path.
+  Two consequences worth stating: **a single flow cannot be sped up by more
+  lanes** — its packets have to stay in order, which is why placement pins it to
+  one lane — so the parallelism a claim gains is per *flow*, and the target is
+  one lane per talking flow; and a claim is never reduced below one lane, which
+  is what keeps it reachable. The signal is the placement table's own per-slot
+  `flows` count, so what the allocator sees is what the router does.
 
 **Which end of a packet the claim is.** Both ends run the same hub
 (`src/transparent/hub.rs`): one reader per TUN device, a **lane set** per
@@ -328,7 +350,7 @@ as `worker:peers` pairs, plus the cumulative `queue_full` and `no_worker` drop
 counters separately; being cumulative, per-second rates come from consecutive
 lines. The pinned counts live on this line rather than a line of their own:
 they *are* the affinity table, cut by the channel each peer is pinned to. The switch is independent of
-`MOLEHILL_KCP_STATS` because the default carrier is TCP — a run can exercise
+`MOLEHILL_KCP_STATS` because a run can exercise
 the UDP path with no KCP session in existence. The runner records whichever
 `MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
 so an instrumented run is never mistaken for a clean one.

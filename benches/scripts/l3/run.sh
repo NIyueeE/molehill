@@ -26,7 +26,14 @@
 #      flows are spread across them, and every arm above is still byte-exact;
 #   9. with CLAIM_LANE_CAP below CLAIM_LANES the server's valve (which counts a
 #      claim's lanes) refuses the surplus with one line naming the cap, and the
-#      claim keeps serving byte-exactly on the lanes it got.
+#      claim keeps serving byte-exactly on the lanes it got;
+#  10. with LENDING=off the mechanism is off: the same two claims and the same
+#      load produce no lent lane at all, which is what `[transparent.data].lend`
+#      promises and what the model's `l3-budget10-nolend` arm measures;
+#  11. with IDLE_CLAIM=1 a second, idle claim holds lanes beside the busy one,
+#      the lane allocator lends an idle lane of it to the claim carrying more
+#      flows than lanes, and the busy workload stays byte-exact through the
+#      change (a lane moves; a flow never does).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,6 +90,8 @@ SRV_CLI_IP=10.30.0.1
 CLI_IP=10.30.0.2
 PUBLIC_IP=10.99.0.1
 PUBLIC_PORT=8443
+# The second claim's port, used only when IDLE_CLAIM is set (see write_configs).
+IDLE_PORT=$((PUBLIC_PORT + 1))
 CONTROL_PORT=2333
 TUN_SRV=l3srv0
 TUN_CLI=l3cli0
@@ -106,7 +115,7 @@ BULK_CHUNK="${BULK_CHUNK:-65536}"
 # recorded with the numbers, because they are what the numbers mean.
 SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
 SMALL_BYTES="${SMALL_BYTES:-64}"
-# Optional lane budget for the claim (`[transparent.data.tcp].tunnels`). Empty
+# Optional lane budget for the claim (`[transparent.data].tunnels`). Empty
 # writes nothing (the product's one connection per claim); 2 or more asks for
 # several lanes, which is what makes this run prove that a claim's flows are
 # spread over several carrier connections and still arrive byte-exact.
@@ -117,6 +126,15 @@ CLAIM_LANES="${CLAIM_LANES:-}"
 # that the operator's valve counts a claim's lanes and refuses the surplus while
 # the claim keeps serving on what it got.
 CLAIM_LANE_CAP="${CLAIM_LANE_CAP:-}"
+# Add a second claim that carries no traffic at all (`idle`, on PUBLIC_PORT+1).
+# It exists so a run can prove the lane allocator's whole point — an idle claim's
+# lane becoming a busy claim's lane — which needs two claims and can therefore
+# only be shown when it is asked for: the default topology stays one claim.
+IDLE_CLAIM="${IDLE_CLAIM:-}"
+# `[transparent.data].lend` for the lending section below. Empty leaves the key
+# out (the product's `true`); `off` writes `false`, which is the control for the
+# mechanism: same claims, same load, no lane moves.
+LENDING="${LENDING:-}"
 # The multi-flow arm: N connections at once, each doing its own strict round
 # trips. This is where packets queue, so it is the arm that says what several
 # visitors through one claim cost (and the only one a queue-per-CPU change
@@ -332,10 +350,17 @@ topology_up() {
 }
 
 write_configs() {
+    # Every claim the client will make has to be allowed on the server, so the
+    # allow-list follows the topology the run asked for.
+    if [ -n "$IDLE_CLAIM" ]; then
+        ALLOW_PORTS="\"$PUBLIC_PORT\", \"$IDLE_PORT\""
+    else
+        ALLOW_PORTS="\"$PUBLIC_PORT\""
+    fi
     cat >"$LOG/server.toml" <<TOML
 [server]
 default_token = "bench"
-allow_ports = ["$PUBLIC_PORT"]
+allow_ports = [$ALLOW_PORTS]
 
 [server.control]
 bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
@@ -361,14 +386,40 @@ TOML
     # The claim's lane budget is the product's default (one connection per
     # claim) unless the run names one. The table has to precede the claim, or
     # the key would land in the claim's own table.
-    if [ -n "$CLAIM_LANES" ]; then
-        printf '\n[transparent.data.tcp]\ntunnels = %s\n' "$CLAIM_LANES" >>"$LOG/client.toml"
+    if [ -n "$LENDING" ]; then
+        # `off` is the only accepted value: a typo must not silently measure the
+        # default (the same rule the model's arm parser keeps).
+        [ "$LENDING" = "off" ] || {
+            echo "LENDING must be 'off' when set, got '$LENDING'" >&2
+            exit 2
+        }
+    fi
+    # One table, one write: both knobs live in `[transparent.data]`, and a
+    # second header would be a duplicate key the loader refuses.
+    if [ -n "$LENDING" ] || [ -n "$CLAIM_LANES" ]; then
+        printf '\n[transparent.data]\n' >>"$LOG/client.toml"
+        if [ -n "$LENDING" ]; then
+            printf 'lend = false\n' >>"$LOG/client.toml"
+        fi
+        if [ -n "$CLAIM_LANES" ]; then
+            printf 'tunnels = %s\n' "$CLAIM_LANES" >>"$LOG/client.toml"
+        fi
     fi
     cat >>"$LOG/client.toml" <<TOML
 
 [transparent.claims.web]
 remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
 TOML
+    # The second claim, when the run wants one: it is a claim like any other
+    # (same lane budget, same carrier) and the point is that nothing is sent to
+    # it, so every lane it holds is idle.
+    if [ -n "$IDLE_CLAIM" ]; then
+        cat >>"$LOG/client.toml" <<TOML
+
+[transparent.claims.idle]
+remote_bind_addr = "$PUBLIC_IP:$IDLE_PORT"
+TOML
+    fi
 }
 
 # The same server without `[server.transparent]`: the negative half of the
@@ -650,6 +701,98 @@ awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGI
 }'
 
 echo
+echo
+echo "================= LENDING: AN IDLE CLAIM GIVES A LANE UP ================="
+# The lane allocator's whole point, and the one thing only an end-to-end run can
+# show: a claim carrying more flows than it has lanes takes an idle lane from a
+# claim that has one to spare. Two claims — `web`, carrying the 16-flow arm, and
+# `idle`, carrying nothing — share a lane budget of four, so each starts with two
+# and the busy one is short of fourteen. The allocator lends what the idle claim
+# can spare (it keeps one lane: a claim is always reachable), the busy claim
+# grows, and the workload must stay byte-exact through the change: a lane moves,
+# a flow never does.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=1
+CLAIM_LANES=4
+LENDING=""
+write_configs
+echo "--- server.toml (lending) ---"
+cat "$LOG/server.toml"
+echo "--- client.toml (lending) ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/lend-server.log" 2>&1 &
+LEND_SRV=$!
+PIDS+=("$LEND_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the lending server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/lend-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/lend-client.log" 2>&1 &
+LEND_CLI=$!
+PIDS+=("$LEND_CLI")
+
+# The busy claim's flow count is what makes it short of lanes, so the load runs
+# in the background while the allocator looks, and the change happens under it.
+LEND_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/lend-visitor.log" 2>&1 &
+LEND_VISITOR=$!
+LEND_LENT=0
+if wait_for "$LOG/lend-client.log" "lent lane"; then
+    LEND_LENT=1
+fi
+wait "$LEND_VISITOR" || LEND_RC=$?
+cat "$LOG/lend-visitor.log"
+echo "--- lending client log (the allocator's lines) ---"
+grep "Lane allocator" "$LOG/lend-client.log" || true
+
+echo
+echo "================= LENDING OFF: THE SPLIT STAYS STATIC ================="
+# The mechanism's control, and the only end-to-end proof of the key itself: the
+# same two claims and the same load as the section above, with
+# `[transparent.data].lend = false`. The busy claim must keep the two lanes its
+# share gave it — no lane is lent, however short of lanes it is — and the
+# workload must still be byte-exact, because "off" is the static shape the
+# configuration asked for, not a degradation.
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=1
+CLAIM_LANES=4
+LENDING=off
+write_configs
+echo "--- client.toml (lending off) ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/nolend-server.log" 2>&1 &
+NOLEND_SRV=$!
+PIDS+=("$NOLEND_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the lending-off server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/nolend-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/nolend-client.log" 2>&1 &
+NOLEND_CLI=$!
+PIDS+=("$NOLEND_CLI")
+
+NOLEND_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/nolend-visitor.log" 2>&1 &
+NOLEND_VISITOR=$!
+# Long enough that the allocator's tick has run many times over the load: the
+# absence below is a measured absence, not a race with the first tick.
+wait "$NOLEND_VISITOR" || NOLEND_RC=$?
+sleep 2
+cat "$LOG/nolend-visitor.log"
+echo "--- lending-off client log (the allocator's lines, expected: none) ---"
+grep "Lane allocator" "$LOG/nolend-client.log" || echo "(none)"
+
+echo
 echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
 # `[server.data].max_tunnels_per_client` is the server operator's cap on the
 # carrier connections ONE client may hold — and a claim's lane is one of them,
@@ -659,9 +802,14 @@ echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
 # budget is a client-side key and the cap is a server-side one, so this is the
 # only run where the two halves are proven to meet.
 kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
 sleep 0.5
+IDLE_CLAIM=""
 CLAIM_LANES=2
 CLAIM_LANE_CAP=1
+LENDING=""
+
 write_configs
 echo "--- server-valve.toml ---"
 cat "$LOG/server.toml"
@@ -707,6 +855,8 @@ echo "================= NEGATIVE: NO SERVER SWITCH ================="
 # recipe instead of the policy refusal.
 kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
 kill "$VALVE_SRV" "$VALVE_CLI" 2>/dev/null || true
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
 sleep 0.5
 ip netns exec "$NS_SRV" ip link del "$TUN_SRV"
 write_no_l3_config
@@ -814,6 +964,25 @@ if grep -qF "does not exist" "$LOG/no-l3-server.log"; then
     fail "the policy refusal comes before the device is looked at (the log carries the missing-interface recipe)"
 else
     pass "the policy refusal comes before the device is looked at"
+fi
+
+if [ "$LEND_LENT" -eq 1 ]; then
+    pass "an idle claim lends a lane to the claim carrying more flows than lanes"
+else
+    fail "the allocator never lent a lane between the two claims"
+fi
+
+if [ "$LEND_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/lend-visitor.log"; then
+    pass "the busy claim stays byte-exact through the lane change"
+else
+    fail "the busy claim lost traffic while a lane was lent (exit $LEND_RC)"
+fi
+
+if [ "$NOLEND_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/nolend-visitor.log" &&
+    ! grep -q "Lane allocator" "$LOG/nolend-client.log"; then
+    pass "with [transparent.data].lend = false no lane moves, and the claim serves byte-exactly"
+else
+    fail "lending-off either moved a lane or lost the workload (exit $NOLEND_RC)"
 fi
 
 if [ "$VALVE_REFUSED" -eq 1 ]; then

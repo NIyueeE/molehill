@@ -25,7 +25,7 @@ use crate::config::parsing::{
     TransportConfig, TransportType, default_tun_name,
 };
 #[cfg(feature = "multiplex")]
-use crate::config::parsing::{ClientDataConfig, DataCarrier, DataCarrierLimits};
+use crate::config::parsing::{ClientDataConfig, DataCarrierLimits};
 
 /// `[transparent]`: the whole configuration of an L3 client.
 ///
@@ -79,9 +79,9 @@ pub struct TransparentClaimConfig {
     pub remote_addr: Option<String>,
     /// Override `[transparent.control].default_retry_interval` for this claim.
     pub retry_interval: Option<u64>,
-    /// Override `[transparent.data].default_carrier` for this claim only.
+    /// Override `[transparent.data].tunnels` for this claim only: its lanes.
     #[cfg(feature = "multiplex")]
-    pub carrier: Option<DataCarrier>,
+    pub tunnels: Option<u16>,
 }
 
 /// Data-plane knobs for a claim (`[transparent.data]`).
@@ -100,23 +100,53 @@ pub struct TransparentClaimConfig {
 /// out by [`TransparentClientConfig::claim_lanes`]. One lane is one connection,
 /// and every claim always has at least one.
 #[cfg(feature = "multiplex")]
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentDataConfig {
     /// Data-plane endpoint; defaults to the claim's control endpoint. Applies
     /// to every claim that does not name its own `remote_addr`.
     pub default_data_addr: Option<String>,
-    /// `tcp` (default) or `kcp`. Either one carries a claim's connections: a
-    /// `tcp` channel is a TCP connection, a `kcp` one is a KCP session of its
-    /// own.
-    #[serde(default)]
-    pub default_carrier: DataCarrier,
-    /// `[transparent.data.tcp]`: the TCP carrier's lane budget.
-    #[serde(default)]
-    pub tcp: DataCarrierLimits,
-    /// `[transparent.data.kcp]`: the KCP carrier's lane budget.
-    #[serde(default)]
-    pub kcp: DataCarrierLimits,
+    /// The **lane budget**: how many carrier connections this client's claims
+    /// hold together, divided equally among them. Unset means one lane per
+    /// claim; a value below the claim count is refused.
+    ///
+    /// The same key a forwarding client writes, because a lane is the same
+    /// physical thing a pool's tunnel is — one carrier connection — and the
+    /// carrier itself is chosen at runtime (KCP, falling back to TCP).
+    pub tunnels: Option<u16>,
+    /// Whether a claim's idle lanes may be lent to a sibling claim carrying more
+    /// flows than lanes (`lend = false` keeps the equal split static).
+    ///
+    /// Default `true`: the mechanism only ever moves a lane that is carrying
+    /// nothing, and the evidence says it is what makes a claim's throughput
+    /// follow its *flows* rather than its share (HANDOFF.md, "Lending,
+    /// measured"). It is a key because the trade is real — lending buys
+    /// throughput with connections and CPU, and only where the carrier is the
+    /// limit — and because a knob is what lets the model measure the mechanism
+    /// as an arm instead of a scratch build.
+    #[serde(default = "lend_by_default")]
+    pub lend: bool,
+}
+
+/// The default of `[transparent.data].lend`, spelled out because `serde`'s
+/// `Default` for a `bool` is `false` and this key's default is `true`.
+#[cfg(feature = "multiplex")]
+const fn lend_by_default() -> bool {
+    true
+}
+
+/// Written out rather than derived: `bool`'s own default is `false`, so a
+/// derived one would turn lending *off* for every config that omits the table
+/// — the opposite of the key's documented default, and invisible in the schema.
+#[cfg(feature = "multiplex")]
+impl Default for TransparentDataConfig {
+    fn default() -> Self {
+        Self {
+            default_data_addr: None,
+            tunnels: None,
+            lend: lend_by_default(),
+        }
+    }
 }
 
 /// How this client reaches its server (`[transparent.transport]`).
@@ -134,37 +164,33 @@ pub struct TransparentTransportConfig {
 
 #[cfg(feature = "multiplex")]
 impl TransparentClientConfig {
-    /// How many claims draw on one carrier's lane budget.
-    pub(crate) fn claims_on(&self, carrier: DataCarrier) -> usize {
-        self.claims
-            .values()
-            .filter(|claim| claim.carrier.unwrap_or(self.data.default_carrier) == carrier)
-            .count()
+    /// How many claims share the lane budget.
+    pub(crate) fn claims(&self) -> usize {
+        self.claims.len()
     }
 
-    /// The carrier's lane budget as the operator wrote it, or `None`.
-    pub(crate) fn written_budget(&self, carrier: DataCarrier) -> Option<usize> {
-        match carrier {
-            DataCarrier::Tcp => self.data.tcp.written(),
-            DataCarrier::Kcp => self.data.kcp.written(),
+    /// The lane budget as the operator wrote it, or `None`.
+    pub(crate) fn written_budget(&self) -> Option<usize> {
+        DataCarrierLimits {
+            tunnels: self.data.tunnels,
         }
+        .written()
     }
 
-    /// The carrier's lane budget: what the operator wrote, else one lane per
-    /// claim that draws on it.
+    /// The lane budget: what the operator wrote, else one lane per claim.
     ///
     /// The default is the shape a claim had before the budget existed — one
     /// carrier connection each — so a client that never writes `tunnels` gets
     /// exactly that, and raising the key is what spreads a busy claim's inner
     /// flows over more connections.
-    pub(crate) fn lane_budget(&self, carrier: DataCarrier) -> usize {
-        match self.written_budget(carrier) {
+    pub(crate) fn lane_budget(&self) -> usize {
+        match self.written_budget() {
             Some(written) => written,
-            None => self.claims_on(carrier).max(1),
+            None => self.claims().max(1),
         }
     }
 
-    /// One claim's lane count: an equal share of the carrier's budget, never
+    /// One claim's lane count: an equal share of the lane budget, never
     /// below one.
     ///
     /// Equal share is the whole policy for now, and it is deliberately static:
@@ -172,8 +198,8 @@ impl TransparentClientConfig {
     /// offers does not depend on what it happened to be doing a minute ago.
     /// Lending a lane that an idle claim is not using is the next step, and the
     /// one that needs its own measurement (HANDOFF.md, L15).
-    pub(crate) fn claim_lanes(&self, carrier: DataCarrier) -> usize {
-        (self.lane_budget(carrier) / self.claims_on(carrier).max(1)).max(1)
+    pub(crate) fn claim_lanes(&self) -> usize {
+        (self.lane_budget() / self.claims().max(1)).max(1)
     }
 }
 
@@ -202,13 +228,15 @@ impl TransparentClientConfig {
                 service.retry_interval = claim.retry_interval;
                 #[cfg(feature = "multiplex")]
                 {
-                    let carrier = claim.carrier.unwrap_or(self.data.default_carrier);
-                    service.carrier = claim.carrier;
                     // The claim's lane count, resolved here so the engine has one
-                    // number to read: an equal share of the carrier's budget,
-                    // never below the one connection every claim has.
+                    // number to read: an equal share of the lane budget, never
+                    // below the one connection every claim has. A claim's own
+                    // `tunnels` does not divide the budget — the budget belongs to
+                    // the client — so it is a refusal when written on a claim, and
+                    // the schema is where that is said.
                     service.transparent_lanes =
-                        u16::try_from(self.claim_lanes(carrier)).unwrap_or(u16::MAX);
+                        u16::try_from(self.claim_lanes()).unwrap_or(u16::MAX);
+                    service.transparent_lend = self.data.lend;
                 }
                 (name.clone(), service)
             })
@@ -220,13 +248,12 @@ impl TransparentClientConfig {
             #[cfg(feature = "multiplex")]
             data: ClientDataConfig {
                 default_data_addr: self.data.default_data_addr.clone(),
-                default_carrier: self.data.default_carrier,
                 // A claim never draws from a pool, so pool ownership has nothing
-                // to select here: the lowered block carries the defaults the
-                // engine reads for the data endpoint and the carrier only.
+                // to select here, and the lane budget travels per claim
+                // (`transparent_lanes`): this block carries only the data
+                // endpoint.
                 shared_pool: false,
-                tcp: self.data.tcp.clone(),
-                kcp: self.data.kcp.clone(),
+                tunnels: None,
             },
             services,
             transport: TransportConfig {
@@ -305,7 +332,12 @@ token = "claim-token"
         assert_eq!(&**service.token.as_ref().unwrap(), "claim-token");
         assert_eq!(
             service.transparent_lanes, 1,
-            "a claim has one lane unless the carrier's budget is raised"
+            "a claim has one lane unless the lane budget is raised"
+        );
+        assert!(
+            service.transparent_lend,
+            "lending is on unless the client turns it off: `[transparent.data].lend` defaults \
+             to true, so a config that never mentions it gets the mechanism"
         );
         assert_eq!(client.transport.transport_type, TransportType::Plain);
         assert!(client.transport.noise.is_none());
@@ -315,7 +347,7 @@ token = "claim-token"
         );
     }
 
-    /// A claim's lanes are an equal share of its carrier's budget: one each
+    /// A claim's lanes are an equal share of its lane budget: one each
     /// when the key is unwritten (the shape a claim had before the budget), and
     /// the written budget divided among the claims that draw on that carrier.
     #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
@@ -358,24 +390,48 @@ default_remote_addr = "example.com:2333"
             "one connection per claim is the default: the budget is the claim count"
         );
         assert_eq!(
-            lanes("[transparent.data.tcp]\ntunnels = 4\n", &two).0,
+            lanes("tunnels = 4", &two).0,
             2,
             "four lanes over two claims is two each"
         );
         assert_eq!(
-            lanes("[transparent.data.tcp]\ntunnels = 4\n", &two).1,
+            lanes("tunnels = 4", &two).1,
             Some(2),
             "the share is equal, not first-come"
         );
         assert_eq!(
-            lanes("[transparent.data.tcp]\ntunnels = 5\n", &two).0,
+            lanes("tunnels = 5", &two).0,
             2,
             "a budget that does not divide evenly still gives every claim one (integer share)"
         );
         assert_eq!(
-            lanes("[transparent.data.tcp]\ntunnels = 2\n", web).0,
+            lanes("tunnels = 2", web).0,
             2,
             "a single claim takes the whole budget"
+        );
+    }
+
+    /// Lending is on unless the client says otherwise, and the switch reaches
+    /// the claim the runtime reads it from.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn lending_is_on_unless_the_client_turns_it_off() {
+        let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
+                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n";
+        let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
+
+        let on = Config::from_str(&format!("{base}{claim}")).unwrap();
+        let service = on.into_l3_client().unwrap().client.unwrap().services["web"].clone();
+        assert!(service.transparent_lend);
+
+        let off = Config::from_str(&format!(
+            "{base}[transparent.data]\nlend = false\n\n{claim}"
+        ))
+        .unwrap();
+        let service = off.into_l3_client().unwrap().client.unwrap().services["web"].clone();
+        assert!(
+            !service.transparent_lend,
+            "an operator who turns lending off gets the equal split held static"
         );
     }
 
@@ -396,7 +452,7 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.data.tcp]
+[transparent.data]
 tunnels = 1
 
 [transparent.claims.web]
@@ -409,8 +465,8 @@ remote_bind_addr = "10.99.0.1:2222"
             .unwrap_err()
         );
         assert!(
-            err.contains("`[transparent.data.tcp].tunnels = 1`")
-                && err.contains("`[transparent.data.tcp].tunnels = 2`")
+            err.contains("`[transparent.data].tunnels = 1`")
+                && err.contains("`[transparent.data].tunnels = 2`")
                 && err.contains("2 claim(s)"),
             "the refusal must name the key, the count and the count to write: {err}"
         );
@@ -472,7 +528,6 @@ mod data_tests {
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
-    use crate::config::DataCarrier;
     use crate::config::parsing::Config;
 
     /// A claim never multiplexes: its data channels are carrier connections of
@@ -497,10 +552,12 @@ remote_bind_addr = "10.99.0.1:8443"
         assert!(!client.services["web"].uses_pool());
     }
 
-    /// A claim's carrier is a key of its own: a claim over KCP is a KCP session
-    /// per channel, and the pair needs no mode to be meaningful.
+    /// A claim never multiplexes: it has no pool to size, so its lanes are
+    /// connections of its own and `tunnels` is a budget rather than a width.
+    /// The carrier is not a key anywhere, which is what this pins: a claim over
+    /// KCP is what the runtime chooses when the path carries it.
     #[test]
-    fn a_kcp_carrier_is_allowed_for_a_claim() {
+    fn a_kcp_carrier_is_not_a_key_a_claim_can_write() {
         let config = r#"
 [transparent]
 default_token = "t"
@@ -509,26 +566,144 @@ default_token = "t"
 default_remote_addr = "example.com:2333"
 
 [transparent.data]
-default_carrier = "kcp"
+tunnels = 2
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
 "#;
-        if cfg!(feature = "kcp") {
-            let client = Config::from_str(config)
-                .unwrap()
-                .into_l3_client()
-                .unwrap()
-                .client
-                .unwrap();
-            assert_eq!(client.data.default_carrier, DataCarrier::Kcp);
-            assert!(!client.services["web"].uses_pool());
-        } else {
-            let message = format!("{:#}", Config::from_str(config).unwrap_err());
-            assert!(
-                message.contains("[transparent.data].default_carrier") && message.contains("kcp"),
-                "the refusal must name the block the reader wrote, got: {message}"
-            );
-        }
+        let client = Config::from_str(config)
+            .unwrap()
+            .into_l3_client()
+            .unwrap()
+            .client
+            .unwrap();
+        assert!(!client.services["web"].uses_pool());
+        assert_eq!(
+            client.services["web"].lanes(),
+            2,
+            "two lanes for one claim: the budget is its connection count"
+        );
+
+        // The old selector is refused with the reason and the replacement, so a
+        // reader who wrote it is told what to do rather than that it is wrong.
+        let with_carrier = config.replace(
+            "[transparent.data]\ntunnels = 2",
+            "[transparent.data]\ndefault_carrier = \"kcp\"",
+        );
+        let message = format!("{:#}", Config::from_str(&with_carrier).unwrap_err());
+        assert!(
+            message.contains("default_carrier"),
+            "the refusal must name the key the reader wrote, got: {message}"
+        );
+    }
+
+    /// Lending is on unless the client says otherwise, and the switch reaches
+    /// the claim the runtime reads it from.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn lending_is_on_unless_the_client_turns_it_off() {
+        let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
+                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n";
+        let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
+
+        let on = Config::from_str(&format!("{base}{claim}")).unwrap();
+        let service = on.into_l3_client().unwrap().client.unwrap().services["web"].clone();
+        assert!(service.transparent_lend);
+
+        let off = Config::from_str(&format!(
+            "{base}[transparent.data]\nlend = false\n\n{claim}"
+        ))
+        .unwrap();
+        let service = off.into_l3_client().unwrap().client.unwrap().services["web"].clone();
+        assert!(
+            !service.transparent_lend,
+            "an operator who turns lending off gets the equal split held static"
+        );
+    }
+
+    /// A budget below the claim count is refused with the number to write: a
+    /// claim's lane is a connection of its own, so some claim would otherwise
+    /// have no carrier at all.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn a_lane_budget_below_the_claim_count_is_refused() {
+        let err = format!(
+            "{:#}",
+            Config::from_str(
+                r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.data]
+tunnels = 1
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+
+[transparent.claims.ssh]
+remote_bind_addr = "10.99.0.1:2222"
+"#
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("`[transparent.data].tunnels = 1`")
+                && err.contains("`[transparent.data].tunnels = 2`")
+                && err.contains("2 claim(s)"),
+            "the refusal must name the key, the count and the count to write: {err}"
+        );
+    }
+
+    /// The `[transparent.control]` block is where the server is named, so a
+    /// block without one is refused — and the message names the block the
+    /// reader actually wrote, not `[client.control]`.
+    #[test]
+    fn a_claim_needs_a_server_to_dial() {
+        let err = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[transparent.control].default_remote_addr"),
+            "the refusal must name the block the reader wrote, got: {message}"
+        );
+    }
+
+    /// An L3 client has claims and nothing else: a forwarding key has no home
+    /// in the model, and the parse says so rather than ignoring it.
+    #[test]
+    fn a_claim_has_no_home_for_forwarding_keys() {
+        let err = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+local_addr = "127.0.0.1:8080"
+"#,
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("unknown field `local_addr`"),
+            "a key the model has no home for must be an unknown field, got: {message}"
+        );
     }
 }

@@ -20,6 +20,7 @@ pub mod check;
 pub mod flow;
 pub mod hub;
 pub mod ip;
+pub mod lanes;
 pub mod tun;
 
 use std::collections::HashMap;
@@ -194,6 +195,14 @@ impl<V> EndpointTable<V> {
     pub fn iter(&self) -> impl Iterator<Item = (Endpoint, &V)> {
         self.entries
             .iter()
+            .map(|((ip, port), value)| (Endpoint::new(*ip, *port), value))
+    }
+
+    /// The same, mutably: a lookup by something *inside* a value (a lane id the
+    /// peer named) has no endpoint to start from, so it has to walk the table.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Endpoint, &mut V)> {
+        self.entries
+            .iter_mut()
             .map(|((ip, port), value)| (Endpoint::new(*ip, *port), value))
     }
 

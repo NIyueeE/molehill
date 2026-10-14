@@ -469,11 +469,18 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
     // (both carriers) and its `[client.data].idle_timeout` shrink clock are
     // gone, and what the operator has to write instead is the count the pool
     // establishes at service start.
-    const CLIENT_KEYS: [(&str, &str); 8] = [
-        ("client.data.default_count", "[client.data.tcp].tunnels"),
-        ("client.services.*.count", "[client.data.tcp].tunnels"),
-        ("client.data.tcp.max_tunnels", "[client.data.tcp].tunnels"),
-        ("client.data.kcp.max_tunnels", "[client.data.kcp].tunnels"),
+    // The two carrier tables are gone as *tables*, so a config that writes
+    // `[client.data.tcp] max_tunnels = 4` is refused at the table — which is why
+    // the deeper `…tcp.max_tunnels` path has no entry of its own any more: the
+    // message a reader gets names the table they wrote and the key that replaces
+    // it.
+    const CLIENT_KEYS: [(&str, &str); 10] = [
+        ("client.data.default_count", "[client.data].tunnels"),
+        ("client.services.*.count", "[client.data].tunnels"),
+        ("client.data.tcp", "[client.data].tunnels"),
+        ("client.data.kcp", "[client.data].tunnels"),
+        ("client.data.default_carrier", "chosen at runtime"),
+        ("client.services.*.carrier", "chosen at runtime"),
         ("client.data.idle_timeout", "no shrink clock"),
         ("client.services.*.pool_size", "udp_workers"),
         (
@@ -490,6 +497,7 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
         "[client.data]\n\
          default_count = 4\n\
          idle_timeout = 2\n\
+         default_carrier = \"tcp\"\n\
          \n\
          [client.data.tcp]\n\
          max_tunnels = 4\n\
@@ -521,6 +529,7 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              local_addr = \"127.0.0.1:{backend}\"\n\
              remote_bind_addr = \"0.0.0.0:{exposed}\"\n\
              count = 2\n\
+             carrier = \"tcp\"\n\
              pool_size = 8\n\
              heartbeat_timeout = 90\n\
              health_check = {{ type = \"tcp\", interval = 10 }}\n\

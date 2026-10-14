@@ -306,19 +306,31 @@ struct TransparentContext {
     /// The session's lane valve.
     #[cfg(all(feature = "transparent", target_os = "linux"))]
     lane_valve: LaneValve,
+    /// Where the claim's per-lane counters are reported to its client.
+    ///
+    /// The deciding end is the client, and the loss that matters on a
+    /// transparent claim happens here (this end reads the visitor's traffic off
+    /// its own device and offers it to the lanes), so the client cannot see it
+    /// without being told.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    sink: ControlSink,
 }
 
 impl TransparentContext {
     /// What a registration hands the service it just accepted.
     #[cfg(all(feature = "transparent", target_os = "linux"))]
-    fn new(claim: Option<Claim>, lane_valve: LaneValve) -> Self {
-        Self { claim, lane_valve }
+    fn new(claim: Option<Claim>, lane_valve: LaneValve, sink: ControlSink) -> Self {
+        Self {
+            claim,
+            lane_valve,
+            sink,
+        }
     }
 
     /// A build without the transparent data path has no lane to charge and no
     /// claim to hold, so there is nothing to carry.
     #[cfg(not(all(feature = "transparent", target_os = "linux")))]
-    fn new(_claim: Option<Claim>, _lane_valve: LaneValve) -> Self {
+    fn new(_claim: Option<Claim>, _lane_valve: LaneValve, _sink: ControlSink) -> Self {
         Self {}
     }
 }
@@ -505,9 +517,16 @@ struct ServerShared {
 /// Shared state for the lazily-bound KCP listener: bound on the first
 /// registration that declares the `kcp` carrier (client-first), once per
 /// server process.
+///
+/// The acceptor is held **weakly** here, and the listener task holds the only
+/// strong reference: the UDP socket must close when the server stops, and a KCP
+/// *session* outlives the accept loop (it keeps this shared state to reach the
+/// registry and the valve). A strong reference here would therefore keep the
+/// data port bound for as long as any session drained — which, in-process, is
+/// how a restarted server ends up refused with "address already in use".
 #[cfg(feature = "kcp")]
 struct KcpListenerState {
-    acceptor: tokio::sync::Mutex<Option<Arc<KcpAcceptor>>>,
+    acceptor: tokio::sync::Mutex<Option<std::sync::Weak<KcpAcceptor>>>,
 }
 
 #[cfg(feature = "kcp")]
@@ -531,7 +550,7 @@ async fn ensure_kcp_listener(
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     let mut guard = shared.kcp.acceptor.lock().await;
-    if guard.is_some() {
+    if guard.as_ref().is_some_and(|weak| weak.strong_count() > 0) {
         return Ok(());
     }
     let acceptor = KcpAcceptor::bind(server_config.data_bind_addr())
@@ -545,14 +564,14 @@ async fn ensure_kcp_listener(
     })?;
     info!("Listening for KCP tunnels at {bound}");
     let acceptor = Arc::new(acceptor);
+    *guard = Some(Arc::downgrade(&acceptor));
     tokio::spawn(run_kcp_listener(
-        Arc::clone(&acceptor),
+        acceptor,
         Arc::clone(&registry),
         Arc::clone(&shared),
         shared.shutdown_tx.subscribe(),
         server_config.max_tunnels_per_client(),
     ));
-    *guard = Some(acceptor);
     Ok(())
 }
 
@@ -797,8 +816,9 @@ async fn handle_connection(
             do_session_handshake(conn, registry, server_config, shared).await?;
         }
         DataChannelHello(_, nonce) => {
-            // A direct data channel names its service in the 4 bytes right
-            // after the hello.
+            // A direct data channel names its service right after the hello;
+            // a transparent lane names itself beside it (see
+            // `read_channel_prologue`).
             let service_id = read_stream_prologue(&mut conn).await?;
             do_v4_data_channel(tcp_data_channel(conn), registry, nonce, service_id).await?;
         }
@@ -1095,15 +1115,11 @@ async fn do_session_handshake(
 
     let reason = loop {
         tokio::select! {
-            cmd = read_session_cmd(&mut rd) => match cmd {
-                Ok(SessionCmd::Register(reg)) => {
-                    if let Err(e) = ctx.register(&reg).await {
-                        break e;
-                    }
+            cmd = read_session_cmd(&mut rd) => {
+                if let Some(reason) = handle_session_cmd(&ctx, &heartbeat_tx, cmd).await? {
+                    break reason;
                 }
-                Ok(SessionCmd::Deregister(service_id)) => ctx.deregister(service_id).await,
-                Err(e) => break e,
-            },
+            }
             () = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
                 if heartbeat_tx.send(heartbeat.clone()).is_err() {
                     break anyhow!("The session writer is gone");
@@ -1137,6 +1153,68 @@ async fn do_session_handshake(
     Ok(())
 }
 
+/// Serve one command from a session's client; `Some(reason)` ends the session.
+///
+/// Split out of the session loop so the loop is the wiring and this is the
+/// policy: what each command does, and which failure is the session's end.
+async fn handle_session_cmd(
+    ctx: &SessionCtx,
+    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    cmd: Result<SessionCmd>,
+) -> Result<Option<anyhow::Error>> {
+    match cmd {
+        Ok(SessionCmd::Register(reg)) => {
+            if let Err(e) = ctx.register(&reg).await {
+                return Ok(Some(e));
+            }
+        }
+        Ok(SessionCmd::Deregister(service_id)) => ctx.deregister(service_id).await,
+        // A claim's lane is being retired, and its dialer needs this end's half
+        // of the agreement: the client cannot see the flows *this* end placed on
+        // the lane, and ending it on the client's word alone is how a peer kept
+        // writing into a connection nothing read (HANDOFF.md, the retired-lane
+        // black hole).
+        Ok(SessionCmd::DrainLane(id, lane)) => {
+            if !answer_lane_drain(ctx, writer, id, lane, true).await? {
+                return Ok(Some(anyhow!("The session writer is gone")));
+            }
+        }
+        Ok(SessionCmd::CancelDrain(id, lane)) => {
+            if !answer_lane_drain(ctx, writer, id, lane, false).await? {
+                return Ok(Some(anyhow!("The session writer is gone")));
+            }
+        }
+        Err(e) => return Ok(Some(e)),
+    }
+    Ok(None)
+}
+
+/// Answer one lane-drain command, and say whether the session writer took it.
+///
+/// The answer is this end's half of a two-sided retirement, and it is the only
+/// thing the client's dialer can learn about the flows *this* end placed on the
+/// lane.
+async fn answer_lane_drain(
+    ctx: &SessionCtx,
+    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    service_id: ServiceId,
+    lane: [u8; 4],
+    drain: bool,
+) -> Result<bool> {
+    let ack = ctx.lane_drain(service_id, lane, drain).await;
+    let sent = writer.send(postcard::to_stdvec(&ack)?).is_ok();
+    if sent {
+        // A lane's retirement is a lifecycle event, not one connection's
+        // business: the operator sees the same fact the client does (once per
+        // drain, and a drain is rate-limited by the policy that asks for it).
+        info!(
+            "Lane {lane:?} of service {service_id}: drain {} answered {ack:?}",
+            if drain { "requested" } else { "cancelled" }
+        );
+    }
+    Ok(sent)
+}
+
 /// One v4 session's registration path: the session it belongs to, plus the
 /// server-side policy every registration is checked against.
 struct SessionCtx {
@@ -1160,6 +1238,85 @@ impl SessionCtx {
             .get(&self.nonce)
             .map(|session| session.write_tx.clone())
             .ok_or_else(|| anyhow!("The control session is gone"))
+    }
+
+    /// Start or call off the drain of one of a claim's lanes, and build the
+    /// answer the client reads.
+    ///
+    /// This end's half of a two-sided retirement: it stops placing **new**
+    /// flows in the lane, and says whether it still holds any of its own. The
+    /// flows a drain has to wait for are the ones *this* end placed — the
+    /// dialer cannot see them, which is why the agreement exists at all.
+    ///
+    /// A lane this end does not hold (already ended, or never its business)
+    /// answers `LANE_DRAIN_UNKNOWN` rather than pretending to have drained
+    /// something: the client then keeps the lane instead of retiring a
+    /// connection on an answer about nothing.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    async fn lane_drain(
+        &self,
+        service_id: ServiceId,
+        lane: [u8; 4],
+        drain: bool,
+    ) -> ControlChannelCmd {
+        use crate::protocol::{
+            LANE_DRAIN_CANCELLED, LANE_DRAIN_PENDING, LANE_DRAIN_READY, LANE_DRAIN_UNKNOWN, LaneId,
+        };
+        use crate::transparent::hub::TunHub;
+        use crate::transparent::{Direction, Endpoint};
+
+        let ack = |state| ControlChannelCmd::LaneDrainAck(service_id, lane, state);
+        let Some(handle) = self
+            .registry
+            .sessions
+            .read()
+            .await
+            .get(&self.nonce)
+            .and_then(|session| session.services.get(&service_id))
+            .cloned()
+        else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        // The transparent device is a server-wide setting: the service's data
+        // path is a hub keyed by that device and the endpoint it claimed.
+        let Ok(tun) = transparent_tun_for(&self.server_config) else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        let Ok(hub) = TunHub::get_or_spawn(tun, Direction::Destination) else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        let endpoint = Endpoint::new(handle.endpoint.ip(), handle.endpoint.port());
+        let lane = LaneId(lane);
+        if !drain {
+            return match hub.cancel_drain(&endpoint, lane) {
+                Some(()) => ack(LANE_DRAIN_CANCELLED),
+                None => ack(LANE_DRAIN_UNKNOWN),
+            };
+        }
+        match hub.begin_drain(&endpoint, lane) {
+            Some(true) => ack(LANE_DRAIN_READY),
+            Some(false) => ack(LANE_DRAIN_PENDING),
+            None => ack(LANE_DRAIN_UNKNOWN),
+        }
+    }
+
+    /// A build without the transparent data path has no lane to drain; the
+    /// answer is the same one an unknown lane gets, so the client's handling is
+    /// one shape.
+    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "the two shapes of this method are one call site: the build that has lanes \
+                  reaches the hub, and the one that does not answers from here"
+    )]
+    async fn lane_drain(
+        &self,
+        service_id: ServiceId,
+        lane: [u8; 4],
+        _drain: bool,
+    ) -> ControlChannelCmd {
+        ControlChannelCmd::LaneDrainAck(service_id, lane, crate::protocol::LANE_DRAIN_UNKNOWN)
     }
 
     /// Frame an ack for the session's writer exactly as a connection write
@@ -1856,6 +2013,13 @@ async fn tunnel_owner(registry: &Registry, nonce: Nonce, arm: &str) -> Result<Tu
 /// senders: dropping the handle shuts the control channel down (each is
 /// a `Sender`, so the type carries the direction).
 pub struct ControlChannelHandle {
+    /// The public endpoint this service serves.
+    ///
+    /// Carried here because a session-level command that concerns one service
+    /// (a lane drain) has to reach that service's *data path*, and the hub is
+    /// keyed by the claimed endpoint — the registration itself is not retained
+    /// anywhere the session can read.
+    endpoint: SocketAddr,
     // Shutdown the control channel by dropping it
     shutdown: broadcast::Sender<bool>,
     data_channel: mpsc::Sender<DataChannel>,
@@ -1884,6 +2048,7 @@ impl ControlChannelHandle {
 impl Clone for ControlChannelHandle {
     fn clone(&self) -> Self {
         ControlChannelHandle {
+            endpoint: self.endpoint,
             shutdown: self.shutdown.clone(),
             data_channel: self.data_channel.clone(),
             data_ch_req: self.data_ch_req.clone(),
@@ -2024,7 +2189,10 @@ enum DataChannelRequest {
 ///
 /// A v3 service owns its control connection; a v4 service shares the
 /// session's, so its commands are framed into the session's single writer
-/// instead.
+/// instead. `Clone` because a service's data path may need to report something
+/// of its own (a transparent claim's per-lane counters) without going through
+/// the request queue that exists for channels.
+#[derive(Clone)]
 enum ControlSink {
     Session {
         service_id: ServiceId,
@@ -2035,7 +2203,7 @@ enum ControlSink {
 impl ControlSink {
     /// Send one already-framed command, queued for the session's writer — the
     /// only task that touches that socket.
-    fn send(&mut self, data: &[u8]) -> Result<()> {
+    fn send(&self, data: &[u8]) -> Result<()> {
         match self {
             ControlSink::Session { write_tx, .. } => write_tx
                 .send(data.to_vec())
@@ -2112,6 +2280,11 @@ impl ControlChannelHandle {
         // public listener, so without that the port stays occupied with
         // nothing serving it and the next registration of that service is
         // rejected with "Port N is already in use".
+        // A transparent claim's data path reports its per-lane counters through
+        // the same sink the control channel uses: the session's writer is the
+        // only task that touches the control socket, so nothing else may write
+        // to it.
+        let report_sink = sink.clone();
         let ch = ControlChannel {
             sink,
             shutdown_rx,
@@ -2188,12 +2361,13 @@ impl ControlChannelHandle {
                 data_ch_req_tx.clone(),
                 shutdown_rx_clone,
                 control_task,
-                TransparentContext::new(claim, lane_valve),
+                TransparentContext::new(claim, lane_valve, report_sink),
                 pool_died_tx,
             ),
         }
 
         ControlChannelHandle {
+            endpoint: service.bind_addr,
             shutdown: shutdown_tx,
             data_channel: data_ch_tx,
             data_ch_req: data_ch_req_tx,
@@ -2209,6 +2383,135 @@ impl ControlChannelHandle {
 /// instantly.
 #[cfg(all(feature = "transparent", target_os = "linux"))]
 const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a transparent claim reports its per-lane counters to its client.
+///
+/// One second, the same cadence as the `l3-stats` line and the allocator's own
+/// tick: a policy compares deltas between consecutive samples, so a slower
+/// report would make every window a guess, and a faster one would spend the
+/// session's single writer on telemetry. Only lanes whose counters *moved* are
+/// sent, so a quiet claim costs nothing.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+const LANE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Aborts a claim's lane reporter when the claim's task ends.
+///
+/// A guard rather than an explicit abort at each exit: `run_transparent_service`
+/// returns from several arms (shutdown, a dead control task, the channel queue
+/// closing), and a reporter that outlived its claim would keep a session writer
+/// alive and report lanes nobody holds.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+struct LaneReporter(tokio::task::JoinHandle<()>);
+
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+impl Drop for LaneReporter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Report one claim's per-lane counters to its client, until dropped.
+///
+/// This is the half of the evidence the client cannot produce: on a transparent
+/// claim the loss that matters happens *here*, where the visitor's packets are
+/// read off the device and offered to the lanes, and the client only ever sees
+/// what arrived. A lane whose queue refuses a large share of what it is offered
+/// is a carrier that is not delivering, and without this report the end that
+/// decides which carrier to use has no way to know.
+///
+/// The same task carries the other thing the client cannot know: when a lane it
+/// asked to drain has become empty **on this end**. The dialer sees only its own
+/// flows, so a lane may only be retired once this answer arrives — the retired
+/// lane black hole is exactly a peer that kept writing into a connection the
+/// other end had let go.
+///
+/// Only lanes whose counters moved since the last sample are sent: a claim that
+/// is quiet (or whose lanes are carrying everything) costs no control traffic,
+/// and the client's own staleness rule is what bounds a lane that stops
+/// reporting.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn spawn_lane_reporter(
+    hub: std::sync::Arc<crate::transparent::hub::TunHub>,
+    endpoint: crate::transparent::Endpoint,
+    sink: ControlSink,
+) -> LaneReporter {
+    use crate::protocol::{ControlChannelCmd, LANE_DRAIN_READY};
+    let service_id = sink.service_id();
+    let task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(LANE_REPORT_INTERVAL);
+        // Per lane: the sequence the client uses to tell a fresh report from a
+        // late one, and the last counters sent so a quiet lane is skipped.
+        let mut seq: std::collections::HashMap<crate::protocol::LaneId, u8> =
+            std::collections::HashMap::new();
+        let mut sent: std::collections::HashMap<crate::protocol::LaneId, (u64, u64)> =
+            std::collections::HashMap::new();
+        // Lanes already answered "ready": the answer is re-sent only when the
+        // lane is drained again, not every second for a lane that stays empty.
+        let mut ready_sent: std::collections::HashSet<crate::protocol::LaneId> =
+            std::collections::HashSet::new();
+        loop {
+            tick.tick().await;
+            for member in hub.member_stats() {
+                if member.endpoint != endpoint {
+                    continue;
+                }
+                let Some(lane) = member.lane else {
+                    continue;
+                };
+                // The peer's half of a retirement: this end holds no flow in a
+                // lane the *peer* asked to drain. The local `draining` mark is
+                // deliberately not the trigger — that one is this end retiring
+                // a lane of its own, and answering "ready" for it would tell the
+                // peer about a decision it never asked about.
+                if member.peer_draining && member.active_flows == 0 {
+                    if ready_sent.insert(lane.id) {
+                        let ack = ControlChannelCmd::LaneDrainAck(
+                            service_id,
+                            lane.id.0,
+                            LANE_DRAIN_READY,
+                        );
+                        let Ok(frame) = postcard::to_stdvec(&ack) else {
+                            return;
+                        };
+                        if sink.send(&frame).is_err() {
+                            return;
+                        }
+                    }
+                } else if !member.peer_draining {
+                    ready_sent.remove(&lane.id);
+                }
+                let counters = (
+                    member.counters.offered_packets,
+                    member.counters.overflow_packets,
+                );
+                if sent.get(&lane.id) == Some(&counters) {
+                    continue;
+                }
+                sent.insert(lane.id, counters);
+                let n = seq.entry(lane.id).or_insert(0);
+                *n = n.wrapping_add(1);
+                let cmd = ControlChannelCmd::CarrierReport(
+                    service_id,
+                    lane.id.0,
+                    // The counters are cumulative for the lane's life and
+                    // saturate: a lane that wrapped a `u32` would have carried
+                    // 4 billion packets, and the client's window is seconds.
+                    u32::try_from(counters.0).unwrap_or(u32::MAX).to_be_bytes(),
+                    u32::try_from(counters.1).unwrap_or(u32::MAX).to_be_bytes(),
+                    *n,
+                );
+                let Ok(frame) = postcard::to_stdvec(&cmd) else {
+                    return;
+                };
+                if sink.send(&frame).is_err() {
+                    // The session is gone: nothing left to report to.
+                    return;
+                }
+            }
+        }
+    });
+    LaneReporter(task)
+}
 
 /// The member set as its supervisor sees it: how many members have ended.
 ///
@@ -2281,7 +2584,14 @@ where
     let TransparentContext {
         claim: _claim,
         lane_valve,
+        sink,
     } = transparent;
+
+    // The claim's lanes are reported to its client for as long as the claim
+    // lives: the client decides which carrier a lane should ride, and the loss
+    // that decides it happens here, where the device's packets are offered to
+    // the lanes. The guard aborts the reporter on every exit from this function.
+    let _reporter = spawn_lane_reporter(Arc::clone(&hub), endpoint, sink);
 
     let start_cmd = Arc::new(postcard::to_stdvec(
         &DataChannelCmd::StartForwardTransparent,
@@ -2296,15 +2606,37 @@ where
     loop {
         tokio::select! {
             channel = data_ch_rx.recv() => {
+                // The lane the client named rides with the channel: the hub
+                // attributes its counters to that connection, so the end that
+                // decides can be told about the lane that actually carried the
+                // traffic (a slot index is this end's own bookkeeping and is
+                // reused by a replacement).
                 let Some(mut channel) = channel else {
                     return Ok(());
                 };
+                // The lane the client named rides in the prologue's second
+                // half, read *here* rather than where the service id was: the
+                // lane is a claim's business, and this is the only place that
+                // knows the channel is one. A channel that cannot name its lane
+                // is dropped — reading nothing would leave its bytes to be
+                // parsed as frames, and a lane nobody can attribute is exactly
+                // what this is here to end.
+                #[cfg(all(feature = "multiplex", target_os = "linux"))]
+                let named_lane = match crate::protocol::read_lane_half(&mut channel).await {
+                    Ok(lane) => Some(lane),
+                    Err(e) => {
+                        debug!("Transparent channel for {endpoint} named no lane: {e:#}");
+                        continue;
+                    }
+                };
+                #[cfg(not(all(feature = "multiplex", target_os = "linux")))]
+                let named_lane = None;
                 // The operator's valve counts these lanes too: a claim's channel
                 // is a carrier connection of its own, and before this it was the
                 // one kind of establishment nothing bounded. The reservation is
                 // held for as long as the lane runs (moved into the member task
                 // below), so a lane that ends gives its slot back.
-                let lane = match lane_valve.reserve() {
+                let valve_slot = match lane_valve.reserve() {
                     Ok(lane) => lane,
                     Err(held) => {
                         report_lane_refusal(held, lane_valve.cap);
@@ -2323,7 +2655,7 @@ where
                 members.spawn(async move {
                     // Held for the lane's whole life: dropping it (the lane
                     // ending, however it ends) releases the session slot.
-                    let _lane = lane;
+                    let _valve_slot = valve_slot;
                     if paced {
                         tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
                     }
@@ -2331,7 +2663,15 @@ where
                         debug!("Transparent channel for {endpoint} died before starting: {e:#}");
                         return;
                     }
-                    if let Err(e) = forward_transparent(channel, hub, endpoint).await {
+                    // The receiving end does not choose the carrier: a lane
+                    // arrives on whichever listener the client reached, and the
+                    // policy that reads this runs where the choice is made. It
+                    // *does* record which lane it was — the client named it in
+                    // the prologue — so this end's counters can be attributed
+                    // to the connection that carried the traffic.
+                    if let Err(e) =
+                        forward_transparent(channel, hub, endpoint, named_lane, None).await
+                    {
                         debug!("Transparent channel for {endpoint} ended: {e:#}");
                     }
                 });
@@ -2417,7 +2757,7 @@ fn spawn_transparent_service(
     }
 }
 
-/// Report that a service's pool task could not serve its listener any more./// Report that a service's pool task could not serve its listener any more.
+/// Report that a service's pool task could not serve its listener any more.
 ///
 /// Only the *abnormal* end is reported: a pool that returns `Ok` ended
 /// orderly (shutdown, or the control channel gone), and must never tell the
@@ -3810,6 +4150,7 @@ mod tests {
             services.insert(
                 ServiceId::new(*id),
                 ControlChannelHandle {
+                    endpoint: "127.0.0.1:0".parse().unwrap(),
                     shutdown: shutdown_tx,
                     data_channel: data_ch_tx.clone(),
                     data_ch_req: request_tx,

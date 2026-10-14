@@ -43,8 +43,8 @@
 //!
 //! **Fixed protocol parameters** (recorded for the arm-2 comparison, see
 //! HANDOFF.md): stream mode; nodelay with a 10 ms interval, fast-resend
-//! trigger 2, congestion control disabled (`nc=1`); send window 2048
-//! segments (~2.8 MiB in flight), receive window 4096; MTU 1400 (protocol
+//! trigger 2, congestion control disabled (`nc=1`); send window 8192
+//! segments (~11.3 MiB in flight), receive window 4096; MTU 1400 (protocol
 //! default); dead-link default (20 retransmits); 32 MiB socket buffers.
 //! SACK gap notification: 10 ms cooldown, 16-segment pile-up (below the
 //! nodelay RTO floor, so the SACK beats the RTO backoff).
@@ -111,21 +111,24 @@ use crate::transport::dgram::{BATCH, Span};
 const KCP_INTERVAL_MS: i32 = 10;
 /// Fast-resend trigger: retransmit a segment after this many skipped acks.
 const KCP_FAST_RESEND: i32 = 2;
-/// Send/receive window in segments. Send window 2048 ≈ 2.8 MiB in flight
-/// with MTU 1400 (baseline was 1024 ≈ 1.4 MiB; that capped throughput at
-/// BDP/RTT — e.g. ~0.28 Gbps at 40 ms tunnel RTT and ~28 Mbps at 400 ms,
-/// both measured — so it has been doubled; see the measured collapse note
-/// below). Receive doubles the send window, so a momentary reader backlog
-/// does not slam the peer's window to zero (classic KCP zero-window
-/// oscillation).
-///
-/// Much larger windows (2048/8192 segments) burst past the shared listener
-/// socket buffers with several sessions and collapsed throughput in every
-/// measured cell (rtt10: 0.55 -> 0.35/0.24 Gbps; rtt100: 0.055 -> 0.04);
-/// the 32 MiB socket buffers and the adaptive pacer bound bursts, but the
-/// window stays at the largest size that keeps 4-session bursts within
-/// them (4 × 2.8 MiB = 11.2 MiB send-side).
-const KCP_SND_WND: u16 = 2048;
+/// Send/receive window in segments. The send window is the carrier's
+/// throughput ceiling whenever a path's bandwidth-delay product exceeds it:
+/// 2048 segments ≈ 2.8 MiB carried 533 Mbit/s at the ~44 ms round trip a
+/// lossy path settles at, which is the arithmetic that identified it (see
+/// HANDOFF.md) and why it is now 8192 ≈ 11.3 MiB. Measured on the model, an
+/// A/B against 2048 on a 1 %-loss path with a 10 000-packet queue: the
+/// 1 Gbit/s UDP ladder cell goes from 42.3 % inner loss and 556 Mbit/s
+/// delivered to 0.2-0.7 % loss, +43 % delivered (claims, sign agreement 1.0,
+/// three rounds each), at +47 % CPU cores on that cell (it does carry 43 %
+/// more); the same A/B on a clean path is indistinguishable on the `l3`
+/// cells and on the four-tunnel `l4` burst cells the 2048-era note was
+/// worried about (bulk-n 9.70 against 9.79 Gbit/s), so the burst collapse
+/// that pinned the smaller window does not reproduce at 8192 with the
+/// current socket buffers and pacer. Receive stays at 4096 — the peer's
+/// advertised window is then the effective cap (4096 × 1472 B / 44 ms ≈
+/// 1.1 Gbit/s) and doubling it is its own change to measure, not an
+/// assumption.
+const KCP_SND_WND: u16 = 8192;
 const KCP_RCV_WND: u16 = 4096;
 /// The most a session may keep *parked* for the pacer, in bytes. Parking is
 /// bounded by the send window in practice (the engine cannot emit more than
@@ -235,11 +238,22 @@ const COALESCE_PRESSURE_PERMITS: usize = 64;
 //   PING: conv(4) magic(1) 0x01 ts(8) pad(2)
 //   PONG: conv(4) magic(1) 0x02 ts(8) pad(2)   (ts echoed from the PING)
 //   SACK: conv(4) magic(1) 0x03 sn(4) pad(6)   (resend this segment)
+//   CLOSE: conv(4) magic(1) 0x04 pad(10)       (this session is over)
 const CTRL_MAGIC: u8 = 0xEE;
 const CTRL_PING: u8 = 0x01;
 const CTRL_PONG: u8 = 0x02;
 const CTRL_SACK: u8 = 0x03;
+const CTRL_CLOSE: u8 = 0x04;
 const CTRL_FRAME_LEN: usize = 16;
+/// How many CLOSE frames an orderly close sends, and how far apart.
+///
+/// One datagram can be lost, and the peer's fallback is its dead-link rule,
+/// which a lane carrying traffic cannot reach (its send window never stands
+/// still — HANDOFF.md, "the paced-loss mechanism"). Three frames 20 ms apart
+/// make that loss unlikely without waiting for anything: the sender has already
+/// decided the session is over and does not need a reply.
+const CTRL_CLOSE_FRAMES: usize = 3;
+const CTRL_CLOSE_GAP: Duration = Duration::from_millis(20);
 
 fn is_ctrl_frame(pkt: &[u8]) -> bool {
     pkt.len() == CTRL_FRAME_LEN && pkt[4] == CTRL_MAGIC
@@ -366,6 +380,15 @@ pub(crate) static KCP_PEER_WND: AtomicU64 = AtomicU64::new(0);
 /// on a keepalive timeout and only raised 5 % per four clean ones, so it is the
 /// one piece of state in this path that can hold a session down for minutes.
 pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
+/// The datagram size the **last** session adapted to, in bytes.
+///
+/// Per-session by nature (each session follows the path it was given), and the
+/// stats line is per process, so this is the most recent adaptation rather than
+/// a mean: enough to answer "is this build emitting full datagrams or half-empty
+/// ones?", which is the question the size field exists for. A mixed pool is read
+/// as its last writer, and `RUST_LOG=debug` still names each session's own value.
+pub(crate) static KCP_DATAGRAM_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// The engine's current retransmission timeout and smoothed round-trip
 /// estimate, in milliseconds.
 pub(crate) static KCP_RTO_MS: AtomicU64 = AtomicU64::new(0);
@@ -430,6 +453,8 @@ pub(crate) struct KcpStats {
     pub pacer_bps: u64,
     pub rto_ms: u64,
     pub srtt_ms: u64,
+    /// The last adapted datagram size, or 0 when no session has adapted yet.
+    pub datagram_bytes: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -471,6 +496,7 @@ pub(crate) fn kcp_stats() -> KcpStats {
         pacer_bps: KCP_PACER_BPS.load(Ordering::Relaxed),
         rto_ms: KCP_RTO_MS.load(Ordering::Relaxed),
         srtt_ms: KCP_SRTT_MS.load(Ordering::Relaxed),
+        datagram_bytes: KCP_DATAGRAM_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -522,6 +548,7 @@ fn spawn_kcp_stats() {
                     pacer_mbit = s.pacer_bps / 1_000_000,
                     rto_ms = s.rto_ms,
                     srtt_ms = s.srtt_ms,
+                    datagram_b = s.datagram_bytes,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -838,29 +865,82 @@ fn feed_input(kcp: &mut Kcp<DatagramOut>, pkt: &[u8]) -> bool {
     }
 }
 
+/// Outcome of feeding one batch of inbound datagrams.
+enum BatchFeed {
+    /// Every datagram was an ARQ datagram; `flush_ack` says whether an ack
+    /// flush is due (only a datagram the ARQ accepted can owe one).
+    Consumed { flush_ack: bool },
+    /// The batch carried adapter control frames. They are handed back in
+    /// arrival order for the caller to await (`handle_ctrl` sends replies),
+    /// and `flush_ack` is what the ARQ half of the same batch owes.
+    Control {
+        flush_ack: bool,
+        ctrl: Vec<(u8, Vec<u8>)>,
+    },
+}
+
 /// Feed the first datagram plus the rest of the ready backlog, bounded to
-/// `INPUT_BATCH_LIMIT` per pump iteration so delivery and ack flushing stay
-/// interleaved with intake. Returns whether any datagram was accepted (an
-/// ack flush is then due).
+/// [`INPUT_BATCH_LIMIT`] per pump iteration so delivery and ack flushing stay
+/// interleaved with intake.
+///
+/// **Every** datagram of the batch is classified, not just the first: an
+/// adapter control frame (PING/PONG/SACK/CLOSE) is 16 bytes with
+/// [`CTRL_MAGIC`] at offset 4, and the backlog a burst leaves behind is
+/// exactly where a keepalive or a close lands — behind the payload it was
+/// sent with. Feeding those to the ARQ is not a neutral mistake: they are
+/// shorter than a KCP header, so `Kcp::input` rejects them as
+/// `InvalidSegmentSize`, and a CLOSE that arrives there is *silently lost* —
+/// which is the retired-lane black hole again (see `CTRL_CLOSE`), reachable
+/// whenever the peer's close datagram shares a readiness wake with data.
+///
+/// Control frames are collected here rather than handled inline so this stays
+/// synchronous: the caller awaits their handling after the batch is drained,
+/// keeping the ordering of one pump round (intake, then control, then the
+/// tail) unchanged.
 fn feed_batch(
     kcp: &mut Kcp<DatagramOut>,
     pkt_rx: &mut mpsc::Receiver<Bytes>,
-    first: &[u8],
-) -> bool {
-    let mut accepted = feed_input(kcp, first);
-    let mut batch = 1;
-    while batch < INPUT_BATCH_LIMIT {
+    first: Bytes,
+) -> BatchFeed {
+    let mut accepted = false;
+    // Control frames of this batch, in arrival order. Collected rather than
+    // handled inline because `handle_ctrl` is async (it sends PONG and CLOSE
+    // replies): the caller awaits them after the whole batch is drained.
+    let mut ctrl: Vec<(u8, Vec<u8>)> = Vec::new();
+
+    // Drain the ready backlog first, bounded: the classification below must
+    // see every datagram of the batch, and `try_recv` is what keeps the
+    // bound (one readiness wake, never an unbounded drain).
+    let mut backlog: Vec<Bytes> = Vec::new();
+    while backlog.len() + 1 < INPUT_BATCH_LIMIT {
         match pkt_rx.try_recv() {
-            Ok(more) => {
-                batch += 1;
-                if feed_input(kcp, &more) {
-                    accepted = true;
-                }
-            }
+            Ok(more) => backlog.push(more),
             Err(_) => break,
         }
     }
-    accepted
+
+    for pkt in std::iter::once(first).chain(backlog) {
+        if is_ctrl_frame(&pkt) {
+            ctrl.push((pkt[5], ctrl_payload(&pkt).to_vec()));
+            continue;
+        }
+        if feed_input(kcp, &pkt) {
+            accepted = true;
+        }
+    }
+
+    if ctrl.is_empty() {
+        return BatchFeed::Consumed {
+            flush_ack: accepted,
+        };
+    }
+    // Hand the collected control frames to the caller, which awaits them; a
+    // CLOSE among them ends the session there, exactly as it does when it
+    // arrives alone.
+    BatchFeed::Control {
+        flush_ack: accepted,
+        ctrl,
+    }
 }
 
 /// Outcome of one non-blocking delivery round.
@@ -1217,6 +1297,7 @@ impl PaceState {
 
 /// Handle an adapter control frame (NOT a KCP segment). `start` anchors
 /// the pump's microsecond clock for RTT computation.
+/// Returns `false` when the peer said the session is over.
 async fn handle_ctrl(
     kind: u8,
     payload: &[u8],
@@ -1224,7 +1305,7 @@ async fn handle_ctrl(
     net: &SessionNet,
     pace: &mut PaceState,
     start: Instant,
-) {
+) -> bool {
     match kind {
         CTRL_PING => {
             // Echo the timestamp back: the peer measures RTT via PONG.
@@ -1251,8 +1332,19 @@ async fn handle_ctrl(
                 trace!("KCP SACK for segment {sn} not in the send buffer");
             }
         }
+        CTRL_CLOSE => {
+            // The peer ended the session on purpose. There is nothing to flush
+            // towards it and nothing to answer: ending here is what lets its
+            // lane task see the end, vacate its slot and re-place the flows that
+            // were pinned to it. Without this frame the peer only learns from
+            // its own dead-link rule, which needs a still send window and
+            // therefore never fires for a lane with traffic.
+            debug!("KCP session closed by peer {}", net.peer);
+            return false;
+        }
         _ => trace!("KCP unknown control frame kind {kind}"),
     }
+    true
 }
 
 /// Send the periodic adapter PING (keepalive + RTT probe); when the
@@ -1594,15 +1686,37 @@ fn maybe_path_mtu(
     let before = kcp.mtu();
     if kcp.set_mtu(fits) != before {
         datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
-        info!(
-            peer = %net.peer,
-            path_mtu,
-            datagram_before = before,
-            datagram_after = kcp.mtu(),
-            "KCP datagram size adapted to the path MTU"
+        KCP_DATAGRAM_BYTES.store(kcp.mtu() as u64, Ordering::Relaxed);
+        let after = kcp.mtu();
+        MTU_ADAPTED.report(
+            || {
+                info!(
+                    peer = %net.peer,
+                    path_mtu,
+                    datagram_before = before,
+                    datagram_after = after,
+                    "KCP datagram size adapted to the path MTU"
+                );
+            },
+            || {
+                debug!(
+                    peer = %net.peer,
+                    path_mtu,
+                    datagram_before = before,
+                    datagram_after = after,
+                    "KCP datagram size adapted to the path MTU"
+                );
+            },
         );
     }
 }
+
+/// The path-MTU adaptation, reported once per process at `INFO` and then at
+/// `DEBUG`: it is a lifecycle fact about a path, and a carrier with several
+/// sessions on the same path would otherwise say it once per session — which the
+/// log-budget test reads as noise (it fails a healthy run that repeats one
+/// message shape).
+static MTU_ADAPTED: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
 
 /// Flush acks for a consumed input batch, then fill the newly-opened
 /// window slots straight from `snd_queue` — waiting for the next writer
@@ -1744,11 +1858,62 @@ async fn pump_tail(
                 close_deadline,
             )
         {
+            // Both halves are gone and the ARQ tail is flushed: tell the peer.
+            // It has no other way to learn — KCP has no close handshake — and
+            // without the frame the peer keeps a session alive that nothing
+            // reads (see `CTRL_CLOSE_FRAMES`).
+            for _ in 0..CTRL_CLOSE_FRAMES {
+                let f = ctrl_frame(kcp.conv(), CTRL_CLOSE, &[]);
+                if let Err(e) = net.send_datagram(&f).await {
+                    debug!("KCP CLOSE send failed (peer {}): {e}", net.peer);
+                    break;
+                }
+                tokio::time::sleep(CTRL_CLOSE_GAP).await;
+            }
             return Tail::Exit;
         }
     }
 
     Tail::Continue
+}
+
+/// One inbound datagram (and the backlog that came with it), classified and
+/// fed. Returns `false` when the session must end.
+///
+/// Split out of `run_session` so the select stays readable; the ordering is
+/// the pump's: the ARQ half of a batch is fed first, then that batch's control
+/// frames are answered in arrival order, and a CLOSE among them ends the
+/// session whether or not data came with it (see [`feed_batch`]).
+async fn intake(
+    kcp: &mut Kcp<DatagramOut>,
+    net: &SessionNet,
+    pace: &mut PaceState,
+    pkt_rx: &mut mpsc::Receiver<Bytes>,
+    pkt: Bytes,
+    ack_flush_due: &mut bool,
+    start: Instant,
+) -> bool {
+    let _t = PhaseTimer::new(&KCP_NS_INPUT);
+    if is_ctrl_frame(&pkt) {
+        // A control frame that arrived alone: the same handling a batched one
+        // gets, without the batch (there is nothing to drain behind it).
+        let kind = pkt[5];
+        return handle_ctrl(kind, ctrl_payload(&pkt), kcp, net, pace, start).await;
+    }
+    match feed_batch(kcp, pkt_rx, pkt) {
+        BatchFeed::Consumed { flush_ack } => {
+            *ack_flush_due |= flush_ack;
+        }
+        BatchFeed::Control { flush_ack, ctrl } => {
+            *ack_flush_due |= flush_ack;
+            for (kind, payload) in ctrl {
+                if !handle_ctrl(kind, &payload, kcp, net, pace, start).await {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The per-session pump: owns the `Kcp` state machine and drives it between
@@ -1833,18 +1998,15 @@ async fn run_session(
             // flushed AFTER delivery, so the advertised window is honest.
             pkt = pkt_rx.recv() => {
                 match pkt {
-                    Some(pkt) => {
-                        let _t = PhaseTimer::new(&KCP_NS_INPUT);
-                        if is_ctrl_frame(&pkt) {
-                            let kind = pkt[5];
-                            handle_ctrl(kind, ctrl_payload(&pkt), &mut kcp,
-                                        &net, &mut pace, start).await;
-                        } else {
-                            ack_flush_due |= feed_batch(&mut kcp, &mut pkt_rx, &pkt);
-                        }
-                    }
                     // Ingress task/dispatcher gone: the session is over.
                     None => break,
+                    Some(pkt) => {
+                        if !intake(&mut kcp, &net, &mut pace, &mut pkt_rx, pkt,
+                                   &mut ack_flush_due, start).await
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             // Update timer: retransmits, delayed acks, window probes.
@@ -2882,6 +3044,59 @@ mod tests {
         buf
     }
 
+    /// A control frame that arrives **behind** data in one batch is a control
+    /// frame, not a short KCP segment.
+    ///
+    /// `feed_batch` exists to amortise intake, and the backlog it drains is
+    /// exactly where a keepalive or a close lands — sent with the payload it
+    /// shares a readiness wake with. Feeding those to the ARQ is not neutral:
+    /// they are shorter than a KCP header, so `Kcp::input` rejects them, and a
+    /// CLOSE that arrives there is lost — the retired-lane black hole
+    /// (`CTRL_CLOSE`) is reachable from an ordinary burst. This pins the
+    /// classification at the batch level, which is where the bug was.
+    #[test]
+    fn a_control_frame_behind_data_in_one_batch_is_not_fed_to_the_arq() {
+        let (dgram_tx, _dgram_rx) = mpsc::unbounded_channel();
+        let mut kcp = Kcp::new_stream(0x5EED_5EED, DatagramOut::new(dgram_tx));
+        kcp.update(0).unwrap();
+        // The pump's own clock, so the session is past its prime.
+        kcp.update(1_000).unwrap();
+
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Bytes>(8);
+        // A CLOSE behind one data-shaped datagram: the shape a peer's close
+        // has whenever it shares a wake with the last of its payload.
+        let close = ctrl_frame(kcp.conv(), CTRL_CLOSE, &[]);
+        pkt_tx
+            .try_send(Bytes::copy_from_slice(&[0u8; KCP_OVERHEAD]))
+            .unwrap();
+        pkt_tx.try_send(Bytes::copy_from_slice(&close)).unwrap();
+
+        let first = pkt_rx.try_recv().unwrap();
+        // The first datagram is not a control frame, so the batch path is the
+        // one under test (a control frame first is handled by the caller).
+        assert!(!is_ctrl_frame(&first));
+        match feed_batch(&mut kcp, &mut pkt_rx, first) {
+            BatchFeed::Control { flush_ack, ctrl } => {
+                // The ARQ rejected the zeroed datagram, so no ack is owed by
+                // it; the point is that the CLOSE came back rather than being
+                // fed to the engine and dropped.
+                let _ = flush_ack;
+                assert_eq!(
+                    ctrl.len(),
+                    1,
+                    "the batch's control frame must come back to the caller"
+                );
+                assert_eq!(ctrl[0].0, CTRL_CLOSE, "and it must be the CLOSE it was");
+            }
+            BatchFeed::Consumed { .. } => panic!("the CLOSE was fed to the ARQ and lost"),
+        }
+        // Nothing was left behind: the backlog was drained, not skipped.
+        assert!(
+            pkt_rx.try_recv().is_err(),
+            "the batch must consume the backlog it classified"
+        );
+    }
+
     #[test]
     fn send_batches_close_at_the_flush_boundary() {
         // The engine emits one datagram per `write` call; the adapter must
@@ -3003,6 +3218,83 @@ mod tests {
         assert!(
             blobs * 2 <= segments,
             "coalescing did not merge: {blobs} blobs for {segments} segments"
+        );
+    }
+
+    /// A dropped stream must end the session **for the peer**.
+    ///
+    /// This is the property a retired transparent lane depends on
+    /// (HANDOFF.md, "the paced-loss mechanism"): the lane's consumer goes away,
+    /// and if its session stays alive answering acks and keepalives, the peer
+    /// keeps writing into a channel that carries nothing while both ends look
+    /// healthy. Here the peer keeps sending after the drop, so a session that
+    /// really ended stops acknowledging and its own dead-link rule fires — which
+    /// the peer's reader sees as the end of its stream. A session that survives
+    /// the drop reads on, and this test times out.
+    #[tokio::test]
+    async fn a_dropped_stream_ends_the_session_for_the_peer() {
+        let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
+        let addr = acceptor.local_addr().unwrap();
+        // The acceptor adopts a conversation from the traffic it sees, so the
+        // client keeps talking until it is accepted.
+        let mut client = connect(addr, 0x5EED_5EED).await.unwrap();
+        let talker = tokio::spawn(async move {
+            loop {
+                if client.write_all(b"hello").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Dropping `client` here is the whole point: it is what a retired
+            // lane's consumer does.
+            drop(client);
+        });
+        let session = tokio::time::timeout(Duration::from_secs(10), acceptor.accept())
+            .await
+            .expect("accept timed out")
+            .expect("acceptor closed");
+        let mut server = session.stream;
+        assert_eq!(read_exact_timeout(&mut server, 5).await, b"hello");
+
+        // The consumer goes away.
+        talker.abort();
+        let _ = talker.await;
+        let after_drop = super::kcp_stats();
+
+        // The peer keeps *sending* — that is what a claim's lane does, and it is
+        // also the only thing that can tell it the session is over: KCP has no
+        // close handshake, so a peer with nothing outstanding cannot learn
+        // anything at all. Every round writes and then reads with a short
+        // timeout, so the writes keep coming and stay unacknowledged; the peer
+        // must find out (a write fails, or the read ends) rather than accepting
+        // writes forever.
+        let mut buf = [0u8; 64];
+        let ended = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if server.write_all(b"still there?").await.is_err() {
+                    break;
+                }
+                if let Ok(Ok(0) | Err(_)) =
+                    tokio::time::timeout(Duration::from_millis(50), server.read(&mut buf)).await
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        // The counters are the diagnosis when this fails: no retransmits while the
+        // peer keeps writing means the other end is still acknowledging, i.e. its
+        // session outlived its stream.
+        let after = super::kcp_stats();
+        let out_delta = after.datagrams_out - after_drop.datagrams_out;
+        let rtx_delta = after.retransmits - after_drop.retransmits;
+        assert!(
+            ended.is_ok(),
+            "the peer kept the session open for 30 s after the other end's stream went \
+             away, writing into a channel that carries nothing: it retransmitted \
+             {rtx_delta} datagram(s) of {out_delta} sent, so it knows the peer is silent \
+             but its dead-link rule has not fired — with the nodelay RTO growing x1.5 per \
+             retransmit, 20 retransmits is minutes, not seconds (HANDOFF.md)"
         );
     }
 

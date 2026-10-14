@@ -10,7 +10,6 @@ default_token = "default_token_if_not_specify" # security-scan:allow dummy fixtu
 default_remote_addr = "127.0.0.1:2341"
 
 [client.data]
-default_carrier = "kcp"
 
 [client.transport]
 type = "plain"

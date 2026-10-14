@@ -89,7 +89,7 @@ transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" }
 强制明文。有效传输为 Noise 的服务必须要有密钥——优先用自己
 `transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
 Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
-(`carrier = "kcp"` 时的)Noise-over-KCP 包裹都用该服务的有效密钥。服务端
+以及其 KCP 会话的 Noise-over-KCP 包裹,都用该服务的有效密钥。服务端
 只需要放置自己的密钥(传输选择器:它接受每条连接所说的语言)。
 
 ### 指定 pattern

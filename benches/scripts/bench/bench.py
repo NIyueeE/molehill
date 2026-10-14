@@ -26,6 +26,8 @@ evidence does not belong in the repository.
 # E402 is waived file-wide: the sys.path insert below is the bench-lib import
 # pattern and must precede the sibling imports.
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -64,7 +66,7 @@ def cmd_list(args) -> int:
     print("\narms (the catalog; `--arm id=...` may state any of them):")
     for name, arm in model.ARM_CATALOG.items():
         print(
-            f"  {name:<12} kind={arm.kind:<8} mode={arm.data_mode:<10} "
+            f"  {name:<12} kind={arm.kind:<8} "
             f"carrier={arm.data_carrier or '-':<5} "
             f"pool_cap={arm.pool_cap or 'default':<8} txqueuelen={arm.txqueuelen}"
         )
@@ -266,20 +268,89 @@ def _check_registry(c: Checker) -> None:
 def _check_arms(c: Checker) -> None:
     for name, arm in model.ARM_CATALOG.items():
         c.equal(f"arm catalog key {name} is the arm's id", arm.id, name)
+    # An L3 arm's `pool_cap` is the *carrier's* lane budget: the product divides
+    # it among every claim of the topology and refuses one below the claim count,
+    # so an arm that names such a budget would measure a client that never
+    # started. A budget that is not a multiple of the claim count is legal but
+    # leaves its remainder unallocated, which would make the arm quietly measure
+    # fewer lanes than its name says.
+    claims = len(topology.SERVICE_PORTS)
+    for name, arm in model.ARM_CATALOG.items():
+        if arm.kind != "l3" or not arm.pool_cap:
+            continue
+        c.check(
+            f"arm {name} lane budget covers every claim",
+            arm.pool_cap >= claims,
+            f"{arm.pool_cap} lanes for {claims} claims is refused by the client",
+        )
+        c.equal(
+            f"arm {name} lane budget divides evenly",
+            arm.pool_cap % claims,
+            0,
+        )
     for name in model.ARM_CATALOG:
         arm = model.arms_from_names([name], "/bin/true")[0]
         c.equal(f"arm {name} id", arm.id, name)
+        # Every arm's config is *built* here, not described: an arm whose
+        # topology writer reaches for a knob the model no longer has fails the
+        # campaign cell by cell (`AttributeError: 'Arm' object has no attribute
+        # ...`) after the round's setup, which is a whole run spent to learn
+        # something this check answers in milliseconds.
+        try:
+            cfg = topology.service_config(arm, Path(tempfile.mkdtemp(prefix="armcfg-")))
+            c.check(
+                f"arm {name} builds a config",
+                bool(cfg.get("server")) and bool(cfg.get("client")),
+                f"the topology writer returned {sorted(cfg)}",
+            )
+            # Built *and parsed*: a written config can be invalid TOML (a
+            # duplicate table header, say) or carry a key the product no longer
+            # knows, and either way the arm fails every cell of a run that has
+            # already paid for its namespaces. tomllib is the same grammar the
+            # product's loader uses, so a duplicate header is caught here.
+            for role in ("server", "client"):
+                text = (cfg[role]).read_text()
+                try:
+                    tomllib.loads(text)
+                    ok, why = True, ""
+                except tomllib.TOMLDecodeError as e:
+                    ok, why = False, str(e)
+                c.check(f"arm {name} {role} config parses", ok, why)
+        except Exception as e:  # noqa: BLE001 - any failure is the finding
+            c.check(f"arm {name} builds a config", False, f"{type(e).__name__}: {e}")
         for kind in ("control", "l4", "l3"):
             spec = f"id={kind},txqueuelen={model.DEEP_TXQUEUELEN}"
             parsed = model.parse_arm_spec(spec)
             c.equal(f"arm spec {kind} txqueuelen", parsed.txqueuelen, 10000)
-    # The carrier is the only data-plane axis an arm states: the *shape* is
-    # derived from the service type (a forwarding service multiplexes, a claim
-    # never does), so an arm spec that still names a mode is refused rather than
-    # silently measuring the default — and `pool_cap` means the pool's width for
-    # an L4 arm and the claim's lane budget for an L3 one.
-    parsed = model.parse_arm_spec("id=l3,carrier=kcp,pool_cap=4")
-    c.equal("arm spec carries kcp", parsed.data_carrier, "kcp")
+    # A carrier is *not* an arm key (the product chooses one at runtime, so the
+    # contrast is the `udp_blocked` condition); the *shape* is derived from the
+    # service type (a forwarding service multiplexes, a claim never does), so an
+    # arm spec that still names a mode is refused rather than silently measuring
+    # the default — and `pool_cap` means the pool's width for an L4 arm and the
+    # claim's lane budget for an L3 one.
+    parsed = model.parse_arm_spec("id=l3,pool_cap=4")
+    c.equal("an arm claims no carrier", parsed.data_carrier, "auto")
+    c.check(
+        "the udp-blocked condition blocks UDP",
+        model.CONDITIONS["udp_blocked"].block_udp,
+        "udp_blocked does not block UDP",
+    )
+    c.check(
+        "the udp-blocked condition is refused off the tunnel leg",
+        _refused(
+            model.refuse_misplaced_condition,
+            model.CONDITIONS["udp_blocked"],
+            "visitor",
+        ),
+        "udp_blocked was accepted on the visitor leg",
+    )
+    c.check(
+        "a netem condition is accepted on any leg",
+        not _refused(
+            model.refuse_misplaced_condition, model.CONDITIONS["loss1"], "visitor"
+        ),
+        "loss1 was refused on the visitor leg",
+    )
     c.equal("arm spec keeps the l3 lane budget", parsed.pool_cap, 4)
     c.check(
         "arm spec refuses the removed mode key",
@@ -287,9 +358,9 @@ def _check_arms(c: Checker) -> None:
         "mode=direct was accepted",
     )
     c.check(
-        "arm spec refuses an unknown carrier",
-        _refused(model.parse_arm_spec, "id=l3,carrier=quic"),
-        "carrier=quic was accepted",
+        "arm spec refuses a carrier key",
+        _refused(model.parse_arm_spec, "id=l3,force_carrier=kcp"),
+        "force_carrier=kcp was accepted (the carrier is chosen at runtime)",
     )
     c.check(
         "unknown arm key is refused",
@@ -333,10 +404,10 @@ def _check_device_io(c: Checker) -> None:
     )
 
 
-def _refused(fn, value) -> bool:
+def _refused(fn, *args) -> bool:
     """True when the call raises: the shape of every refusal check here."""
     try:
-        fn(value)
+        fn(*args)
     except ValueError:
         return True
     return False
@@ -667,7 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--arm",
         action="append",
         default=[],
-        help="an arm as data: id=l3,mode=direct,txqueuelen=10000 (repeatable)",
+        help="an arm as data: id=l3,pool_cap=10,txqueuelen=10000 (repeatable)",
     )
     run.add_argument("--scenarios", default="", help="comma list of scenario ids")
     run.add_argument("--rounds", type=int, default=0, help="measured rounds per arm")

@@ -257,7 +257,10 @@ class Topology:
         In place is the point: a staged run changes the path while the tool
         keeps running, so what is measured is how the tool adapts rather than
         how it starts. `tc qdisc replace` swaps the discipline without touching
-        the device, and `clean` removes it.
+        the device, and `clean` removes it. A `block_udp` condition is imposed
+        the same way, as a firewall rule that is added when the condition asks
+        for it and deleted when it does not — the netns goes away with the run,
+        so a rule can never outlive it.
         """
         for ns, dev in LEGS[leg]:
             if condition.netem:
@@ -276,8 +279,28 @@ class Topology:
                 )
             else:
                 self.ns_run(ns, ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
+            self.set_udp_block(ns, dev, condition.block_udp)
             if condition.mtu is not None:
                 self.set_link_mtu(ns, dev, condition.mtu)
+
+    def set_udp_block(self, ns: str, dev: str, blocked: bool) -> None:
+        """Drop UDP leaving one device, or stop dropping it.
+
+        The data plane tries KCP first, so a path that refuses UDP is what makes
+        the product fall back to TCP — there is no key to write for that, which
+        is exactly the point: the fallback is a path property. The rule is
+        `OUTPUT -o <dev> -p udp -j DROP` and it is checked before it is changed,
+        so applying the same condition twice is a no-op and `clean` removes what
+        an earlier stage added.
+        """
+        rule = ["OUTPUT", "-o", dev, "-p", "udp", "-j", "DROP"]
+        present = (
+            self.ns_run(ns, ["iptables", "-C", *rule], check=False).returncode == 0
+        )
+        if blocked and not present:
+            self.ns_run(ns, ["iptables", "-I", "OUTPUT", "1", *rule[1:]])
+        elif not blocked and present:
+            self.ns_run(ns, ["iptables", "-D", *rule])
 
     def set_link_mtu(self, ns: str, dev: str, mtu: int) -> None:
         """Change one interface's MTU, remembering the original to restore it.
@@ -511,18 +534,19 @@ tun = "{TUN_SRV}"
             + "\n"
             for port in SERVICE_PORTS
         )
-        # The data plane is stated once, on the block every claim inherits: the
-        # carrier is written even when it is the product's default, because an
-        # arm must record the configuration it measured and the carrier is one
-        # of the axes this model compares. The key that *is* left out when an
-        # arm says nothing — the claim's lane budget — keeps every arm that
-        # predates it on the exact config it measured (and therefore on its
-        # method fingerprint): an unwritten budget is one connection per claim.
-        cap = (
-            f"\n[transparent.data.{arm.data_carrier}]\ntunnels = {arm.pool_cap}\n"
-            if arm.pool_cap
-            else ""
-        )
+        # The data plane is stated once, on the block every claim inherits. The
+        # key that is left out when an arm says nothing — the claim's lane
+        # budget — keeps every arm that predates it on the exact config it
+        # measured (and therefore on its method fingerprint): an unwritten budget
+        # is one connection per claim. The *carrier* is not written here at all:
+        # it is an override in the arm's environment (`MOLEHILL_DATA_CARRIER`),
+        # because the product chooses it at runtime.
+        # One table, one write: `lend` and `tunnels` live in the same block, and
+        # a second `[transparent.data]` header would be a duplicate key the
+        # loader refuses (which is how every `pool_cap` arm broke silently when
+        # the per-carrier tables were merged — hence the parse check in
+        # `bench.py selfcheck`).
+        cap = f"\ntunnels = {arm.pool_cap}" if arm.pool_cap else ""
         client = f"""[transparent]
 default_token = "bench"
 tun = "{TUN_CLI}"
@@ -531,10 +555,11 @@ tun = "{TUN_CLI}"
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
 [transparent.data]
-default_carrier = "{arm.data_carrier}"{cap}
+lend = {str(arm.lend).lower()}{cap}
+
 {claims}"""
     else:
-        cap = f"\n[client.data.tcp]\ntunnels = {arm.pool_cap}\n" if arm.pool_cap else ""
+        cap = f"\ntunnels = {arm.pool_cap}" if arm.pool_cap else ""
         services = []
         for port in SERVICE_PORTS:
             block = [f"[client.services.s{port}]"]
@@ -572,9 +597,8 @@ default_token = "bench"
 [client.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
-[client.data]
-default_carrier = "{arm.data_carrier}"
-{cap}
+[client.data]{cap}
+
 {"".join(services)}"""
     (d / "server.toml").write_text(server)
     (d / "client.toml").write_text(client)

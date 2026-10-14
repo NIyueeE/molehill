@@ -345,7 +345,7 @@ pub struct PoolSnapshot {
     pub carrier: &'static str,
     /// The number of live tunnels.
     pub size: usize,
-    /// How many tunnels the pool establishes (`[client.data.tcp|kcp].tunnels`).
+    /// How many tunnels the pool establishes (`[client.data].tunnels`).
     /// A pool at this size is complete; one below it is repairing.
     pub count: usize,
     /// The UDP-derived floor the pool's configured count must cover (D7).

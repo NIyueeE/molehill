@@ -495,9 +495,16 @@ def verdicts(results: dict) -> list:
     out: list = []
     noise = (results.get("summary", {}).get("noise", {}) or {}).get("metrics", {})
     twins = _twin_pairs(results)
+    # An arm may declare the arm it is the *decision* against (a configuration
+    # axis rather than a build axis); the results file carries the declaration.
+    declared = {
+        a["id"]: a.get("against", "")
+        for a in results.get("meta", {}).get("arms", [])
+        if a.get("against")
+    }
     for summary_cell in results.get("summary", {}).get("cells", []):
         scenario, cell = summary_cell["scenario"], summary_cell["cell"]
-        for label_a, label_b in _pairs_of(summary_cell, twins):
+        for label_a, label_b in _pairs_of(summary_cell, twins, declared):
             for metric_id in model.metric_ids():
                 values_a = round_values(results, label_a, scenario, cell, metric_id)
                 values_b = round_values(results, label_b, scenario, cell, metric_id)
@@ -523,9 +530,10 @@ def verdicts(results: dict) -> list:
     return out
 
 
-def _pairs_of(summary_cell: dict, twins: list) -> list:
-    """The comparisons one cell supports: each arm against the control, then
-    every twin against its base (the A/A floor and the A/B pair)."""
+def _pairs_of(summary_cell: dict, twins: list, declared: dict) -> list:
+    """The comparisons one cell supports: each arm against the control, every
+    twin against its base (the A/A floor and the A/B pair), and every arm that
+    declared a baseline against it (a configuration's own A/B)."""
     arms = summary_cell["arms"]
     pairs = []
     if "control" in arms:
@@ -535,6 +543,9 @@ def _pairs_of(summary_cell: dict, twins: list) -> list:
             if a != "control" and not a.endswith(TWIN_SUFFIXES)
         ]
     pairs += [(base, twin) for base, twin in twins if base in arms and twin in arms]
+    pairs += [
+        (declared[a], a) for a in sorted(arms) if a in declared and declared[a] in arms
+    ]
     return pairs
 
 

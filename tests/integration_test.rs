@@ -226,7 +226,7 @@ async fn settle(secs: f64) {
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Default)]
 struct ClientOverrides {
-    /// `[client.data.tcp].tunnels`: the pinned pool's count — the tunnels it
+    /// `[client.data].tunnels`: the pinned pool's count — the tunnels it
     /// establishes at service start and keeps, not a cap it grows to.
     tunnels: Option<u16>,
 }
@@ -264,14 +264,7 @@ fn write_client_variant(config_path: &str, overrides: &ClientOverrides) -> Resul
                 anyhow::anyhow!("Test fixture {config_path} has a non-table [client.data]")
             })?;
         if let Some(count) = overrides.tunnels {
-            let tcp = data
-                .entry("tcp".to_owned())
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-                .as_table_mut()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Test fixture {config_path} has a non-table [client.data.tcp]")
-                })?;
-            tcp.insert("tunnels".to_owned(), toml::Value::Integer(i64::from(count)));
+            data.insert("tunnels".to_owned(), toml::Value::Integer(i64::from(count)));
         }
     }
 
@@ -373,15 +366,15 @@ async fn noise_session_resume() -> Result<()> {
 }
 
 /// Per-service data-plane overrides: the fixture keeps a pinned pool as the
-/// client-wide shape and gives one service its own carrier.
+/// client-wide shape and gives one service its own `tunnels`.
 #[cfg(feature = "multiplex")]
 #[tokio::test]
-async fn per_service_data_modes() -> Result<()> {
+async fn per_service_tunnel_counts() -> Result<()> {
     init();
 
     spawn_tcp_backends();
 
-    test("tests/for_tcp/per_service_carriers.toml", Type::Tcp, None).await?;
+    test("tests/for_tcp/per_service_tunnels.toml", Type::Tcp, None).await?;
 
     Ok(())
 }
@@ -474,8 +467,9 @@ type PoolShape = (usize, Vec<(usize, usize, usize)>);
 /// a transfer cannot see: four streams on three tunnels (with the fourth
 /// empty) is the same pool size as the spread.
 ///
-/// The four tunnels are already there: a fixture with no `[client.data.tcp]`
-/// block gets the default count (`DEFAULT_MUX_TUNNELS`, 4), established at
+/// The four tunnels are already there: a fixture that writes no
+/// `[client.data].tunnels` gets the default count (`DEFAULT_MUX_TUNNELS`, 4),
+/// established at
 /// service start. What is waited for is therefore the *group's* placement —
 /// each of its four channels landing on a distinct tunnel — not the pool
 /// growing to receive it.
@@ -855,10 +849,10 @@ async fn mixed_transports() -> Result<()> {
     Ok(())
 }
 
-/// Arm 2 of the transport comparison: data tunnels are KCP-over-UDP sessions
-/// (Noise-wrapped with the control transport's keys, `[client.data.kcp]`
-/// `tunnels` established at service start — the default 4 when unwritten);
-/// the control channel stays TCP+Noise. Full lifecycle.
+/// The KCP data plane: data tunnels are KCP-over-UDP sessions (Noise-wrapped
+/// with the control transport's keys, `[client.data].tunnels` established at
+/// service start — the default 4 when unwritten); the control channel stays
+/// TCP+Noise. Full lifecycle.
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
 #[tokio::test]
 async fn kcp_tunnel() -> Result<()> {

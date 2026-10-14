@@ -94,14 +94,14 @@ pub enum Carrier {
 }
 
 impl Carrier {
-    /// Map the client's config-side carrier to the wire value. Only
-    /// exists with the `multiplex` feature (the `DataCarrier` type is
-    /// feature-gated); without it the data plane is always TCP.
+    /// The wire value of the carrier the client will try first. Only exists with
+    /// the `multiplex` feature (the runtime carrier type is feature-gated);
+    /// without it the data plane is always TCP.
     #[cfg(feature = "multiplex")]
-    pub fn from_data_carrier(c: crate::config::DataCarrier) -> Carrier {
+    pub fn from_data_carrier(c: crate::transport::multiplex::Carrier) -> Carrier {
         match c {
-            crate::config::DataCarrier::Tcp => Carrier::Tcp,
-            crate::config::DataCarrier::Kcp => Carrier::Kcp,
+            crate::transport::multiplex::Carrier::Tcp => Carrier::Tcp,
+            crate::transport::multiplex::Carrier::Kcp => Carrier::Kcp,
         }
     }
 }
@@ -160,6 +160,67 @@ impl std::fmt::Display for ServiceId {
     }
 }
 
+/// The identity of one **physical** data connection — a transparent lane, or
+/// one tunnel of a pool.
+///
+/// Four wire bytes, never a varint, for the reason [`ServiceId`] states: every
+/// command that carries one has a value-independent length, so a tag-dispatched
+/// reader knows exactly how many bytes follow.
+///
+/// This exists because a carrier's quality can only be compared *per lane*, and
+/// a lane is not its slot: a slot is a routing index one end reuses (a
+/// replacement inherits its predecessor's), while a lane is the connection that
+/// actually rode some carrier for some stretch of time. Two ends agree on a
+/// lane because its dialer named it in the prologue, not because both counted
+/// to the same index — which is what lets the *other* end say what it received
+/// from a lane this end can no longer see (a retired one included).
+///
+/// Unique per control session, and meaningless across sessions: it is a
+/// correlation key for the lifetime of one session, not a global name.
+#[cfg_attr(
+    not(any(
+        feature = "client",
+        all(feature = "transparent", feature = "multiplex")
+    )),
+    expect(
+        dead_code,
+        reason = "a lane id is named by a client and read by the transparent server path; \
+                  a build with neither has no lane to name"
+    )
+)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaneId(pub [u8; 4]);
+
+// `get` is reached through `Display`, which is never dead (a trait impl is
+// reachable by construction); `new` is what a build that dials a lane uses, and
+// a build that only carries the type in a signature has no lane to mint.
+impl LaneId {
+    /// Wrap a numeric id as its big-endian wire form.
+    #[cfg_attr(
+        not(all(feature = "transparent", feature = "multiplex")),
+        expect(
+            dead_code,
+            reason = "only a transparent build mints a lane id; the others carry the type"
+        )
+    )]
+    #[must_use]
+    pub fn new(raw: u32) -> Self {
+        LaneId(raw.to_be_bytes())
+    }
+
+    /// The numeric form, for logs and for the client's own bookkeeping.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+}
+
+impl std::fmt::Display for LaneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
 /// One service registration inside a v4 session: the service's own credential
 /// (`digest(service_token ‖ nonce)`) plus the registration it authorizes.
 ///
@@ -181,6 +242,22 @@ pub struct SessionRegistration {
 pub enum SessionCmd {
     Register(SessionRegistration),
     Deregister(ServiceId),
+    /// Ask the server to stop placing **new** flows in one of a claim's lanes,
+    /// so the lane can be retired once both ends agree it is empty.
+    ///
+    /// A lane's flows are placed by each end for its own direction, and the
+    /// end that dialed the lane cannot see the flows the peer placed on it. So
+    /// a lane may only end when both ends have stopped placing new flows in it
+    /// *and* have none left: the alternative — ending it on this end's word
+    /// alone — is the retired-lane black hole (HANDOFF.md), where the peer kept
+    /// writing into a connection nothing read. The lane id is the one the dialer
+    /// named in the channel's prologue, so both ends are talking about the same
+    /// connection rather than about an index either of them reuses.
+    DrainLane(ServiceId, [u8; 4]),
+    /// Put a lane back in service: the drain could not be completed (a flow
+    /// outlived the budget, or the replacement never came up), and a claim with
+    /// a lane nobody may use is worse than the carrier it was trying to leave.
+    CancelDrain(ServiceId, [u8; 4]),
 }
 
 /// Upper bound for the encoded size of a [`SessionCmd`] frame: a registration
@@ -294,7 +371,7 @@ pub enum ControlChannelCmd {
     /// order, and the session reader tells an ack frame from a command by the
     /// first byte — an ack's is its length's high byte, which is `0` as long
     /// as the frame stays under 256 bytes. Keeping a variant at tag 0 is what
-    /// makes every command this build does speak sit at 1..=4, where that
+    /// makes every command this build does speak sit at 1..=5, where that
     /// disambiguation holds.
     CreateDataChannel,
     HeartBeat,
@@ -323,7 +400,73 @@ pub enum ControlChannelCmd {
     /// index and count are `u8`s, so the tag alone still decides that exactly
     /// 10 bytes follow.
     CreateDataChannelForStripe(ServiceId, [u8; 4], u8, u8),
+    /// What the **server** offered one of a claim's lanes, and what that lane's
+    /// queue refused — the half of the evidence the client cannot see.
+    ///
+    /// The client decides which carrier a lane should ride, and on a
+    /// transparent claim the loss that matters happens where the packets are
+    /// *offered*: the server reads the visitor's traffic off its own device and
+    /// hands it to the lanes, so a lane whose queue refuses 44 % of what it is
+    /// offered is a carrier that is not delivering — and the client's own
+    /// counters (which only ever see what arrived) read zero for exactly that
+    /// lane. Without this report the deciding end has no evidence of the only
+    /// place the loss happens.
+    ///
+    /// Fixed width on purpose, like every other session command: four raw
+    /// byte-array fields rather than `u32`s (postcard varints integers), so the
+    /// tag alone decides that exactly 17 bytes follow — service, lane, offered,
+    /// refused, and the sample's sequence.
+    ///
+    /// The counters are cumulative for the lane's life and saturate at
+    /// `u32::MAX`; the sequence is what lets the receiver tell a fresh report
+    /// from one that overtook it, and a *delta* is what a policy compares.
+    CarrierReport(ServiceId, [u8; 4], [u8; 4], [u8; 4], u8),
+    /// What became of a [`SessionCmd::DrainLane`] for one lane.
+    ///
+    /// The client asked the server to stop placing new flows in a lane; this is
+    /// the server's answer, and it is the *other half* of the agreement a
+    /// retirement needs. `state` is one of the `LANE_DRAIN_*` values: still
+    /// draining (flows the server placed are still talking), ready (the server
+    /// holds no flow in it), or unknown (the lane is not one this server holds —
+    /// already gone, or never its business).
+    ///
+    /// Fixed width: four raw bytes of service id, four of lane id, one of state.
+    LaneDrainAck(ServiceId, [u8; 4], u8),
 }
+
+/// [`ControlChannelCmd::LaneDrainAck`] states: the server is draining the lane
+/// and its own flows are still talking.
+#[cfg_attr(
+    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_PENDING: u8 = 0;
+/// The server holds no flow in the lane: its half of the agreement is met.
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_READY: u8 = 1;
+/// The lane is not one this server holds (already ended, or never registered).
+///
+/// Every build answers with this one: a build that cannot drain anything says
+/// so, which is what keeps the client's handling one shape.
+pub const LANE_DRAIN_UNKNOWN: u8 = 2;
+/// The drain was called off: the lane takes new flows again.
+#[cfg_attr(
+    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_CANCELLED: u8 = 3;
 
 /// Variant names mirror the wire contract and stay stable across versions.
 #[expect(clippy::enum_variant_names, reason = "wire-contract variant names")]
@@ -769,6 +912,86 @@ pub async fn read_stream_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<
     Ok(ServiceId(buf))
 }
 
+/// The prologue a **lane** opens with: the service it serves, and the identity
+/// of the physical connection carrying it.
+///
+/// The lane id rides here rather than in a later frame because the two facts
+/// are one opening act: a reader that knows the service but not the lane cannot
+/// tell this connection from the one that replaced it, and the retired-lane
+/// black hole (HANDOFF.md) is exactly a peer that kept writing into a
+/// connection the other end had already let go. Naming the lane up front is
+/// what lets the *other* end report what it received from a lane this end no
+/// longer holds.
+///
+/// Eight raw bytes, never varints: the tag-dispatched reader of a data channel
+/// consumes a fixed prologue, so its length must not depend on either value.
+#[cfg(all(feature = "client", feature = "transparent", feature = "multiplex"))]
+pub async fn write_lane_prologue<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    service_id: ServiceId,
+    lane: LaneId,
+) -> Result<()> {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&service_id.0);
+    buf[4..].copy_from_slice(&lane.0);
+    conn.write_all(&buf)
+        .await
+        .with_context(|| "Failed to write the v4 lane prologue")?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Read the whole lane prologue in one 8-byte read: the round-trip form, and
+/// the only place the two halves' order is pinned.
+///
+/// The server's own path cannot use it: a direct channel's prologue is the
+/// first bytes on the channel, so the server has to learn the *width* from the
+/// registered service before it reads (`read_channel_prologue` reads the
+/// service id, then the lane half). Both go through the same constants here,
+/// so the two cannot drift apart.
+/// Read the **lane half** of a prologue: the four bytes that follow the
+/// service id, and only they.
+///
+/// Split so the server can use it on the path it actually has: a direct data
+/// channel's prologue is the first thing on the channel, so its *width* has to
+/// be known before anything is read, and the width is a property of the
+/// registered service (`read_channel_prologue` looks the service up, reads its
+/// id, then calls this for the lane that follows). The whole-prologue form is
+/// what the round-trip test pins.
+#[cfg(all(
+    feature = "server",
+    feature = "transparent",
+    feature = "multiplex",
+    target_os = "linux"
+))]
+pub async fn read_lane_half<T: AsyncRead + Unpin>(conn: &mut T) -> Result<LaneId> {
+    let mut lane = [0u8; 4];
+    conn.read_exact(&mut lane)
+        .await
+        .with_context(|| "Failed to read the v4 lane prologue")?;
+    Ok(LaneId(lane))
+}
+
+#[cfg(all(
+    test,
+    feature = "server",
+    feature = "client",
+    feature = "transparent",
+    feature = "multiplex",
+    target_os = "linux"
+))]
+pub async fn read_lane_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ServiceId, LaneId)> {
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read the v4 lane prologue")?;
+    let mut service = [0u8; 4];
+    let mut lane = [0u8; 4];
+    service.copy_from_slice(&buf[..4]);
+    lane.copy_from_slice(&buf[4..]);
+    Ok((ServiceId(service), LaneId(lane)))
+}
+
 #[cfg(feature = "server")]
 pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
     let mut buf = vec![0u8; PACKET_LEN.auth];
@@ -853,9 +1076,9 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
 /// same reason as [`read_register_result`].
 #[cfg(feature = "client")]
 pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
-    // 1 tag byte + the largest suffix below (a service id, a group id, an
-    // index and a count: the stripe request's 10 bytes).
-    let mut buf = [0u8; 11];
+    // 1 tag byte + the largest suffix below (the carrier report's 17 bytes:
+    // service, lane, offered, refused, sequence).
+    let mut buf = [0u8; 18];
     conn.read_exact(&mut buf[..1])
         .await
         .with_context(|| "Failed to read cmd")?;
@@ -864,6 +1087,8 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
         1 => return Ok(ControlChannelCmd::HeartBeat),
         2 | 3 => 4,
         4 => 10,
+        5 => 17,
+        6 => 9,
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -879,12 +1104,35 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
                 ControlChannelCmd::ServiceDropped(service_id)
             }
         }
+        // The carrier report: raw fixed-width fields, decoded by hand because
+        // postcard would varint the integers and move the frame's length with
+        // their values (see the variant's own note).
+        5 => {
+            let mut service = [0u8; 4];
+            let mut lane = [0u8; 4];
+            let mut offered = [0u8; 4];
+            let mut refused = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            lane.copy_from_slice(&buf[5..9]);
+            offered.copy_from_slice(&buf[9..13]);
+            refused.copy_from_slice(&buf[13..17]);
+            ControlChannelCmd::CarrierReport(ServiceId(service), lane, offered, refused, buf[17])
+        }
+        // The drain answer: service, lane, state — the same hand-decoded
+        // fixed-width form as the report, and for the same reason.
+        6 => {
+            let mut service = [0u8; 4];
+            let mut lane = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            lane.copy_from_slice(&buf[5..9]);
+            ControlChannelCmd::LaneDrainAck(ServiceId(service), lane, buf[9])
+        }
         // The only tag left is 4, the stripe request: the dispatch above
-        // returned on 0 and 1 and bailed on everything but 2, 3 and 4. Parsed
-        // with postcard as one tuple rather than field by field, so the reader
-        // and the writer agree on the layout by construction: a reordered or
-        // resized field fails here instead of silently reading the next
-        // frame's bytes as an index.
+        // returned on 0 and 1 and bailed on everything but 2, 3, 4, 5 and 6.
+        // Parsed with postcard as one tuple rather than field by field, so the
+        // reader and the writer agree on the layout by construction: a
+        // reordered or resized field fails here instead of silently reading the
+        // next frame's bytes as an index.
         _ => {
             let (service_id, group, index, count): (ServiceId, [u8; 4], u8, u8) =
                 postcard::from_bytes(&buf[1..11]).with_context(|| "Failed to deserialize cmd")?;
@@ -1471,6 +1719,32 @@ mod tests {
         }
     }
 
+    /// A lane's prologue is eight fixed bytes — the service, then the lane —
+    /// and it round-trips as the pair the reader needs. The lane half is what
+    /// lets two ends talk about one physical connection without agreeing on an
+    /// index: a slot is one end's routing bookkeeping and is reused, a lane is
+    /// the connection that actually rode a carrier.
+    #[cfg(all(
+        feature = "client",
+        feature = "server",
+        feature = "transparent",
+        feature = "multiplex",
+        target_os = "linux"
+    ))]
+    #[tokio::test]
+    async fn a_lane_prologue_carries_the_service_and_the_lane() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        let service = ServiceId::new(0xDEAD_BEEF);
+        let lane = LaneId::new(0x00C0_FFEE);
+        write_lane_prologue(&mut tx, service, lane).await.unwrap();
+        let (read_service, read_lane) = read_lane_prologue(&mut rx).await.unwrap();
+        assert_eq!(read_service, service);
+        assert_eq!(read_lane, lane);
+        assert_eq!(read_lane.get(), 0x00C0_FFEE);
+    }
+
     /// The prologue is exactly four raw bytes, written in big-endian order,
     /// and nothing else precedes a v4 stream's first byte.
     #[cfg(all(feature = "client", feature = "server"))]
@@ -1803,6 +2077,66 @@ mod tests {
         tx.write_u16(over_cap).await.unwrap();
         let err = read_session_cmd(&mut rx).await.unwrap_err();
         assert!(format!("{err:#}").contains("too large"));
+    }
+
+    /// A lane-drain ask and its answer round-trip, and the answer is exactly
+    /// the width the reader assumes.
+    ///
+    /// The width matters more than usual here: the client's reader decides how
+    /// many bytes to consume from the tag alone, so a drain answer that grew a
+    /// field would silently reframe the *next* command on the session.
+    #[tokio::test]
+    async fn a_lane_drain_ask_and_its_answer_roundtrip() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(4096);
+        write_session_cmd(
+            &mut tx,
+            &SessionCmd::DrainLane(ServiceId::new(7), [1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let back = read_session_cmd(&mut rx).await.unwrap();
+        assert!(matches!(
+            back,
+            SessionCmd::DrainLane(id, lane) if id == ServiceId::new(7) && lane == [1, 2, 3, 4]
+        ));
+        write_session_cmd(
+            &mut tx,
+            &SessionCmd::CancelDrain(ServiceId::new(7), [1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let back = read_session_cmd(&mut rx).await.unwrap();
+        assert!(matches!(back, SessionCmd::CancelDrain(..)));
+
+        // The answer: tag 6, then service, lane and state — 9 bytes, whatever
+        // the values are (the state is one byte, not a varint).
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_all(&[
+            6, 0, 0, 0, 7, // service 7
+            1, 2, 3, 4, // lane
+            1, // ready
+        ])
+        .await
+        .unwrap();
+        let back = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(
+            back,
+            ControlChannelCmd::LaneDrainAck(id, lane, state)
+                if id == ServiceId::new(7) && lane == [1, 2, 3, 4] && state == 1
+        ));
+
+        // And a following command still lands on its own tag: the answer's
+        // length is what makes that true.
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_all(&[6, 0, 0, 0, 7, 1, 2, 3, 4, 0, 1])
+            .await
+            .unwrap();
+        let first = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(first, ControlChannelCmd::LaneDrainAck(..)));
+        let second = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(second, ControlChannelCmd::HeartBeat));
     }
 
     /// The transparent data channel's framing: `[u16 length][packet]`, and the

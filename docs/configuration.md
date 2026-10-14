@@ -78,7 +78,7 @@ A typical setup:
 > The 0.8 client-side blocks use `default_`-prefixed names for the
 > client-wide defaults — `[client.control]` (`default_remote_addr`,
 > `default_heartbeat_timeout`, `default_retry_interval`) and `[client.data]`
-> (`default_data_addr`, `default_carrier`) — so they read
+> (`default_data_addr`, `tunnels`) — so they read
 > distinctly from the per-service overlay keys on
 > `[client.services.<name>]` (`protocol`, `remote_addr`, `token`,
 > `retry_interval`, `carrier`, `transport`, `udp_workers`,
@@ -114,8 +114,8 @@ write). Write this instead:
 
 | Removed key | Write instead |
 |---|---|
-| `[client.data].default_count` | Nothing: the pool's width is `[client.data.tcp].tunnels` (or `[client.data.kcp].tunnels`), default 4 |
-| `[client.services.<name>].count` | Nothing: the pool belongs to the session and carrier rather than to one service. `[client.data.tcp\|kcp].tunnels` is its width |
+| `[client.data].default_count` | Nothing: the pool's width is `[client.data].tunnels`, default 4 |
+| `[client.services.<name>].count` | Nothing: the pool belongs to the session rather than to one service. `[client.data].tunnels` (or the service's own) is its width |
 | `[client.services.<name>].pool_size` | `[client.services.<name>].udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
 | `[client.services.<name>].heartbeat_timeout` | Nothing: the server declares its cadence in the session ack and the client derives the timeout from it. `[client.control].default_heartbeat_timeout` remains as an optional floor |
 | `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the carrier connections one client may hold; 0 = unlimited) |
@@ -133,7 +133,7 @@ service type now:
 
 | Removed key | Write instead |
 |---|---|
-| `[client.data].default_mode` | Nothing: a forwarding service always multiplexes. `[client.data.tcp\|kcp].tunnels` is how wide its pool is |
+| `[client.data].default_mode` | Nothing: a forwarding service always multiplexes. `[client.data].tunnels` is how wide its pool is |
 | `[client.services.<name>].mode` | Nothing: the shape follows the protocol — a forwarding service multiplexes, a transparent claim never does |
 
 A claim's channels *are* its carrier connections — a claim's throughput is the
@@ -150,9 +150,9 @@ The first choice is the mode: `[client]` forwards to a local application,
 [Transparent (L3) services](#transparent-l3-services)) — and it is a choice
 about the process, not about a service, so it comes before anything below.
 
-The defaults — a pinned pool of `tunnels = 4` multiplexed connections,
-`carrier = "tcp"`, plain transport — are the right starting point for almost
-everyone. Deviate only when the tree says so, change one thing at a time, and
+The defaults — a pinned pool of `tunnels = 4` multiplexed connections, plain
+transport, and a data plane that tries KCP before falling back to TCP — are the
+right starting point for almost everyone. Deviate only when the tree says so, change one thing at a time, and
 measure the result on your own path: the published runs, their numbers and how
 to reproduce them are
 in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
@@ -167,7 +167,7 @@ flowchart TD
     D -- Typical --> H["keep tunnels = 4"]
     G --> I{"Path quality?"}
     H --> I
-    I -- "High pure latency +<br/>UDP game (100ms+ RTT)" --> J["A/B test carrier = kcp"]
+    I -- "High pure latency +<br/>UDP game (100ms+ RTT)" --> J["measure KCP vs TCP<br/>with MOLEHILL_DATA_CARRIER"]
     I -- Otherwise --> Z["Done - tune per service<br/>via [client.services.*] overrides"]
     J --> Z
 ```
@@ -206,14 +206,11 @@ default_remote_addr = "example.com:2333" # Necessary. The address of the server
 # default_heartbeat_timeout = 65 # Optional. Application-layer heartbeat timeout. Unset (the default) derives it from the cadence the server declares in the session ack: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. A value below that floor is refused at startup (it would time out a healthy server); 0 disables the check
 default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
 
-[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override default_carrier individually — see the per-service keys in `[client.services.*]` below
-# default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). With `default_carrier = "kcp"` the KCP sessions dial the control address over UDP — TCP control and UDP KCP can share one port (distinct protocols)
-default_carrier = "tcp" # Optional. Default data carrier: "tcp" (default) rides the control channel's wire stack; "kcp" uses KCP-over-UDP sessions (feature `kcp`; the server opens its KCP listener lazily on the first `kcp` registration — no server-side opt-in). Both transport types compose with KCP: with `noise` the same Noise handshake wraps each KCP session, with `plain` the session stays unencrypted. The sessions are this carrier's pool's tunnels
-# shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool per carrier (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
-[client.data.tcp] # Optional. The TCP carrier's tunnel count
-# tunnels = 4 # Optional. How many tunnels this carrier's pool establishes at service start and keeps. Validated `>= 1` and `>= ` the UDP-derived floor of the services that share it; clamped to 1..=64. Default: 4
-[client.data.kcp] # Optional. The KCP carrier's count, the same key and rules
-# tunnels = 4
+[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override `tunnels` individually — see the per-service keys in `[client.services.*]` below
+# default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). The KCP sessions dial that address over UDP, so a TCP control channel and the KCP data plane can share one port (distinct protocols)
+# tunnels = 4 # Optional. The pool's width: how many carrier connections this client holds for a service (or, with `shared_pool`, for a session). Default: 4, raised to the UDP-derived floor of the services that share the pool. Validated `>= 1` and `>=` that floor; clamped to 1..=64
+# shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
+# The carrier is deliberately **not** a key here: the data plane tries KCP (feature `kcp`) and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. A transparent claim goes further and moves a lane *while it runs*: each lane is measured (what the server offered it, what that lane's queue refused there, what the client injected off it), and a lane whose carrier is refusing a material share of what it is offered is handed over to the other one — the peer stops placing new flows in it, and it is retired once both ends agree it holds nothing, so a running flow finishes where it is and nothing is reordered. `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one, for a measurement or a test that needs the paths apart — it also disables the fallback and the automatic move
 
 [client.transport] # Optional. How the wire is wrapped; applies to both planes
 type = "plain" # Optional. Possible values: ["plain", "noise"]. Default: "plain"
@@ -235,7 +232,7 @@ nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default
 retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
-carrier = "tcp" # Optional. Override `client.data.default_carrier` for this service only. Inherits the default when unset
+# tunnels = 2 # Optional. This service's own pool width; inherits `[client.data].tunnels` when unset
 transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
 
 [client.services.service2] # Multiple services can be defined
@@ -309,7 +306,7 @@ restarting client takes over cleanly.
 
 The `multiplex` feature is part of the default feature set. A registered
 forwarding service runs over a **fixed pool of tunnel connections**
-(`[client.data.tcp|kcp].tunnels`, default 4), and every data channel it carries
+(`[client.data].tunnels`, default 4), and every data channel it carries
 becomes a yamux stream inside one of them. This removes the per-connection
 handshake latency (TCP connect plus, with `noise`, the Noise handshake) and cuts
 FD usage under many concurrent visitors. The shape is not a key: a forwarding
@@ -345,11 +342,15 @@ service always multiplexes (there is no `mode` to write), and a
   stream to retire and is refused if none does. Size `tunnels` for the
   concurrency you expect; the measurements behind the sizing are in
   [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
-- **Experimental (transport comparison arms):** `carrier = "kcp"` runs the
-  data plane as KCP-over-UDP sessions instead of TCP connections (feature
-  `kcp`, in the default set). KCP is a userspace ARQ protocol that trades
-  throughput for UDP session quality, so treat it as an A/B arm rather than
-  a default: the measured comparison against the TCP carriers is in
+- **The carrier is not a choice you write.** The data plane dials KCP
+  (feature `kcp`, in the default set) and falls back to TCP when a session
+  cannot be established, because which of the two works is a property of the
+  network between the two ends: UDP may be blocked, shaped, or fine today and
+  blocked tomorrow. A fallback is announced once at `INFO`, is re-probed every
+  60 s, and never changes how packets are carried once a pool or a lane is up.
+  To *measure* the two paths apart — or to reproduce a test that needs TCP —
+  `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one and disables the fallback; the
+  comparison itself is in
   [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
   The crypto stack is unchanged — with
   transport `noise` the same Noise handshake wraps each KCP session — and
@@ -366,7 +367,11 @@ service always multiplexes (there is no `mode` to write), and a
   conflict (remember to open both protocols in the firewall/NAT). Fixed KCP
   parameters (recorded
   for comparability): stream mode, nodelay 10 ms interval, fast-resend 2,
-  congestion control off, snd window 2048 / rcv window 4096 segments,
+  congestion control off, snd window 8192 / rcv window 4096 segments
+  (the send window is the throughput ceiling on a lossy path: 2048 carried
+  533 Mbit/s at the ~44 ms round trip such a path settles at, and 8192 with
+  the peer's 4096-segment window as the cap both removes that ceiling and
+  leaves a clean path's numbers where they were),
   **datagram size follows the path** (1400 bytes — what any path carries —
   up to 8 KiB where the path's own MTU allows it; the kernel's path-MTU
   answer is re-read once a second, so a session on a 1500-byte path never
@@ -383,16 +388,13 @@ service always multiplexes (there is no `mode` to write), and a
   keys — `deny_unknown_fields`). Delete those tables and every data channel is
   a connection of its own.
 
-**Per-service overrides.** `[client.data]` holds the defaults; each service
-can override `carrier` individually on its own
-`[client.services.<name>]` block. The same rules as the global block apply
-to the merged view: `carrier = "kcp"` needs the `kcp` feature. A service's
-carrier selects which of the two counts (`[client.data.tcp|kcp].tunnels`) its
-pool is established with; with `[client.data].shared_pool` every service of the
-session shares one pool per carrier. So one client can put a latency-sensitive
-service on TCP and a service whose path blocks TCP on KCP, or share one pool
-between two services, without any server configuration change: the server adapts
-per connection and opens its KCP listener on the first `kcp` registration (there
+**Per-service overrides.** `[client.data]` holds the defaults; each service can
+override `tunnels` individually on its own `[client.services.<name>]` block, and
+nothing else about the data plane: the carrier follows the path and the shape
+follows the protocol. So one client can give a busy service a wider pool than the
+rest, or share one pool between two services, without any server configuration
+change: the server adapts per connection and opens its KCP listener on the first
+registration that declares it (there
 is no per-carrier server configuration). The same overlay pattern covers the
 control defaults: `token` and `remote_addr` override `[client].default_token` and
 `[client.control].default_remote_addr`, and `retry_interval` overrides
@@ -478,7 +480,7 @@ address routed to the server, and a single-IP server — are in
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
-| `[transparent.data.tcp\|kcp].tunnels` | the carrier's **lane budget**: how many carrier connections this client holds for all of its claims together on that carrier, divided equally among the claims that draw on it. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: one lane per claim — the shape a claim has always had — and a budget below the claim count is refused with the number to write. At most 1024 |
+| `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together on that carrier, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: one lane per claim — the shape a claim has always had — and a budget below the claim count is refused with the number to write. At most 1024. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget is what decides how many connections exist and the traffic decides who holds them. Three consequences of the division being an equal share and of lending: with the **default** (no `tunnels` written, so one lane per claim) no claim ever has a lane to spare and nothing is lent — the budget is what gives the mechanism room, so an operator who wants it writes at least two lanes per claim; a budget below the claim count is refused (each claim keeps at least one); and a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
@@ -497,12 +499,16 @@ moved 6 % fewer wire bytes, took 33 % less CPU per packet and carried 65 % more
 round trips per second than the same claim as one stream of a pool
 ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
 
-`[transparent.data]` takes the same keys as `[client.data]` — `default_data_addr`,
-`default_carrier` and the two per-carrier `tunnels` counts — with a different
-meaning for the count. A forwarding `tunnels` is a pool's width; a claim's is a
-budget of connections, because there is no pool: each claim's share is
-`tunnels / claims` on its carrier, never below one, so
-`[transparent.data.tcp].tunnels = 4` with two claims gives each of them two
+`[transparent.data]` takes the same keys as `[client.data]` —
+`default_data_addr` and `tunnels` — plus `lend`
+(default `true`), which is whether an idle lane of one claim may be lent to a
+sibling carrying more flows than lanes. `lend = false` holds the equal split
+static; the mechanism's worth depends on what limits the path
+([Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when)), and this is the
+key that turns it off. The count itself has a different meaning here. A
+forwarding `tunnels` is a pool's width; a claim's is a budget of connections,
+because there is no pool: each claim's share is `tunnels / claims`, never below
+one, so `[transparent.data].tunnels = 4` with two claims gives each of them two
 connections, and `tunnels = 1` with two claims is refused with `2` to write. A
 claim's inner flows are spread across its lanes (one flow per lane, by a hash of
 its five-tuple), so more lanes are how a claim that carries many concurrent
@@ -611,17 +617,20 @@ Consequences worth stating, because they are what keeps a busy log readable:
 ### Diagnostics switches (opt-in)
 
 Six environment variables turn on aggregated diagnostics, one `INFO` line per
-second per subject. They are off by default, they never change the forwarding
-path, and turning one on is the consent — a line an operator would have to
-raise `RUST_LOG` to see never reaches anything:
+second per subject, one more forces the data plane's carrier, and a last one
+schedules a single diagnostic carrier switch. The six are off by default, they
+never change the forwarding path, and turning one on is the consent — a line an
+operator would have to raise `RUST_LOG` to see never reaches anything:
 
 | Switch | Emitted | Carries |
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | one line per second per tunnel | cumulative yamux framing counters (`written`, `read`, `bytes`) — frames per second, and with a CPU sample, CPU per frame |
-| `MOLEHILL_KCP_STATS=1` | one line per second per process | the KCP adapter's cumulative counters (`datagrams_in`/`out`, `retransmits`, `acks_out`, `sacks_sent`, `blobs_out`, pump rounds) and the coarse per-phase timings that split a segment's userspace cost into intake, delivery, writer drain, wire drain and ARQ update |
+| `MOLEHILL_KCP_STATS=1` | one line per second per process | the KCP adapter's cumulative counters (`datagrams_in`/`out`, `retransmits`, `acks_out`, `sacks_sent`, `blobs_out`, pump rounds, `datagram_b` — the datagram size the last session adapted to, which is the one reading a size question needs) and the coarse per-phase timings that split a segment's userspace cost into intake, delivery, writer drain, wire drain and ARQ update |
 | `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, configured count, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with the reason for each (`+repair:1->2`, `-dead:2->1`) — in a healthy run there are none, and a pool whose `size` sits below its `count` is a pool whose repair is being refused |
 | `MOLEHILL_PLACEMENT_STATS=1` | one line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
 | `MOLEHILL_UDP_STATS=1` | one line per second per process | the UDP affinity table's size, its evictions, and each worker's pinned peers |
+| `MOLEHILL_DATA_CARRIER=tcp\|kcp` | nothing (it changes behaviour) | forces the carrier the data plane dials, for a test or a measurement that needs the two paths apart: `kcp` makes a KCP failure final instead of falling back, `tcp` skips the attempt entirely. Not a deployment knob — the carrier is chosen at runtime because which one works is a property of the network — and a value that is neither is reported and ignored. To measure the *fallback* rather than force it, block UDP on the path instead: that is what the bench model's `udp_blocked` condition does, and it measures the product's own decision |
+| `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` | one line when it fires, per claim | at that many seconds after the pool starts, moves every transparent claim of the client to the other carrier and asks the peer to drain its busiest lane, so the replacement is dialed on the new carrier. The drain is the same two-sided one the automatic policy uses: the lane stops taking new flows on **both** ends, keeps the flows already on it (so nothing is reordered), and is retired only once both agree it holds none — which means a lane still carrying a long-lived flow is not taken, and the switch's effect is the new flows that follow. It exists to **measure** what a carrier switch buys and what it costs — the production behaviour is a measured decision inside the client, not a knob — and a value that is not a whole number of seconds is reported and ignored |
 | `MOLEHILL_L3_STATS=1` | one line per second per transparent data path, plus one line per lane slot of every claim on its device | the transparent data path's cumulative counters: `forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)` and `channel_errors`; then, per claim, each slot's `live`, `flows`, `forwarded` and `no_channel` — which lane carried how much, how many flows are placed in it, and which one a replacement window cost. This is how a lane set is told from a stack (all the traffic on `member=0` is a claim that is not spreading), and `no_channel` on a slot is the traffic a dead lane dropped |
 
 The counters are cumulative, so a reader that knows the window — or takes the

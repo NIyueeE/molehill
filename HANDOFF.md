@@ -797,7 +797,7 @@ change, not here.
 
 ### The derived data plane: what landed, and what is next
 
-Two commits of the L12–L18 plan are in:
+The plan's L12–L18 are in, as four commits:
 
 - the schema change: `mode` and `members` are gone, `uses_pool` derives the
   shape from the service type, `[transparent.data.tcp|kcp].tunnels` is the
@@ -807,40 +807,987 @@ Two commits of the L12–L18 plan are in:
 - the placement table: a claim's flows are placed once and remembered, so a
   lane change cannot reorder a flow, a new flow never lands in an empty slot,
   an entry expires after 60 s of silence in either direction, and
-  `MOLEHILL_L3_STATS` reports each lane's `flows`.
+  `MOLEHILL_L3_STATS` reports each lane's `flows`;
+- the valve (L17): `[server.data].max_tunnels_per_client` now counts a
+  transparent claim's lanes, not just multiplexed tunnels, and the harness case
+  that proves it (cap `1` against a two-lane claim) is in `run.sh`;
+- the allocator (L15): `src/transparent/lanes.rs` decides, `LanePool` in
+  `src/core/client.rs` reads the hubs and dials, a lane is asked to end only
+  when it holds no flow at all, and the receiver's lane is dialled only after
+  the donor's has ended. The target is **a lane per talking flow**, and the
+  first measurement of it is the harness's lending case: two claims sharing a
+  budget of four, one carrying the 16-flow arm, the other nothing —
+  `Lane allocator: lent lane 0 of claim 10.99.0.1:8444 to claim 10.99.0.1:8443
+  on the Tcp carrier`, with the busy claim byte-exact through the change.
 
-Next, in the order they should be picked up (each is a session of its own, and
-each needs its own evidence):
+**Lending, measured (2026-10-11).** Four A/B runs through the model, each on
+`bulk-n` (eight flows on one claim), ten rounds, with the run's own A/A twin
+beside it. The final three are the ones to quote: they use the **same binary**
+and two catalog arms that differ only in the knob
+(`l3-budget10-lending` against `l3-budget10-nolend`, i.e.
+`[transparent.data].lend` on and off), so the only thing between them is the
+decision under test.
 
-1. **Reclaim an idle lane for a busy claim (L15).** The hub half is almost
-   there — `MemberSlot::flows` is the idleness signal the rule needs — but the
-   runtime is the work: a per-claim lane target the client's transparent
-   service owns, a `draining` mark on the donor's slot *before* it is dropped
-   (so no new flow can land in the window), a lane task that can be asked to
-   end, and the server's replacement request suppressed for a lane that was
-   retired on purpose. It needs a **mixed-claims scenario in the bench model**
-   (one busy claim, several idle ones) before it is a claim, not after: the
-   mechanism's only evidence is the throughput a busy claim gains.
-2. **The server's valve over transparent lanes (L17).** The cap counts
-   multiplexed tunnels only (registered by `reserve_tunnel` on the tunnel
-   hello), and a claim's lane is a plain data channel, so nothing bounds it. The
-   fix is `SessionGate { sessions, nonce, cap }` threaded into
-   `ControlChannelHandle::new` → `spawn_transparent_service` →
-   `run_transparent_service`, one reservation per arriving lane held for the
-   member's life, and the same once-INFO-then-DEBUG refusal the tunnel valve
-   uses. It is a one-call-chain change, but it touches the session registry,
-   which is why it wants a fresh pass rather than the tail of another one.
-3. **The mux×1 gap (L18).** The baseline is measured and recorded above
-   (9.15 against 18.95 Gbit/s, +87 % CPU per byte, 15.35 % A/A floor). The
-   attribution is the first step — a `perf` profile of the `l4-mux2` arm, to
-   see whether the per-write `Vec::from`, the 32 KiB split, the driver hand-off
-   or the window updates own the gap — and each candidate lands as its own
-   commit with its own A/B, reverted if it does not clear the floor.
-4. **The model/docs sweep.** `docs/benchmarks.md` (+ `.zh.md`) still describes
-   the retired arms inside its measurement records; each record is history and
-   stays, but the current catalog's names (`l3`, `l3-lanes4`, `l3-kcp4`) want a
-   note where a reader meets them, and the mixed-claims scenario of (1) is a new
-   scenario with its own row.
+| condition (leg) | lending | no lending | A/A floor | verdict |
+|---|---|---|---|---|
+| clean loopback | 5.107 Gbit/s | 5.086 | 2.09 % | indistinguishable (+0.4 %) |
+| **100 ms, carrier leg** | **2.395** | **1.754** | 11.39 % | **CLAIM: +26.75 %** (materiality 10 %, sign agreement 1.0, n=[10, 10]) |
+| 1 % loss, carrier leg | 5.105 | 4.509 | 12.04 % | directional +11.69 % (sign agreement 0.8 — one round of ten disagreed) |
+
+An earlier, cruder run of the same shape — a scratch build with the allocator
+stubbed out as the second *binary* — put the long-haul effect at +39.95 %
+(2.400 against 1.715). Same direction, larger point estimate, and it is the run
+that found the retire path's cost (below); the arm-based numbers supersede it
+because anyone can reproduce them from the catalog.
+
+What that says, in order of how much it matters:
+
+- **Lending's value is conditional on what limits the path.** On a clean
+  loopback the L3 path is limited per *packet* (the TUN path's own cost, see the
+  L3 attribution in `docs/benchmarks.md`), so more lanes buy nothing. With the
+  carrier connections long-haul, a claim's throughput is limited per
+  *connection* (window over RTT), and spreading its eight flows over the lanes
+  the idle claims lent it is worth **+27 %** — a claim by the model's own rules.
+  Under 1 % loss the same comparison is +12 % and directional: the effect
+  survives loss, but ten rounds cannot separate it from the run's 12 % scatter.
+- **It buys that with CPU and memory, not efficiency**: under the long-haul
+  condition `cpu_s_per_gbit` 0.846 against 0.783 (+8 % per byte),
+  `cpu_cores` +31.89 % and `rss_peak_mib` +11.27 % (both directional) — more
+  connections carrying more traffic. A deployment on a fast, short path should
+  expect neither the throughput nor the cost, and can turn the mechanism off
+  with `[transparent.data].lend = false`.
+- **The condition's leg decides whether the experiment can see anything.** The
+  same A/B with `--condition rtt100 --condition-leg visitor` (the default) gave
+  +2 % and nothing above the floor, because the *carrier* was never the
+  bottleneck; four runs went into learning that.
+- **The retire path cost 8 % before it was fixed.** The first A/B had the
+  pre-lending binary ahead (4.857 against 5.072 in one run, consistently across
+  four), and the cause was a lock the packet path took per relayed packet
+  (`8bee843`): mirroring the draining mark in an atomic and building the retire
+  wait once per lane instead of once per packet recovered more than the whole
+  regression. Without that measurement the cost would have shipped as "lending
+  made it slightly slower".
+- **The model could not state a config-axis claim until this run.** Two catalog
+  arms were never compared: `_pairs_of` paired each arm with the control and
+  each `~b`/`~aa` twin with its base, so a decision that is a *field* rather
+  than a second binary had no verdict. An arm may now declare `against = "<arm
+  id>"` and the analysis pairs them — which is how the table above is a claim
+  and not two columns a reader has to subtract.
+
+Still true, and the reason the mechanism is designed the way it is: **a single
+flow cannot be spread over two lanes** — its packets must stay in order, which
+is what pins it to one — so a one-flow workload gains nothing from lending by
+construction, and the target is one lane per talking flow.
+
+### KCP, second thread: the inner-UDP loss item, measured (2026-10-11)
+
+The recorded item was "inner-UDP loss 1.05 % vs 0.60 %" on the KCP carrier. It is
+now measured the way §10 requires — the metric's own floor **and** the run's own
+A/A — with the contrast the new condition gives: the same arm, the same path, the
+carrier chosen by the product (KCP) or forced for isolation (TCP).
+
+```
+sudo -n uv run benches/scripts/bench/bench.py run --profile smoke --arms l3,l4 \
+  --scenarios udp-pace,udp-ladder --condition loss1 --condition-leg tunnel \
+  --rounds 3 --warmup-rounds 1 --aa --out /home/dsh/tmp/k4-udp-kcp.json
+sudo -n env MOLEHILL_DATA_CARRIER=tcp uv run benches/scripts/bench/bench.py run \
+  --profile smoke --arms l3,l4 --scenarios udp-pace,udp-ladder --condition loss1 \
+  --condition-leg tunnel --rounds 3 --warmup-rounds 1 --aa --out /home/dsh/tmp/k4-udp-tcp.json
+uv run benches/scripts/bench/bench.py compare /home/dsh/tmp/k4-udp-kcp.json \
+  /home/dsh/tmp/k4-udp-tcp.json
+```
+
+Both runs are on `6b5ea61`, three rounds an arm, one warm-up, `--aa` on, the
+`tunnel` leg shaped with 10 ms delay + 1 % loss. `A` is the KCP run, `B` the
+TCP one.
+
+**The recorded item is noise.** On the paced session (`udp-pace`, 2000
+datagram/s, 1200 B) the inner-UDP loss is 0.821 % [0.775..0.975] on KCP against
+0.920 % [0.736..0.980] on TCP — a 0.1-point difference, inside the same run's
+A/A twin (KCP twin 1.075 %) and far below the metric's 1.0-point materiality
+floor. It is not a claim in either direction, so the note that started this
+thread was reading scatter.
+
+**What is a claim, and is worth the optimisation work:**
+
+1. **KCP's ARQ collapses where TCP's holds**, on the bulk ladder with the same
+   1 %-loss tunnel leg: at 1000 Mbit/s offered, KCP delivers 384.6 Mbit/s with
+   **59.5 %** inner-UDP loss against TCP's 986.6 Mbit/s with **0 %**; at
+   2000 Mbit/s it is 386.0 Mbit/s / 79.0 % against 1972.9 Mbit/s / 0.002 %
+   (`udp_recv_mbit` -61.0 % and -80.4 %, `udp_loss_pct` +59.5 and +79.0 points,
+   every paired round agreeing, both floors cleared). Above roughly 150 Mbit/s
+   the KCP carrier stops being a usable path for a UDP workload on a lossy link
+   while the TCP fallback is unaffected — and note *both* carriers make inner
+   UDP reliable, so this is KCP's reliability machinery losing, not a
+   retransmission-policy difference.
+2. **A paced UDP session costs 6.8× the CPU per delivered byte on KCP**:
+   `cpu_s_per_gbit` 83.04 vs 12.19 (+581 %, floor 15 %), `syscalls_per_s` +49.6 %
+   and `bytes_per_syscall` -30.6 % beside it, `rss_peak_mib` +19.1 %. The same
+   run shows the *latency* shape KCP is chosen for (gap p99 57.6 ms against
+   TCP's 248.8 ms), but it is not a claim: the TCP twin's own rounds disagreed
+   (one round saw 521 ms), which is exactly what the A/A floor is for.
+
+**A method artefact hid part of the number, and a deeper queue names the real
+ceiling.** `loss1` pins no netem queue limit, so the class runs on netem's
+default 1000-packet queue: on a 1 Gbit/s ladder burst that queue tail-drops
+*beyond* the 1 % it emulates, and part of what looked like KCP's loss was the
+shaper's. The new `loss1_deep` class is the same 1 % loss with a 100 000-packet
+queue, and the ladder cell moves from 384.6 Mbit/s / 59.5 % loss to 545.0 /
+42.5 % — while the TCP fallback on the *same* class delivers 988.4 Mbit/s with
+**0.051 %** loss (A/A twin 985.8 / 0.010 %, three rounds, `--aa`). So the
+carrier gap is real and large once the shaper stops adding its own drops: the
+KCP carrier carries about **55 % of what the TCP fallback carries** on a
+1 %-loss path, and the A/A twin shows the run can resolve differences of a few
+percent, so this is not scatter.
+
+**First optimisation attempt: the RTO floor. REVERTED — it did not clear the
+floors.** The counters said `rto_ms=30` with `srtt_ms=16` (the nodelay floor
+binding while the path's queueing delay exceeds it) and `resends_rto=71631` of
+`retransmits=100021`, so raising the nodelay minimum RTO to 60 ms was the cheap
+test. Built as a second binary and A/B'd in one run (`--ab-arm l3 --binary
+…/molehill-base --binary-b …/molehill-rto60`, `loss1_deep`, tunnel leg, 3 rounds
++ 1 warm-up, `--aa`, 60 samples): `udp-ladder[1000M]` throughput 536.7 →
+547.5 Mbit/s (+2.0 %) and inner loss 42.04 → 42.98 %, with the run's own A/A twin
+at 539.1 Mbit/s — inside the run's noise, and **no claim cleared the floors**.
+The change is reverted (the product source is byte-identical to the baseline,
+verified by binary hash) and the engine keeps upstream's floor. What that rules
+out is the floor itself: the retransmissions are not caused by an
+under-estimated RTO, so the 21 % re-send rate is either affordable or comes from
+somewhere else in the send path.
+
+**The diagnosis first, and it named the ceiling: the send window.** Running the
+ladder under `MOLEHILL_KCP_STATS=1` and reading the deltas at the busiest second
+(the 1 Gbit/s cell) gives, on the **sender**: `datagrams_out +54791`, of which
+`retransmits +3135` (5.7 %, not the 21 % the shallow-queue class showed),
+`wait_snd_peak=4107` — the send queue sitting at its limit (`2 × snd_wnd`) while
+the app keeps writing — and per-phase times of `ms_output +122`, `ms_writer
++24.7`, `ms_input +17.5`, `ms_update +15.1` per second, i.e. **~18 % of a core**,
+with the pacer at 12 Gbit/s. The receiver's second is `datagrams_in +21373` with
+`acks_out +21373` (one ack per datagram) at ~8 % of a core. So neither end is
+busy, nothing is spilling, no window is *waiting* on the receive side — and the
+sender's queue is full: the ceiling is in-flight data, not CPU.
+
+The arithmetic then fits the measurement: 2048 segments × 1472 B ≈ 2.8 MiB over
+the ~44 ms round trip a lossy path with a large buffer settles at is **~533
+Mbit/s**, and the ladder cell measured 533-556 Mbit/s across three different
+queue classes. That is the window, exactly.
+
+A third condition followed from the same reasoning: `loss1_deep`'s 100 000-packet
+queue (≈147 MB) is not a network anyone has — it is deep enough to add ~1 s of
+queueing at these rates — so `loss1_buf` was added (10 000 packets ≈ 14.7 MB,
+≈27 ms of standing queue at 545 Mbit/s): deep enough that tail drops are not the
+story, shallow enough that the RTT stays a path property. The baseline measures
+556.5 Mbit/s / 42.3 % there, i.e. the same ceiling.
+
+**Third optimisation attempt: send window 2048 → 8192 segments. KEPT — it
+clears both floors, and the checks are clean.** Two-binary A/B, `--aa`, three
+rounds each:
+
+| cell (`loss1_buf`, tunnel leg) | baseline (2048) | candidate (8192) |
+|---|---|---|
+| `udp-ladder[1000M]` | 556.5 Mbit/s, **42.31 %** loss | **0.16 / 0.37 / 0.66 %** loss per round, +43.2 % delivered |
+| `udp-ladder[2000M]` | 533.5 Mbit/s, 70.87 % | +49.5 % delivered, −27.0 points loss |
+| `udp-ladder[5000M]` | — | −16.3 points loss |
+
+Every paired round agreed in sign and both floors cleared (`udp_loss_pct`
++41.9 points against a 1-point floor; `udp_recv_mbit` +43.2 % against 10 %). The
+cost is real and stated: `cpu_cores` +47.5 % and `cpu_s_per_gbit` +46.6 % on that
+cell (it carries 43 % more), `rss_peak_mib` +15 %; at 2000M the extra cost is
+−36 % cores. The two regression checks the old note demanded: on a clean path
+with one lane (`l3`, `bulk-1`/`bulk-n`/`rr-16`/`udp-pace`) the only claim in
+twenty-four comparisons is in the candidate's favour (`setup_p50_ms` −26 %), and
+on the four-tunnel burst case (`l4`, clean, `bulk-1`/`bulk-n`) there is **no
+claim at all** (bulk-n 9.704 against 9.789 Gbit/s) — so the 2048-era burst
+collapse does not reproduce at 8192 with the current socket buffers and pacer.
+
+**Where the inner-UDP item stands after the window fix (2026-10-11).** The same
+`loss1_buf` class, three rounds an arm with `--aa`, KCP against the forced TCP
+fallback, `l3` and `l4` in one run each:
+
+| `udp-ladder` cell | KCP (`l3`) | TCP (`l3`) | KCP (`l4`, four tunnels) | TCP (`l4`) |
+|---|---|---|---|---|
+| 200M | 197.7 Mbit/s, 0.000 % loss | 194.8, 1.465 % | 195.1, 1.163 % | 193.8, 1.774 % |
+| **1000M** | **985.7, 0.120 %** | **986.6, 0.009 %** | 840.9, 14.486 % | 837.0, 14.323 % |
+| 2000M | 1033.7, 43.99 % | **1973.6, 0.000 %** | 870.2, 53.7 % | 874.1, 54.2 % |
+
+Three things this settles:
+
+1. **The recorded item is closed at the rate that matters.** At 1 Gbit/s the KCP
+   carrier now delivers 985.7 Mbit/s with 0.120 % inner-UDP loss against TCP's
+   986.6 / 0.009 % — the 42 % the earlier rounds measured was the 533 Mbit/s
+   send-window ceiling starving the path, not loss recovery failing, and the
+   fix is the 8192-segment window that shipped.
+2. **Above 1 Gbit/s the carrier still caps at ~1.05 Gbit/s** (2000M cell) while
+   TCP reaches 1.97 — that is the receive-window ceiling the fourth attempt
+   chose not to buy, and this run is the independent confirmation of that
+   choice: the ceiling is real, deliberate, and stated.
+3. **The remaining KCP cost is CPU per delivered byte**: 1.661 s/Gbit against
+   TCP's 0.586 at the same 1 Gbit/s cell — **2.8×** — with the four-tunnel arm
+   identical on both carriers (2.29 against 2.05) because the multiplexer, not
+   the carrier, is the ceiling there. This is the same family as the paced-UDP
+   figure from the first thread (6.8× per delivered byte at 2.4 Mbit/s), and it
+   is the open item the next round starts from: the carrier's per-packet work,
+   not its window or its recovery.
+
+**Fourth attempt: receive window 4096 → 8192. REVERTED — it buys throughput past
+the point where the carrier's efficiency holds.** Same method (two binaries, one
+run, `--aa`, 3 rounds, `loss1_buf`):
+
+| cell | shipped (snd 8192 / rcv 4096) | candidate (8192 / 8192) |
+|---|---|---|
+| `udp-ladder[1000M]` | 981.6 Mbit/s, **0.171 %** loss, 1.610 s/Gbit | 986.9 Mbit/s, 0.000 %, **2.071 s/Gbit (+28.6 %)** |
+| `udp-ladder[2000M]` | 1046.7 Mbit/s, 43.3 % | **1746.2 Mbit/s, 11.1 %** |
+| `udp-ladder[5000M]` | 1044.6 Mbit/s, 66.8 % | 1606.0 Mbit/s, 51.1 % |
+| `udp-pace[1000/s]` | 0.971 % loss | 0.869 % (inside the A/A band), plus `cpu_cores` and `cpu_s_per_gbit` worse by ~23 % |
+
+The claims are on both sides with sign agreement 1.0: the candidate delivers
++40 % and loses 32 points less on the 2000 Mbit/s cell, while the shipped build
+is better on `cpu_cores` (−39 %), `cpu_s_per_gbit` (−35 %), `syscalls_per_s`
+(−19 %), `rss_peak_mib` (−29 %) and `wire_per_visitor_byte` (−38 %). The
+distinction that decides it is the one the round-3 change was kept for: at
+1 Gbit/s — the rate the carrier has to serve — the shipped build already
+delivers 981.6 Mbit/s with 0.171 % loss, and doubling the receive window buys
+**0.5 % throughput for +28.6 % CPU per delivered byte**. What the candidate
+really does is move the ceiling from ~1.05 to ~1.75 Gbit/s, and it pays ~2× CPU
+per bit above 1 Gbit/s to do it; on a proxy whose typical host is a small box,
+that is not a change to make by default. It is `HANDOFF`-recorded rather than
+shipped, and a *capped* middle (rcv 6144) is the obvious next variant if a
+high-rate lossy path ever becomes the target.
+
+The receive window stays 4096, so the peer's advertised window is still what
+caps the sender at ~1.1 Gbit/s — the deliberate end state, not an oversight.
+
+**Second optimisation attempt: congestion control on. REVERTED — it is far
+worse.** Built as a second binary (`set_nodelay(..., nc=false)` against the
+baseline's `nc=true`) and A/B'd in one run on `loss1_deep` with four scenarios
+(`udp-ladder,udp-pace,bulk-1,bulk-n`, 3 rounds + 1 warm-up, `--aa`, 84 samples):
+
+| cell | baseline (`nc=1`) | candidate (`nc=0`) |
+|---|---|---|
+| `udp-ladder[1000M]` | 531.9 Mbit/s, 41.8 % inner loss | **2.7 Mbit/s, 97.3 %** (two of three rounds failed) |
+| `udp-ladder[2000M]` | 534.5 Mbit/s, 71.1 % | **all three rounds failed** |
+| `bulk-n[P8]` | — | `cpu_cores` +1639 %, `syscalls_per_s` +15130 %, `rss_peak_mib` +69 % |
+
+The engine's `nc=0` path is the reference's: `cwnd` grows by slow start, halves
+on a fast retransmit and restarts at **one segment** on a timeout. On this path
+that restart never recovers — 15 000 % more syscalls is a pump spinning on a
+one-segment window — so the candidate is not a slower carrier but a stalled one.
+Reverted, and the product source is byte-identical to the committed baseline
+again.
+
+**What two reverted attempts establish:** neither the RTO floor nor the
+congestion window is the knob that fixes the KCP bulk ceiling on a lossy path.
+Both are now *measured* rather than assumed, and the numbers say the next step
+is diagnosis rather than another policy guess: with `nc=1` the sender spends
+21 % of its datagrams on re-sends and reaches ~55 % of the TCP fallback's
+throughput, so the question is which phase of the send path is saturated —
+`MOELEHILL_KCP_STATS=1`'s per-phase timings under the deep-queue class
+(`ms_input` / `ms_deliver*` / `ms_writer` / `ms_output` / `ms_update`) on both
+ends, read *while* the ladder runs at 1 Gbit/s, before any further change. A
+bound on in-flight data tuned to the path's bandwidth-delay product is the
+shape the evidence points at (the window is 2048 segments ≈ 2.8 MiB, and the
+deep queue's own limit is 100 000 packets), but that is a hypothesis to test
+with the same A/B, not a conclusion.
+
+**Next hypothesis to test, not to assume:** the session is configured with
+congestion control **off** (`set_nodelay(true, 10, 2, /*nc=*/true)`, and the
+listener logs `nc=1`), so a sender with a 2048-segment window keeps blasting
+into a lossy path and re-sends what the path drops — which is consistent with a
+21 % re-send rate, a 55 %-of-TCP ceiling and an output phase that dominates the
+sender's time. The engine implements `ssthresh`/`cwnd` when `nc=0`, so the next
+A/B is congestion control **on**, measured on the same cells (throughput, inner
+loss, `retransmits` per delivered byte) and reverted the same way if it does not
+clear them.
+
+**The window/pacing hypothesis is falsified, and the real one is in the
+retransmission counters.** A ladder run with `MOLEHILL_KCP_STATS=1` on the same
+condition (`54f...`/`6b5ea61`, one round, `--aa`) shows, on the **client**:
+
+```
+retransmits=0 resends_rto=0 resends_fast=0 wait_snd_peak=0 wait_rcv=0
+advertised_wnd=4096 peer_wnd=4096 pacer_mbit=9000 spill_bytes=0
+```
+
+— no window wait, no queue spill, and a 9 Gbit/s pacer: nothing at the client
+is the ceiling. The **server's** counters name it:
+
+```
+datagrams_out=483665 retransmits=100021 resends_rto=71631 resends_fast=28390
+ms_output="1509.263" ms_input="269.649" ms_writer="253.221" srtt_ms=16 rto_ms=30
+```
+
+The sender retransmits **21 % of its datagrams on a path that loses 1 %** — a
+20× spurious-retransmission rate — and the output phase is where its time goes
+(1.5 s against 0.27 s for input and 0.25 s for the writer). So the bulk
+collapse is not a window, a pacer or a queue: it is KCP's loss recovery
+retransmitting far more than the path loses, which both wastes the wire and
+consumes the send path that would have carried payload. The next change to try
+is therefore in RTO/fast-resend policy (`rto_ms=30` against `srtt_ms=16`;
+28 % of the resends are the fast path), measured on exactly these counters —
+`retransmits` per delivered byte — rather than on throughput alone.
+
+### Quality-driven carrier switching: the plan, and the first piece
+
+The shipped fallback reacts to a carrier that **cannot be established**. The
+measurements say that is not the only case worth reacting to: on the same 1 %-loss
+class the two carriers differ by ~90 % of delivered throughput at 2 Gbit/s
+(KCP 1033.7 Mbit/s with 44 % inner loss against TCP's 1973.6 with 0.000 %), while
+at 1 Gbit/s they are level and on a clean path TCP is the cheaper one. So the
+policy that follows from the data is "stay where you are unless the carrier in
+use is measured to carry materially less", delivered by machinery that already
+exists:
+
+- **The decision** lives in `CarrierChoice` (per data endpoint, one per client):
+  `prefer(carrier, why)` moves it deliberately, is refused while a
+  `SWITCH_COOLDOWN` (120 s) from the previous switch is running, prints one
+  `INFO` line per switch and then `DEBUG`, and holds the new carrier against the
+  re-probe (a switch *to* TCP writes the same 60 s retry gate a fallback does).
+  **Landed with tests**; the policy is the only thing still missing.
+- **The move** is a lane drain, and the hub already implements it: `retire_lane`
+  marks a slot draining, a draining slot takes **no new flows** (`live_slots`
+  excludes it) and keeps serving the flows already placed on it, and when the
+  slot vacates the *server's* replacement request dials a new channel into it —
+  which asks the choice, and therefore rides the new carrier. So a switch never
+  reorders: existing flows finish on the old carrier, new ones start on the new
+  one, and a busy lane's flows are only moved when they end on their own.
+- **The diagnostic hatch** (`MOLEHILL_CARRIER_SWITCH_AT=<seconds>`, landed) does
+  exactly one switch that way, at a fixed time, so its *effect* can be measured
+  before the policy that decides one is written: what the following lanes
+  capture of the ~90 % the A/B says is available, and what the drain costs the
+  flows that were on the retired lane.
+
+**Measured: a switch captures the whole prize, and costs nothing where the
+carriers are level.** `l3-budget10` (ten lanes over five claims — two each, so a
+claim always has one lane left while the other is drained), `loss1_buf` on the
+tunnel leg, `udp-ladder`, three rounds plus a warm-up with `--aa`, same binary,
+the only difference being `MOLEHILL_CARRIER_SWITCH_AT=6` (one switch, six seconds
+in, every claim of the endpoint):
+
+| `udp-ladder` | carrier held (all KCP) | one switch at 6 s | change |
+|---|---|---|---|
+| 200M | 197.4 Mbit/s, 0.000 % loss | 197.4, 0.000 % | — |
+| 1000M | 984.1, 0.140 % | 979.6, 0.126 % | level (inside the run's noise) |
+| **2000M** | **1057.6, 40.73 %** | **1883.5, 4.49 %** | **+78 % delivered, −36 points of loss** |
+| **5000M** | **1041.8, 61.99 %** | **3067.5, 7.87 %** | **+194 % delivered, −54 points of loss** |
+| CPU per delivered byte (2000M) | 0.821 s/Gbit | 0.552 | −33 % (it delivers more per CPU-second) |
+
+The A/A twin in the carrier-held run is tight on the divergence cell (1056.8 /
+40.83 against 1057.6 / 40.73), so the baseline is not scatter; the switched run's
+cells are tight too (1883.2..1883.7). The switched figure is 95 % of what forcing
+TCP outright delivers on the same cell (1973.6), which is the right reading: one
+of a claim's two lanes moved, and the claim now carries a KCP lane *and* a TCP
+lane. Nothing on the cells where the carriers are level moved — so the policy has
+room to be conservative and only act on evidence.
+
+### FIXED: the black hole behind a retired lane (2026-10-11)
+
+The bug below is fixed by a **CLOSE control frame** (`CTRL_CLOSE = 0x04`, the
+same 16-byte vocabulary as PING/PONG/SACK): when both halves of a session's
+stream are gone and its ARQ tail is flushed, the session sends three CLOSE frames
+20 ms apart, and a session that receives one ends immediately. The regression
+test that failed at the 30 s timeout now passes in 0.03 s, and the bench cell
+that reproduced it end to end — `l3-budget10` over `udp-ladder,udp-pace` on
+`loss1_buf`, which read **100 %** loss for whole rounds — reads 0.873 / 1.360 /
+1.129 / 0.825 % across four rounds. Frames are sent only on the orderly close
+path (never in answer to one), so two peers cannot ping-pong them, and an older
+peer that does not know the kind already ignores unknown control frames (the
+catch-all is `trace!`).
+
+### The bug it fixed: lending on + ladder-then-paced loses the paced flow (2026-10-11)
+
+The fix above made `l3-budget10` runnable for the first time, and its
+`udp-pace` cell reads **100 % loss** in some rounds. Bisected as far as the
+evidence goes:
+
+- **Lending is implicated, not the switch.** The 100 % appears with the hatch
+  unset (`switch-off2`, i.e. shipped behaviour) and with it set, so the switch is
+  not the cause. `l3-budget10-nolend` with the same scenarios and rounds is
+  **healthy** (1.122 / 0.773 / 0.870 %), and `l3-budget10` with lending on and the
+  paced scenario run **alone** is healthy too (1.251 / 1.306 / 0.978 %).
+- **The trigger is the ladder running first.** `l3-budget10` +
+  `udp-ladder,udp-pace` is where it shows, intermittently: three reproduction
+  attempts produced healthy rounds (1.075 %, then 0.976 / 1.081 / 1.179 %), so
+  the failing case is timing-dependent rather than a fixed configuration.
+- **What the allocator is doing at the time** (`MOLEHILL_L3_STATS=1` run, the
+  client's own lines): the ladder's traffic makes claim `…:2405` the busy one, so
+  the allocator lends to it from every other claim —
+  `lent lane 1 of claim …:2401 to claim …:2405`, then `lane 0` of `2402`, `2403`
+  and **`2404`** — and `2404` is exactly the claim the paced probe dials
+  (`UDP_PORT`). A live flow cannot lose its lane (`plan` only names a donor with
+  more than one lane and a lane with `flows == 0`, and the hub re-checks under
+  its own lock), so the remaining candidate is what happens *after* the lend: a
+  claim that ends up with no live lane has an empty `live_slots()`, the placement
+  then falls back to the hash alone, and a flow placed in a memberless slot is
+  dropped as `no_channel` for as long as it lives — which is 100 % loss for a
+  single-flow probe.
+
+**First theory, falsified.** The obvious reading of the allocator trace — a
+replacement takes the *lowest* vacancy, so a lane lent away earlier gets the
+replacement while the flows pinned to a dead slot are stranded forever — does not
+hold: `Routes::vacate` removes the claim from the table entirely once no slot
+holds a queue, and the claim's flow placements go with it, so a claim with no
+lanes re-places its next packet fresh instead of pinning it. A hub test written
+to demonstrate the stranding fails for exactly that reason (its assertion finds
+`member_stats()` empty), and the change that would have made a replacement prefer
+a pinned slot was therefore reverted rather than kept on a theory.
+
+**Caught, with both ends' counters — the lane is a black hole after a lend.**
+A run that reproduced it (`MOLEHILL_L3_STATS=1`, `l3-budget10` +
+`udp-ladder,udp-pace`, `loss1_buf`, tunnel leg, 3 rounds + 1 warm-up) gives rounds
+of 0.870 % then **100.000 / 100.000 / 100.000 %**, and the per-second lines say
+exactly where the traffic stops:
+
+- the allocator's own line at 11:02:51: `lent lane 0 of claim 10.99.0.1:2404 to
+  claim 10.99.0.1:2405` — the paced probe's claim lends a lane away, as designed;
+- **client**, claim `:2404`: `member=1 live=true` for the whole failure (so the
+  claim is *not* dead), `flows=0 forwarded=0 no_channel=0` on both slots, and the
+  aggregate line **stops growing entirely** (`forwarded=70`, `unclaimed=16`, then
+  constant for minutes) — nothing arrives at the client's device at all;
+- **server**, same claim: `member=1 live=true flows=1 forwarded=2370 … 2396` and
+  climbing — the server is still handing the visitor's datagrams to a lane.
+
+So the client retired one of the claim's two lanes, and the *server* keeps writing
+into the channel that lane was: its flow entry is pinned to that lane's slot (the
+rule that makes a lane's death invisible to flows), while the client's end of the
+channel is gone. The client's remaining live lane receives nothing because the
+server is not sending to it.
+
+Why the server never notices is the part that makes this a defect rather than a
+race: a KCP session whose *lane task* has ended is not necessarily a session the
+peer sees fail. If the client drops the reader but the session's pump keeps
+answering — which is exactly what a KCP session does when only its consumer goes
+away — the server's writes are acknowledged, its keepalives are answered, and its
+dead-link detector (`~20` unacknowledged RTOs) never fires. The result is a
+channel that looks healthy from both ends and carries nothing.
+
+**Reproduced deterministically, and the mechanism is now complete.**
+`src/transport/kcp.rs`, `a_dropped_stream_ends_the_session_for_the_peer` (committed
+`#[ignore]`d with its reason): a session pair on the loopback, a round trip both
+ways to prove it works, then the consumer's stream is dropped while the peer keeps
+writing. Three things follow from it, each verified rather than reasoned:
+
+1. **The end is prompt on the side that ends.** A temporary probe in the pump's
+   exit path (reverted) showed the dropped stream's session going
+   `writer half gone` → `reader_closed=true` → `quiescent=true` → exit, inside the
+   5 s `CLOSE_FLUSH_TIMEOUT` the code promises. The half-close default is not the
+   problem either: dropping the whole stream closes both halves, as a retired lane
+   does.
+2. **The peer is never told.** KCP has no close handshake, so the other end learns
+   only from its own unacknowledged traffic. The test's failure message measures
+   exactly that: in 30 s the peer sent **7876 datagrams of which 7288 were
+   retransmissions** — it knows perfectly well that nobody is listening — and it
+   still holds the session open.
+3. **Its dead-link rule cannot fire.** That rule wants 20 retransmits *and* a send
+   window that has stood still for 5 s. A lane forwarding a visitor's traffic
+   keeps taking new data, so its window is never still; with the nodelay RTO
+   growing ×1.5 per retransmit, "20 retransmits" is minutes even when it could
+   apply. For a claim whose lane was retired or died, the black hole is therefore
+   **permanent** for as long as the visitor keeps sending — which is what the bench
+   captured (the server's `forwarded` climbing for minutes while the client's
+   counters did not move).
+
+**The fix this points at — a close frame.** The adapter already carries control
+frames it recognises by a magic byte (PING/PONG/SACK, `is_ctrl_frame`), and the
+wire is the unreleased v5 line, whose commands may be extended in place. Adding a
+CLOSE frame, sent when a session's stream ends, tells the peer to end its session
+at once: its lane task sees the end, vacates its slot, and the flows pinned to it
+are re-placed onto the lanes that remain. Tightening the dead-link rule is not a
+substitute — a lane with traffic has no still window to trigger it — though the
+rule is worth revisiting separately for the idle case.
+
+**The fix to design (next round, with a test that fails first):****The fix to design (next round, with a test that fails first):** a lane's end
+must be *visible to the peer*. When a transparent lane retires, drains or its task
+exits, its carrier connection has to be shut down — not merely unread — so the
+peer's lane task sees the end, vacates its slot, and its pinned flows are
+re-placed onto the lanes that remain. The two halves to check are the client's
+lane teardown (does ending a lane close its KCP session/TCP connection for the
+peer?) and the server's own placement rule (a flow pinned to a lane that vanished
+without a close is the same stranding shape this bug has already shown twice).
+
+**Superseded: the earlier hypothesis below is wrong** — the claim does keep a live
+lane through the failure, so "lending turns a claim into an all-or-nothing shape"
+is not what happens. Kept for the record because it is the road that led to the
+counters above.
+
+**An earlier hypothesis, since falsified.** Lending turns a claim
+into an all-or-nothing shape: with two lanes one death leaves one, but the
+allocator moves a claim down to `target = 1` when it lends its idle lane, and a
+single lane death then leaves that claim with **no** lane at all. Whether it
+heals depends on the server asking for a replacement channel and on
+`wants_another_lane` answering yes (live 0 < target 1) — and the paced probe's
+single long-lived flow is the exact shape that would read the whole round as
+100 % loss if that ask does not come or is refused. It also explains the bisect
+precisely: with lending off the claim keeps two lanes, one death leaves one, and
+nothing is total.
+
+The next step is instrumentation rather than another theory: run
+`l3-budget10` + `udp-ladder,udp-pace` with `MOLEHILL_L3_STATS=1` until a round
+fails (it appeared in roughly half the rounds when it appeared at all), then read
+**both ends'** per-slot lines for the paced claim — `live=false` on every slot
+with `no_channel` growing is the all-or-nothing shape, and a client line
+showing `wants_another_lane` refusing (or no replacement ever joining) names the
+half that is broken. Until that is understood, **the carrier-switching policy
+does not ship**: it moves lanes with the same machinery this bug lives in.
+
+**Two things the measurement found on the way**, both worth fixing before the
+policy is written:
+
+1. **Every `pool_cap` arm had been unrunnable since the carrier tables were
+   merged** (the K3 rename made the topology writer emit a second
+   `[transparent.data]` header, a duplicate key the loader refuses). `l3-budget10`
+   and the two lending arms failed all cells with "not ready"; the self-check had
+   only *built* the configs, never parsed them. Both are fixed in this commit:
+   one table per block, and `bench.py selfcheck` now runs every catalog arm's
+   server and client config through `tomllib` (556 → 582 checks).
+2. **`l3-budget10` on `udp-pace` measures 100 % loss**, in *both* runs and
+   therefore independently of the switch: a single long-lived UDP flow over a
+   ten-lane claim loses everything, while the same arm's `udp-ladder` cells are
+   healthy. This could not be seen before because the arm's config never loaded.
+   It is a real open item — either the lane path under one long-lived flow with
+   lending on, or the model's paced workload — and it is the first thing to
+   diagnose next round, before the policy is built on a claim shape that may not
+   work.
+
+**What the policy still needs, in order** (next rounds):
+
+1. Per-lane evidence, which does not exist yet: the allocator's snapshot carries
+   `flows` per lane but not `forwarded`/`no_channel`. The hub counts both per
+   slot already, so this is plumbing plus the previous tick's values to make a
+   delta (`forwarded/s` and the drop ratio, per lane, per carrier).
+2. The rule itself: keep a split across the carriers the endpoint can use
+   (at least one lane on each while a claim holds two), compare the carriers'
+   delivered rates and drop ratios over a window, drain a lane of the loser and
+   let its replacement ride the winner — one move per tick at most, never more
+   often than the cooldown. With converged evidence, stop probing on every tick
+   and re-probe on a long timer, or the clean path pays KCP's per-byte cost
+   forever for a comparison it has already won.
+3. The forwarding-pool half (L4): a *per-tunnel* handover, never a whole-pool
+   swap, because the server's `max_tunnels_per_client` valve counts tunnels and
+   an overlap would be refused.
+
+### The policy did not trigger, and the read-only review says why (2026-10-11)
+
+The round-3 hypothesis — "the policy reads the *send* side, and `udp-ladder` is
+downstream traffic, so the client's per-slot counters stay at zero" — is
+**partly right and partly wrong**, and both halves were established by reading
+the code rather than by another run:
+
+- **Right about the direction being unproven by the bench.** `run_udp_ladder`
+  dials the tool's exposed port from the visitor namespace
+  (`topology.VIS_NS`) towards the iperf3 sink the client namespace binds
+  (`benches/scripts/bench/workloads.py`, `iperf_sink` + `run_udp_ladder`), and
+  the command carries no `-R`. So the ladder is **visitor → client**, not the
+  downstream direction the earlier note assumed — which does not exonerate the
+  policy, because what it reads is not delivery either (below).
+- **Wrong about what the counters mean.** `Routes::flush` counts `forwarded`
+  when a batch is *accepted by the slot's channel* and `no_channel` when it is
+  not — a local enqueue result, on the end that read the packet from its own
+  device. It is not "delivered to the peer", and it is not a drop the carrier
+  made. Two different causes share the counter: a full 128-message queue (the
+  path's own backpressure) and a slot whose lane is gone. So `drop_pct()` in the
+  round-3 policy is a mis-named quantity: it is "offered packets this slot did
+  not enqueue", and for a claim whose lanes are alive and fast it is 0 even
+  when the carrier two hops away is losing a third of what it was handed.
+
+That is the real reason a policy built on it cannot fire on the divergence cell,
+and it is not fixed by adding a receive counter alone. What the policy needs is
+a **per-lane identity plus both ends' view**: which lane (not which slot) rode
+which carrier, what this end offered it, what the *other* end received from it,
+and whether that lane is empty on **both** ends before it is retired. The
+round-3 change reads slots, has no lane identity, and takes the client's own
+flow table as proof of emptiness — which a lane carrying only downstream
+traffic never satisfies on the client.
+
+Three more defects the same review found, all of them in the machinery the
+policy would have shipped on:
+
+1. **`CarrierChoice::prefer` does not hold what it promises.** Moving to TCP
+   sets `retry_at_ms` to `KCP_RETRY_COOLDOWN` (60 s) while the switch's own
+   permission lasts `SWITCH_COOLDOWN` (120 s), so between the two the endpoint
+   re-probes KCP, and a successful session calls `reached_kcp()` — which stores
+   KCP and clears the cooldown. A *quality* decision can therefore be undone by
+   a *reachability* event that says only "KCP came up", before the 120 s the
+   decision was supposed to be held for. Reachability and quality are two
+   decisions about one endpoint and must not spend each other's permission.
+2. **A lane's carrier is recorded on the slot, not on the lane.**
+   `MemberSlot.carrier` is overwritten by whoever takes the slot next, and the
+   round-3 policy compares "lanes whose carrier is `chosen`" — so after one
+   switch, the *old-carrier* lanes it still needs to migrate are invisible to
+   it, and it cannot complete a handover that is already half done.
+3. **A draining lane is not known to the peer.** `Routes::retire` marks a slot
+   draining on this end only; the server keeps writing into the channel because
+   its own flow entry still names that lane. The client's retire path is what
+   the black-hole fix (above) made visible, and it is the same shape: a handover
+   has to be agreed by both ends before a lane is allowed to end.
+
+**Confirmed by a run, not by reading (2026-10-11).** One round of
+`l3-budget10` / `udp-ladder` / `loss1_buf` (tunnel leg, baseline `490198c`,
+binary `1083c5849745eb1b`, `MOLEHILL_L3_STATS=1 MOLEHILL_KCP_STATS=1`) with the
+same claim read on both ends:
+
+| | client | server |
+|---|---|---|
+| aggregate `forwarded` (last stats line) | **61** | **1 050 617** |
+| aggregate `no_channel` | **0** | **909 766** |
+| busiest slot of the loaded claim (`:2405 member=1`) | ≈0 | 9 039 (first line) and climbing |
+
+So the direction *is* the one the round-3 note guessed — the client's per-slot
+counters are four orders of magnitude below the server's on the loaded claim —
+and the mechanism is now sharper than "the policy read the wrong direction":
+
+- the client's slots are **live** and its `no_channel` is **zero** the whole
+  run, so nothing about the *client's* enqueue path is failing — there is simply
+  nothing being offered to it, because the traffic is handed to the lanes at the
+  **server** end (it reads the visitor's packets off its own device);
+- the丢 is on the server, and it is counted there: `no_channel` climbs to 909 766
+  beside 1 050 617 forwarded, i.e. **the server's lane queues are refusing
+  ~46 %** of what the device offers them, which is the ladder's 44.5 % inner-UDP
+  loss at 2000M seen from the other end of the same path;
+- the round-3 policy reads `dropped` from `no_channel` **at the client**, where
+  it is 0 — so `drop_pct()` is `None` for every lane, every tick, and the policy
+  cannot fire. Not because it was unlucky, but because the counter it reads
+  lives on the end that is not dropping anything.
+
+That also names what a fix cannot be: **a receive counter at the client is not
+enough**. This workload's loss happens where the packets are *offered* (the
+server's hub), and the client has no evidence of it at all — it only ever sees
+what arrived. The two ends therefore have to report to each other: the offerer
+counts what it offered and what its lane queues refused, the receiver counts
+what it actually injected, and the policy compares carriers on the *pair*.
+
+**What this supersedes.** "Add per-slot receive counters and compare delivery
+rates" is not the next step: it measures the wrong thing (enqueue, not
+delivery), has no lane identity to compare *across* carriers, and would be
+driven by a preference switch that the reachability path can silently reverse.
+The work is a per-lane identity, both ends' counters for it, and a two-sided
+drain — in that order.
+
+### The evidence chain, landed (2026-10-11)
+
+What that ordered list produced, in the order it landed:
+
+- **Lane identity** (`a3d0067`). `protocol::LaneId`, four fixed bytes, minted
+  by the client and named in a transparent lane's prologue (8 bytes: service,
+  then lane). The server learns the *width* from the registered service before
+  it reads — the prologue is the first bytes on a direct channel, so nothing
+  on it can say how long it is — and reads the lane half with `read_lane_half`.
+  The hub records `LaneKey` (id + generation) per slot, and names the lane in
+  the `l3-stats` line.
+- **Per-lane counters** (`9fa82a1`). A lane now carries `offered` (counted
+  before the answer), `enqueued`, and the two refusals *apart*: `overflow`
+  (a full queue — this end's backpressure) and `disconnected` (no lane held
+  the slot — a replacement window). Plus `injected`: what the lane delivered
+  into this end's kernel, the one "delivery" in the set and the half its peer
+  cannot see. The legacy `forwarded`/`no_channel` counters keep their meaning;
+  they just no longer have to carry a cause they cannot express.
+- **The archive.** A lane's counters are kept when it leaves, mirrored on the
+  claim, and kept past the claim's own removal: a handover on a one-lane
+  claim retires the only lane and empties the routing table in the same
+  instant, so the evidence has to outlive the entry that held it.
+
+Two defects in the *machinery* were fixed first, because a decision built on
+top of them could not have been trusted whatever it decided
+(`b3b2bba`, `2bad8b9`): a batched control frame was fed to the ARQ and
+dropped — so a CLOSE arriving behind data was lost, which is the retired-lane
+black hole reachable from an ordinary burst — and a 60 s reachability
+re-probe could undo a 120 s quality decision, because `reached_kcp` stored
+KCP and cleared the cooldown with it.
+
+**Still missing, and the reason the policy cannot ship yet:** the counters are
+local. The ladder's loss happens at the **server** (which offers the packets),
+so the client — the only end that decides — still has no evidence of it. The
+server has to report its per-lane counters over the existing independent
+control channel, and a drain has to be agreed by both ends before a lane is
+allowed to end (the client's own flow table cannot see a lane that is only
+carrying traffic *towards* it). Both are the next slice.
+
+### The report, and the pair it makes readable (2026-10-11)
+
+The first of those two is landed (`0516d43`): the server attributes its
+counters to the lane the client named (`5d79ab4`), and reports them
+(`CarrierReport`, tag 5, fixed 17 bytes — service, lane, offered, refused,
+sequence) once a second and only for lanes whose counters moved. The client
+records each report **against the lane id**, on the hub that owns it, and
+prints it beside its own view. Measured on the divergence cell, on the end
+that decides:
+
+| client slot | its own `injected` | `peer_offered` | `peer_refused` | refused share |
+|---|---|---|---|---|
+| `member=3` (lane 4) | 358 632 | 625 008 | 266 376 | **42.6 %** |
+| `member=5` (lane 6) | 309 463 | 668 726 | 438 044 | **65.5 %** |
+
+That is the evidence the policy needs, and the client's own counters — 1
+forwarded, 0 `no_channel` — could never have produced it: on this workload
+the deciding end's local view of those two lanes is empty by construction.
+The pair also settles the mechanism the earlier round could only guess at:
+the loss is the **peer's lane queues refusing**, not a missing lane
+(`disconnected` is 0 throughout) and not the client's own scheduling.
+
+**What is still missing before a policy can act:**
+
+1. **A two-sided drain.** — **Landed (`51e92da`).** The dialer asks
+   (`SessionCmd::DrainLane` / `CancelDrain`), the peer stops placing new flows
+   in that lane and answers `ControlChannelCmd::LaneDrainAck` (tag 6, fixed 9
+   bytes); its per-claim reporter sends "ready" once its own flows in the lane
+   reach zero, and the dialer retires the lane only then. A drain nobody answers
+   inside the budget is called off, so a lane is never left unusable.
+
+   **The first run found the bug this design exists to prevent, from the other
+   side.** The peer's ask set the *local* draining flag, which wakes its own
+   lane task — so it tore the connection down before the dialer had its answer,
+   and the dialer saw a dead lane instead of a reply: three "the peer answered
+   ready but this end holds no such lane" in one run, with the lanes' `live`
+   flipping to false between two stats lines. The peer's ask now sets a separate
+   `peer_draining` mark that stops placement and nothing else.
+
+   Measured with the diagnostic switch on the divergence cell: three lanes
+   retired on the peer's confirmation, zero teardown races, zero unanswered
+   drains, and the two lanes the peer still had flows in waited rather than
+   being taken.
+
+2. **The rule itself**, on the pair the report makes readable: a lane whose
+   peer-side queue refuses a material share of what it is offered is a carrier
+   that is not delivering, and the decision is which carrier to prefer for the
+   next lane — never a running lane's flows, which must stay where they are.
+
+   **Landed (`9c84a77`), with the arbitration it needed (`97755a2`).** The rule
+   is `lanes::carrier_move` (pure, with the pre-registered constants), the
+   reading and the action are `LanePool::carrier_step`, and a handover in flight
+   now outranks a lend. It fires by itself on the divergence cell — "lane 4
+   refused its share for 3 ticks; asked the peer to drain it so its replacement
+   rides Tcp" — with no diagnostic hatch.
+
+   **The first A/B of it is a `no claim`, and the reason is worth keeping.**
+   Forced KCP (the policy disabled) against the policy live, three runs of
+   `l3-budget10` / `udp-ladder` / `loss1_buf`, three rounds plus a warm-up with
+   `--aa`, identical fingerprints: every difference was inside the floors. Two
+   mechanisms explain it, and both are properties of the design rather than of
+   the rule:
+
+   - **An existing flow never moves.** A lane change cannot reorder a flow, so
+     the flow that is being refused stays on its lane until it ends; only flows
+     that *start* after the switch can ride the replacement. The ladder's cells
+     are fresh flows, but the policy needs three ticks of evidence and the
+     divergence cells (2000M/5000M) are the last ones — by the time it fires,
+     the round is over.
+   - **And until this round the drain could not complete at all**: three runs,
+     three drains asked, three answered `pending`, none retired. Readiness was
+     `flows == 0`, and the placement table remembers a flow for
+     `FLOW_IDLE_EVICTION` (a minute) after its last packet, so a flow that
+     stopped seconds ago held the lane for a minute — longer than the dialer's
+     30 s budget, so every drain was called off. Readiness is now
+     `active_flows == 0` (`DRAIN_QUIET`, 3 s) for a *peer's* drain only; the
+     local retire and the lending path keep the stricter `flows == 0`.
+
+   **Measured after the fix** (four rounds plus a warm-up, policy live), the
+   whole chain in one run, to the millisecond:
+
+   ```
+   16:27:20.566773  Data carrier for 10.10.0.254:2400 switched from kcp to tcp
+                    (the carrier in use kept refusing this claim's traffic at the peer)
+   16:27:20.566801  Data carrier for claim 10.99.0.1:2405: lane 3 refused its share
+                    for 3 ticks; asked the peer to drain it so its replacement rides Tcp
+   16:27:23.567831  Lane 3 of claim 10.99.0.1:2405: the peer holds no flow in it;
+                    retiring it (still carrying this end's flows)
+   ```
+
+   The 3.001 s between the ask and the retirement is exactly `DRAIN_QUIET`: the
+   quiet window is what unblocked the handover, and the retirement waited for
+   the peer's answer rather than taking the lane.
+
+   **The second A/B is also a `no claim`, with a control that is now really
+   inert, and it fails for a reason the workload cannot fix.** The first
+   comparison's control was not a control at all: the forced-carrier arm still
+   asked the peer to drain a lane once per round, because the rule ignored
+   `MOLEHILL_DATA_CARRIER` (`prefer` refused the move, the drain went out
+   anyway). That is fixed (`2250385`), and the comparison re-run on the `dev`
+   profile — whose ladder has five cells of four seconds, so a switch early in a
+   round has cells after it — is still a `no claim`: the only reading outside
+   the floors is the policy's *cost* (`rss_peak_mib` +14.81 % on the 1000M cell,
+   directional).
+
+   The instrumented runs say why, and it is a property of the workload shape
+   rather than of the rule. Per round: the policy fires, the carrier switches,
+   the drain is asked — and the drain does **not** complete, with **no TCP lane
+   ever carrying a packet**. A round is ~20 s; the rule needs three ticks of
+   evidence (it fires ~16 s in), the peer then needs `DRAIN_QUIET` (3 s) of
+   silence on that lane, and the round is over before the replacement can carry
+   anything. The one completion measured so far (the four-round smoke run above)
+   landed at the very end of its round, with no cell left to show a difference.
+
+   So the benefit is **not demonstrated, and the current model cannot
+   demonstrate it**: what it needs is a workload whose flows *start* after the
+   switch, which means a round long enough to contain both the three-tick
+   confirmation and several fresh flows afterwards (a 60 s+ cell, or a
+   churn-shaped cell). Until that exists and is run, this policy is mechanism
+   evidence only — and the honest options are the ones HANDOFF already commits
+   to: price it in a release sweep once the model can, or revert it by
+   discipline if it cannot.
+
+   **What is still not demonstrated is the policy's *benefit*.** The mechanism
+   is measured end to end; a `CLAIM` it is not. The A/B that can show one needs
+   a workload whose flows *start* while the policy is already in force — a long
+   campaign where round 1 switches and the later rounds' flows ride the
+   replacement, or a churn-shaped cell — and that measurement has not been run.
+   Until it is, this policy is shipped on mechanism evidence and stays on the
+   list of things a release sweep must price.
+
+   **The arbitration it needed is landed** (`97755a2`): `LaneLoad` carries
+   `handover` and donor selection goes through `ClaimLoad::lendable()`, so a
+   handover in flight is never spent on a lend — repair, then handover, then
+   lending, in that order.
+
+3. **L4's version** (a per-tunnel handover), which the report does not cover
+   yet: a multiplexed tunnel's streams are not lanes, and the pool's repair
+   dialer still pins the carrier a pool was established on.
+
+The round-3 policy in `src/transparent/lanes.rs` (still uncommitted) is
+**not** the basis for any of this: it reads `no_channel` as carrier loss, has
+no lane identity, and cannot see the report. It is superseded by the pair
+above and should be rewritten against it rather than adapted.
+
+That policy has since been reverted out of the worktree, so the branch is
+clean; it is preserved **outside the repository** as
+`~/tmp/p0/pending-strategy-round3.patch` (and the four files as they stood in
+`~/tmp/p0/`). Its lending allocator (`plan`) was never part of that diff and
+is still in `lanes.rs` at HEAD.
+
+Build gaps fixed on the way (all pre-existing — the baseline does not compile
+`transparent` without `multiplex`): the lane allocator, the carrier policy
+and the direct-channel carrier reader are gated by the features that define
+them. A `noise`-without-`multiplex` combination still fails on an unrelated
+`NoiseConfig` import; it fails identically on `490198c` and is not this
+cycle's.
+
+**What the new counters say on the divergence cell** (one round,
+`l3-budget10` / `udp-ladder` / `loss1_buf`, tunnel leg, `9fa82a1`, binary
+`026a526622d8f9a2`; 5000M cell: 61.2 % inner loss, 1055.7 Mbit/s delivered):
+
+| server slot of the loaded claim | `offered` | `enqueued` | `overflow` | `disconnected` |
+|---|---|---|---|---|
+| `member=3` | 623 296 | 349 366 | **273 930** | **0** |
+| `member=4` | 941 626 | 331 224 | **610 402** | **0** |
+| `member=1` | 375 127 | 374 922 | 205 | 0 |
+
+So the loss is **this end's lane queues refusing packets**, and it is not a
+single even failure: two lanes of one claim refused 44 % and 65 % of what the
+device offered them while a third, carrying the same claim, refused 0.05 %.
+`disconnected` is 0 throughout, i.e. no lane was missing — the round-3
+policy's counter would have reported "the carrier is fine" for every lane
+that had a lane in its slot, and "the carrier lost everything" for none.
+
+That is the shape the policy has to react to, and it is why the counters had
+to be split before anything could be decided on them: a per-lane queue
+overflow under load is a *carrier* property (a lane that cannot take data
+fast enough is a lane whose carrier is not delivering), while an empty slot
+is this end's own scheduling and says nothing about the path.
+
+Note `lane=-` on the server: the receiving end does not know the lane id its
+peer named, because the server's lane prologue is read but not yet handed to
+the hub. That is the next slice — the server has to attribute its counters to
+the lane it read, and report them, or the deciding end still has no evidence
+of the only place where the loss happens.
+
+### KCP, first thread: the datagram-size collapse does not reproduce (2026-10-11)
+
+The open item carried since the MTU work — "`bulk-n` after `bulk-1` collapses the
+datagram size from 6.2 KB to 3.4 KB, with a repro command" — is **falsified on
+`41f4005`**, on the KCP path as the product now ships it:
+
+```
+sudo -n uv run benches/scripts/bench/bench.py run --profile smoke --arms l3-kcp \
+  --scenarios bulk-1,bulk-n --condition clean --link-mtu 9000 --tun-mtu 8000 \
+  --rounds 1 --warmup-rounds 0
+```
+
+Both scenarios share one daemon pair and one arm, so the ordering the finding
+described is the ordering this run had. Result: `bulk-1` 6.836 Gbit/s and
+`bulk-n` 6.874 Gbit/s (one round each; a smoke run, so the number is a control
+point and not a claim), and the per-session adaptation log — read with
+`RUST_LOG=debug`, since the once-per-process `INFO` line is the log contract's
+limit — shows **exactly five adaptations, all at establishment**
+(`1400 -> 8000`, one per lane), and none afterwards: a *decrease* would have
+logged, because the probe only reports a change. The datagram size is therefore
+stable across the two workloads, and there is nothing to fix here.
+
+What the thread leaves behind is the observation that the size is worth seeing
+per run: `MOLEHILL_KCP_STATS=1` carries no size field, so the diagnosis above
+needs `RUST_LOG=debug`. If a future size question comes up, add the field there
+rather than promoting the per-session line back to `INFO` (the log-budget test
+fails a healthy default-level run that repeats one message shape).
+
+### The carrier migration (2026-10-11): KCP first, TCP as its fallback
+
+Landed in one commit because the halves are one change: removing the carrier key
+while TCP was still the default would have left KCP unconfigurable, and making
+KCP the default without a fallback would have broken every UDP-blocked
+deployment. What the work found on the way, in the order it was found:
+
+- **The wire never had to change.** The server serves both carriers per
+  connection and only *opens* the KCP listener when a registration declares it,
+  so the fallback needs no protocol work: the client declares the carrier it
+  will try first and dials either one.
+- **The server bound a KCP listener per registration rather than per address,
+  and the socket outlived its server.** With KCP as the default this surfaced in
+  the integration suite as `Address already in use` — a session holds the shared
+  state, which held the acceptor, so the UDP port stayed bound while sessions
+  drained. The acceptor is now held **weakly** by that state and strongly only
+  by the listener task, so the port closes with the server (`src/core/server.rs`).
+- **The suite's fixtures shared a data port** (`data_plane_separate.toml` and
+  `per_service_tunnels.toml` both on 2344) — invisible while only TCP-declaring
+  clients bound anything, fatal once every server does. One fixture moved.
+- **A healthy run's log budget broke**: the KCP path reported its path-MTU
+  adaptation once per session at `INFO`, and the budget test fails a run that
+  repeats one message shape. It reports once and then at `DEBUG` now.
+- **A test that needs a specific carrier can no longer write one**, which is
+  what `MOLEHILL_DATA_CARRIER` is for: `pool_test`'s spawned scenarios (the
+  operator's valve, the pool's own lines) force TCP.
+- **The model's carrier axis followed the key out.** An arm cannot name a
+  carrier; the contrast is a *path* condition. `--condition udp_blocked
+  --condition-leg tunnel` installs an `iptables -j DROP` for UDP on the leg the
+  carrier crosses, so the KCP attempt cannot be established and the run measures
+  the fallback — verified end to end (`l4`, `bulk-1`): the client logged
+  `KCP could not be established to 10.10.0.254:2400 (KCP establishment
+  timed out); using TCP for it and retrying KCP in 60s` and every pool
+  established with `carrier="tcp"`. The condition is *refused* on any other leg:
+  on the visitor's leg it drops the payload and the carrier comes up as usual,
+  which is a run whose method says "fallback" while every packet rode KCP — the
+  first attempt at this measurement did exactly that and was caught by the
+  pool-stats line, not by the number. Isolating one carrier is now the inherited
+  `MOLEHILL_DATA_CARRIER` switch, recorded as instrumentation.
+
+Known and deliberate: with the carrier forced there is **no** fallback — a
+failing KCP run fails rather than quietly measuring TCP — and an operator who
+wants TCP always pays one bounded attempt (2 s) per endpoint per cooldown before
+the fallback engages. Both are properties of the state machine rather than
+configuration, and both are stated in `docs/configuration.md`.
+
+**All of L12–L18 is landed and measured**, and the two open questions this
+section used to carry are answered: lending is a `CLAIM` at +26.75 % when the
+carrier is the bottleneck and indistinguishable on a clean path (above), and the
+mux×1 gap is priced as the engine's per-byte work rather than a fixable defect
+(above). What is left is follow-up work, in the order it is worth picking up:
+
+1. **The L3 arms in a routine run.** The default `l3` arm holds one lane per
+   claim, so it exercises the *product default* and cannot show lending at all;
+   anything about lanes should name `l3-budget10-lending` and
+   `l3-budget10-nolend` (the pair the model now compares itself). If a future
+   sweep should carry the axis rather than an on-demand A/B, that is the pair to
+   add — and the cost is real: each condition needs the long-haul leg to say
+   anything at all.
+2. **The L3 path's own ceiling (M, above).** The measurement said the TUN path
+   is per-packet bound and the lever is the packet size (the MTU), not a
+   compressor and not more lanes. Nothing there has changed; the L3 acceptance
+   harness measures the wire at whatever MTU the operator sets.
+3. **The gap's kernel half.** `perf` cannot name kernel symbols in this
+   container, so ~35 % of the mux profile is an unattributed number. On a host
+   where `/proc/kallsyms` is readable, `gap_profile.sh` would name it — worth one
+   run before anyone proposes work on the kernel-side copies.
+4. **`docs/benchmarks.md`'s history.** The measurement records still name the
+   arms their runs used (`l3-mux`, `l3-raw4`, `l4-mux1`, …). That is deliberate —
+   they are published history and the page's note maps them to today's catalog —
+   but a future release sweep should add today's names rather than renumber the
+   old ones.
 
 ## The v0.10.0 theme
 
@@ -1072,6 +2019,15 @@ mechanism; `command -v iperf3` before a long run is the cheap guard.
   d764f9da9c7e5b2a`, and a file *without* a `host_id`
   (`results-soak-v0.9.0.json`, `98c48ea3fa68`) falls back to the hostname, so
   the gate refuses it.
+- **`iperf3` is version-boundary-sensitive, and this session crossed one.**
+  The carrier/KCP numbers of this cycle were measured with an `iperf3` that was
+  no longer on PATH when this session began (a container restart); it was
+  reinstalled and is **3.18** now. A version can change the UDP summary fields
+  the model reads (`end.sum_received`, the loss percent, the interval shape), so
+  a number from the other side of that boundary is context, not a comparable
+  baseline — re-measure the baseline in the same session whenever the pair
+  matters. The model should record the version with the run rather than leaving
+  it to be rediscovered.
 - **A baseline-less run is the norm here**: the gate's own self-check
   (completeness, endpoint invariant, absolute SLO) is what a fresh sweep is
   gated on, because every stored baseline either has no `host_id` or predates

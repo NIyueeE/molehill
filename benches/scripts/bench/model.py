@@ -648,15 +648,19 @@ class Condition:
     `netem` is the argument list of a netem qdisc (`[]` is the clean path) and
     `mtu` is an *interface* property, not a qdisc: a condition that names one
     changes the path for every packet during that stage, which is why the MTU
-    classes are never in a default timeline. The vocabulary lives here because
-    it is method: a run's fingerprint must move when a condition's meaning
-    moves, and a report must be able to say what a stage emulated.
+    classes are never in a default timeline. `block_udp` is a firewall rule
+    rather than a qdisc — it drops one *protocol* on the leg, which is how a
+    path that refuses the data plane's first carrier is emulated without asking
+    the product for a setting it does not have. The vocabulary lives here
+    because it is method: a run's fingerprint must move when a condition's
+    meaning moves, and a report must be able to say what a stage emulated.
     """
 
     name: str
     what: str
     netem: tuple = ()
     mtu: int | None = None
+    block_udp: bool = False
 
 
 CONDITIONS: dict[str, Condition] = {
@@ -685,6 +689,25 @@ CONDITIONS: dict[str, Condition] = {
     ),
     "jitter": Condition(
         "jitter", "a bufferbloated access link", ("delay", "20ms", "10ms")
+    ),
+    "loss1_deep": Condition(
+        "loss1_deep",
+        "the same 1 % loss with a queue deep enough not to tail-drop: it tells "
+        "a carrier's loss recovery apart from the shaper's own drops",
+        ("delay", "10ms", "loss", "1%", "limit", "100000"),
+    ),
+    "loss1_buf": Condition(
+        "loss1_buf",
+        "a lossy path with a large but finite buffer (10 000 packets ≈ 14.7 MB, "
+        "≈ 27 ms of standing queue at 545 Mbit/s): tail drops are out of the "
+        "way without the hundred-megabyte standing queue that inflates RTT",
+        ("delay", "10ms", "loss", "1%", "limit", "10000"),
+    ),
+    "udp_blocked": Condition(
+        "udp_blocked",
+        "a path that drops UDP: the data plane's first carrier cannot be "
+        "established, so it must fall back to TCP",
+        block_udp=True,
     ),
     "mtu1280": Condition("mtu1280", "a tunnel or an IPv6-minimum path", mtu=1280),
     "loss1_mtu1280": Condition(
@@ -756,7 +779,7 @@ class Arm:
     * `l3` — the transparent client: whole IP packets over a TUN device.
 
     `binary` is the build under test; two arms differing only in it are the A/B
-    axis. `pool_cap` (the configured `[client.data.tcp].tunnels`) and
+    axis. `pool_cap` (the configured `[client.data].tunnels`) and
     `txqueuelen` are the two settings this model prices separately, because both
     are architectural choices rather than tuning: the pool's width separates the
     multiplexer's framing cost from its pool's — the pool is pinned at that
@@ -765,7 +788,7 @@ class Arm:
     kernel's default queue.
 
     `pool_cap` is the third such setting, and it means one thing per kind: for an
-    L4 arm it is the pool's `[client.data.tcp].tunnels`; for an L3 arm it is the
+    L4 arm it is the pool's `[client.data].tunnels`; for an L3 arm it is the
     claim's carrier **lane budget** (`[transparent.data.<carrier>].tunnels`),
     which is one connection per lane because a claim never multiplexes. `0`
     leaves the key out of the generated config — the product's default, four
@@ -773,19 +796,28 @@ class Arm:
     states the width it measured instead of inheriting whatever the default is
     this week.
 
-    `carrier` is the transport the data plane rides: `tcp` (the control
-    channel's own wire stack) or `kcp` (KCP-over-UDP sessions, feature `kcp`).
-    It is the difference between a congestion-controlled stream and a
-    retransmit-aggressive one on a shaped path, so an arm that does not state
-    it is not describing the run it measured. The data plane's *shape* is not an
-    arm parameter at all: a forwarding service always multiplexes and a claim
-    never does, which is what the product derives from the service type.
+    `lend` states whether the L3 client may move a lane between claims, and only
+    an L3 arm may say so (a forwarding service has no lanes to move).
+
+    The data plane's *carrier* is not an arm parameter: the product chooses it
+    at runtime (KCP, falling back to TCP, re-probing), so a run that needs the
+    paths apart says so with a **condition** — `udp_blocked` is the fallback, a
+    clean path carries KCP — or, to isolate one carrier, with the inherited
+    `MOLEHILL_DATA_CARRIER` switch, which the results record as instrumentation.
+    The data plane's *shape* is not an arm parameter either: a forwarding
+    service always multiplexes and a claim never does, which is what the product
+    derives from the service type.
     """
 
     id: str
     kind: str
-    carrier: str = "tcp"
     pool_cap: int = 0
+    #: Whether an L3 client may lend an idle lane of one claim to another
+    #: (`[transparent.data].lend`, on by default). Off is the equal split held
+    #: static, which is the control an arm needs to price the mechanism: the two
+    #: arms are then the same binary and the same topology, differing only in the
+    #: decision under test.
+    lend: bool = True
     txqueuelen: int = 1000
     binary: str = ""
     #: Free-form label recorded in the results (e.g. "A"/"B" for a build pair).
@@ -794,6 +826,11 @@ class Arm:
     tool: str = ""
     #: What a table calls this arm; the id is what a result file calls it.
     label: str = ""
+    #: The arm this one is the *decision* against: the pair the analysis reads,
+    #: for an axis that is a configuration field rather than a second binary.
+    #: `--ab-arm` pairs two builds of one arm; this pairs two configurations of
+    #: one build, which is what a knob's own A/B is.
+    against: str = ""
 
     @property
     def name(self) -> str:
@@ -811,15 +848,17 @@ class Arm:
 
     @property
     def data_carrier(self) -> str:
-        """The carrier the data plane rides.
+        """The carrier an arm can claim, which is none: the product chooses.
 
-        Empty for a control arm (no tool) and for a peer (which owns its own
-        stack). Naming it here is what makes the choice auditable in the
-        results instead of a reading of the generated config.
+        `auto` for a tool arm — the data plane tries KCP and falls back to TCP on
+        its own, so an arm cannot name a carrier without describing a setting the
+        product no longer has. A run that needs the paths apart uses the
+        `udp_blocked` condition (the fallback) or the inherited
+        `MOLEHILL_DATA_CARRIER` switch (one carrier alone, recorded as
+        instrumentation). Empty for a control arm and for a peer, whose stacks
+        are their own.
         """
-        if self.kind in ("peer", "control"):
-            return ""
-        return self.carrier if self.carrier in ("tcp", "kcp") else "tcp"
+        return "" if self.kind in ("peer", "control") else "auto"
 
     @property
     def states_kcp(self) -> bool:
@@ -892,7 +931,7 @@ ARM_CATALOG: dict = {
     "l4": Arm("l4", "l4"),
     "l4-mux2": Arm("l4-mux2", "l4", pool_cap=2),
     "l4-mux8": Arm("l4-mux8", "l4", pool_cap=8),
-    # `pool_cap` writes `[client.data.tcp].tunnels`, so these arms are the pool
+    # `pool_cap` writes `[client.data].tunnels`, so these arms are the pool
     # *pinned* at 2 / 8 connections — the arm's width, not a cap it may grow to.
     # There is no `l4-mux1`: the topology carries a UDP service with two workers,
     # so `tunnels = 1` is below the UDP-derived floor and the client refuses to
@@ -901,17 +940,32 @@ ARM_CATALOG: dict = {
     # single-flow scenario — the same shape, one stream on one session, with a
     # legal pool.
     "l3": Arm("l3", "l3"),
-    # The lane axis: one L3 claim's carrier budget, so its inner flows can be
-    # spread over several connections instead of one. A claim never multiplexes,
-    # so the budget *is* the number of connections it holds.
-    "l3-lanes4": Arm("l3-lanes4", "l3", pool_cap=4),
+    # The lane axis: the carrier's budget, so a claim's inner flows can be spread
+    # over several connections instead of one. A claim never multiplexes, so the
+    # budget *is* the number of connections the claims hold — and it is the
+    # *carrier's* total, divided equally among every claim of the topology, not
+    # one claim's count. The L3 topology carries five claims, so a budget that is
+    # not a multiple of five leaves its remainder unallocated (the allocator
+    # redistributes the shares; it does not spend the remainder) and one below
+    # five is refused outright: the self-check enforces both, because a config
+    # the product refuses measures nothing.
+    "l3-budget10": Arm("l3-budget10", "l3", pool_cap=10),
+    # The same arm with the mechanism switched off: the equal split held static,
+    # which is what prices lending itself (same binary, same topology, one
+    # decision apart).
+    "l3-budget10-nolend": Arm("l3-budget10-nolend", "l3", pool_cap=10, lend=False),
+    # The same two claims, stated as the pair they are: `l3-budget10` declares
+    # the static arm as its baseline, so a run carrying both compares them with
+    # the run's own floors rather than leaving the reader to subtract medians.
+    "l3-budget10-lending": Arm(
+        "l3-budget10-lending", "l3", pool_cap=10, against="l3-budget10-nolend"
+    ),
     "l3-deep": Arm("l3-deep", "l3", txqueuelen=DEEP_TXQUEUELEN),
-    # The carrier axis: `kcp` rides UDP. A lane over KCP is a KCP session of its
-    # own, with no multiplexer above it, which is what the L3 arms measure; the
-    # L4 arm measures the same carrier with the multiplexer above it.
-    "l3-kcp": Arm("l3-kcp", "l3", carrier="kcp"),
-    "l3-kcp4": Arm("l3-kcp4", "l3", carrier="kcp", pool_cap=4),
-    "l4-kcp": Arm("l4-kcp", "l4", carrier="kcp"),
+    # There is no carrier axis: the product chooses its carrier at runtime
+    # (KCP, falling back to TCP), so the contrast lives in the *path* — a run
+    # against `--condition udp_blocked` is the fallback, a clean run is KCP —
+    # while forcing one carrier for isolation is an experiment-wide environment
+    # switch rather than an arm.
     # The reference tools. Their adapters live in `peers.py`; the arm is the
     # same shape as any other, which is what makes the comparison one run.
     "frp": Arm("frp", "peer", tool="frp", label="frp"),
@@ -931,7 +985,9 @@ def arms_from_names(names: list, binary: str) -> list:
     for name in names:
         arm = replace(ARM_CATALOG[name], binary=binary)
         try:
-            refuse_unknown_carrier(arm)
+            refuse_carrier_arm(arm)
+            refuse_lend_outside_l3(arm)
+            refuse_dangling_baseline(arm)
         except ValueError as e:
             raise SystemExit(str(e)) from e
         arms.append(arm)
@@ -948,7 +1004,7 @@ def default_arms() -> list:
 
 
 def parse_arm_spec(spec: str) -> Arm:
-    """`id=l3,carrier=kcp,pool_cap=4,txqueuelen=10000,side=B` — an arm as data.
+    """`id=l3,pool_cap=10,txqueuelen=10000,side=B` — an arm as data.
 
     The syntax exists so that an experiment with a knob the catalog does not
     name is still *declared* (and therefore recorded and comparable) rather than
@@ -967,8 +1023,9 @@ def parse_arm_spec(spec: str) -> Arm:
     known = {
         "id",
         "kind",
-        "carrier",
         "pool_cap",
+        "lend",
+        "against",
         "txqueuelen",
         "binary",
         "side",
@@ -981,31 +1038,97 @@ def parse_arm_spec(spec: str) -> Arm:
     for numeric in ("pool_cap", "txqueuelen"):
         if numeric in fields:
             fields[numeric] = int(fields[numeric])
-    if "carrier" in fields and fields["carrier"] not in ("tcp", "kcp"):
-        raise ValueError(
-            f"unknown carrier {fields['carrier']!r}; known: tcp, kcp "
-            "(the product's `[client.data].default_carrier`)"
-        )
+    if "lend" in fields:
+        fields["lend"] = _parse_bool("lend", fields["lend"])
     kind = fields.pop("kind", None) or fields.get("id", "")
     if kind not in ("control", "l4", "l3", "peer"):
         raise ValueError(f"unknown arm kind {kind!r}; known: control, l4, l3, peer")
     arm = Arm(kind=kind, **fields)
-    refuse_unknown_carrier(arm)
+    refuse_carrier_arm(arm)
+    refuse_lend_outside_l3(arm)
+    refuse_dangling_baseline(arm)
     return arm
 
 
-def refuse_unknown_carrier(arm: Arm) -> None:
-    """Refuse a carrier the product does not have.
+def _parse_bool(key: str, value: str) -> bool:
+    """A strict `true`/`false`.
 
-    The carrier is the only data-plane axis an arm states (the product derives
-    the *shape* from the service type: a forwarding service multiplexes, a claim
-    never does), so the only thing left to check is the vocabulary: an arm that
-    names a carrier nothing implements would fail every cell on a config error
-    instead of measuring.
+    `bool("false")` is `True`, and an arm that silently measured the opposite of
+    what it says is the failure the arm parser exists to prevent.
     """
-    if arm.kind in ("l3", "l4") and arm.data_carrier not in ("tcp", "kcp"):
+    if value not in ("true", "false"):
+        raise ValueError(f"{key} must be true or false, got {value!r}")
+    return value == "true"
+
+
+def refuse_dangling_baseline(arm: Arm) -> None:
+    """Refuse an arm whose declared baseline is not in the catalog.
+
+    A pair the catalog cannot resolve is a comparison nobody will make: the
+    analysis reads the ids in the results file, and an arm naming a stranger
+    would quietly measure alone.
+    """
+    if not arm.against:
+        return
+    if arm.against not in ARM_CATALOG:
         raise ValueError(
-            f"arm {arm.id!r}: unknown carrier {arm.carrier!r}; known: tcp, kcp"
+            f"arm {arm.id!r}: `against` names {arm.against!r}, "
+            "which is not in the catalog"
+        )
+    if ARM_CATALOG[arm.against].kind != arm.kind:
+        raise ValueError(
+            f"arm {arm.id!r}: `against` names a {ARM_CATALOG[arm.against].kind} arm, "
+            f"and this one is {arm.kind}"
+        )
+
+
+def refuse_lend_outside_l3(arm: Arm) -> None:
+    """Refuse a `lend` statement on an arm that has no lanes.
+
+    A forwarding service's channels come from a pool and are not allotted, so
+    `lend` would be a setting the topology writer drops on the floor — and an arm
+    that states a knob nothing reads is an arm whose name describes a method it
+    did not use.
+    """
+    if not arm.lend and arm.kind != "l3":
+        raise ValueError(
+            f"arm {arm.id!r}: `lend` is an L3 claim's lane policy, and a "
+            f"{arm.kind} arm has no lanes to lend"
+        )
+
+
+def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
+    """Refuse a condition imposed on a leg where it cannot mean anything.
+
+    `udp_blocked` is how a run asks for the data plane's *fallback*: it drops
+    UDP on the leg the carrier crosses. Imposed on the visitor's leg it would
+    block the payload instead and the carrier would come up as usual — a run
+    whose method says "the fallback" while every packet rode KCP. The refusal
+    names the leg to use rather than letting the number lie.
+    """
+    if condition.block_udp and leg != "tunnel":
+        raise ValueError(
+            f"the {condition.name} condition drops UDP on the leg the carrier crosses; "
+            f"impose it on the `tunnel` leg (got {leg!r}), or it blocks the payload "
+            "instead of the carrier"
+        )
+
+
+def refuse_carrier_arm(arm: Arm) -> None:
+    """Refuse an arm that names a carrier.
+
+    The data plane's carrier is chosen at runtime (KCP, falling back to TCP), so
+    there is no key to write and no arm field to set: a run that means "the
+    fallback" asks for the `udp_blocked` condition, and one that means "KCP
+    alone" sets `MOLEHILL_DATA_CARRIER=kcp` in the environment it launches the
+    bench from (the results record it as instrumentation). An arm that named a
+    carrier anyway would measure the product's own choice while its name said
+    otherwise — the failure the arm parser exists to prevent.
+    """
+    if arm.data_carrier not in ("", "auto"):
+        raise ValueError(
+            f"arm {arm.id!r}: the carrier is chosen at runtime; use the `udp_blocked` "
+            "condition for the fallback, not an arm field"
         )
 
 

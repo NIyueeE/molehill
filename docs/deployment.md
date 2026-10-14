@@ -204,6 +204,16 @@ the exact refusals belong to
 network the operator has to build. It is Linux only, needs `CAP_NET_ADMIN` on
 both ends (each side opens a TUN device), and configures nothing itself.
 
+One sizing note before the recipes: a claim's inner flows are spread over its
+lanes, and the lanes of a client's claims are lent between them as their flows
+come and go — but only if the budget leaves a claim with something to spare
+(`[transparent.data].tunnels`, at least two per claim). Measured, that is
+worth a great deal when the *carrier connections* are the limit (a long-haul or
+lossy path) and nothing on a fast, short one, at the cost of more connections
+and more CPU; the numbers and the `lend = false` switch are
+[Configuration](./configuration.md#transparent-l3-services) and
+[Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when).
+
 The server serves L3 only if **its own** config asks for it: the
 `[server.transparent]` table in `server.toml` below is that switch, and without
 it the registration is refused before any device is touched. Run the L3 server
@@ -460,7 +470,7 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 The image carries the full default feature set (`server`, `client`, `noise`,
-`hot-reload`, `multiplex`, `kcp`, `transparent`), so `default_carrier = "kcp"`
+`hot-reload`, `multiplex`, `kcp`, `transparent`), so the data plane's KCP sessions
 needs no different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
 instead of `:latest` when you want reproducible upgrades.
 
@@ -508,8 +518,8 @@ services:
 Bridge-network variant for Docker Desktop (macOS/Windows): keep the same
 file, drop `network_mode: host` from both services, add a `ports:` list to
 the server — `"2333:2333"` for the control channel and the TCP data plane,
-`"2333:2333/udp"` for the KCP data plane (only when a service uses
-`carrier = "kcp"`) and one entry per exposed service (e.g. `"5202:5202"`) —
+`"2333:2333/udp"` for the KCP data plane (the carrier the data plane tries
+first) and one entry per exposed service (e.g. `"5202:5202"`) —
 and point the client at the compose DNS name with
 `default_remote_addr = "molehill-server:2333"`.
 
@@ -547,8 +557,8 @@ The client variant is the same file with
 
 ## Network requirements
 
-- The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server). Add the matching **UDP** port whenever a service uses `carrier = "kcp"` — the KCP listener binds `server.data.bind_addr`, i.e. the control port by default, and TCP plus UDP coexist on that port number.
-- The **client** only needs outbound access to `server.control.bind_addr` (and the data endpoint when it differs; TCP, plus UDP for `carrier = "kcp"`); no inbound port is required behind the NAT.
+- The **server** must be reachable from the Internet: `server.control.bind_addr`, `server.data.bind_addr` (when set) and every registered `remote_bind_addr` need inbound access (open the ports in the firewall or port-forward them on the public server). Add the matching **UDP** port as well: the data plane tries KCP, so the KCP listener binds `server.data.bind_addr` — the control port by default — and TCP plus UDP coexist on that port number.
+- The **client** only needs outbound access to `server.control.bind_addr` (and the data endpoint when it differs; TCP, plus UDP for the KCP data plane); no inbound port is required behind the NAT.
 - Running in a container: the image runs as UID 1000 and cannot bind ports below 1024 — see [Container](#container) for the port and config-permission consequences.
 - `client.control.default_remote_addr` must use the same port as `server.control.bind_addr` unless the server moved its control listener.
 

@@ -381,7 +381,13 @@ class ArmTurn:
     def _spawn(self, role: str, argv: list) -> None:
         path = self.dir / f"{role}.log"
         fh = path.open("ab")
-        self.procs[role] = subprocess.Popen(argv, stdout=fh, stderr=fh)
+        # The daemons inherit this process's environment, which is where the
+        # diagnostic switches live: a run that forces a carrier
+        # (`MOLEHILL_DATA_CARRIER=kcp`) inherited it from the shell that started
+        # the bench, and the results record inherited `MOLEHILL_*` switches as
+        # instrumentation, so the forcing is auditable rather than implied.
+        env = dict(os.environ)
+        self.procs[role] = subprocess.Popen(argv, stdout=fh, stderr=fh, env=env)
         self.logs[role] = path
 
     def pids(self) -> dict:
@@ -665,6 +671,15 @@ def _sigint(signum, frame):  # noqa: ARG001 — signal handlers take both
 
 
 def run(args) -> int:
+    try:
+        model.refuse_misplaced_condition(
+            model.CONDITIONS[args.condition], args.condition_leg
+        )
+    except ValueError as e:
+        # A condition that cannot mean anything on the leg it was given is an
+        # argument error, not a campaign failure: say so before any namespace
+        # is built, and without a traceback.
+        raise SystemExit(str(e)) from e
     camp = _prepare(args)
     topo = topology.Topology(tun_mtu=args.tun_mtu, link_mtu=args.link_mtu)
     t0 = time.perf_counter()

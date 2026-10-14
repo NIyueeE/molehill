@@ -209,8 +209,9 @@ async fn a_shared_pool_serves_two_services_of_one_session() -> Result<()> {
     );
     let pool = &pools[0];
     assert_eq!(
-        pool.key, "session/tcp:127.0.0.1:2380",
-        "a shared pool is keyed by the session, its carrier and its data endpoint"
+        pool.key, "session:127.0.0.1:2380",
+        "a shared pool is keyed by the session and its data endpoint (the carrier is a\
+         property of the pool, not of its name)"
     );
     assert!(
         pool.size >= 1 && pool.streams() > 0,
@@ -1102,7 +1103,7 @@ fn stop(child: &mut std::process::Child) {
 /// Run the compiled binary as a server+client pair over its own ports, force a
 /// visitor through it, and return everything the client printed.
 ///
-/// `tunnels` is the client's `[client.data.tcp].tunnels`; `valve` is the
+/// `tunnels` is the client's `[client.data].tunnels`; `valve` is the
 /// server's `[server.data].max_tunnels_per_client` when the scenario wants the
 /// valve to bite. The pairing is what lets one runner measure both the healthy
 /// establishment and the refused one.
@@ -1117,7 +1118,7 @@ async fn run_binary_pair(
     let ([control_port, exposed_port], held) = free_ports::<2>();
     let control = format!("127.0.0.1:{control_port}");
     let exposed = format!("127.0.0.1:{exposed_port}");
-    let pool_key = format!("session/tcp:{control}");
+    let pool_key = format!("session:{control}");
     let valve_block = valve.map_or_else(String::new, |n| {
         format!("\n[server.data]\nmax_tunnels_per_client = {n}\n")
     });
@@ -1156,8 +1157,6 @@ async fn run_binary_pair(
              \n\
              [client.data]\n\
              shared_pool = true\n\
-             \n\
-             [client.data.tcp]\n\
              tunnels = {tunnels}\n\
              \n\
              [client.services.echo]\n\
@@ -1172,9 +1171,15 @@ async fn run_binary_pair(
     drop(held);
     let bin = env!("CARGO_BIN_EXE_molehill");
     let log = dir.join("client.log");
+    // These scenarios measure the **TCP** tunnel path: the operator's valve
+    // refuses a tunnel hello with a typed ack, and the pool's own lines describe
+    // those tunnels. The data plane tries KCP first by default, so the carrier
+    // is forced here — which is what the diagnostic switch exists for — rather
+    // than leaving the run to whatever the loopback path happens to carry.
     let mut server = Command::new(bin)
         .arg("--server")
         .arg(&server_cfg)
+        .env("MOLEHILL_DATA_CARRIER", "tcp")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1193,6 +1198,7 @@ async fn run_binary_pair(
     command
         .arg("--client")
         .arg(&client_cfg)
+        .env("MOLEHILL_DATA_CARRIER", "tcp")
         .env("RUST_LOG", "debug");
     if stats {
         command

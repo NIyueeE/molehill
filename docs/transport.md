@@ -93,9 +93,9 @@ Rules: `transport.type` unset follows the client-wide `type`; `"noise"`
 forces encryption, `"plain"` forces plaintext. A service whose effective transport is
 Noise needs keys — its own `transport.noise` if set, else the global
 `[client.transport].noise`; configuring effective Noise with no keys
-anywhere is a startup error. The data plane follows the service: TCP
-tunnels and (with `carrier = "kcp"`) the Noise-over-KCP wrapping both use
-the service's effective keys. The server needs nothing beyond placing its
+anywhere is a startup error. The data plane follows the service: its TCP tunnels and
+the Noise-over-KCP wrapping of its KCP sessions both use the service's
+effective keys. The server needs nothing beyond placing its
 keys (the transport selector: it accepts whatever each connection speaks).
 
 ### Specifying the pattern
