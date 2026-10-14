@@ -218,12 +218,16 @@ Both recipes start from the same two facts:
   and a source rule sends the replies the local application emits back into the
   tunnel.
 - **The TUN MTU is the packet-size lever.** A userspace data path pays per
-  packet, so the MTU decides how many packets a given byte rate costs: the same
-  bulk transfer at an 8000-byte TUN MTU (with a link MTU to match) measured
-  1.8× the throughput of 1400-byte packets at half the CPU per byte
-  ([Benchmarks](./benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness)).
-  The recipes below use 1400, which fits any path that carries the tunnel; raise
-  it to what the path between the two ends actually allows.
+  packet, so the MTU decides how many packets a given byte rate costs. Measured
+  on one host, the same bulk flow through an L3 claim moved **1.84×** the
+  throughput at an 8000-byte TUN MTU (with a link MTU to match) than at 1400,
+  at **a third** of the CPU per byte — and at that packet size one L3 flow
+  matches the forwarding path on the same host
+  ([Benchmarks](./benchmarks.md#the-l3-data-path-what-limits-it-2026-10-10-this-model)).
+  The L3 path does not scale with the number of connections, so this is the
+  lever that matters. The recipes below use 1400, which fits any path that
+  carries the tunnel; raise it to what the path between the two ends actually
+  allows.
 
 Both recipes end with the same configuration:
 

@@ -274,8 +274,13 @@ def visitor_bytes(sample: dict) -> int:
     return sample.get("wire", {}).get(topology.VISITOR_IFACE, {}).get("tx_bytes", 0)
 
 
-def counter_metrics(sample: dict, peaks: dict) -> dict:
-    """Every metric that needs only counters, over the sample's own window."""
+def counter_metrics(sample: dict, peaks: dict, device_io: bool = True) -> dict:
+    """Every metric that needs only counters, over the sample's own window.
+
+    `device_io` says whether this arm's payload crosses a character device: the
+    two syscall metrics describe device I/O and are not computable for an arm
+    whose bytes move through sockets (see `workloads.DEVICE_IO_METRICS`).
+    """
     window = max(sample.get("elapsed_s", 0.0), 1e-9)
     offered = visitor_bytes(sample)
     link = wire_of(sample)
@@ -292,8 +297,8 @@ def counter_metrics(sample: dict, peaks: dict) -> dict:
             round(sample["cpu_s_total"] / (offered * 8 / 1e9), 4) if offered else None
         ),
         "cpu_cores": round(sample["cpu_s_total"] / window, 3),
-        "bytes_per_syscall": round(moved / calls, 1) if calls else None,
-        "syscalls_per_s": round(calls / window, 1) if calls else None,
+        "bytes_per_syscall": (round(moved / calls, 1) if calls and device_io else None),
+        "syscalls_per_s": round(calls / window, 1) if calls and device_io else None,
         "wire_per_visitor_byte": round(link / offered, 4) if offered else None,
         "mean_carried_packet_b": round(link / packets, 1) if packets else None,
         "rss_peak_mib": (

@@ -43,6 +43,7 @@ import instruments as inst  # noqa: E402
 import model  # noqa: E402
 import runner  # noqa: E402
 import topology  # noqa: E402
+import workloads  # noqa: E402
 
 
 def cmd_list(args) -> int:
@@ -64,6 +65,7 @@ def cmd_list(args) -> int:
     for name, arm in model.ARM_CATALOG.items():
         print(
             f"  {name:<12} kind={arm.kind:<8} mode={arm.data_mode:<10} "
+            f"carrier={arm.data_carrier or '-':<5} "
             f"pool_cap={arm.pool_cap or 'default':<8} txqueuelen={arm.txqueuelen}"
         )
     print("\nprofiles (a profile is a time budget with a method attached):")
@@ -271,11 +273,67 @@ def _check_arms(c: Checker) -> None:
             spec = f"id={kind},mode=direct,txqueuelen={model.DEEP_TXQUEUELEN}"
             parsed = model.parse_arm_spec(spec)
             c.equal(f"arm spec {kind} txqueuelen", parsed.txqueuelen, 10000)
-    with contextlib.suppress(ValueError):
-        model.parse_arm_spec("id=l3,typo=1")
-        c.check("unknown arm key is refused", False, "typo=1 was accepted")
-        return
-    c.check("unknown arm key is refused", True)
+    # `mode` and `carrier` are independent axes: the product accepts every
+    # combination, so the catalog may state every combination.
+    for mode in ("direct", "multiplex"):
+        spec = f"id=l3,mode={mode},carrier=kcp"
+        parsed = model.parse_arm_spec(spec)
+        c.equal(f"arm spec carries kcp in {mode} mode", parsed.data_carrier, "kcp")
+        c.equal(f"arm spec keeps the {mode} mode", parsed.data_mode, mode)
+    c.check(
+        "arm spec refuses an unknown carrier",
+        _refused(model.parse_arm_spec, "id=l3,carrier=quic"),
+        "carrier=quic was accepted",
+    )
+    c.check(
+        "unknown arm key is refused",
+        _refused(model.parse_arm_spec, "id=l3,typo=1"),
+        "typo=1 was accepted",
+    )
+
+
+def _check_device_io(c: Checker) -> None:
+    """The device-I/O metrics belong to the arms that have a device.
+
+    `/proc/<pid>/io` does not account socket payload (measured in this
+    container: 200 MB through a socketpair moves `rchar` by 105 KB, the same
+    bytes through a pipe by 209 MB), so a forwarding arm would report its
+    runtime's plumbing as if it were the path. The reader of a result sees a
+    typed absence for those arms instead of a number that means nothing.
+    """
+    l3 = model.arms_from_names(["l3"], "/bin/true")[0]
+    l4 = model.arms_from_names(["l4"], "/bin/true")[0]
+    c.check("an L3 arm has device I/O", l3.uses_device_io, "l3 reported no device")
+    c.check("an L4 arm has no device I/O", not l4.uses_device_io, "l4 reported one")
+    sample = {
+        "elapsed_s": 2.0,
+        "io": {"server": {"rchar": 4096, "wchar": 2048, "syscr": 2, "syscw": 1}},
+        "syscalls": 3,
+        "cpu_s_total": 1.0,
+        "wire": {},
+    }
+    with_device = inst.counter_metrics(sample, {}, device_io=True)
+    without = inst.counter_metrics(sample, {}, device_io=False)
+    c.equal(
+        "a device arm reports bytes per syscall",
+        with_device["bytes_per_syscall"],
+        2048.0,
+    )
+    c.equal("a socket arm reports none", without["bytes_per_syscall"], None)
+    c.check(
+        "the two device metrics share one rule",
+        workloads.DEVICE_IO_METRICS == ("bytes_per_syscall", "syscalls_per_s"),
+        "the rule and the metric list disagree",
+    )
+
+
+def _refused(fn, value) -> bool:
+    """True when the call raises: the shape of every refusal check here."""
+    try:
+        fn(value)
+    except ValueError:
+        return True
+    return False
 
 
 def _check_analysis(c: Checker) -> None:
@@ -564,6 +622,7 @@ def cmd_selfcheck(args) -> int:
     c = Checker()
     _check_registry(c)
     _check_arms(c)
+    _check_device_io(c)
     _check_analysis(c)
     _check_summary(c)
     _check_comparability(c)

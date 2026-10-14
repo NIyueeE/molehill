@@ -25,7 +25,7 @@ The rules the model enforces, in code:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import ClassVar
 
 # --------------------------------------------------------------------------
@@ -407,7 +407,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "id": "bytes_per_syscall",
         "unit": "B",
         "direction": "higher",
-        "definition": "tool process rchar+wchar / syscr+syscw (the I/O granularity)",
+        "definition": (
+            "device I/O per call: the tool process's rchar+wchar / syscr+syscw. "
+            "Only an L3 arm can produce it — `/proc/<pid>/io` does not account "
+            "socket payload — so a forwarding arm records a typed absence"
+        ),
         "denominator": "one read/write-family syscall",
         "needs": (
             "bulk",
@@ -425,7 +429,11 @@ METRIC_SPECS: tuple[dict, ...] = (
         "id": "syscalls_per_s",
         "unit": "1/s",
         "direction": "lower",
-        "definition": "tool process syscr+syscw / measured window",
+        "definition": (
+            "device I/O calls per second: the tool process's syscr+syscw over "
+            "the measured window. The L3 path's shape, and only its: see "
+            "`bytes_per_syscall`"
+        ),
         "denominator": "the workload's measured window",
         "needs": (
             "bulk",
@@ -670,6 +678,11 @@ CONDITIONS: dict[str, Condition] = {
         "a 20 Mbit uplink",
         ("rate", "20mbit", "delay", "40ms", "limit", "2000"),
     ),
+    "loss1_rate100": Condition(
+        "loss1_rate100",
+        "a 100 Mbit uplink that also loses packets (the lossy-WAN case)",
+        ("rate", "100mbit", "delay", "20ms", "loss", "1%", "limit", "2000"),
+    ),
     "jitter": Condition(
         "jitter", "a bufferbloated access link", ("delay", "20ms", "10ms")
     ),
@@ -748,11 +761,19 @@ class Arm:
     capped pool separates the multiplexer's framing cost from its pool's, and
     the TUN queue length decides whether an L3 arm measures the architecture or
     the kernel's default queue.
+
+    `carrier` is the transport the data plane rides: `tcp` (the control
+    channel's own wire stack) or `kcp` (KCP-over-UDP sessions, feature `kcp`).
+    It is the difference between a congestion-controlled stream and a
+    retransmit-aggressive one on a shaped path, so an arm that does not state
+    it is not describing the run it measured — and `kcp` needs `mode` =
+    `multiplex` (a KCP session is a mux tunnel), which `states_kcp` names.
     """
 
     id: str
     kind: str
     mode: str = "multiplex"
+    carrier: str = "tcp"
     pool_cap: int = 0
     txqueuelen: int = 1000
     binary: str = ""
@@ -781,9 +802,42 @@ class Arm:
     def data_mode(self) -> str:
         if self.kind == "peer":
             return ""
+        if self.kind == "control":
+            # No tool in the path: the architecture has no data plane to
+            # describe, and printing the dataclass default here would read as a
+            # configuration the control arm never had.
+            return ""
         if self.kind == "l3":
             return self.mode if self.mode in ("direct", "multiplex") else "direct"
         return self.mode
+
+    @property
+    def data_carrier(self) -> str:
+        """The carrier the data plane rides.
+
+        Empty for a control arm (no tool) and for a peer (which owns its own
+        stack). Naming it here is what makes the choice auditable in the
+        results instead of a reading of the generated config.
+        """
+        if self.kind in ("peer", "control"):
+            return ""
+        return self.carrier if self.carrier in ("tcp", "kcp") else "tcp"
+
+    @property
+    def states_kcp(self) -> bool:
+        return self.data_carrier == "kcp"
+
+    @property
+    def uses_device_io(self) -> bool:
+        """Whether this arm's payload crosses a character device.
+
+        Only the L3 path does: a claim reads and writes whole packets on its TUN
+        device. Everything else moves payload through sockets, and
+        `/proc/<pid>/io` does not account socket payload (measured: 200 MB
+        through a socketpair moves `rchar` by 105 KB, the same bytes through a
+        pipe by 209 MB), so the device-I/O metrics can only be produced here.
+        """
+        return self.kind == "l3"
 
     @property
     def dial_host(self) -> str:
@@ -845,6 +899,14 @@ ARM_CATALOG: dict = {
     "l3": Arm("l3", "l3", mode="direct"),
     "l3-mux": Arm("l3-mux", "l3", mode="multiplex"),
     "l3-deep": Arm("l3-deep", "l3", mode="direct", txqueuelen=DEEP_TXQUEUELEN),
+    # The carrier axis: `kcp` rides UDP, `mode` says whether a yamux pool sits
+    # above the carrier (multiplex) or the carrier's own session *is* the
+    # channel (direct). The two are independent, so the L3 arm that pairs
+    # `direct` with `kcp` measures KCP without the multiplexer's framing — the
+    # pairing the question "does KCP pay for its framing?" needs.
+    "l3-kcp": Arm("l3-kcp", "l3", mode="direct", carrier="kcp"),
+    "l3-mux-kcp": Arm("l3-mux-kcp", "l3", mode="multiplex", carrier="kcp"),
+    "l4-kcp": Arm("l4-kcp", "l4", mode="multiplex", carrier="kcp"),
     # The reference tools. Their adapters live in `peers.py`; the arm is the
     # same shape as any other, which is what makes the comparison one run.
     "frp": Arm("frp", "peer", tool="frp", label="frp"),
@@ -860,19 +922,15 @@ def arms_from_names(names: list, binary: str) -> list:
     unknown = [n for n in names if n not in ARM_CATALOG]
     if unknown:
         raise SystemExit(f"unknown arm(s): {unknown}; known: {', '.join(ARM_CATALOG)}")
-    return [
-        Arm(
-            id=a.id,
-            kind=a.kind,
-            mode=a.mode,
-            pool_cap=a.pool_cap,
-            txqueuelen=a.txqueuelen,
-            binary=binary,
-            tool=a.tool,
-            label=a.label,
-        )
-        for a in (ARM_CATALOG[n] for n in names)
-    ]
+    arms = []
+    for name in names:
+        arm = replace(ARM_CATALOG[name], binary=binary)
+        try:
+            refuse_unknown_carrier(arm)
+        except ValueError as e:
+            raise SystemExit(str(e)) from e
+        arms.append(arm)
+    return arms
 
 
 def default_arms() -> list:
@@ -885,7 +943,7 @@ def default_arms() -> list:
 
 
 def parse_arm_spec(spec: str) -> Arm:
-    """`id=l3,mode=direct,txqueuelen=10000,side=B` — an arm as data.
+    """`id=l3,mode=direct,carrier=kcp,txqueuelen=10000,side=B` — an arm as data.
 
     The syntax exists so that an experiment with a knob the catalog does not
     name is still *declared* (and therefore recorded and comparable) rather than
@@ -905,6 +963,7 @@ def parse_arm_spec(spec: str) -> Arm:
         "id",
         "kind",
         "mode",
+        "carrier",
         "pool_cap",
         "txqueuelen",
         "binary",
@@ -918,10 +977,31 @@ def parse_arm_spec(spec: str) -> Arm:
     for numeric in ("pool_cap", "txqueuelen"):
         if numeric in fields:
             fields[numeric] = int(fields[numeric])
+    if "carrier" in fields and fields["carrier"] not in ("tcp", "kcp"):
+        raise ValueError(
+            f"unknown carrier {fields['carrier']!r}; known: tcp, kcp "
+            "(the product's `[client.data].default_carrier`)"
+        )
     kind = fields.pop("kind", None) or fields.get("id", "")
     if kind not in ("control", "l4", "l3", "peer"):
         raise ValueError(f"unknown arm kind {kind!r}; known: control, l4, l3, peer")
-    return Arm(kind=kind, **fields)
+    arm = Arm(kind=kind, **fields)
+    refuse_unknown_carrier(arm)
+    return arm
+
+
+def refuse_unknown_carrier(arm: Arm) -> None:
+    """Refuse a carrier the product does not have.
+
+    `mode` and `carrier` are independent axes now (a direct channel rides a KCP
+    session as readily as a TCP connection), so the only thing left to check is
+    the vocabulary: an arm that names a carrier nothing implements would fail
+    every cell on a config error instead of measuring.
+    """
+    if arm.kind in ("l3", "l4") and arm.data_carrier not in ("tcp", "kcp"):
+        raise ValueError(
+            f"arm {arm.id!r}: unknown carrier {arm.carrier!r}; known: tcp, kcp"
+        )
 
 
 # --------------------------------------------------------------------------

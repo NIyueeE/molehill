@@ -220,6 +220,330 @@ configuration surface is free to change — and this cycle changes it.
    also its acceptance test. The 5 Gbit/s UDP ladder cell and the loopback
    ceiling remain the two places where a single run cannot order the arms.
 
+7. **The carrier axis and the L3 data path, measured (2026-10-10, unreleased).**
+   The hypothesis on the table was "L3 + KCP is better overall, and the
+   multiplexer should not cost much". The model answered both, and the answers
+   are *no* and *it costs 28 %* — with one exception each way, and with the
+   real L3 lever showing up in the same campaign.
+
+   **The carrier is now independent of the mode** (`08e72aa`): a `direct`
+   service or claim can ride KCP — one session per channel, no yamux above it —
+   where the config used to refuse the pair. The server's KCP listener reads the
+   data-channel hello beside the tunnel hello, the client dials the carrier its
+   service declared, and the model gained the axis to measure it (`fd4c9aa`):
+   arms `l3` / `l3-mux` / `l3-kcp` / `l3-mux-kcp` / `l4-kcp`, the carrier in the
+   generated config and in the evidence, and the condition `loss1_rate100` (a
+   100 Mbit/s, 20 ms, 1 %-loss leg — the lossy WAN the choice is about).
+
+   What the model measured (`--profile smoke`, two rounds, A/A twin in every
+   run, conditions on the **tunnel** leg, tables in
+   [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)):
+
+   | Condition | control | tcp carrier | kcp carrier |
+   |---|---|---|---|
+   | clean, `l3` (direct) | 41.8 | 4.17 Gbit/s, 0.855 s/Gbit | 2.19 Gbit/s, 2.554 s/Gbit |
+   | clean, `l3-mux` | — | 2.99 Gbit/s, 1.435 | 2.51 Gbit/s, 2.310 |
+   | `loss1`, `l4` / `l4-kcp` | 4.43 | 2.51 | 0.40 |
+   | `loss1`, `l3` / `l3-kcp` | 4.43 | 2.03 | 0.41 |
+   | `loss1_rate100`, bulk | 0.096 | 0.093 (`l4`), 0.089 (`l3`) | 0.059 (`l3-kcp`), **failed 3/3** (`l4-kcp`) |
+   | `loss1_rate100`, `rr-16` | 323.2/s | 328.0 (`l4`), 335.3 (`l3`) | **337.8 (`l4-kcp`)**, **338.6 (`l3-kcp`)** |
+
+   Read: the multiplexer costs **28 %** of the bulk throughput and 68 % more CPU
+   per byte; KCP costs **48 %** and 3× the CPU per byte *on a clean path*; under
+   loss KCP is **five to six times behind TCP** in both architectures; and on a
+   rate-limited lossy leg the multiplexed KCP arm does not finish its test at
+   all — `KCP session dead link`, which kills the visitor's connection with it.
+   The mechanism came out of the carrier's own counters
+   (`MOLEHILL_KCP_STATS=1`): **22 % of the datagrams it sent were
+   retransmissions**, because with `nc=1` there is no congestion control and the
+   pacer's only signal is a PONG that does not arrive within 2.5 s — a
+   window-sized burst goes into whatever queue the path has, the standing queue
+   delays the acks past the escalating RTO, and the retransmissions enlarge the
+   queue until the ARQ declares a live-but-rate-limited peer dead.
+
+   **Both obvious fixes were tried and both are wrong.** `nc=0` (KCP's own
+   congestion control) as an A/B against the shipped build on `loss1_rate100`
+   measured **0.002 Gbit/s against 0.043** on bulk and 256/s against 344/s on
+   `rr-16` — KCP's built-in control collapses the window on a lossy path and
+   never recovers. And capping the send window to the path's BDP (2048 → 256
+   segments, `set_wndsize`) left bulk where it was (**0.039 against 0.044**) and
+   the multiplexed arm still died. The counters say why a knob cannot do it: on
+   that leg the sender retransmits **24 % of its output** against a 1 % loss
+   rate, so the recovery loop itself is the defect — it needs a controller
+   driven by what the path delivers (delivery rate and/or RTT inflation), in the
+   adapter, with the `loss1_rate100` A/B as its gate. The engine exposes
+   `set_wndsize`/`wait_snd` but not `snd_una`/`rx_srtt`, so such a controller
+   starts with two accessors. The one place KCP won is worth keeping in view: on the same leg,
+   many short interactions (`rr-16`) were fastest on both KCP arms with the best
+   p99 — fast retransmit pays, and it is the bulk path where the missing control
+   costs more.
+
+   **The larger finding is about L3 itself.** The same campaigns measured the
+   data path against the forwarding path on one host
+   ([table](docs/benchmarks.md#the-l3-data-path-what-limits-it-2026-10-10-this-model)):
+
+   | Arm | `bulk-1`, TUN MTU 1400 | `bulk-n` (8 flows) | `bulk-1`, TUN MTU 8000 |
+   |---|---|---|---|
+   | `l3` | 4.34 Gbit/s | 3.93 | **8.00** |
+   | `l4` | 8.99 | 22.33 | 8.00 |
+
+   Two conclusions, both actionable. **L3 does not scale with flows** (eight
+   flows move less than one) — the ceiling is a serialized per-packet path, not
+   a window, so more connections through a claim cannot raise it. And **packet
+   size is the lever**: an 8000-byte TUN MTU (link MTU to match) took the same
+   flow to 8.00 Gbit/s (+84 %) at a **third** of the CPU per byte, matching the
+   forwarding path at one flow. That is an operator setting, and
+   [deployment.md](docs/deployment.md#transparent-services) now carries the
+   number.
+
+   At that packet size a second measurement says *what* the remaining ceiling
+   is — the forwarding path with its pool capped, so that one arm prices one
+   carrier connection:
+
+   | Arm (TUN MTU 8000) | `bulk-1` | `bulk-n` (8 flows) |
+   |---|---|---|
+   | control | 38.672 | 44.805 |
+   | `l3` | 7.136 | 5.847 |
+   | `l4` (pool ≤ 4) | 8.286 | 21.604 |
+   | `l4-mux1` (one tunnel) | 9.819 | 12.646 |
+   | `l4-mux8` | 9.058 | 21.955 |
+
+   One carrier connection tops out near 8–10 Gbit/s here (the one-tunnel arm
+   says so at one flow *and* at eight streams over that tunnel), and the
+   forwarding path passes it only by spreading streams over several tunnels. A
+   claim has exactly one channel, so it sits at the per-connection ceiling by
+   construction — that is why its `bulk-n` is below its `bulk-1`. Going past it
+   is a **design** decision (per-flow sharding: several channels per claim, one
+   per inner flow), not a tuning one, and the model cannot price it before it
+   exists.
+
+   Open, in the order the measurements argue for them:
+
+   - **A device path that carries more than one packet per syscall** — chosen
+     as the next lever (2026-10-10), and **the kernel half is now verified**
+     (spike outside the repo, same host):
+     - attaching to an operator-created device with `IFF_VNET_HDR` works, and
+       so do `TUNSETVNETHDRSZ` (its argument goes **by pointer**) and
+       `TUNSETOFFLOAD` (its argument goes **by value** — mixing the two
+       conventions returns `EINVAL` for every mask, which cost an hour of the
+       spike);
+     - `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6` is accepted, so the device advertises
+       TSO/GSO;
+     - one 54 918-byte **USO** write (`gso_type = UDP_L4`) was delivered as
+       **40 datagrams of 1372 B** to a local socket: one syscall, forty packets,
+       segmented by the kernel;
+     - one 54 440-byte **TSO** super-packet was accepted and crossed a veth as
+       *one* 54 KB skb (the virtual link preserves GSO), so segmentation is
+       deferred to wherever it is really needed.
+
+     Two more things the same day's experiments settled, both of them reasons
+     the header does **not** land on its own:
+
+     - **The offload flag is two-way, and enabling it alone breaks every
+       claim.** With `TUN_F_CSUM` on and the virtio header dropped on the floor,
+       no visitor could reach a claim at all (measured: both the framing run and
+       the readiness probe failed for every round). The reason is the topology's
+       own veth: it hands over packets whose transport checksum is still
+       partial, the device advertises that it may do so, and a daemon that
+       forwards the packet without its flags forwards something the far end can
+       only drop. The header's `flags`/`csum_*` fields have to travel with the
+       packet — which is the wire change, not a local one.
+     - **The header without the offloads is a pure cost.** Attach with
+       `IFF_VNET_HDR` only (offloads off, packets complete, everything still
+       working) measured **4–5 % below** the released build on `bulk-1`: three
+       rounds, the A/A twin beside it, every round below both old arms
+       (4.041 against 4.188/4.255 Gbit/s). The header costs a 10-byte copy on
+       read and a two-segment `writev` on write, and buys nothing until the
+       writes coalesce. So it lands *with* the GSO write, as one change whose
+       A/B has a win to show.
+
+     **What is still unverified** is the half the win depends on: whether the
+     kernel *coalesces* on the read side. The spike could not answer it — a UDP
+     stream arriving on a veth is fragmented, not GRO-able, and the reads came
+     back one packet each with the header all zeroes (10 169 reads of 1406 B,
+     no `gso_type`) — so the TCP case has to be measured where TCP flows exist:
+     in the bench, with the L3 arm at 1400 and at 8000, watching
+     `mean_carried_packet_b` (a frame above the MTU is a coalesced read) and
+     `syscalls_per_s`. If the read side never coalesces, the win is only the
+     inject side's, and the design has to coalesce a run in userspace — which is
+     why the two slices below are ordered that way.
+
+     The design that follows, in two slices:
+
+     * **Slice 1, no wire change.** Both TUNs attach with `IFF_VNET_HDR` and
+       enable the offloads; the *inject* side groups consecutive packets of one
+       flow (same 5-tuple and direction, consecutive TCP sequence numbers or
+       equal-size UDP payloads, no SYN/FIN/RST inside the run, DF set) and
+       writes the run as one GSO packet, falling back to one write per packet
+       whenever the run does not qualify or the device has no offloads. The
+       frames on the wire stay one packet each, so nothing needs a version bump
+       and an old peer keeps working.
+     * **Slice 2, with a wire change.** The virtio metadata travels in the L3
+       frame, so a super-packet read from one TUN is carried as one unit and
+       injected as one write at the far end (and the reverse direction too).
+       This is a protocol change (v6) and is only worth it after slice 1 has
+       been measured.
+
+     Measurement plan, all of it on the model as it stands: the L3 arms
+     (`l3`, `l3-deep`) at the default 1400-byte TUN MTU and at 8000, on
+     `bulk-1`/`bulk-n`/`rr-16` and on `udp-pace` (`bytes_per_syscall` and
+     `syscalls_per_s` are the readings that must move — they are device-I/O
+     metrics, so an L3 arm is exactly where they are valid), with `l3-deep`'s
+     deeper queue as the control for "is it syscalls or queueing". Success is a
+     throughput gain the run's own A/A floor can see, at no cost to `rr-16`'s
+     latency or the wire ratio.
+   - **The datagram size follows the path — landed, measured, kept.** The
+     carrier had been pinned at 1400 bytes with a shrink-only adaptation, so
+     every jumbo path paid the per-datagram cost 5.7× more often than it had
+     to. `Kcp::set_mtu` (was `shrink_mtu`) now follows the caller in both
+     directions, the adapter computes the size from the kernel's path-MTU
+     answer up to an 8 KiB ceiling (`datagram_for_path`), re-reads it once a
+     second, and every inbound buffer is sized from the *ceiling* rather than
+     from the engine's default — the spike's first jumbo attempt arrived as a
+     retransmit storm because `DGRAM_BUF` was 2048 against 8000-byte segments.
+     A/B against the previous build, two rounds an arm, `l3-kcp`, one bulk
+     flow: clean jumbo **2.170 → 3.026 Gbit/s (+39 %)** at −28 % CPU per Gbit
+     and a better wire ratio; `loss1` jumbo **0.407 → 1.713 (+4.2×)** at −40 %
+     CPU; `loss1` on a 1500-byte link **neutral** (0.406 → 0.434), which is the
+     safety property — the probe keeps a normal path at the size it carries;
+     `rr-16` on `loss1_rate100` +3.8 %.
+   - **The dead link was the rule, and it is fixed.** The engine inherited the
+     reference's dead-link rule — twenty retransmissions of one segment ends the
+     session — which conflates a peer that is gone with one that is slow. On a
+     rate-limited path the acknowledgements queue behind the shaper, so a
+     segment collects twenty retransmissions while the peer answers everything
+     else, and a live session is closed. The rule now needs the count *and* a
+     send window that has not moved for five seconds (`KCP_DEAD_GRACE_MS`, with
+     `last_progress` set wherever `snd_una` advances). Measured on
+     `loss1_rate100` + a jumbo link: the multiplexed arm failed `bulk-1` in
+     **every** round before and completes **both** after (0.058–0.059 Gbit/s,
+     17 % fewer wire bytes than the direct arm), and the direct arm's CPU per
+     byte fell by a fifth. The one cost: a genuinely vanished peer is now
+     detected up to five seconds later, which the session-level watchdogs
+     (`FORWARD_IDLE_TIMEOUT`) bound anyway.
+   - **The collapse was the pacer, and it is fixed.** The trigger turned out to
+     be blunt: in a session's lifetime, the *first* cell of a turn runs at full
+     speed and *every later* cell runs at a fraction, whatever the scenario
+     (`bulk-n,bulk-n` 6.18 → 1.00; `bulk-n,bulk-1` 5.86 → 1.08; `bulk-1,bulk-n`
+     7.1 → 2.0). The state was the adaptive pacer's allowance, visible once a
+     gauge for it was added: 12 → 9 → 6.75 → 5.06 → 3.8 Gbit/s across the first
+     cell's PONG timeouts, held for the rest of the session because the recovery
+     is 5 % per four clean PONGs. A PONG that is late because the peer is busy
+     sending is not congestion, so `PaceState::on_ping_timeout` now cuts only
+     when the send window has not moved since the PING (`Kcp::snd_una`, sampled
+     at PING time). Measured after the fix: `bulk-n,bulk-n` **7.79 then 7.67**,
+     `bulk-1,bulk-n` **7.19 then 7.44** — no collapse — while `loss1` jumbo
+     stays at 1.67–1.71, `rtt100` is 0.169 → 0.182 and `loss5` is unchanged.
+     Two detours are recorded rather than hidden: a **window byte budget** (to
+     stop the buffers growing 5.7× at a jumbo MTU) fixed nothing and cost the
+     lossy leg two thirds of its throughput (0.45 against 1.67 Gbit/s on
+     `loss1`), so it was reverted — a lossy path wants the window *wider* than
+     the BDP, not closer to it; and a **1 ms ack-batching window** was −6 % to
+     −12 % on the clean path and was reverted. What remains open from the
+     original finding: nothing — the collapse is gone, and the numbers that
+     replaced it are on the benchmarks page.
+   - **L3+KCP matches the TCP carrier on a jumbo single flow and now leads it on
+     eight (historical note; see the entry above for the fix).** With the segment size following
+     the path and the dead link fixed, one bulk flow through an L3 claim at a
+     jumbo TUN MTU (8000) and a jumbo link (9000) measures **7.265 Gbit/s
+     against the TCP carrier's 7.086** in the same run (A/A twin 6.948, so both
+     are inside the noise of each other) at 2.3× the CPU per byte — the
+     user-facing claim "L3+KCP can be as fast as L3+TCP" now has a measurement.
+     What does *not* hold is the eight-flow cell, and the trigger is
+     reproducible and narrow:
+     - `--arms l3-kcp --scenarios bulk-n` (alone): **5.9–6.2 Gbit/s** across
+       four runs;
+     - `--arms l3-kcp --scenarios bulk-1,bulk-n` (a bulk cell first): **1.99 and
+       3.54 Gbit/s** in two runs — and in a 4-arm, 3-round campaign, 2.06 in
+       every measured round while the TCP carrier beside it read 5.6–5.9;
+     - the engine's own counters are *identical* in both cases (server
+       retransmits ~15–18 % of its datagrams either way, client `ms_input`
+       1.5–1.9 s, `ms_output` per datagram 7.5 µs), and the difference is the
+       **bytes per datagram**: 6.2 KB when it is fast, 3.4 KB when it collapses
+       — the sender is producing smaller datagrams, not more work per datagram.
+     So the next step is to find why a preceding bulk cell makes the carrier
+     emit half-full datagrams: the candidates are the hub's batching (it flushes
+     "the moment the device runs dry", and eight flows drain the device
+     differently from one) and the KCP writer's chunking downstream of it.
+     Reproduce with `sudo -n uv run benches/scripts/bench/bench.py run --profile
+     smoke --arms l3-kcp --scenarios bulk-1,bulk-n --condition clean
+     --link-mtu 9000 --tun-mtu 8000 --rounds 1 --warmup-rounds 0`.
+   - **The whole-workload sweep (`dev`, jumbo path, A/A twin) says where this
+     stands**: level with the TCP carrier on one bulk flow (7.136 against 7.554
+     and a twin at 7.496) and on churn (6 779 against 7 139, twin 7 209),
+     **19 % ahead on eight flows** (7.418 against 6.023, twin 6.243), **behind on
+     short round trips** (rr-1 10 177/s against 14 167/s, rr-16 30 264/s against
+     32 984/s, p99 equal) and **about twice the inner-UDP loss** at every rung of
+     the ladder (1.05 % against 0.60 % at 2 Gbit/s). The UDP loss is the one to
+     chase next if quality matters more than throughput: it is the hub's
+     endpoint channel dropping when the carrier's writer is slower than the
+     ingress, and the loss is unrecoverable for a UDP flow.
+   - **The long-haul gap is the next real target, and its mechanism is now
+     measured.** `rtt100` (100 ms each way, no configured loss): TCP carrier
+     0.461 Gbit/s, `l3-kcp` 0.178 — the widest gap left in the model. The
+     carrier's counters put 21 % of the sender's datagrams somewhere on the
+     floor and 28 % of its output into recovery, split 4 239 RTO against 2 163
+     fast-retransmit (so mostly spurious timeouts). **Kept:** RTO headroom of
+     `srtt/8` (`KCP_RTO_HEADROOM_DIVISOR`), worth −42 % RTO resends and a wire
+     ratio of 1.20 → 1.09 with throughput flat. **Falsified:** pacing the burst
+     to the BDP (`window / srtt`) is 35 % *slower* (0.114 against 0.175 Gbit/s,
+     three rounds each, ranges disjoint) and does not change the wire ratio —
+     the pacer's bucket-and-rate gate does not remove the losses, it only slows
+     the sender. So the next attempt has to find where those datagrams actually
+     die (the receiving socket's buffer, the veth queue between the namespaces,
+     or the ARQ's own flush cadence) rather than throttle the sender: the
+     obvious throttles have all been measured now. The diagnostics this needed
+     are on the `MOLEHILL_KCP_STATS` line for good: `resends_rto` vs
+     `resends_fast`, `rto_ms`/`srtt_ms`, the window state, the reader/spill
+     residency and the pacer's allowance.
+     Two more results from chasing it, both landed: **the drain parks what the
+     pacer or the kernel refuses** instead of dropping it (worth +12 % on
+     `loss1`, 1.824 against 1.627 Gbit/s with disjoint ranges, at an identical
+     wire ratio) and the park is bounded by half the RTO so the ARQ does not
+     duplicate what the pacer is holding. And one **trade left on the table**:
+     with parking in place, capping the send rate at `window / srtt` is +21 % on
+     `rtt100` (0.204 against 0.169 Gbit/s) but **+14 % wire bytes** there; it is
+     measured, documented on the benchmarks page, and deliberately not carried
+     until someone decides that trade. A quick follow-up worth one run: whether
+     a *larger* pacer bucket (more burst allowed, less queueing delay) keeps the
+     throughput and loses the wire cost.
+   - **A rate-aware pacer for the KCP carrier** (above) — **attempted
+     2026-10-10, measured, reverted.** The design: sample the peer's
+     acknowledged progress every 20 ms, convert it to segments per second, and
+     set the send window to `rate × srtt × 1.5`, never below 64 segments. Its
+     A/B against the shipped build, same arm, two rounds each:
+     clean **neutral** (2.174 against 2.188 Gbit/s), `loss1_rate100` **slightly
+     ahead** (0.059 against 0.053 Gbit/s, 9 % fewer wire bytes), and `loss1`
+     **twelve times worse** (0.033 against 0.411). The reason is the signal, not
+     the intent: `snd_una` measures *contiguous* acknowledgement, so it stalls
+     on every gap and the window shrinks exactly when loss needs the opposite —
+     and a window too small starves fast retransmit, which is driven by the acks
+     of *later* segments; with nothing in flight the sender waits out a 30 ms+
+     RTO instead. Two things follow for the next attempt: the rate signal must
+     come from acks (or from `KCP_SACKS_SENT`/retransmit counters) rather than
+     from contiguous progress, and the window needs a loss-aware reserve with a
+     hard floor under fast retransmit's needs. The shipped constant window stays
+     until that exists.
+   - **The churn scenario reports zeros, and only for L4 arms.** Three runs on
+     2026-10-10 (`churn-16`, 2/5/10 rounds) produced four rounds with no samples
+     at all and three rounds where the readiness probe could not reach the
+     exposed port for its full 30 s — every one of them on an L4 arm or its
+     twin, never on L3, and the probe's own log for a zero round *does* contain
+     latency samples. Two candidate explanations, neither established: the
+     architecture (a fresh visitor connection costs L4 a data channel and a
+     pair of ephemeral ports that L3 does not spend) or the probe (which reports
+     a rate without saying why connections failed). Until the probe records the
+     failure reason, no churn number may be quoted — including the tempting
+     reading that L3 beat L4 in both runs' means (6366/7131 against 5638/4932).
+     The instrument is the thing to fix first; if the architecture is the cause,
+     it is a finding worth having.
+   - **What the multiplexer's 28 % actually is.** The earlier per-cell model
+     measured 6 % of wire and 33 % of CPU per packet for `direct` over
+     `multiplex`; this model measures 28 % of throughput and 68 % of CPU per
+     Gbit. The two are not the same reading and the difference is worth
+     attributing (yamux frame copies vs the pool's stream machinery) before
+     anything is changed for it.
+
 **Pre-registered criteria (kept as written, for the record).** Small packets
 (≤128 B payload): wire bytes down ≥ 20 %. Mid (512 B–1 KB): ≥ 5 %. Bulk
 (1400 B): throughput down ≤ 2 %. The small-packet and the bulk conditions must

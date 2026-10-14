@@ -37,7 +37,7 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -205,27 +205,17 @@ def resolve_arms(args, profile: dict | None = None) -> list:
 
 
 def _with_binary(arm: model.Arm, binary: str, arm_id: str = "", side: str = ""):
-    return model.Arm(
-        id=arm_id or arm.id,
-        kind=arm.kind,
-        mode=arm.mode,
-        pool_cap=arm.pool_cap,
-        txqueuelen=arm.txqueuelen,
-        binary=binary,
-        side=side or arm.side,
-    )
+    """The same arm on another build.
+
+    `replace` rather than a field-by-field constructor: every field of the arm
+    is part of what it measures, so a new axis must never be able to go missing
+    here (the carrier axis was added by exactly this rule).
+    """
+    return replace(arm, id=arm_id or arm.id, binary=binary, side=side or arm.side)
 
 
 def _set_side(arm: model.Arm, side: str):
-    return model.Arm(
-        id=arm.id,
-        kind=arm.kind,
-        mode=arm.mode,
-        pool_cap=arm.pool_cap,
-        txqueuelen=arm.txqueuelen,
-        binary=arm.binary,
-        side=side or arm.side,
-    )
+    return replace(arm, side=side or arm.side)
 
 
 def with_aa(arms: list, enabled: bool) -> list:
@@ -241,17 +231,7 @@ def with_aa(arms: list, enabled: bool) -> list:
     base = next((a for a in arms if a.is_tool), None)
     if base is None:
         return arms
-    twin = _with_binary(base, base.binary, arm_id=f"{base.id}~aa")
-    twin = model.Arm(
-        id=twin.id,
-        kind=twin.kind,
-        mode=twin.mode,
-        pool_cap=twin.pool_cap,
-        txqueuelen=twin.txqueuelen,
-        binary=twin.binary,
-        side=twin.side,
-    )
-    return [*arms, twin]
+    return [*arms, replace(base, id=f"{base.id}~aa")]
 
 
 @dataclass

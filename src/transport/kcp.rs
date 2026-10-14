@@ -127,9 +127,25 @@ const KCP_FAST_RESEND: i32 = 2;
 /// them (4 × 2.8 MiB = 11.2 MiB send-side).
 const KCP_SND_WND: u16 = 2048;
 const KCP_RCV_WND: u16 = 4096;
+/// The most a session may keep *parked* for the pacer, in bytes. Parking is
+/// bounded by the send window in practice (the engine cannot emit more than
+/// that ahead); this is the backstop that keeps a pathological rate from
+/// growing the queue without limit.
+const PARKED_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Cap on app data queued in the `Kcp` send queue, in segments. Beyond this
 /// the pump stops pulling from the writer channel, backpressuring
 /// `AsyncWrite`.
+///
+/// Segment-counted, like the windows above, and that is deliberate: a byte
+/// budget was tried (the same counts' worth at the 1400-byte default, with the
+/// counts derived from the session's datagram size) to stop these buffers
+/// growing 5.7× on a jumbo path. It fixed nothing — the growth was a red
+/// herring for the one symptom it was aimed at, which turned out to be the
+/// pacer (`PaceState::on_ping_timeout`) — and it cost the lossy leg **two
+/// thirds of its throughput**: 0.45 against 1.67 Gbit/s on `loss1` with jumbo
+/// datagrams, because a window barely one bandwidth-delay product wide leaves
+/// fast retransmit nothing to ride on. A lossy path wants the window *wider*
+/// than the path's BDP, not closer to it.
 const SND_QUEUE_LIMIT: usize = 2 * KCP_SND_WND as usize;
 /// One `Kcp::send` call must stay under 128 segments (`UserBufTooBig`), so
 /// app writes are chunked well below that.
@@ -179,14 +195,24 @@ const MAX_LISTENER_SESSIONS: usize = 4096;
 /// the writer arm) at high link rates.
 const INPUT_BATCH_LIMIT: usize = 512;
 /// Inbound datagram scratch buffer (one datagram is at most one MTU).
-const DGRAM_BUF: usize = 2048;
-/// Arm-2 MTU (KCP's protocol default; never tuned — see the module docs).
-/// Only sizes the send batch's staging buffer.
-const KCP_MTU: usize = 1400;
+///
+/// Sized for the **ceiling**, not for the session's current size: a session may
+/// grow its datagrams at any point (`maybe_path_mtu`), and a short buffer
+/// truncates the datagram instead of failing — the first jumbo experiment
+/// arrived as a retransmit storm because this was 2048 bytes against 8000-byte
+/// segments.
+const DGRAM_BUF: usize = KCP_MTU_CEILING + KCP_OVERHEAD;
+/// The largest datagram a session may use. The engine's default (1400) is where
+/// every session *starts*, because that is what any path carries; the path-MTU
+/// probe is what permits more, and this is the cap on what it may permit — a
+/// jumbo datagram, not an arbitrary one, so a bogus probe result cannot make
+/// the carrier emit something that must be fragmented.
+const KCP_MTU_CEILING: usize = 8000;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
-/// appending never reallocates inside a batch (≈46 KiB).
-const BATCH_STAGE_BYTES: usize = BATCH * (KCP_MTU + KCP_OVERHEAD) + KCP_MTU + KCP_OVERHEAD;
+/// appending never reallocates inside a batch (≈256 KiB at the ceiling).
+const BATCH_STAGE_BYTES: usize =
+    BATCH * (KCP_MTU_CEILING + KCP_OVERHEAD) + KCP_MTU_CEILING + KCP_OVERHEAD;
 /// Reader-side coalescing target: consecutive segments are batched into
 /// one channel message up to this many bytes (the mux/yamux/Noise reader
 /// above asks for ~24 such segments per frame, so this cuts the
@@ -321,6 +347,29 @@ pub(crate) static KCP_RECV_EMPTY: AtomicU64 = AtomicU64::new(0);
 /// sessions of this process. `KCP_NS_DELIVER` is the whole delivery
 /// phase and stays for continuity; the two splits below carve the spill
 /// flush and the receive-queue drain out of it.
+/// Bytes handed to a session's reader channel and not yet consumed by it, and
+/// the bytes parked in spill queues beside it. These are the buffers between
+/// the wire and the reader, and their depth is what the path above experiences
+/// as round-trip time when a reader cannot keep up.
+pub(crate) static KCP_READER_QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_SPILL_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Peak `wait_snd` (unacknowledged segments) since the last stats line: the
+/// session's own queue, as the engine sees it.
+pub(crate) static KCP_WAIT_SND_PEAK: AtomicU64 = AtomicU64::new(0);
+/// The receive queue's depth and the window this side advertises, sampled once
+/// per pump round: the state a stalled reader turns into backpressure.
+pub(crate) static KCP_WAIT_RCV: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_ADVERTISED_WND: AtomicU64 = AtomicU64::new(0);
+/// The peer's advertised window, as last received.
+pub(crate) static KCP_PEER_WND: AtomicU64 = AtomicU64::new(0);
+/// The adaptive send pacer's current allowance, in bits per second. It is cut
+/// on a keepalive timeout and only raised 5 % per four clean ones, so it is the
+/// one piece of state in this path that can hold a session down for minutes.
+pub(crate) static KCP_PACER_BPS: AtomicU64 = AtomicU64::new(0);
+/// The engine's current retransmission timeout and smoothed round-trip
+/// estimate, in milliseconds.
+pub(crate) static KCP_RTO_MS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_SRTT_MS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_INPUT: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KCP_NS_DELIVER_SPILL: AtomicU64 = AtomicU64::new(0);
@@ -358,6 +407,8 @@ pub(crate) struct KcpStats {
     pub datagrams_out: u64,
     pub retransmits: u64,
     pub acks_out: u64,
+    pub resends_rto: u64,
+    pub resends_fast: u64,
     pub sacks_sent: u64,
     pub blobs_out: u64,
     pub segments_delivered: u64,
@@ -370,6 +421,15 @@ pub(crate) struct KcpStats {
     pub ms_writer: f64,
     pub ms_output: f64,
     pub ms_update: f64,
+    pub reader_queued_bytes: u64,
+    pub spill_bytes: u64,
+    pub wait_snd_peak: u64,
+    pub wait_rcv: u64,
+    pub advertised_wnd: u64,
+    pub peer_wnd: u64,
+    pub pacer_bps: u64,
+    pub rto_ms: u64,
+    pub srtt_ms: u64,
 }
 
 /// Snapshot of the KCP path counters, for the periodic stats line.
@@ -382,11 +442,14 @@ pub(crate) fn kcp_stats() -> KcpStats {
     fn ms(stat: &AtomicU64) -> f64 {
         Duration::from_nanos(stat.load(Ordering::Relaxed)).as_secs_f64() * 1.0e3
     }
+    let (dg_in, dg_out, retransmits, acks_out, resends_rto, resends_fast) = kcp_engine_stats();
     KcpStats {
-        datagrams_in: kcp_engine_stats().0,
-        datagrams_out: kcp_engine_stats().1,
-        retransmits: kcp_engine_stats().2,
-        acks_out: kcp_engine_stats().3,
+        datagrams_in: dg_in,
+        datagrams_out: dg_out,
+        retransmits,
+        acks_out,
+        resends_rto,
+        resends_fast,
         sacks_sent: KCP_SACKS_SENT.load(Ordering::Relaxed),
         blobs_out: KCP_BLOBS_OUT.load(Ordering::Relaxed),
         segments_delivered: KCP_SEGMENTS_DELIVERED.load(Ordering::Relaxed),
@@ -399,6 +462,15 @@ pub(crate) fn kcp_stats() -> KcpStats {
         ms_writer: ms(&KCP_NS_WRITER),
         ms_output: ms(&KCP_NS_OUTPUT),
         ms_update: ms(&KCP_NS_UPDATE),
+        reader_queued_bytes: KCP_READER_QUEUED_BYTES.load(Ordering::Relaxed),
+        spill_bytes: KCP_SPILL_BYTES.load(Ordering::Relaxed),
+        wait_snd_peak: KCP_WAIT_SND_PEAK.swap(0, Ordering::Relaxed),
+        wait_rcv: KCP_WAIT_RCV.load(Ordering::Relaxed),
+        advertised_wnd: KCP_ADVERTISED_WND.load(Ordering::Relaxed),
+        peer_wnd: KCP_PEER_WND.load(Ordering::Relaxed),
+        pacer_bps: KCP_PACER_BPS.load(Ordering::Relaxed),
+        rto_ms: KCP_RTO_MS.load(Ordering::Relaxed),
+        srtt_ms: KCP_SRTT_MS.load(Ordering::Relaxed),
     }
 }
 
@@ -426,6 +498,8 @@ fn spawn_kcp_stats() {
                     datagrams_in = s.datagrams_in,
                     datagrams_out = s.datagrams_out,
                     retransmits = s.retransmits,
+                    resends_rto = s.resends_rto,
+                    resends_fast = s.resends_fast,
                     acks_out = s.acks_out,
                     sacks_sent = s.sacks_sent,
                     blobs_out = s.blobs_out,
@@ -439,6 +513,15 @@ fn spawn_kcp_stats() {
                     ms_writer = format!("{:.3}", s.ms_writer),
                     ms_output = format!("{:.3}", s.ms_output),
                     ms_update = format!("{:.3}", s.ms_update),
+                    reader_queued_bytes = s.reader_queued_bytes,
+                    spill_bytes = s.spill_bytes,
+                    wait_snd_peak = s.wait_snd_peak,
+                    wait_rcv = s.wait_rcv,
+                    advertised_wnd = s.advertised_wnd,
+                    peer_wnd = s.peer_wnd,
+                    pacer_mbit = s.pacer_bps / 1_000_000,
+                    rto_ms = s.rto_ms,
+                    srtt_ms = s.srtt_ms,
                     "kcp-stats: cumulative counters"
                 );
             }
@@ -479,6 +562,9 @@ pub(crate) struct ReadBatch {
     /// The segments, in delivery order; each is one complete stream-mode
     /// message (≤ one MSS).
     pub parts: Vec<Bytes>,
+    /// `parts`' total length, kept so the residency gauges need not walk the
+    /// vector on the hot path.
+    pub bytes: usize,
 }
 
 /// Collects `Kcp` output as whole datagrams: each `Write::write` call from
@@ -593,6 +679,71 @@ impl DatagramSink for DatagramOut {
 fn configure(kcp: &mut Kcp<DatagramOut>) {
     kcp.set_nodelay(true, KCP_INTERVAL_MS, KCP_FAST_RESEND, true);
     kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
+}
+
+/// Add to a residency gauge (saturating: a gauge is a diagnostic, never a
+/// correctness input).
+fn add_bytes(gauge: &AtomicU64, bytes: usize) {
+    gauge.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Subtract from a residency gauge, saturating at zero.
+fn sub_bytes(gauge: &AtomicU64, bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let _ = gauge.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(bytes))
+    });
+}
+
+/// Record the session's send-queue depth for the periodic stats line (a peak
+/// since the last line, so a transient backlog is visible rather than averaged
+/// away).
+fn note_wait_snd(depth: usize) {
+    KCP_WAIT_SND_PEAK.fetch_max(u64::try_from(depth).unwrap_or(u64::MAX), Ordering::Relaxed);
+}
+
+/// Record the receive-side window state for the periodic stats line: the
+/// receive queue's depth, the window this side advertises out of it, and the
+/// peer's window as last received.
+fn note_pacer(rate_bps: f64) {
+    // Saturating and lossy on purpose: this is a diagnostic gauge of a number
+    // that stays far inside u64 for any real link rate.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a diagnostic gauge; the value is a positive bit rate far below u64::MAX"
+    )]
+    let bps = rate_bps as u64;
+    KCP_PACER_BPS.store(bps, Ordering::Relaxed);
+}
+
+/// Sample every per-session gauge the periodic stats line reports, once per
+/// pump round: the send queue's peak, the receive-side window state, the
+/// timeout the engine is working to, and the pacer's allowance. They are the
+/// state a stuck session is stuck *in*, which is what made this path's measured
+/// regressions findable at all.
+fn note_gauges(kcp: &Kcp<DatagramOut>, pacer_bps: f64) {
+    note_wait_snd(kcp.wait_snd());
+    note_windows(kcp);
+    note_rto(kcp);
+    note_pacer(pacer_bps);
+}
+
+/// Record the retransmission timeout and round-trip estimate in force.
+fn note_rto(kcp: &Kcp<DatagramOut>) {
+    KCP_RTO_MS.store(u64::from(kcp.rx_rto_ms()), Ordering::Relaxed);
+    KCP_SRTT_MS.store(u64::from(kcp.rx_srtt_ms()), Ordering::Relaxed);
+}
+
+/// Record the receive queue's depth, the window this side advertises out of
+/// it, and the peer's window as last received.
+fn note_windows(kcp: &Kcp<DatagramOut>) {
+    KCP_WAIT_RCV.store(
+        u64::try_from(kcp.wait_rcv()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    KCP_ADVERTISED_WND.store(u64::from(kcp.advertised_wnd()), Ordering::Relaxed);
+    KCP_PEER_WND.store(u64::from(kcp.peer_wnd()), Ordering::Relaxed);
 }
 
 /// Request large kernel buffers on a KCP socket (see
@@ -741,15 +892,17 @@ fn flush_parts(
     parts: &mut Vec<Bytes>,
     spill: &mut std::collections::VecDeque<ReadBatch>,
 ) -> BlobFlush {
-    let batch = ReadBatch {
-        parts: std::mem::replace(parts, Vec::with_capacity(MAX_READ_PARTS)),
-    };
+    let parts = std::mem::replace(parts, Vec::with_capacity(MAX_READ_PARTS));
+    let bytes = parts.iter().map(Bytes::len).sum();
+    let batch = ReadBatch { parts, bytes };
     match in_tx.try_send(batch) {
         Ok(()) => {
             KCP_BLOBS_OUT.fetch_add(1, Ordering::Relaxed);
+            add_bytes(&KCP_READER_QUEUED_BYTES, bytes);
             BlobFlush::Sent
         }
         Err(TrySendError::Full(batch)) => {
+            add_bytes(&KCP_SPILL_BYTES, batch.bytes);
             spill.push_back(batch);
             BlobFlush::Spilled
         }
@@ -790,13 +943,21 @@ fn deliver_recv(
     {
         let _t = PhaseTimer::new(&KCP_NS_DELIVER_SPILL);
         while let Some(batch) = spill.pop_front() {
+            let spilled = batch.bytes;
             match in_tx.try_send(batch) {
-                Ok(()) => delivered = true,
+                Ok(()) => {
+                    sub_bytes(&KCP_SPILL_BYTES, spilled);
+                    add_bytes(&KCP_READER_QUEUED_BYTES, spilled);
+                    delivered = true;
+                }
                 Err(TrySendError::Full(batch)) => {
                     spill.push_front(batch);
                     break;
                 }
-                Err(TrySendError::Closed(_)) => return Delivery::ReaderGone,
+                Err(TrySendError::Closed(_)) => {
+                    sub_bytes(&KCP_SPILL_BYTES, spilled);
+                    return Delivery::ReaderGone;
+                }
             }
         }
     }
@@ -936,9 +1097,38 @@ struct PaceState {
     last_ping_us: u64,
     ping_outstanding: bool,
     clean_pongs: u32,
+    /// The send window's front when the outstanding PING was sent. A late PONG
+    /// with a window that moved is a *busy* peer, not an over-driven path.
+    una_at_ping: u32,
     /// When this session last re-read the kernel's path MTU; `None` until the
     /// first check (see `maybe_path_mtu`).
     last_mtu_check: Option<Instant>,
+    /// Datagrams the pacer or the kernel would not take, with the buffer they
+    /// point into (a `Bytes` share, never a copy). They go out, **in order**,
+    /// as tokens accrue — the alternative, which this path used to do, is to
+    /// drop them and let the ARQ re-send them a round trip later, which turns
+    /// every act of rate control into packet loss.
+    parked: std::collections::VecDeque<ParkedBatch>,
+    /// Bytes in `parked`.
+    parked_bytes: usize,
+}
+
+/// One batch's worth of datagrams the pacer has not allowed yet, kept with the
+/// buffer its spans point into and when it was parked.
+struct ParkedBatch {
+    buf: Bytes,
+    spans: Vec<Span>,
+    parked_at: Instant,
+}
+
+impl ParkedBatch {
+    fn new(buf: Bytes, spans: Vec<Span>) -> Self {
+        Self {
+            buf,
+            spans,
+            parked_at: Instant::now(),
+        }
+    }
 }
 
 impl PaceState {
@@ -954,6 +1144,9 @@ impl PaceState {
             last_ping_us: 0,
             ping_outstanding: false,
             clean_pongs: 0,
+            una_at_ping: 0,
+            parked: std::collections::VecDeque::new(),
+            parked_bytes: 0,
             last_mtu_check: None,
         }
     }
@@ -981,9 +1174,41 @@ impl PaceState {
         }
     }
 
-    /// A PING went unanswered past the deadline: the path is over capacity,
-    /// cut the send rate (the pacer is the congestion-control stand-in).
-    fn on_ping_timeout(&mut self) {
+    /// How long a datagram may stay parked before the pacer stops holding it.
+    ///
+    /// Parking delays data, and the ARQ is timing that same data: a segment
+    /// whose datagram sits here past its retransmission timeout is sent again
+    /// by the engine, so the byte goes on the wire twice and the link pays for
+    /// the pacer's queueing. Half the timeout leaves the engine's own timer
+    /// room to be the thing that acts, and the result is measurable: without
+    /// this bound the parked path cost 18 % more wire bytes on `rtt100` and
+    /// put 3 879 RTO re-sends on the *receiving* side's acknowledgements alone.
+    fn park_deadline(kcp: &Kcp<DatagramOut>) -> Duration {
+        let half_rto = kcp.rx_rto_ms() / 2;
+        Duration::from_millis(u64::from(half_rto.clamp(5, 100)))
+    }
+
+    /// A PING went unanswered past the deadline. That is a congestion signal
+    /// only when the session is otherwise **stalled**: a peer that is busy
+    /// answering data queues the PONG behind that data, and cutting the rate
+    /// for it is the one thing that makes the queue worse.
+    ///
+    /// The distinction is not academic. This cut is permanent in practice — the
+    /// recovery is `PACER_UP_FACTOR` per four clean PONGs, so +5 % every eight
+    /// seconds — and one heavy transfer fires it four times over (12 → 3.8
+    /// Gbit/s, measured), after which the *next* transfer in the same session
+    /// reads a fifth of what the same transfer reads on a fresh session (0.97
+    /// against 7.12 Gbit/s for `bulk-n` at a jumbo MTU, reproducibly). A send
+    /// window that moved while the PONG was late is the peer working: hold the
+    /// rate and let the data decide.
+    fn on_ping_timeout(&mut self, snd_una: u32) {
+        if snd_una != self.una_at_ping {
+            debug!(
+                "KCP pacer: late PONG with progress, rate held at {:.0} bps",
+                self.rate_bps
+            );
+            return;
+        }
         self.rate_bps = (self.rate_bps * PACER_DOWN_FACTOR).max(PACER_MIN_BPS);
         self.clean_pongs = 0;
         debug!("KCP pacer: PONG timeout, rate -> {:.0} bps", self.rate_bps);
@@ -1043,15 +1268,16 @@ async fn maybe_ping(
     // signal: cut the rate immediately instead of waiting for the next
     // keepalive tick, and allow an immediate retry.
     if pace.ping_outstanding && pace.last_ping.elapsed() >= PONG_TIMEOUT {
-        pace.on_ping_timeout();
+        pace.on_ping_timeout(kcp.snd_una());
         pace.ping_outstanding = false;
     }
     if pace.last_ping.elapsed() < Duration::from_millis(u64::from(KEEPALIVE_MS)) {
         return;
     }
     if pace.ping_outstanding {
-        pace.on_ping_timeout();
+        pace.on_ping_timeout(kcp.snd_una());
     }
+    pace.una_at_ping = kcp.snd_una();
     pace.last_ping = Instant::now();
     let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     pace.last_ping_us = us;
@@ -1062,135 +1288,241 @@ async fn maybe_ping(
     }
 }
 
-/// Drain KCP's outbound datagrams onto the wire, through the pacer. Each
-/// staged batch reaches the pump as one channel message; the pacer is
-/// consulted per datagram and a denied span is dropped on its own (KCP's
-/// ARQ still holds the segment and re-emits it on the next flush), so the
-/// drain never blocks the pump and a partial denial costs exactly that
-/// datagram, not the rest of the batch. A full kernel send buffer drops
-/// the unsent tail the same way.
+/// Park refused spans (with the buffer they point into) for a later round.
+/// Bounded by [`PARKED_MAX_BYTES`]: past it the *newest* are dropped, which is
+/// what the whole path used to do with everything.
+fn park(pace: &mut PaceState, buf: &Bytes, spans: Vec<Span>) {
+    if spans.is_empty() {
+        return;
+    }
+    let bytes: usize = spans.iter().map(Span::len).sum();
+    if pace.parked_bytes + bytes > PARKED_MAX_BYTES {
+        debug!(
+            "KCP pacer: parked queue full ({} bytes), dropping {} datagrams",
+            pace.parked_bytes,
+            spans.len()
+        );
+        return;
+    }
+    pace.parked_bytes += bytes;
+    pace.parked.push_back(ParkedBatch::new(buf.clone(), spans));
+}
+
+/// Put one batch's spans on the wire. Returns how many datagrams the kernel
+/// took (a short count means its send buffer filled, not that the rest are
+/// lost — the caller parks them).
+#[cfg(target_os = "linux")]
+async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    // Park on writability first: this arms tokio's writable interest — a bare
+    // `try_io` would only run the closure on *cached* readiness and drop the
+    // very first batch. After an EAGAIN, `try_io` clears the cached flag, so
+    // this await parks until the kernel send buffer drains — no spinning.
+    net.socket.writable().await?;
+    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
+    net.socket.try_io(Interest::WRITABLE, || {
+        send_batch.send_spans(net.socket.as_raw_fd(), net.peer, buf, spans)
+    })
+}
+
+/// Put one batch's spans on the wire, one datagram at a time (see the Linux
+/// version for the batched one). A two-iovec span is reassembled into a single
+/// buffer here — the copy this platform pays, byte-identical on the wire.
+#[cfg(not(target_os = "linux"))]
+async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::Result<usize> {
+    let mut dgram_buf = [0u8; KCP_MTU_CEILING + KCP_OVERHEAD];
+    let mut sent = 0;
+    for span in spans {
+        let (header, payload): (&[u8], &[u8]) = match span {
+            Span::Staged { off, len } => (&buf[*off..*off + *len], &[]),
+            Span::Split { hdr_off, payload } => {
+                (&buf[*hdr_off..*hdr_off + KCP_OVERHEAD], payload.as_ref())
+            }
+        };
+        let total = header.len() + payload.len();
+        if total > dgram_buf.len() {
+            continue; // cannot happen: one datagram is at most one MTU
+        }
+        net.socket.writable().await?;
+        dgram_buf[..header.len()].copy_from_slice(header);
+        dgram_buf[header.len()..total].copy_from_slice(payload);
+        match net.socket.try_send_to(&dgram_buf[..total], net.peer) {
+            Ok(_) => sent += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(sent)
+}
+
+/// Drain KCP's outbound datagrams onto the wire, through the pacer.
+///
+/// Nothing here is dropped on refusal: a datagram the pacer or the kernel will
+/// not take is parked, in order, and retried on the next round. Dropping it
+/// instead — which this path used to do — hands the ARQ a loss event for every
+/// act of rate control, so pacing becomes a source of retransmissions rather
+/// than a way to avoid them.
 async fn drain_dgrams(
     dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
     net: &SessionNet,
     pace: &mut PaceState,
+    kcp: &Kcp<DatagramOut>,
     sent_any: &mut bool,
 ) {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd;
-        use tokio::io::Interest;
+    if pace.parked.is_empty() {
+        drain_batches(dgram_rx, net, pace, sent_any).await;
+    } else {
+        // Parked data goes first: it is older than anything still in the
+        // channel, and letting newer datagrams overtake it would reorder a
+        // stream the ARQ has already put on the wire.
+        drain_parked(net, pace, kcp, sent_any).await;
+    }
+}
 
-        let mut send_batch = crate::transport::udp_batch::SendBatch::new();
-        // Spans the pacer allowed from the batch in hand (= the whole batch
-        // unless the rate is currently cut). A `Span::Split` clones the
-        // payload's `Bytes` handle (an O(1) refcount share), never the
-        // payload itself.
-        let mut allowed: Vec<Span> = Vec::with_capacity(BATCH);
-        loop {
-            let Ok(batch) = dgram_rx.try_recv() else {
-                return;
-            };
-            allowed.clear();
-            for span in &batch.spans {
-                if pace
-                    .pacer
-                    .allow(Instant::now(), span.len(), pace.rate_bps)
-                    .is_ok()
-                {
-                    allowed.push(span.clone());
-                }
-                // denied: drop just this span, ARQ holds the segment
+/// Send what an earlier round parked, in order, as tokens accrue. Returns when
+/// the parked queue is empty or the rate will not allow more this round.
+async fn drain_parked(
+    net: &SessionNet,
+    pace: &mut PaceState,
+    kcp: &Kcp<DatagramOut>,
+    sent_any: &mut bool,
+) {
+    let deadline = PaceState::park_deadline(kcp);
+    while let Some(front) = pace.parked.front_mut() {
+        let rate = pace.rate_bps;
+        // Past the deadline the pacer yields: a datagram held longer than the
+        // engine's own retransmission timer has the ARQ send the same bytes
+        // again (see `PaceState::park_deadline`).
+        let overdue = front.parked_at.elapsed() >= deadline;
+        let mut take: Vec<Span> = Vec::with_capacity(front.spans.len());
+        let mut rest: Vec<Span> = Vec::new();
+        for (i, span) in front.spans.iter().enumerate() {
+            if overdue || pace.pacer.allow(Instant::now(), span.len(), rate).is_ok() {
+                take.push(span.clone());
+            } else {
+                rest.extend(front.spans[i..].iter().cloned());
+                break;
             }
-            if allowed.is_empty() {
-                return;
-            }
-            // Park on writability first: this arms tokio's writable
-            // interest — a bare `try_io` would only run the closure on
-            // *cached* readiness and drop the very first batch. After an
-            // EAGAIN, `try_io` clears the cached flag, so this await parks
-            // until the kernel send buffer drains — no spinning.
-            if net.socket.writable().await.is_err() {
-                return;
-            }
-            match net.socket.try_io(Interest::WRITABLE, || {
-                send_batch.send_spans(net.socket.as_raw_fd(), net.peer, &batch.buf, &allowed)
-            }) {
-                Ok(k) => {
+        }
+        if take.is_empty() {
+            return;
+        }
+        let buf = front.buf.clone();
+        pace.parked_bytes = pace
+            .parked_bytes
+            .saturating_sub(take.iter().map(Span::len).sum());
+        if rest.is_empty() {
+            pace.parked.pop_front();
+        } else {
+            front.spans = rest;
+        }
+        match send_spans(net, &buf, &take).await {
+            Ok(k) => {
+                if k > 0 {
                     *sent_any = true;
-                    if k < allowed.len() {
-                        // Partial send: drop the rest — KCP's ARQ re-emits
-                        // them on the next flush.
-                        return;
-                    }
                 }
-                // WouldBlock: kernel send buffer full; the datagrams are
-                // dropped and KCP's ARQ re-emits them on the next flush.
-                Err(e) => {
-                    debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                if k < take.len() {
+                    // The kernel took what it could; the tail goes back to the
+                    // front of the queue rather than on the floor.
+                    let tail: Vec<Span> = take[k..].to_vec();
+                    park_front(pace, &buf, tail);
                     return;
                 }
             }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // No sendmmsg here, so a two-iovec (split) datagram is reassembled
-        // into one buffer before the single-datagram send — the copy this
-        // platform pays, byte-identical on the wire.
-        let mut dgram_buf = [0u8; KCP_MTU + KCP_OVERHEAD];
-        while let Ok(batch) = dgram_rx.try_recv() {
-            for span in &batch.spans {
-                let (header, payload): (&[u8], &[u8]) = match span {
-                    Span::Staged { off, len } => (&batch.buf[*off..*off + *len], &[]),
-                    Span::Split { hdr_off, payload } => (
-                        &batch.buf[*hdr_off..*hdr_off + KCP_OVERHEAD],
-                        payload.as_ref(),
-                    ),
-                };
-                let total = header.len() + payload.len();
-                if total > dgram_buf.len() {
-                    continue; // cannot happen: one datagram is at most one MTU
-                }
-                match pace.pacer.allow(Instant::now(), total, pace.rate_bps) {
-                    Ok(()) => {
-                        // Same park-then-try pattern as the Linux path.
-                        if net.socket.writable().await.is_err() {
-                            return;
-                        }
-                        dgram_buf[..header.len()].copy_from_slice(header);
-                        dgram_buf[header.len()..total].copy_from_slice(payload);
-                        match net.socket.try_send_to(&dgram_buf[..total], net.peer) {
-                            Ok(_) => *sent_any = true,
-                            // WouldBlock: drop and let the ARQ re-emit on the
-                            // next flush; tokio's try_send_to clears the
-                            // cached writability so the next park waits.
-                            Err(e) => {
-                                debug!("KCP datagram send failed (peer {}): {e}", net.peer);
-                            }
-                        }
-                    }
-                    // denied: drop just this span
-                    Err(_) => {}
-                }
+            Err(e) => {
+                debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                park_front(pace, &buf, take);
+                return;
             }
         }
     }
 }
 
-/// Whether a half-closed session is done: the ARQ tail is quiescent and
-/// the close budget is spent (or the reader is already gone).
+/// Take fresh batches from the engine and put what the pacer allows on the
+/// wire, parking the refused tail (see [`drain_dgrams`]).
+async fn drain_batches(
+    dgram_rx: &mut mpsc::UnboundedReceiver<DgramBatch>,
+    net: &SessionNet,
+    pace: &mut PaceState,
+    sent_any: &mut bool,
+) {
+    loop {
+        let Ok(batch) = dgram_rx.try_recv() else {
+            return;
+        };
+        // Spans the pacer allowed from the batch in hand (= the whole batch
+        // unless the rate is currently cut). A `Span::Split` clones the
+        // payload's `Bytes` handle (an O(1) refcount share), never the payload
+        // itself.
+        let mut allowed: Vec<Span> = Vec::with_capacity(batch.spans.len());
+        let mut denied: Vec<Span> = Vec::new();
+        for span in &batch.spans {
+            let ok = denied.is_empty()
+                && pace
+                    .pacer
+                    .allow(Instant::now(), span.len(), pace.rate_bps)
+                    .is_ok();
+            if ok {
+                allowed.push(span.clone());
+            } else {
+                denied.push(span.clone());
+            }
+        }
+        if allowed.is_empty() {
+            park(pace, &batch.buf, denied);
+            return;
+        }
+        match send_spans(net, &batch.buf, &allowed).await {
+            Ok(k) => {
+                if k > 0 {
+                    *sent_any = true;
+                }
+                // A partial send and an EAGAIN mean the same thing — the
+                // kernel took what it could — so the tail is parked with the
+                // refused rest and retried, never dropped.
+                let mut unsent: Vec<Span> = allowed[k..].to_vec();
+                unsent.extend(denied);
+                park(pace, &batch.buf, unsent);
+                if k < allowed.len() {
+                    return;
+                }
+            }
+            Err(e) => {
+                debug!("KCP datagram send failed (peer {}): {e}", net.peer);
+                let mut unsent = allowed;
+                unsent.extend(denied);
+                park(pace, &batch.buf, unsent);
+                return;
+            }
+        }
+    }
+}
+
+/// Park at the *front*: data an earlier round already owed the wire.
+fn park_front(pace: &mut PaceState, buf: &Bytes, spans: Vec<Span>) {
+    if spans.is_empty() {
+        return;
+    }
+    pace.parked_bytes += spans.iter().map(Span::len).sum::<usize>();
+    pace.parked.push_front(ParkedBatch::new(buf.clone(), spans));
+}
+
 fn closing_quiescent(
     sent_any: bool,
     delivered: bool,
     kcp: &Kcp<DatagramOut>,
     spill: &std::collections::VecDeque<ReadBatch>,
+    parked: &std::collections::VecDeque<ParkedBatch>,
     quiet_rounds: &mut u32,
     close_deadline: Instant,
 ) -> bool {
-    // Quiet = ARQ queue empty and nothing emitted or delivered:
-    // everything KCP accepted was acked (or the peer vanished, which the
-    // deadline bounds).
-    if !sent_any && !delivered && kcp.wait_snd() == 0 && spill.is_empty() {
+    // Quiet = ARQ queue empty, nothing emitted or delivered, and nothing the
+    // pacer is still holding: a parked datagram is data the peer has not seen,
+    // so a session with one is not done — the engine would sit `wait_snd`
+    // until the close deadline and then drop the tail.
+    if !sent_any && !delivered && kcp.wait_snd() == 0 && spill.is_empty() && parked.is_empty() {
         *quiet_rounds += 1;
     } else {
         *quiet_rounds = 0;
@@ -1222,9 +1554,17 @@ async fn pump_head(
 /// at session start describes the path that existed then, and a session that
 /// keeps sending 1400-byte datagrams down a 1280-byte path pays a lost
 /// *datagram* for every lost fragment. One second is the cadence at which a
-/// path change costs a bounded amount of traffic; the check is one
-/// `getsockopt` on a throwaway socket, and `shrink_mtu` is one-way, so
-/// re-reading cannot oscillate.
+/// path change costs a bounded amount of traffic, and the check is one
+/// `getsockopt` on a throwaway socket.
+///
+/// The same probe is what lets a session *grow*: the kernel's answer is the
+/// path's own datagram size, and a carrier pinned below it pays its
+/// per-datagram cost 5.7× more often than it has to on a jumbo path (measured:
+/// +35 % throughput, −30 % CPU per byte — [benchmarks.md](../../docs/benchmarks.md),
+/// "The carrier axis"). Growth is bounded by [`KCP_MTU_CEILING`], and both
+/// directions are hysteresis-free on purpose: the value is a property of the
+/// path, not a probe of it, so a path that changes is followed rather than
+/// averaged.
 const PATH_MTU_RECHECK: Duration = Duration::from_secs(1);
 
 /// Re-read the path MTU and shrink the datagram size if the path got smaller.
@@ -1246,16 +1586,20 @@ fn maybe_path_mtu(
     let Some(path_mtu) = probe_path_mtu(local, net.peer) else {
         return;
     };
-    if let Some(fits) = clamp_mtu(kcp.mtu(), path_mtu, net.peer.is_ipv6()) {
-        let before = kcp.mtu();
-        kcp.shrink_mtu(fits);
+    let Some(fits) = datagram_for_path(path_mtu, net.peer.is_ipv6()) else {
+        // Smaller than a KCP header can be: not our call to make, and the
+        // engine's floor keeps a payload in any case.
+        return;
+    };
+    let before = kcp.mtu();
+    if kcp.set_mtu(fits) != before {
         datagram_bytes.store(kcp.mtu(), Ordering::Relaxed);
         info!(
             peer = %net.peer,
             path_mtu,
             datagram_before = before,
             datagram_after = kcp.mtu(),
-            "KCP datagram size adapted to the path MTU (shrink-only)"
+            "KCP datagram size adapted to the path MTU"
         );
     }
 }
@@ -1375,7 +1719,7 @@ async fn pump_tail(
     //    pacer (see `drain_dgrams`).
     {
         let _t = PhaseTimer::new(&KCP_NS_OUTPUT);
-        drain_dgrams(tail.dgram_rx, net, pace, tail.sent_any).await;
+        drain_dgrams(tail.dgram_rx, net, pace, kcp, tail.sent_any).await;
     }
 
     if kcp.is_dead_link() {
@@ -1395,6 +1739,7 @@ async fn pump_tail(
                 delivered,
                 kcp,
                 tail.spill,
+                &pace.parked,
                 tail.quiet_rounds,
                 close_deadline,
             )
@@ -1457,7 +1802,10 @@ async fn run_session(
             // channel permanently ready under load, tokio's uniform select
             // fairness would otherwise starve the writer side to a fraction
             // of the link rate (measured ~half the window limit at 20 ms).
-            data = out_rx.recv(), if !closing && kcp.wait_snd() < SND_QUEUE_LIMIT => {
+            data = out_rx.recv(), if {
+                note_gauges(&kcp, pace.rate_bps);
+                !closing && kcp.wait_snd() < SND_QUEUE_LIMIT
+            } => {
                 if let Some(data) = data {
                     let mut fatal = false;
                     let _t = PhaseTimer::new(&KCP_NS_WRITER);
@@ -1595,14 +1943,17 @@ fn ipv6_mtu_of(probe: &std::net::UdpSocket) -> Option<usize> {
 /// needs two fragments (measured on the `loss1_mtu1280` cell: the KCP arm
 /// drops from 0.3 Gbit/s to zero, while the TCP arm is unaffected because
 /// the kernel does this arithmetic for TCP).
-fn clamp_mtu(current: usize, path_mtu: usize, ipv6: bool) -> Option<usize> {
+/// The datagram size a path of `path_mtu` deserves: what is left after the IP
+/// and UDP headers this session's family adds, capped at [`KCP_MTU_CEILING`],
+/// or `None` when even a KCP header does not fit.
+fn datagram_for_path(path_mtu: usize, ipv6: bool) -> Option<usize> {
     let overhead = if ipv6 {
         IPV6_UDP_HEADERS
     } else {
         IPV4_UDP_HEADERS
     };
     let fits = path_mtu.saturating_sub(overhead);
-    (fits > KCP_OVERHEAD && fits < current).then_some(fits)
+    (fits > KCP_OVERHEAD).then(|| fits.min(KCP_MTU_CEILING))
 }
 
 /// The kernel's current path MTU towards `peer`, as it knows it today.
@@ -1873,6 +2224,7 @@ impl AsyncRead for KcpStream {
             };
             match rx.poll_recv(cx) {
                 Poll::Ready(Some(batch)) => {
+                    sub_bytes(&KCP_READER_QUEUED_BYTES, batch.bytes);
                     for part in batch.parts {
                         if !part.is_empty() {
                             me.read_queue.push_back(part);
@@ -2412,7 +2764,7 @@ mod path_mtu_tests {
         reason = "a test's failure path is a panic; the module-level allow keeps \
                   the assertions readable"
     )]
-    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, clamp_mtu};
+    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, KCP_MTU_CEILING, datagram_for_path};
     use crate::kcp::KCP_OVERHEAD;
     #[cfg(target_os = "linux")]
     use crate::transport::kcp::ipv6_mtu_of;
@@ -2424,57 +2776,59 @@ mod path_mtu_tests {
     /// against the value the adapter actually ships with).
     const KCP_MTU_DEF: usize = 1400;
 
-    /// The arithmetic that decides whether a datagram fits, per family. Every
-    /// case here is a boundary a wrong constant would move: the default
-    /// datagram on a clean path, the same datagram on a 1280 path (the cell
-    /// this exists for), a path exactly the size of the datagram, a jumbo
-    /// path, and a path too small to carry a KCP header at all.
+    /// The arithmetic that decides which datagram size a path deserves, per
+    /// family. Every case here is a boundary a wrong constant would move: a
+    /// clean path, the 1280 path (the cell this exists for), a path exactly the
+    /// size of the engine's default, a jumbo path (where the *ceiling* binds),
+    /// and a path too small to carry a KCP header at all.
     ///
     /// The IPv6 column is what the `IPV6_MTU` probe feeds: its overhead is
     /// the 40-byte IPv6 header plus UDP, not the IPv4 pair.
     #[test]
-    fn clamp_mtu_fits_the_path_per_family() {
+    fn datagram_for_path_follows_the_path_per_family() {
         /// One row: the datagram size the kernel's answer must produce for
-        /// each family, or `None` when there is nothing to do.
-        fn row(current: usize, path_mtu: usize, v4: Option<usize>, v6: Option<usize>) {
+        /// each family, or `None` when the path cannot carry one.
+        fn row(path_mtu: usize, v4: Option<usize>, v6: Option<usize>) {
             assert_eq!(
-                clamp_mtu(current, path_mtu, false),
+                datagram_for_path(path_mtu, false),
                 v4,
-                "IPv4: {current} on a {path_mtu} path"
+                "IPv4 on a {path_mtu} path"
             );
             assert_eq!(
-                clamp_mtu(current, path_mtu, true),
+                datagram_for_path(path_mtu, true),
                 v6,
-                "IPv6: {current} on a {path_mtu} path"
+                "IPv6 on a {path_mtu} path"
             );
         }
 
-        // A clean path: the default datagram fits (1400 + 28 / + 48 <= 65536).
-        row(KCP_MTU_DEF, 65536, None, None);
+        // A clean path: the ceiling binds, not the path (65536 - 28 > 8000).
+        row(65536, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
 
         // 1280: the IPv6 minimum every real path must carry. The datagram has
         // to shed the header the path adds, per family.
         row(
-            KCP_MTU_DEF,
             1280,
             Some(1280 - IPV4_UDP_HEADERS),
             Some(1280 - IPV6_UDP_HEADERS),
         );
 
-        // A path exactly the size of the current datagram still fragments
-        // once the IP header is added, so it must shrink.
-        row(KCP_MTU_DEF, KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
+        // A path exactly the size of the engine's default: one byte less than
+        // it, once the header the path adds is paid.
+        row(KCP_MTU_DEF, Some(1400 - 28), Some(1400 - 48));
+
+        // A jumbo path is followed up to the ceiling — this is the growth the
+        // measurement asked for. The ceiling binds for both families: a 9000-byte
+        // link would carry 8972 bytes of IPv4 payload, and the carrier stops at
+        // 8000 by design rather than at whatever a probe reports.
+        row(9000, Some(KCP_MTU_CEILING), Some(KCP_MTU_CEILING));
 
         // Smaller than a KCP header can be: not our call to make, leave the
         // engine alone rather than produce an unsendable size.
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, KCP_OVERHEAD + 10, false), None);
-
-        // Never grows: a jumbo path leaves a session that already shrank.
-        row(1252, 9000, None, None);
+        assert_eq!(datagram_for_path(KCP_OVERHEAD + 10, false), None);
 
         // Both families' 1280 arithmetic against the shipped engine default:
         // the datagram below the IPv6 minimum a v6 session must not exceed.
-        assert_eq!(clamp_mtu(KCP_MTU_DEF, 1280, true), Some(1232));
+        assert_eq!(datagram_for_path(1280, true), Some(1232));
     }
 
     /// The IPv6 probe must answer off the **kernel**, not off a constant: a
@@ -2611,11 +2965,16 @@ mod tests {
 
     #[tokio::test]
     async fn coalescing_merges_segments_into_blobs() {
-        // One 32 KiB write crosses as ~24 MTU-sized segments; the
-        // receiver's deliver loop must merge them into far fewer
-        // reader-channel messages (COALESCE_LIMIT_BYTES each) while the
-        // byte stream arrives intact.
-        const PAYLOAD: usize = 32 * 1024;
+        // One 256 KiB write crosses as a run of MTU-sized segments; the
+        // receiver's deliver loop must merge consecutive ones into fewer
+        // reader-channel messages (`COALESCE_LIMIT_BYTES` each) while the byte
+        // stream arrives intact.
+        //
+        // The payload is sized so the *segment* count is high whatever the
+        // session's segment size is: that size follows the path now, and on the
+        // loopback it is the ceiling (8000), so a 32 KiB write would be four
+        // segments and the merge factor would say nothing.
+        const PAYLOAD: usize = 256 * 1024;
         let acceptor = KcpAcceptor::bind("127.0.0.1:0").await.unwrap();
         let addr = acceptor.local_addr().unwrap();
         let before = super::kcp_stats();
@@ -2635,8 +2994,14 @@ mod tests {
         let after = super::kcp_stats();
         let segments = after.datagrams_in - before.datagrams_in;
         let blobs = after.blobs_out - before.blobs_out;
+        // Two segments per message at least. The merge *factor* is bounded by
+        // `COALESCE_LIMIT_BYTES / segment size`, and the segment size is the
+        // path's now — on the loopback it is the 8000-byte ceiling, so a blob
+        // holds two segments and the factor cannot be large. What did not
+        // regress is the reading that matters: bytes per channel message went
+        // *up* (16 KiB against the 8 KiB that 1400-byte segments merged into).
         assert!(
-            blobs * 3 < segments,
+            blobs * 2 <= segments,
             "coalescing did not merge: {blobs} blobs for {segments} segments"
         );
     }
@@ -2817,10 +3182,10 @@ mod tests {
             .expect("the v6 loopback must answer the path-MTU probe");
         let expected = loopback_mtu - IPV6_UDP_HEADERS;
         assert!(
-            expected < KCP_MTU,
+            expected < KCP_MTU_CEILING,
             "this test needs a shrunken v6 loopback to mean anything: lo reports an MTU of \
-             {loopback_mtu}, so the engine's {KCP_MTU}-byte default already fits. Run it \
-             inside a network namespace:\n  \
+             {loopback_mtu}, so the carrier's {KCP_MTU_CEILING}-byte ceiling is what binds. Run \
+             it inside a network namespace:\n  \
              sudo unshare -n bash -c 'ip link set lo up; ip link set lo mtu 1280; \
              ip -6 addr add ::1/128 dev lo 2>/dev/null; \
              cargo test --lib ipv6_path_mtu_clamps_on_a_shrunk_loopback -- --ignored --nocapture'"
@@ -2846,9 +3211,9 @@ mod tests {
         assert_eq!(
             client.datagram_bytes(),
             expected,
-            "the client session's datagram must shrink to the v6 path (loopback MTU \
-             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected}); {KCP_MTU} means \
-             the IPv6 probe did not run"
+            "the client session's datagram must follow the v6 path (loopback MTU \
+             {loopback_mtu} − {IPV6_UDP_HEADERS} header bytes = {expected}); the engine \
+             default still being in force means the IPv6 probe did not run"
         );
         assert_eq!(
             server.datagram_bytes(),

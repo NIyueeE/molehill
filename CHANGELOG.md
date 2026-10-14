@@ -23,7 +23,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   combination. What it costs and what it buys is measured, per path condition,
   in [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp).
 
+### Fixed
+
+- **A refused KCP datagram is held, not dropped.** The send path discarded
+  anything the pacer would not admit or the kernel would not take (a denied
+  span, a partial `sendmmsg`, an `EAGAIN`) and let the ARQ re-send it a round
+  trip later — so every act of rate control and every full socket buffer became
+  packet loss. Refusals are now parked, in order and bounded by half the
+  retransmission timeout, and retried: **+12 % throughput on the benchmark's
+  lossy leg** (1.824 against 1.627 Gbit/s, disjoint ranges) at an identical wire
+  ratio, neutral on the clean and long-haul cells. Pacing the send burst to the
+  bandwidth-delay product on top of that is worth another +21 % on the
+  long-haul cell but costs 14 % more wire bytes there; it is measured, recorded
+  and **not** carried.
+
+- **A KCP retransmission timeout now clears the round trip it is timing.** The
+  reference's timeout is `srtt + max(interval, 4·rttvar)`, and this adapter sets
+  the flush interval to 10 ms for latency — which left a 200 ms path with a
+  **205 ms** timeout, so acknowledgements that arrived at 200 ms plus the
+  receiver's own batching were treated as losses: on the model's `rtt100` cell
+  (100 ms each way, no loss configured) 21 % of the datagrams never reached the
+  receiver and 28 % of what was sent was recovery traffic. A margin of `srtt/8`
+  (nothing changes below an 80 ms round trip) cuts RTO-driven resends by 42 %
+  and the wire ratio from 1.20 to 1.09, with throughput unchanged. Related
+  repairs measured and **not** carried, with their numbers on the benchmarks
+  page: pacing the send burst to the bandwidth-delay product (35 % slower) and a
+  window byte budget (two thirds of the lossy leg's throughput).
+
+- **A KCP session no longer throttles itself for being busy.** The carrier's
+  send pacer, which stands in for congestion control (`nc=1`), took its only
+  signal from a keepalive PONG that arrived later than 2.5 s — and a PONG queued
+  behind a peer that is busy sending is exactly what a *fast* path looks like.
+  The cut is 25 % and the recovery 5 % per four clean PONGs, so one heavy
+  transfer ratcheted the rate down four times (12 → 3.8 Gbit/s, measured) and
+  left it there for the rest of the session: the next transfer in that session
+  read a fraction of the same transfer on a fresh one (**1.00 against 7.79
+  Gbit/s** on the same cell, reproducibly). A late PONG now only cuts when the
+  send window is *not* moving — a peer that is acknowledging data is working,
+  whatever its keepalive looks like — and the slow regimes confirm the fix costs
+  nothing there (`rtt100` 0.169 → 0.182 Gbit/s, `loss5` unchanged). The
+  `MOLEHILL_KCP_STATS` line also gained the gauges this needed: reader-channel
+  and spill residency, the peak send-queue depth, the advertised and peer
+  windows, and the pacer's current allowance.
+
+- **A KCP session is no longer declared dead for being slow.** The dead-link
+  rule was the reference implementation's — a segment retransmitted twenty times
+  ends the session — which cannot tell a peer that is *gone* from one that is
+  *slow*. On a rate-limited path the acknowledgements queue behind the shaper,
+  so a segment collects its twenty retransmissions while the peer is answering
+  everything else, and the session (and the visitor's connection with it) is
+  closed: measured on the benchmark's 100 Mbit/s, 20 ms, 1 %-loss leg, the
+  multiplexed KCP arm failed its bulk cell in **every** round before this change
+  and completes **both** rounds after it. A session now ends only when the count
+  is reached *and* the send window has not moved for five seconds — a gone peer
+  stops acknowledging, a slow one keeps acknowledging something
+  ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
+
 ### Changed
+
+- **The KCP carrier's datagram size follows the path.** It was pinned at KCP's
+  1400-byte default, and the adaptation that existed was shrink-only: a small
+  path lowered the size, a jumbo path never raised it. Since the carrier's cost
+  is per *datagram* — a UDP send, a receive, a header, an acknowledgement and a
+  loss event — a jumbo path paid that 5.7× more often than it had to. The
+  carrier now sizes its segments from the kernel's path-MTU answer, from 1400 up
+  to an 8 KiB ceiling, re-read once a second, so a session on a 1500-byte path
+  behaves exactly as before (measured neutral) while one on a jumbo path
+  measures **+39 % throughput and −28 % CPU per byte** on a clean path, and
+  **4.2×** on a lossy one ([docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model)).
+  No configuration changes; the kernel's own answer is the policy.
 
 - **The benchmark model is one runner again: the soak sweep is a profile of
   it.** `benches/scripts/bench/` now owns everything a performance number is
@@ -40,6 +108,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression baseline, because the gate refuses a baseline whose method record
   does not match. The method, the metric definitions and the profiles are on
   [docs/benchmarks.md](docs/benchmarks.md#the-bench-model-the-measurement-standard).
+  An arm now states its **carrier** as well as its mode (`l3`, `l3-mux`,
+  `l3-kcp`, `l3-mux-kcp`, `l4-kcp`), so the two axes are measured apart, and the
+  condition vocabulary gained `loss1_rate100` — a 100 Mbit uplink that also
+  loses packets, the lossy WAN the carrier choice is actually about. First
+  measurements of that axis: [docs/benchmarks.md](docs/benchmarks.md#the-carrier-axis-tcp-versus-kcp-2026-10-10-this-model).
+  Two metrics changed scope after an audit of their instrument:
+  `bytes_per_syscall` and `syscalls_per_s` are **device-I/O** readings
+  (`/proc/<pid>/io` does not account socket payload — 200 MB through a
+  socketpair moves `rchar` by 105 KB, the same bytes through a pipe by 209 MB),
+  so only an L3 arm publishes them now and a forwarding arm records a typed
+  absence instead of a number that described the runtime's plumbing.
 
 ### Added
 

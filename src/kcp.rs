@@ -32,7 +32,7 @@
 //! - the `tokio`-feature code and the unused accessor methods are trimmed
 //!   (datagram mode, `set_interval`, the conv-adoption hook); `mtu` is the
 //!   one accessor kept back, because the adapter shrinks the datagram size to
-//!   the path MTU the kernel reports (`shrink_mtu`, see `transport::kcp`);
+//!   the path MTU the kernel reports (`set_mtu`, see `transport::kcp`);
 //! - buffers are grown through the safe `BytesMut::zeroed` instead of
 //!   `unsafe` length manipulation;
 //! - errors are molehill's own `Error` type.
@@ -60,6 +60,21 @@ use log::{debug, trace};
 
 const KCP_RTO_NDL: u32 = 30; // no delay min rto
 const KCP_RTO_MIN: u32 = 100; // normal min rto
+/// The RTO's headroom over the measured round trip, as a fraction of it
+/// (`srtt / this`), when the jitter-derived term is smaller.
+///
+/// The reference's timeout is `srtt + max(interval, 4·rttvar)`, so the flush
+/// interval doubles as the timeout's floor. That is fine at the reference's
+/// 100 ms default and wrong for this adapter, which sets the interval to 10 ms
+/// for latency: on a 200 ms path with netem's near-zero jitter the timeout
+/// lands at **205 ms**, the acknowledgements arrive at 200 ms *plus* the
+/// receiver's own batching, and roughly a quarter of the sender's output turns
+/// into retransmissions (measured: 4 239 RTO-driven resends against 2 163
+/// fast-retransmit ones on `rtt100`, 28 % of the datagrams sent, on a path with
+/// no loss at all). A margin that grows with the round trip keeps the timeout
+/// ahead of the acknowledgements it is waiting for, and leaves short paths
+/// exactly where they were: nothing changes below an 80 ms round trip.
+const KCP_RTO_HEADROOM_DIVISOR: u32 = 8;
 const KCP_RTO_DEF: u32 = 200;
 const KCP_RTO_MAX: u32 = 60000;
 
@@ -80,6 +95,21 @@ const KCP_INTERVAL: u32 = 100;
 /// KCP Header size
 pub const KCP_OVERHEAD: usize = 24;
 const KCP_DEADLINK: u32 = 20;
+/// How long the send window may stand still before [`KCP_DEADLINK`] means what
+/// it is for.
+///
+/// The reference counts a segment's retransmissions and calls the session dead
+/// at twenty, which conflates two different things: a peer that is **gone** and
+/// a peer that is **slow**. On a rate-limited path a segment's acknowledgement
+/// can be behind megabytes of queued traffic while the peer acknowledges
+/// everything else happily — and the retransmissions fired into that queue make
+/// the wait longer still, so twenty of them arrive in seconds and a live
+/// session is closed (measured: the multiplexed KCP arm died on every round of
+/// the bench's `loss1_rate100` cell, [benchmarks.md](../../docs/benchmarks.md)).
+/// A session that is moving its `snd_una` is not dead, whatever any single
+/// segment's retransmit count says; one that has moved nothing for this long is,
+/// whether or not twenty retransmissions have gone by.
+const KCP_DEAD_GRACE_MS: i32 = 5_000;
 
 const KCP_THRESH_INIT: u16 = 2;
 const KCP_THRESH_MIN: u16 = 2;
@@ -114,16 +144,25 @@ pub(crate) static KCP_DATAGRAMS_OUT: AtomicU64 = AtomicU64::new(0);
 /// DROPPED"), so today this is an attribution counter: a rising rate is
 /// how a collapsing cell is recognized in a stats line.
 pub(crate) static KCP_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
+/// The same events, split by what fired them: an RTO (`resendts` reached,
+/// nothing heard about the segment) or a run of later acknowledgements
+/// (`fastack`, the peer is receiving *around* a hole). The two mean opposite
+/// things about a path — a timeout is silence, a skip is a gap — so a stats
+/// line that cannot tell them apart cannot say which one a cell is paying for.
+pub(crate) static KCP_RESENDS_RTO: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KCP_RESENDS_FAST: AtomicU64 = AtomicU64::new(0);
 /// Ack entries sent to the peer (several may share one datagram).
 pub(crate) static KCP_ACKS_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of the engine-side counters, for the periodic stats line.
-pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64) {
+pub(crate) fn kcp_engine_stats() -> (u64, u64, u64, u64, u64, u64) {
     (
         KCP_DATAGRAMS_IN.load(Relaxed),
         KCP_DATAGRAMS_OUT.load(Relaxed),
         KCP_RETRANSMITS.load(Relaxed),
         KCP_ACKS_OUT.load(Relaxed),
+        KCP_RESENDS_RTO.load(Relaxed),
+        KCP_RESENDS_FAST.load(Relaxed),
     )
 }
 
@@ -358,6 +397,9 @@ pub struct Kcp<Output> {
 
     /// Maximum resend time
     dead_link: u32,
+    /// `current` (ms) when the send window last moved: the difference between a
+    /// peer that is slow and one that is gone (see [`KCP_DEAD_GRACE_MS`]).
+    last_progress: u32,
     /// Maximum payload size
     incr: usize,
 
@@ -406,6 +448,7 @@ impl<Output> Debug for Kcp<Output> {
             .field("ts_probe", &self.ts_probe)
             .field("probe_wait", &self.probe_wait)
             .field("dead_link", &self.dead_link)
+            .field("last_progress", &self.last_progress)
             .field("incr", &self.incr)
             .field("snd_queue.len", &self.snd_queue.len())
             .field("rcv_queue.len", &self.rcv_queue.len())
@@ -437,21 +480,25 @@ impl<Output> Kcp<Output> {
         self.mtu
     }
 
-    /// Lower the maximum datagram size, and the payload capacity that follows
+    /// Set the maximum datagram size, and the payload capacity that follows
     /// from it. Returns the size now in force.
     ///
-    /// **Shrink-only by contract.** The caller learns the path MTU from the
-    /// kernel, which can report a *larger* value than the current size (a
-    /// route change, a different peer, a cached PMTU that expired). Growing
-    /// back mid-session would re-fragment exactly what this call exists to
-    /// stop, on a path whose segment statistics KCP has already tuned; a
-    /// session that needs a bigger datagram starts a new session. The floor
-    /// keeps a payload of at least one byte, so the `mss > 0` invariant the
-    /// send path asserts cannot be broken by a nonsensical probe result.
-    pub fn shrink_mtu(&mut self, mtu: usize) -> usize {
-        if mtu < self.mtu {
-            self.mtu = mtu.max(KCP_OVERHEAD + 1);
-            self.mss = self.mtu - KCP_OVERHEAD;
+    /// **The engine does not have an opinion about the path; the caller
+    /// does.** It probes, and this follows it in either direction. Growth is
+    /// allowed because a segment size is what every byte of traffic pays for
+    /// and the probe is what knows how large a datagram the path carries:
+    /// pinning a session at the default left 5.7× of the per-datagram cost on
+    /// the table on a jumbo path (measured: +35 % throughput and −30 % CPU per
+    /// byte against a pinned 1400, [benchmarks.md](../../docs/benchmarks.md)).
+    /// What the engine owes the caller is the invariant: a datagram always has
+    /// room for at least one payload byte, whatever the caller passes in, so
+    /// the `mss > 0` assertion on the send path cannot be broken by a
+    /// nonsensical probe result.
+    pub fn set_mtu(&mut self, mtu: usize) -> usize {
+        let mtu = mtu.max(KCP_OVERHEAD + 1);
+        if mtu != self.mtu {
+            self.mtu = mtu;
+            self.mss = mtu - KCP_OVERHEAD;
         }
         self.mtu
     }
@@ -502,6 +549,7 @@ impl<Output> Kcp<Output> {
             fastlimit: KCP_FASTACK_LIMIT,
             xmit: 0,
             dead_link: KCP_DEADLINK,
+            last_progress: 0,
 
             output: KcpOutput(output),
         }
@@ -809,7 +857,9 @@ impl<Output> Kcp<Output> {
                 self.rx_srtt = 1;
             }
         }
-        let rto = self.rx_srtt + cmp::max(self.interval, 4 * self.rx_rttval);
+        let headroom = cmp::max(self.interval, 4 * self.rx_rttval)
+            .max(self.rx_srtt / KCP_RTO_HEADROOM_DIVISOR);
+        let rto = self.rx_srtt + headroom;
         self.rx_rto = bound(self.rx_minrto, rto, KCP_RTO_MAX);
     }
 
@@ -843,6 +893,8 @@ impl<Output> Kcp<Output> {
         while let Some(seg) = self.snd_buf.front() {
             if timediff(una, seg.sn) > 0 {
                 self.snd_buf.pop_front();
+                // The window moved: whatever this session is, it is not gone.
+                self.last_progress = self.current;
             } else {
                 break;
             }
@@ -1202,6 +1254,46 @@ impl<Output> Kcp<Output> {
         self.snd_buf.len() + self.snd_queue.len()
     }
 
+    /// The oldest unacknowledged sequence number: the send window's front, and
+    /// therefore the cheapest signal that the peer is still acknowledging
+    /// *something*. A window that moved is a peer that is working, whatever a
+    /// keepalive round trip looks like.
+    pub fn snd_una(&self) -> u32 {
+        self.snd_una
+    }
+
+    /// The retransmission timeout this side is currently using, in
+    /// milliseconds, and the smoothed round-trip estimate behind it. Together
+    /// they say whether a spurious-retransmission rate is the path's or the
+    /// estimator's.
+    pub fn rx_rto_ms(&self) -> u32 {
+        self.rx_rto
+    }
+
+    /// The smoothed round-trip estimate in milliseconds (see [`Self::rx_rto_ms`]).
+    pub fn rx_srtt_ms(&self) -> u32 {
+        self.rx_srtt
+    }
+
+    /// Segments sitting in the receive queue, waiting for the application to
+    /// take them. This is what the window this side *advertises* is computed
+    /// from: a reader that falls behind shrinks the peer's send window, and
+    /// the throughput of the whole session follows it.
+    pub fn wait_rcv(&self) -> usize {
+        self.rcv_queue.len()
+    }
+
+    /// The receive window this side is currently advertising to the peer, in
+    /// segments (the `wnd` field of every segment it emits).
+    pub fn advertised_wnd(&self) -> u16 {
+        self.wnd_unused()
+    }
+
+    /// The peer's receive window as this side last heard it, in segments.
+    pub fn peer_wnd(&self) -> u16 {
+        self.rmt_wnd
+    }
+
     /// Force an immediate retransmit of segment `sn` (adapter SACK
     /// support). Returns whether the segment was still in the send buffer.
     /// The resend bypasses the RTO backoff: the peer explicitly told us it
@@ -1233,11 +1325,25 @@ impl<Output> Kcp<Output> {
         self.rcv_nxt
     }
 
-    /// Check if KCP connection is dead (resend times excceeded)
+    /// Check if KCP connection is dead (resend times excceeded *and* the send
+    /// window has stood still — see [`Self::peer_is_gone`])
     #[inline]
     pub fn is_dead_link(&self) -> bool {
         self.state != 0
     }
+}
+
+/// Whether `xmit` retransmissions of one segment, together with a send window
+/// that has stood still past the grace, are a peer that is gone.
+///
+/// The reference's rule is the count alone, and a rate-limited path proves it
+/// wrong: acknowledgements queued behind megabytes of shaped traffic arrive
+/// later than the retransmissions they would have stopped, so the count climbs
+/// on a peer that is answering everything. The silence is what separates a peer
+/// that is slow from one that is absent (see [`KCP_DEAD_GRACE_MS`]).
+#[inline]
+const fn peer_is_gone(xmit: u32, dead_link: u32, window_still: bool) -> bool {
+    xmit >= dead_link && window_still
 }
 
 /// One parsed KCP segment header, as read off the wire in [`Kcp::input`].
@@ -1418,6 +1524,9 @@ impl<Output: DatagramSink> Kcp<Output> {
 
         let mut lost = false;
         let mut change = 0;
+        // Read the dead-link inputs before the loop borrows `snd_buf` mutably.
+        let dead_link = self.dead_link;
+        let window_still = timediff(self.current, self.last_progress) > KCP_DEAD_GRACE_MS;
 
         for snd_segment in &mut self.snd_buf {
             let mut need_send = false;
@@ -1432,6 +1541,7 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.xmit += 1;
                 self.xmit += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
+                KCP_RESENDS_RTO.fetch_add(1, Relaxed);
                 if self.flags.has(KcpFlags::NODELAY) {
                     // nodelay steps the RTO by half instead of doubling it
                     let step = snd_segment.rto;
@@ -1450,6 +1560,7 @@ impl<Output: DatagramSink> Kcp<Output> {
                 snd_segment.resendts = self.current + snd_segment.rto;
                 change += 1;
                 KCP_RETRANSMITS.fetch_add(1, Relaxed);
+                KCP_RESENDS_FAST.fetch_add(1, Relaxed);
             }
 
             if need_send {
@@ -1480,7 +1591,9 @@ impl<Output: DatagramSink> Kcp<Output> {
                     snd_segment.encode(&mut self.buf);
                 }
 
-                if snd_segment.xmit >= self.dead_link {
+                // Dead is a *stalled* sender, not a retransmitted segment: the
+                // count is the trigger, the silence is the verdict.
+                if peer_is_gone(snd_segment.xmit, dead_link, window_still) {
                     self.state = -1; // (IUINT32)-1
                 }
             }
@@ -1622,24 +1735,112 @@ mod tests {
         }
     }
 
-    /// The shrink is one-way: a later, larger probe result must not undo it.
-    /// Nothing else in the engine may write `mtu`/`mss`, so this is the whole
-    /// contract of the path-MTU adaptation.
+    /// The dead-link rule: the retransmit count only means "gone" once the send
+    /// window has stood still for the grace. A peer that keeps acknowledging is
+    /// slow, not absent, however many times one segment went out — which is
+    /// exactly the case a rate-limited path produces, and what closed a live
+    /// multiplexed session on every round of the bench's `loss1_rate100` cell.
     #[test]
-    fn shrink_mtu_is_one_way_and_keeps_a_payload() {
+    fn the_dead_link_needs_silence_not_just_retransmits() {
+        let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
+        kcp.update(1).unwrap();
+        kcp.send(&[0u8; 64]).unwrap();
+        kcp.flush().unwrap();
+
+        // The same silence test `flush` performs, spelled out here so the two
+        // thresholds stay visible.
+        let still =
+            |kcp: &Kcp<SharedBuf>| timediff(kcp.current, kcp.last_progress) > KCP_DEAD_GRACE_MS;
+        let grace = u32::try_from(KCP_DEAD_GRACE_MS).unwrap();
+        kcp.current = 10_000;
+
+        // The count alone, with progress just inside the grace: alive.
+        kcp.last_progress = 10_000 - (grace - 1);
+        assert!(!peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+
+        // The same count with the window still where it was a whole grace ago:
+        // a peer that has stopped answering.
+        kcp.last_progress = 10_000 - (grace + 1);
+        assert!(peer_is_gone(KCP_DEADLINK, KCP_DEADLINK, still(&kcp)));
+
+        // Below the count it is not a dead link either, however quiet: the
+        // first retransmissions of a stalled segment are what the RTO loop is
+        // for, and a peer that comes back inside them is served.
+        assert!(!peer_is_gone(KCP_DEADLINK - 1, KCP_DEADLINK, still(&kcp)));
+
+        // And the rule is what ends a session: a flush past both thresholds
+        // flips the state the adapter reads. Nodelay, as the adapter configures
+        // it, so the RTO steps by half of itself per retransmit rather than
+        // doubling — the difference between reaching the trigger in twenty
+        // rounds and in fifteen.
+        kcp.set_nodelay(true, 10, 2, true);
+        kcp.current = 10_000_000;
+        kcp.last_progress = 0;
+        for _ in 0..(KCP_DEADLINK + 2) {
+            // Far beyond any RTO the escalation can reach in nodelay mode, so
+            // every round retransmits.
+            kcp.current += 10 * KCP_RTO_MAX;
+            kcp.flush().unwrap();
+        }
+        assert!(
+            kcp.is_dead_link(),
+            "a window that has stood still past the grace, with the count over the trigger, \
+             must end the session"
+        );
+    }
+
+    /// The timeout must stay ahead of the round trip it is timing, by a margin
+    /// that grows with it — the interval term alone leaves a long path with none
+    /// (see [`KCP_RTO_HEADROOM_DIVISOR`]).
+    #[test]
+    fn a_long_path_gets_rto_headroom() {
+        let out = SharedBuf::default();
+        let mut kcp = Kcp::new_stream(0x1234, out);
+        // The adapter's parameters: a 10 ms flush interval, nodelay.
+        kcp.set_nodelay(true, 10, 2, true);
+
+        // A steady 200 ms round trip with no jitter (a shaped path).
+        for _ in 0..8 {
+            kcp.update_ack(200);
+        }
+        assert_eq!(kcp.rx_srtt, 200);
+        assert!(
+            kcp.rx_rto >= 200 + 200 / KCP_RTO_HEADROOM_DIVISOR,
+            "a 200 ms path got an RTO of {} ms: the timeout must clear the round \
+             trip by a margin that grows with it",
+            kcp.rx_rto
+        );
+
+        // A short path is untouched: the interval term still dominates.
+        let mut lan = Kcp::new_stream(0x1234, SharedBuf::default());
+        lan.set_nodelay(true, 10, 2, true);
+        for _ in 0..8 {
+            lan.update_ack(1);
+        }
+        // Unchanged: on a short path the nodelay floor (30 ms) is what binds,
+        // exactly as it did before the headroom existed.
+        assert_eq!(lan.rx_rto, 30, "a 1 ms path keeps the nodelay floor");
+    }
+
+    /// `set_mtu` follows the caller in either direction and keeps a payload in
+    /// every case. Nothing else in the engine may write `mtu`/`mss`, so this is
+    /// the whole contract the adapter's path-MTU adaptation builds on: the
+    /// *policy* (which size a path deserves) lives there, the invariant here.
+    #[test]
+    fn set_mtu_follows_the_caller_and_keeps_a_payload() {
         let mut kcp = Kcp::new_stream(0x1234, SharedBuf::default());
         assert_eq!(kcp.mtu(), KCP_MTU_DEF);
         assert_eq!(kcp.mss, KCP_MTU_DEF - KCP_OVERHEAD);
 
-        assert_eq!(kcp.shrink_mtu(1252), 1252);
+        assert_eq!(kcp.set_mtu(1252), 1252);
         assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
 
-        // A bigger path (or a stale cache) must not grow it back.
-        assert_eq!(kcp.shrink_mtu(9000), 1252);
-        assert_eq!(kcp.mss, 1252 - KCP_OVERHEAD);
+        // A jumbo path grows the datagram — the whole point of the setter.
+        assert_eq!(kcp.set_mtu(8000), 8000);
+        assert_eq!(kcp.mss, 8000 - KCP_OVERHEAD);
 
         // Nonsense cannot produce an empty payload: `send` asserts `mss > 0`.
-        assert_eq!(kcp.shrink_mtu(0), KCP_OVERHEAD + 1);
+        assert_eq!(kcp.set_mtu(0), KCP_OVERHEAD + 1);
         assert_eq!(kcp.mss, 1);
     }
 
