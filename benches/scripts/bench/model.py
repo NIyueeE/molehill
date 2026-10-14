@@ -1531,13 +1531,19 @@ PROFILES |= {
         "params": {"cost": {"scale": 0.5, "streams": 4}},
     },
     "sweep": {
+        # The product's own two architectures first, then the reference tools.
+        # `l3` has no peer: frp, rathole and nps are forwarding proxies with no
+        # TUN path, so that arm's comparison is against `molehill` (L4) and the
+        # control — the same workload, the same topology, one architecture apart.
+        # It earns its place because L3 is what this release is *for*, and a
+        # release artifact that omits it cannot support the release's own claim.
         "what": "the release sweep: the staged schedule and the load ramp",
         "rounds": 1,
         "warmup_rounds": 0,
         "scenarios": ("timeline", "capacity"),
-        "budget_s": 2400.0,
+        "budget_s": 3000.0,
         "aa": False,
-        "arms": ("molehill", "frp", "rathole", "nps"),
+        "arms": ("molehill", "l3", "frp", "rathole", "nps"),
         "params": {},
     },
 }

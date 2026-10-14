@@ -105,9 +105,13 @@ and the whole package is self-contained (`benches/scripts/bench/`).
 3. `just bench --profile sweep --binary target/release/molehill \
    --out benches/records/results-bench-vX.Y.Z.json`
    — run the sweep. **The profile's arm list is the requirement**: a run whose
-   arms are not `molehill,frp,rathole,nps` produces a file that looks like a
-   release artifact with an empty peer comparison in it, so name them
-   explicitly if the profile ever changes. The release artifact path is passed
+   arms are not `molehill,l3,frp,rathole,nps` produces a file that looks like a
+   release artifact with a missing architecture or an empty peer comparison in
+   it, so name them explicitly if the profile ever changes. The `l3` arm is the
+   product's second architecture; it has no peer to be compared against (frp,
+   rathole and nps are forwarding proxies with no TUN path), so its contrast is
+   `molehill` (L4) and the control arm — and the README has to say so, or the
+   row reads as a fourth tool. The release artifact path is passed
    explicitly: the default `--out` is `~/tmp/bench-<stamp>.json`, which is
    scratch and never the committed evidence. Before the run: the tree must be
    clean and the binary freshly built, because a number has to describe code
@@ -116,7 +120,7 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    `tree_clean` excludes the results file the run is writing, so an uncommitted
    *source* change is the only thing that makes it false.
    Budget: the sweep profile's timeline is ~17 minutes per arm plus the ramp,
-   so four arms are about two hours on this host. `--scale 0.2` shortens the
+   so five arms are a little over two hours on this host. `--scale 0.2` shortens the
    holds without changing the schedule's *shape*, and the fingerprint records
    the scale, so a shortened run can never be mistaken for the published one.
 4. `just bench-plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
