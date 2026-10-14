@@ -256,6 +256,7 @@ impl TransparentClientConfig {
                 tunnels: None,
             },
             services,
+            status: None,
             transport: TransportConfig {
                 transport_type: TransportType::Plain,
                 proxy: self.transport.proxy.clone(),

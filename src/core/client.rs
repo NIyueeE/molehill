@@ -580,6 +580,11 @@ struct Client {
     sessions: Vec<SessionEntry>,
     /// Every service this client runs, by name.
     services: HashMap<String, ServiceLocation>,
+    /// The status API's ask channels, by the endpoint a session dials: one
+    /// sender per session, consumed by the status task's report. An endpoint
+    /// without a `[client.status]` block has no entry, and nothing reads the
+    /// map.
+    status_asks: HashMap<String, mpsc::UnboundedSender<crate::status::SessionAsk>>,
 }
 
 impl Client {
@@ -591,6 +596,7 @@ impl Client {
             config,
             sessions: Vec::new(),
             services: HashMap::new(),
+            status_asks: HashMap::new(),
         }
     }
 
@@ -606,6 +612,20 @@ impl Client {
         for config in services {
             self.add_service(config)?;
         }
+
+        // The optional status API: one read-only listener the sessions answer.
+        // Off unless `[client.status]` exists; the asks map is empty without
+        // it, so spawning the task anyway would only cost a dead select arm —
+        // and one condition here reads clearer than one feature flag there.
+        let status_task = self.config.status.clone().map(|status| {
+            let asks = self.status_asks.clone();
+            let shutdown = shutdown_rx.resubscribe();
+            tokio::spawn(async move {
+                if let Err(e) = crate::status::run(status, shutdown, asks).await {
+                    error!("status API stopped: {e:#}");
+                }
+            })
+        });
 
         // Wait for the shutdown signal
         loop {
@@ -636,6 +656,13 @@ impl Client {
         // of that endpoint's public ports on the server.
         for entry in self.sessions.drain(..) {
             entry.handle.shutdown();
+        }
+
+        // The status task ends on its own (its select carries the same
+        // shutdown signal); keep the handle so the join is not silently
+        // detached work at exit.
+        if let Some(task) = status_task {
+            let _ = task.await;
         }
 
         Ok(())
@@ -760,6 +787,7 @@ impl Client {
             return i;
         }
         let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::status::SessionAsk>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let session = ClientSession {
             remote_addr: key.addr.clone(),
@@ -767,6 +795,7 @@ impl Client {
             token: self.config.default_token.clone(),
             default_heartbeat_timeout: self.config.control.default_heartbeat_timeout,
             req_rx,
+            ask_rx,
             shutdown_rx,
             services: HashMap::new(),
             pending_drops: Vec::new(),
@@ -791,6 +820,7 @@ impl Client {
             }
             .instrument(Span::current()),
         );
+        let endpoint = key.addr.clone();
         self.sessions.push(SessionEntry {
             key,
             handle: ClientSessionHandle {
@@ -799,6 +829,10 @@ impl Client {
             },
             next_id: 0,
         });
+        // The status task asks this session for its view by endpoint; a
+        // session that never answers (reconnecting) is a gap in one report,
+        // not an error.
+        self.status_asks.insert(endpoint, ask_tx);
         self.sessions.len() - 1
     }
 
@@ -3497,6 +3531,10 @@ struct ClientSession {
     default_heartbeat_timeout: Option<u64>,
     /// Registrations the client asks for.
     req_rx: mpsc::UnboundedReceiver<SessionRequest>,
+    /// The status API's asks, answered from this session's own state. A
+    /// session without a status listener still holds the receiver: an ask
+    /// channel nobody closes is one fewer conditional in the session loop.
+    ask_rx: mpsc::UnboundedReceiver<crate::status::SessionAsk>,
     /// The client's shutdown signal.
     shutdown_rx: oneshot::Receiver<u8>,
     /// Services this session carries, by the id the client allocated.
@@ -3748,6 +3786,7 @@ impl ClientSession {
                     // The client is gone.
                     None => break,
                 },
+                ask = self.ask_rx.recv() => self.answer_ask(ask),
                 () = wait_for_heartbeat(heartbeat_timeout) => {
                     bail!(
                         "Heartbeat timed out after {} seconds",
@@ -3856,6 +3895,84 @@ impl ClientSession {
     /// [`resolve_heartbeat_timeout`]).
     fn heartbeat_timeout(&self, interval: u64) -> Result<Option<Duration>> {
         resolve_heartbeat_timeout(interval, self.default_heartbeat_timeout)
+    }
+
+    /// Answer one status ask, or drop the channel when the asker is gone.
+    fn answer_ask(&self, ask: Option<crate::status::SessionAsk>) {
+        match ask {
+            Some(crate::status::SessionAsk::Snapshot(tx)) => {
+                let _ = tx.send(self.status_view());
+            }
+            // The status task is gone: nothing asks again.
+            None => {}
+        }
+    }
+
+    /// This session's own answer to a status ask: its services and its
+    /// transparent claims.
+    ///
+    /// Built from the same maps the session loop mutates, under no lock that
+    /// matters — the ask arrives on the session's own select branch, so the
+    /// read cannot race the write. The tunnel pools are *not* answered here:
+    /// they are a process registry (`live_pools`) the status task reads
+    /// directly, and one pool per session key means a session-keyed answer
+    /// would only duplicate it.
+    fn status_view(&self) -> crate::status::SessionView {
+        let services = self
+            .services
+            .values()
+            .map(|entry| crate::status::ServiceStatus {
+                name: entry.slot.service.name.clone(),
+                kind: match entry.slot.service.service_type {
+                    crate::config::ServiceType::Tcp => "tcp",
+                    crate::config::ServiceType::Udp => "udp",
+                    crate::config::ServiceType::Transparent => "transparent",
+                }
+                .to_owned(),
+                remote_addr: entry.slot.service.remote_bind_addr.clone(),
+                local_addr: entry.slot.service.local_addr.clone(),
+                state: match entry.state {
+                    ServiceState::Registering => "registering",
+                    ServiceState::Active(_) => "active",
+                    ServiceState::Rejected => "rejected",
+                },
+            })
+            .collect();
+
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        let claims = self
+            .lane_pool
+            .as_ref()
+            .map(|pool| {
+                pool.snapshot()
+                    .0
+                    .into_iter()
+                    .map(|load| crate::status::ClaimStatus {
+                        endpoint: load.endpoint.to_string(),
+                        lanes: load
+                            .lanes
+                            .into_iter()
+                            .map(|lane| crate::status::LaneStatus {
+                                slot: lane.slot,
+                                flows: lane.flows,
+                                handover: lane.handover,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+        let claims = ();
+
+        crate::status::SessionView {
+            services,
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            claims,
+            #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+            claims,
+        }
     }
 
     /// Apply every request already queued, without waiting for one.

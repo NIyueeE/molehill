@@ -592,6 +592,62 @@ keepalive)。因此 `nodelay = false` 无法让这些 socket 重新启用 Nagle�
 如果带宽更重要,可以在每个服务上用 `nodelay = false` 关闭 TCP_NODELAY
 ——只作用于上面那些客户端侧 socket。
 
+## 状态 API
+
+一个可选的只读视图,回答"这个正在运行的**客户端**正在承载什么":它的服务、
+各隧道池(含每隧道字节数与 KCP ARQ 健康),以及透明客户端的 claim 与 lane。
+单个 HTTP 端点上的 JSON——前端刻意交给别人的程序(mihomo external-controller
+确立的那种分离):把面板或脚本指向这个应答即可,本守护进程不带 UI。
+
+```toml
+[client]
+default_token = "服务端的-token" # security-scan:allow 文档占位
+
+[client.control]
+default_remote_addr = "server.example.com:2333"
+
+[client.status]
+bind_addr = "127.0.0.1:9090"   # 建议默认:回环地址
+token = "一串足够长的随机字符串" # 必填;每个请求都需要 # security-scan:allow 文档占位
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+```
+
+没有这个块,功能整体关闭:无监听、无端口、无可探测面。写了它:
+
+- `GET /status`(唯一路径、唯一方法)在请求携带
+  `Authorization: Bearer <token>` 时返回 `application/json`,否则返回
+  `401` 与 `WWW-Authenticate: Bearer` 质询。比对走摘要,时序不泄漏
+  token 的任何信息。
+- 应答陈述**整个**客户端:服务及其注册状态、每个活跃隧道池与每隧道
+  计数器,构建与配置带透明服务时还有 claim 与 lane。处于重连间隙的
+  会话是应答里的一段空白,而不是一个错误:还知道的就照实显示。
+- 每个响应都带 `Access-Control-Allow-Origin: *`,因此另一 origin 上的
+  浏览器面板可以读取(带 token,这就是 bearer)。
+- 为什么在客户端而不是服务端:隧道池与 lane 分配器是客户端的,而服务端
+  自身的每隧道健康也以隧道报告的形式到达客户端——一个进程已经握有
+  全部图景。控制端口承载的是客户端的协议与其认证,不是 HTTP;教它嗅探
+  请求等于把一个解析器放到数据面唯一信任的连接上,所以这是一个
+  独立的监听器。
+
+把它绑定到回环之外,等于发布这台机器自身的拓扑——请带着 token、放在
+主机已有的防护之后,刻意地做这个决定。
+
+裸 `curl` 就是全部客户端:一个头、一个路径、JSON 出来。
+
+```sh
+# 每隧道健康:各隧道承载了多少,载体让它重发了多少
+curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
+
+# 轮询观察重发计数:载体在丢流量时重发数以千计,健康时几乎为零
+# (这正是载体规则所依据的信号)
+watch -n 1 "curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[].kcp_retransmits'"
+```
+
 ## 示例与部署
 
 常见场景的完整示例(最小配置、Noise、UDP、合并一个文件、代理、iperf3)、

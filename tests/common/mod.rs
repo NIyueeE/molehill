@@ -57,6 +57,29 @@ pub mod tcp {
         }
     }
 
+    /// Wait until the forwarded endpoint answers a full PING/PONG round: a
+    /// bare connect can succeed against a listener whose registration is
+    /// still settling, and the server closes such a connection — so the
+    /// readiness signal is the protocol round itself, polled to a deadline.
+    pub async fn wait_for_ready<A: ToSocketAddrs>(addr: A) -> Result<()> {
+        for _ in 0..50 {
+            if pingpong_round(&addr).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        anyhow::bail!("the endpoint never became ready")
+    }
+
+    /// One PING/PONG round over a fresh connection.
+    pub async fn pingpong_round<A: ToSocketAddrs>(addr: A) -> Result<Vec<u8>> {
+        let mut conn = TcpStream::connect(&addr).await?;
+        conn.write_all(PING.as_bytes()).await?;
+        let mut buf = vec![0u8; PONG.len()];
+        conn.read_exact(&mut buf).await?;
+        Ok(buf)
+    }
+
     pub async fn pingpong_server<A: ToSocketAddrs>(addr: A) -> Result<()> {
         let l = TcpListener::bind(addr).await?;
 

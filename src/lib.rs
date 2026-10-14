@@ -18,6 +18,8 @@ pub mod logging;
 #[cfg(feature = "multiplex")]
 mod mux;
 mod protocol;
+#[cfg(feature = "client")]
+mod status;
 mod stripe;
 #[cfg(all(feature = "transparent", target_os = "linux"))]
 mod transparent;

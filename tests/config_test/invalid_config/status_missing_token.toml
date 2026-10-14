@@ -1,0 +1,11 @@
+# expect: missing field `token`
+
+[client]
+default_token = "t"
+[client.control]
+default_remote_addr = "127.0.0.1:2333"
+[client.status]
+bind_addr = "127.0.0.1:9090"
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"

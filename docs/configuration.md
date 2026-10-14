@@ -661,6 +661,71 @@ TCP keepalive is also enabled by default on these sockets (20s idle time, 8s pro
 
 If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service — on the client-side sockets above.
 
+## Status API
+
+An optional, read-only view of what a running **client** is carrying: its
+services, their tunnel pools with per-tunnel bytes and KCP ARQ health, and a
+transparent client's claims and lanes. JSON over one HTTP endpoint — the
+frontend is deliberately someone else's program (the split mihomo's
+external-controller made standard): point a panel or a script at the answer,
+this daemon ships no UI.
+
+```toml
+[client]
+default_token = "the-servers-token" # security-scan:allow documentation placeholder
+
+[client.control]
+default_remote_addr = "server.example.com:2333"
+
+[client.status]
+bind_addr = "127.0.0.1:9090"   # default suggestion: the loopback
+token = "a-long-random-string" # required; every request needs it # security-scan:allow documentation placeholder
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+```
+
+Absent, the block is off: no listener, no port, nothing to probe. Present:
+
+- `GET /status` (the only path, the only method) answers
+  `application/json` when the request carries
+  `Authorization: Bearer <token>`, and `401` with a
+  `WWW-Authenticate: Bearer` challenge otherwise. The comparison runs over
+  a digest, so timing leaks nothing about the token.
+- The answer states the *whole* client: services with their registration
+  state, every live tunnel pool with per-tunnel counters, and — where the
+  build and config carry transparent services — the claims and their
+  lanes. A session between reconnects is a gap in the report, not an
+  error: what is still known is what is shown.
+- `Access-Control-Allow-Origin: *` is sent on every response, so a browser
+  panel on another origin can read it (with the token, which is the
+  bearer).
+- Why the client and not the server: the tunnel pool and the lane
+  allocator are the client's, and the server's own per-tunnel health
+  arrives at the client as the tunnel report — one process already holds
+  the full picture. The control port carries the client's protocol and its
+  authentication, not HTTP; teaching it to sniff requests is a parser on
+  the one connection the data plane trusts, which is why this is a
+  separate listener.
+
+Binding it beyond the loopback publishes the machine's own topology —
+make that decision deliberately, with the token, and behind whatever the
+host already has.
+
+Plain `curl` is the whole client: one header, one path, JSON out.
+
+```sh
+# Per-tunnel health: what each tunnel carried, and what its carrier made it re-send
+curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
+
+# Watch the re-send counter: a carrier losing traffic re-sends by the thousands,
+# a healthy one sits at ~nothing (this is the signal the carrier rule acts on)
+watch -n 1 "curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[].kcp_retransmits'"
+```
+
 ## Examples & deployment
 
 Worked examples for the common scenarios — minimal, Noise, UDP, one file,

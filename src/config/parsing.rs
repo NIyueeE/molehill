@@ -345,6 +345,28 @@ fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
+/// The optional status API (`[client.status]`).
+///
+/// A read-only HTTP endpoint that answers "what is this client carrying":
+/// its services, their tunnel pools with per-tunnel bytes and ARQ health,
+/// and the transparent claims. One GET path, one bearer token, no frontend —
+/// the panel is someone else's program. Absent means the whole feature is
+/// off: no listener, no port, nothing to probe.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    /// Address the status API listens on, e.g. `"127.0.0.1:9090"`. The
+    /// sensible default is the loopback: this endpoint states the machine's
+    /// own topology, and binding it beyond the host is the operator's
+    /// explicit decision, not the daemon's.
+    pub bind_addr: String,
+    /// The bearer token every request must present
+    /// (`Authorization: Bearer <token>`). Required and non-empty: an
+    /// unauthenticated topology view on the machine that is itself how the
+    /// traffic gets in would hand an attacker the map of what to attack.
+    pub token: MaskedString,
+}
+
 /// Control-channel defaults (`[client.control]`).
 ///
 /// Every service inherits these and may override `remote_addr` and
@@ -507,6 +529,9 @@ pub struct ClientConfig {
     #[serde(default)]
     pub data: ClientDataConfig,
     pub services: HashMap<String, ClientServiceConfig>,
+    /// The optional read-only status API (`[client.status]`). Absent = off.
+    #[serde(default)]
+    pub status: Option<StatusConfig>,
     #[serde(default)]
     pub transport: TransportConfig,
 }
@@ -1157,6 +1182,26 @@ impl Config {
 
         if client.default_token.is_empty() {
             bail!("`{}.default_token` must not be empty", model.block());
+        }
+
+        // The status API is off unless asked for; asked for, it is a
+        // credential-bearing listener, and half a credential is worse than
+        // none.
+        if let Some(status) = &client.status {
+            if status.token.is_empty() {
+                bail!(
+                    "`{}.status.token` must not be empty: the status API \
+                     answers without one for nobody",
+                    model.block()
+                );
+            }
+            if status.bind_addr.rfind(':').is_none() {
+                bail!(
+                    "`{}.status.bind_addr` is missing the port: {}",
+                    model.block(),
+                    status.bind_addr
+                );
+            }
         }
 
         #[cfg(feature = "multiplex")]

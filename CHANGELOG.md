@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The client can answer "what am I carrying" over an optional status
+  API.** A `[client.status]` block with a `bind_addr` and a required
+  `token` starts one read-only HTTP endpoint — `GET /status`, the only
+  path and the only method — answering `application/json`: every service
+  with its registration state, every live tunnel pool with per-tunnel
+  bytes and KCP ARQ health, and a transparent client's claims and lanes.
+  The frontend is deliberately someone else's program (mihomo's
+  external-controller split): the response carries
+  `Access-Control-Allow-Origin: *`, a panel lives on another origin and
+  reads with the token. Absent, the block is off — no listener, no port,
+  nothing to probe; present, the token is required and compared by digest,
+  because an unauthenticated topology view on the machine that is itself
+  how the traffic gets in would hand an attacker the map of what to
+  attack. It lives on the **client** and on its **own** listener: the pool
+  and the lane allocator are the client's (the server's per-tunnel health
+  already arrives there as the tunnel report), and the control port
+  carries the client's protocol and its authentication — teaching it to
+  sniff HTTP would put a parser on the one connection the data plane
+  trusts.
 - **The tunnel pool's carrier rule probes the other carrier instead of
   trusting its own counters.** A suspicion — a tunnel re-sending 4 % or more
   of a window it carried real traffic in — hands one tunnel to the carrier the
