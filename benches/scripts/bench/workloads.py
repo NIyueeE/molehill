@@ -389,13 +389,24 @@ def _dial(ctx: Ctx, params: dict) -> iperf.IperfDial:
 
 
 def _iperf_cell(spot: Spot, result: dict, metrics: dict) -> Cell:
-    if not result.get("ok"):
+    if result.get("ok") is False:
         extra = {"cmd": result.get("artifact"), "exit": result.get("exit")}
         return Cell(
             cell=spot.cell,
             ok=False,
             reason=result.get("reason", "unknown iperf3 failure"),
             evidence=_evidence(spot.ctx, spot.window, extra),
+        )
+    if not result:
+        # No bulk spine at all (`streams: 0`): the throughput metric is a typed
+        # absence rather than a zero, because a run that carried nothing must
+        # not read as one that carried nothing *well*.
+        return Cell(
+            cell=spot.cell,
+            ok=True,
+            metrics=metrics,
+            unavailable={"throughput_gbps": {"reason": "no bulk spine: streams = 0"}},
+            evidence=_evidence(spot.ctx, spot.window, {}),
         )
     extra = {
         "bytes_sent": result.get("bytes_sent"),
@@ -898,26 +909,39 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
     drain = ctx.topo.drain(ctx.leg)
     port = topology.IPERF_PORT
-    with (
-        measured(ctx, topology.ECHO_PORT) as window,
-        iperf_sink(ctx, f"stage-{label}", port),
-    ):
-        if not wait_listener(port):
-            return Cell(label, False, reason="the iperf3 sink never listened")
-        t0 = time.time()
-        result = iperf.iperf_result(
-            iperf.IperfDial(
-                port,
-                host=ctx.arm.dial_host,
-                argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
-                omit=min(2, max(0, int(secs) // 4)),
-            ),
-            params.get("streams", 4),
-            secs,
-            iperf_timeout(secs + 20),
-            ctx.work / "iperf-raw" / f"{ctx.arm.id}-stage-{label}",
-        )
-        t1 = time.time()
+    # `streams: 0` is the bulk spine switched off: the staged timeline still
+    # measures its interactive, datagram and churn series for every stage, and
+    # the throughput cell reads as a typed absence rather than as zero. A tool
+    # cannot be asked to carry nothing and then be judged on what it carried, so
+    # the run says so instead of dialling iperf3 with `-P 0`.
+    streams = int(params.get("streams", 4))
+    result: dict = {}
+    if streams > 0:
+        with (
+            measured(ctx, topology.ECHO_PORT) as window,
+            iperf_sink(ctx, f"stage-{label}", port),
+        ):
+            if not wait_listener(port):
+                return Cell(label, False, reason="the iperf3 sink never listened")
+            t0 = time.time()
+            result = iperf.iperf_result(
+                iperf.IperfDial(
+                    port,
+                    host=ctx.arm.dial_host,
+                    argv_prefix=("ip", "netns", "exec", topology.VIS_NS),
+                    omit=min(2, max(0, int(secs) // 4)),
+                ),
+                streams,
+                secs,
+                iperf_timeout(secs + 20),
+                ctx.work / "iperf-raw" / f"{ctx.arm.id}-stage-{label}",
+            )
+            t1 = time.time()
+    else:
+        with measured(ctx, topology.ECHO_PORT) as window:
+            t0 = time.time()
+            time.sleep(max(0.0, secs))
+            t1 = time.time()
     interaction = read_series(logs["interactive"], t0, t1)
     datagrams = read_series(logs["udp"], t0, t1)
     churn = read_series(logs["churn"], t0, t1)
@@ -925,10 +949,11 @@ def _one_stage(ctx: Ctx, stage: tuple, params: dict, logs: dict) -> Cell:
     stage_metrics, evidence, unavailable = _stage_metrics(
         interaction, datagrams, churn, window_s
     )
-    stage_metrics |= {
-        "throughput_gbps": result.get("gbps_received_own_window"),
-        "slo_broken": _breaks_slo(stage_metrics),
-    }
+    stage_metrics |= {"slo_broken": _breaks_slo(stage_metrics)}
+    # Only the interactive metrics carry the stage's verdict; throughput is the
+    # bulk spine's and a run without one records its absence, not a zero.
+    if result:
+        stage_metrics["throughput_gbps"] = result.get("gbps_received_own_window")
     built = _iperf_cell(Spot(ctx, window, label), result, stage_metrics)
     built.unavailable |= unavailable
     built.evidence["series"] = evidence["series"]

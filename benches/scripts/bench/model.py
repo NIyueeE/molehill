@@ -1536,6 +1536,24 @@ PROFILES |= {
         "arms": (),
         "params": {"cost": {"scale": 0.5, "streams": 4}},
     },
+    # A diagnostic, not a gate: the same staged timeline with the bulk spine
+    # removed. It exists to answer one question — whether an L3 wedge is
+    # contention with a bulk claim sharing the carrier — and the answer is read
+    # by comparing its interactive stream against the sweep's own. The two runs
+    # are otherwise identical, so anything that differs is the bulk workload.
+    # `streams: 0` is the whole point and the spine handles it by dialing
+    # nothing: the staged runner still measures the interactive, UDP and churn
+    # series for every stage.
+    "nobulk": {
+        "what": "the same staged timeline with the bulk spine removed",
+        "rounds": 2,
+        "warmup_rounds": 1,
+        "aa": False,
+        "arms": ("l3",),
+        "scenarios": ("timeline",),
+        "budget_s": 300.0,
+        "params": {"timeline": {"scale": 0.3, "streams": 0}},
+    },
     "sweep": {
         # The product's own two architectures first, then the reference tools.
         # `l3` has no peer: frp, rathole and nps are forwarding proxies with no
