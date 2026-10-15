@@ -37,6 +37,7 @@ sys.path.insert(0, str(HERE))
 
 import argparse  # noqa: E402
 import contextlib  # noqa: E402
+import importlib.util  # noqa: E402
 import json  # noqa: E402
 import py_compile  # noqa: E402
 import shutil  # noqa: E402
@@ -1157,7 +1158,38 @@ def _check_fingerprint(c: Checker) -> None:
     )
 
 
+def _load_probe_module(name: str):
+    """A probe module, loaded by path so its constants can be read.
+
+    The probes are scripts with a PEP 723 header, not a package, and they carry
+    no import-time side effects (their `main` is behind a `__name__` guard), so
+    loading one is how a check in this file can assert something *about* the
+    numbers the probe runs with instead of restating them.
+    """
+    path = HERE / "probes" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"bench_probe_{name}", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 — an unimportable probe is the finding
+        return None
+    return module
+
+
 def _check_probes(c: Checker) -> None:
+    """The probes compile, and the silence threshold is stated against theirs.
+
+    The wedge threshold and the interactive probe's attempt budget are two
+    numbers in two files that have to stay ordered. With the threshold at or
+    below the budget, **one** unanswered attempt is a "silence" by
+    construction: a lost SYN on a 5 %-loss path costs 1 s and then 3 s, every
+    tool pays it, and a gate that fails a subject arm on any wedge becomes a
+    coin flip (measured 2026-10-15: the same L4 arm read 0 wedges in one
+    release sweep and 2 in the next). Both were 5.0 when that happened, and no
+    check noticed — this is the check.
+    """
     for probe in sorted((HERE / "probes").glob("*.py")):
         try:
             py_compile.compile(str(probe), doraise=True, cfile=str(probe) + "c")
@@ -1167,6 +1199,67 @@ def _check_probes(c: Checker) -> None:
         finally:
             with contextlib.suppress(OSError):
                 Path(str(probe) + "c").unlink()
+
+    series = _load_probe_module("series")
+    if series is None:
+        c.check(
+            "the interactive probe's attempt budget is readable",
+            False,
+            "probes/series.py did not import",
+        )
+        return
+    c.check(
+        "the wedge threshold exceeds the probe's own attempt budget",
+        inst.WEDGE_SILENCE_S > series.ATTEMPT_TIMEOUT_S,
+        f"wedge {inst.WEDGE_SILENCE_S}s vs attempt {series.ATTEMPT_TIMEOUT_S}s: "
+        "a threshold at or below the budget makes one unanswered attempt a wedge",
+    )
+
+
+#: What [`_check_wedges`]'s silent sample must report: two unanswered attempts,
+#: the first starting at 105.0 and the last ending at 115.6 — so a silence is
+#: measured from the first failure's start, not from the gap between the
+#: samples around it (which would be 5.1 or 10.5 and would read as a different
+#: metric's answer).
+WEDGE_SAMPLE_SPAN_S = 10.6
+
+
+def _check_wedges(c: Checker) -> None:
+    """A slow answer is not a silence, and a run of them is.
+
+    The distinction is the whole metric, and it was wrong: the threshold sat at
+    the probe's own attempt budget, and the gaps it measured were the *next
+    attempt's duration*, so one slow-but-successful answer counted as a wedge.
+    Both samples are written the way the probe now emits them — an attempt has a
+    start and an end — because the metric reads both.
+    """
+    slow = [
+        {"t": 100.0, "started_at": 95.0, "metric": "rtt_ms", "v": 4980.0},
+        {"t": 105.1, "started_at": 100.05, "metric": "rtt_ms", "v": 4980.0},
+    ]
+    silent = [
+        *slow,
+        {"t": 110.5, "started_at": 105.0, "metric": "error", "v": 1, "why": "timeout"},
+        {"t": 115.6, "started_at": 110.5, "metric": "error", "v": 1, "why": "timeout"},
+    ]
+    answered = inst.wedges(slow)
+    c.check(
+        "a slow but successful answer is not a wedge",
+        answered["count"] == 0,
+        f"count {answered['count']} over {len(slow)} answered attempts",
+    )
+    wedged = inst.wedges(silent)
+    c.check(
+        "a run of unanswered attempts is a wedge, measured end to end",
+        wedged["count"] == 1 and wedged["max_s"] == WEDGE_SAMPLE_SPAN_S,
+        f"count {wedged['count']}, max {wedged['max_s']}s "
+        f"(want 1 and {WEDGE_SAMPLE_SPAN_S})",
+    )
+    c.check(
+        "a silence is reported even when the attempts around it answered",
+        inst.wedges(silent[1:])["count"] == 1,
+        "the run starts at the first failure, not at the first attempt",
+    )
 
 
 def _check_socket_query(c: Checker) -> None:
@@ -1298,6 +1391,7 @@ def cmd_selfcheck(args) -> int:
     _check_comparability(c)
     _check_fingerprint(c)
     _check_probes(c)
+    _check_wedges(c)
     _check_socket_query(c)
     _check_topology(c)
     return c.report()

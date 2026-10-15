@@ -144,8 +144,9 @@ METRIC_SPECS: tuple[dict, ...] = (
         "unit": "count",
         "direction": "lower",
         "definition": (
-            "interactive silences longer than 5 s: a tool that stops answering "
-            "under degradation, which an average cannot show"
+            "stretches longer than 10 s in which the interactive probe asked "
+            "and heard nothing: a tool that stops answering under degradation, "
+            "which an average cannot show"
         ),
         "denominator": "one silent stretch",
         "needs": ("staged",),

@@ -20,7 +20,6 @@ Two rules the code enforces rather than documents:
 from __future__ import annotations
 
 import contextlib
-import itertools
 import os
 import platform
 import subprocess
@@ -47,9 +46,20 @@ PROC_POLL_S = 0.20
 DRIFT_POLL_S = 2.0
 MIN_SLOPE_POINTS = 5
 MIN_SLOPE_SPAN_S = 60.0
-#: An interactive silence longer than this is a wedge, not a slow answer, and
-#: the fewest attempts that can show one.
-WEDGE_SILENCE_S = 5.0
+#: An interactive silence longer than this is a wedge, not a slow answer.
+#:
+#: It is stated against the probe's own patience and it **has** to exceed it: at
+#: or below `series.ATTEMPT_TIMEOUT_S`, a single unanswered attempt — a lost SYN
+#: on a 5 %-loss path, whose retransmission ladder is 1 s and then 3 s, which
+#: every tool pays — is a "silence" by construction, and a gate that fails a
+#: subject arm on any wedge becomes a coin flip. Measured 2026-10-15: the same
+#: L4 arm read 0 wedges in one release sweep and 2 in the next, both of them
+#: single 5.1-5.5 s *successful* answers in `loss5`. Two budgets is the smallest
+#: value that means "the probe asked more than once and heard nothing", which is
+#: what a wedge is; the selfcheck asserts the ordering so the two cannot drift
+#: back into each other.
+WEDGE_SILENCE_S = 10.0
+#: The fewest attempts a run needs before its silences mean anything.
 MIN_WEDGE_POINTS = 2
 #: The kernel's page size, for `statm`.
 PAGE_KIB = os.sysconf("SC_PAGE_SIZE") // 1024
@@ -393,20 +403,43 @@ def slope_per_min(points: list, key: str):
 def wedges(points: list, silence_s: float = WEDGE_SILENCE_S) -> dict:
     """Interactive silences longer than `silence_s`: a wedge, with its length.
 
-    An average cannot show a tool that stops answering for ten seconds, and a
-    wedge is the failure mode the SLO is stated for; so it is its own metric.
-    The gaps are measured between consecutive attempts, so a stream that simply
-    stopped producing lines is a wedge too - `None` (not zero) when there are
-    fewer than two attempts to measure a gap between.
+    A silence is a stretch in which the probe **asked and heard nothing**: a run
+    of consecutive failed attempts, measured from the first one's start to the
+    last one's end. An average cannot show a tool that stops answering, and a
+    wedge is the failure mode the SLO is stated for, so it is its own metric.
+
+    It is deliberately **not** a gap between samples, which is what this used to
+    measure. The interactive probe is serial, so the gap between two samples is
+    the *next attempt's duration* rather than any silence of the tool's — and a
+    single slow-but-successful answer therefore counted as one. That is how two
+    5.1-5.5 s answers in a 5 %-loss stage became "L4 went silent twice": every
+    tool pays them, because a fresh TCP connection's SYN ladder on a lossy path
+    is 1 s and then 3 s.
+
+    `None` (not zero) when there are fewer than [`MIN_WEDGE_POINTS`] attempts to
+    judge; `max_s` is the longest silence, so a run with no failed attempt reads
+    0.0 rather than the longest gap (which is the slowest answer, and that is
+    [`rtt_max_ms`]'s to report).
     """
-    if len(points) < MIN_WEDGE_POINTS:
+    attempts = [p for p in points if p.get("started_at") is not None]
+    if len(attempts) < MIN_WEDGE_POINTS:
         return {"count": None, "max_s": None}
-    times = [p["t"] for p in points]
-    gaps = [b - a for a, b in itertools.pairwise(times)]
-    silent = [g for g in gaps if g > silence_s]
+    spans: list = []
+    run_start = None
+    last_end = 0.0
+    for point in attempts:
+        if point.get("metric") == "error":
+            run_start = point["started_at"] if run_start is None else run_start
+            last_end = point["t"]
+        elif run_start is not None:
+            spans.append(last_end - run_start)
+            run_start = None
+    if run_start is not None:
+        spans.append(last_end - run_start)
+    silent = [span for span in spans if span > silence_s]
     return {
         "count": len(silent),
-        "max_s": round(max(gaps), 3) if gaps else None,
+        "max_s": round(max(spans), 3) if spans else 0.0,
     }
 
 

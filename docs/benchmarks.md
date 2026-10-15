@@ -213,8 +213,8 @@ the definitions are what the report and the verdict render.
 | `drift_rss_mib_per_min` | MiB/min | lower is better | least-squares slope of the arm's summed RSS over the run: a leak is a slope over time, not a level | one minute of run time |
 | `drift_fds_per_min` | count/min | lower is better | least-squares slope of the arm's open descriptors | one minute of run time |
 | `drift_threads_per_min` | count/min | lower is better | least-squares slope of the arm's thread count | one minute of run time |
-| `wedge_count` | count | lower is better | interactive silences longer than 5 s: a tool that stops answering under degradation, which an average cannot show | one silent stretch |
-| `wedge_max_s` | s | lower is better | the longest interactive silence in the run | one silent stretch |
+| `wedge_count` | count | lower is better | stretches longer than 10 s in which the interactive probe asked and heard nothing: a tool that stops answering under degradation, which an average cannot show | one silent stretch |
+| `wedge_max_s` | s | lower is better | the longest such stretch in the run | one silent stretch |
 | `capacity_streams` | count | higher is better | the highest bulk-stream level whose interactive stream still met the SLO, from the capacity ramp | one bulk stream |
 | `capacity_headroom_pct` | % | higher is better | 1 - max sustainable streams / the ramp's ceiling | the ramp's ceiling |
 | `startup_s` | s | lower is better | median time from process start to the service answering a fresh connection: what a visitor pays after a restart | one cold start |
@@ -582,7 +582,15 @@ must act on:
 - **the drift and wedge axes** — a leak is a slope over time and a wedge is an
   interactive silence; a slope is only judged when the run is long enough to
   carry one (fifteen minutes), and a shorter run's slopes are reported as
-  context;
+  context. **A silence is a run of unanswered attempts, measured from the first
+  attempt's start to the last one's end — not a gap between samples.** The
+  interactive probe is serial, so a gap is the *next attempt's own duration*,
+  and reading gaps made a single slow-but-successful answer look like a wedge:
+  two 5.1–5.5 s answers in a 5 %-loss stage were reported as L4 "going silent",
+  and every tool pays those, because a fresh TCP connection's SYN ladder on a
+  lossy path is 1 s and then 3 s. The threshold is **two attempt budgets**
+  (2 × 5 s) for the same reason: at one budget, a single unanswered attempt is
+  a silence by construction, and the axis becomes a coin flip;
 - **the capacity ramp** — a ramp that sustained nothing is not a reading;
 - and, with `--baseline`, the **regression half**: the same comparison
   `just bench-compare` makes, refused unless the two files' method records

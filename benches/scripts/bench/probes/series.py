@@ -41,6 +41,13 @@ import time
 PING_BYTES = 64
 #: How long an attempt may take before it is a failure. A ping that is still
 #: waiting is not a measurement.
+#:
+#: It bounds the **whole attempt**, not each socket operation: set as a
+#: per-operation timeout it let one attempt spend it three times over
+#: (connect, then send, then receive) and still report success — a "successful"
+#: 5.5-second ping, which the wedge metric then read as a silence. The budget is
+#: also the unit the silence threshold is stated against, so an attempt that can
+#: outrun it moves the threshold's meaning without moving the number.
 ATTEMPT_TIMEOUT_S = 5.0
 #: Sockets that cannot be created are retried rather than recorded: a refused
 #: connection during a restart is the tool's business, a closed socket in this
@@ -54,31 +61,58 @@ def emit(metric: str, value, **extra) -> None:
     sys.stdout.flush()
 
 
-def emit_error(why: str) -> None:
-    emit("error", 1, why=why[:120])
+def emit_error(why: str, started_at: float) -> None:
+    emit("error", 1, why=why[:120], started_at=started_at)
+
+
+def attempt_deadline(started_at: float) -> float:
+    """The wall-clock instant this attempt must be over by.
+
+    The whole attempt is bounded, so a successful sample can never be longer
+    than the budget and a failure is always about one budget long. Callers pass
+    the result to `socket.settimeout`, which is what makes the deadline real:
+    a socket that would rather wait is cut off at it.
+    """
+    return started_at + ATTEMPT_TIMEOUT_S
+
+
+def remaining(started_at: float) -> float:
+    """Seconds left in this attempt's budget; never zero or negative.
+
+    `settimeout(0)` means non-blocking, so a spent budget has to be handed over
+    as a sliver rather than as nothing: the socket then fails the operation
+    immediately, which is the failure the budget asked for.
+    """
+    return max(attempt_deadline(started_at) - time.time(), 0.001)
 
 
 def ping(target: tuple, size: int) -> None:
     """One fresh TCP connection, one echo, timed end to end."""
     started = time.perf_counter()
+    started_at = time.time()
     try:
-        with socket.create_connection(target, ATTEMPT_TIMEOUT_S) as sock:
-            sock.settimeout(ATTEMPT_TIMEOUT_S)
+        with socket.create_connection(target, remaining(started_at)) as sock:
             payload = bytes(size)
+            sock.settimeout(remaining(started_at))
             sock.sendall(payload)
             got = 0
             while got < size:
+                sock.settimeout(remaining(started_at))
                 chunk = sock.recv(size - got)
                 if not chunk:
                     break
                 got += len(chunk)
     except OSError as exc:
-        emit_error(f"{type(exc).__name__}: {exc}")
+        emit_error(f"{type(exc).__name__}: {exc}", started_at)
         return
     if got != size:
-        emit_error(f"short echo: {got} of {size} bytes")
+        emit_error(f"short echo: {got} of {size} bytes", started_at)
         return
-    emit("rtt_ms", round((time.perf_counter() - started) * 1000, 4))
+    emit(
+        "rtt_ms",
+        round((time.perf_counter() - started) * 1000, 4),
+        started_at=started_at,
+    )
 
 
 def _deadline(args) -> float:
