@@ -230,87 +230,217 @@
     one run's incidental noise. A wedge with no loss anywhere is the same
     discriminator the earlier `limit 10000p` arm produced, and it points at the
     same place: **delay, not discard**.
-  - **What the per-second rate shows instead, and it is the whole story.** The
-    server's bulk claim (2402) offers **211 297 packets/s** steadily, then at
-    08:33:28 collapses to 107 239/s, then to **0/s for five seconds**
-    (08:33:29–08:33:33), then climbs back. The first `overflow` lands at
-    08:33:38 — **ten seconds after the collapse begins** — and the interactive
-    probe's two timeouts are at **08:34:01 and 08:34:10**, 23 s and 32 s after
-    it. The order is measured, not inferred: **the device goes quiet first, the
-    lane queue overflows second, the wedge third.** The interactive claim is
-    clean on both ends for the whole run (server 58 131 offered / 58 131
-    forwarded / `overflow=0`; client 39 162 / 39 162 / `0`), and the product's
-    device-level counters are `not_ipv4=1, malformed=0, unclaimed=0,
-    channel_errors=0`.
-  - **So the question is why the device goes quiet for five seconds, and the
-    answer is on the *client*, not the server.** The visitor→client direction is
-    intact: the visitor sent 4 041 780 TCP segments and the client received
-    4 053 100. What collapses is the **return** direction — the visitor received
-    338 202 of them, with 49 295 retransmitted. The client's own counters at
-    `rtt100` show the same shape as the server's: `in_segs` falls from
-    9 868 801 (clean) to 4 053 100 and `out_segs` from 4 592 446 to 1 583 768.
-    Both ends collapse at once, which is one stall in the middle of the path,
-    not two independent ones.
-  - **The mechanism is now narrow enough to name.** At `rtt100` the L3 arm
-    carries 1.19 Gbit/s with **2.45 CPU cores while the L4 arm carries 3.38
-    Gbit/s with 4.01** — 2.06 cores/Gbit against 1.19, i.e. **1.7× the CPU per
-    bit** — and 326 069 syscalls/s at 929 bytes per syscall. The bulk claim
-    alone offers 211 297 packets/s, and the whole L3 path is *four syscalls per
-    packet* (TUN read, socket write, socket read, TUN write). One reader task
-    per device means every claim's packets are parsed, framed, hashed and queued
-    by the same task, and when the carrier at 100 ms RTT cannot accept the bulk
-    claim's bytes fast enough, that task spends its time on the bulk claim and
-    the device is not drained — which is the five seconds of silence, seen from
-    the kernel as a queue nobody is reading. The wedge is a **scheduling
-    starvation of one shared reader task under a load it cannot drain**, not a
-    kernel drop, which is why six black-box knobs (queue depth, qdisc, probe
-    buffers, BDP, lane budget) all failed: none of them changes how much work
-    the reader has to do per packet.
-  - **The chain, corrected end to end**: `rtt100` is the only stage that is both
-    unshaped and lossless, so it is the only one where the offered load is
-    allowed to exceed what the L3 carrier drains → the bulk claim's lane queue
-    refuses (~1 M packets, counted on both ends) → **the reader task is occupied
-    serving it and stops draining the device for seconds** → the interactive
-    claim's packets are not read → the visitor's TCP retransmits (measured:
-    49 295 of 4 041 780 segments in one stage) → one handshake passes the
-    probe's 5 s cap → a wedge. No packet is dropped anywhere in the product;
-    they are late.
+  - **The first reading of that instrument was wrong, and the correction is the
+    round's real result (2026-10-15, same day, after placing the samples on the
+    timeline).** The bulk claim's rate does not collapse "for five seconds
+    inside `rtt100`": **08:33:28–08:33:33 is the tail of the *clean* stage.**
+    The stage boundaries come from the run's own artifacts (each stage's
+    iperf3 server log mtime): `clean` ends 08:33:27 and `rtt100` runs
+    08:33:27 → 08:34:13. Inside `rtt100` the bulk claim offers a steady
+    **100 000–145 000 packets/s**, the device **10 000–14 000/s**, and the
+    interactive claim **2–17/s** — and the reader never stops at all: the
+    device's own rate stays flat through the whole stage, which is the number
+    the first reading inverted.
+  - **What actually happens at the wedge, and it is the whole story.** During
+    `rtt100` the interactive stream's round trips are bimodal: 20 samples at
+    0.5–1.2 ms (the clean stage's tail, before the delay was applied at
+    08:33:28.4), then **every sample at a clean 401 ms** — exactly the stage's
+    configured 100 ms — except eleven outliers at **1410, 1408, 1427, 1456,
+    1007, 2431, 1418, 1418, 5972 ms**. Those decompose precisely:
+    `401 + 1009`, `401 + 2029`, `401 + 5570` — a **TCP RTO ladder of 1 s, 2 s
+    and 5.5 s** on top of the path's own 401 ms. The probe's cap is 5 s, so the
+    5 972 ms sample is the wedge, and it is a *retransmission timer*, not a
+    queue.
+  - **The interactive claim's counters collapse at exactly those moments, on
+    both ends.** At 08:33:57–08:34:09 the server's claim 2401 offered
+    **1–3 packets/s where it had been doing 12–17/s**, and the client's claim
+    2401 did the same 1–9/s where it had been 9–12/s — simultaneously, with
+    `overflow=0` and `no_channel=0` on both. So the product was offered less
+    traffic and refused none of it: **the visitor's own TCP stopped sending,
+    because its retransmission timer had not expired.** That is the mechanism,
+    and it is the visitor's congestion control, not the tool.
+  - **And nothing is dropped anywhere.** Every interface reads `rx_dropped=0,
+    tx_dropped=0` through the whole `rtt100` stage in both rounds (round 1's
+    `mhbsrv0` reads **-619**, a counter-delta artifact). The product's own
+    counters are `not_ipv4=1, malformed=0, unclaimed=0, channel_errors=0`. So
+    the earlier reading — that the interactive SYN is dropped at the shared TUN
+    queue — is refuted twice over: there is no drop, and there is no stall.
+  - **What this leaves, and it is a different problem from the one this cycle
+    has been chasing.** The L3 arm's interactive stream at `rtt100` pays
+    **p99 4 492–5 972 ms against every other arm's 401 ms** (molehill l4
+    402 ms, frp 401 ms, rathole 401 ms, nps 416 ms), with 49 295–114 285
+    retransmitted segments and a 7 % error rate, and it does so with **no loss
+    anywhere and no product-side stall** — the delay is the visitor's TCP
+    backing off. The mechanism that distinguishes L3 from L4 at that stage is
+    the one thing the measurements have not yet separated: L3 carries the
+    interactive stream's packets through the same reader task and the same
+    carrier as a bulk claim offering **100 000+ packets/s**, while L4 gives it
+    a tunnel of its own. Whether that contention is what makes the visitor's
+    TCP back off, or whether it is the carrier's own behaviour at 100 ms RTT
+    under a bulk load, is the open question — and it is now answerable, because
+    the instrument that was missing (a per-second rate on the device *and* per
+    claim) is the one that was just added.
+  - **The last link, measured: it is the carrier switch and the drain it asks
+    for (2026-10-15, same run).** The per-claim state shows the whole sequence
+    inside the `rtt100` stage (08:33:27 → 08:34:13, from each stage's iperf3
+    log mtime):
+
+    | time | event |
+    |------|-------|
+    | 08:33:27 | `rtt100` begins; interactive RTT 0.7 ms → 401 ms |
+    | 08:33:37 | bulk claim 2402 begins refusing: `overflow` starts |
+    | 08:33:38 | first overflow = 13 026; one ping at 1 410 ms (= 401 + 1 009) |
+    | 08:33:41 | **client: `lane 1 refused its share for 3 ticks; asked the peer to drain it so its replacement rides Tcp`, and the carrier switches `kcp → tcp`**; server sets `peer_draining=true` on 2402 |
+    | 08:34:01 | probe timeout #1 (the wedge) |
+    | 08:34:10 | probe timeout #2 (the wedge) |
+    | 08:34:12 | **client: `no drain answer within 30 s; calling the drain off`** |
+    | 08:34:13 | `rtt100` ends |
+
+    And the interactive claim's own path is **provably clean**: server
+    10 833 offered / 10 833 forwarded / `overflow=0` / `disconnected=0`, client
+    7 295 / 7 295 / `0` / `0`, `unclaimed=0` and `tx_dropped=0` on every
+    interface for the whole stage. The product carries every packet it is
+    offered, both ways, the whole time. So the five-second silences are the
+    visitor's own kernel deciding not to send — and what it is reacting to is
+    the claim's lane being drained while the bulk claim that shares the carrier
+    with it is refusing 36 999 packets.
+  - **What that sequence does and does not explain.** The drain is asked for
+    **claim 2402, the bulk claim**, so `live_slots()` for 2402 alone goes empty
+    and *its* new flows stop routing — which is exactly what the counters show:
+    2402's offered rate falls to ~0 from 08:33:49 and its overflow freezes at
+    36 999 and never moves again. **Claim 2401 is untouched by it** (its own
+    slot, `peer_draining=false` throughout, offered == forwarded for the whole
+    stage). So the drain explains the bulk claim going quiet, and it does
+    **not** explain the interactive wedge — that was the mistake in the first
+    draft of this bullet, and the per-claim counters are what caught it.
+    The interactive wedge's cause is still open, and it is now the *only* open
+    question: every candidate it has been tested against (the TUN queue, the
+    reader, the flow table, the lane budget, the probe's buffers, BDP) is
+    refuted by a measurement in this entry, and the interactive claim's own
+    path is measurably perfect while its round trips climb to 5 972 ms.
+  - **That prediction is tested, and it is refuted (2026-10-15, same day).**
+    `l3bud` (`pool_cap=10`, so two lanes per claim) ran the same staged timeline
+    three times against `l3`'s default. Lane lending gave claim **2401 up to six
+    lanes** (its own two plus four lent from the quiet claims 2403/2404/2405),
+    and the interactive claim **never once had `peer_draining=true`** — so
+    `live_slots()` was never empty for it. It still wedged:
+
+    | round | arm | rtt100 p99 | err % | wedge_count | wedge_max_s |
+    |-------|-----|-----------|-------|-------------|-------------|
+    | 0 | `l3bud` | 3 939 ms | 11.11 | 3 | 6.22 |
+    | 1 | `l3bud` | 2 475 ms | 7.89 | 3 | 5.21 |
+    | 2 | `l3bud` | 3 507 ms | 16.67 | 4 | 5.01 |
+
+    And in the same run the carrier still switched `kcp → tcp` (09:55:16) and the
+    drain was still requested — on claim 2402, the bulk claim, exactly as before.
+    So neither the lane budget nor the drain nor the carrier switch is the
+    wedge's cause: the interactive stream wedges while holding six routable
+    lanes and being drained by nobody.
+  - **And the `l3` arm of that comparison is void, for a reason worth
+    recording.** `pool_cap=1` was written for the control arm, and the config
+    layer refused it outright: *"`[transparent.data].tunnels = 1` is below what
+    this client's claims need: 5 claim(s) draw on it, and a claim's lane is a
+    connection of its own"*. The arm therefore never started (three rounds of
+    `not ready: no visitor could reach 10.99.0.1:2401`), which is the check
+    doing its job — and the honest way to state the result is that the
+    comparison is `l3bud` against `l3`'s *published* numbers, not against a
+    co-measured control in this run. A clean A/B on the same timeline still
+    needs to be run before any claim of the form "more lanes is better/worse"
+    is made.
   - **Therefore the queue-depth work could not fix it, and the reason is
-    precise**: a deeper TUN queue only *delays* the packets that were not read
-    (the bufferbloat reading this entry first proposed and then withdrew); a
-    shallower one drops them sooner. Neither reduces the reader's per-packet
-    work, which is what the five seconds of silence is made of. **A fix has to
-    reduce the work one claim can force the shared reader to do, or let a reader
-    be scheduled per claim** — not another knob. The candidates that follow from
-    this, in the order they should be tried:
-    1. **Bound the reader's per-claim duty inside one drain.** The reader
-       currently serves a claim until the device is dry, so one bulk flow can
-       hold it indefinitely. Capping the packets one claim may take per drain
-       (round-robin between claims) costs nothing when the load is light and
-       gives the interactive claim its packets within one drain's window. This
-       is the smallest change that targets the measured mechanism, and it is the
-       one to measure first.
-    2. **One reader task per claim** (`IFF_MULTI_QUEUE`, which needs the
-       operator's device to be created with `multi_queue` — verified on this
-       kernel: a device created without it refuses a second attach with
-       `EINVAL`, and `tun_flags` bit `0x100` says which kind it is). That would
-       let the kernel schedule the readers independently, but it moves the
-       fairness question into the kernel's flow hash and is not something this
-       repository can test without changing every operator's setup.
-    3. **Cheaper per-packet work** — the four-syscall-per-packet path is what
-       the 1.7× CPU/bit is made of, and the earlier `perf` finding already named
-       packet size as the lever (84 % of the CPU in the kernel).
-    Two things about the instrument, learned the hard way and worth keeping:
+    precise**: the wedge is a retransmission timer, and a queue's depth only
+    decides how long a packet that *was* delivered waits. **A deeper TUN queue
+    delays the packets that were read; a shallower one drops them; neither
+    changes when a sender retransmits** — which is where the 5 972 ms comes
+    from. This is also why six black-box knobs failed in a row: none of them
+    changes the thing the wedge is made of.
+  - **What the evidence does support, and what it does not.** Every mechanism
+    this cycle proposed for the wedge has now been measured and refuted: the
+    shared TUN queue (zero drops, all stage), the reader starving (device rate
+    flat at 10–14 k/s), the flow table (1770 → 1230 is settling to the
+    20/s × 60 s equilibrium), the lane budget and the drain (six routable lanes
+    and no drain on the wedging claim), the carrier switch (present on the arm
+    that wedges *and* on the arms that do not), and the probe's own buffers.
+    What is left is a single unexplained fact: **at `rtt100`, and only there,
+    the L3 arm's interactive stream pays 2 475–5 972 ms where every other arm
+    pays ~401 ms, with the product's own counters clean on both ends.** The
+    one structural difference that has not been separated is *where the
+    interactive flow's packets are carried*: on L4 they ride a tunnel of their
+    own, and on L3 they ride the same carrier connection, the same reader task
+    and the same kernel as a bulk claim offering 100 000+ packets/s. That
+    contention is the remaining candidate, and it is now the only one.
+  - **That experiment is run, and it settles it (2026-10-15, same day).** The
+    staged timeline ran again with the bulk spine removed entirely
+    (`--profile nobulk`, `streams: 0`, the new diagnostic profile —
+    `throughput_gbps` is a typed absence, not a zero, and no iperf3 is dialled
+    at all). The L3 arm still wedges:
+
+    | round | clean p99 | **rtt100 p99** | err % | interactive silences > 5 s |
+    |-------|-----------|----------------|-------|----------------------------|
+    | 1 | 1.22 ms | **4 508 ms** | 13.04 | 2 (max 17.46 s) |
+    | 2 | 1.36 ms | (stage clean of wedges) | 0 | 0 |
+
+    and its round trips carry the same ladder as before — 1 045, 1 416,
+    1 651, 1 834, 2 088, 2 092, 3 344, 4 508 ms against a 401 ms baseline, i.e.
+    **+644, +1 015, +1 687, +2 943 and +3 871 ms of extra delay with no bulk
+    traffic in the path at all.** A KCP nodelay RTO ladder from the 100 ms floor
+    (100 → 150 → 225 → 338 → 506 → 759 → 1 139 → 1 709 → 2 563, ×1.5 per
+    retransmit) reproduces those numbers, which is what a retransmission round
+    costs when the path's own RTT is 100 ms.
+  - **So the wedge is the L3 path's own behaviour at a 100 ms RTT, and the bulk
+    claim's contention is refuted as its cause.** That was the last structural
+    candidate this cycle had left. Every mechanism proposed for the wedge — the
+    shared TUN queue, the reader starving, the flow table, the lane budget, the
+    drain, the carrier switch, contention with the bulk claim, and the probe's
+    own buffers — has now been measured and refuted, each by a run that
+    separated it. What remains is a fact rather than a hypothesis: **an L3
+    arm's interactive stream pays a retransmission-scaled penalty at `rtt100`
+    that no other arm in the sweep pays** (l4 402 ms, frp 401 ms, rathole
+    401 ms, nps 416 ms — all at the stage's configured delay), while the L3
+    arm's own counters stay clean on both ends: `offered == forwarded`,
+    `overflow=0`, `disconnected=0`, `unclaimed=0`, and `rx_dropped=tx_dropped=0`
+    on every interface for the whole stage.
+  - **What that says the next step is.** The loss is at the *carrier*, not the
+    device, the reader or the claim: KCP's ARQ on a 100 ms path is what adds the
+    seconds, and the wedge is one handshake whose retransmission timer grew past
+    the probe's 5 s cap. The lever the product already has for exactly this is
+    the carrier switch it fires when a claim's traffic keeps being refused —
+    but in this run the switch fired *after* the ladder had already started
+    (10:53:35, with the first 1 022 ms ping at 10:53:32), and it was asked for
+    by claim 2402, the bulk claim, while the wedging stream rides 2401. **A
+    switch keyed to the interactive claim's own round trips, rather than to a
+    bulk claim's refusals, is the change the measurements now point at.** That
+    is a design change and it needs the human's decision before it is built —
+    the AGENTS.md §9 timebox has been exceeded many times over on this thread,
+    so it is recorded here rather than pursued further unattended.
+  - Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a
     timeline that contains a delay stage — the first attempt at this experiment
     therefore measured clean paths and proved nothing; and a shortened timeline
     does not reproduce the phenomenon reliably, so a scaled run can *disprove*
     but should not be used to *measure* the effect.
-  - **This needs a decision before the tag**, and it is the human's: investigate
-    the mechanism, ship it documented with a recorded waiver, or move L3 out of
-    the release sweep into its own artifact (option B from the plotting
-    discussion). The sweep, its charts and the README currently carry the L3 row.
+  - **The mechanism is now known, and what is left is a decision, not a
+    question (2026-10-15).** The wedge is the L3 carrier's ARQ on a 100 ms path:
+    a retransmission round costs 2× the RTO, the RTO ladder grows ×1.5 per
+    retransmit from a 100 ms floor, and one interactive handshake that climbs
+    that ladder past 5 s is a wedge. It is `rtt100`-only because that is the
+    only stage whose delay is large enough for the ladder to reach the probe's
+    cap inside a 120 s hold. **The options, for the human to choose between:**
+    1. key the carrier switch to the *interactive* stream's own round trips
+       rather than to a bulk claim's refusals, so the stream that is wedging is
+       the stream that triggers the switch — the change the measurements point
+       at, and a design change;
+    2. ship v0.11.0 with the L3 wedge recorded, waived and documented (the SLO
+       is a chart line, and `slo_broken` already travels with the numbers), on
+       the grounds that the affected case is one stage of a sweep whose purpose
+       is to show how the tool degrades;
+    3. move L3 out of the release sweep into its own artifact (option B from the
+       plotting discussion), so the published comparison is between the tools
+       that have the same shape and the L3 result stands beside it rather than
+       inside it.
+    The sweep, its charts and the README currently carry the L3 row, so options
+    2 and 3 both need the docs and the chart set updated with the decision.
 - **The v0.11.0 pre-release checks that are not in the chain, all green**: the
   interop matrix (`just interop`, 3 cases — both directions refuse the other's
   dialect and keep serving a peer of their own version, against the released
