@@ -566,6 +566,42 @@
     in the benchmarks page, and the obvious lever for it (GRO/TSO offloads on
     the TUN, so the receiving stack can coalesce) is a feature and not part of
     this release.
+  - **A second harness defect, found by the re-run and fixed the same way
+    (2026-10-15).** The sweep that followed the shaper fix read `wedge_count 2`
+    on **L4** — an arm that had read 0 in the previous sweep. Both were located
+    in the raw series and neither is a silence:
+
+    ```
+    gap 5.50s  stage=loss5  prev_rtt=401.8  next=rtt_ms 5498.0
+    gap 5.12s  stage=loss5  prev_rtt=1060.4 next=rtt_ms 5119.8
+    ```
+
+    Two **successful** answers of 5.5 s and 5.1 s, in the 5 %-loss stage. Two
+    defects stacked to produce that reading. The metric measured **gaps between
+    samples**, and the interactive probe is serial — so the gap is the *next
+    attempt's own duration*, never a silence of the tool's; and the threshold
+    was 5.0 s, exactly the probe's `ATTEMPT_TIMEOUT_S`, so a single unanswered
+    attempt was a "silence" by construction. Underneath both, the budget was not
+    a budget: set as a per-socket-operation timeout it let one attempt spend it
+    three times (connect, send, receive) and still report success, which is how
+    a 5.5-second *successful* ping exists at all.
+  - **The fix, and the shape of it.** `ATTEMPT_TIMEOUT_S` now bounds the whole
+    attempt (verified: a socket that accepts and never answers ends the attempt
+    at 5.01 s); the probe emits each attempt's `started_at`; `wedges()` counts a
+    silence as a **run of consecutive unanswered attempts**, measured from the
+    first one's start to the last one's end; and the threshold is stated as
+    **two attempt budgets**, because one budget is the probe's patience rather
+    than the tool's silence. `max_s` is now the longest silence rather than the
+    longest gap — a run with no failed attempt reads 0.0, and the slowest answer
+    is `rtt_max_ms`'s to report. Four selfcheck cases pin it: the ordering of
+    the two constants (the invariant that was violated — both were 5.0 and
+    nothing noticed), that a slow successful answer is not a wedge, that a run
+    of failures is one measured end to end, and that a silence surrounded by
+    answers is still found. **The re-run is the point**: a gate that fails a
+    subject arm on any wedge cannot be allowed to flip on whether a lost SYN
+    costs 3 s or 7 s, and every tool pays that on a 5 %-loss path — the peers'
+    `loss5` p99s are 1.7–2.7 s and `nps` wedged once in the previous sweep,
+    which was reported and not gated only because it is a peer.
   - Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a

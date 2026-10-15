@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them. Numbers published for the shaped stages under the old default measured
   the shaper.
 
+- **The wedge axis measures silence, and it used to measure something else.**
+  `wedge_count` and `wedge_max_s` read gaps between interactive samples, and
+  the probe is serial — so the gap was the *next attempt's own duration* — while
+  the threshold sat at exactly the probe's attempt budget, making a single
+  unanswered attempt a "silence" by construction. A 5 %-loss stage therefore
+  reported two 5.1–5.5 s **successful** answers as a tool "going silent". A
+  silence is now a run of consecutive unanswered attempts measured end to end,
+  the threshold is two attempt budgets, and `ATTEMPT_TIMEOUT_S` bounds the whole
+  attempt rather than each socket operation. Published `wedge_count` numbers
+  mean something different now; the benchmarks page says what.
+
 ### Added
 
 - **Transparent (L3) clients: the client owns the public `ip:port`.** A
