@@ -428,31 +428,41 @@ def host_calibration(reps: int = CALIBRATION_REPS) -> dict:
     }
 
 
-def git_revision(exclude: Path | None = None) -> tuple:
-    """The commit this run's harness came from, and whether the tree is clean.
+def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple:
+    """The revision this run came from, whether the tree is clean, and what is not.
 
     §10's provenance rule: a number must describe a revision someone can check
-    out. Two facts, deliberately separate:
+    out. Three facts, deliberately separate:
 
-    * `git describe --always --broken` names the commit — without `--dirty`,
-      whose suffix conflates two very different situations;
+    * `git describe --always` names the commit — without `--dirty`, whose suffix
+      conflates two very different situations;
     * the clean/dirty verdict comes from `git status --porcelain` **minus the
       results file this run is writing**. A run always makes its own tracked
       output dirty, so a naive `--dirty` marks every release artifact dirty and
-      the mark stops carrying information. An uncommitted *source* change still
-      shows up, which is the case the rule exists for.
+      the mark stops carrying information;
+    * **the verdict is about the repository, not about this file's directory.**
+      It used to run `git status -- .` from `benches/scripts/bench/`, which
+      cannot see an uncommitted change under `src/` — the case the rule exists
+      for — and it read clean for a release sweep that had uncommitted files
+      (measured 2026-10-15; those two happened to be documentation, so the
+      numbers were sound and the flag was not).
 
-    Returns `(revision, tree_clean)`; `tree_clean` is `None` when git cannot
-    answer (a tarball checkout), which is honest rather than assumed-clean.
+    Returns `(revision, tree_clean, dirty_paths)`; `tree_clean` is `None` when
+    git cannot answer (a tarball checkout), which is honest rather than
+    assumed-clean. The paths travel because a boolean nobody can check is a
+    claim, and the list is evidence.
+
+    `here` is where the source lives, and it is a parameter so the scope rule
+    above can be tested against a throwaway repository rather than argued about
+    (see `bench.py selfcheck`, "the clean verdict covers the repository").
     """
-    here = Path(__file__).parent
+    here = Path(__file__).parent if here is None else Path(here)
     rev = "unknown"
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         r = subprocess.run(
             # No `--broken`: in git 2.47 it appends `-dirty` to the *name*,
-            # which is the conflation this function exists to undo (the
-            # clean/dirty verdict is the second return value, and it excludes
-            # the results file this run is writing).
+            # which is the conflation this function exists to undo (the verdict
+            # is the second return value, and it excludes the run's own output).
             ["git", "describe", "--always"],
             capture_output=True,
             text=True,
@@ -463,49 +473,33 @@ def git_revision(exclude: Path | None = None) -> tuple:
         if r.returncode == 0 and r.stdout.strip():
             rev = r.stdout.strip()
     clean = None
+    dirty: list = []
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        args = ["git", "status", "--porcelain"]
-        # `:(exclude)` pathspec: everything except the run's own output. Two
-        # facts make this subtle, both measured rather than assumed:
-        #
-        # * the pathspec is interpreted from `here`, the cwd of this call, so a
-        #   repo-relative path (or an absolute one) never matches and the run's
-        #   own results file would mark every artifact dirty;
-        # * a path *outside* the repository cannot be excluded at all — git
-        #   exits 128 with "outside repository", which would turn the whole
-        #   verdict into `None` (an honest "cannot answer", but a worse one than
-        #   the truth).
-        #
-        # An output file outside the tree cannot make the tree dirty either, so
-        # the exclusion is simply not needed there and the plain verdict is the
-        # right answer.
-        exclude_in_tree = False
+        root = Path(
+            subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                cwd=here,
+            ).stdout.strip()
+            or here
+        )
+        args = ["git", "status", "--porcelain", "--", "."]
+        # `:(exclude)` pathspec: everything except the run's own output, stated
+        # relative to the repository root the status is run from. A path
+        # *outside* the repository cannot be excluded — git exits 128 with
+        # "outside repository" — and cannot make the tree dirty either, so the
+        # exclusion is simply not needed there.
         if exclude is not None:
-            try:
-                root = subprocess.run(
-                    ["git", "rev-parse", "--show-toplevel"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=10,
-                    cwd=here,
-                ).stdout.strip()
-                resolved = Path(exclude).resolve()
-                if root and resolved.is_relative_to(Path(root)):
-                    exclude_in_tree = True
-                    spec = Path(os.path.relpath(resolved, here.resolve()))
-                    args += ["--", ".", f":(exclude){spec}"]
-            except (OSError, ValueError, subprocess.SubprocessError):
-                exclude_in_tree = False
-        if exclude is not None and not exclude_in_tree:
-            # Keep the `-- .` scope (repo files only): an outside output path
-            # needs no exclusion, and the caller's intent is still "the tree".
-            args += ["--", "."]
+            resolved = Path(exclude).resolve()
+            if resolved.is_relative_to(root):
+                args.append(f":(exclude){os.path.relpath(resolved, root)}")
         r = subprocess.run(
-            args, capture_output=True, text=True, check=False, timeout=20, cwd=here
+            args, capture_output=True, text=True, check=False, timeout=20, cwd=root
         )
         if r.returncode == 0:
-            clean = not r.stdout.strip()
-        if r.returncode == 0:
-            clean = not r.stdout.strip()
-    return rev, clean
+            dirty = [line[3:].strip() for line in r.stdout.splitlines() if line.strip()]
+            clean = not dirty
+    return rev, clean, dirty

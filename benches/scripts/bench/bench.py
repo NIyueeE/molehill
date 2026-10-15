@@ -44,6 +44,7 @@ import shutil  # noqa: E402
 import subprocess  # noqa: E402
 
 import analysis  # noqa: E402
+import hostinfo  # noqa: E402
 import instruments as inst  # noqa: E402
 import model  # noqa: E402
 import runner  # noqa: E402
@@ -1262,6 +1263,67 @@ def _check_wedges(c: Checker) -> None:
     )
 
 
+def _check_provenance(c: Checker) -> None:
+    """The clean verdict covers the repository, not the harness's own folder.
+
+    The defect this pins: the verdict ran `git status -- .` from
+    `benches/scripts/bench/`, so an uncommitted change under `src/` — the case
+    §10's provenance rule exists for — could not be seen, and a release sweep
+    with uncommitted files read `clean: True`. The check builds a throwaway
+    repository shaped like this one (`src/` beside a nested harness directory),
+    dirties `src/`, asks from the nested directory, and also pins the exclusion
+    of a run's own output.
+    """
+    git = shutil.which("git")
+    if not git:
+        return
+
+    def run(args, cwd):
+        return subprocess.run(
+            args, capture_output=True, text=True, cwd=cwd, check=False
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        here = root / "benches" / "scripts" / "bench"
+        (root / "src").mkdir()
+        (here).mkdir(parents=True)
+        (root / "src" / "code.rs").write_text("fn main() {}\n")
+        (here / "harness.py").write_text("# the harness\n")
+        ident = ["-c", "user.email=check@example.invalid", "-c", "user.name=check"]
+        run([git, "init", "-q"], root)
+        run([git, "add", "-A"], root)
+        run([git, *ident, "commit", "-qm", "base"], root)
+        clean_rev, clean, dirty = hostinfo.git_revision(here=here)
+        c.check(
+            "the clean verdict says clean on a clean repository",
+            clean is True and dirty == [],
+            f"clean={clean} dirty={dirty}",
+        )
+        # Dirty `src/`, which is outside the directory the call runs from.
+        (root / "src" / "code.rs").write_text("fn main() { /* dirty */ }\n")
+        _rev, verdict, paths = hostinfo.git_revision(here=here)
+        c.check(
+            "the clean verdict covers the repository, not the harness's folder",
+            verdict is False and paths == ["src/code.rs"],
+            f"verdict={verdict} paths={paths} (want False and ['src/code.rs'])",
+        )
+        # A run's own output must not mark it dirty, and other files still must.
+        out = here / "results.json"
+        out.write_text("{}\n")
+        _rev, verdict, paths = hostinfo.git_revision(exclude=out, here=here)
+        c.check(
+            "the run's own output is excluded and nothing else is",
+            verdict is False and paths == ["src/code.rs"],
+            f"verdict={verdict} paths={paths}",
+        )
+        c.check(
+            "a revision is recorded even on a dirty tree",
+            bool(clean_rev) and clean_rev != "unknown",
+            f"revision {clean_rev!r}",
+        )
+
+
 def _check_socket_query(c: Checker) -> None:
     """The socket filter must be a command `ss` accepts.
 
@@ -1392,6 +1454,7 @@ def cmd_selfcheck(args) -> int:
     _check_fingerprint(c)
     _check_probes(c)
     _check_wedges(c)
+    _check_provenance(c)
     _check_socket_query(c)
     _check_topology(c)
     return c.report()

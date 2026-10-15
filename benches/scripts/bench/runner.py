@@ -781,8 +781,13 @@ def _prepare(args) -> Campaign:
     _log(f"bench: work {work}")
     _log(f"bench: results {out}")
     _log("bench: host probes (the machine's own baseline)...")
+    rev, clean, dirty = hostinfo.git_revision(exclude=out)
     provenance = {
-        "revision": hostinfo.git_revision(exclude=out),
+        # `[revision, tree_clean]`, the shape `githooks/pre-tag` reads, plus the
+        # paths themselves: a boolean nobody can check is a claim, and the list
+        # of what was uncommitted is evidence.
+        "revision": [rev, clean],
+        "dirty_paths": dirty,
         "host": inst.host_provenance(with_calibration=not args.no_host_probes),
         "binaries": _binaries(arms),
         "engine_hash": method["engine_hash"],
