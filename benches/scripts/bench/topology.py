@@ -273,6 +273,10 @@ class Topology:
         run(["ip", *(["-n", ns] if ns else []), *argv])
 
     @staticmethod
+    def _tc(*argv: str, ns: str | None = None) -> None:
+        run(["tc", *(["-n", ns] if ns else []), *argv])
+
+    @staticmethod
     def _ip_check(*argv: str, ns: str | None = None):
         return run(["ip", *(["-n", ns] if ns else []), *argv], check=False)
 
@@ -489,9 +493,29 @@ class Topology:
         return total
 
     def set_txqueuelen(self, length: int) -> None:
-        """Set both TUN devices' queue length — the arm's stated setting."""
+        """Set both TUN devices' queue length — the arm's stated setting.
+
+        The attribute alone is not the queue: a TUN device comes up with the
+        host's default qdisc (`fq` on this host), and `fq` does not derive its
+        `limit` from `txqueuelen`. Measured: `txqueuelen` 60/1000/10000 all
+        left the qdisc at `limit 10000p`, so an arm's stated queue length never
+        reached the queue it was supposed to describe. The qdisc is therefore
+        rebuilt with the same number as its limit, which is what makes the
+        stated length the measured one.
+        """
         for ns, dev in ((SRV_NS, TUN_SRV), (CLI_NS, TUN_CLI)):
             self._ip("link", "set", dev, "txqueuelen", str(length), ns=ns)
+            self._tc(
+                "qdisc",
+                "replace",
+                "dev",
+                dev,
+                "root",
+                "fq",
+                "limit",
+                str(length),
+                ns=ns,
+            )
 
     # --- observation -------------------------------------------------------
     def wait_target(self, host: str, port: int, timeout: float = 30.0) -> bool:

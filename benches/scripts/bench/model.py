@@ -803,7 +803,12 @@ class Arm:
     multiplexer's framing cost from its pool's — the pool is pinned at that
     count, so an arm's width is a method parameter and not a result — and the
     TUN queue length decides whether an L3 arm measures the architecture or the
-    kernel's default queue.
+    kernel's default queue — and it is set as the **qdisc's** limit, not only as
+    the interface attribute. A TUN device comes up on the host's default qdisc
+    (`fq` here), which does not derive its limit from `txqueuelen`: setting the
+    attribute alone left every arm on the host's default (measured 2026-10-15,
+    `txqueuelen` 60/1000/10000 all read back `limit 10000p`), so the arm's
+    stated length never reached the queue it was supposed to describe.
 
     `pool_cap` is the third such setting, and it means one thing per kind: for an
     L4 arm it is the pool's `[client.data].tunnels`; for an L3 arm it is the
@@ -927,7 +932,8 @@ class Arm:
 
 
 #: The deeper TUN queue an arm may ask for: the same architecture with one
-#: operator setting changed (`ip link set <tun> txqueuelen N`).
+#: operator setting changed (`ip link set <tun> txqueuelen N`, plus the qdisc
+#: limit that actually holds the packets — see `topology.set_txqueuelen`).
 DEEP_TXQUEUELEN = 10000
 
 # The topology's addresses live here because an arm's identity is defined by

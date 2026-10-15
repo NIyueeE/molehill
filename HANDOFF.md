@@ -136,6 +136,37 @@
     `enqueued == offered` for every lane, whole run. The internal queue drains
     fine; the standing buffer is the kernel's, and what limits it is the drain
     *rate*, not the depth.
+  - **Third finding: the model's `txqueuelen` axis was inert, and that is fixed
+    (2026-10-15).** A TUN device comes up on the host's default qdisc (`fq` on
+    this host), and `fq` does **not** derive its `limit` from `txqueuelen`:
+    measured on a fresh device, `txqueuelen` 60 / 1000 / 10000 all left the
+    qdisc reading `limit 10000p flow_limit 100p`. So every arm that stated a
+    queue length measured the host's default instead — including the release
+    sweep, which recorded `txqueuelen: 1000` while actually running a
+    10 000-packet queue. `topology.set_txqueuelen` now rebuilds the qdisc with
+    the stated number as its limit, which is what makes the arm's declaration
+    the measured queue. This also means **the earlier queue-depth dose-response
+    in this entry was measuring an artifact** and is withdrawn: those runs
+    varied an attribute that never reached a queue.
+  - **Hypotheses refuted since, each with a real run** (so nobody re-runs them):
+    an explicit `fq_codel` on both TUNs (3 wedges, p99 4480 ms — no better);
+    a *real* 1000-packet queue against 10 000 (1 wedge vs 2, p99 4758 vs
+    3500 ms — no better, if anything worse); the probe's 4 MiB `SO_RCVBUF`
+    (interactive rate 0.59/s vs 0.71/s — unchanged); BDP/bufferbloat (no
+    monotone relation across stages); and the lane budget (recorded above).
+  - **What the refutations leave standing, and it is the sharpest clue yet.**
+    In the real-knob A/B the `limit 10000p` arm wedged **with 0 drops on every
+    interface** and 138 361 TCP retransmits. A stall with *no loss anywhere*
+    cannot be a drop-based mechanism: the packets are being **delayed**, not
+    discarded. Every queue in the path is far too shallow to hold five seconds
+    of traffic (TUN 10 000 packets ≈ 14 MB ≈ 94 ms at 1.19 Gbit/s; the claim's
+    own lane queue ≈ 2 MiB ≈ 13 ms; netem ≈ 1 000 packets ≈ 9 ms), so the
+    remaining candidate is a **stall in the product's own task/pacing path** —
+    something that stops draining a queue for seconds and then resumes. The next
+    step is in-process instrumentation (timing around the lane write and the
+    pacer's parked queue), not another black-box knob: six black-box hypotheses
+    have now been refuted, and the AGENTS.md §9 timebox says to record and ask
+    rather than keep guessing.
     Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a
