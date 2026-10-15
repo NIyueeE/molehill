@@ -62,6 +62,66 @@
   - The two runs agree inside the host's own spread, which is the reading the
     README publishes: molehill's clean bulk 9.209 → 8.495, frp 6.106 → 6.040,
     rathole 28.986 → 25.026, nps 0.135 → 0.134.
+- **OPEN: the release gate fails on one axis, and the failure is a real finding
+  about L3 (2026-10-14).** Adding `l3` to the sweep was the point — it is the
+  first time the architecture has been measured over the stage schedule — and it
+  immediately produced something: **`l3` wedges 6 times, longest 8.27 s, where
+  `molehill` (L4) wedges 0 times** in the same run.
+  - The gate is deliberate about this, not arbitrary: `SUBJECT_KINDS = ("l4", "l3")`
+    and `_drift` fails on *any* wedge in a subject arm, while a **peer** that
+    wedges is reported and never blocks (`nps` wedged once this run and passed).
+    So the product's own architectures must not go silent; the reference tools may.
+  - **The obvious hypothesis is wrong, and is recorded so nobody re-runs it.**
+    A claim never multiplexes, and the `l3` arm's budget is unwritten, so each of
+    the topology's five claims gets **one** lane — one connection, no
+    head-of-line isolation, where L4 has four tunnels. That predicts more lanes
+    should wedge less. A scaled run (`--scale 0.25`, arms molehill/l3/l3-budget10)
+    gave the opposite: `l3` 1 wedge (5.21 s), `l3-budget10` 4 wedges (8.32 s),
+    `molehill` 0. The lane budget is not the mechanism. That run is short and
+    noisy — `l3` read 6 wedges in the full sweep and 1 in the scaled one — so it
+    rules out the hypothesis without establishing a new one.
+  - What is solid: L4 does not wedge, L3 does, in three independent runs (the
+    full sweep, `--scale 0.5` and `--scale 0.3`). What is not yet known: why.
+  - **Localised: the wedge is one stage, not a property of the run**
+    (2026-10-14). The wedge metric lives on the `run` cell, so nothing said
+    *where* the silences were. They were localised from the run's own artifacts
+    (`round0/arm-l3/series-l3-*.ndjson`): all six fall between t=166 s and
+    t=261 s of a 950 s run — **every one inside `rtt100`** (a clean 100 ms
+    delay, no configured loss), and every other stage is clean. Each wedge is a
+    single `error TimeoutError` line: one attempt past the probe's own 5 s cap,
+    not minutes of silence. In that stage `l3` completes 74 interactive pings
+    where L4 completes 309, with `err%=7.5`, `p99=4992 ms`, `retrans=137355`,
+    and **8528 `tx_dropped` on the server's own TUN (`mhbsrv0`) — a device L4
+    never drops a packet on**.
+  - **Second hypothesis tested and refuted, with a clean discriminator**
+    (2026-10-14). `tx_dropped` on a TUN counts what the kernel handed a reader
+    that was not reading, so the natural reading is *the server's TUN queue
+    overflows and those drops are the wedge*. The model already prices this axis
+    (`Arm.txqueuelen`, 1000 vs `DEEP_TXQUEUELEN` 10000), so `l3` and `l3-deep`
+    ran together over the same rtt100-bearing timeline at two scales. **A deeper
+    queue removes the drops entirely and leaves the wedge untouched — sometimes
+    worse:**
+
+    | scale | arm       | txqueuelen | server-TUN drops | rtt100 p99 | interactive n |
+    |-------|-----------|------------|------------------|------------|---------------|
+    | 0.5   | `l3`      | 1000       | 5205             | 4476 ms    | 44            |
+    | 0.5   | `l3-deep` | 10000      | **0**            | 4948 ms    | 32            |
+    | 0.3   | `l3`      | 1000       | 640              | 3118 ms    | 33            |
+    | 0.3   | `l3-deep` | 10000      | **0**            | 2464 ms    | **19**        |
+
+    So the overflow is collateral damage of whatever stalls the reader, not the
+    cause: a queue drops packets when something upstream stops draining it.
+    Two things about the instrument, learned the hard way and worth keeping:
+    **`--condition` has no effect on a staged run** (every stage sets its own
+    condition from the timeline), so the only way to get a delayed L3 path is a
+    timeline that contains a delay stage — the first attempt at this experiment
+    therefore measured clean paths and proved nothing; and a shortened timeline
+    does not reproduce the phenomenon reliably, so a scaled run can *disprove*
+    but should not be used to *measure* the effect.
+  - **This needs a decision before the tag**, and it is the human's: investigate
+    the mechanism, ship it documented with a recorded waiver, or move L3 out of
+    the release sweep into its own artifact (option B from the plotting
+    discussion). The sweep, its charts and the README currently carry the L3 row.
 - **The v0.11.0 pre-release checks that are not in the chain, all green**: the
   interop matrix (`just interop`, 3 cases — both directions refuse the other's
   dialect and keep serving a peer of their own version, against the released
