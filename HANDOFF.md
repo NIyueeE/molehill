@@ -62,12 +62,23 @@
   the baseline for v0.12. Worth remembering when the next release's gate is
   read.
 
-- **The branch was squashed twice: 187 commits to 13 (2026-10-14), then 36 to
-  29 (2026-10-15, after the wedge cycle).** Each commit is one topic, and each
-  was a state that passed the gate chain when first committed; both times the
-  tree came out byte-identical to the tip it replaced. Backups:
-  `backup/l3-pre-squash-2026-10-14`, `backup/l3-pre-squash2-2026-10-15` and
-  `backup/pre-squash3-2026-10-15`. A squash changes every SHA, which is why the
+- **The branch was squashed three times: 187 commits to 13 (2026-10-14), 36 to
+  29 (2026-10-15, after the wedge cycle), then 39 to 35 (2026-10-16, before the
+  release sweep).** Each commit is one topic, and each was a state that passed
+  the gate chain when first committed; every time the tree came out
+  byte-identical to the tip it replaced (`git diff` against the backup, empty).
+  Backups: `backup/l3-pre-squash-2026-10-14`, `backup/l3-pre-squash2-2026-10-15`,
+  `backup/pre-squash3-2026-10-15` and `backup/pre-squash4-2026-10-16`.
+  - **The third squash is the smallest, and that is the honest shape of the
+    history rather than a failure to compress.** It folded three commits that
+    were one investigation's instruments into one, the shaper's instrument and
+    its queue statement into one, and one docs half-commit into the code commit
+    it belonged to. What it did *not* fold is the eight `docs(handoff)` record
+    entries: they are interleaved with code commits and each edits the same
+    file, so folding them means either reordering (which breaks the later
+    patches and resolves as conflicts) or dropping the chain's diffs — and the
+    records themselves are append-only history by this repository's own rule
+    (HANDOFF-archive.md). Their *content* is in the archive now regardless. A squash changes every SHA, which is why the
   sweep is re-measured rather than carried over: `githooks/pre-tag` checks the
   results file's recorded revision against the commit being tagged, and an
   artifact citing a revision nobody can check out is not provenance.
