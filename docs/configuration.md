@@ -510,21 +510,30 @@ address routed to the server, and a single-IP server — are in
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
-| `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: **four lanes per claim** — a measured knee, and the trade it makes is priced in the note below this table. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget decides how many connections exist and the traffic decides who holds them. A budget below the claim count is refused with the number to write; the ceiling is 1024 lanes per client; a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
+| `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: **two lanes per claim** — a measured knee, and the trade it makes is priced in the note below this table. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget decides how many connections exist and the traffic decides who holds them. A budget below the claim count is refused with the number to write; the ceiling is 1024 lanes per client; a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
 
-**The lane budget's default is four lanes per claim, and that is a trade, not a
-preference.** A claim's data path is serialized per lane — one device reader and
-one injector — so a busy claim's throughput follows its lanes up to the
-per-connection ceiling, and the budget is what decides how many it may hold.
-Four is where that curve flattens (one host, one binary, five claims, eight
-inner flows): **2.351 Gbit/s at one lane, 3.283 at two, 5.191 at four, 5.255 at
-eight**, on a run whose own noise floor was 1.1 %, and two steps below four
-costs 55 %. It is paid for in connections — `lanes x claims` of them, each a
+**The lane budget's default is two lanes per claim, and that is a trade, not
+a preference.** A claim's data path is serialized per lane — one device reader
+and one injector — so a busy claim's throughput follows its lanes, and so does
+the pressure it puts on the reader every claim shares. Both axes are measured
+(one host, one binary, five claims, eight inner flows):
+
+| lanes per claim | bulk alone | with an interactive stream beside it |
+|---|---|---|
+| 1 | 2.351 Gbit/s | 8 streams sustained, 2.35 Gbit/s plateau |
+| **2** | **3.283 (+40 %)** | **8 streams — the ramp's ceiling — 3.32 Gbit/s, p99 2 ms** |
+| 4 | 5.191 (+121 %) | **3 streams**, p99 271 ms from four, 560 ms at five |
+| 8 | 5.255 | — |
+
+Four lanes buys another 58 % of *bulk* throughput and spends the interactive
+stream's headroom doing it, which is why the default is two: the bulk ceiling is
+reachable by writing `tunnels`, and the SLO is not something a default may
+quietly break. It is paid for in connections — `lanes x claims` of them, each a
 socket, **≈2.6 file descriptors and 0.5–0.8 MiB RSS on both ends**, plus a slot
 in the server's `[server.data].max_tunnels_per_client` valve (unlimited by
-default). A claim carrying a *single* flow gains nothing from the extra lanes
+default). A claim carrying a *single* flow gains nothing from any of them
 (1.966 / 1.962 / 2.050 / 2.087 Gbit/s from one lane to eight), so a client that
 serves many claims — or whose claims each carry one connection — should write
 `tunnels` and pay for fewer. **Upgrading:** this default was one lane per claim;

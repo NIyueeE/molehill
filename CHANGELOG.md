@@ -128,20 +128,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast loopback the difference is inside the noise.
   `[transparent.data].lend = false` holds the equal split static.
 
-- **A transparent client holds four lanes per claim by default, not one.** A
+- **A transparent client holds two lanes per claim by default, not one.** A
   claim's data path is serialized per lane — one device reader and one injector —
-  so a busy claim's throughput follows its lanes up to the per-connection
-  ceiling, and the old default left more than half of it unused on a workload
-  this project calls normal. Measured on one host with eight inner flows:
-  2.351 Gbit/s at one lane, 3.283 at two, **5.191 at four**, 5.255 at eight
-  (a run whose own noise floor was 1.1 %); a claim carrying a *single* flow
-  gains nothing from them (1.966 → 2.087 across one to eight). The trade is
-  connections — `lanes x claims`, each a socket, ≈2.6 file descriptors and
-  0.5–0.8 MiB RSS on both ends, plus a slot in the server's
-  `max_tunnels_per_client` valve — so a client that serves many claims, or whose
-  claims each carry one connection, should write `[transparent.data].tunnels`:
-  **`tunnels` equal to the claim count restores the old behaviour**, and the
-  configuration page prices the default in full.
+  so a busy claim's throughput follows its lanes, and so does the pressure it
+  puts on the reader every claim shares. Two is the largest value that keeps
+  both axes, and both were measured (one host, five claims, eight inner flows):
+  bulk alone reads 2.351 Gbit/s at one lane, **3.283 at two** and 5.191 at four;
+  with an interactive stream beside the load — the capacity ramp, and the SLO's
+  50 ms p99 — **two sustains all eight streams at a 2 ms p99 and 3.32 Gbit/s**,
+  while **four sustains three** and reads 271 ms from four streams onward. Four
+  lanes buys another 58 % of bulk throughput and spends the interactive stream's
+  headroom doing it, so four is a configuration to ask for, not one to inherit.
+  The trade is connections — `lanes x claims`, each a socket, ≈2.6 file
+  descriptors and 0.5–0.8 MiB RSS on both ends, plus a slot in the server's
+  `max_tunnels_per_client` valve — and a claim carrying a *single* flow gains
+  nothing from any of them. **`tunnels` equal to the claim count restores the old
+  behaviour**; the configuration page prices both the default and the ceiling.
 
 - **A claim's flow placement is remembered, so a lane change cannot reorder a
   flow.** The hub used to route every packet by `hash % width`, which meant a

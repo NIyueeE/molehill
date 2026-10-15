@@ -130,33 +130,45 @@ pub const MAX_TRANSPARENT_LANES: u16 = 1024;
 /// The lanes a claim gets when the client writes no budget
 /// (`[transparent.data].tunnels`).
 ///
-/// **Four is a measured knee, not a preference.** A claim's data path is
-/// serialized per lane — one device reader and one injector — so a busy claim's
-/// throughput follows its lanes until the per-connection ceiling, and the budget
-/// is what decides how many it may hold. Measured on one host, one binary, five
-/// claims and `bulk-n` (eight inner flows), everything else at its default:
+/// **Two — the largest value that keeps both axes.** A claim's data path is
+/// serialized per lane, so a busy claim's throughput follows its lanes; so does
+/// the pressure it puts on the one device reader every claim of the client
+/// shares, which is what the second table measures. One host, one binary, five
+/// claims, everything else at its default:
+///
+/// Bulk alone (`bulk-n`, eight inner flows):
 ///
 /// | lanes per claim | throughput | CPU per Gbit |
 /// |---|---|---|
-/// | 1 (the old default) | 2.351 Gbit/s | 2.482 s |
-/// | 2 | 3.283 | 3.076 |
-/// | **4** | **5.191** | **2.329** |
-/// | 8 | 5.255 (+1.2 %, inside the run's own 1.1 % floor) | 2.253 |
+/// | 1 | 2.351 Gbit/s | 2.482 s |
+/// | **2** | **3.283 (+40 %)** | 3.076 |
+/// | 4 | 5.191 (+121 %) | 2.329 |
+/// | 8 | 5.255 | 2.253 |
 ///
-/// Two steps past four buys 1.2 %; two below it costs 55 %. A claim carrying a
-/// **single** flow does not move at all (1.966 / 1.962 / 2.050 / 2.087 across
-/// one to eight lanes), which is the other half of the same fact: extra lanes
-/// are worth nothing to flows that cannot spread over them.
+/// With an interactive stream beside the load (the capacity ramp: one fresh
+/// connection per sample, and the SLO's 50 ms p99):
+///
+/// | lanes per claim | streams sustained | plateau | interactive p99 |
+/// |---|---|---|---|
+/// | **2** | **8 — the ramp's ceiling** | **3.32 Gbit/s** | **2 ms** |
+/// | 4 | 3 | one level short of the plateau | 271 ms from four streams |
+/// | 4, lending off | 3 | ditto | ditto |
+///
+/// Four lanes buys another 58 % of *bulk* throughput and spends the interactive
+/// stream's headroom doing it: 5.19 Gbit/s at five bulk streams, with the
+/// probe's p99 at 560 ms and its sample rate halved. Two lanes hold the whole
+/// eight-stream ramp at a 2 ms p99 and still carry 40 % more than one. A
+/// default has to serve both — the bulk ceiling is reachable by writing
+/// `tunnels`, and the SLO is not something a default may quietly break — so it
+/// is two, and the first version of this constant said four on the strength of
+/// the first table alone.
 ///
 /// The cost is linear in the claim count, and the configuration page prices it:
 /// `lanes x claims` connections, each a socket, ~2.6 file descriptors and
-/// 0.5–0.8 MiB RSS on **both** ends, and a slot in the server's
-/// `[server.data].max_tunnels_per_client` valve (unlimited by default). The
-/// default errs toward the architecture's own capacity — one lane per claim left
-/// more than half of it unused on a workload this project calls normal — and a
-/// deployment serving many claims writes the key instead.
+/// 0.5-0.8 MiB RSS on **both** ends, and a slot in the server's
+/// `[server.data].max_tunnels_per_client` valve (unlimited by default).
 #[cfg(feature = "multiplex")]
-pub const DEFAULT_CLAIM_LANES: u16 = 4;
+pub const DEFAULT_CLAIM_LANES: u16 = 2;
 
 // The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this
 // constant are gone with the elastic model): a pool's tunnels are established

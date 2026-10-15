@@ -42,17 +42,16 @@
     exactly one dated section exists, so a tag cut later should carry the date
     it is cut on. That is a human's edit to make in the release commit.
   - **the final sweep is the one running as this is written**, on the commit
-    that changes an L3 claim's default to four lanes (`bfb1ef4`); it replaces
+    that changes an L3 claim's default to two lanes; it replaces
     `benches/records/results-bench-v0.11.0.json`, the `assets/bench-v0.11.0*.png`
     chart set and the README's benchmark tables. The sweeps before it measured
     either the harness's shaper or the previous default, and are not the
     artifact.
   - **the L3 row will jump, and the reason is the default, not the code.** A
-    claim now holds four carrier connections where it held one, which is
-    measured at 2.2× on a multi-flow claim ([`DEFAULT_CLAIM_LANES`] carries the
-    table) and costs `lanes x claims` connections — a breaking change with a
-    one-line upgrade path, both stated in the changelog and the configuration
-    page.
+    claim now holds two carrier connections where it held one, which is measured
+    at +40 % on a multi-flow claim ([`DEFAULT_CLAIM_LANES`] carries both tables)
+    and costs `lanes x claims` connections — a breaking change with a one-line
+    upgrade path, both stated in the changelog and the configuration page.
 
 - **The cycle being released**: transparent (L3) services, wire **v5**, based on
   `main` at `cf01091`. Nothing of it is in `v0.10.0` (verified: the tag's tree
@@ -632,49 +631,52 @@
     selfcheck cases pin it against a throwaway repository, including the one
     that matters: a dirty `src/` seen from the nested directory.
   - **The L3 throughput ceiling, and the default that was measuring it
-    (2026-10-15).** The ceiling is a **serialized per-packet path** — one device
-    reader and one injector per claim — so a claim's throughput follows its
-    *lanes*, and the budget decides how many it may hold. Measured on one host,
-    one binary, five claims, `bulk-n` (eight inner flows), everything else at
-    its default:
+    (2026-10-15/16).** The ceiling is a **serialized per-packet path** — one
+    device reader and one injector per claim — so a claim's throughput follows
+    its *lanes*, and the budget decides how many it may hold. Bulk alone, on one
+    host, one binary, five claims, `bulk-n` (eight inner flows), everything else
+    at its default:
 
     | lanes per claim | throughput | CPU per Gbit | wire/visitor byte |
     |---|---|---|---|
     | 1 (the default until this cycle) | 2.351 Gbit/s | 2.482 s | 1.1401 |
     | 2 | 3.283 | 3.076 | 1.1460 |
-    | **4** | **5.191** | **2.329** | **1.0246** |
-    | 8 | 5.255 (+1.2 %, inside the run's own 1.13 % floor) | 2.253 | 0.9950 |
+    | 4 | 5.191 | 2.329 | 1.0246 |
+    | 8 | 5.255 | 2.253 | 0.9950 |
 
-    Four is the knee — two steps past it buys 1.2 %, two below it costs 55 % —
-    and a claim carrying a **single** flow gains nothing from any of them
-    (1.966 / 1.962 / 2.050 / 2.087 across one to eight, i.e. flat inside the
-    floor). **The product's default was one lane per claim**, which is why the
-    release's L3 row read 2.27 Gbit/s on the staged timeline while four lanes
-    read 5.19 on the same host: the published number was the weakest
-    configuration of the architecture, and the configuration page had even
-    documented that "with the default no claim ever has a lane to spare and
-    nothing is lent".
-  - **So the default changed** (`DEFAULT_CLAIM_LANES = 4`, a BREAKING note in
-    the changelog): an L3 client that writes no `[transparent.data].tunnels` now
-    holds four carrier connections per claim. The cost is priced where an
-    operator meets it — the configuration page carries the table above plus
-    `lanes x claims` connections, ≈2.6 FDs and 0.5–0.8 MiB RSS **on both ends**,
-    and a slot in the server's `max_tunnels_per_client` valve (unlimited by
-    default) — and `tunnels` equal to the claim count is the documented path
-    back to the old shape. **What was *not* done, and why:** an earlier reading
-    of this same ceiling said the lever was TUN offloads (TSO/GRO) and possibly
-    a wire change. That is wrong twice over: the packet-size lever is real but
-    needs a **jumbo path** (the docs' 1400 → 8000 TUN MTU measurement ran with
-    `--link-mtu 9000`, and on a 1500-byte path the server's injection would
-    produce oversized packets for the visitor leg), and TSO on a TUN implies
-    `NETIF_F_HW_CSUM`, so userspace would receive partial checksums and
-    forwarding them needs the checksum/GSO state carried per packet — v6. The
-    lane count is the lever that needs neither.
+    **And that table is the wrong one to choose a default from — which is the
+    correction this cycle had to make twice.** The first version of the constant
+    read it, saw the knee at four, and shipped four. The release's own capacity
+    ramp then priced the other axis: with an interactive stream beside the load,
+    four lanes sustains **three** bulk streams and reads a 271 ms p99 from four
+    streams onward (560 ms at five, with the probe's sample rate halved), while
+    two sustains **all eight** at a 2 ms p99 and 3.32 Gbit/s. The mechanism is
+    the same fact from the other side: the lanes that carry the bulk claim's
+    flows are also pressure on the one reader every claim shares. So the default
+    is **two** — the largest value that keeps both axes — and four is a
+    configuration an operator asks for. A claim carrying a *single* flow gains
+    nothing from any of them (1.966 / 1.962 / 2.050 / 2.087 across one to eight).
+  - **The product's default was one lane per claim**, which is why the release's
+    L3 row read 2.27 Gbit/s on the staged timeline while four lanes read 5.19 on
+    the same host: the published number was the weakest configuration of the
+    architecture, and the configuration page had even documented that "with the
+    default no claim ever has a lane to spare and nothing is lent".
+  - **What was *not* done, and why.** An earlier reading of this same ceiling
+    said the lever was TUN offloads (TSO/GRO) and possibly a wire change. That is
+    wrong twice over: the packet-size lever is real but needs a **jumbo path**
+    (the docs' 1400 → 8000 TUN MTU measurement ran with `--link-mtu 9000`, and on
+    a 1500-byte path the server's injection would produce oversized packets for
+    the visitor leg), and TSO on a TUN implies `NETIF_F_HW_CSUM`, so userspace
+    would receive partial checksums and forwarding them needs the checksum/GSO
+    state carried per packet — v6. The lane count is the lever that needs
+    neither.
   - **Lending is the mechanism this leaves in place, and it is now the open
     one.** `lend` is on by default and moves an *idle* lane to the claim with
     more flows than lanes; with four lanes per claim the measured `bulk-n` is
     the same with lending on and off (5.191 against 5.187), because four lanes
-    already reach the knee. Its value is therefore in the *budget-with-slack*
+    already reach the knee — and on the ramp the two are the same configuration
+    again (three streams either way), which says the *lane count*, not lending,
+    is what the interactive stream pays for. Its value is therefore in the *budget-with-slack*
     regime — which the new default now creates — and **its own measurement is
     still missing**: the 7-second `bulk-n` cell cannot show it (lending needs
     ticks and confirmations to converge, and each `dev` round restarts the
