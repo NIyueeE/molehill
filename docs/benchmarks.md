@@ -762,10 +762,29 @@ collapsed distribution and put eight flows on two members. That is why the hash
 ends with a splitmix64 finalizer, and why the regression test pins the measured
 port set and every stride.
 
-The operator's copy of the packet-size finding, with the recipe, is
-[deployment.md](deployment.md#transparent-services); what is left on the table —
-a device path that can carry more than one packet per syscall — is the next
-lever, and it needs its own arm before it is a claim.
+The operator's copy of the packet-size finding, with its recipe, is
+[deployment.md](deployment.md#transparent-services).
+
+**And the lever on an ordinary path — no jumbo frames and no wire change — is
+the lane budget.** The ceiling is a serialized per-packet path (one device
+reader and one injector per claim), so a claim's throughput follows its *lanes*
+and the budget decides how many it may hold. One host, one binary, five claims,
+eight inner flows: a claim at one lane carries 2.351 Gbit/s, at two 3.283, at
+four 5.191. It is not free — the lanes that spread a busy claim's flows are also
+pressure on the one reader every claim shares, so four lanes spends the
+interactive stream's SLO headroom (three streams sustained on the capacity ramp,
+against two lanes' eight) — which is why the shipping default is two and four is
+a configuration to ask for. What a lane *costs*, and the upgrade path for a
+deployment that wants the old default, are
+[configuration.md](configuration.md#transparent-l3-services)'s to state; this
+page owns the measurement.
+
+One earlier reading at the end of this section is retracted: the "device path
+that can carry more than one packet per syscall" (GSO/TSO on the TUN) is real,
+but a 1500-byte path cannot have it — the TUN may not hand userspace packets
+larger than the path — and enabling TSO implies `NETIF_F_HW_CSUM`, so forwarding
+those packets would need the checksum and GSO state carried per packet, which is
+a wire change. The lane count needs neither.
 
 ### The carrier axis: TCP versus KCP (2026-10-10, this model)
 

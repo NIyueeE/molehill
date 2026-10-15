@@ -112,7 +112,7 @@ must never explain, and who a user page may link to).
 | `release.md` | contributors | release mechanics, versioning, CD test builds, the per-tag benchmark *ritual* and its gate | the measurement method (→ benchmarks) |
 | `structure.md` | contributors | this map — what every file is for, and which page owns which topic (the routing table AGENTS.md §3 points to) | any topic's content |
 | `HANDOFF.md` | contributors | working state: decisions, open threads, the release checklist | anything a user needs, and the closed records (→ HANDOFF-archive.md) |
-| `HANDOFF-archive.md` | contributors | the closed records: incidents, superseded sweeps, measurement records, retracted diagnoses | the current state (→ HANDOFF.md) |
+| `HANDOFF-archive.md` | contributors | the closed records: incidents, superseded sweeps, measurement records, retracted diagnoses, and each cycle's investigation | the current state (→ HANDOFF.md) |
 | `AGENTS.md` | contributors | the rules that bind future changes (§2 lint, §5 release, §10 measurement) | topic content |
 | `CHANGELOG.md` | users | what changed, per release | design rationale |
 | `*.zh.md` | users | Chinese mirrors of the user-facing docs (`README`, `configuration`, `deployment`, `transport`, `benchmarks`) — governance and contributor docs are English-only by decision | — |

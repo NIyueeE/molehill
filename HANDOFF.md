@@ -183,13 +183,12 @@ configuration surface is free to change — and this cycle changes it.
 | L11 | No startup INFO for the switch; the plaintext consequence lives in the docs instead |
 | L12 | `tunnels` is one quantity in both models — **how many carrier connections this client holds for that carrier**: L4 spends them on a pool that carries unbounded per-visitor streams, L3 hands them to claims as lanes |
 | L13 | The data plane's shape is **derived from the service type**, not configured: a forwarding service always multiplexes, a transparent claim never does. `mode` is deleted, and a config that still carries it is refused by name |
-| L14 | A claim's lane count is `max(1, floor(tunnels / claims on that carrier))`, and `tunnels` unset means one lane per claim; a budget below the claim count is refused with the number to write |
+| L14 | A claim's lane count is `max(1, floor(tunnels / claims on that carrier))`, and `tunnels` unset means **`DEFAULT_CLAIM_LANES` per claim** (two — the largest value that keeps both the bulk ceiling and the interactive SLO, measured); a budget below the claim count is refused with the number to write |
 | L15 | A lane **is** a connection, so reclamation moves **idle lanes only** — at most one per tick, never below one per claim: taking a busy lane would drop that claim's packets while its replacement was dialled anyway |
 | L16 | Flow placement is a **per-flow table**, not a hash modulus: assignment happens once, into a *live* slot; established flows never move; entries expire after silence in either direction, so a lane change cannot reorder a flow |
 | L17 | `[server.data].max_tunnels_per_client` counts a client's **carrier connections**: a transparent claim's direct lane registers against it, a per-visitor channel (the no-`multiplex` build's shape) does not |
 | L18 | The mux×1-versus-direct gap is attributed with the model before it is optimised, and each optimisation lands only if it clears that run's own noise floor. No reorder buffer, no mid-stream framing switch, no compact single-stream mode |
 
-#
 ## Open threads for the next cycle
 
 - **A config the product refuses was a config every check accepted
