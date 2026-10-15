@@ -62,11 +62,22 @@
   - The two runs agree inside the host's own spread, which is the reading the
     README publishes: molehill's clean bulk 9.209 → 8.495, frp 6.106 → 6.040,
     rathole 28.986 → 25.026, nps 0.135 → 0.134.
-- **OPEN: the release gate fails on one axis, and the failure is a real finding
-  about L3 (2026-10-14).** Adding `l3` to the sweep was the point — it is the
-  first time the architecture has been measured over the stage schedule — and it
-  immediately produced something: **`l3` wedges 6 times, longest 8.27 s, where
-  `molehill` (L4) wedges 0 times** in the same run.
+- **RESOLVED 2026-10-15: the release gate failed on one axis, and the failure was
+  the harness's shaper rather than the tool.** The sub-bullets below are the
+  investigation as it happened, wrong turns included — they are worth keeping
+  because most of them are hypotheses a reader would otherwise re-run, and
+  because the answer took a dozen of them. **The short version: the shaped
+  leg's netem queue was left on its implicit 1 000-packet default, which caps a
+  100 ms leg at 10 000 packets/s, and the L3 arm's return stream is 37 600
+  packets/s; 73 % of it was dropped at the shaper, invisibly, and the
+  interactive cell was reading that loss. The queue is now stated (10 000
+  packets) and the shaper's own drops are recorded; the same arm on the same
+  timeline reads a 400.8 ms median with zero timeouts where it read 400–3 182 ms
+  with six.** Jump to "The fix is the model's own" below for the measurement.
+  The investigation opened like this (2026-10-14): adding `l3` to the sweep was
+  the point — it is the first time the architecture has been measured over the
+  stage schedule — and it immediately produced something, **`l3` wedging 6
+  times (longest 8.27 s) where `molehill` (L4) wedged 0 times** in the same run.
   - The gate is deliberate about this, not arbitrary: `SUBJECT_KINDS = ("l4", "l3")`
     and `_drift` fails on *any* wedge in a subject arm, while a **peer** that
     wedges is reported and never blocks (`nps` wedged once this run and passed).
@@ -413,34 +424,139 @@
     is a design change and it needs the human's decision before it is built —
     the AGENTS.md §9 timebox has been exceeded many times over on this thread,
     so it is recorded here rather than pursued further unattended.
+  - **The mechanism recorded in the bullet above is refuted, and this is the
+    correction (2026-10-15, second pass).** It said the wedge is the L3
+    carrier's ARQ on a 100 ms path. The carrier never retransmits anything. Run
+    with `MOLEHILL_KCP_STATS=1` on the release timeline (`--profile sweep
+    --arms l3 --scenarios timeline`), the `rtt100` stage that pays p99 4 524 ms
+    with 7.7 % errors and **32.4 % datagram loss** reads, on **both** ends, for
+    every second of the stage:
+
+    | counter | client | server |
+    |---|---|---|
+    | `retransmits` / `resends_rto` / `resends_fast` | 0 / 0 / 0 | 0 / 0 / 0 |
+    | `rto_ms` / `srtt_ms` | 30 / 1 | 30 / 1 |
+    | `wait_rcv` / `advertised_wnd` / `peer_wnd` | 0 / 4096 / 4096 | 0 / 4096 / 4096 |
+    | `reader_queued_bytes` / `spill_bytes` | 0 / 0 | 0 / 0 |
+
+    So the ARQ is idle, its windows are open and its reader is never behind.
+    The RTO-ladder match that produced the claim was arithmetic done on a run
+    whose carrier counters were not recorded at all — it fitted the numbers and
+    was never a measurement of them. **A ladder of numbers is not evidence of a
+    timer; the timer has to be read.**
+  - **The bulk spine is what the wedge needs, and the no-bulk control is now
+    run properly.** `--profile carrier` (new: the `wedge` timeline — clean 30 s,
+    `rtt100` 180 s, clean 30 s — with `streams: 0`) ran three rounds: **540 s of
+    `rtt100` at median 401 ms, p90 401.4 ms, max 401.9 ms, zero errors, zero
+    retransmissions, zero drops.** The earlier "`nobulk` refutes contention"
+    claim does not reproduce, and the artifact it rested on was not a `nobulk`
+    run at all: it forwarded 9.4 M packets with claim 2402 (the bulk port) at
+    240 000 packets/s, and its stages were ~100 s where the `nobulk` profile's
+    are 36 s. Contention is back on the table, and it is the only candidate
+    still standing.
+  - **The product carries everything it is offered, and the packets are lost
+    where no counter in this repository was looking.** Per-second per-claim
+    counters on both ends, for the interactive claim *and* the UDP claim, read
+    `offered == forwarded == injected` with `overflow = 0`, `no_channel = 0`,
+    `disconnected = 0` at every second of the stage; what moves is the *rate*
+    (216 packets/s → 1–20 packets/s). The visitor's kernel stopped sending
+    because it is waiting out a retransmission timer of its own. And the loss is
+    the shaper's: read live, `mhbsrv/v-srv` — the server's egress toward the
+    visitor, the leg the condition is imposed on — **dropped 9 900 packets/s
+    against 34 000 sent (23 %) during `loss1`**, with `tx_dropped` reading 0 on
+    that interface the whole time. **`/proc/net/dev` cannot see a qdisc's
+    drops**: netem drops at enqueue, before the packet reaches the device, so
+    the one place this topology sheds traffic was the one place the model did
+    not read. Every mechanism this cycle blamed — the TUN queue, the reader, the
+    lane budget, the drain, the carrier — was blamed because the real loss was
+    invisible.
+  - **The mechanism, and it is arithmetic.** A qdisc holds `offered rate x
+    delay` packets in flight, so a netem queue of `limit` packets on a leg with
+    `delay` has a packet-rate ceiling of `limit / delay` — and netem's default
+    limit is **1 000 packets**. Read live inside the running namespaces at
+    `rtt100` (both ends shaped, so both ends read):
+
+    | interface | qdisc | sent | dropped | backlog |
+    |---|---|---|---|---|
+    | `mhbsrv/v-srv` (server → visitor) | `netem limit 1000 delay 100ms` | 9 400 pkt/s | **28 180 pkt/s** | **1000p — pinned at the limit** |
+    | `mhbvis/v-vis` (visitor → server) | `netem limit 1000 delay 100ms` | — | 0 | 65–136 GSO skbs |
+
+    So the shaped leg's capacity is 1 000 / 0.1 s = **10 000 packets/s**, the
+    server offers it **37 600 packets/s**, and 75 % is dropped. The interactive
+    probe's replies and the datagram echoes are in that stream, so they are
+    lost, and the visitor pays its own retransmission timer: ~1 000 ms for a
+    fresh connection's initial RTO (the observed 1 005–1 045 ms cluster),
+    ~1 400 ms for a lost SYN (1 000 + the path's 401 ms), and ladders up to the
+    probe's 5 s cap. **And the default is not neutral between the arms**: L3
+    offers ~37 600 return packets/s for 0.83 Gbit/s (one acknowledgement per
+    ~2.8 KB, because the client's TCP stack sees the bulk arrive through its TUN
+    in 1 400-byte units) where L4 offers 6 277/s for 3.38 Gbit/s (the server's
+    TCP stack GRO-aggregates the visitor's 64 KB skbs, one acknowledgement per
+    ~67 KB) — a **24× higher acknowledgement-per-byte ratio**, which is what
+    tips a marginal shaper over. That ratio is a real architectural property of
+    the L3 path and worth its own entry; it is not what the `rtt100` row was
+    measuring.
+  - **The fix is the model's own, applied where it was missing, and it is
+    verified.** The model already knew: `loss1_buf` exists precisely to put
+    "tail drops out of the way without the hundred-megabyte standing queue that
+    inflates RTT" (10 000 packets), `loss1_deep` goes to 100 000, and
+    `docs/benchmarks.md` already said "**a shaped stage's interactive cell is
+    context, not a verdict** — the netem queue the harness installed dominates
+    it". What was missing is that the same implicit default was still on
+    `rtt100`, `loss5`, `jitter` and `loss1_mtu1280`, and that a queue which
+    *dominates* a cell also *drops* from it. Those four now state 10 000
+    packets, `loss1` and `loss1_mtu1280` state the 1 000 they mean, and the
+    model records every stage's qdisc drops and standing backlog. The same
+    release timeline, the same arm, the same binary, one method parameter
+    apart:
+
+    | `rtt100` | before (`limit 1000`) | after (`limit 10000`) |
+    |---|---|---|
+    | shaped leg's sent rate (live `tc`) | 9 400 pkt/s | **30 000 pkt/s** |
+    | shaped leg's drop rate (live `tc`) | **28 180 pkt/s** | 1 790 pkt/s |
+    | queue backlog (live `tc`) | **1000p — pinned at the limit** | 308–1442p |
+    | interactive p99 (recorded) | 4 524 / 7 390 / 4 992 ms | **1 423 ms** |
+    | interactive median / p90 (recorded) | 400.8 ms / up to 3 182 ms | **400.8 ms / 401.1 ms** |
+    | interactive samples | 65–96 per 120 s | **288** (the probe's own rate) |
+    | probe errors | 6–7 (7.7–9.7 %) | **0** |
+    | datagram loss | 32.4–36.5 % | **2.72 %** |
+    | bulk throughput | 0.83–1.19 Gbit/s | **1.42 Gbit/s** |
+    | shaper drops, as recorded | (instrument broken) | **260 828 over the stage** |
+
+    **This is not a number chosen to flatter the tool**: it is the value the
+    model already used for exactly this purpose, the row it changes was
+    measuring the shaper, and the reading is now in the evidence rather than
+    promised. **What is left is a finding, not an artifact**: the L3 arm still
+    sheds ~4 % of its return stream against the peers' 0 % at `rtt100` (and
+    ~8 % against their 1.3–2.6 % at `loss1`), which costs it three or four ~1 s
+    outliers in eighty samples and no timeouts. That residue is the packet-rate
+    amplification below meeting a finite buffer — a property of the
+    architecture on a modelled link — and it is now visible as a number instead
+    of being attributed to the carrier, the TUN queue or the reader. A deeper
+    buffer would absorb it, and choosing one is a method question with its own
+    justification to make; it is deliberately not being tuned until the L3 row
+    matches L4's.
+  - **The L3 packet-rate amplification is a real finding and is *not* what the
+    row was measuring.** L3 offers ~37 600 return packets/s for 0.83 Gbit/s
+    (one acknowledgement per ~2.8 KB, because the client's TCP stack sees the
+    bulk arrive through its TUN in 1 400-byte units) where L4 offers 6 277/s for
+    3.38 Gbit/s (the server's TCP stack GRO-aggregates the visitor's 64 KB skbs
+    into one acknowledgement per ~67 KB) — a **24× higher
+    acknowledgement-per-byte ratio**. That is inherent to carrying whole IP
+    packets to a kernel that then re-segments them, it is worth its own entry
+    in the benchmarks page, and the obvious lever for it (GRO/TSO offloads on
+    the TUN, so the receiving stack can coalesce) is a feature and not part of
+    this release.
   - Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a
     timeline that contains a delay stage — the first attempt at this experiment
     therefore measured clean paths and proved nothing; and a shortened timeline
     does not reproduce the phenomenon reliably, so a scaled run can *disprove*
-    but should not be used to *measure* the effect.
-  - **The mechanism is now known, and what is left is a decision, not a
-    question (2026-10-15).** The wedge is the L3 carrier's ARQ on a 100 ms path:
-    a retransmission round costs 2× the RTO, the RTO ladder grows ×1.5 per
-    retransmit from a 100 ms floor, and one interactive handshake that climbs
-    that ladder past 5 s is a wedge. It is `rtt100`-only because that is the
-    only stage whose delay is large enough for the ladder to reach the probe's
-    cap inside a 120 s hold. **The options, for the human to choose between:**
-    1. key the carrier switch to the *interactive* stream's own round trips
-       rather than to a bulk claim's refusals, so the stream that is wedging is
-       the stream that triggers the switch — the change the measurements point
-       at, and a design change;
-    2. ship v0.11.0 with the L3 wedge recorded, waived and documented (the SLO
-       is a chart line, and `slo_broken` already travels with the numbers), on
-       the grounds that the affected case is one stage of a sweep whose purpose
-       is to show how the tool degrades;
-    3. move L3 out of the release sweep into its own artifact (option B from the
-       plotting discussion), so the published comparison is between the tools
-       that have the same shape and the L3 result stands beside it rather than
-       inside it.
-    The sweep, its charts and the README currently carry the L3 row, so options
-    2 and 3 both need the docs and the chart set updated with the decision.
+    but should not be used to *measure* the effect. A third: **a live `tc -s
+    qdisc show` inside the running namespaces is the fastest way to see this
+    topology's loss**, and it is worth reaching for before another mechanism is
+    proposed.
 - **The v0.11.0 pre-release checks that are not in the chain, all green**: the
   interop matrix (`just interop`, 3 cases — both directions refuse the other's
   dialect and keep serving a peer of their own version, against the released

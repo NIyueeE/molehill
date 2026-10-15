@@ -73,6 +73,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   profile of it. Records measured with the model it replaced stay in
   `benches/records/` as published history.
 
+- **A shaped stage states its queue depth, and the model records what the
+  shaper dropped.** netem's implicit 1 000-packet default is a capacity as much
+  as a depth — a qdisc holds `rate x delay` packets — so at `rtt100` it capped
+  the shaped leg at 10 000 packets/s against a return stream of 37 600 and shed
+  73 % of it, while every device counter in the evidence read zero, because
+  `/proc/net/dev` cannot see a qdisc's drops. The classes that shape a delay
+  now carry 10 000 packets (the value `loss1_buf` already used for "tail drops
+  out of the way"), `loss1` states the 1 000 it means, each stage's qdisc drops
+  and standing backlog travel in its evidence, and `dropped_packets` counts
+  them. Numbers published for the shaped stages under the old default measured
+  the shaper.
+
 ### Added
 
 - **Transparent (L3) clients: the client owns the public `ip:port`.** A
