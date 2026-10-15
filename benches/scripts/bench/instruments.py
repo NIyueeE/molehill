@@ -119,6 +119,7 @@ def snapshot(topo: topology.Topology, pids: dict) -> dict:
         "cpu": cpu_ticks(pids),
         "io": proc_io(pids),
         "dev": topo.dev(),
+        "qdisc": topo.qdisc(),
         "tcp": topo.tcp_mib(),
     }
 
@@ -143,15 +144,30 @@ def delta(before: dict, after: dict) -> dict:
         role: {k: v - before["io"].get(role, {}).get(k, 0) for k, v in counters.items()}
         for role, counters in after["io"].items()
     }
-    drops = {
+    qdisc = {
         key: {
-            "rx_dropped": a["rx_dropped"]
-            - before.get("dev", {}).get(key, {}).get("rx_dropped", 0),
-            "tx_dropped": a["tx_dropped"]
-            - before.get("dev", {}).get(key, {}).get("tx_dropped", 0),
+            "dropped": a["dropped"]
+            - before.get("qdisc", {}).get(key, {}).get("dropped", 0),
+            "backlog_p": a["backlog_p"],
         }
-        for key, a in wire.items()
-        if a["rx_dropped"] or a["tx_dropped"]
+        for key, a in after.get("qdisc", {}).items()
+    }
+    drops = {
+        key: entry
+        for key, entry in (
+            (
+                key,
+                {
+                    "rx_dropped": wire.get(key, {}).get("rx_dropped", 0)
+                    - before.get("dev", {}).get(key, {}).get("rx_dropped", 0),
+                    "tx_dropped": wire.get(key, {}).get("tx_dropped", 0)
+                    - before.get("dev", {}).get(key, {}).get("tx_dropped", 0),
+                    "qdisc_dropped": qdisc.get(key, {}).get("dropped", 0),
+                },
+            )
+            for key in sorted(set(wire) | set(qdisc))
+        )
+        if entry["rx_dropped"] or entry["tx_dropped"] or entry["qdisc_dropped"]
     }
     return {
         "elapsed_s": round(after["t"] - before["t"], 4),
@@ -161,6 +177,7 @@ def delta(before: dict, after: dict) -> dict:
         "syscalls": sum(c["syscr"] + c["syscw"] for c in io.values()),
         "wire": wire,
         "drops": drops,
+        "qdisc": qdisc,
         "tcp": tcp,
     }
 
@@ -289,7 +306,8 @@ def counter_metrics(sample: dict, peaks: dict, device_io: bool = True) -> dict:
     moved = sum(c["rchar"] + c["wchar"] for c in sample.get("io", {}).values())
     retrans = sum(c.get("retrans_segs", 0) for c in sample.get("tcp", {}).values())
     dropped = sum(
-        d["rx_dropped"] + d["tx_dropped"] for d in sample.get("drops", {}).values()
+        d["rx_dropped"] + d["tx_dropped"] + d.get("qdisc_dropped", 0)
+        for d in sample.get("drops", {}).values()
     )
     return {
         "offered_gbps": round(offered * 8 / window / 1e9, 4) if offered else None,

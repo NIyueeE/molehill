@@ -581,7 +581,9 @@ METRIC_SPECS: tuple[dict, ...] = (
         "id": "dropped_packets",
         "unit": "count",
         "direction": "lower",
-        "definition": "packets the topology's interfaces dropped over the window",
+        "definition": (
+            "packets the topology's devices and qdiscs dropped over the window"
+        ),
         "denominator": "one packet",
         "needs": (
             "bulk",
@@ -670,14 +672,45 @@ class Condition:
     udp_limit: int | None = None
 
 
+#: The buffer a shaped leg carries unless its condition says otherwise, in
+#: packets — netem's `limit`, which is what its queue is counted in.
+#:
+#: A qdisc holds `offered rate x delay` packets in flight, so this number is a
+#: *capacity* as much as a depth: at the 100 ms `rtt100` names, 10 000 packets
+#: is 100 000 packets/s. The workloads offer up to ~38 000 packets/s on the
+#: return leg, so the buffer is not the binding constraint and the delay the
+#: condition names is the delay the path has. `loss1_buf` arrived at the same
+#: value from the other direction ("tail drops out of the way without the
+#: hundred-megabyte standing queue that inflates RTT"), and a condition that
+#: means to tail-drop states its own smaller limit instead.
+SHAPED_QUEUE_LIMIT_PACKETS = 10_000
+
+#: The buffer a class carries when tail-dropping is part of what it *means*:
+#: netem's own default, stated rather than inherited, so that "this class drops
+#: when it is full" is a decision on the page instead of a value nobody chose.
+TAIL_DROP_QUEUE_LIMIT_PACKETS = 1_000
+
 CONDITIONS: dict[str, Condition] = {
+    # A shaped leg's buffer is method and every shaped class states it rather
+    # than leaving it to netem's default of 1 000 packets — see
+    # `SHAPED_QUEUE_LIMIT_PACKETS` for what that default cost and why this
+    # value. A class that *means* to tail-drop states the smaller limit it
+    # means (`loss1`).
     "clean": Condition("clean", "a healthy network (the control)"),
-    "rtt100": Condition("rtt100", "a long-haul or satellite link", ("delay", "100ms")),
+    "rtt100": Condition(
+        "rtt100",
+        "a long-haul or satellite link",
+        ("delay", "100ms", "limit", str(SHAPED_QUEUE_LIMIT_PACKETS)),
+    ),
     "loss1": Condition(
-        "loss1", "a lossy wifi or mobile link", ("delay", "10ms", "loss", "1%")
+        "loss1",
+        "a lossy wifi or mobile link",
+        ("delay", "10ms", "loss", "1%", "limit", str(TAIL_DROP_QUEUE_LIMIT_PACKETS)),
     ),
     "loss5": Condition(
-        "loss5", "a badly congested path", ("delay", "100ms", "loss", "5%")
+        "loss5",
+        "a badly congested path",
+        ("delay", "100ms", "loss", "5%", "limit", str(SHAPED_QUEUE_LIMIT_PACKETS)),
     ),
     "rate100": Condition(
         "rate100",
@@ -695,7 +728,9 @@ CONDITIONS: dict[str, Condition] = {
         ("rate", "100mbit", "delay", "20ms", "loss", "1%", "limit", "2000"),
     ),
     "jitter": Condition(
-        "jitter", "a bufferbloated access link", ("delay", "20ms", "10ms")
+        "jitter",
+        "a bufferbloated access link",
+        ("delay", "20ms", "10ms", "limit", str(SHAPED_QUEUE_LIMIT_PACKETS)),
     ),
     "loss1_deep": Condition(
         "loss1_deep",
@@ -731,7 +766,7 @@ CONDITIONS: dict[str, Condition] = {
     "loss1_mtu1280": Condition(
         "loss1_mtu1280",
         "a lossy link that also fragments",
-        ("delay", "10ms", "loss", "1%"),
+        ("delay", "10ms", "loss", "1%", "limit", str(TAIL_DROP_QUEUE_LIMIT_PACKETS)),
         mtu=1280,
     ),
 }

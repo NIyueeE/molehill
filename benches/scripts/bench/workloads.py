@@ -307,6 +307,11 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
             )
         },
         "drops": sample.get("drops"),
+        # The shaper's own reading, kept beside the devices' drops rather than
+        # folded into them: `drops` says *how much* an interface shed, this says
+        # whether the queue it shed from was the binding constraint (a standing
+        # backlog at the limit) or merely passing a burst.
+        "qdisc": sample.get("qdisc"),
         "tcp": sample.get("tcp"),
         "peaks": peaks,
         "sockets": sockets,

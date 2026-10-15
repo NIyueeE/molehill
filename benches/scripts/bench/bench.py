@@ -1217,6 +1217,70 @@ def _check_topology(c: Checker) -> None:
         all(ns.startswith("mhb") for ns in topology.NS_ALL),
         str(topology.NS_ALL),
     )
+    _check_qdisc_parse(c)
+
+
+#: A real `tc -s qdisc show` transcript, with the three shapes the parser has to
+#: tell apart: a `noqueue` device, a shaped one whose queue is pinned at its
+#: limit and dropping, and a TUN on `fq`. Copied from a run, not written by
+#: hand: the first parser read the drop count one token out and answered "no
+#: drops" for a leg dropping 28 000 packets/s, which no hand-written sample
+#: would have caught because the sample would have been written to match it.
+QDISC_SAMPLE = """
+qdisc noqueue 0: dev lo root refcnt 2
+ Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+qdisc netem 8059: dev v-srv root refcnt 21 limit 1000 delay 100ms
+ Sent 43083438 bytes 631739 pkt (dropped 2445474, overlimits 0 requeues 0)
+ backlog 66024b 1000p requeues 0
+qdisc fq 8056: dev mhbsrv0 root refcnt 2 limit 1000p
+ Sent 119476087498 bytes 85445027 pkt (dropped 0, overlimits 0 requeues 0)
+ backlog 0b 0p requeues 0
+"""
+
+#: What [`QDISC_SAMPLE`] must parse to: the shaped device's drop count and the
+#: queue depth it was pinned at. Named, because a bare number in a check is one
+#: nobody can tell from a typo.
+QDISC_SAMPLE_DROPPED = 2_445_474
+QDISC_SAMPLE_BACKLOG_P = 1_000
+
+
+def _check_qdisc_parse(c: Checker) -> None:
+    """The shaper's own counters are read the way `tc` writes them.
+
+    This is the instrument the whole L3 wedge was invisible to, so its shape is
+    pinned: a parser that silently matches nothing reports a clean path, and a
+    clean path is exactly the answer that was wrong.
+    """
+    parsed = topology.parse_qdisc(QDISC_SAMPLE)
+    c.check(
+        "the qdisc parser reads every device it is given",
+        set(parsed) == {"lo", "v-srv", "mhbsrv0"},
+        f"parsed {sorted(parsed)}",
+    )
+    c.check(
+        "the qdisc parser reads a drop count, not the token before it",
+        parsed.get("v-srv", {}).get("dropped") == QDISC_SAMPLE_DROPPED,
+        f"v-srv dropped {parsed.get('v-srv', {}).get('dropped')}",
+    )
+    c.check(
+        "the qdisc parser separates a full queue from an idle one",
+        (
+            parsed.get("v-srv", {}).get("backlog_p"),
+            parsed.get("lo", {}).get("backlog_p"),
+        )
+        == (QDISC_SAMPLE_BACKLOG_P, 0),
+        f"v-srv backlog {parsed.get('v-srv', {}).get('backlog_p')}",
+    )
+    c.check(
+        "every shaped class states its queue depth",
+        all(
+            "limit" in condition.netem
+            for condition in model.CONDITIONS.values()
+            if condition.netem
+        ),
+        "a class left its buffer to netem's default",
+    )
 
 
 def cmd_selfcheck(args) -> int:

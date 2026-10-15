@@ -147,6 +147,41 @@ def _bytes_of(raw: str) -> int:
     return 0
 
 
+def parse_qdisc(text: str) -> dict:
+    """One `tc -s qdisc show` output as `{iface: {"dropped", "backlog_p"}}`.
+
+    Pure, so the shape of `tc`'s output is pinned by a check rather than by
+    hope. It is worth pinning: the first version of this parser read the drop
+    count at a fixed token offset, was one token out, and answered "no drops"
+    for a leg that was dropping 28 000 packets/s — the exact failure it exists
+    to end, reproduced by the code written to end it.
+
+    `dropped` sums an interface's whole qdisc tree (a drop anywhere in it is a
+    drop by that interface's shaping) and `backlog_p` takes the deepest level
+    (that is what is actually waiting).
+    """
+    out: dict = {}
+    iface = ""
+    for line in text.splitlines():
+        fields = line.split()
+        if line.startswith("qdisc "):
+            iface = fields[fields.index("dev") + 1] if "dev" in fields else ""
+            continue
+        if not iface or not fields:
+            continue
+        entry = out.setdefault(iface, {"dropped": 0, "backlog_p": 0})
+        if fields[0] == "Sent" and "(dropped" in fields:
+            # ` Sent <bytes> bytes <packets> pkt (dropped <n>, overlimits ...)`
+            at = fields.index("(dropped") + 1
+            with contextlib.suppress(IndexError, ValueError):
+                entry["dropped"] += int(fields[at].rstrip(",)"))
+        elif fields[0] == "backlog":
+            # ` backlog <bytes>b <packets>p requeues <n>`
+            with contextlib.suppress(IndexError, ValueError):
+                entry["backlog_p"] = max(entry["backlog_p"], int(fields[2].rstrip("p")))
+    return out
+
+
 def run(argv: list, timeout: float = 30.0, check: bool = True):
     """One short host command; raises with its own stderr in the message."""
     r = subprocess.run(
@@ -569,6 +604,32 @@ class Topology:
                     "tx_packets": int(f[9]),
                     "tx_dropped": int(f[11]),
                 }
+        return out
+
+    def qdisc(self) -> dict:
+        """Every namespace's qdisc counters, keyed `ns/iface`.
+
+        The interfaces' own `/proc/net/dev` columns cannot see a **qdisc's**
+        drops: netem drops at enqueue, before the packet reaches the device, so
+        a shaped leg can shed most of what it is offered while every counter the
+        model read stayed at zero (measured 2026-10-15: `mhbsrv/v-srv` dropped
+        9 900 packets/s against 34 000 sent, with `tx_dropped` reading 0 the
+        whole time). Loss that is invisible is loss that gets attributed to
+        whatever else shares the path, which is how an L3 wedge was blamed on
+        the carrier, the TUN queue and the reader in turn. The shaper's own
+        counters are read here and reported beside the devices'.
+
+        `dropped` is the sum over an interface's qdisc tree — a drop anywhere in
+        it is a drop by that interface's shaping, and the tree's shape is not
+        what the model is asking about. `backlog_p` is what is still queued: a
+        standing backlog is a shaper that has become the binding constraint,
+        which is a fact about the *method* and has to be visible as one.
+        """
+        out: dict = {}
+        for ns in NS_ALL:
+            text = self.ns_run(ns, ["tc", "-s", "qdisc", "show"], check=False).stdout
+            for iface, counters in parse_qdisc(text).items():
+                out[f"{ns}/{iface}"] = counters
         return out
 
     def tcp_mib(self) -> dict:

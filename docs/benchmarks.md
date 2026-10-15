@@ -241,7 +241,7 @@ the definitions are what the report and the verdict render.
 | `threads_peak` | count | lower is better | peak thread count summed over the tool's daemons | one process set |
 | `service_sockets_peak` | count | lower is better | peak sockets on the exposed service port in the server's own namespace: the per-visitor state the architecture keeps | one visitor |
 | `retrans_segments` | count | lower is better | TCP segments retransmitted by the visitor and server namespaces | one TCP segment |
-| `dropped_packets` | count | lower is better | packets the topology's interfaces dropped over the window | one packet |
+| `dropped_packets` | count | lower is better | packets the topology's devices and qdiscs dropped over the window | one packet |
 
 
 Two conventions the table cannot state, because they belong to the workload:
@@ -345,7 +345,11 @@ carried" are different findings.
   5-24 % (and the two-leg scope's by up to 48 %) against the 25 % limit the gate
   applies to a per-stage p99. So the gate *reports* a shaped stage's number and
   fails only a blow-up (3× or more), and the README marks those columns as
-  context instead of picking a winner in them.
+  context instead of picking a winner in them. **The queue's depth is stated
+  per class and its drops are recorded**, so "the shaper dominated this cell" is
+  a reading rather than an excuse: a stage whose qdisc dropped what it was
+  offered, or sat at its limit, is measuring the shaper, and its interactive
+  number says nothing about the tool.
 - **A stage that carried no reading says so, with the reason.** `— (reason)` in
   the plot's table, and `bulk_gbps_source` in the results file, distinguish "the
   path carried nothing" from "nobody could measure what it carried". A bare
@@ -387,13 +391,13 @@ same vocabulary without the schedule: one cell, one condition, one number.
 | Stage | What it emulates | Applied to the path | `sweep` hold |
 |---|---|---|---|
 | `clean` | a healthy network (the control) | nothing | 150 s |
-| `rtt100` | a long-haul or satellite link | 100 ms delay | 120 s |
-| `loss1` | a lossy wifi or mobile link | 10 ms delay, 1 % loss | 120 s |
-| `loss5` | a badly congested path | 100 ms delay, 5 % loss | 120 s |
+| `rtt100` | a long-haul or satellite link | 100 ms delay, 10 000-packet queue | 120 s |
+| `loss1` | a lossy wifi or mobile link | 10 ms delay, 1 % loss, 1 000-packet queue (this class means to tail-drop) | 120 s |
+| `loss5` | a badly congested path | 100 ms delay, 5 % loss, 10 000-packet queue | 120 s |
 | `rate100` | a 100 Mbit uplink | 100 Mbit/s, 20 ms delay, 2000-packet queue | 120 s |
 | `rate20` | a 20 Mbit/s uplink | 20 Mbit/s, 40 ms delay, 2000-packet queue | 120 s |
 | `loss1_rate100` | a 100 Mbit uplink that also loses packets — the lossy WAN the carriers are chosen for | 100 Mbit/s, 20 ms delay, 1 % loss | focused cell only |
-| `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms | 120 s |
+| `jitter` | a bufferbloated access link | 20 ms delay ± 10 ms, 10 000-packet queue | 120 s |
 | `loss1_buf` | a lossy path with a large but finite buffer: deep enough that tail drops are not the story, shallow enough not to inflate RTT (10 000 packets ≈ 14.7 MB, ≈ 27 ms of standing queue at 545 Mbit/s) | 10 ms delay, 1 % loss, 10 000-packet queue | focused cell only |
 | `loss1_deep` | the same 1 % loss with a queue deep enough not to tail-drop — it tells a carrier's loss recovery apart from the shaper's own drops | 10 ms delay, 1 % loss, 100 000-packet queue | focused cell only |
 | `udp_throttled` | a path that **polices** UDP instead of refusing it: the carrier riding UDP still establishes, but only carries what the policer admits (10 000 packets/s ≈ 117 Mbit/s of 1472-byte datagrams) while a carrier that does not ride UDP is untouched | `iptables -m limit` accept-then-drop for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
@@ -402,9 +406,24 @@ same vocabulary without the schedule: one cell, one condition, one number.
 
 The schedule, the durations, the sample rates and the SLO are recorded in every
 results file (`meta`), so a chart can always be traced back to the method that
-produced it. So is the shaping applied to each class — including the rate
-stages' queue depth (`rate`/`limit 2000`), which bounds how much traffic the
-shaper may hold and therefore what a burst through it can do.
+produced it. So is the shaping applied to each class — including each class's
+queue depth, which bounds how much traffic the shaper may hold and therefore
+what a burst through it can do.
+
+**A shaped class's queue is stated, and it is not netem's default.** That
+default is 1 000 packets, and it is not neutral: a qdisc holds
+`offered rate x delay` packets in flight, so at `rtt100`'s 100 ms a stream of
+37 600 packets/s needs a 3 760-packet queue, and a 1 000-packet one **drops
+73 % of it**. That is what happened to the transparent-L3 row — the leg shed
+28 180 packets/s against 9 400 sent while every device counter in the evidence
+read zero, because `/proc/net/dev` cannot see a qdisc's drops — and the loss was
+read as a property of the tool for a whole cycle. The classes that shape a delay
+now carry 10 000 packets (100 000 packets/s at 100 ms), the same value
+`loss1_buf` established for "tail drops out of the way without a standing
+queue"; a class that *means* to tail-drop states its own smaller limit, and
+`loss1` does. The reading is checkable rather than promised: each stage's qdisc
+drops and standing backlog travel in its evidence beside the devices'
+counters.
 
 ### The MTU classes
 
