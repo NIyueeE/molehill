@@ -111,6 +111,31 @@
 
     So the overflow is collateral damage of whatever stalls the reader, not the
     cause: a queue drops packets when something upstream stops draining it.
+    **Read alone, that result was misleading — it tested only one direction of
+    the right mechanism.** The finding is **bufferbloat in the kernel's TUN
+    txqueue**, and the discriminator is the *shallow* direction (2026-10-15,
+    `--scale 0.3`):
+
+    | arm         | txqueuelen | clean n | clean p99 | rtt100 n | rtt100 p99 |
+    |-------------|------------|---------|-----------|----------|------------|
+    | `l3base`    | 1000       | 939     | 1.25 ms   | 25       | 4524 ms    |
+    | `l3shallow` | 60         | 336     | 1462 ms   | **86**   | **1435 ms** |
+
+    A shallow queue **cures the wedge** (4524 → 1435 ms, 3.4× as many pings
+    land) but starves the clean path (1.2 M drops). Three points on one axis
+    are now monotone — shallow costs throughput and buys latency, deep costs
+    latency and buys drops, 1000 sits between — which is what makes this a
+    queueing-depth finding rather than three unrelated numbers.
+
+    **The product's own queue is exonerated, and that is measured, not assumed.**
+    `QUEUE = 128` batches × `BATCH_BYTES = 16 KiB` ≈ 2 MiB of standing buffer
+    inside `hub.rs` was the obvious suspect, and it has a counter built for
+    exactly this question (`overflow_packets`, "this end's backpressure, not the
+    path's loss", behind `MOLEHILL_L3_STATS`). A run with the switch on reports
+    **3 060 746 packets offered, 0 overflow, 0 no_channel, 0 disconnected** —
+    `enqueued == offered` for every lane, whole run. The internal queue drains
+    fine; the standing buffer is the kernel's, and what limits it is the drain
+    *rate*, not the depth.
     Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a
