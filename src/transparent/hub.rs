@@ -311,10 +311,20 @@ impl TunHub {
             // up.
             let mut batches: HashMap<(Endpoint, usize), Batch> = HashMap::new();
             loop {
+                let mut read_here = 0u64;
                 let outcome = self
                     .tun
-                    .drain(&mut buf, &mut |packet| self.route(packet, &mut batches))
+                    .drain(&mut buf, &mut |packet| {
+                        read_here += 1;
+                        self.route(packet, &mut batches);
+                    })
                     .await;
+                if read_here > 0 {
+                    self.routes.stats.note_device_read();
+                    self.routes
+                        .stats
+                        .count_device_offered_by(usize::try_from(read_here).unwrap_or(usize::MAX));
+                }
                 // Whatever ended the drain, what was read is written: a batch
                 // never waits for the next packet to arrive.
                 for ((endpoint, slot), batch) in batches.drain() {
@@ -1452,11 +1462,13 @@ where
     // The pump is one `write_all` per batch: the reader already framed every
     // packet, so a batch of N packets costs one syscall and one carrier
     // segment run instead of N of each.
+    let pump_stats = Arc::clone(&stats);
     let pump = tokio::spawn(async move {
         while let Some(batch) = rx.recv().await {
             if writer.write_all(&batch).await.is_err() {
                 break;
             }
+            pump_stats.note_carrier_write();
         }
     });
 
@@ -1555,10 +1567,13 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tick.tick().await;
+            stats.sample_rates();
             tracing::info!(
                 target: "molehill::transparent",
                 "l3-stats: role={role} forwarded={} dropped(not_ipv4={} malformed={} \
-                 unclaimed={} no_channel={}) channel_errors={}",
+                 unclaimed={} no_channel={}) channel_errors={} read_gap_max_ms={} \
+                 read_gap_at_ms={} write_gap_max_ms={} write_gap_at_ms={} \
+                 offered_per_s={} forwarded_per_s={}",
                 stats.forwarded.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dropped_not_ipv4.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed),
@@ -1567,6 +1582,16 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                     .dropped_no_channel
                     .load(std::sync::atomic::Ordering::Relaxed),
                 stats.channel_errors.load(std::sync::atomic::Ordering::Relaxed),
+                stats.max_read_gap_ms.load(std::sync::atomic::Ordering::Relaxed),
+                stats.max_read_gap_at_ms.load(std::sync::atomic::Ordering::Relaxed),
+                stats.max_write_gap_ms.load(std::sync::atomic::Ordering::Relaxed),
+                stats.max_write_gap_at_ms.load(std::sync::atomic::Ordering::Relaxed),
+                stats
+                    .device_offered_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                stats
+                    .forwarded_rate
+                    .load(std::sync::atomic::Ordering::Relaxed),
             );
             // A lane that left a claim which then left the table: the one-lane
             // handover shape, whose evidence lives nowhere else.

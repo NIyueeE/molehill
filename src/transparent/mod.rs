@@ -248,6 +248,71 @@ pub struct Stats {
     pub dropped_no_channel: AtomicU64,
     /// Frames read from the tunnel that failed to parse.
     pub channel_errors: AtomicU64,
+    /// Packets the device handed this end, whatever happened to them next —
+    /// the denominator every rate below is measured against.
+    ///
+    /// Kept apart from `forwarded` because a packet can be read and then
+    /// dropped for a reason of its own (unclaimed, malformed), and a reader
+    /// that is asked "did you keep up" must answer against what it was *given*,
+    /// not against what it accepted.
+    pub device_offered: AtomicU64,
+    /// Wall-clock ms of the last device read that produced packets.
+    pub last_read_ms: AtomicU64,
+    /// The longest gap between two such reads, and when that gap ended.
+    ///
+    /// A reader that stops draining its device for seconds is invisible in the
+    /// per-packet counters: the packets it never read are not dropped by this
+    /// process, they are dropped by the kernel's queue, and a visitor sees a
+    /// stall rather than a loss. This is the number that says whether the stall
+    /// is *here*. The gap is measured between reads that returned data, so an
+    /// idle device does not look like a stall, and the timestamp is kept so a
+    /// stall can be placed against the workload's own clock.
+    pub max_read_gap_ms: AtomicU64,
+    pub max_read_gap_at_ms: AtomicU64,
+    /// The same question for the *write* side: the longest gap between two
+    /// batches the carrier accepted, and when it ended.
+    ///
+    /// The reader being healthy does not mean the lane is draining: a carrier
+    /// that stops accepting bytes leaves the reader's queue full, and the
+    /// overflow is then counted as this end's backpressure rather than as a
+    /// stall. Together the two gaps say which half stopped.
+    pub last_write_ms: AtomicU64,
+    pub max_write_gap_ms: AtomicU64,
+    pub max_write_gap_at_ms: AtomicU64,
+    /// Packets the device offered in the last complete second, and the same for
+    /// what this end forwarded, with the counters they were measured against.
+    ///
+    /// The two gaps above say whether this process *stopped*; they cannot say
+    /// whether it ever *kept up*. A reader that drains 90 % of what is offered
+    /// has no gap at all and still loses a tenth of every flow's packets —
+    /// which is exactly the shape of a loss that no in-process counter reports
+    /// (the packets it never read are the kernel's to drop) and that reaches a
+    /// visitor only as retransmits. A per-second reading is what turns "kept up
+    /// on average" into "kept up except between t=70 s and t=85 s", which is
+    /// the only form in which this question can be answered: the wedge lives in
+    /// a five-second window, and a whole-run average cannot see one.
+    ///
+    /// A whole-run average would also be actively misleading here — a reader
+    /// that keeps up for 95 % of a run and starves for 5 % reads as 95 % on the
+    /// average and as the cause of the wedge on the timeline.
+    pub device_offered_rate: AtomicU64,
+    pub forwarded_rate: AtomicU64,
+    /// The counters as they stood at the previous sample: a rate is a *delta*,
+    /// and a counter divided by its own elapsed time is the run's average
+    /// (which is the number this exists to replace).
+    pub rate_offered_was: AtomicU64,
+    pub rate_forwarded_was: AtomicU64,
+    /// When the rate counters were last sampled, so each second is measured
+    /// rather than assumed: a reporter that drifted would divide by its own
+    /// error.
+    pub rate_at_ms: AtomicU64,
+}
+
+/// Unix milliseconds, for the stall detector's own clock.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl Stats {
@@ -277,6 +342,73 @@ impl Stats {
     /// A frame off the tunnel could not be read.
     pub fn count_channel_error(&self) {
         self.channel_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One device read that produced packets: close the previous gap.
+    pub fn note_device_read(&self) {
+        let now = unix_ms();
+        let prev = self.last_read_ms.swap(now, Ordering::Relaxed);
+        if prev != 0 {
+            let gap = now.saturating_sub(prev);
+            if gap > self.max_read_gap_ms.load(Ordering::Relaxed) {
+                self.max_read_gap_ms.store(gap, Ordering::Relaxed);
+                self.max_read_gap_at_ms.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `packets` the device handed this end, whatever happens to them next.
+    pub fn count_device_offered_by(&self, packets: usize) {
+        self.device_offered
+            .fetch_add(packets as u64, Ordering::Relaxed);
+    }
+
+    /// Sample the two rate counters against the previous sample, so a reader is
+    /// reported at the rate it actually ran at rather than at the rate a
+    /// whole-run average implies.
+    ///
+    /// The delta is taken against the counters as they stood at the *previous*
+    /// sample, and the window against the previous sample's clock: both are
+    /// needed, because dividing a counter by its own elapsed time yields the
+    /// run's average — the very number this replaces — and assuming a one-second
+    /// window makes the rate drift with the reporter.
+    pub fn sample_rates(&self) {
+        let now = unix_ms();
+        let prev = self.rate_at_ms.swap(now, Ordering::Relaxed);
+        let offered = self.device_offered.load(Ordering::Relaxed);
+        let forwarded = self.forwarded.load(Ordering::Relaxed);
+        let was_offered = self.rate_offered_was.swap(offered, Ordering::Relaxed);
+        let was_forwarded = self.rate_forwarded_was.swap(forwarded, Ordering::Relaxed);
+        // The first sample only sets the baseline: there is no previous second
+        // to measure, and publishing a rate from a partial one would be a number
+        // with no window behind it.
+        if prev == 0 {
+            self.device_offered_rate.store(0, Ordering::Relaxed);
+            self.forwarded_rate.store(0, Ordering::Relaxed);
+            return;
+        }
+        let elapsed = now.saturating_sub(prev).max(1);
+        self.device_offered_rate.store(
+            offered.saturating_sub(was_offered) / elapsed,
+            Ordering::Relaxed,
+        );
+        self.forwarded_rate.store(
+            forwarded.saturating_sub(was_forwarded) / elapsed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// One batch the carrier accepted: close the previous write gap.
+    pub fn note_carrier_write(&self) {
+        let now = unix_ms();
+        let prev = self.last_write_ms.swap(now, Ordering::Relaxed);
+        if prev != 0 {
+            let gap = now.saturating_sub(prev);
+            if gap > self.max_write_gap_ms.load(Ordering::Relaxed) {
+                self.max_write_gap_ms.store(gap, Ordering::Relaxed);
+                self.max_write_gap_at_ms.store(now, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Whether the operator asked for the stats line.
@@ -395,5 +527,49 @@ mod tests {
         assert_eq!(table.len(), 1);
         // The address still has exactly one claimant, so ICMP still routes.
         assert_eq!(table.lookup(&info("10.99.0.1", None, 1)), Some(&2));
+    }
+
+    /// The rate is a *delta* against the previous sample, and the first sample
+    /// only sets the baseline. Both are what make it a per-second reading
+    /// instead of the run's average — the difference that lets a five-second
+    /// starvation be seen inside a ten-minute run.
+    #[test]
+    fn a_rate_is_the_delta_since_the_last_sample() {
+        let stats = Stats::default();
+
+        stats.count_device_offered_by(10);
+        stats.sample_rates();
+        // Nothing to measure yet: the first sample is a baseline, not a rate.
+        assert_eq!(stats.device_offered_rate.load(Ordering::Relaxed), 0);
+
+        // A second that offered 40 more packets, of which 30 more were
+        // forwarded.
+        stats.count_device_offered_by(40);
+        stats.count_forwarded_by(30);
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        stats.sample_rates();
+        let offered = stats.device_offered_rate.load(Ordering::Relaxed);
+        let forwarded = stats.forwarded_rate.load(Ordering::Relaxed);
+        // The window is real time, so the rate is a rate only because the
+        // sampler divided by the window it measured. What the test can assert
+        // without a fake clock is that it is *strictly less* than the running
+        // total (50 offered, 40 forwarded) — which is the property a
+        // counter-divided-by-elapsed-time would fail, because that reading grows
+        // with the run instead of with the second.
+        assert!(
+            offered < 50,
+            "a rate of {offered} is the running total, not a delta"
+        );
+        assert!(
+            forwarded < 40,
+            "a rate of {forwarded} is the running total, not a delta"
+        );
+        // And the baseline the next sample divides against has moved on, so the
+        // same total is never reported twice.
+        assert_eq!(
+            stats.rate_offered_was.load(Ordering::Relaxed),
+            50,
+            "the baseline must be the counter as it stands now"
+        );
     }
 }

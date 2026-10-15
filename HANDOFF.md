@@ -167,6 +167,139 @@
     pacer's parked queue), not another black-box knob: six black-box hypotheses
     have now been refuted, and the AGENTS.md §9 timebox says to record and ask
     rather than keep guessing.
+  - **In-process instrumentation, and what it settles (2026-10-15).** The
+    reader now records the longest gap between two device reads that returned
+    data (`read_gap_max_ms` / `read_gap_at_ms` in the `MOLEHILL_L3_STATS` line).
+    A reader that stops draining is invisible in the per-packet counters — the
+    packets it never read are dropped by the kernel, not by this process — so
+    this is the number that says whether the stall is here. **It is not: the
+    server's longest gap over a whole run was 989 ms and the client's 1000 ms,
+    both at a stage transition, while the interactive probe was timing out at
+    5.2 s.** The reader drains; the stall is downstream of it.
+  - **The bulk claim's lane queue overflows ~1 M packets, and that is the real
+    anomaly.** Same run, per claim, server side: `2401` (interactive/churn)
+    offered 40 135 and forwarded 40 135 with **zero** drops; `2402` (bulk)
+    offered 28 166 823 and refused **992 414** on `overflow` — the lane's own
+    queue, the documented "this end's backpressure". The client reports the
+    same number as `peer_refused=992 414` for the same claim, so the two ends
+    agree on it. The storm starts ~9 s before the carrier switch (KCP → TCP,
+    "the carrier in use kept refusing this claim's traffic at the peer"), runs
+    for minutes, and **the wedges fall inside it** (t=72 s and t=82.5 s of a
+    322 s run, against a storm from t≈54 s).
+  - **So the wedge is contention, not the interactive stream's own path.** The
+    interactive claim's counters are clean on both ends, which rules out "the
+    interactive lane is broken"; what it shares with the bulk claim is the TUN
+    device, the carrier, and the CPU. The open question is now narrow and
+    specific: **why the bulk claim's lane queue cannot drain at `rtt100`**, and
+    whether the carrier switch that follows is a cause or a consequence of it.
+    The next step is to instrument the lane's *write* side (the pump's gap
+    between successful carrier writes) the way the read side now is — that
+    splits "the carrier cannot carry it" from "the queue is fed faster than the
+    pump is scheduled".
+  - **Both halves instrumented, and the product is cleared (2026-10-15).** The
+    write side now records the longest gap between two batches the carrier
+    accepted (`write_gap_max_ms` / `write_gap_at_ms`). Over a whole run the
+    server read 789 ms and wrote 789 ms, the client read 959 ms and wrote
+    959 ms — **the same value and the same timestamp on each side**, i.e. both
+    maxima are the same inter-stage idle window, not a stall. Neither half of
+    the product stops: it reads, it writes, and it forwards every packet the
+    interactive claim offers (40 940 offered, 40 940 forwarded, `overflow=0`)
+    while the *bulk* claim refuses 890 094 on its lane queue.
+  - **Therefore the interactive loss is upstream of the product**, at the TUN
+    device the claims share: the bulk claim's backpressure fills that queue and
+    the interactive SYN is dropped there — before this process ever sees it,
+    which is exactly why no product-side counter has ever shown a drop for the
+    interactive claim, and why six product-side hypotheses failed. The sweep's
+    own `tx_dropped=8528` on `mhbsrv0` is that drop site.
+    **This conclusion is wrong. It is corrected in the next bullets and kept
+    here rather than deleted, because the record of what was believed and why is
+    what stops the next reader from re-deriving it from the same evidence.**
+  - **The correction, and it is the round's main result (2026-10-15, later the
+    same day).** A staged timeline re-run with a *per-second* rate instrument
+    added (`offered_per_s` / `forwarded_per_s`, sampled as a delta against the
+    previous sample, because a whole-run average cannot see a five-second
+    window) shows the wedge **reproducing with `tx_dropped = -619` — no drops at
+    all on the server's TUN**:
+
+    | round | stage | rtt100 p99 | visitor retrans | `mhbsrv0` tx_dropped |
+    |-------|-------|-----------|-----------------|----------------------|
+    | 0 | rtt100 | 4487 ms | 114 285 | 0 |
+    | 1 | rtt100 | 5971 ms | 49 295 | **-619** (none) |
+
+    So the wedge is **not** a drop at the shared TUN, and the sweep's 8528 was
+    one run's incidental noise. A wedge with no loss anywhere is the same
+    discriminator the earlier `limit 10000p` arm produced, and it points at the
+    same place: **delay, not discard**.
+  - **What the per-second rate shows instead, and it is the whole story.** The
+    server's bulk claim (2402) offers **211 297 packets/s** steadily, then at
+    08:33:28 collapses to 107 239/s, then to **0/s for five seconds**
+    (08:33:29–08:33:33), then climbs back. The first `overflow` lands at
+    08:33:38 — **ten seconds after the collapse begins** — and the interactive
+    probe's two timeouts are at **08:34:01 and 08:34:10**, 23 s and 32 s after
+    it. The order is measured, not inferred: **the device goes quiet first, the
+    lane queue overflows second, the wedge third.** The interactive claim is
+    clean on both ends for the whole run (server 58 131 offered / 58 131
+    forwarded / `overflow=0`; client 39 162 / 39 162 / `0`), and the product's
+    device-level counters are `not_ipv4=1, malformed=0, unclaimed=0,
+    channel_errors=0`.
+  - **So the question is why the device goes quiet for five seconds, and the
+    answer is on the *client*, not the server.** The visitor→client direction is
+    intact: the visitor sent 4 041 780 TCP segments and the client received
+    4 053 100. What collapses is the **return** direction — the visitor received
+    338 202 of them, with 49 295 retransmitted. The client's own counters at
+    `rtt100` show the same shape as the server's: `in_segs` falls from
+    9 868 801 (clean) to 4 053 100 and `out_segs` from 4 592 446 to 1 583 768.
+    Both ends collapse at once, which is one stall in the middle of the path,
+    not two independent ones.
+  - **The mechanism is now narrow enough to name.** At `rtt100` the L3 arm
+    carries 1.19 Gbit/s with **2.45 CPU cores while the L4 arm carries 3.38
+    Gbit/s with 4.01** — 2.06 cores/Gbit against 1.19, i.e. **1.7× the CPU per
+    bit** — and 326 069 syscalls/s at 929 bytes per syscall. The bulk claim
+    alone offers 211 297 packets/s, and the whole L3 path is *four syscalls per
+    packet* (TUN read, socket write, socket read, TUN write). One reader task
+    per device means every claim's packets are parsed, framed, hashed and queued
+    by the same task, and when the carrier at 100 ms RTT cannot accept the bulk
+    claim's bytes fast enough, that task spends its time on the bulk claim and
+    the device is not drained — which is the five seconds of silence, seen from
+    the kernel as a queue nobody is reading. The wedge is a **scheduling
+    starvation of one shared reader task under a load it cannot drain**, not a
+    kernel drop, which is why six black-box knobs (queue depth, qdisc, probe
+    buffers, BDP, lane budget) all failed: none of them changes how much work
+    the reader has to do per packet.
+  - **The chain, corrected end to end**: `rtt100` is the only stage that is both
+    unshaped and lossless, so it is the only one where the offered load is
+    allowed to exceed what the L3 carrier drains → the bulk claim's lane queue
+    refuses (~1 M packets, counted on both ends) → **the reader task is occupied
+    serving it and stops draining the device for seconds** → the interactive
+    claim's packets are not read → the visitor's TCP retransmits (measured:
+    49 295 of 4 041 780 segments in one stage) → one handshake passes the
+    probe's 5 s cap → a wedge. No packet is dropped anywhere in the product;
+    they are late.
+  - **Therefore the queue-depth work could not fix it, and the reason is
+    precise**: a deeper TUN queue only *delays* the packets that were not read
+    (the bufferbloat reading this entry first proposed and then withdrew); a
+    shallower one drops them sooner. Neither reduces the reader's per-packet
+    work, which is what the five seconds of silence is made of. **A fix has to
+    reduce the work one claim can force the shared reader to do, or let a reader
+    be scheduled per claim** — not another knob. The candidates that follow from
+    this, in the order they should be tried:
+    1. **Bound the reader's per-claim duty inside one drain.** The reader
+       currently serves a claim until the device is dry, so one bulk flow can
+       hold it indefinitely. Capping the packets one claim may take per drain
+       (round-robin between claims) costs nothing when the load is light and
+       gives the interactive claim its packets within one drain's window. This
+       is the smallest change that targets the measured mechanism, and it is the
+       one to measure first.
+    2. **One reader task per claim** (`IFF_MULTI_QUEUE`, which needs the
+       operator's device to be created with `multi_queue` — verified on this
+       kernel: a device created without it refuses a second attach with
+       `EINVAL`, and `tun_flags` bit `0x100` says which kind it is). That would
+       let the kernel schedule the readers independently, but it moves the
+       fairness question into the kernel's flow hash and is not something this
+       repository can test without changing every operator's setup.
+    3. **Cheaper per-packet work** — the four-syscall-per-packet path is what
+       the 1.7× CPU/bit is made of, and the earlier `perf` finding already named
+       packet size as the lever (84 % of the CPU in the kernel).
     Two things about the instrument, learned the hard way and worth keeping:
     **`--condition` has no effect on a staged run** (every stage sets its own
     condition from the timeline), so the only way to get a delayed L3 path is a
