@@ -128,6 +128,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast loopback the difference is inside the noise.
   `[transparent.data].lend = false` holds the equal split static.
 
+- **A transparent client holds four lanes per claim by default, not one.** A
+  claim's data path is serialized per lane — one device reader and one injector —
+  so a busy claim's throughput follows its lanes up to the per-connection
+  ceiling, and the old default left more than half of it unused on a workload
+  this project calls normal. Measured on one host with eight inner flows:
+  2.351 Gbit/s at one lane, 3.283 at two, **5.191 at four**, 5.255 at eight
+  (a run whose own noise floor was 1.1 %); a claim carrying a *single* flow
+  gains nothing from them (1.966 → 2.087 across one to eight). The trade is
+  connections — `lanes x claims`, each a socket, ≈2.6 file descriptors and
+  0.5–0.8 MiB RSS on both ends, plus a slot in the server's
+  `max_tunnels_per_client` valve — so a client that serves many claims, or whose
+  claims each carry one connection, should write `[transparent.data].tunnels`:
+  **`tunnels` equal to the claim count restores the old behaviour**, and the
+  configuration page prices the default in full.
+
 - **A claim's flow placement is remembered, so a lane change cannot reorder a
   flow.** The hub used to route every packet by `hash % width`, which meant a
   lane *joining* re-placed every established flow.

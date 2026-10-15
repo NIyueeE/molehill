@@ -127,6 +127,37 @@ pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 #[cfg(feature = "multiplex")]
 pub const MAX_TRANSPARENT_LANES: u16 = 1024;
 
+/// The lanes a claim gets when the client writes no budget
+/// (`[transparent.data].tunnels`).
+///
+/// **Four is a measured knee, not a preference.** A claim's data path is
+/// serialized per lane — one device reader and one injector — so a busy claim's
+/// throughput follows its lanes until the per-connection ceiling, and the budget
+/// is what decides how many it may hold. Measured on one host, one binary, five
+/// claims and `bulk-n` (eight inner flows), everything else at its default:
+///
+/// | lanes per claim | throughput | CPU per Gbit |
+/// |---|---|---|
+/// | 1 (the old default) | 2.351 Gbit/s | 2.482 s |
+/// | 2 | 3.283 | 3.076 |
+/// | **4** | **5.191** | **2.329** |
+/// | 8 | 5.255 (+1.2 %, inside the run's own 1.1 % floor) | 2.253 |
+///
+/// Two steps past four buys 1.2 %; two below it costs 55 %. A claim carrying a
+/// **single** flow does not move at all (1.966 / 1.962 / 2.050 / 2.087 across
+/// one to eight lanes), which is the other half of the same fact: extra lanes
+/// are worth nothing to flows that cannot spread over them.
+///
+/// The cost is linear in the claim count, and the configuration page prices it:
+/// `lanes x claims` connections, each a socket, ~2.6 file descriptors and
+/// 0.5–0.8 MiB RSS on **both** ends, and a slot in the server's
+/// `[server.data].max_tunnels_per_client` valve (unlimited by default). The
+/// default errs toward the architecture's own capacity — one lane per claim left
+/// more than half of it unused on a workload this project calls normal — and a
+/// deployment serving many claims writes the key instead.
+#[cfg(feature = "multiplex")]
+pub const DEFAULT_CLAIM_LANES: u16 = 4;
+
 // The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this
 // constant are gone with the elastic model): a pool's tunnels are established
 // at service start and kept, so that the capacity a deployment offers does not

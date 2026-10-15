@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
 
+#[cfg(feature = "multiplex")]
+use crate::common::constants::DEFAULT_CLAIM_LANES;
 use crate::config::parsing::{
     ClientConfig, ClientControlConfig, ClientServiceConfig, ClientServiceTransportConfig,
     MaskedString, NoiseConfig, ServiceType, TransportConfig, TransportType, default_tun_name,
@@ -107,8 +109,10 @@ pub struct TransparentDataConfig {
     /// to every claim that does not name its own `remote_addr`.
     pub default_data_addr: Option<String>,
     /// The **lane budget**: how many carrier connections this client's claims
-    /// hold together, divided equally among them. Unset means one lane per
-    /// claim; a value below the claim count is refused.
+    /// hold together, divided equally among them. Unset means
+    /// [`DEFAULT_CLAIM_LANES`] per claim (four, the measured knee of the
+    /// throughput curve — see that constant for the numbers and the cost); a
+    /// value below the claim count is refused.
     ///
     /// The same key a forwarding client writes, because a lane is the same
     /// physical thing a pool's tunnel is — one carrier connection — and the
@@ -196,16 +200,19 @@ impl TransparentClientConfig {
         .written()
     }
 
-    /// The lane budget: what the operator wrote, else one lane per claim.
+    /// The lane budget: what the operator wrote, else
+    /// [`DEFAULT_CLAIM_LANES`] per claim.
     ///
-    /// The default is the shape a claim had before the budget existed — one
-    /// carrier connection each — so a client that never writes `tunnels` gets
-    /// exactly that, and raising the key is what spreads a busy claim's inner
-    /// flows over more connections.
+    /// The key is what spreads a busy claim's inner flows over more
+    /// connections, and the default is the measured knee of that curve rather
+    /// than the smallest value that starts ([`DEFAULT_CLAIM_LANES`] carries the
+    /// numbers and the cost). A client that serves many claims and would rather
+    /// not pay for lanes it cannot use writes `tunnels` and gets exactly the
+    /// split it asks for.
     pub(crate) fn lane_budget(&self) -> usize {
         match self.written_budget() {
             Some(written) => written,
-            None => self.claims().max(1),
+            None => self.claims().max(1) * usize::from(DEFAULT_CLAIM_LANES),
         }
     }
 
@@ -338,6 +345,8 @@ mod tests {
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
+    #[cfg(feature = "multiplex")]
+    use crate::common::constants::DEFAULT_CLAIM_LANES;
     use crate::config::parsing::Config;
     #[cfg(all(feature = "transparent", target_os = "linux"))]
     use crate::config::parsing::{ServiceType, TransportType};
@@ -391,8 +400,8 @@ token = "claim-token"
         assert_eq!(service.transparent_tun, "l3test0");
         assert_eq!(&**service.token.as_ref().unwrap(), "claim-token");
         assert_eq!(
-            service.transparent_lanes, 1,
-            "a claim has one lane unless the lane budget is raised"
+            service.transparent_lanes, DEFAULT_CLAIM_LANES,
+            "a claim starts at the default lane count unless the budget is raised"
         );
         assert!(
             service.transparent_lend,
@@ -496,8 +505,19 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
         assert_eq!(
             lanes("", web).0,
-            1,
-            "one connection per claim is the default: the budget is the claim count"
+            DEFAULT_CLAIM_LANES,
+            "an unwritten budget is the default per claim: the budget is claims x that"
+        );
+        assert_eq!(
+            lanes("", &two).0,
+            DEFAULT_CLAIM_LANES,
+            "and an unwritten budget does not divide a client's spare lanes onto it: every \
+             claim starts with the same share, whatever its siblings are doing"
+        );
+        assert_eq!(
+            lanes("", &two).1,
+            Some(DEFAULT_CLAIM_LANES),
+            "the default share is per claim, not a pool divided among them"
         );
         assert_eq!(
             lanes("tunnels = 4", &two).0,

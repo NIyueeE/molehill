@@ -114,7 +114,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   `just bench-selfcheck`. Records below name the arms the catalog had when each
   run was made: where one says `l3-mux` (one stream of a pool), `l3-mux4` (four
   streams) or `l3-raw4` (four connections), today's catalog has `l3` (the
-  product's default one lane per claim) and `l3-budget10` (a carrier budget the
+  product's default lane count) and `l3-budget10` (a carrier budget the
   claims share — the L3 topology carries five claims, so ten lanes start at two
   each and the allocator concentrates the spare ones on whichever claim is
   carrying flows), and `l4-mux1` is gone because

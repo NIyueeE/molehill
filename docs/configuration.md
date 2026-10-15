@@ -510,9 +510,26 @@ address routed to the server, and a single-IP server — are in
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
-| `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together on that carrier, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: one lane per claim — the shape a claim has always had — and a budget below the claim count is refused with the number to write. At most 1024. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget is what decides how many connections exist and the traffic decides who holds them. Three consequences of the division being an equal share and of lending: with the **default** (no `tunnels` written, so one lane per claim) no claim ever has a lane to spare and nothing is lent — the budget is what gives the mechanism room, so an operator who wants it writes at least two lanes per claim; a budget below the claim count is refused (each claim keeps at least one); and a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
+| `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: **four lanes per claim** — a measured knee, and the trade it makes is priced in the note below this table. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget decides how many connections exist and the traffic decides who holds them. A budget below the claim count is refused with the number to write; the ceiling is 1024 lanes per client; a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
+
+**The lane budget's default is four lanes per claim, and that is a trade, not a
+preference.** A claim's data path is serialized per lane — one device reader and
+one injector — so a busy claim's throughput follows its lanes up to the
+per-connection ceiling, and the budget is what decides how many it may hold.
+Four is where that curve flattens (one host, one binary, five claims, eight
+inner flows): **2.351 Gbit/s at one lane, 3.283 at two, 5.191 at four, 5.255 at
+eight**, on a run whose own noise floor was 1.1 %, and two steps below four
+costs 55 %. It is paid for in connections — `lanes x claims` of them, each a
+socket, **≈2.6 file descriptors and 0.5–0.8 MiB RSS on both ends**, plus a slot
+in the server's `[server.data].max_tunnels_per_client` valve (unlimited by
+default). A claim carrying a *single* flow gains nothing from the extra lanes
+(1.966 / 1.962 / 2.050 / 2.087 Gbit/s from one lane to eight), so a client that
+serves many claims — or whose claims each carry one connection — should write
+`tunnels` and pay for fewer. **Upgrading:** this default was one lane per claim;
+writing `tunnels` equal to the claim count is how a deployment that wants that
+behaviour back keeps it.
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
 `retry_interval`, `tunnels`. `[transparent.transport]` decides how the two

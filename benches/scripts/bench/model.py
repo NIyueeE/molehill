@@ -859,12 +859,12 @@ class Arm:
 
     `pool_cap` is the third such setting, and it means one thing per kind: for an
     L4 arm it is the pool's `[client.data].tunnels`; for an L3 arm it is the
-    claim's carrier **lane budget** (`[transparent.data.<carrier>].tunnels`),
-    which is one connection per lane because a claim never multiplexes. `0`
-    leaves the key out of the generated config — the product's default, four
-    tunnels for a forwarding pool and one lane per claim for a claim — so an arm
-    states the width it measured instead of inheriting whatever the default is
-    this week.
+    claim's carrier **lane budget** (`[transparent.data].tunnels`), which is one
+    connection per lane because a claim never multiplexes. `0` leaves the key
+    out of the generated config — the product's own default, four tunnels for a
+    forwarding pool and four lanes per claim for a claim — so an arm states the
+    width it measured instead of inheriting whatever the default is this week,
+    and an arm that wants the pre-0.11 shape writes `pool_cap = <claims>`.
 
     `lend` states whether the L3 client may move a lane between claims, and only
     an L3 arm may say so (a forwarding service has no lanes to move).
