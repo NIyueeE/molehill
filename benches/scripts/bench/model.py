@@ -798,6 +798,17 @@ TIMELINES: dict[str, tuple] = {
     ),
     # One stage: the fixed operating point a cost or screen run measures.
     "single": (("clean", 60.0),),
+    # The L3 wedge's own timeline: the one condition that produces it, held
+    # long enough to catch it, bracketed by the clean stages that show it is
+    # not permanent. A diagnostic, not the sweep: the wedge appears in the
+    # *tail* of an `rtt100` hold (measured 2026-10-15: nothing in the first
+    # 60 s of a stage, a collapse from t≈110 s of a 100 s hold), so a stage
+    # short enough to be convenient is a stage that mostly misses it.
+    "wedge": (
+        ("clean", 30.0),
+        ("rtt100", 180.0),
+        ("clean", 30.0),
+    ),
 }
 
 
@@ -1588,6 +1599,25 @@ PROFILES |= {
         "scenarios": ("timeline",),
         "budget_s": 300.0,
         "params": {"timeline": {"scale": 0.3, "streams": 0}},
+    },
+    # A diagnostic, not a gate: one condition, held long, with the bulk spine
+    # off. It exists to answer one question — whether the L3 wedge is the
+    # carrier's own behaviour at that condition or contention with a bulk claim
+    # sharing it — and the answer is read from the interactive series beside the
+    # product's own KCP and L3 stats lines. `streams: 0` removes the contention;
+    # the `wedge` timeline keeps the delay and gives it time.
+    "carrier": {
+        "what": (
+            "the L3 wedge's own timeline with the bulk spine off: "
+            "is the carrier alone enough?"
+        ),
+        "rounds": 3,
+        "warmup_rounds": 0,
+        "aa": False,
+        "arms": ("l3",),
+        "scenarios": ("timeline",),
+        "budget_s": 240.0,
+        "params": {"timeline": {"scale": 1.0, "streams": 0, "timeline": "wedge"}},
     },
     "sweep": {
         # The product's own two architectures first, then the reference tools.

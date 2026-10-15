@@ -297,6 +297,7 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
 | `sweep` | 1 (+0 warm-up) | ~2400 s | the release sweep: the staged schedule and the load ramp |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
+| `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |
 
 ## How to read the charts
 Six figures, each answering one question, each drawn only when the run carried
