@@ -4,8 +4,10 @@
 > merge and tag.** `feat/transparent-l3` carries the release: the transparent
 > (L3) client, the mandatory-Noise control channel, the bench model as the one
 > measurement standard, and a new default for an L3 claim's lane budget.
-> `version = "0.11.0"` is committed, the CHANGELOG section is written, and the
-> release sweep is the record under `benches/records/`.
+> `version = "0.11.0"` is committed and the CHANGELOG section is written.
+> **The release sweep is owed**: the record under `benches/records/` was measured
+> before the audit's one code change (`2d4cc0f`, a musl compile fix), so it has
+> to be re-measured before the tag — see "The sweep is owed" below.
 >
 > What is left is not code: the human's merge and tag, the repository-settings
 > items, and the open threads below.
@@ -153,6 +155,40 @@
   assertions including the negative policy half). Both were broken by the
   mandatory-Noise change and both were repaired with it; neither would have
   been caught by `just check`.
+
+- **The release audit found a blocker that would have failed the tag, and it is
+  fixed** (`2d4cc0f`). The transparent code did not compile for musl: the TUN
+  attach passed `TUNSETIFF` typed for glibc's `ioctl` signature, and
+  `release.yml` builds `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
+  with `transparent` — the two artifacts the GHCR image is built from — so the
+  tag would have failed at the build step. The CI job whose comment claims it
+  builds "exactly this target and feature set" had drifted to five sixths of it
+  when `transparent` joined `release.yml` alone, so **no musl build had ever
+  compiled the L3 code the release ships**; `just container` had the same gap.
+  The cast is an identity cast on glibc — the release binary's `.text` is
+  byte-identical with and without it — and `githooks/check-docs` now fails any of
+  the three copies of that list that is not `Cargo.toml`'s default set.
+
+- **The L3-versus-L4 throughput gap is the architecture, not a defect, and this
+  release does not change it.** Four TUN syscalls per data packet — the visitor's
+  data read and written, plus its acknowledgement read and written, because the
+  *client's* kernel terminates the connection — put ~4.6 of the daemons' 7.7
+  cores in system time. It is neither a lock nor one saturated stage: over 22
+  threads, run ≈ 600 % against wait ≈ 1 %. Three candidate fixes were built or
+  measured and refused (a serialized reader, the routing-table mutex, and
+  multi-queue TUN readers, which the A/B showed buy nothing and which would have
+  stranded every pre-v0.11.0 binary, since a `multi_queue` device refuses a
+  non-multi-queue attach). The levers are the TUN MTU and the lane budget, both
+  already documented; the record and the one test that could not resolve
+  anything are in the archive.
+
+- **The sweep is owed.** The one running when the audit began was stopped: the
+  L3 question was going to change `src/`, and a record measured before a code
+  change describes code that is no longer here. `src/` is now final (the audit's
+  only code change is `2d4cc0f`), so the release artifact has to be re-measured
+  at `dfe44b9` or later — the committed
+  `results-bench-v0.11.0.json` is the earlier run at `1c2dcd9` and is not the
+  release's.
 
 - **The repository state**: `version = "0.11.0"`, `CHANGELOG.md` carries
   `## [0.11.0] - 2026-10-14` with `[Unreleased]` empty, and no tag names this

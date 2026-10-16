@@ -24,6 +24,70 @@ Moved from [HANDOFF.md](HANDOFF.md) when the cycle's release was prepared: each 
 settled something, and none of them is open work. The rules at the top of this page apply
 to every one (no number here may be quoted as a measurement of the current code).
 
+## Why L3 is slower than L4, and the three fixes measurement refused (2026-10-16, this session)
+
+The question was whether the L3 arm's throughput deficit against L4 is a defect this
+release should fix. It is not a defect: it is the price of carrying **packets** where the
+forwarding path carries **bytes**, and three candidate fixes were built or measured and
+refused. Recorded because the refutations are the expensive part and none of them should
+be re-tried blind.
+
+**What the deficit is made of**, measured on the `screen` profile's L3 arm (`cost`
+scenario, clean, `MOLEHILL_L3_STATS=1`):
+
+- **One TUN syscall per packet per direction.** ~900 k syscalls/s (`syscalls_per_s`
+  822–972 k) at ~850 B/syscall, which is the data packet's read + write plus the
+  reverse-direction acknowledgement's read + write — four per data packet, because the
+  client's kernel (not the server's) terminates the TCP connection, so its ACKs have to
+  cross the tunnel too.
+- **The cost is system time, not compute.** Host split during the bulk phase: molehill
+  ~7.7 cores (3.1 user + **4.6 system**), with the whole host at 14.2 of 20 cores busy.
+  `cpu_s_per_gbit` 3.1 against the forwarding path's 1.57.
+- **It is not a lock, and not one saturated stage.** `schedstat` over the daemons:
+  **run ≈ 600 %, wait ≈ 1 %** across 22 threads — ~6 cores of genuine execution, no
+  runqueue contention. (A tokio *task* migrates between workers, so "no thread at 100 %"
+  alone would not have settled this; the run/wait split does.)
+
+**Three fixes, refused:**
+
+1. **A single serialized reader thread.** The code has one reader task per device doing
+   read + parse + frame + carrier-write inline, and a task can use at most one core, so
+   this looked like the funnel. *Refuted by the run/wait split above*: ~6 cores of real
+   work is not one task's worth, and no stage was saturated.
+2. **The global routing-table mutex.** `Routes::pick` and `Routes::touch` each take
+   `Mutex<EndpointTable<ClaimSlots>>` — twice per packet, with a 5-tuple hash and an
+   `Instant::now()` inside the critical section. *Refuted by the same measurement*:
+   wait ≈ 1 % is not a contended lock.
+3. **Multi-queue TUN readers.** Built and A/B'd (`--ab-arm l3`, one reader vs four,
+   same commit, same device). The kernel side is exactly as needed — verified on this
+   host that a `multi_queue` device hands each **flow** to one queue and keeps it in
+   order (8 flows over 3 queues, every flow wholly on one, in order), so parallel
+   readers cannot reorder a flow. *Refuted by the A/B*: throughput indistinguishable
+   (3.12/2.76/3.11/2.09 against 2.97/3.00/3.05/2.92 Gbit/s) and `cpu_s_per_gbit`
+   marginally **worse** (3.164 → 3.221), `bytes_per_syscall` unchanged. The change was
+   reverted: it buys nothing, and a `multi_queue` device refuses a non-multi-queue
+   attach, so adopting it would have made every pre-v0.11.0 binary unable to serve the
+   device — a hard upgrade hazard for no measured gain.
+
+A fourth test could not resolve anything and is **not** evidence either way: one reader
+vs four at a 4-lane budget on the `capacity` ramp. Its own A/A twin differed by 100 % on
+throughput (`throughput_gbps` floor 100.00 %), the model's own report says ~385 rounds
+would be needed to resolve a level-1 difference, and the single "claim" it printed was a
+`capacity_streams` delta that the same arm's self-comparison also produced. The config
+also needed `pool_cap=20` for 5 claims × 4 lanes, which is not a shape the release
+measures.
+
+**So what moves it** (both already documented, neither a code change): **packet size** —
+1.84× and a third of the CPU per byte at an 8000-byte TUN MTU on a jumbo path
+(`benchmarks.md`, "The L3 data path") — and **the lane budget**, +58 % for four lanes
+against two, paid for out of the interactive stream's SLO headroom.
+
+**What remains unmeasured**, if anyone wants to reopen it: which of the four TUN syscalls
+dominates (no `perf` and `ptrace` is blocked in this container, so `strace -c` could not
+attach — `MOLEHILL_L3_STATS`'s `read_gap_max_ms`/`write_gap_max_ms` and
+`/proc/<pid>/io` are what is available), and whether GSO on the TUN could cut the inject
+half's syscalls without the wire change the docs assume it needs.
+
 ## An L3 claim holds a member set (2026-10-10, this session)
 
 The transparent path's claim used to be one data channel, and one carrier
@@ -686,6 +750,14 @@ exercised by the pool test, not by a live bench run.
 ---
 
 ## Index
+
+### Added 2026-10-16 (the release audit and the L3 throughput question)
+
+- **Why L3 is slower than L4, and the three fixes measurement refused** — the
+  per-packet cost that is the whole deficit (four TUN syscalls per data packet,
+  ~4.6 cores of system time), the three candidate fixes that were built or
+  measured and refused (a serialized reader, the routing-table mutex,
+  multi-queue TUN readers), and the one test that could not resolve anything.
 
 ### Added in the 2026-10-16 move (v0.11.0 preparation)
 
