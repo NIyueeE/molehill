@@ -70,13 +70,17 @@
   the baseline for v0.12. Worth remembering when the next release's gate is
   read.
 
-- **The branch was squashed three times: 187 commits to 13 (2026-10-14), 36 to
+- **The branch was squashed four times: 187 commits to 13 (2026-10-14), 36 to
   29 (2026-10-15, after the wedge cycle), then 39 to 35 (2026-10-16, before the
-  release sweep).** Each commit is one topic, and each was a state that passed
+  release sweep), then 44 to 42 (2026-10-16, before the re-run sweep — the
+  offload cycle grew nine commits; two pairs folded: the musl fix with the
+  deployment doc that stated its consequence, and the offload fix with its own
+  refactor).** Each commit is one topic, and each was a state that passed
   the gate chain when first committed; every time the tree came out
   byte-identical to the tip it replaced (`git diff` against the backup, empty).
   Backups: `backup/l3-pre-squash-2026-10-14`, `backup/l3-pre-squash2-2026-10-15`,
-  `backup/pre-squash3-2026-10-15` and `backup/pre-squash4-2026-10-16`.
+  `backup/pre-squash3-2026-10-15`, `backup/pre-squash4-2026-10-16` and
+  `backup/pre-squash5-2026-10-16`.
   - **The third squash is the smallest, and that is the honest shape of the
     history rather than a failure to compress.** It folded three commits that
     were one investigation's instruments into one, the shaper's instrument and
