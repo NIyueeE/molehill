@@ -710,6 +710,17 @@ bytes on the visitor's leg were tunnel overhead (`wire_per_visitor_byte` 1.0755)
 at 8000 it is 1.5 % (1.0152), because the carrier's own header and
 acknowledgements are paid once per 8000-byte packet instead of once per 1400.
 
+**Postscript (2026-10-16, the offload fix): the two readings above are dated.
+** This section's binary segmented every packet at the TUN boundary; the
+shipped one declares its segmentation offloads and receives GSO super-frames —
+see the retraction-turned-correction below. In the v0.11.0 release sweep the
+staged L3 clean cell read 5.687 Gbit/s against this section's 4.335 (same
+1400-byte TUN MTU, same host), and a single-flow smoke A/B measured the fix at
+2.0 → 3.4 Gbit/s. "Does not scale with flows" and "packet size is the lever"
+both survive — but the packet size inside the device is no longer the
+operator's alone to set, and the serialized per-packet reader is no longer the
+whole of the ceiling.
+
 **What the ceiling then is.** The same topology, with the TUN MTU at 8000 and
 the link MTU at 9000, against the forwarding path with its pool capped — the
 `l4-mux1` arm is one tunnel, so it prices a single carrier connection:
@@ -770,7 +781,9 @@ the lane budget.** The ceiling is a serialized per-packet path (one device
 reader and one injector per claim), so a claim's throughput follows its *lanes*
 and the budget decides how many it may hold. One host, one binary, five claims,
 eight inner flows: a claim at one lane carries 2.351 Gbit/s, at two 3.283, at
-four 5.191. It is not free — the lanes that spread a busy claim's flows are also
+four 5.191. (Pre-v0.11.0 binary — the offload it takes raises the absolute
+values, as the v0.11.0 sweep's L3 clean cell of 5.687 Gbit/s at two lanes
+shows; the lane trade itself is unchanged.) It is not free — the lanes that spread a busy claim's flows are also
 pressure on the one reader every claim shares, so four lanes spends the
 interactive stream's SLO headroom (three streams sustained on the capacity ramp,
 against two lanes' eight) — which is why the shipping default is two and four is

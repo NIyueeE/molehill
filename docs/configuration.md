@@ -530,7 +530,10 @@ the pressure it puts on the reader every claim shares. Both axes are measured
 Four lanes buys another 58 % of *bulk* throughput and spends the interactive
 stream's headroom doing it, which is why the default is two: the bulk ceiling is
 reachable by writing `tunnels`, and the SLO is not something a default may
-quietly break. It is paid for in connections — `lanes x claims` of them, each a
+quietly break. (Measured on the pre-v0.11.0 binary; the segmentation offload
+that release takes raises the bulk column's absolute values, but the *shape* —
+the knee at two, the SLO cost past it — is the trade this table prices, and the
+SLO column is probe-bound rather than throughput-bound, so it does not move.) It is paid for in connections — `lanes x claims` of them, each a
 socket, **≈2.6 file descriptors and 0.5–0.8 MiB RSS on both ends**, plus a slot
 in the server's `[server.data].max_tunnels_per_client` valve (unlimited by
 default). A claim carrying a *single* flow gains nothing from any of them
