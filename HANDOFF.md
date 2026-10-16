@@ -211,17 +211,24 @@
   whole; the UDP control (`gso_probe5.py`, kept out of the repo — it needs a
   UDP_SEGMENT sender and only rules out a UDP-shaped win)).
 
-- **RESOLVED: the release sweep is measured.** The run that mattered landed on
-  2026-10-16 at `26ebb13` (the fourth squash's tip, tree clean, binary
-  `b69cec9e3c43e32a`): 88 samples over the five arms (molehill, l3, frp,
-  rathole, nps), timeline + capacity, 104 minutes. `just bench-gate` PASSES —
-  the endpoint invariant, the clean-stage SLOs, zero wedges on every arm, all
-  arms sustaining the ramp's eight streams (nps five, its own history). The
-  headline shift from the run it replaces (measured at `1c2dcd9`, before the
-  offload fix): L3 clean bulk 2.811 → **5.687 Gbit/s** (+102 %, the offload
-  fix working through a staged run), clean interactive p99 2.3 → **1.6 ms**;
-  L4 essentially unchanged (9.10 → 9.05). The charts and both READMEs carry
-  the new numbers, and the L3-vs-L4 reading on them is
+- **RESOLVED: the release sweep is measured.** The run that matters landed on
+  2026-10-16 at `e4afa24` (the release commit, tree clean, binary
+  `a6169db1841a19cf`): 85 samples over the five arms (molehill, l3, frp,
+  rathole, nps), timeline + capacity, 103 minutes, zero failed samples.
+  `just bench-gate` PASSES — the endpoint invariant, the clean-stage SLOs,
+  zero wedges on every arm, every arm sustaining the ramp to its own ceiling
+  (nps two this run; its path-limited ceiling has read 2/5/8 across runs, its
+  own recorded behavior). Two earlier attempts taught the same lesson from
+  both ends: the first (at `26ebb13`) was green but its tag's release build
+  failed on aarch64-musl — `c_char`'s signedness is a target property the
+  x86_64-only CI musl job never sees, fixed in `e4afa24`; the second re-run
+  lost one cell to a probe timeout while this host was busy with the cross
+  builds for that very fix — a self-inflicted measurement contamination that
+  the gate's coverage rule correctly refused. The headline shift from the
+  pre-offload record (`1c2dcd9`): L3 clean bulk 2.811 → **6.014 Gbit/s**
+  (+114 %, the offload fix through a staged run), clean interactive p99
+  2.3 → **1.3 ms**; L4 essentially unchanged (9.10 → 9.30). The charts and
+  both READMEs carry these numbers, and the L3-vs-L4 reading on them is
   "the two architectures split the workloads" rather than "one trades
   throughput for latency".
 
