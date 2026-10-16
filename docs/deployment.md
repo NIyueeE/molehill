@@ -549,9 +549,10 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 The image carries the full default feature set (`server`, `client`, `noise`,
-`hot-reload`, `multiplex`, `kcp`, `transparent`), so the data plane's KCP sessions
-needs no different image. Pin a release tag (`ghcr.io/niyueee/molehill:v0.9.0`)
-instead of `:latest` when you want reproducible upgrades.
+`hot-reload`, `multiplex`, `kcp`, `transparent`), so neither the data plane's
+KCP sessions nor the transparent (L3) services need a different image. Pin a
+release tag (`ghcr.io/niyueee/molehill:v0.11.0`) instead of `:latest` when you
+want reproducible upgrades.
 
 Two consequences of running as UID 1000:
 

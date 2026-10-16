@@ -142,7 +142,12 @@ fn attach_interface(file: &File, name: &str) -> Result<()> {
             *slot = byte.cast_signed();
         }
         request.ifr_ifru.ifru_flags = IFF_TUN | IFF_NO_PI;
-        libc::ioctl(file.as_raw_fd(), TUNSETIFF, &request)
+        // The cast is to whatever this libc declares for `ioctl`'s request
+        // parameter: `c_ulong` on glibc, `c_int` on musl. It is an identity
+        // cast on glibc, and the constant is the same 32-bit value on both
+        // (it fits `c_int` positively), so the request the kernel sees is
+        // identical either way.
+        libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, &request)
     };
 
     if result < 0 {

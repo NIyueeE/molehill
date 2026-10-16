@@ -190,9 +190,10 @@ inside the instrument's own scatter.
    section present, `cargo audit`.
 2. **build matrix** (9 targets): linux gnu + musl, aarch64 musl (via cross),
    arm/armv7 musl (`embedded` feature), macOS x86_64 + aarch64, Windows
-   msvc. musl artifacts build with the full feature set
-   (`server,client,noise,hot-reload,multiplex`); linux artifacts are
-   UPX-compressed. Tests run inside the matrix for native and cross targets.
+   msvc. musl artifacts build with the full default feature set
+   (`server,client,noise,hot-reload,multiplex,kcp,transparent`); linux
+   artifacts are UPX-compressed. Tests run inside the matrix for native and
+   cross targets.
 3. **GitHub Release**: published **directly** (no draft stage; the tag push
    itself is the human checkpoint), with notes extracted from `CHANGELOG.md`,
    all archives, and a `SHA256SUMS` — never edit the notes by hand.

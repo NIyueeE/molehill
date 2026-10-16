@@ -214,6 +214,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   switch that cannot happen, and **carrier reports are matched to their claim**
   before the lane id is consulted.
 
+- **The transparent (L3) code compiles for musl**, so the static release
+  binaries — and the container image built from them — carry L3 services: the
+  TUN attach passed `TUNSETIFF` typed for glibc's `ioctl` signature, which
+  musl's `c_int` request parameter refuses. The CI musl job and `just container`
+  now name the whole default feature set, so the image a reader builds locally
+  is the image the release publishes.
+
 ## [0.10.0] - 2026-10-01
 
 ### Changed

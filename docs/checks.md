@@ -89,7 +89,7 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 | 1 | fmt | `cargo fmt --all -- --check` | code style |
 | 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
 | 3 | machete | `cargo machete` | unused dependencies |
-| 4 | docs | `githooks/check-docs` | docs ↔ code alignment (includes the feature-name registry: every `[features]` row must be documented in docs/build-guide.md) |
+| 4 | docs | `githooks/check-docs` | docs ↔ code alignment (includes the feature-name registry: every `[features]` row must be documented in docs/build-guide.md; and the explicit feature lists that build the release artifacts — `release.yml`'s musl entries, the CI musl job, `just container` — must equal Cargo.toml's default set) |
 | 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
 | 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
 | 7 | bench model | `uv run benches/scripts/bench/bench.py selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |

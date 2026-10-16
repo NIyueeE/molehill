@@ -510,9 +510,9 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
-`multiplex`、`kcp`、`transparent`),所以数据面的 KCP 不需要换
-镜像。想要可复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.9.0`),
-而不是用 `:latest`。
+`multiplex`、`kcp`、`transparent`),所以数据面的 KCP 会话和透明(L3)服务
+都不需要换镜像。想要可复现的升级就固定 release tag
+(`ghcr.io/niyueee/molehill:v0.11.0`),而不是用 `:latest`。
 
 以 UID 1000 运行带来两个后果:
 

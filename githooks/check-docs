@@ -277,6 +277,51 @@ done < <(awk '/^const REMOVED_KEYS/{f=1;next} f&&/^\];/{exit} f{
 }' src/config/parsing.rs)
 rm -f "$normalised"
 
+# 17) the explicit feature lists that build the release artifacts must be
+#     Cargo.toml's default set. Three places name it in full — release.yml's
+#     musl entries (the container image), the CI musl job that exists to check
+#     that very build, and `just container` — and they have drifted twice: `kcp`
+#     (v0.10.0) and `transparent` (v0.11.0, where the CI job's list was the one
+#     left behind, so no musl build had ever compiled the L3 code the release
+#     shipped). Cargo.toml is the single source; a list that is not the default
+#     set is a release artifact that is not the default build.
+default_features=$(
+  awk '/^default = \[/{f=1;next} f&&/^\]/{exit} f{
+         gsub(/[",[:space:]]/,""); if ($0 != "") print
+       }' Cargo.toml | paste -sd, -
+)
+release_musl=$(
+  awk '/x86_64-unknown-linux-musl/{seen=1}
+       seen && /^[[:space:]]*features:/{sub(/^[[:space:]]*features:[[:space:]]*/,""); print; exit}' \
+    .github/workflows/release.yml
+)
+ci_musl=$(
+  awk '/x86_64-unknown-linux-musl/{seen=1}
+       seen {for (i=1;i<=NF;i++) if ($i=="--features") {print $(i+1); exit}}' \
+    .github/workflows/ci.yml
+)
+just_container=$(
+  awk '/^container:/{seen=1}
+       seen {for (i=1;i<=NF;i++) if ($i=="--features") {print $(i+1); exit}}' justfile
+)
+if [ -z "$default_features" ]; then
+  echo "  FAIL  no default feature set read from Cargo.toml [features]" >&2
+  errors=$((errors + 1))
+else
+  for named in "release.yml musl entries=$release_musl" \
+               "CI musl job=$ci_musl" \
+               "just container=$just_container"; do
+    label="${named%%=*}"
+    value="${named#*=}"
+    if [ "$value" = "$default_features" ]; then
+      echo "  ok    $label build the default feature set"
+    else
+      echo "  FAIL  $label build '$value', not Cargo.toml's default set '$default_features'" >&2
+      errors=$((errors + 1))
+    fi
+  done
+fi
+
 # soft notice: stale upstream references are expected only in provenance docs
 if grep -qiF 'rathole-org' README.md README.zh.md 2>/dev/null; then
   echo "  note: upstream 'rathole-org' references present (expected: provenance links only)"

@@ -196,8 +196,10 @@ cat <<'EOF'
   [ ] Docs audit: version numbers, config examples and claims in README.md /
       README.zh.md / docs/ still hold at this commit
   [ ] Container image review: scratch + static musl; img/bin amd64+arm64
-      layout; feature set server,client,noise,hot-reload,multiplex; the
-      --help smoke test passed in the workflow run
+      layout; feature set server,client,noise,hot-reload,multiplex,kcp,
+      transparent (the whole default set — the same list release.yml and the
+      CI musl job carry, which githooks/check-docs keeps in step with
+      Cargo.toml); the --help smoke test passed in the workflow run
   [ ] Benchmark ritual done (docs/release.md): sweep run, 'just bench-gate'
       green vs the previous tag (waivers recorded in HANDOFF.md), README
       benchmark section refreshed
