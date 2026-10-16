@@ -237,6 +237,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now name the whole default feature set, so the image a reader builds locally
   is the image the release publishes.
 
+- **Dependencies refreshed ahead of the release**: `chacha20` moves off its
+  yanked 0.10.1 to 0.10.2 (cargo audit's last allowed warning), and `libc`,
+  `sha2`, `tokio`, `toml` take their patch releases. The `tokio` patch
+  deprecates `AsyncFd::new` (an I/O-safety hole), so the TUN fd registers
+  through `AsyncFd::register` instead — same semantics, with the ownership
+  argument the safe path could not state.
+
 ## [0.10.0] - 2026-10-01
 
 ### Changed

@@ -109,7 +109,22 @@ impl Tun {
                  this build requires a tun driver with TUNSETOFFLOAD support"
             )
         })?;
-        let fd = AsyncFd::new(file).with_context(|| "Failed to register the TUN fd with tokio")?;
+        // `AsyncFd::new` is deprecated (its `I/O-safety` hole: nothing pinned
+        // the fd open across registration). The replacement is `unsafe` and
+        // its contract is exactly what this function already guarantees by
+        // construction: `file` is open, and it moves into the `AsyncFd` here
+        // — owned by it for the struct's whole life — so the fd cannot close
+        // or change under the registration.
+        #[expect(
+            unsafe_code,
+            reason = "audited FFI-adjacent: `AsyncFd::register` demands an open fd that stays \
+                      open and unchanged for the AsyncFd's life; `file` is the open TUN fd \
+                      this function built and it moves into the guard below, which owns it \
+                      exclusively until drop"
+        )]
+        // SAFETY: see the expect above — the fd is open, owned, and moves.
+        let fd = unsafe { AsyncFd::register(file) }
+            .with_context(|| "Failed to register the TUN fd with tokio")?;
         Ok(Self { fd })
     }
 
