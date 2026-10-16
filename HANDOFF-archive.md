@@ -82,6 +82,17 @@ measures.
 (`benchmarks.md`, "The L3 data path") — and **the lane budget**, +58 % for four lanes
 against two, paid for out of the interactive stream's SLO headroom.
 
+**The deficit is one-sided, and the other side is L3's.** The same smoke run that
+read the bulk gap (one flow, one connection in both arms: l3 1.998 against l4 2.878
+Gbit/s) read the round-trip scenarios the other way — `rr-1` 9 524 against 8 525
+requests/s, `rr-16` 27 863 against 26 823, `rr-1` p99 0.146 against 0.151 ms. Directional
+only (2 rounds, no A/A, "no claim cleared the floors"), but the sign is what the
+abstraction-count intuition predicts: where the workload is latency- and small-message-
+bound, one layer less wins — which is also the release sweep's own headline (L3's clean
+interactive p99 is 2.3 against L4's 4.3 ms). The bulk penalty and the round-trip advantage
+are the same trade read from its two ends: the layer L4 adds is a *packer*, and a packer
+costs latency and buys bulk.
+
 **What remains unmeasured**, if anyone wants to reopen it: which of the four TUN syscalls
 dominates (no `perf` and `ptrace` is blocked in this container, so `strace -c` could not
 attach — `MOLEHILL_L3_STATS`'s `read_gap_max_ms`/`write_gap_max_ms` and
