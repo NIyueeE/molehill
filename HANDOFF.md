@@ -47,11 +47,17 @@
     chart set and the README's benchmark tables. The sweeps before it measured
     either the harness's shaper or the previous default, and are not the
     artifact.
-  - **the L3 row will jump, and the reason is the default, not the code.** A
-    claim now holds two carrier connections where it held one, which is measured
-    at +40 % on a multi-flow claim ([`DEFAULT_CLAIM_LANES`] carries both tables)
-    and costs `lanes x claims` connections — a breaking change with a one-line
-    upgrade path, both stated in the changelog and the configuration page.
+  - **the L3 row will jump for two stacked reasons — the default and the code.**
+    The default: a claim now holds two carrier connections where it held one,
+    measured at +40 % on a multi-flow claim ([`DEFAULT_CLAIM_LANES`] carries both
+    tables) and costing `lanes x claims` connections — a breaking change with a
+    one-line upgrade path, both stated in the changelog and the configuration
+    page. The code: the TUN device now takes its segmentation offload (the
+    "The fourth fix is the one that worked" bullet below), measured at +70 % on
+    a single-flow bulk claim — so a sweep read against the v0.10.0 record is
+    neither a like-for-like default comparison nor a like-for-like code one, and
+    the two effects are separated by the smoke A/B in HANDOFF-archive's
+    2026-10-16 section, not by the sweep.
 
 - **The cycle being released**: transparent (L3) services, wire **v5**, based on
   `main` at `cf01091`. Nothing of it is in `v0.10.0` (verified: the tag's tree
@@ -194,9 +200,12 @@
   What did **not** work: `IFF_VNET_HDR` alone (the kernel still segments —
   the declaration is the lever), and the UDP-GSO read side segments even with
   the declaration on this kernel (UDP offload is TX-only here); TCP TSO is
-  the win. The probe scripts live in `~/tmp/tcp_tso_census2.py` (method:
+  the win. The probe is in-repo:
+  [`benches/scripts/l3/tcp_tso_census.py`](benches/scripts/l3/tcp_tso_census.py)
+  (method:
   two netns, one routed TUN hop, a userspace shuttle that relays frames
-  whole; `gso_probe5.py` is the UDP control).
+  whole; the UDP control (`gso_probe5.py`, kept out of the repo — it needs a
+  UDP_SEGMENT sender and only rules out a UDP-shaped win)).
 
 - **The sweep is owed.** The one running when the audit began was stopped: the
   L3 question was going to change `src/`, and a record measured before a code

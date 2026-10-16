@@ -779,12 +779,21 @@ deployment that wants the old default, are
 [configuration.md](configuration.md#transparent-l3-services)'s to state; this
 page owns the measurement.
 
-One earlier reading at the end of this section is retracted: the "device path
-that can carry more than one packet per syscall" (GSO/TSO on the TUN) is real,
-but a 1500-byte path cannot have it — the TUN may not hand userspace packets
-larger than the path — and enabling TSO implies `NETIF_F_HW_CSUM`, so forwarding
-those packets would need the checksum and GSO state carried per packet, which is
-a wire change. The lane count needs neither.
+One earlier reading at the end of this section is **retracted as wrong** (the
+2026-10-16 offload fix is its correction): the "device path that can carry more
+than one packet per syscall" — GSO/TSO on the TUN — was ruled out on the
+reasoning that a 1500-byte path cannot have it (the TUN may not hand userspace
+packets larger than the path) and that enabling TSO would carry checksum and
+GSO state per packet, which was called a wire change. Both halves fail: the
+kernel hands the reader **GSO super-frames** — one up-to-64 KiB unit naming a
+`gso_size`, whose packets the far end re-segments — so the path's MTU never
+bounds the read, and the state already had a wire shape (the 10-byte
+virtio-net header, relayed whole, `NEEDS_CSUM` intact). What the path lacked
+was the declaration: `IFF_VNET_HDR` plus `TUNSETOFFLOAD`. Measured: 3.85 GB of
+bulk TCP arrived as 576 071 reads of 1 500 bytes without it and 59 160 reads
+averaging 65 212 bytes with it. That fix is in the shipping binary; the probe
+is [`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+and "What is left is per-packet syscall cost" below now reads differently.
 
 ### The carrier axis: TCP versus KCP (2026-10-10, this model)
 
@@ -1150,7 +1159,9 @@ userspace hotspot exists to fix — a synchronous data path would chase the
   ratio of reads to bytes the 8000-byte-MTU operator lever buys below, taken
   by the binary instead of the deployment. UDP GSO segments before the reader
   on this kernel even with the declaration (UDP offload is TX-only here), so
-  the win is TCP-shaped; the probe is `~/tmp/tcp_tso_census2.py`, and the
+  the win is TCP-shaped; the probe is
+  [`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+  and the
   wire's length prefix moved to `u32` the same release so a whole super-frame
   fits one frame.
 - **The TUN MTU (an operator setting):** the same bytes in 8000-byte packets

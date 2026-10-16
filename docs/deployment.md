@@ -270,17 +270,24 @@ Both recipes start from the same two facts:
 - **The client owns the address.** Its TUN device carries the claimed address,
   and a source rule sends the replies the local application emits back into the
   tunnel.
-- **The TUN MTU is the packet-size lever.** A userspace data path pays per
-  packet, so the MTU decides how many packets a given byte rate costs. Measured
-  on one host, the same bulk flow through an L3 claim moved **1.84×** the
-  throughput at an 8000-byte TUN MTU (with a link MTU to match) than at 1400,
-  at **a third** of the CPU per byte — and at that packet size one L3 flow
-  matches the forwarding path on the same host
+- **The TUN MTU is the packet-size lever — and, since v0.11.0, the smaller
+  half of it.** A userspace data path pays per packet, so the MTU decides how
+  many packets a given byte rate costs. Measured on one host, the same bulk
+  flow through an L3 claim moved **1.84×** the throughput at an 8000-byte TUN
+  MTU (with a link MTU to match) than at 1400, at **a third** of the CPU per
+  byte — and at that packet size one L3 flow matches the forwarding path on
+  the same host
   ([Benchmarks](./benchmarks.md#the-l3-data-path-what-limits-it-2026-10-10-this-model)).
-  The L3 path does not scale with the number of connections, so this is the
-  lever that matters. The recipes below use 1400, which fits any path that
-  carries the tunnel; raise it to what the path between the two ends actually
-  allows.
+  v0.11.0 narrows the gap at 1400 too: the daemon now attaches the device with
+  `IFF_VNET_HDR` and declares its segmentation offloads, so the kernel hands
+  the reader GSO super-frames (up-to-64 KiB units) instead of one 1400-byte
+  packet per read — the packing that lever bought, taken by the binary. The
+  MTU remains worth raising where the path between the two ends actually
+  allows it (fewer per-syscall headers, less ACK traffic), but a 1400-byte TUN
+  no longer caps a bulk flow at per-packet syscalls. The L3 path does not
+  scale with the number of connections, so packet size — from either source —
+  is still the lever that matters. The recipes below use 1400, which fits any
+  path that carries the tunnel; raise it to what the path actually allows.
 
 Both recipes end with the same configuration:
 

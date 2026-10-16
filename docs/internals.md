@@ -31,10 +31,13 @@ A session uses two credentials, which is what lets one connection carry services
 ### Protocol versions
 
 The protocol version rides in every hello, and this build speaks and serves one
-dialect: **v5**. v5 adds one service type (`ServiceType::Transparent`) and one
-data-channel command (`DataChannelCmd::StartForwardTransparent`), nothing else:
-the selector byte, the session handshake, the service prologue, the striping
-frames and the UDP framing are v4's. (0.8–0.9 spoke v3 and 0.10 v4; each
+dialect: **v5**. v5 adds one service type (`ServiceType::Transparent`), one
+data-channel command (`DataChannelCmd::StartForwardTransparent`), and the
+transparent lane's own framing — a transparent channel's `[u16 length][packet]`
+becomes `[u32 length][vnet frame]`, wide enough for a GSO super-frame and
+carrying the virtio-net header the device attaches. Everything else — the
+selector byte, the session handshake, the service prologue, the striping
+frames, the UDP framing — is v4's. (0.8–0.9 spoke v3 and 0.10 v4; each
 dialect was dropped by the release that followed it.) The rule — a
 dialect is defined by a release, its number moves with the tag that introduces
 it, and no two tags are compatible — lives in AGENTS.md §5; what it means on the
@@ -208,11 +211,16 @@ How a claim's lane set is opened, held and repaired:
   packet.
 - The server answers each channel with
   `DataChannelCmd::StartForwardTransparent` (tag 3, a unit variant like the other
-  fixed-size data commands), and from then on it carries whole IP packets, framed
-  `[u16 length][packet]` in both directions by `IpTraffic` (`src/protocol.rs`).
-  The packet travels verbatim — there is no address tag, because the addresses
-  are inside it — and a zero-length frame is a protocol error rather than an
-  empty packet.
+  fixed-size data commands), and from then on it carries whole IP frames, framed
+  `[u32 length][vnet frame]` in both directions by `IpTraffic`
+  (`src/protocol.rs`). The "vnet frame" is the unit the TUN device produces:
+  the 10-byte virtio-net header followed by the packet — or the GSO
+  super-frame — it describes. The frame travels **whole**: a `NEEDS_CSUM`
+  frame only checksums with its header present, and a super-frame only
+  re-segments at the far end when its `gso_size` arrives intact. There is no
+  address tag, because the addresses are inside the packet; a zero-length
+  frame, or one shorter than the header it must carry, is a protocol error
+  rather than an empty packet.
 - The server supervises the set, and it is not told the set's width: the
   channels the client opens *are* the set, and the hub discovers the width from
   the lanes that actually join, widening by one whenever a join finds every
