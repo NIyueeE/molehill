@@ -237,8 +237,16 @@ fn attach_interface(file: &File, name: &str) -> Result<()> {
     // request the kernel defines for exactly this struct.
     let result = unsafe {
         let mut request: libc::ifreq = std::mem::zeroed();
-        for (slot, byte) in request.ifr_name.iter_mut().zip(name.bytes()) {
-            *slot = byte.cast_signed();
+        // `ifr_name` is `[c_char; _]`, and `c_char` is `i8` on most targets
+        // but `u8` on aarch64 (and the other arm64-family) libcs — the C
+        // `char`'s signedness is a target property. Writing through the
+        // pointer as the byte type sidesteps whichever it is: the kernel
+        // reads the 16 bytes as the NUL-terminated name either way.
+        let name_ptr = request.ifr_name.as_mut_ptr().cast::<u8>();
+        for (offset, byte) in name.bytes().enumerate() {
+            // In range by the same argument the name copy is: `ifr_name` is
+            // 16 bytes, the caller length-checked the name against it.
+            name_ptr.add(offset).write(byte);
         }
         request.ifr_ifru.ifru_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
         // The cast is to whatever this libc declares for `ioctl`'s request
