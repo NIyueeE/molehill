@@ -104,22 +104,22 @@ winner is marked in those columns. Sample counts and the full reading rules:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 4.3 | 402.1 | 1076.8 | 1456.9 | 197.2 | 429.2 | 266.8 | 4.5 |
-| molehill (L3) | 2.3 | 2441.8 | 1320.9 | 2443.8 | 195.3 | 428.1 | 255.0 | 2.5 |
-| frp | 1.3 | 401.4 | 1063.5 | 2097.3 | 197.4 | 431.9 | 285.6 | 1.8 |
-| rathole | 2.1 | 401.0 | 1043.8 | 3494.6 | 198.7 | 428.6 | 285.6 | 2.0 |
-| nps | 16.6 | 418.0 | 1081.4 | 1648.6 | 198.4 | 428.8 | 267.4 | 300.8 |
+| molehill (L4) | 4.8 | 401.9 | 1085.4 | 2826.4 | 196.3 | 431.5 | 279.8 | 4.4 |
+| molehill (L3) | 1.6 | 401.4 | 1069.9 | 2433.5 | 207.8 | 440.3 | 264.1 | 2.0 |
+| frp | 1.7 | 401.2 | 1066.5 | 2688.5 | 194.5 | 455.7 | 279.7 | 1.4 |
+| rathole | 2.7 | 400.8 | 1071.2 | 2098.1 | 197.8 | 431.6 | 285.1 | 3.6 |
+| nps | 15.1 | 501.1 | 1067.8 | 2077.4 | 199.9 | 429.1 | 269.2 | 101.2 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 9.102 | 3.408 | 8.858 | 1.135 | 0.094 | 0.019 | 0.019 | 9.131 |
-| molehill (L3) | 2.811 | 2.755 | 3.837 | 0.893 | 0.093 | 0.019 | 0.019 | 2.855 |
-| frp | 5.821 | 3.384 | 5.839 | 1.015 | 0.094 | 0.019 | 0.019 | 5.758 |
-| rathole | 29.524 | 3.391 | 14.808 | 1.120 | 0.094 | 0.019 | 0.019 | 29.278 |
-| nps | 0.134 | 0.135 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 9.053 | 3.386 | 8.805 | 1.229 | 0.094 | 0.019 | 0.019 | 9.041 |
+| molehill (L3) | 5.687 | 3.114 | 4.483 | 0.689 | 0.094 | 0.019 | 0.019 | 5.606 |
+| frp | 5.863 | 3.361 | 5.920 | 1.083 | 0.094 | 0.019 | 0.019 | 5.803 |
+| rathole | 27.878 | 3.406 | 12.640 | 0.716 | 0.094 | 0.019 | 0.019 | 26.546 |
+| nps | 0.135 | 0.135 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **The run's own replicate.** `clean` is measured at both ends of every
 timeline, so each tool's two readings are two samples of one condition about an
@@ -127,11 +127,11 @@ hour apart — the scale every other cell is read against:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (L4) | 9.102 – 9.131 Gbit/s (**0.3 %** apart) | 4.3 – 4.5 ms |
-| molehill (L3) | 2.811 – 2.855 Gbit/s (**1.6 %** apart) | 2.3 – 2.5 ms |
-| frp | 5.821 – 5.758 Gbit/s (**1.1 %** apart) | 1.3 – 1.8 ms |
-| rathole | 29.524 – 29.278 Gbit/s (**0.8 %** apart) | 2.1 – 2.0 ms |
-| nps | 0.134 – 0.134 Gbit/s (**0.1 %** apart) | 16.6 – 300.8 ms |
+| molehill (L4) | 9.053 – 9.041 Gbit/s (**0.1 %** apart) | 4.8 – 4.4 ms |
+| molehill (L3) | 5.687 – 5.606 Gbit/s (**1.4 %** apart) | 1.6 – 2.0 ms |
+| frp | 5.863 – 5.803 Gbit/s (**1.0 %** apart) | 1.7 – 1.4 ms |
+| rathole | 27.878 – 26.546 Gbit/s (**4.9 %** apart) | 2.7 – 3.6 ms |
+| nps | 0.135 – 0.134 Gbit/s (**0.7 %** apart) | 15.1 – 101.2 ms |
 
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
@@ -142,17 +142,18 @@ streams, so 8 reads as a **floor** ("at least 8"), not a maximum.
 **Two rows are one tool.** `molehill (L3)` is this project's second
 architecture, not a fifth tool: frp, rathole and nps are forwarding proxies with
 no TUN path, so the L3 row's comparison is `molehill (L4)` and the tool-free
-control arm — same workload, same topology, one architecture apart. Measured
-here for the first time, the honest reading is that **it trades throughput for
-latency**: 2.81 against 9.10 Gbit/s on the clean stage, with a lower interactive
-p99 (2.3 against 4.3 ms) and a steadier one under load — it holds every level of
-the capacity ramp, reading 1.4–5.0 ms where L4 reads 1.7–4.9 ms. A claim's lanes
-are carrier connections of its own rather than streams of a multiplexed pool, and
-it holds **two by default**: the largest value that keeps both the bulk ceiling
-and the interactive SLO, because four lanes buys 58 % more bulk and spends the
-interactive stream's headroom doing it
-([Configuration](./docs/configuration.md#transparent-l3-services) prices the
-trade in connections).
+control arm — same workload, same topology, one architecture apart. The honest
+reading is that **the two architectures now split the workloads**: on the clean
+stage L3 reads 5.69 against L4's 9.05 Gbit/s bulk, with a clearly lower
+interactive p99 (1.6 against 4.8 ms) and a steadier one under load — it holds
+every level of the capacity ramp. Bulk and latency move opposite ways because
+v0.11.0 narrowed the bulk gap at its root: the device now takes its
+segmentation offload (GSO super-frames instead of one packet per read), which
+took a single-flow claim from 2.0 to 3.4 Gbit/s in the smoke A/B, and the
+staged run's L3 clean cell reflects the same fix. A claim's lanes are carrier
+connections of its own rather than streams of a multiplexed pool, and it holds
+**two by default** ([Configuration](./docs/configuration.md#transparent-l3-services)
+prices the trade in connections).
 
 **The wedge that used to be this row's headline is gone, and it was never the
 tool.** L3 once went silent 6 times on this schedule where L4 never did; both
@@ -169,13 +170,13 @@ is what a shaped stage's interactive number is a reading *of*
 
 **Read the L4 row against the v0.10.0 one and the difference is the data plane,
 not the tool.** v0.10.0 published 16.83 Gbit/s on the clean stage with a plain
-data plane; this run reads 9.10 with the control channel's Noise keys inherited
+data plane; this run reads 9.05 with the control channel's Noise keys inherited
 by every service — and the price list for that choice is measured at
 [Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)
 (10.0 → 5.8 Gbit/s at one stream, 19.5 → 14.9 at eight: ~42 %, against the ~46 %
 seen here). A deployment that wants the old number sets
 `transport = { type = "plain" }` per service and keeps the encrypted control
-channel. **rathole reads above this host's loopback calibration** (28.7 against
+channel. **rathole reads above this host's loopback calibration** (27.9 against
 a ~21.8 Gbit/s loopback probe), which is the ceiling artefact this page has
 always flagged: two of the fast tools sit at or above the loopback measurement
 and move with the host's state between runs, so their order is not stable across

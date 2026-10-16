@@ -5,9 +5,9 @@
 > (L3) client, the mandatory-Noise control channel, the bench model as the one
 > measurement standard, and a new default for an L3 claim's lane budget.
 > `version = "0.11.0"` is committed and the CHANGELOG section is written.
-> **The release sweep is owed**: the record under `benches/records/` was measured
-> before the audit's one code change (`2d4cc0f`, a musl compile fix), so it has
-> to be re-measured before the tag — see "The sweep is owed" below.
+> **The release sweep is measured** (2026-10-16 at `26ebb13`, `just bench-gate`
+> PASS — see "RESOLVED: the release sweep is measured" below); the record, the
+> chart set and both READMEs' numbers are the release's own.
 >
 > What is left is not code: the human's merge and tag, the repository-settings
 > items, and the open threads below.
@@ -211,13 +211,19 @@
   whole; the UDP control (`gso_probe5.py`, kept out of the repo — it needs a
   UDP_SEGMENT sender and only rules out a UDP-shaped win)).
 
-- **The sweep is owed.** The one running when the audit began was stopped: the
-  L3 question was going to change `src/`, and a record measured before a code
-  change describes code that is no longer here. `src/` changed again with the
-  offload fix above, so the release artifact has to be re-measured at this
-  revision or later — the committed
-  `results-bench-v0.11.0.json` is the earlier run at `1c2dcd9` and is not the
-  release's.
+- **RESOLVED: the release sweep is measured.** The run that mattered landed on
+  2026-10-16 at `26ebb13` (the fourth squash's tip, tree clean, binary
+  `b69cec9e3c43e32a`): 88 samples over the five arms (molehill, l3, frp,
+  rathole, nps), timeline + capacity, 104 minutes. `just bench-gate` PASSES —
+  the endpoint invariant, the clean-stage SLOs, zero wedges on every arm, all
+  arms sustaining the ramp's eight streams (nps five, its own history). The
+  headline shift from the run it replaces (measured at `1c2dcd9`, before the
+  offload fix): L3 clean bulk 2.811 → **5.687 Gbit/s** (+102 %, the offload
+  fix working through a staged run), clean interactive p99 2.3 → **1.6 ms**;
+  L4 essentially unchanged (9.10 → 9.05). The charts and both READMEs carry
+  the new numbers, and the L3-vs-L4 reading on them is
+  "the two architectures split the workloads" rather than "one trades
+  throughput for latency".
 
 - **The repository state**: `version = "0.11.0"`, `CHANGELOG.md` carries
   `## [0.11.0] - 2026-10-14` with `[Unreleased]` empty, and no tag names this
