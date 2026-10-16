@@ -45,7 +45,7 @@ use tokio::sync::{Notify, mpsc};
 use crate::protocol::{IpFrames, IpTraffic, LaneId};
 use crate::transparent::flow;
 use crate::transparent::ip::{self, PacketInfo};
-use crate::transparent::tun::Tun;
+use crate::transparent::tun::{MAX_PACKET, Tun};
 use crate::transparent::{Direction, DropReason, Endpoint, EndpointTable, Stats};
 #[cfg(feature = "multiplex")]
 use crate::transport::multiplex::Carrier;
@@ -83,14 +83,43 @@ const QUEUE: usize = 128;
 /// either way, and this only bounds how much one hand-over may hold.
 const BATCH_PACKETS: usize = 32;
 
-/// The most bytes one batch may carry, whichever comes first. Large enough to
-/// fill several carrier segments in one write, small enough that a batch is
-/// never a burst of its own.
-const BATCH_BYTES: usize = 16 * 1024;
+/// The most bytes one batch may carry, whichever comes first. Sized to hold
+/// several GSO super-frames: the device hands out up-to-64 KiB units once the
+/// offload declaration is in place (see [`tun`][super::tun]), so a batch built
+/// of super-frames is bounded by bytes, not by the packet count.
+const BATCH_BYTES: usize = 64 * 1024;
 
-/// The largest packet a TUN read is willing to see: an IPv4 packet with
-/// options, bounded by the frame's `u16` length prefix.
-pub const MAX_PACKET: usize = u16::MAX as usize;
+/// Read the routing identity out of one device frame.
+///
+/// The virtio-net header is skipped, not interpreted: segmentation state
+/// (`gso_type`, `gso_size`, `NEEDS_CSUM`) is the far end's business, and the
+/// header travels with the frame whichever way the frame goes. Only the
+/// packet's own routing fields matter here.
+fn frame_info(frame: &[u8]) -> Result<PacketInfo, ip::ParseError> {
+    let Some(packet) = frame.get(crate::transparent::tun::VNET_HDR_LEN..) else {
+        return Err(ip::ParseError::Malformed);
+    };
+    ip::parse(packet)
+}
+
+/// How many MTU-sized packets one frame costs on the wire.
+///
+/// A super-frame names its `gso_size`; a plain packet is one packet. The count
+/// is an estimate for the counters and the batch's packet budget — the bytes
+/// are counted exactly, so a coarse packets number only moves a report.
+fn packet_estimate(frame: &[u8]) -> usize {
+    const VNET: usize = crate::transparent::tun::VNET_HDR_LEN;
+    if frame.len() <= VNET + ip::IPV4_MIN_HEADER {
+        return 1;
+    }
+    // The virtio-net header layout (`<BBHHHH`): gso_type at 1, gso_size at 4.
+    let gso_type = frame[1];
+    let gso_size = u16::from_le_bytes([frame[4], frame[5]]);
+    if gso_type == 0 || gso_size == 0 {
+        return 1;
+    }
+    (frame.len() - VNET).div_ceil(usize::from(gso_size))
+}
 
 /// How long a flow's placement is remembered after its last packet.
 ///
@@ -190,9 +219,9 @@ impl TunHub {
         self.routes.member_stats()
     }
 
-    /// Hand one packet to the kernel, as if it had arrived on the device.
-    pub async fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        self.tun.write_packet(packet).await
+    /// Hand one frame to the kernel, as it arrived: header included.
+    pub async fn inject(&self, frame: &[u8]) -> io::Result<()> {
+        self.tun.write_packet(frame).await
     }
 
     /// Count packets a lane delivered into this end's device (see
@@ -295,28 +324,31 @@ impl TunHub {
     /// gone.
     ///
     /// It drains the device and hands over **batches**, one per (endpoint,
-    /// member), not packets: a batch is a run of `[u16 length][packet]` frames
-    /// in one `Bytes`, so N packets cost one queue message, one `write_all` on
-    /// the tunnel and — with a carrier that segments at the MSS — one carrier
-    /// header and one acknowledgement instead of N. That per-packet transport
-    /// cost was measured at ~80 bytes against a ~35-byte header, which is what
-    /// makes this the lever ([benchmarks.md](../../docs/benchmarks.md), "The
-    /// transparent-L3 wire question").
+    /// member), not packets: a batch is a run of `[u16 length][vnet frame]`
+    /// frames in one `Bytes`, so N packets cost one queue message, one
+    /// `write_all` on the tunnel and — with a carrier that segments at the
+    /// MSS — one carrier header and one acknowledgement instead of N. That
+    /// per-packet transport cost was measured at ~80 bytes against a ~35-byte
+    /// header, which is what makes this the lever
+    /// ([benchmarks.md](../../docs/benchmarks.md), "The transparent-L3 wire
+    /// question"). With the offload declaration in place the device itself
+    /// hands over super-frames, so N is counted in tens of thousands of bytes
+    /// per hand-over rather than tens of packets.
     fn spawn_reader(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
             // One buffer per (endpoint, member) while the device is drained.
-            // Keyed by the slot rather than by the queue so a batch survives the
-            // queue being replaced mid-drain: the flush looks the current queue
-            // up.
+            // Keyed by the slot rather than by the queue so a batch survives
+            // the queue being replaced mid-drain: the flush looks the current
+            // queue up.
             let mut batches: HashMap<(Endpoint, usize), Batch> = HashMap::new();
             loop {
                 let mut read_here = 0u64;
                 let outcome = self
                     .tun
-                    .drain(&mut buf, &mut |packet| {
+                    .drain(&mut buf, &mut |frame| {
                         read_here += 1;
-                        self.route(packet, &mut batches);
+                        self.route_frame(frame, &mut batches);
                     })
                     .await;
                 if read_here > 0 {
@@ -340,10 +372,16 @@ impl TunHub {
         });
     }
 
-    /// Parse one packet and append it to its member's batch, flushing that
-    /// batch when it is as large as one message may grow.
-    fn route(&self, packet: &[u8], batches: &mut HashMap<(Endpoint, usize), Batch>) {
-        let info = match ip::parse(packet) {
+    /// Parse one device frame and append it to its member's batch, flushing
+    /// that batch when it is as large as one message may grow.
+    ///
+    /// The frame is appended **whole** — virtio-net header first: the far end
+    /// injects what this end received, and a `NEEDS_CSUM` frame only checksums
+    /// if its header arrives with it. What is parsed here is the packet's
+    /// routing identity, one lookup per frame however many packets the frame
+    /// carries.
+    fn route_frame(&self, frame: &[u8], batches: &mut HashMap<(Endpoint, usize), Batch>) {
+        let info = match frame_info(frame) {
             Ok(info) => info,
             Err(e) => {
                 self.routes.stats.count_drop(DropReason::from(e));
@@ -355,9 +393,9 @@ impl TunHub {
             return;
         };
         let batch = batches.entry((endpoint, slot)).or_default();
-        if batch.push(packet).is_err() {
-            // An oversized packet cannot be framed; it is not the batch's
-            // problem, and dropping it keeps the rest.
+        if batch.push(frame).is_err() {
+            // A frame that cannot be framed (past the wire's u16) cannot be
+            // carried; dropping it keeps the rest.
             self.routes.stats.count_drop(DropReason::Malformed);
             return;
         }
@@ -861,13 +899,20 @@ impl Routes {
     /// with the counting still done per packet — and, for a member set, per
     /// member, so which member a claim lost its traffic with is legible.
     fn flush(&self, endpoint: &Endpoint, slot: usize, batch: Batch) -> bool {
-        let Batch { frames, packets } = batch;
+        let Batch {
+            frames,
+            packets,
+            packet_total,
+        } = batch;
         if packets == 0 {
             return false;
         }
         // The wire's own denominator: what this batch will cost the lane as
         // framed, not the packets' payload alone.
         let bytes = frames.len() as u64;
+        // The counter the operator reads is packets, however they travel: a
+        // batch of super-frames is counted as the packets inside them.
+        let count = u64::from(u32::try_from(packet_total.max(packets)).unwrap_or(u32::MAX));
         let delivered = {
             let Ok(mut table) = self.table.lock() else {
                 return false;
@@ -879,22 +924,22 @@ impl Routes {
                 Some(entry) => {
                     // What the device offered this lane, counted before the
                     // answer: a refusal is as much evidence as an acceptance.
-                    entry.counters.offer(packets as u64, bytes);
+                    entry.counters.offer(count, bytes);
                     let lane_absent = entry.queue.is_none();
                     let sent = entry
                         .queue
                         .as_ref()
                         .is_some_and(|queue| queue.try_send(frames.freeze()).is_ok());
                     if sent {
-                        entry.forwarded += packets as u64;
-                        entry.counters.enqueued_packets += packets as u64;
+                        entry.forwarded += count;
+                        entry.counters.enqueued_packets += count;
                         entry.counters.enqueued_bytes += bytes;
                     } else {
-                        entry.no_channel += packets as u64;
+                        entry.no_channel += count;
                         // The two refusals are different facts and are counted
                         // apart: a full queue is this end's backpressure, an
                         // absent lane is a replacement window.
-                        entry.counters.refuse(packets as u64, bytes, lane_absent);
+                        entry.counters.refuse(count, bytes, lane_absent);
                     }
                     sent
                 }
@@ -902,9 +947,11 @@ impl Routes {
             }
         };
         if delivered {
-            self.stats.count_forwarded_by(packets);
+            self.stats
+                .count_forwarded_by(usize::try_from(count).unwrap_or(usize::MAX));
         } else {
-            self.stats.count_no_channel_by(packets);
+            self.stats
+                .count_no_channel_by(usize::try_from(count).unwrap_or(usize::MAX));
         }
         delivered
     }
@@ -1410,16 +1457,25 @@ impl ClaimSlots {
 /// One buffer per (endpoint, member), not per packet: `frames` grows into a
 /// single `Bytes` (a `BytesMut` freeze is a move, not a copy), so nothing is
 /// allocated per packet on this path.
+///
+/// The counters are honest to what the carrier will move: `packets` counts
+/// *units* (frames), `packet_estimate` is how many MTU-sized packets those
+/// frames carry, and the bytes are exact. A batch of super-frames reports both,
+/// which is what keeps a super-frame run comparable with a plain-packet run.
 #[derive(Default)]
 struct Batch {
     frames: BytesMut,
+    /// Frames appended (units, not packets).
     packets: usize,
+    /// MTU-sized packets those frames are estimated to carry.
+    packet_total: usize,
 }
 
 impl Batch {
-    fn push(&mut self, packet: &[u8]) -> Result<()> {
-        IpTraffic::encode_into(&mut self.frames, packet)?;
+    fn push(&mut self, frame: &[u8]) -> Result<()> {
+        IpTraffic::encode_into(&mut self.frames, frame)?;
         self.packets += 1;
+        self.packet_total += packet_estimate(frame);
         Ok(())
     }
 
@@ -1434,15 +1490,16 @@ impl Batch {
 
 /// Forward one transparent data channel until either end stops.
 ///
-/// The channel is a stream of `[u16 length][packet]` frames in both
+/// The channel is a stream of `[u16 length][vnet frame]` frames in both
 /// directions; everything on it for `endpoint` is injected into the local
-/// kernel, and everything the kernel routes to that endpoint is framed onto
-/// whichever of the claim's members the packet's flow is placed on. This
-/// channel becomes one *member* of the claim while it runs — it takes a slot of
-/// the set, and its own frames are the ones it reads back. The function returns
-/// when the channel or the device ends — the caller decides whether to ask for
-/// another channel, and the set keeps the slot the channel held so its
-/// replacement inherits it.
+/// kernel whole (header included, so a `NEEDS_CSUM` frame checksums and a
+/// super-frame re-segments), and everything the kernel routes to that endpoint
+/// is framed onto whichever of the claim's members the packet's flow is placed
+/// on. This channel becomes one *member* of the claim while it runs — it takes
+/// a slot of the set, and its own frames are the ones it reads back. The
+/// function returns when the channel or the device ends — the caller decides
+/// whether to ask for another channel, and the set keeps the slot the channel
+/// held so its replacement inherits it.
 pub async fn forward_transparent<T>(
     conn: T,
     hub: Arc<TunHub>,
@@ -1473,7 +1530,7 @@ where
     });
 
     // The receive half is batched the same way the send half is: one socket
-    // read carries a run of frames, so the inject loop walks a burst of packets
+    // read carries a run of frames, so the inject loop walks a burst of frames
     // without awaiting between them (and the far side writes them that way).
     let mut frames = IpFrames::new(reader);
     // The wait is built **once**, outside the loop: `tokio::select!` evaluates
@@ -1492,26 +1549,34 @@ where
                 break Ok(());
             }
             frame = frames.next() => match frame {
-                Ok(packet) => {
+                Ok(frame) => {
                     // Defence in depth: a peer must not be able to steer traffic
                     // into a local address this service did not claim. Which end
                     // of the packet names the claim depends on the side: the
                     // client is the destination, the server is the source of the
-                    // traffic it hands back.
-                    let Some(info) = claimed_info(&endpoint, packet, hub.direction()) else {
+                    // traffic it hands back. The frame arrives whole — the
+                    // virtio-net header first — so the parse starts past it.
+                    let Some(info) = claimed_frame_info(&endpoint, frame, hub.direction()) else {
                         stats.count_drop(DropReason::Unclaimed);
                         continue;
                     };
                     hub.touch(&endpoint, &info);
-                    if let Err(e) = hub.inject(packet).await {
+                    if let Err(e) = hub.inject(frame).await {
                         break Err(anyhow::Error::from(e))
                             .with_context(|| format!("Failed to inject a packet for {endpoint}"));
                     }
-                    // The one "delivery" in this module: the packet crossed
+                    // The one "delivery" in this module: the frame crossed
                     // the lane and reached this end's kernel. Counted against
                     // the lane that carried it, because that is the number the
-                    // *other* end cannot see and the policy needs.
-                    hub.count_injected(&endpoint, slot, 1, packet.len() as u64);
+                    // *other* end cannot see and the policy needs. A
+                    // super-frame delivers many packets; the estimate is what
+                    // the counters and the peer's reports work in.
+                    hub.count_injected(
+                        &endpoint,
+                        slot,
+                        packet_estimate(frame) as u64,
+                        frame.len() as u64,
+                    );
                 }
                 Err(e) => {
                     stats.count_channel_error();
@@ -1526,20 +1591,25 @@ where
     result
 }
 
-/// The parsed packet, when it is one this service claimed.
+/// The parsed packet, when the frame is one this service claimed.
 ///
-/// The claim lives at the end this side owns: the client injected a visitor's
-/// packet for the address it carries, so it matches the *destination*; the
-/// server receives that connection's replies, so it matches the *source*. A
-/// portless packet (ICMP, and the fragments after the first) matches on the
-/// address alone.
+/// The frame arrives whole — the virtio-net header first — so the parse starts
+/// past it. The claim lives at the end this side owns: the client injected a
+/// visitor's packet for the address it carries, so it matches the
+/// *destination*; the server receives that connection's replies, so it matches
+/// the *source*. A portless packet (ICMP, and the fragments after the first)
+/// matches on the address alone.
 ///
 /// The parse is handed back rather than thrown away: the caller needs the
 /// packet's flow identity to keep its placement entry alive (see
-/// [`Routes::touch`]), and parsing twice per packet to get it would be a tax on
-/// every packet of the path.
-fn claimed_info(endpoint: &Endpoint, packet: &[u8], direction: Direction) -> Option<PacketInfo> {
-    let info = ip::parse(packet).ok()?;
+/// [`Routes::touch`]), and parsing twice per frame to get it would be a tax on
+/// every frame of the path.
+fn claimed_frame_info(
+    endpoint: &Endpoint,
+    frame: &[u8],
+    direction: Direction,
+) -> Option<PacketInfo> {
+    let info = frame_info(frame).ok()?;
     let (addr, port) = match direction {
         Direction::Source => (info.dst, info.dst_port),
         Direction::Destination => (info.src, info.src_port),
@@ -1713,6 +1783,15 @@ mod tests {
         packet
     }
 
+    /// A device frame: the all-zero (NONE) virtio-net header in front of the
+    /// packet — the shape [`Tun::drain`] hands the reader and what every
+    /// batch/flush test below pushes.
+    fn frame_of(packet: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; crate::transparent::tun::VNET_HDR_LEN];
+        frame.extend_from_slice(packet);
+        frame
+    }
+
     /// A full queue and a missing lane are **different** refusals.
     ///
     /// This is the distinction the round-3 policy did not have: it read
@@ -1733,7 +1812,11 @@ mod tests {
         let batch = |packet: &[u8]| {
             let mut frames = bytes::BytesMut::new();
             crate::protocol::IpTraffic::encode_into(&mut frames, packet).unwrap();
-            Batch { frames, packets: 1 }
+            Batch {
+                frames,
+                packets: 1,
+                packet_total: 1,
+            }
         };
 
         // One offer, accepted: the queue has room.
@@ -1773,14 +1856,30 @@ mod tests {
 
         let mut frames = bytes::BytesMut::new();
         crate::protocol::IpTraffic::encode_into(&mut frames, &packet_for_claim()).unwrap();
-        routes.flush(&web, slot, Batch { frames, packets: 1 });
+        routes.flush(
+            &web,
+            slot,
+            Batch {
+                frames,
+                packets: 1,
+                packet_total: 1,
+            },
+        );
         drop(held);
 
         // The lane is gone: vacate it, then offer the slot more traffic.
         routes.vacate(&web, slot);
         let mut frames = bytes::BytesMut::new();
         crate::protocol::IpTraffic::encode_into(&mut frames, &packet_for_claim()).unwrap();
-        routes.flush(&web, slot, Batch { frames, packets: 1 });
+        routes.flush(
+            &web,
+            slot,
+            Batch {
+                frames,
+                packets: 1,
+                packet_total: 1,
+            },
+        );
 
         // The claim left the table when its only lane went — so the gone lane's
         // evidence has to be read from the archive. That is the whole point of
@@ -2032,7 +2131,7 @@ mod tests {
             let (endpoint, placed) = routes.pick(&info, Direction::Destination).unwrap();
             assert_eq!(placed, *slot, "a flow keeps the member it was placed on");
             let mut batch = Batch::default();
-            batch.push(packet).unwrap();
+            batch.push(&frame_of(packet)).unwrap();
             assert!(routes.flush(&endpoint, placed, batch));
         }
         for (slot, queue) in [(0usize, &mut rx_first), (1usize, &mut rx_second)] {
@@ -2040,7 +2139,7 @@ mod tests {
                 Some((_, packet)) => {
                     let frames = queue.try_recv().unwrap();
                     assert_eq!(
-                        &frames[2..],
+                        &frames[4 + crate::transparent::tun::VNET_HDR_LEN..],
                         &packet[..],
                         "member {slot} carried the flow placed in it, and only that"
                     );
@@ -2291,8 +2390,8 @@ mod tests {
     async fn a_batch_is_a_run_of_the_same_frames() {
         use tokio::io::AsyncWriteExt;
 
-        let first = tcp_packet(4);
-        let second = tcp_packet(8);
+        let first = frame_of(&tcp_packet(4));
+        let second = frame_of(&tcp_packet(8));
         let mut batch = Batch::default();
         batch.push(&first).unwrap();
         batch.push(&second).unwrap();
@@ -2312,40 +2411,59 @@ mod tests {
     }
 
     /// The caps are what bound one hand-over: a small-packet flow is stopped by
-    /// the packet count, a bulk flow by the bytes, whichever comes first.
+    /// the packet count, a bulk flow by the bytes, whichever comes first. With
+    /// super-frames the byte cap is what a bulk flow actually hits — one
+    /// 65 KiB unit is a third of the budget, not a fifteenth.
     #[test]
     fn a_batch_is_bounded_by_packets_and_by_bytes() {
         let mut by_packets = Batch::default();
         for _ in 0..BATCH_PACKETS {
             assert!(!by_packets.is_full(), "not full before the cap is reached");
-            by_packets.push(&tcp_packet(4)).unwrap();
+            by_packets.push(&frame_of(&tcp_packet(4))).unwrap();
         }
         assert!(by_packets.is_full(), "the packet cap bounds it");
 
         let mut by_bytes = Batch::default();
-        let big = tcp_packet(1400);
-        while by_bytes.frames.len() < BATCH_BYTES {
-            by_bytes.push(&big).unwrap();
-        }
+        // A whole super-frame (~65 KiB) per push: two of them pass the byte
+        // cap, one does not — the shape a bulk flow actually arrives in now.
+        let big = frame_of(&tcp_packet(64_000));
+        by_bytes.push(&big).unwrap();
+        assert!(
+            !by_bytes.is_full(),
+            "one super-frame is inside the batch budget"
+        );
+        by_bytes.push(&big).unwrap();
         assert!(by_bytes.is_full(), "the byte cap bounds it");
         assert!(
             by_bytes.packets < BATCH_PACKETS,
             "a bulk flow reaches the byte cap first"
         );
+
+        // And one super-frame alone is a meaningful slice of a batch, which is
+        // the whole point of the device's offload declaration.
+        let mut one = Batch::default();
+        one.push(&frame_of(&tcp_packet(60_000))).unwrap();
+        assert!(
+            one.frames.len() > BATCH_BYTES / 3,
+            "a super-frame should dominate a batch: {} bytes",
+            one.frames.len()
+        );
     }
 
-    /// A packet the frame format cannot carry is refused without disturbing the
-    /// packets already batched: the batch is not the packet's problem.
+    /// The length prefix's guards: a zero prefix is a corrupt stream, and a
+    /// prefix shorter than the virtio-net header cannot name a packet. (An
+    /// over-limit frame has no test: the device's own read ceiling
+    /// ([`MAX_PACKET`], ~66 KiB) is orders of magnitude below the `u32`
+    /// prefix, so the writer's refusal is unreachable from a real device.)
     #[test]
-    fn an_unframable_packet_leaves_the_batch_intact() {
-        let mut batch = Batch::default();
-        batch.push(&tcp_packet(4)).unwrap();
-        let before = batch.frames.len();
+    fn an_unframable_frame_is_named_at_the_length_check() {
+        // A zero-length prefix is a corrupt stream, not an empty frame.
+        let err = IpTraffic::frame_at(&0u32.to_be_bytes()).unwrap_err();
+        assert!(format!("{err:#}").contains("Empty IP frame"));
 
-        let oversized = vec![0u8; usize::from(u16::MAX) + 1];
-        assert!(batch.push(&oversized).is_err());
-        assert_eq!(batch.frames.len(), before);
-        assert_eq!(batch.packets, 1);
+        // And a prefix shorter than the virtio-net header cannot name a packet.
+        let err = IpTraffic::frame_at(&8u32.to_be_bytes()).unwrap_err();
+        assert!(format!("{err:#}").contains("shorter than its virtio-net header"));
     }
 
     /// The routing answer is the endpoint, not the queue, so a flush after the

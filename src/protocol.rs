@@ -753,23 +753,48 @@ pub fn digest(data: &[u8]) -> Digest {
     d.into()
 }
 
-/// The framing of a transparent data channel: `[u16 length][packet]`, in both
-/// directions.
+/// The framing of a transparent data channel: `[u32 length][vnet frame]`, in
+/// both directions.
 ///
 /// A namespace type rather than a painted buffer — the packet's destination
 /// lives *inside* it, so unlike [`UdpTraffic`] there is no address tag to
 /// carry, and callers read straight into their own scratch buffer.
+///
+/// The "vnet frame" is the whole unit off the TUN device: the 10-byte
+/// virtio-net header followed by the packet (or GSO super-frame) it
+/// describes. The frame is relayed **whole** — the reader hands it over
+/// including the header, and the injection side writes it back with the
+/// header — because a `NEEDS_CSUM` frame only checksums correctly when the
+/// header travels with it, and a GSO super-frame only re-segments at the far
+/// end when its `gso_size` arrives intact.
+///
+/// The length prefix is `u32` (the old `u16` would have capped a frame below
+/// what the device can hand over: a GSO super-frame reaches ~65 560 bytes,
+/// past any 16-bit ceiling).
 // Present where it is carried (the transparent data path) or exercised (this
 // module's own framing tests): a build with neither would only know it as dead
 // code, and the tests would not compile without it.
+/// The 10-byte virtio-net header the transparent path relays in front of
+/// every frame (`include/uapi/linux/virtio_net.h`).
+///
+/// Declared here, not on the TUN side, because the transparent framing
+/// (`IpTraffic`) counts it — its length prefix is the frame's whole size,
+/// header included — and the framing compiles in builds whose `transparent`
+/// feature is off. The TUN side re-exports it as its own. Same gate as
+/// [`IpTraffic`]: without the framing there is nothing to count it into, and
+/// an unused constant is a dead one.
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub const VNET_HDR_LEN: usize = 10;
+
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
 pub struct IpTraffic;
 
 /// How much room a read makes for frames it has not parsed yet. One read of
 /// this size carries a whole batch from the far side, so the per-frame cost is
-/// a slice, not a syscall.
+/// a slice, not a syscall. Sized for the largest unit the transparent path
+/// moves: a GSO super-frame (up to ~64 KiB) plus its virtio-net header.
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
-const IP_READ_CHUNK: usize = 32 * 1024;
+const IP_READ_CHUNK: usize = 68 * 1024;
 
 /// Frames read from a transparent channel, with the reads batched.
 ///
@@ -798,15 +823,16 @@ impl<R: AsyncRead + Unpin> IpFrames<R> {
         }
     }
 
-    /// The next frame. The returned slice is valid until the next call.
+    /// The next frame — the whole `[vnet header][packet]` unit.
     ///
-    /// The end of the stream is an error, not an empty frame: this channel
-    /// exists only while its service does, and the caller answers a channel
-    /// that ended by asking for another one.
+    /// The returned slice starts at the virtio-net header and stays valid
+    /// until the next call. The end of the stream is an error, not an empty
+    /// frame: this channel exists only while its service does, and the caller
+    /// answers a channel that ended by asking for another one.
     pub async fn next(&mut self) -> Result<&[u8]> {
         loop {
             if let Some(len) = IpTraffic::frame_at(&self.buf[self.start..])? {
-                let start = self.start + 2;
+                let start = self.start + 4;
                 self.start = start + len;
                 return Ok(&self.buf[start..start + len]);
             }
@@ -841,22 +867,25 @@ impl<R: AsyncRead + Unpin> IpFrames<R> {
 
 #[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
 impl IpTraffic {
-    /// Append one packet to a batch as a `[u16 length][packet]` frame.
+    /// Append one **whole device frame** (virtio-net header already in front)
+    /// to a batch as a `[u32 length][frame]` entry.
     ///
-    /// Synchronous on purpose: a packet is framed where it is read, so a whole
-    /// batch of frames can be handed over and written as one unit. The frame
-    /// itself is unchanged — a batch is several of them in one write, and the
-    /// reader on the far side consumes them one frame at a time.
-    pub fn encode_into(batch: &mut BytesMut, packet: &[u8]) -> Result<()> {
-        let len = u16::try_from(packet.len()).with_context(|| {
+    /// Synchronous on purpose: a frame is framed where it is read, so a whole
+    /// batch of frames can be handed over and written as one unit. Nothing is
+    /// prepended here — the caller's frame is exactly the unit the device
+    /// produced, and it is relayed byte for byte; the length prefix is the
+    /// frame's own size, which is what [`Self::frame_at`] on the far side
+    /// expects.
+    pub fn encode_into(batch: &mut BytesMut, frame: &[u8]) -> Result<()> {
+        let len = u32::try_from(frame.len()).with_context(|| {
             format!(
-                "IP packet of {} bytes exceeds the wire format limit",
-                packet.len()
+                "device frame of {} bytes exceeds the wire format limit",
+                frame.len()
             )
         })?;
-        batch.reserve(2 + packet.len());
-        batch.put_u16(len);
-        batch.extend_from_slice(packet);
+        batch.reserve(4 + frame.len());
+        batch.put_u32(len);
+        batch.extend_from_slice(frame);
         Ok(())
     }
 
@@ -864,16 +893,21 @@ impl IpTraffic {
     /// there — the frame format's only reader, so the writer and the reader
     /// cannot drift apart.
     ///
-    /// A zero-length frame is a protocol error rather than an empty packet.
+    /// A frame shorter than the virtio-net header cannot name a packet; a
+    /// zero-length frame is a protocol error rather than an empty packet.
     pub fn frame_at(available: &[u8]) -> Result<Option<usize>> {
-        let Some(header) = available.first_chunk::<2>() else {
+        let Some(header) = available.first_chunk::<4>() else {
             return Ok(None);
         };
-        let len = usize::from(u16::from_be_bytes(*header));
+        let len = u32::from_be_bytes(*header);
         if len == 0 {
             bail!("Empty IP frame: the stream is corrupt");
         }
-        if available.len() < 2 + len {
+        let len = len as usize;
+        if len < VNET_HDR_LEN {
+            bail!("IP frame shorter than its virtio-net header ({len} bytes)");
+        }
+        if available.len() < 4 + len {
             return Ok(None);
         }
         Ok(Some(len))
@@ -2294,8 +2328,8 @@ mod tests {
         assert!(matches!(second, ControlChannelCmd::HeartBeat));
     }
 
-    /// The transparent data channel's framing: `[u16 length][packet]`, and the
-    /// packet comes back byte for byte -- including the header, which is the
+    /// The transparent data channel's framing: `[u16 length][vnet frame]`, and
+    /// the frame comes back byte for byte -- header included, which is the
     /// whole point of this service type.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
@@ -2308,42 +2342,54 @@ mod tests {
         ];
         packet.extend_from_slice(&[10, 0, 0, 1]);
         packet.extend_from_slice(b"payload");
+        // The frame is the whole device unit: virtio-net header first.
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        frame.extend_from_slice(&packet);
 
         let (mut tx, mut rx) = duplex(4096);
         // A batch of one here; the writer hands over whole batches.
         let mut batch = BytesMut::new();
-        IpTraffic::encode_into(&mut batch, &packet).unwrap();
+        IpTraffic::encode_into(&mut batch, &frame).unwrap();
         tx.write_all(&batch).await.unwrap();
 
         let mut frames = IpFrames::new(&mut rx);
         let got = frames.next().await.unwrap();
-        assert_eq!(got, &packet[..], "the packet must survive verbatim");
+        assert_eq!(got, &frame[..], "the frame must survive verbatim");
+        // And the packet is still readable past the header.
+        assert_eq!(&got[VNET_HDR_LEN..], &packet[..]);
     }
 
-    /// A frame longer than the reader is willing to buffer is refused by the
-    /// length prefix, and a zero-length frame is a corrupt stream — neither may
-    /// be handed to the caller as a packet.
+    /// A zero-length prefix is a corrupt stream, not an empty packet, and the
+    /// reader names it; an over-limit frame is refused by the writer before
+    /// anything reaches the channel. (The length ceiling itself is `u32` now —
+    /// the device's ~66 KiB super-frames have to fit — so the oversized case
+    /// is the writer's refusal, not the reader's.)
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
     async fn ip_frame_rejects_empty_and_oversized() {
         use tokio::io::duplex;
 
         let (mut tx, mut rx) = duplex(64);
-        tx.write_u16(0).await.unwrap();
+        tx.write_u32(0).await.unwrap();
         let mut frames = IpFrames::new(&mut rx);
         let err = frames.next().await.unwrap_err();
         assert!(format!("{err:#}").contains("Empty IP frame"));
 
-        // One byte past the wire-format ceiling must be refused while the
-        // batch is built, before anything reaches the channel.
-        let oversized = vec![0u8; usize::from(u16::MAX) + 1];
+        // A frame the writer cannot name (past the u32 prefix) is refused
+        // while the batch is built, before anything reaches the channel. The
+        // 5 GiB frame only exists on a 64-bit target; the assertion that
+        // matters is the refusal, not the size.
         let mut batch = BytesMut::new();
-        let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
-        assert!(format!("{err:#}").contains("exceeds the wire format limit"));
-        assert!(
-            batch.is_empty(),
-            "a refused packet must not leave a partial frame in the batch"
-        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            let oversized: Box<[u8]> = vec![0u8; 5 * 1024 * 1024 * 1024].into_boxed_slice();
+            let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
+            assert!(format!("{err:#}").contains("exceeds the wire format limit"));
+            assert!(
+                batch.is_empty(),
+                "a refused frame must not leave a partial frame in the batch"
+            );
+        }
     }
 
     /// A truncated frame (the writer died mid-packet) surfaces as an error, so
@@ -2373,10 +2419,17 @@ mod tests {
     async fn a_run_of_frames_reads_back_frame_by_frame() {
         use tokio::io::AsyncWriteExt;
 
-        let packets: Vec<Vec<u8>> = (0..3).map(|i| vec![0x45; 20 + i * 100]).collect();
+        // Frames as the device hands them over: vnet header first.
+        let frames_in: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                let mut f = vec![0u8; VNET_HDR_LEN];
+                f.extend_from_slice(&vec![0x45; 20 + i * 100]);
+                f
+            })
+            .collect();
         let mut batch = BytesMut::new();
-        for packet in &packets {
-            IpTraffic::encode_into(&mut batch, packet).unwrap();
+        for frame in &frames_in {
+            IpTraffic::encode_into(&mut batch, frame).unwrap();
         }
 
         let (mut tx, mut rx) = tokio::io::duplex(4096);
@@ -2384,7 +2437,7 @@ mod tests {
         drop(tx);
 
         let mut frames = IpFrames::new(&mut rx);
-        for expected in &packets {
+        for expected in &frames_in {
             assert_eq!(frames.next().await.unwrap(), &expected[..]);
         }
         assert!(

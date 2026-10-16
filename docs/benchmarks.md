@@ -1134,16 +1134,29 @@ idea: parallel TUN queues (`IFF_MULTI_QUEUE`) would parallelise a device read
 that is not what limits a busy host, and the control is what makes that
 statement checkable instead of plausible.
 
-**What is left is per-packet syscall cost, and it is not ours to remove.** A
-`perf` profile of the release build during the bulk arm puts **84 % of the CPU
-in the kernel**, 10 % in molehill and 5 % in libc, with no symbol above 11 %:
-the cost is one TUN read, one socket write, one socket read and one TUN write
-per packet, spread thin. No userspace hotspot exists to fix — a synchronous
-data path would chase the 10 %, not the 84 % — and the lever that does move it
-is the **packet size**: the same bytes in 8000-byte packets instead of 1400
-measured 1.8× the throughput at half the CPU per byte. That is an operator
-setting, not a code change: the TUN MTU, with a link MTU to match
-([deployment.md](deployment.md#transparent-services)).
+**What is left is per-packet syscall cost — and the packet size inside the
+device is now ours to change.** A `perf` profile of the release build during
+the bulk arm puts **84 % of the CPU in the kernel**, 10 % in molehill and 5 %
+in libc, with no symbol above 11 %: the cost is one TUN read, one socket
+write, one socket read and one TUN write per packet, spread thin. No
+userspace hotspot exists to fix — a synchronous data path would chase the
+10 %, not the 84 % — and the levers that move it are **the packet size**:
+- **The device's own offload (a code change, in v0.11.0):** the TUN device is
+  attached with `IFF_VNET_HDR` and declares `TUNSETOFFLOAD`, so the kernel
+  hands the reader TCP super-frames instead of segmenting first. Measured on
+  a routed forward path (two netns, one TUN hop, frames relayed whole):
+  3.85 GB of bulk TCP arrived as 576 071 reads of 1 500 bytes without the
+  declaration and as 59 160 reads averaging 65 212 bytes with it — the same
+  ratio of reads to bytes the 8000-byte-MTU operator lever buys below, taken
+  by the binary instead of the deployment. UDP GSO segments before the reader
+  on this kernel even with the declaration (UDP offload is TX-only here), so
+  the win is TCP-shaped; the probe is `~/tmp/tcp_tso_census2.py`, and the
+  wire's length prefix moved to `u32` the same release so a whole super-frame
+  fits one frame.
+- **The TUN MTU (an operator setting):** the same bytes in 8000-byte packets
+  instead of 1400 measured 1.8× the throughput at half the CPU per byte. That
+  is a deployment choice, not a code change: the TUN MTU, with a link MTU to
+  match ([deployment.md](deployment.md#transparent-services)).
 
 **What lending lanes buys, and when.** The L3 rows below are measured on claims
 that hold the lanes their share of the carrier budget gives them; the client also

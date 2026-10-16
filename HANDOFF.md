@@ -169,24 +169,40 @@
   byte-identical with and without it — and `githooks/check-docs` now fails any of
   the three copies of that list that is not `Cargo.toml`'s default set.
 
-- **The L3-versus-L4 throughput gap is the architecture, not a defect, and this
-  release does not change it.** Four TUN syscalls per data packet — the visitor's
-  data read and written, plus its acknowledgement read and written, because the
+- **The L3-versus-L4 throughput gap is the architecture, not a defect — and
+  then it was fixed.** Four TUN syscalls per data packet — the visitor's data
+  read and written, plus its acknowledgement read and written, because the
   *client's* kernel terminates the connection — put ~4.6 of the daemons' 7.7
   cores in system time. It is neither a lock nor one saturated stage: over 22
   threads, run ≈ 600 % against wait ≈ 1 %. Three candidate fixes were built or
   measured and refused (a serialized reader, the routing-table mutex, and
-  multi-queue TUN readers, which the A/B showed buy nothing and which would have
-  stranded every pre-v0.11.0 binary, since a `multi_queue` device refuses a
-  non-multi-queue attach). The levers are the TUN MTU and the lane budget, both
-  already documented; the record and the one test that could not resolve
-  anything are in the archive.
+  multi-queue TUN readers, which the A/B showed buy nothing and which would
+  have stranded every pre-v0.11.0 binary, since a `multi_queue` device refuses
+  a non-multi-queue attach).
+  **The fourth fix is the one that worked** (this session): the kernel was
+  segmenting every packet at the TUN boundary because the device never
+  declared the offloads its reader can take. `IFF_VNET_HDR` +
+  `TUNSETOFFLOAD(CSUM|TSO4|TSO6|ECN|USO4|USO6)` changes the unit of the whole
+  data path from one 1 400-byte packet to one ~64 KiB super-frame — measured
+  on a routed forward path, 3.85 GB of bulk TCP: 576 071 reads of 1 500 bytes
+  became 59 160 reads averaging 65 212 bytes. The frame travels the lane
+  whole (vnet header included, `NEEDS_CSUM` intact), the routing decision is
+  one lookup per super-frame, and the wire framing's length prefix moved from
+  `u16` to `u32` to carry a whole super-frame. Attach-time compatibility was
+  verified on this host: a VNET_HDR attach to a pre-created plain device
+  succeeds (unlike the `multi_queue` trap), so no operator recipe changes.
+  What did **not** work: `IFF_VNET_HDR` alone (the kernel still segments —
+  the declaration is the lever), and the UDP-GSO read side segments even with
+  the declaration on this kernel (UDP offload is TX-only here); TCP TSO is
+  the win. The probe scripts live in `~/tmp/tcp_tso_census2.py` (method:
+  two netns, one routed TUN hop, a userspace shuttle that relays frames
+  whole; `gso_probe5.py` is the UDP control).
 
 - **The sweep is owed.** The one running when the audit began was stopped: the
   L3 question was going to change `src/`, and a record measured before a code
-  change describes code that is no longer here. `src/` is now final (the audit's
-  only code change is `2d4cc0f`), so the release artifact has to be re-measured
-  at `dfe44b9` or later — the committed
+  change describes code that is no longer here. `src/` changed again with the
+  offload fix above, so the release artifact has to be re-measured at this
+  revision or later — the committed
   `results-bench-v0.11.0.json` is the earlier run at `1c2dcd9` and is not the
   release's.
 

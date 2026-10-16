@@ -40,6 +40,7 @@ import contextlib  # noqa: E402
 import importlib.util  # noqa: E402
 import json  # noqa: E402
 import py_compile  # noqa: E402
+import select  # noqa: E402
 import shutil  # noqa: E402
 import subprocess  # noqa: E402
 
@@ -248,7 +249,23 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
     loaded = False
     refused = ""
     try:
-        for line in proc.stdout:
+        # select() around every read: the deadline has to bound the *wait*,
+        # not only the time between lines. A bare `for line in proc.stdout`
+        # parked in a blocking read(2) forever once (measured: the daemon had
+        # written its startup lines, the reader sat in pipe_read on the same
+        # pipe for ten minutes, and a loop that only checks the clock after a
+        # line arrives cannot bound a read that never returns — the whole
+        # pre-commit chain hung behind it twice).
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break  # the child closed its stdout
             out.append(line)
             if line.startswith("Running as"):
                 loaded = True
@@ -262,10 +279,8 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
             if line.startswith("Error: Failed to load"):
                 refused = line.strip()
                 break
-            if time.monotonic() > deadline:
-                break
     finally:
-        proc.terminate()
+        proc.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
         with contextlib.suppress(Exception):
