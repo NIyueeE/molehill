@@ -1,5 +1,5 @@
 use crate::common::helper::{datagram_len, udp_connect};
-#[cfg(feature = "notify")]
+#[cfg(feature = "hot-reload")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
 #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
@@ -8,16 +8,32 @@ use crate::config::{
     ClientConfig, ClientServiceConfig, Config, MaskedString, ServiceType, TransportConfig,
     TransportType,
 };
-#[cfg(feature = "multiplex")]
-use crate::config::{DataCarrier, DataMode};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
 use crate::protocol::{
     self, Ack, Auth, CURRENT_PROTO_VERSION, ControlChannelCmd, DataChannelCmd, HASH_WIDTH_IN_BYTES,
-    MAX_UDP_HEADER_LEN, SUPPORTED_PROTO_VERSIONS, ServiceId, ServiceRegistration, SessionCmd,
-    SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd, read_hello,
-    read_register_result, write_session_cmd, write_stream_prologue,
+    LaneId, MAX_UDP_HEADER_LEN, SUPPORTED_PROTO_VERSIONS, ServiceId, ServiceRegistration,
+    SessionCmd, SessionRegistration, UdpTraffic, read_ack, read_control_cmd, read_data_cmd,
+    read_hello, read_register_result, write_session_cmd, write_stream_prologue,
 };
+// The mux prologue is written only where multiplexed tunnels exist.
+#[cfg(feature = "multiplex")]
+use crate::protocol::write_tunnel_prologue;
+// The lane *prologue* is what only a transparent+multiplex build writes; the
+// `LaneId` type itself is imported above for every build, because a data
+// channel's signature carries `Option<LaneId>` wherever it is compiled.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::protocol::write_lane_prologue;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::Direction;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::Endpoint;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::hub::TunHub;
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+use crate::transparent::lanes::{self, ClaimLoad, LaneLoad};
+#[cfg(feature = "multiplex")]
+use crate::transport::carrier::{CarrierChoice, KCP_ATTEMPT_BUDGET, first_carrier};
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
@@ -43,6 +59,8 @@ use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 #[cfg(feature = "multiplex")]
 use crate::transport::multiplex::{Carrier, ClientTunnel, Dialer, StreamLease, TunnelPool};
 
+#[cfg(feature = "multiplex")]
+use crate::common::constants::DEFAULT_MUX_TUNNELS;
 use crate::common::constants::{
     DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
     DEFAULT_UDP_WORKERS, FORWARD_IDLE_TIMEOUT, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
@@ -68,11 +86,13 @@ pub async fn run_client(
 type Nonce = protocol::Digest;
 
 /// Data-plane knobs for one service, resolved from `[client.data]` with the
-/// service's own `mode`/`carrier` overrides.
+/// service's own `tunnels` override.
 #[derive(Clone, Debug, Default)]
 struct DataOpts {
-    /// Whether the service multiplexes its data plane onto tunnels. Only the
-    /// `multiplex` build has tunnels, so the field does not exist without it.
+    /// Whether the service multiplexes its data plane onto tunnels. Derived
+    /// from the service type rather than configured
+    /// ([`ClientServiceConfig::uses_pool`]); only the `multiplex` build has
+    /// tunnels, so the field does not exist without it.
     #[cfg(feature = "multiplex")]
     enabled: bool,
     /// Endpoint the data plane dials: the service's own `remote_addr` when
@@ -80,18 +100,39 @@ struct DataOpts {
     /// channel's
     /// `remote_addr`.
     addr: String,
-    /// Which carrier carries the data plane.
+    /// How many tunnels this service's pool establishes at start
+    /// (`[client.data].tunnels`, or the service's own), or `None` when the
+    /// operator left it to the default — which the pool raises to the
+    /// UDP-derived floor of the services sharing it.
     #[cfg(feature = "multiplex")]
-    carrier: DataCarrier,
-    /// The cap the pool may grow to for this service's carrier
-    /// (`[client.data.tcp|kcp].max_tunnels`). The pool starts cold and grows
-    /// up to it on demand.
+    tunnels: Option<usize>,
+    /// How many data channels this service opens itself (a UDP service's
+    /// worker set; 0 for the others). It is the service's own contribution to
+    /// the pool's UDP-derived floor.
     #[cfg(feature = "multiplex")]
-    max_tunnels: usize,
+    channels: u16,
     /// Noise key config, `Some` iff the control transport is `noise`; KCP
     /// tunnels wrap it on top (the crypto stack is kept).
     #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
     noise: Option<NoiseConfig>,
+}
+
+#[cfg(feature = "multiplex")]
+impl DataOpts {
+    /// How many tunnels to establish, given the UDP-derived floor of the
+    /// services that will share this pool.
+    ///
+    /// The operator's number when they wrote one (the configuration is
+    /// validated against the floor before a client ever gets here), else the
+    /// default raised to it — so a deployment that declares four UDP workers
+    /// gets at least four tunnels without the operator having to repeat the
+    /// arithmetic, and a TCP-only deployment keeps the plain default.
+    fn tunnel_target(&self, floor: usize) -> usize {
+        match self.tunnels {
+            Some(n) => n,
+            None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
+        }
+    }
 }
 
 /// Placeholder so the channel-opening code keeps one shape without the
@@ -100,9 +141,9 @@ struct DataOpts {
 #[cfg(not(feature = "multiplex"))]
 struct Tunnels;
 
-/// A data-channel open the elastic pool refused. Reported once per process,
+/// A data-channel open the tunnel pool refused. Reported once per process,
 /// then DEBUG: the visitor's failure is per-connection, the condition behind it
-/// is the operator's to see (the pool at its ceiling, or a growth the server's
+/// is the operator's to see (the pool at its ceiling, or a repair the server's
 /// valve refuses).
 #[cfg(feature = "multiplex")]
 static OPEN_REFUSED: RepeatNotice = RepeatNotice::new();
@@ -118,10 +159,16 @@ type Pins = ();
 /// One connection dialed by the client, after its v3 transport selector
 /// byte: plain TCP, or TCP wrapped in the Noise record stream. The
 /// transport is a per-service decision (see `ClientTransport`).
+///
+/// A `Kcp` variant is the carrier's own byte stream. A KCP *tunnel* is a yamux
+/// session whose channels are `TunnelStream`s, so this variant exists for the
+/// **direct** data channels, where the carrier's session is the channel.
 enum ClientStream {
     Plain(TcpStream),
     #[cfg(feature = "noise")]
     Noise(Box<crate::transport::NoiseStream<TcpStream>>),
+    #[cfg(feature = "kcp")]
+    Kcp(crate::transport::kcp::KcpTunnelStream),
 }
 
 impl std::fmt::Debug for ClientStream {
@@ -130,17 +177,25 @@ impl std::fmt::Debug for ClientStream {
             ClientStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
             #[cfg(feature = "noise")]
             ClientStream::Noise(_) => f.debug_tuple("Noise").finish(),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => f.debug_tuple("Kcp").field(s).finish(),
         }
     }
 }
 
 impl ClientStream {
     /// Apply socket options to the underlying TCP socket.
+    ///
+    /// A KCP stream has no socket of its own: its session's UDP socket is tuned
+    /// where it is created (`transport::kcp::tune_socket_buffers`), and the
+    /// per-connection TCP options have nothing to land on.
     fn hint(&self, opts: SocketOpts) {
         match self {
             ClientStream::Plain(s) => opts.apply(s),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => opts.apply(s.get_inner()),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(_) => {}
         }
     }
 }
@@ -155,6 +210,8 @@ impl tokio::io::AsyncRead for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -169,6 +226,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -179,6 +238,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -189,6 +250,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "noise")]
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
+            ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -258,7 +321,7 @@ impl ClientTransport {
 
 impl DataOpts {
     /// Resolve the data-plane knobs for one service: `[client.data]` as
-    /// defaults, overridden by the service's own `mode`/`carrier`.
+    /// defaults, overridden by the service's own `tunnels`.
     /// The data endpoint follows the service's own server: its `remote_addr`
     /// override when set, else `[client.data].default_data_addr` (or the
     /// client-wide
@@ -266,14 +329,19 @@ impl DataOpts {
     fn for_service(c: &ClientConfig, s: &ClientServiceConfig) -> DataOpts {
         DataOpts {
             #[cfg(feature = "multiplex")]
-            enabled: s
-                .mode
-                .map_or_else(|| c.multiplex_enabled(), |m| m == DataMode::Multiplex),
+            enabled: s.uses_pool(),
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
-            carrier: s.carrier.unwrap_or(c.data.default_carrier),
+            tunnels: c.limits_for(s).tunnels(),
             #[cfg(feature = "multiplex")]
-            max_tunnels: c.max_tunnels(s.carrier.unwrap_or(c.data.default_carrier)),
+            channels: match s.service_type {
+                ServiceType::Udp => s.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS),
+                // A claim's lanes are connections of its own, drawn from its
+                // carrier's budget — never a pool. The budget is capped at
+                // `MAX_TRANSPARENT_LANES`, so the conversion cannot truncate.
+                ServiceType::Transparent => u16::try_from(s.lanes()).unwrap_or(u16::MAX),
+                ServiceType::Tcp => 0,
+            },
             #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
             noise: match s.transport_type_with(c.transport.transport_type) {
                 TransportType::Noise => s.noise_config_with(c.transport.noise.as_ref()).cloned(),
@@ -331,12 +399,16 @@ impl ServiceSlot {
                 name: self.service.name.clone(),
                 service_type: self.service.service_type,
                 bind_addr,
-                // Client-declared data-plane carrier; the server validates it
-                // against its own capabilities and lazily opens listeners.
+                // The carrier the client will **try first** (KCP where the
+                // feature is built in, TCP otherwise). The server opens the
+                // listener that needs opening and validates nothing further: a
+                // channel that arrives on the other carrier is served exactly
+                // the same, which is what lets the fallback work without a
+                // second registration.
                 carrier: {
                     #[cfg(feature = "multiplex")]
                     {
-                        protocol::Carrier::from_data_carrier(self.data.carrier)
+                        protocol::Carrier::from_data_carrier(first_carrier())
                     }
                     #[cfg(not(feature = "multiplex"))]
                     {
@@ -359,6 +431,114 @@ enum SessionRequest {
     /// Drop a service: the server releases its public endpoint while the
     /// session keeps serving its siblings.
     Deregister(ServiceId),
+    /// Ask the peer to stop using one of a claim's lanes, or to take it back.
+    ///
+    /// The allocator decides (it is the only thing that reads the evidence) but
+    /// does not own the writer, so the ask travels through the same channel a
+    /// registration does.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    DrainLane {
+        service: ServiceId,
+        lane: [u8; 4],
+        cancel: bool,
+    },
+}
+
+/// What every tunnel of this process has carried so far, as
+/// `(delivered, written)` pairs in pool order.
+///
+/// **Delivered** is read out of the tunnel; **written** is handed into it. This
+/// is the L4 quality signal: a carrier that is slow shows up as a low
+/// per-tunnel rate, and backpressure makes both ends observe the same rate — so
+/// the deciding end can measure it here, with no peer report. (L3 could not:
+/// there the *loss* is on the peer's offering side, which this end never sees.)
+///
+/// The counters live in each tunnel's own
+/// [`TunnelCounters`](crate::transport::multiplex::TunnelCounters) — two
+/// relaxed adds per IO poll, no lock — and the pool snapshot carries them, so
+/// this reads the same registry every pool is already in. The predecessor was
+/// a process-wide `Mutex<HashMap>` the *same* IO poll took on every read and
+/// write, which serialized every multiplexed byte behind one lock whether or
+/// not anyone had asked for the diagnostic.
+///
+/// Cumulative for a tunnel's life: a policy compares *windows*, so it takes
+/// two snapshots and differences them, exactly as the lane policy does.
+#[cfg(feature = "multiplex")]
+pub(crate) fn tunnel_bytes() -> Vec<(u64, u64)> {
+    crate::transport::multiplex::live_pools()
+        .into_iter()
+        .flat_map(|pool| pool.bytes)
+        .collect()
+}
+
+/// Print each tunnel's cumulative bytes once a second, while
+/// `MOLEHILL_TUNNEL_STATS` is set.
+///
+/// The instrument has to be readable in a run to be worth having: it exists to
+/// answer one question the L4 work is falsifiable on — **do tunnels on different
+/// carriers carry materially different rates?** — which is the same shape the
+/// lane counters had (S1 measured before S2 decided).
+#[cfg(feature = "multiplex")]
+fn spawn_tunnel_stats() {
+    if std::env::var_os("MOLEHILL_TUNNEL_STATS").is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let mut counts = tunnel_bytes();
+            if counts.is_empty() {
+                continue;
+            }
+            // Pool order, numbered: the line has no tunnel ids (they live in
+            // the pool-stats line beside it), but the position is stable
+            // between lines of the same run, so a reader can difference two.
+            let line: Vec<String> = counts
+                .drain(..)
+                .enumerate()
+                .map(|(i, (delivered, written))| format!("{i}:{delivered}/{written}"))
+                .collect();
+            tracing::info!(
+                "tunnel-stats: delivered/written bytes per tunnel {}",
+                line.join(" ")
+            );
+        }
+    });
+}
+
+/// One lane's cumulative counters as of the previous tick.
+///
+/// `(peer offered, peer refused, this end injected)`: the peer's two are what its
+/// report carries, and the third is this end's own view of the same lane. A
+/// window is the difference between two of these.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+type LaneSample = (u64, u64, u64);
+
+/// What the server said about the drains this client asked for, by lane.
+///
+/// The dialer cannot see the flows the peer placed on a lane, so its own
+/// emptiness is only half the question; this is the other half, and a lane is
+/// only retired once it says [`crate::protocol::LANE_DRAIN_READY`].
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct LaneDrainState {
+    states: std::sync::Mutex<HashMap<(ServiceId, LaneId), u8>>,
+}
+
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+impl LaneDrainState {
+    fn set(&self, service: ServiceId, lane: LaneId, state: u8) {
+        if let Ok(mut states) = self.states.lock() {
+            states.insert((service, lane), state);
+        }
+    }
+
+    fn take(&self, service: ServiceId, lane: LaneId) -> Option<u8> {
+        self.states
+            .lock()
+            .ok()
+            .and_then(|mut states| states.remove(&(service, lane)))
+    }
 }
 
 /// The identity of one control session: the endpoint and the wire stack it is
@@ -400,6 +580,11 @@ struct Client {
     sessions: Vec<SessionEntry>,
     /// Every service this client runs, by name.
     services: HashMap<String, ServiceLocation>,
+    /// The status API's ask channels, by the endpoint a session dials: one
+    /// sender per session, consumed by the status task's report. An endpoint
+    /// without a `[client.status]` block has no entry, and nothing reads the
+    /// map.
+    status_asks: HashMap<String, mpsc::UnboundedSender<crate::status::SessionAsk>>,
 }
 
 impl Client {
@@ -411,6 +596,7 @@ impl Client {
             config,
             sessions: Vec::new(),
             services: HashMap::new(),
+            status_asks: HashMap::new(),
         }
     }
 
@@ -427,6 +613,20 @@ impl Client {
             self.add_service(config)?;
         }
 
+        // The optional status API: one read-only listener the sessions answer.
+        // Off unless `[client.status]` exists; the asks map is empty without
+        // it, so spawning the task anyway would only cost a dead select arm —
+        // and one condition here reads clearer than one feature flag there.
+        let status_task = self.config.status.clone().map(|status| {
+            let asks = self.status_asks.clone();
+            let shutdown = shutdown_rx.resubscribe();
+            tokio::spawn(async move {
+                if let Err(e) = crate::status::run(status, shutdown, asks).await {
+                    error!("status API stopped: {e:#}");
+                }
+            })
+        });
+
         // Wait for the shutdown signal
         loop {
             tokio::select! {
@@ -441,11 +641,11 @@ impl Client {
                 },
                 e = update_rx.recv() => {
                     if let Some(e) = e {
-                        #[cfg(feature = "notify")]
+                        #[cfg(feature = "hot-reload")]
                         self.handle_hot_reload(e);
                         // Without the `notify` feature the config never
                         // changes at runtime; nothing can arrive here.
-                        #[cfg(not(feature = "notify"))]
+                        #[cfg(not(feature = "hot-reload"))]
                         warn!("Ignored {e:?} since running as a client");
                     }
                 }
@@ -456,6 +656,13 @@ impl Client {
         // of that endpoint's public ports on the server.
         for entry in self.sessions.drain(..) {
             entry.handle.shutdown();
+        }
+
+        // The status task ends on its own (its select carries the same
+        // shutdown signal); keep the handle so the join is not silently
+        // detached work at exit.
+        if let Some(task) = status_task {
+            let _ = task.await;
         }
 
         Ok(())
@@ -490,12 +697,24 @@ impl Client {
         // The client opens its configured channels itself: a v4 registration
         // asks the server for none. UDP opens its worker set (they are the
         // sharding targets and the pool's UDP floor); TCP opens none, because
-        // the server asks for one channel per visitor.
+        // the server asks for one channel per visitor; a transparent service
+        // opens its **lanes** — one carrier connection per lane, from the
+        // carrier's budget — and keeps them, because the claim's inner flows are
+        // spread across them and the server asks for a replacement for each lane
+        // that ends.
         let channels = match cfg.service_type {
             ServiceType::Tcp => 0,
             ServiceType::Udp => usize::from(cfg.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS)),
+            ServiceType::Transparent => cfg.lanes(),
         };
         let retry_interval = cfg.retry_interval.unwrap_or(1);
+
+        // A transparent service's prerequisites are the operator's to satisfy
+        // and this process's to verify: it must already own the address it
+        // claims, and the kernel must be willing to accept injected packets.
+        if cfg.service_type == ServiceType::Transparent {
+            check_transparent_client(&cfg)?;
+        }
 
         let previous = self.services.remove(&name);
         if let Some(loc) = &previous
@@ -568,6 +787,7 @@ impl Client {
             return i;
         }
         let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (ask_tx, ask_rx) = mpsc::unbounded_channel::<crate::status::SessionAsk>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let session = ClientSession {
             remote_addr: key.addr.clone(),
@@ -575,6 +795,7 @@ impl Client {
             token: self.config.default_token.clone(),
             default_heartbeat_timeout: self.config.control.default_heartbeat_timeout,
             req_rx,
+            ask_rx,
             shutdown_rx,
             services: HashMap::new(),
             pending_drops: Vec::new(),
@@ -583,9 +804,15 @@ impl Client {
             #[cfg(feature = "multiplex")]
             shared_pool: self.config.shared_pool(),
             #[cfg(feature = "multiplex")]
-            idle_timeout: self.config.pool_idle_timeout(),
-            #[cfg(feature = "multiplex")]
             pins: Arc::new(crate::transport::multiplex::PinRegistry::new()),
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            lane_pool: None,
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            req_tx: req_tx.clone(),
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            lane_drains: Arc::new(LaneDrainState::default()),
+            #[cfg(feature = "multiplex")]
+            carriers: HashMap::new(),
         };
         tokio::spawn(
             async move {
@@ -593,6 +820,7 @@ impl Client {
             }
             .instrument(Span::current()),
         );
+        let endpoint = key.addr.clone();
         self.sessions.push(SessionEntry {
             key,
             handle: ClientSessionHandle {
@@ -601,11 +829,15 @@ impl Client {
             },
             next_id: 0,
         });
+        // The status task asks this session for its view by endpoint; a
+        // session that never answers (reconnecting) is a gap in one report,
+        // not an error.
+        self.status_asks.insert(endpoint, ask_tx);
         self.sessions.len() - 1
     }
 
     /// Apply one client-service config change (add or remove a service).
-    #[cfg(feature = "notify")]
+    #[cfg(feature = "hot-reload")]
     fn handle_hot_reload(&mut self, e: ConfigChange) {
         match e {
             ConfigChange::ClientChange(client_change) => match *client_change {
@@ -643,6 +875,12 @@ struct RunDataChannelArgs {
     service_id: ServiceId,
     remote_addr: AddrMaybeCached,
     connector: Arc<ClientTransport>,
+    /// The carrier decision for this service's data endpoint, shared with every
+    /// other channel that dials it: a **direct** channel asks it which carrier
+    /// to use, and reports back what happened (the multiplex path makes the same
+    /// decision once, when it establishes its pool).
+    #[cfg(feature = "multiplex")]
+    carrier: Arc<CarrierChoice>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
     /// Mints this service session's data-channel ids: the key the UDP pin
@@ -651,6 +889,11 @@ struct RunDataChannelArgs {
     channels: std::sync::atomic::AtomicU64,
     /// Shared UDP hub for the service; `Some` iff this is a UDP service.
     udp: Option<Arc<UdpHub>>,
+    /// The service's Noise keys, when its control transport is `noise`: a KCP
+    /// data channel carries the same record stream a TCP one does, so it is
+    /// wrapped under exactly the same rule.
+    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    noise: Option<NoiseConfig>,
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
     /// here until the group is complete (see [`crate::stripe`]).
@@ -659,6 +902,26 @@ struct RunDataChannelArgs {
     /// Placement state of this service's stripe groups, by group id (D24).
     #[cfg(feature = "multiplex")]
     stripe_placements: StripePlacements,
+    /// Mints the *lane* ids this service's transparent claims dial.
+    ///
+    /// A lane is one physical carrier connection, and it is the unit a carrier
+    /// can be compared per — not the hub slot it happens to hold (a slot is
+    /// reused by whatever takes it next). The id is named in the lane's
+    /// prologue so the server knows which connection it is reading, which is
+    /// what will let it report what it received from a lane the client has
+    /// already retired.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    lane_ids: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+impl RunDataChannelArgs {
+    /// The next lane id: unique per service session, and never reused inside
+    /// one (a retired lane's id must not be read as its replacement's).
+    fn next_lane_id(&self) -> u32 {
+        self.lane_ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// What the server's `CreateDataChannelForStripe` said about one data channel:
@@ -699,10 +962,10 @@ const MAX_TRACKED_STRIPE_GROUPS: usize = 64;
 /// The server names the group in every `CreateDataChannelForStripe`, so the
 /// client knows what the placement rule alone never could: which of its opens
 /// belong together. It remembers the tunnels a group's stripes already took and
-/// hands the list to the pool, which grows to the group's K and avoids them —
-/// so the group's K data channels land on K distinct tunnels, a cold pool
-/// included. Without it, K requests were K indistinguishable opens and a cold
-/// pool (whose default state is *zero* tunnels) put the whole group on one.
+/// hands the list to the pool, which avoids them — so the group's K data
+/// channels land on K distinct tunnels while the pool has that many and share
+/// them when it does not. Without it, K requests were K indistinguishable opens
+/// and the whole group stacked on one tunnel.
 ///
 /// The map is per service (`RunDataChannelArgs` is one service's), so the group
 /// id alone is the key: a group belongs to one service of one session.
@@ -845,14 +1108,67 @@ impl RunDataChannelArgs {
     }
 }
 
-async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<ClientStream> {
+/// Dial the carrier a **direct** data channel rides.
+///
+/// TCP goes through the service's transport (`ClientTransport`, so Noise is
+/// applied where the control channel's wire stack says it should be) with the
+/// usual retry: a visitor may arrive while the server is briefly unreachable.
+/// KCP opens a session on the data endpoint directly — the carrier owns its own
+/// socket stack — and its reliability makes the retry loop meaningless: a lost
+/// datagram is KCP's business, and there is no connect error to retry on.
+async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStream> {
+    // KCP first, where the endpoint's choice still allows it: an attempt is
+    // bounded, and a path that cannot bring a session up in that budget is one
+    // where UDP is going nowhere — the fallback turns that into a delay on this
+    // channel rather than a data plane that never comes up.
+    #[cfg(all(feature = "multiplex", feature = "kcp"))]
+    if args.carrier.try_kcp() {
+        let remote_addr = {
+            let mut probe = args.remote_addr.clone();
+            probe
+                .resolve()
+                .await
+                .with_context(|| format!("Failed to resolve the data endpoint {}", probe.addr))?;
+            probe
+                .socket_addr
+                .ok_or_else(|| anyhow!("The data endpoint {} resolved to nothing", probe.addr))?
+        };
+        #[cfg(feature = "noise")]
+        let noise = args.noise.as_ref();
+        #[cfg(not(feature = "noise"))]
+        let noise = None;
+        match tokio::time::timeout(
+            KCP_ATTEMPT_BUDGET,
+            crate::transport::kcp::connect_stream(remote_addr, noise),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                args.carrier.reached_kcp();
+                return Ok(ClientStream::Kcp(stream));
+            }
+            Ok(Err(e)) => {
+                if !args.carrier.on_kcp_failure(&format!("{e:#}")) {
+                    return Err(e).context("the KCP session failed and the carrier is forced");
+                }
+            }
+            Err(_) => {
+                if !args
+                    .carrier
+                    .on_kcp_failure("the KCP session did not come up in time")
+                {
+                    bail!("the KCP session did not come up in time, and the carrier is forced");
+                }
+            }
+        }
+    }
+
     // Retry at least every 100ms, at most for 10 seconds
     let backoff = ExponentialBuilder::default()
         .with_max_delay(Duration::from_millis(100))
         .with_total_delay(Some(Duration::from_secs(10)));
 
-    // Connect to remote_addr
-    let mut conn: ClientStream = (|| async {
+    let conn = (|| async {
         args.connector
             .connect(&args.remote_addr)
             .await
@@ -865,6 +1181,13 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Clie
         debug!("{:#}. Retry in {:?}", e, duration);
     })
     .await?;
+    Ok(conn)
+}
+
+async fn do_data_channel_handshake(
+    args: Arc<RunDataChannelArgs>,
+) -> Result<(ClientStream, Option<LaneId>)> {
+    let mut conn = connect_direct_channel(&args).await?;
 
     conn.hint(args.socket_opts);
 
@@ -874,14 +1197,27 @@ async fn do_data_channel_handshake(args: Arc<RunDataChannelArgs>) -> Result<Clie
     let hello = Hello::DataChannelHello(CURRENT_PROTO_VERSION, args.session_nonce);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
+    // A transparent lane names itself, so the two ends can talk about the
+    // *connection* rather than about a slot: a slot is one end's routing index
+    // and is reused by whatever takes it next, which is what made a half-done
+    // handover invisible to the policy. The id is kept here as well as sent:
+    // the server reports what it offered *this* lane, and a report the dialer
+    // cannot match to a lane is a number about nothing. Everything else keeps
+    // the 4-byte prologue it has always written.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    if args.service.service_type == ServiceType::Transparent {
+        let lane = LaneId::new(args.next_lane_id());
+        write_lane_prologue(&mut conn, args.service_id, lane).await?;
+        return Ok((conn, Some(lane)));
+    }
     write_stream_prologue(&mut conn, args.service_id).await?;
 
-    Ok(conn)
+    Ok((conn, None))
 }
 
 async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
     // Do the handshake
-    let conn = do_data_channel_handshake(args.clone()).await?;
+    let (conn, lane) = do_data_channel_handshake(args.clone()).await?;
 
     // Forward
     forward_data_channel(
@@ -889,6 +1225,7 @@ async fn run_data_channel(args: Arc<RunDataChannelArgs>) -> Result<()> {
         &args.service,
         args.udp.clone(),
         args.stripes(),
+        lane,
     )
     .await
 }
@@ -903,7 +1240,7 @@ enum Tunnels {
 
 #[cfg(feature = "multiplex")]
 impl Tunnels {
-    /// Open the next data channel: a stream from the elastic pool, placed
+    /// Open the next data channel: a stream from the tunnel pool, placed
     /// least-loaded-first over the physical tunnels.
     async fn open_stream(&self) -> Result<TunnelStream> {
         match self {
@@ -974,6 +1311,15 @@ impl TunnelStream {
             TunnelStream::Yamux(lease) => lease.tunnel_id(),
         }
     }
+
+    /// Record what one IO poll moved across this channel's tunnel (see
+    /// [`StreamLease::count_bytes`]): the counters are the tunnel's own, so
+    /// the poll pays two relaxed adds and no lock.
+    fn count_bytes(&self, delivered: u64, written: u64) {
+        match self {
+            TunnelStream::Yamux(lease) => lease.count_bytes(delivered, written),
+        }
+    }
 }
 
 #[cfg(feature = "multiplex")]
@@ -1033,10 +1379,14 @@ async fn run_mux_data_channel(
     };
     trace!("Multiplexed data channel opened");
     // A v4 tunnel belongs to the session, so each of its streams names the
-    // service it carries: the server reads these four bytes before its
-    // forwarding command. Several services may share the tunnel — that is
-    // what a shared pool produces — so the routing is per stream.
-    write_stream_prologue(&mut stream, args.service_id).await?;
+    // service it carries: the server reads these bytes before its forwarding
+    // command. Several services may share the tunnel — that is what a shared
+    // pool produces — so the routing is per stream. The stream also names the
+    // **tunnel** it rides, which is what lets the server say what it offered
+    // that connection (see `TunnelId`).
+    let tunnel =
+        crate::protocol::TunnelId::new(u32::try_from(stream.tunnel_id()).unwrap_or(u32::MAX));
+    write_tunnel_prologue(&mut stream, args.service_id, tunnel).await?;
     // The channel belongs to one tunnel now: the client's UDP pin accounting
     // keys on the channel, so a peer's route can move a tunnel's pinned count.
     let channel = args
@@ -1050,6 +1400,9 @@ async fn run_mux_data_channel(
         &args.service,
         args.udp.clone(),
         args.stripes(),
+        // A stream of a multiplexed tunnel is not a lane: a claim never
+        // multiplexes, so nothing here has an id to report or to match.
+        None,
     )
     .await;
     if let Some(udp) = &args.udp {
@@ -1091,6 +1444,30 @@ enum ClientDataChannel {
     Mux(TunnelStream),
 }
 
+#[cfg(feature = "multiplex")]
+impl ClientDataChannel {
+    /// The carrier this channel rides, when the channel *is* the carrier.
+    ///
+    /// A direct channel is one carrier connection — a plain TCP socket, a Noise
+    /// stream over one, or a KCP session — so its own type is the answer, and
+    /// that is what a transparent lane needs: the hub records it per slot so the
+    /// allocator's carrier policy compares lanes by what they actually ride
+    /// rather than by the choice in force when they were dialed. A multiplexed
+    /// channel rides a tunnel whose carrier was decided when the pool was
+    /// established, which the pool knows and this type does not.
+    fn carrier(&self) -> Option<Carrier> {
+        match self {
+            // The KCP arm is the feature's: without `kcp` the variant does not
+            // exist and every raw channel is a TCP connection, which is the
+            // only carrier this build has.
+            #[cfg(feature = "kcp")]
+            Self::Raw(ClientStream::Kcp(_)) => Some(Carrier::Kcp),
+            Self::Raw(_) => Some(Carrier::Tcp),
+            Self::Mux(_) => None,
+        }
+    }
+}
+
 impl tokio::io::AsyncRead for ClientDataChannel {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -1100,7 +1477,17 @@ impl tokio::io::AsyncRead for ClientDataChannel {
         match self.get_mut() {
             ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "multiplex")]
-            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            ClientDataChannel::Mux(s) => {
+                let before = buf.filled().len();
+                let ready = std::pin::Pin::new(&mut *s).poll_read(cx, buf);
+                if let std::task::Poll::Ready(Ok(())) = ready {
+                    let got = buf.filled().len().saturating_sub(before);
+                    if got > 0 {
+                        s.count_bytes(u64::try_from(got).unwrap_or(u64::MAX), 0);
+                    }
+                }
+                ready
+            }
         }
     }
 }
@@ -1114,7 +1501,15 @@ impl tokio::io::AsyncWrite for ClientDataChannel {
         match self.get_mut() {
             ClientDataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "multiplex")]
-            ClientDataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            ClientDataChannel::Mux(s) => {
+                let ready = std::pin::Pin::new(&mut *s).poll_write(cx, buf);
+                if let std::task::Poll::Ready(Ok(n)) = ready
+                    && n > 0
+                {
+                    s.count_bytes(0, u64::try_from(n).unwrap_or(u64::MAX));
+                }
+                ready
+            }
         }
     }
 
@@ -1159,6 +1554,14 @@ async fn forward_data_channel(
         )
     )]
     stripes: &StripeRegistry,
+    #[cfg_attr(
+        not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+        expect(
+            unused_variables,
+            reason = "only a transparent claim's lane names itself in its prologue"
+        )
+    )]
+    lane: Option<LaneId>,
 ) -> Result<()> {
     let sock_opts = SocketOpts::from_client_cfg(service);
     match read_data_cmd(&mut conn).await? {
@@ -1202,8 +1605,91 @@ async fn forward_data_channel(
                 "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
             );
         }
+        DataChannelCmd::StartForwardTransparent => {
+            if service.service_type != ServiceType::Transparent {
+                bail!("Expect transparent traffic. Please check the configuration.")
+            }
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            run_transparent_channel(conn, service, lane).await?;
+            #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+            {
+                let _ = (conn, service);
+                bail!(
+                    "This build cannot carry a transparent service: it needs Linux and the \
+                     `transparent` feature"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+/// Inject what the tunnel sends for this service's claimed endpoint, and hand
+/// the kernel's return traffic back.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+async fn run_transparent_channel(
+    conn: ClientDataChannel,
+    service: &ClientServiceConfig,
+    lane: Option<LaneId>,
+) -> Result<()> {
+    use crate::transparent::hub::{TunHub, forward_transparent};
+    use crate::transparent::{Direction, Endpoint};
+
+    let addr: SocketAddr = service.remote_bind_addr.parse().with_context(|| {
+        format!(
+            "service {}: invalid `remote_bind_addr`: {:?}",
+            service.name, service.remote_bind_addr
+        )
+    })?;
+    // The hub owns the data path's counters, so every channel of the claim —
+    // its member set — counts into the same line. This channel becomes one
+    // member of that set for as long as it runs; the set's width is what the
+    // hub actually sees join, so a replacement inherits its predecessor's slot.
+    let hub = TunHub::get_or_spawn(&service.transparent_tun, Direction::Source)?;
+    // This end dialed the lane, so it knows which carrier it rides — the fact
+    // the allocator's carrier policy compares instead of trusting the choice it
+    // made earlier (a lane dialed before a switch rides the old carrier). The
+    // lane id it named is handed to the hub for the same reason: the server
+    // reports what it offered *that* connection, and a report this end cannot
+    // match to a lane is a number about nothing.
+    #[cfg(feature = "multiplex")]
+    let carrier = conn.carrier();
+    #[cfg(not(feature = "multiplex"))]
+    let carrier = None;
+    forward_transparent(
+        conn,
+        hub,
+        Endpoint::new(addr.ip(), addr.port()),
+        lane,
+        carrier,
+    )
+    .await
+}
+
+/// The client's side of a transparent service's contract, checked before the
+/// service registers rather than after its first packet disappears.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn check_transparent_client(cfg: &ClientServiceConfig) -> Result<()> {
+    let addr: SocketAddr = cfg.remote_bind_addr.parse().with_context(|| {
+        format!(
+            "service {}: invalid `remote_bind_addr`: {:?}",
+            cfg.name, cfg.remote_bind_addr
+        )
+    })?;
+    crate::transparent::check::check_client(&cfg.transparent_tun, &[addr.ip()]).with_context(|| {
+        format!(
+            "service {}: transparent prerequisites are not met",
+            cfg.name
+        )
+    })
+}
+
+#[cfg(not(all(feature = "transparent", target_os = "linux")))]
+fn check_transparent_client(_cfg: &ClientServiceConfig) -> Result<()> {
+    bail!(
+        "This build cannot carry a transparent service: it needs Linux and the `transparent` feature"
+    );
 }
 
 /// Dial an extra connection and upgrade it into a yamux data tunnel.
@@ -1234,20 +1720,26 @@ async fn establish_tunnel(
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tunnel = ClientTunnel::start(conn, config, shutdown_rx);
+    // The per-tunnel byte counters start with the first tunnel, like the KCP
+    // adapter's own stats task: no entry point has to know about it, and a
+    // run that never multiplexes pays nothing.
+    spawn_tunnel_stats();
     Ok((tunnel, shutdown_tx))
 }
 
-/// Establish one tunnel's pool: **cold**, plus the dialer every growth uses.
+/// Establish one service's tunnel pool: its configured count, plus the dialer
+/// every repair uses.
 ///
-/// There is no initial size any more (`default_count` / `count` are gone): the
-/// pool starts at zero and its first open grows it synchronously
-/// (`GrowReason::Cold`), so the client pays one tunnel setup on the first
-/// visitor after an idle period instead of keeping N connections warm for
-/// every configured service.
+/// All `tunnels` connections are dialed here, at service start, and kept for
+/// the service's lifetime; a tunnel that dies is replaced by the pool's repair
+/// tick, which is the only establishment after this point. The count is the
+/// operator's `[client.data].tunnels`, or the default raised to the
+/// UDP-derived floor (`floor`) of the services sharing the pool.
 ///
-/// The carrier follows `[client.data].default_carrier`: `tcp` dials the data
-/// endpoint with the control-channel wire stack, `kcp` opens KCP-over-UDP
-/// sessions (optionally Noise-wrapped). The pool's identity is `key`:
+/// The carrier is chosen at runtime, not written: KCP first (feature `kcp`),
+/// TCP when a KCP session cannot be established within the attempt's budget,
+/// with the decision remembered per data endpoint and re-probed after a
+/// cooldown (see [`crate::transport::carrier`]). The pool's identity is `key`:
 /// `session` for a shared pool, `service:<name>` otherwise.
 ///
 /// The returned senders shut the tunnel drivers down when dropped; a tunnel
@@ -1255,37 +1747,133 @@ async fn establish_tunnel(
 /// release it.
 #[cfg(feature = "multiplex")]
 async fn establish_tunnels(
-    transport: &Arc<ClientTransport>,
-    data_addr: &AddrMaybeCached,
-    session_nonce: Nonce,
-    opts: &DataOpts,
+    dial: PoolDial<'_>,
     key: &str,
-    idle_timeout: Duration,
+    floor: usize,
     pins: Arc<crate::transport::multiplex::PinRegistry>,
+    choice: &Arc<CarrierChoice>,
 ) -> Result<Tunnels> {
-    let carrier = match opts.carrier {
-        DataCarrier::Tcp => Carrier::Tcp,
-        DataCarrier::Kcp => Carrier::Kcp,
+    let opts = dial.opts;
+    // The pool's tunnels are established here, together, and kept for the
+    // service's lifetime: a deployment's capacity is what its configuration
+    // says it is, not what it happened to be doing a minute ago. The dialer
+    // stays with the pool for repair — a tunnel that dies is replaced so the
+    // count survives — which is the only runtime establishment left.
+    let target = opts.tunnel_target(floor);
+    // The carrier is decided once, here, and the choice remembers it for the
+    // endpoints's other channels: a pool that established on TCP keeps dialing
+    // TCP (its repair included), because a pool whose tunnels rode two carriers
+    // would be two pools wearing one name.
+    let (carrier, dialer, initial) = if choice.try_kcp() {
+        match dial.dialer().await {
+            Ok(dialer) => {
+                let attempt = tokio::time::timeout(
+                    KCP_ATTEMPT_BUDGET,
+                    establish_initial(&dialer, target, key, Carrier::Kcp),
+                )
+                .await;
+                match attempt {
+                    Ok(established) if !established.is_empty() => {
+                        choice.reached_kcp();
+                        (Carrier::Kcp, dialer, established)
+                    }
+                    Ok(_) => {
+                        if !choice.on_kcp_failure("no KCP session came up") {
+                            bail!("no KCP session came up, and the carrier is forced");
+                        }
+                        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
+                        (Carrier::Tcp, dialer, initial)
+                    }
+                    Err(_) => {
+                        if !choice.on_kcp_failure("KCP establishment timed out") {
+                            bail!("KCP establishment timed out, and the carrier is forced");
+                        }
+                        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
+                        (Carrier::Tcp, dialer, initial)
+                    }
+                }
+            }
+            Err(e) => {
+                if !choice.on_kcp_failure(&format!("{e:#}")) {
+                    return Err(e).context("the KCP dial failed and the carrier is forced");
+                }
+                let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
+                (Carrier::Tcp, dialer, initial)
+            }
+        }
+    } else {
+        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
+        (Carrier::Tcp, dialer, initial)
     };
-    let dialer = tunnel_dialer(transport, data_addr, session_nonce, opts).await?;
-    // Cold by construction: resolve the dialer (a KCP growth must not block on
-    // DNS later) and leave the pool empty until an open asks for a tunnel.
-    let initial = Vec::new();
-    debug!(
+    let established = initial.len();
+    info!(
         pool = %key,
         carrier = carrier.as_str(),
-        max_tunnels = opts.max_tunnels,
-        "Multiplexed data tunnel pool established cold"
+        tunnels = target,
+        established,
+        "pool-stats: tunnel pool established"
     );
-    Ok(Tunnels::Yamux(TunnelPool::with_dialer(
+    // The pool is told how to ask which carrier to establish *now*: a repair
+    // after a fallback comes up on the carrier the endpoint prefers, instead of
+    // dialing the one the pool was born on forever.
+    let preferred: crate::transport::multiplex::PreferredCarrier = {
+        let choice = Arc::clone(choice);
+        Arc::new(move || choice.carrier())
+    };
+    Ok(Tunnels::Yamux(TunnelPool::with_choice(
         carrier,
         key.to_owned(),
         initial,
-        opts.max_tunnels,
-        idle_timeout,
+        target,
         Some(dialer),
+        preferred,
         pins,
+        Some(Arc::clone(choice)),
     )))
+}
+
+/// Dial the pool's tunnels, concurrently, and hand back the ones that came up.
+///
+/// A partial result is not a failure: the pool repairs what is missing (its
+/// dialer is the same closure), and a service that cannot reach *any* tunnel
+/// says so on its first open — which is a better answer than refusing to start
+/// a service whose server is briefly unreachable.
+#[cfg(feature = "multiplex")]
+async fn establish_initial(
+    dialer: &crate::transport::multiplex::Dialer,
+    target: usize,
+    key: &str,
+    carrier: Carrier,
+) -> Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> {
+    let mut dials = tokio::task::JoinSet::new();
+    for _ in 0..target {
+        let dial = Arc::clone(dialer);
+        dials.spawn(async move { dial(carrier).await });
+    }
+    let mut initial = Vec::with_capacity(target);
+    let mut failures = 0usize;
+    while let Some(joined) = dials.join_next().await {
+        match joined {
+            Ok(Ok(tunnel)) => initial.push(tunnel),
+            Ok(Err(e)) => {
+                failures += 1;
+                debug!(pool = %key, carrier = carrier.as_str(), "tunnel establishment failed: {e}");
+            }
+            Err(e) => {
+                failures += 1;
+                debug!(pool = %key, carrier = carrier.as_str(), "tunnel establishment panicked: {e}");
+            }
+        }
+    }
+    if failures > 0 {
+        debug!(
+            pool = %key,
+            carrier = carrier.as_str(),
+            failures,
+            "some of the pool's tunnels did not come up; the pool will repair them"
+        );
+    }
+    initial
 }
 
 /// The closure a pool calls to add a tunnel.
@@ -1300,12 +1888,28 @@ async fn tunnel_dialer(
     data_addr: &AddrMaybeCached,
     session_nonce: Nonce,
     opts: &DataOpts,
+    choice: &Arc<CarrierChoice>,
 ) -> Result<Dialer> {
-    match opts.carrier {
-        DataCarrier::Tcp => {
+    // Both carriers are built, and the pool says which one to use **per call**:
+    // a repair asks for the carrier the endpoint prefers *now*, which is what
+    // lets a pool that came up on KCP bring its replacement up on TCP after UDP
+    // stops working.
+    /// One carrier's dial, before the choice of which to call: the composite
+    /// below is what the pool holds.
+    type OneDialer = std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = crate::transport::multiplex::DialResult>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    >;
+    let tcp: OneDialer = {
+        {
             let transport = Arc::clone(transport);
             let data_addr = data_addr.clone();
-            Ok(Arc::new(move || {
+            Arc::new(move || {
                 let transport = Arc::clone(&transport);
                 let data_addr = data_addr.clone();
                 Box::pin(async move {
@@ -1313,39 +1917,107 @@ async fn tunnel_dialer(
                         .await
                         .map_err(|e| format!("{e:#}"))
                 })
-            }))
+            })
         }
-        #[cfg(feature = "kcp")]
-        DataCarrier::Kcp => {
-            // Resolved once, at pool creation: a KCP growth must not block on
-            // DNS inside the placement path.
-            let remote_addr = {
-                let mut probe = AddrMaybeCached::new(&opts.addr);
-                probe.resolve().await.with_context(|| {
-                    format!("Failed to resolve the KCP data endpoint {}", opts.addr)
-                })?;
-                probe.socket_addr.ok_or_else(|| {
-                    anyhow!("The KCP data endpoint {} resolved to nothing", opts.addr)
-                })?
-            };
+    };
+    #[cfg(feature = "kcp")]
+    let kcp: OneDialer = {
+        // Resolved once, at pool creation: a KCP growth must not block on
+        // DNS inside the placement path.
+        let remote_addr = {
+            let mut probe = AddrMaybeCached::new(&opts.addr);
+            probe.resolve().await.with_context(|| {
+                format!("Failed to resolve the KCP data endpoint {}", opts.addr)
+            })?;
+            probe
+                .socket_addr
+                .ok_or_else(|| anyhow!("The KCP data endpoint {} resolved to nothing", opts.addr))?
+        };
+        let opts = opts.clone();
+        let choice = Arc::clone(choice);
+        Arc::new(move || {
             let opts = opts.clone();
-            Ok(Arc::new(move || {
-                let opts = opts.clone();
-                Box::pin(async move {
-                    tokio::time::timeout(
-                        KCP_ESTABLISH_TIMEOUT,
-                        establish_one_kcp_tunnel(remote_addr, session_nonce, &opts, "pool"),
-                    )
-                    .await
+            let choice = Arc::clone(&choice);
+            Box::pin(async move {
+                let attempt = tokio::time::timeout(
+                    KCP_ESTABLISH_TIMEOUT,
+                    establish_one_kcp_tunnel(remote_addr, session_nonce, &opts, "pool"),
+                )
+                .await;
+                let result = attempt
                     .map_err(|_| "KCP tunnel establishment timed out".to_owned())?
-                    .map_err(|e| format!("{e:#}"))
-                })
-            }))
-        }
-        // Config validation rejects `carrier = "kcp"` without the feature,
-        // so this arm is unreachable in a correctly loaded configuration.
+                    .map_err(|e| format!("{e:#}"));
+                if let Err(e) = &result {
+                    // A repair that cannot bring KCP up is the same news the
+                    // *initial* establishment reports, and it is the only
+                    // news the endpoint's choice would otherwise never get:
+                    // the pool's dialer is fixed to the carrier the pool was
+                    // born on, so without this the client keeps believing a
+                    // path that has since stopped carrying UDP is fine —
+                    // and every other pool, lane and future session that
+                    // dials that endpoint keeps paying for the attempt.
+                    choice.on_kcp_failure(e);
+                }
+                result
+            })
+        })
+    };
+    Ok(Arc::new(move |wanted: Carrier| match wanted {
+        Carrier::Tcp => tcp(),
+        // A build without the feature has no way to be asked for KCP
+        // (`CarrierChoice::try_kcp` answers false), and TCP is then the only
+        // carrier there is.
+        #[cfg(feature = "kcp")]
+        Carrier::Kcp => kcp(),
         #[cfg(not(feature = "kcp"))]
-        DataCarrier::Kcp => bail!("This binary was built without the `kcp` feature"),
+        Carrier::Kcp => tcp(),
+    }))
+}
+
+/// Everything one pool's dialing needs, so the functions that build a dialer,
+/// start a pool and fall back to TCP pass one thing rather than four.
+#[cfg(feature = "multiplex")]
+#[derive(Clone, Copy)]
+struct PoolDial<'a> {
+    transport: &'a Arc<ClientTransport>,
+    data_addr: &'a AddrMaybeCached,
+    session_nonce: Nonce,
+    opts: &'a DataOpts,
+    /// The endpoint's carrier decision, so a dialer's own failures are reported
+    /// to the one place that knows what the path is doing (see the KCP arm of
+    /// [`tunnel_dialer`]).
+    choice: &'a Arc<CarrierChoice>,
+}
+
+/// A pool's start on TCP: its dialer (which repair keeps using) and the tunnels
+/// that came up. The fallback's own half, and the only half a build without the
+/// `kcp` feature ever runs.
+#[cfg(feature = "multiplex")]
+async fn tcp_pool_start(
+    dial: PoolDial<'_>,
+    target: usize,
+    key: &str,
+) -> Result<(
+    Dialer,
+    Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+)> {
+    let dialer = dial.dialer().await?;
+    let initial = establish_initial(&dialer, target, key, Carrier::Tcp).await;
+    Ok((dialer, initial))
+}
+
+#[cfg(feature = "multiplex")]
+impl PoolDial<'_> {
+    /// The dialer one carrier's tunnels are established with.
+    async fn dialer(&self) -> Result<Dialer> {
+        tunnel_dialer(
+            self.transport,
+            self.data_addr,
+            self.session_nonce,
+            self.opts,
+            self.choice,
+        )
+        .await
     }
 }
 
@@ -1365,35 +2037,18 @@ async fn establish_one_kcp_tunnel(
     opts: &DataOpts,
     service_name: &str,
 ) -> Result<(ClientTunnel, watch::Sender<bool>)> {
-    use crate::transport::kcp::{self, KcpTunnelStream};
-    use rand::TryRng;
-
-    // Random per-session conversation id; together with the ephemeral client
-    // port it keeps the server's session map collision-free across restarts.
-    let mut rng = rand::rngs::SysRng;
-    let mut conv_bytes = [0u8; 4];
-    rng.try_fill_bytes(&mut conv_bytes)
-        .with_context(|| "Failed to generate a KCP conversation id")?;
-    let conv = u32::from_le_bytes(conv_bytes);
-
-    let stream = kcp::connect(remote_addr, conv).await?;
-    let mut io = {
-        #[cfg(feature = "noise")]
-        if let Some(cfg) = &opts.noise {
-            let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-            // Full handshake + v3 selector byte (the wrapper owns the
-            // selector): KCP tunnels establish once per control session,
-            // so a resume attempt has nothing cached yet and would only
-            // add a round trip.
-            KcpTunnelStream::Noise(Box::new(keys.wrap_initiator_full(stream).await?))
-        } else {
-            let mut s = stream;
-            s.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
-            KcpTunnelStream::Plain(s)
-        }
-        #[cfg(not(feature = "noise"))]
-        KcpTunnelStream::Plain(stream)
-    };
+    // Full Noise handshake + v3 selector byte (the wrapper owns the selector):
+    // KCP tunnels establish once per control session, so a resume attempt has
+    // nothing cached yet and would only add a round trip.
+    #[cfg(feature = "noise")]
+    let noise = opts.noise.as_ref();
+    #[cfg(not(feature = "noise"))]
+    let noise = None;
+    let mut io = crate::transport::kcp::connect_stream(remote_addr, noise).await?;
+    // The session's ARQ counters travel with the tunnel: the pool reads this
+    // tunnel's retransmit share for the carrier rule (the KCP-side signal; a
+    // TCP tunnel has none, which is why the rule is one-sided by construction).
+    let health = io.health();
 
     let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_nonce);
     io.write_all(&postcard::to_stdvec(&hello)?).await?;
@@ -1405,7 +2060,10 @@ async fn establish_one_kcp_tunnel(
 
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    Ok((ClientTunnel::start(io, config, shutdown_rx), shutdown_tx))
+    Ok((
+        ClientTunnel::start_with_health(io, Some(health), config, shutdown_rx),
+        shutdown_tx,
+    ))
 }
 
 // Runtime-resolved per-service UDP options. Validation fills the defaults;
@@ -1905,7 +2563,7 @@ fn build_udp_hub(
             },
             pins,
         ))),
-        ServiceType::Tcp => None,
+        ServiceType::Tcp | ServiceType::Transparent => None,
     }
 }
 
@@ -2080,11 +2738,719 @@ enum ServiceState {
     /// Handed to the session, not yet answered by the server.
     Registering,
     /// Registered: the server bound the public endpoint and this side keeps
-    /// the configured channel pool warm.
+    /// its configured data channels open.
     Active(Box<ActiveService>),
     /// The server refused the registration. Terminal for this service: only a
     /// human can fix the config or the server's `allow_ports`.
     Rejected,
+}
+
+/// The lanes one carrier's claims hold, and the allocator that moves them.
+///
+/// A lane is a claim's carrier connection — one per lane, because a claim never
+/// multiplexes. The configuration gives every claim of a carrier an equal share
+/// of the operator's budget, which is the right *starting* point and the wrong
+/// steady state: a claim carrying ten flows on one connection and a claim
+/// carrying nothing have no use for the same number of connections. Once a
+/// second this pool looks at what each claim's lanes are carrying and moves at
+/// most one idle lane from a claim that can spare one to a claim carrying more
+/// flows than it has lanes ([`crate::transparent::lanes`] owns the rule; this is
+/// the runtime that reads the hubs and dials).
+///
+/// Two properties make it safe:
+///
+/// - a lane is asked to end **only when it holds no flow at all**, which is the
+///   condition the hub re-checks under its own lock, and no flow ever moves —
+///   so lending cannot reorder anything;
+/// - the receiver's lane is dialed only after the donor's lane has actually
+///   ended, so the pair never holds more carrier connections than the budget at
+///   any instant: the server's `max_tunnels_per_client` valve, and the
+///   operator's bill, both see a swap rather than a growth.
+///
+/// The allocator redistributes what the configuration gave these claims; it does
+/// not invent lanes the configuration never allocated. That keeps the operator's
+/// `tunnels` the number that decides how many connections exist, with the
+/// *division* of them left to what the traffic turns out to be.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+struct LanePool {
+    /// Whether lending is on for this client (`[transparent.data].lend`).
+    ///
+    /// Off means the equal split stands: the pool still tracks its claims (the
+    /// replacement bookkeeping is the same), it just never moves a lane.
+    lend: bool,
+    /// When this pool started, for the diagnostic switch below.
+    started: std::time::Instant,
+    /// Whether the one diagnostic switch has been made.
+    switched: std::sync::atomic::AtomicBool,
+    /// Drains this pool has asked for, with when it asked: a lane whose drain
+    /// never becomes ready is called off rather than left unusable.
+    draining: std::sync::Mutex<HashMap<(ServiceId, LaneId), std::time::Instant>>,
+    /// The previous tick's per-lane cumulative counters, so a tick is a window
+    /// rather than a lifetime: `(peer offered, peer refused, this end injected)`.
+    carrier_sample: std::sync::Mutex<HashMap<(Endpoint, LaneId), LaneSample>>,
+    /// Consecutive ticks each claim has been judged to be losing traffic on the
+    /// carrier it rides. One second of loss is a burst; the rule waits for
+    /// [`CARRIER_CONFIRM_TICKS`] of them before it moves a lane.
+    carrier_streak: std::sync::Mutex<HashMap<Endpoint, u32>>,
+    /// Where an ask goes (the session owns the writer), and where its answer
+    /// arrives (the peer's half of the agreement).
+    req_tx: mpsc::UnboundedSender<SessionRequest>,
+    drain_state: Arc<LaneDrainState>,
+    /// The claims of this pool, by claimed endpoint.
+    claims: std::sync::Mutex<HashMap<Endpoint, ClaimEntry>>,
+}
+
+/// How long a lane drain may wait for the peer's answer before it is called
+/// off. The peer answers as soon as its own flows in the lane are gone, and a
+/// flow that outlives this budget is one the drain must not wait for: a lane
+/// nobody may use is worse than the carrier the drain was trying to leave.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many consecutive ticks a claim must be judged to be losing traffic on
+/// the carrier it rides before a lane is handed over.
+///
+/// One second of loss is a burst — a visitor's blast, a queue that filled for a
+/// moment — and moving a lane for it would trade a transient for a drain. Three
+/// ticks is the order the lending allocator's own tick works at, and the move
+/// itself is rate-limited again by
+/// [`crate::transport::carrier::SWITCH_COOLDOWN`].
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+const CARRIER_CONFIRM_TICKS: u32 = 3;
+
+/// One claim, as the allocator knows it.
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+struct ClaimEntry {
+    /// The device the claim's hub reads (`[transparent].tun`).
+    tun: String,
+    /// What one data channel of the claim needs, so another lane can be dialed
+    /// for it without going back to the session.
+    args: Arc<RunDataChannelArgs>,
+    /// The lanes the configuration gave this claim (its equal share), which is
+    /// what the pool's budget is the sum of — a move redistributes these, it
+    /// does not create more.
+    share: usize,
+    /// The lanes the claim is wanted to hold right now: the share, adjusted by
+    /// every move. It is also what tells a replacement the server asks for
+    /// apart: a lane that *failed* leaves the claim short of its target, so the
+    /// replacement is dialed; a lane retired on purpose lowered the target
+    /// first, so that request is refused.
+    target: usize,
+}
+
+#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+impl LanePool {
+    fn new(
+        lend: bool,
+        req_tx: mpsc::UnboundedSender<SessionRequest>,
+        drain_state: Arc<LaneDrainState>,
+    ) -> Self {
+        Self {
+            lend,
+            started: std::time::Instant::now(),
+            switched: std::sync::atomic::AtomicBool::new(false),
+            draining: std::sync::Mutex::new(HashMap::new()),
+            carrier_sample: std::sync::Mutex::new(HashMap::new()),
+            carrier_streak: std::sync::Mutex::new(HashMap::new()),
+            req_tx,
+            drain_state,
+            claims: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Add a claim to the pool, or update the one already there (a hot reload
+    /// re-registers the same claim, possibly with a new share).
+    fn register(
+        &self,
+        endpoint: Endpoint,
+        tun: String,
+        args: Arc<RunDataChannelArgs>,
+        share: usize,
+    ) {
+        if let Ok(mut claims) = self.claims.lock() {
+            let share = share.max(1);
+            claims.insert(
+                endpoint,
+                ClaimEntry {
+                    tun,
+                    args,
+                    share,
+                    target: share,
+                },
+            );
+        }
+    }
+
+    /// A service is gone: its claim stops counting against the budget.
+    fn unregister(&self, endpoint: &Endpoint) {
+        if let Ok(mut claims) = self.claims.lock() {
+            claims.remove(endpoint);
+        }
+    }
+
+    /// Whether a data channel the server asked for is one this claim wants.
+    ///
+    /// A lane that failed leaves the claim short of its target, and the hub keeps
+    /// the dead lane's slot for exactly that replacement. A lane that was retired
+    /// on purpose lowered the target first, so this answers no — otherwise the
+    /// allocator would undo its own move on every request.
+    fn wants_another_lane(&self, endpoint: &Endpoint) -> bool {
+        let Some((tun, target)) = self.claims.lock().ok().and_then(|claims| {
+            claims
+                .get(endpoint)
+                .map(|entry| (entry.tun.clone(), entry.target))
+        }) else {
+            return true;
+        };
+        match TunHub::get_or_spawn(&tun, Direction::Source) {
+            Ok(hub) => {
+                hub.member_stats()
+                    .iter()
+                    .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                    .count()
+                    < target
+            }
+            // The device is not up (yet): a claim with no hub has no lanes
+            // either, so the channel is what it is waiting for.
+            Err(_) => true,
+        }
+    }
+
+    /// Start the allocator's tick for this pool.
+    ///
+    /// It runs for the session's lifetime rather than for its claims': a pool
+    /// that emptied and filled again must not need a second start, and one wake
+    /// per second with nothing to do costs nothing worth the bookkeeping.
+    fn spawn_ticker(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(lanes::LANE_TICK);
+            loop {
+                tick.tick().await;
+                pool.step();
+            }
+        });
+    }
+
+    /// What the policy sees: every claim's live lanes and what they carry, and
+    /// how many lanes that is in total.
+    fn snapshot(&self) -> (Vec<ClaimLoad>, usize) {
+        let Ok(claims) = self.claims.lock() else {
+            return (Vec::new(), 0);
+        };
+        // Lanes whose handover is in flight, as (service, lane) — read once, so
+        // the loop below does not take the drain lock per lane.
+        let handing_over: Vec<(ServiceId, LaneId)> = self
+            .draining
+            .lock()
+            .map(|draining| draining.keys().copied().collect())
+            .unwrap_or_default();
+        let mut loads = Vec::with_capacity(claims.len());
+        let mut used = 0;
+        for (endpoint, entry) in claims.iter() {
+            let Ok(hub) = TunHub::get_or_spawn(&entry.tun, Direction::Source) else {
+                continue;
+            };
+            let service = entry.args.service_id;
+            let lanes: Vec<LaneLoad> = hub
+                .member_stats()
+                .iter()
+                .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                .map(|lane| LaneLoad {
+                    slot: lane.slot,
+                    flows: lane.flows,
+                    // A lane is under a handover when this end asked the peer to
+                    // drain it: the ask is what makes it unavailable to lending
+                    // (a handover in flight outranks a lend).
+                    handover: lane
+                        .lane
+                        .is_some_and(|key| handing_over.contains(&(service, key.id))),
+                })
+                .collect();
+            used += lanes.len();
+            loads.push(ClaimLoad {
+                endpoint: *endpoint,
+                lanes,
+            });
+        }
+        (loads, used)
+    }
+
+    /// The budget these claims share: the lanes the configuration gave them.
+    ///
+    /// The *shares*, not the targets — a move must not raise the budget it moves
+    /// within, or an allocator that dialed once could keep finding room to dial
+    /// again.
+    fn budget(&self) -> usize {
+        self.claims
+            .lock()
+            .map_or(0, |claims| claims.values().map(|entry| entry.share).sum())
+    }
+
+    /// The hub of one claim, or `None` when its device is not up.
+    fn hub(&self, endpoint: &Endpoint) -> Option<Arc<TunHub>> {
+        let tun = self
+            .claims
+            .lock()
+            .ok()
+            .and_then(|claims| claims.get(endpoint).map(|entry| entry.tun.clone()))?;
+        TunHub::get_or_spawn(&tun, Direction::Source).ok()
+    }
+
+    /// Ask the peer to stop using a lane, or to take it back.
+    ///
+    /// Recorded here so the ask is made once (a ticker that re-sent it every
+    /// second would fill the session's writer with duplicates), and the deadline
+    /// is what stops a lane being unusable forever when the answer never comes.
+    fn ask_drain(&self, service: ServiceId, lane: LaneId, cancel: bool) {
+        if let Ok(mut draining) = self.draining.lock() {
+            if cancel {
+                if draining.remove(&(service, lane)).is_none() {
+                    return;
+                }
+            } else if draining
+                .insert((service, lane), std::time::Instant::now())
+                .is_some()
+            {
+                return;
+            }
+        }
+        let _ = self.req_tx.send(SessionRequest::DrainLane {
+            service,
+            lane: lane.0,
+            cancel,
+        });
+    }
+
+    /// Act on the answers the server gave about the drains this pool asked for.
+    ///
+    /// A lane is only marked for retirement once the **peer** says it holds no
+    /// flow in it: the dialer cannot see the flows the peer placed there, and
+    /// retiring on this end's word alone is the retired-lane black hole. Once
+    /// both halves hold, the existing retire path does the rest — the lane takes
+    /// no new flows and ends when the ones it has are done.
+    ///
+    /// A drain that is never answered is called off: a lane nobody may use is
+    /// worse than the carrier the drain was trying to leave.
+    fn drain_step(&self) {
+        use crate::protocol::{LANE_DRAIN_CANCELLED, LANE_DRAIN_READY, LANE_DRAIN_UNKNOWN};
+        let asked: Vec<(ServiceId, LaneId)> = self
+            .draining
+            .lock()
+            .map(|draining| draining.keys().copied().collect())
+            .unwrap_or_default();
+        for (service, lane) in asked {
+            let Some(state) = self.drain_state.take(service, lane) else {
+                // No answer yet: give up on a drain that has been waiting too
+                // long rather than leaving the lane half-retired.
+                let stale = self.draining.lock().is_ok_and(|draining| {
+                    draining
+                        .get(&(service, lane))
+                        .is_some_and(|at| at.elapsed() >= DRAIN_BUDGET)
+                });
+                if stale {
+                    info!(
+                        "Lane {lane} of service {service}: no drain answer within {DRAIN_BUDGET:?}; \
+                         calling the drain off"
+                    );
+                    self.ask_drain(service, lane, true);
+                }
+                continue;
+            };
+            if state != LANE_DRAIN_READY {
+                if matches!(state, LANE_DRAIN_UNKNOWN | LANE_DRAIN_CANCELLED)
+                    && let Ok(mut draining) = self.draining.lock()
+                {
+                    draining.remove(&(service, lane));
+                }
+                debug!("Lane {lane} of service {service}: drain answer {state}, not retiring it");
+                continue;
+            }
+            // The peer holds nothing in it. Find the claim that owns the lane
+            // and mark it: from here the lane takes no new flows and ends when
+            // the ones it has are done.
+            let claim = self.claims.lock().ok().and_then(|claims| {
+                claims
+                    .iter()
+                    .find(|(_, entry)| entry.args.service_id == service)
+                    .map(|(endpoint, entry)| (*endpoint, entry.tun.clone()))
+            });
+            let Some((endpoint, tun)) = claim else {
+                debug!("Lane {lane} of service {service}: no claim of this session dials it");
+                continue;
+            };
+            let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) else {
+                debug!("Lane {lane} of service {service}: its device is not up");
+                continue;
+            };
+            let Some(slot) = hub
+                .member_stats()
+                .into_iter()
+                .find(|member| {
+                    member.endpoint == endpoint && member.lane.is_some_and(|l| l.id == lane)
+                })
+                .map(|member| member.slot)
+            else {
+                // The peer answered about a lane this end does not hold — the
+                // one inconsistency worth a line: the two ends disagree about
+                // which connections exist, and a retirement decided on it would
+                // be about nothing.
+                info!(
+                    "Lane {lane} of claim {endpoint}: the peer answered ready but this end holds \
+                     no such lane; not retiring anything"
+                );
+                if let Ok(mut draining) = self.draining.lock() {
+                    draining.remove(&(service, lane));
+                }
+                continue;
+            };
+            let idle = hub.retire_lane(&endpoint, slot);
+            if let Ok(mut draining) = self.draining.lock() {
+                draining.remove(&(service, lane));
+            }
+            info!(
+                "Lane {lane} of claim {endpoint}: the peer holds no flow in it; retiring it \
+                 ({}) so its replacement rides the carrier now preferred",
+                if idle {
+                    "idle"
+                } else {
+                    "still carrying this end's flows"
+                }
+            );
+        }
+    }
+
+    /// One look: move at most one lane, if the policy says to.
+    ///
+    /// The carrier rule runs first: a lane being handed over is unavailable to
+    /// lending (`ClaimLoad::lendable` skips it), and a handover a lend would
+    /// cancel is worse than a claim waiting one more tick for a lane. Then the
+    /// diagnostic switch (a measurement hatch, not policy), then lending.
+    fn step(&self) {
+        self.drain_step();
+        self.carrier_step();
+        self.diagnostic_switch();
+        if !self.lend {
+            return;
+        }
+        let (loads, used) = self.snapshot();
+        // Nothing to move between, and no move without a reason.
+        if loads.len() < 2 {
+            return;
+        }
+        let Some(plan) = lanes::plan(&loads, self.budget(), used) else {
+            return;
+        };
+        match plan {
+            lanes::Plan::Add { to } => {
+                // Room under the budget means a claim is holding fewer lanes than
+                // the configuration gave it — a lane died and its replacement has
+                // not arrived — so this hands the room to the claim that needs it
+                // rather than waiting for the dead one.
+                info!(
+                    "Lane allocator: claim {to} has more flows than lanes and the lane budget has \
+                     room; dialing a lane"
+                );
+                self.dial(&to);
+            }
+            lanes::Plan::Lend {
+                from,
+                from_slot,
+                to,
+            } => {
+                let Some(hub) = self.hub(&from) else {
+                    return;
+                };
+                if !hub.retire_lane(&from, from_slot) {
+                    // The policy only names a lane that was carrying nothing, so
+                    // this is the race with the packets that arrived since its
+                    // snapshot: the lane is draining now, ends on its own, and
+                    // the next tick can lend it.
+                    debug!(
+                        "Lane {from_slot} of claim {from} is not idle; not lending it this tick"
+                    );
+                    return;
+                }
+                if let Ok(mut claims) = self.claims.lock()
+                    && let Some(entry) = claims.get_mut(&from)
+                {
+                    entry.target = entry.target.saturating_sub(1).max(1);
+                }
+                info!("Lane allocator: lent lane {from_slot} of claim {from} to claim {to}");
+                // Only now, with the donor's lane on its way out: a swap, never
+                // a growth.
+                self.dial(&to);
+            }
+        }
+    }
+
+    /// The measurement hatch for carrier switching: after
+    /// `MOLEHILL_CARRIER_SWITCH_AT` seconds, move every claim of this pool to the
+    /// other carrier and drain one lane so the replacement rides it.
+    ///
+    /// It exists so the *effect* of a switch can be measured before the policy
+    /// that decides one is written — whether the lanes that follow it capture
+    /// what the A/B says is available, and what a switch costs the flows that
+    /// are on the lane being drained. It is a diagnostic switch, not a
+    /// deployment knob: the production behaviour is a measured decision inside
+    /// [`crate::transport::carrier::CarrierChoice`], and this is how the
+    /// measurement that justifies it gets its data. Read once per pool; a value
+    /// that is not a whole number of seconds is reported and ignored.
+    fn diagnostic_switch(&self) {
+        use std::sync::atomic::Ordering;
+        static SWITCH_AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let Some(at) = *SWITCH_AT.get_or_init(|| {
+            let Ok(raw) = std::env::var("MOLEHILL_CARRIER_SWITCH_AT") else {
+                return None;
+            };
+            if let Ok(secs) = raw.trim().parse::<u64>() {
+                Some(secs)
+            } else {
+                warn!(
+                    "MOLEHILL_CARRIER_SWITCH_AT={raw:?} is not a whole number of seconds; \
+                     ignoring it (the carrier is chosen at runtime)"
+                );
+                None
+            }
+        }) else {
+            return;
+        };
+        if self.started.elapsed() < std::time::Duration::from_secs(at)
+            || self.switched.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let targets: Vec<(Endpoint, Arc<RunDataChannelArgs>, Option<LaneId>)> = {
+            let Ok(claims) = self.claims.lock() else {
+                return;
+            };
+            claims
+                .iter()
+                .map(|(endpoint, entry)| {
+                    // The busiest live lane is the one whose replacement shows
+                    // the other carrier's worth: an idle lane would move without
+                    // carrying anything.
+                    let busiest = TunHub::get_or_spawn(&entry.tun, Direction::Source)
+                        .ok()
+                        .and_then(|hub| {
+                            hub.member_stats()
+                                .into_iter()
+                                .filter(|lane| lane.endpoint == *endpoint && lane.live)
+                                .max_by_key(|lane| lane.flows)
+                                .and_then(|lane| lane.lane)
+                                .map(|lane| lane.id)
+                        });
+                    (*endpoint, Arc::clone(&entry.args), busiest)
+                })
+                .collect()
+        };
+        for (endpoint, args, lane) in targets {
+            let choice = &args.carrier;
+            let other = match choice.carrier() {
+                Carrier::Kcp => Carrier::Tcp,
+                Carrier::Tcp => Carrier::Kcp,
+            };
+            // `prefer` is per *endpoint* and the choice is shared by every claim
+            // dialing it, so the first claim moves it and the rest find it
+            // already there — the drain below is what each claim owes the switch
+            // regardless, or the ones that find the choice moved would keep every
+            // lane on the carrier being left.
+            choice.prefer(other, "MOLEHILL_CARRIER_SWITCH_AT: diagnostic switch");
+            if let Some(lane) = lane {
+                // The lane is *asked* for, not taken: its dialer cannot see the
+                // flows the peer placed on it, so it is retired only once the
+                // peer answers that it holds none (see [`Self::drain_step`]).
+                // That is the whole difference between this and the black hole
+                // the earlier version of this switch could produce.
+                self.ask_drain(args.service_id, lane, false);
+                info!(
+                    "Data carrier switched for claim {endpoint}: asked the peer to drain lane \
+                     {lane} so its replacement rides the other carrier"
+                );
+            }
+        }
+    }
+
+    // The carrier policy was here, and its rule is gone with it. It read
+    // `forwarded`/`no_channel` per slot and called it carrier loss: those are
+    // *local enqueue* results (a full queue and a missing lane share the second
+    // one), and on a transparent claim the loss that matters happens at the
+    // **peer**, which offers the packets. Measured on the divergence cell, this
+    // end's counters read 61 forwarded and 0 `no_channel` for a whole round
+    // while the peer refused hundreds of thousands — so the rule could not fire,
+    // and would have been judging the wrong end if it had.
+    //
+    // The replacement is built on the pair the report makes readable: what the
+    // peer offered each lane and what that lane's queue refused there, against
+    // what this end injected off it, both keyed by the lane id the dialer named
+    // (`LaneId`; `peer_offered`/`peer_refused` in the `l3-stats` line). It is
+    // deliberately not written yet: a lane may only be retired once **both**
+    // ends agree it is empty, and that agreement does not exist (HANDOFF.md).
+
+    // The carrier rule reads the pair the report made readable — what the peer
+    // offered each lane and what that lane's queue refused there, against what
+    // this end injected off it — and acts through the two-sided drain. It is not
+    // the predecessor that read `no_channel` (see the note above where that one
+    // was): this one samples the *peer's* counters, which is the only place the
+    // loss on a transparent claim is visible at all.
+
+    /// One window of evidence for one claim: what the peer offered each of its
+    /// lanes and refused there, against what this end injected off it, all as
+    /// differences from the previous tick.
+    ///
+    /// Every counter involved is cumulative for a lane's life, so a tick is only
+    /// a window once there is a previous sample: a lane seen for the first time
+    /// contributes nothing, which is the safe direction (no evidence, no move).
+    fn carrier_evidence(&self, endpoint: &Endpoint, hub: &Arc<TunHub>) -> Vec<lanes::LaneEvidence> {
+        let mut evidence = Vec::new();
+        let mut fresh = Vec::new();
+        {
+            let Ok(mut last) = self.carrier_sample.lock() else {
+                return evidence;
+            };
+            for member in hub
+                .member_stats()
+                .into_iter()
+                .filter(|member| member.endpoint == *endpoint && member.live)
+            {
+                let Some(lane) = member.lane else {
+                    continue;
+                };
+                let now = (
+                    member.remote.map_or(0, |remote| u64::from(remote.offered)),
+                    member.remote.map_or(0, |remote| u64::from(remote.refused)),
+                    member.counters.injected_packets,
+                );
+                let previous = last.get(&(*endpoint, lane.id)).copied();
+                fresh.push(((*endpoint, lane.id), now));
+                let Some(previous) = previous else {
+                    continue;
+                };
+                evidence.push(lanes::LaneEvidence {
+                    slot: member.slot,
+                    lane: lane.id,
+                    carrier: member.carrier,
+                    offered: now.0.saturating_sub(previous.0),
+                    refused: now.1.saturating_sub(previous.1),
+                    injected: now.2.saturating_sub(previous.2),
+                });
+            }
+            for (key, value) in fresh {
+                last.insert(key, value);
+            }
+        }
+        evidence
+    }
+
+    /// Move a claim's lane to the other carrier when the one it rides is
+    /// measurably losing its traffic.
+    ///
+    /// One tick is a rate: each lane's counters are differenced against the
+    /// previous tick's, and the rule ([`lanes::carrier_move`]) sees a window.
+    /// A verdict is held for [`CARRIER_CONFIRM_TICKS`] ticks before anything
+    /// moves — one second of loss is a burst — and the move itself is the drain
+    /// both ends have to agree on, never a lane retired on this end's word.
+    fn carrier_step(&self) {
+        // A forced carrier is the run's answer, not a preference to be argued
+        // with: `MOLEHILL_DATA_CARRIER` exists so a measurement can pin one
+        // carrier, `prefer` refuses to move it, and asking the peer to drain
+        // lanes anyway would take them out of service for a switch that cannot
+        // happen. (Measured: the "forced KCP" control of the first A/B asked for
+        // four drains, one per round, and moved lanes while claiming to be the
+        // arm where nothing moves.)
+        if crate::transport::carrier::forced_carrier().is_some() {
+            return;
+        }
+        let Ok(claims) = self.claims.lock() else {
+            return;
+        };
+        let claims: Vec<(Endpoint, String, ServiceId, Arc<RunDataChannelArgs>)> = claims
+            .iter()
+            .map(|(endpoint, entry)| {
+                (
+                    *endpoint,
+                    entry.tun.clone(),
+                    entry.args.service_id,
+                    Arc::clone(&entry.args),
+                )
+            })
+            .collect();
+        for (endpoint, tun, service, args) in claims {
+            let Ok(hub) = TunHub::get_or_spawn(&tun, Direction::Source) else {
+                continue;
+            };
+            let evidence = self.carrier_evidence(&endpoint, &hub);
+            // Only lanes that are not already being handed over are candidates:
+            // a second drain for the same lane would be about a connection that
+            // is already on its way out.
+            let handing_over: Vec<LaneId> = self
+                .draining
+                .lock()
+                .map(|draining| {
+                    draining
+                        .keys()
+                        .filter(|(asked, _)| *asked == service)
+                        .map(|(_, lane)| *lane)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let evidence: Vec<lanes::LaneEvidence> = evidence
+                .into_iter()
+                .filter(|lane| !handing_over.contains(&lane.lane))
+                .collect();
+            let verdict = lanes::carrier_move(&evidence, args.carrier.carrier());
+            let Ok(mut streaks) = self.carrier_streak.lock() else {
+                return;
+            };
+            let streak = streaks.entry(endpoint).or_insert(0);
+            let Some(moved) = verdict else {
+                *streak = 0;
+                continue;
+            };
+            *streak += 1;
+            if *streak < CARRIER_CONFIRM_TICKS {
+                continue;
+            }
+            *streak = 0;
+            drop(streaks);
+            // The evidence is what justifies the change, so it is what the log
+            // line carries (once per switch: `prefer` is the notice).
+            args.carrier.prefer(
+                moved.prefer,
+                "the carrier in use kept refusing this claim's traffic at the peer",
+            );
+            if args.carrier.carrier() != moved.prefer {
+                // The cooldown from an earlier switch refused it: the decision
+                // stands, the move waits, and no lane is taken out of service
+                // for a carrier that cannot change yet.
+                debug!(
+                    "Claim {endpoint}: carrier move to {:?} deferred by the switch cooldown",
+                    moved.prefer
+                );
+                continue;
+            }
+            self.ask_drain(service, moved.lane, false);
+            info!(
+                "Data carrier for claim {endpoint}: lane {} refused its share for \
+                 {CARRIER_CONFIRM_TICKS} ticks; asked the peer to drain it so its replacement \
+                 rides {:?}",
+                moved.lane, moved.prefer
+            );
+        }
+    }
+
+    /// Dial one more lane for a claim, and count it as wanted.
+    fn dial(&self, endpoint: &Endpoint) {
+        let args = self.claims.lock().ok().and_then(|mut claims| {
+            claims.get_mut(endpoint).map(|entry| {
+                entry.target += 1;
+                Arc::clone(&entry.args)
+            })
+        });
+        if let Some(args) = args {
+            spawn_data_channel(args, None, None);
+        }
+    }
 }
 
 /// A registered service's live data plane.
@@ -2102,6 +3468,16 @@ struct ActiveService {
     /// The pool's key in the session, so the service can be counted against it.
     #[cfg(feature = "multiplex")]
     pool_key: Option<String>,
+    /// The claimed endpoint this service's lanes carry, when it is a
+    /// transparent service: the allocator names a claim by it.
+    ///
+    /// Gated with `multiplex` because the lane allocator is: without it there
+    /// is no pool and no carrier choice, so a claim has no lanes to allocate
+    /// and nothing reads this. (Without the gate the type is simply missing on
+    /// a `transparent`-without-`multiplex` build, which no feature powerset
+    /// leg compiles today.)
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    lane: Option<Endpoint>,
 }
 
 /// Open `count` data channels for a registered service.
@@ -2155,6 +3531,10 @@ struct ClientSession {
     default_heartbeat_timeout: Option<u64>,
     /// Registrations the client asks for.
     req_rx: mpsc::UnboundedReceiver<SessionRequest>,
+    /// The status API's asks, answered from this session's own state. A
+    /// session without a status listener still holds the receiver: an ask
+    /// channel nobody closes is one fewer conditional in the session loop.
+    ask_rx: mpsc::UnboundedReceiver<crate::status::SessionAsk>,
     /// The client's shutdown signal.
     shutdown_rx: oneshot::Receiver<u8>,
     /// Services this session carries, by the id the client allocated.
@@ -2175,13 +3555,31 @@ struct ClientSession {
     /// `[client.data].shared_pool`.
     #[cfg(feature = "multiplex")]
     shared_pool: bool,
-    /// `[client.data].idle_timeout`, applied to every pool of this session.
-    #[cfg(feature = "multiplex")]
-    idle_timeout: Duration,
     /// The client's UDP pin accounting, shared by every hub of this session's
     /// services: a tunnel with pinned peers is never shrunk (D30).
     #[cfg(feature = "multiplex")]
     pins: Arc<crate::transport::multiplex::PinRegistry>,
+    /// The lane allocator this session's transparent claims share.
+    ///
+    /// One per session, not one per claim: the lane budget is the client's, so
+    /// the claims that share it are the claims the allocator can move a lane
+    /// between — and they are exactly the claims that dial this session.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    lane_pool: Option<Arc<LanePool>>,
+    /// A second handle on this session's own request channel, so the lane
+    /// allocator can ask for a drain without owning the writer.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    req_tx: mpsc::UnboundedSender<SessionRequest>,
+    /// What the server said about those drains, shared with the allocator.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    lane_drains: Arc<LaneDrainState>,
+    /// One carrier decision per data endpoint this session's services dial.
+    ///
+    /// The scope is the endpoint because the network path is: services dialing
+    /// the same address share the decision (and the one bounded attempt it
+    /// costs), while a service with its own `remote_addr` makes its own.
+    #[cfg(feature = "multiplex")]
+    carriers: HashMap<String, Arc<crate::transport::carrier::CarrierChoice>>,
 }
 
 impl ClientSession {
@@ -2324,6 +3722,33 @@ impl ClientSession {
                         self.open_stripe_channel(id, group, index, count);
                     }
                     ControlChannelCmd::HeartBeat => (),
+                    // What the server offered one of this claim's lanes, and
+                    // what that lane's queue refused there. Recorded against
+                    // the lane, on the hub that owns it: the loss on a
+                    // transparent claim happens where the packets are offered
+                    // (the server), so this is the only view of it this end
+                    // will ever have.
+                    ControlChannelCmd::CarrierReport(id, lane, offered, refused, seq) => {
+                        self.note_lane_report(id, lane, offered, refused, seq);
+                    }
+                    // The peer's half of a tunnel's ARQ health: what the
+                    // server's session for that tunnel emitted and re-sent.
+                    // Without it the carrier rule sees only what this end sent,
+                    // which on a downstream workload is nothing (HANDOFF.md).
+                    #[cfg(feature = "multiplex")]
+                    ControlChannelCmd::TunnelHealth(id, tunnel, out, resent, handed, seq) => {
+                        self.note_tunnel_report(id, tunnel, out, resent, handed, seq);
+                    }
+                    // No tunnels exist without `multiplex`, so no report can
+                    // arrive: the arm exists for exhaustiveness alone.
+                    #[cfg(not(feature = "multiplex"))]
+                    ControlChannelCmd::TunnelHealth(..) => {}
+                    // The peer's half of a lane retirement: it holds no flow in
+                    // the lane, or it does not know the lane at all. Recorded
+                    // for the allocator, which is what may now retire it.
+                    ControlChannelCmd::LaneDrainAck(id, lane, state) => {
+                        self.note_lane_drain(id, lane, state);
+                    }
                     // The server lost that service's listener; re-register it.
                     ControlChannelCmd::ServiceDropped(id) => {
                         self.pending_drops.push(id);
@@ -2349,9 +3774,19 @@ impl ClientSession {
                     Some(SessionRequest::Deregister(id)) => {
                         self.deregister(id, &mut wr).await?;
                     }
+                    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                    Some(SessionRequest::DrainLane { service, lane, cancel }) => {
+                        let cmd = if cancel {
+                            SessionCmd::CancelDrain(service, lane)
+                        } else {
+                            SessionCmd::DrainLane(service, lane)
+                        };
+                        write_session_cmd(&mut wr, &cmd).await?;
+                    }
                     // The client is gone.
                     None => break,
                 },
+                ask = self.ask_rx.recv() => self.answer_ask(ask),
                 () = wait_for_heartbeat(heartbeat_timeout) => {
                     bail!(
                         "Heartbeat timed out after {} seconds",
@@ -2462,6 +3897,84 @@ impl ClientSession {
         resolve_heartbeat_timeout(interval, self.default_heartbeat_timeout)
     }
 
+    /// Answer one status ask, or drop the channel when the asker is gone.
+    fn answer_ask(&self, ask: Option<crate::status::SessionAsk>) {
+        match ask {
+            Some(crate::status::SessionAsk::Snapshot(tx)) => {
+                let _ = tx.send(self.status_view());
+            }
+            // The status task is gone: nothing asks again.
+            None => {}
+        }
+    }
+
+    /// This session's own answer to a status ask: its services and its
+    /// transparent claims.
+    ///
+    /// Built from the same maps the session loop mutates, under no lock that
+    /// matters — the ask arrives on the session's own select branch, so the
+    /// read cannot race the write. The tunnel pools are *not* answered here:
+    /// they are a process registry (`live_pools`) the status task reads
+    /// directly, and one pool per session key means a session-keyed answer
+    /// would only duplicate it.
+    fn status_view(&self) -> crate::status::SessionView {
+        let services = self
+            .services
+            .values()
+            .map(|entry| crate::status::ServiceStatus {
+                name: entry.slot.service.name.clone(),
+                kind: match entry.slot.service.service_type {
+                    crate::config::ServiceType::Tcp => "tcp",
+                    crate::config::ServiceType::Udp => "udp",
+                    crate::config::ServiceType::Transparent => "transparent",
+                }
+                .to_owned(),
+                remote_addr: entry.slot.service.remote_bind_addr.clone(),
+                local_addr: entry.slot.service.local_addr.clone(),
+                state: match entry.state {
+                    ServiceState::Registering => "registering",
+                    ServiceState::Active(_) => "active",
+                    ServiceState::Rejected => "rejected",
+                },
+            })
+            .collect();
+
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        let claims = self
+            .lane_pool
+            .as_ref()
+            .map(|pool| {
+                pool.snapshot()
+                    .0
+                    .into_iter()
+                    .map(|load| crate::status::ClaimStatus {
+                        endpoint: load.endpoint.to_string(),
+                        lanes: load
+                            .lanes
+                            .into_iter()
+                            .map(|lane| crate::status::LaneStatus {
+                                slot: lane.slot,
+                                flows: lane.flows,
+                                handover: lane.handover,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+        let claims = ();
+
+        crate::status::SessionView {
+            services,
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            claims,
+            #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+            claims,
+        }
+    }
+
     /// Apply every request already queued, without waiting for one.
     ///
     /// Called once a connection is up, before the re-registration sweep: a
@@ -2481,8 +3994,20 @@ impl ClientSession {
                     );
                 }
                 SessionRequest::Deregister(id) => {
+                    #[cfg(all(
+                        feature = "transparent",
+                        feature = "multiplex",
+                        target_os = "linux"
+                    ))]
+                    self.forget_claim(id);
                     self.services.remove(&id);
                 }
+                // A drain ask that arrives while the session is (re)connecting
+                // is about lanes of the *previous* connection: they are gone
+                // with it, and the allocator re-asks on its next tick if it
+                // still wants one.
+                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                SessionRequest::DrainLane { .. } => {}
             }
         }
     }
@@ -2515,9 +4040,14 @@ impl ClientSession {
             Ack::RegisterRejected(reason) => {
                 // Per-service and terminal: the session and the siblings are
                 // untouched, and a retry would only spam the server.
+                // The reason is the server's own sentence and names what it
+                // refused for (`allow_ports`, the missing `[server.transparent]`
+                // switch, a claimed address, ...), so the advice stays generic:
+                // this end cannot know which policy answered.
                 error!(
                     "Server rejected service {name}: {reason}. Giving up on that service; fix \
-                     the client config or the server's `allow_ports`, then reload."
+                     what the reason names — in the client config or in the server's policy — \
+                     then reload."
                 );
                 if let Some(entry) = self.services.get_mut(&id) {
                     entry.state = ServiceState::Rejected;
@@ -2578,6 +4108,26 @@ impl ClientSession {
                 }
                 ControlChannelCmd::HeartBeat => (),
                 ControlChannelCmd::ServiceDropped(id) => self.pending_drops.push(id),
+                // A report that arrives while a registration is in flight is
+                // still the server's view of a live lane: recorded the same
+                // way, so a claim does not lose its evidence to a reload.
+                ControlChannelCmd::CarrierReport(id, lane, offered, refused, seq) => {
+                    self.note_lane_report(id, lane, offered, refused, seq);
+                }
+                // See the other control loop: the peer's half of a tunnel's ARQ
+                // health, routed to the pool that owns the tunnel.
+                #[cfg(feature = "multiplex")]
+                ControlChannelCmd::TunnelHealth(id, tunnel, out, resent, handed, seq) => {
+                    self.note_tunnel_report(id, tunnel, out, resent, handed, seq);
+                }
+                #[cfg(not(feature = "multiplex"))]
+                ControlChannelCmd::TunnelHealth(..) => {}
+                // A drain answer that arrives while a registration is in flight
+                // is still the peer's half of a retirement: recorded the same
+                // way, so a claim does not lose the answer to a reload.
+                ControlChannelCmd::LaneDrainAck(id, lane, state) => {
+                    self.note_lane_drain(id, lane, state);
+                }
                 ControlChannelCmd::CreateDataChannel => bail!(
                     "Protocol violation: the server sent the v3-only command `CreateDataChannel` \
                      on a v{CURRENT_PROTO_VERSION} control session"
@@ -2585,6 +4135,152 @@ impl ClientSession {
             }
         }
     }
+
+    /// Record the peer's health report for one tunnel of one of this session's
+    /// pools: what the server's session for that tunnel emitted and re-sent.
+    ///
+    /// Routed by the tunnel id the client itself assigned (`next_tunnel_id`), so
+    /// no per-service ambiguity can arise: the same id is what the tunnel's
+    /// stream prologue carries, which is how the server learned to attribute the
+    /// report in the first place.
+    #[cfg(feature = "multiplex")]
+    fn note_tunnel_report(
+        &self,
+        id: ServiceId,
+        tunnel: [u8; 4],
+        out: [u8; 4],
+        resent: [u8; 4],
+        handed: [u8; 4],
+        seq: u8,
+    ) {
+        // Every step that can drop a report says so at debug: a peer's evidence
+        // is what the carrier rule acts on, and "the rule never fires" has to be
+        // distinguishable from "the evidence never landed" without a rebuild.
+        let Some(entry) = self.services.get(&id) else {
+            debug!(service = %hex::encode(id.0), "tunnel report for an unknown service");
+            return;
+        };
+        let ServiceState::Active(active) = &entry.state else {
+            debug!(service = %hex::encode(id.0), "tunnel report for a service that is not active");
+            return;
+        };
+        let Some(key) = active.pool_key.as_ref() else {
+            debug!(service = %hex::encode(id.0), "tunnel report for a service with no pool");
+            return;
+        };
+        let Some(Tunnels::Yamux(pool)) = self.pools.get(key) else {
+            debug!(pool = %key, "tunnel report for a pool this session does not hold");
+            return;
+        };
+        let recorded = pool.note_peer_health(
+            crate::protocol::TunnelId(tunnel),
+            (
+                u64::from(u32::from_be_bytes(out)),
+                u64::from(u32::from_be_bytes(resent)),
+            ),
+            u64::from(u32::from_be_bytes(handed)),
+            seq,
+        );
+        // A heartbeat rather than one line per report (they arrive every 50 ms):
+        // every twentieth frame shows the summed counters the rule reads, which
+        // is what makes "the rule never fires" distinguishable from "the
+        // evidence never reached the counters it reads".
+        if seq.is_multiple_of(20) {
+            debug!(
+                tunnel = %hex::encode(tunnel),
+                pool = %key,
+                summed = ?recorded,
+                "tunnel health recorded"
+            );
+        }
+    }
+
+    /// Record the server's view of one lane: what it offered it, and what that
+    /// lane's queue refused there.
+    ///
+    /// The hub is the destination, not a map beside it: the hub is what knows
+    /// which slot the lane id belongs to *now*, and a report matched by slot
+    /// would land on whatever took the slot next — the exact confusion the lane
+    /// id exists to remove. A report for a service that is not (or no longer) a
+    /// transparent claim of this session is dropped: it is not this end's
+    /// business, and inventing a place for it would make stale evidence
+    /// readable.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    fn note_lane_report(
+        &self,
+        id: ServiceId,
+        lane: [u8; 4],
+        offered: [u8; 4],
+        refused: [u8; 4],
+        seq: u8,
+    ) {
+        let Some(entry) = self.services.get(&id) else {
+            return;
+        };
+        if entry.slot.service.service_type != ServiceType::Transparent {
+            return;
+        }
+        let tun = &entry.slot.service.transparent_tun;
+        let Ok(hub) = TunHub::get_or_spawn(tun, Direction::Source) else {
+            return;
+        };
+        // The report is matched to the **claim** the service owns — its claimed
+        // endpoint — before the lane id is consulted: every claim mints its lane
+        // ids from 1 in one shared hub, so a report keyed by lane id alone
+        // landed on the first claim holding that number (measured: the ladder's
+        // claim's report read as an idle sibling's `peer_offered`), and the
+        // carrier policy was reading evidence about nothing.
+        let Some(claimed) = entry
+            .slot
+            .service
+            .remote_bind_addr
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|addr| Endpoint::new(addr.ip(), addr.port()))
+        else {
+            return;
+        };
+        hub.note_remote(
+            claimed,
+            LaneId(lane),
+            u32::from_be_bytes(offered),
+            u32::from_be_bytes(refused),
+            seq,
+        );
+    }
+
+    /// A build without the transparent data path has no lane to report on.
+    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the two shapes of this method are one call site: the build that has lanes \
+                  reads them off itself, and the one that does not keeps the same signature"
+    )]
+    fn note_lane_report(
+        &self,
+        _id: ServiceId,
+        _lane: [u8; 4],
+        _offered: [u8; 4],
+        _refused: [u8; 4],
+        _seq: u8,
+    ) {
+    }
+
+    /// Record the peer's half of a lane retirement, for the allocator to act on
+    /// (see [`LanePool::drain_step`]).
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    fn note_lane_drain(&self, id: ServiceId, lane: [u8; 4], state: u8) {
+        self.lane_drains.set(id, LaneId(lane), state);
+    }
+
+    /// A build without the transparent data path has no lane to retire.
+    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the two shapes of this method are one call site: the build that has lanes \
+                  records them on itself, and the one that does not keeps the signature"
+    )]
+    fn note_lane_drain(&self, _id: ServiceId, _lane: [u8; 4], _state: u8) {}
 
     /// Re-register every service the server reported dropped while this
     /// session was busy answering a registration.
@@ -2605,9 +4301,8 @@ impl ClientSession {
     /// The key is `session` for a shared pool (`[client.data].shared_pool`),
     /// so the *second* service of the session finds the pool here and does not
     /// dial a second one; without the flag it is `service:<id>`, so every
-    /// service keeps the pool it had. The key also carries the data endpoint
-    /// and the carrier: two services cannot share a physical tunnel to
-    /// different endpoints, and a KCP pool is not a TCP pool.
+    /// service keeps the pool it had. The key also carries the data endpoint:
+    /// two services cannot share a physical tunnel to different endpoints.
     #[cfg(feature = "multiplex")]
     async fn service_pool(
         &mut self,
@@ -2622,27 +4317,81 @@ impl ClientSession {
         } else {
             format!("service:{id}")
         };
-        // The key carries the data endpoint and the carrier as well as the
-        // owner: two services cannot share a physical tunnel to different
-        // endpoints, and a KCP pool is not a TCP pool.
-        let key = format!("{owner}/{}:{}", slot.data.carrier.as_str(), data_addr);
+        // The key carries the data endpoint as well as the owner: two services
+        // cannot share a physical tunnel to different endpoints. The carrier is
+        // *not* part of it — a pool has one carrier for its lifetime, chosen
+        // when it is established, so there is never a second pool on the same
+        // key to tell apart.
+        let key = format!("{owner}:{data_addr}");
         if let Some(pool) = self.pools.get(&key) {
             debug!(service = %name, pool = %key, "Reusing the session's tunnel pool");
             return Ok((pool.clone(), key));
         }
-        let tunnel = establish_tunnels(
-            &slot.transport,
+        // This service's own contribution to the pool's floor: a UDP worker
+        // set shards across tunnels, so the pool must be at least that wide
+        // before the first channel is placed.
+        let floor = crate::transport::pool::udp_floor(
+            [usize::from(slot.data.channels)],
+            crate::transport::multiplex::stream_cap(),
+        );
+        let choice = self.carrier_for(data_addr);
+        let dial = PoolDial {
+            transport: &slot.transport,
             data_addr,
-            *nonce,
-            &slot.data,
-            &key,
-            self.idle_timeout,
-            Arc::clone(&self.pins),
-        )
-        .await
-        .with_context(|| format!("service {name}: failed to establish its tunnel pool"))?;
+            session_nonce: *nonce,
+            opts: &slot.data,
+            choice: &choice,
+        };
+        let tunnel = establish_tunnels(dial, &key, floor, Arc::clone(&self.pins), &choice)
+            .await
+            .with_context(|| format!("service {name}: failed to establish its tunnel pool"))?;
         self.pools.insert(key.clone(), tunnel.clone());
         Ok((tunnel, key))
+    }
+
+    /// The carrier decision for one data endpoint, created on first use.
+    ///
+    /// Per endpoint rather than per service: the decision is about a network
+    /// path, and services that dial the same address share it — including the
+    /// one bounded KCP attempt it costs when the path cannot carry KCP.
+    #[cfg(feature = "multiplex")]
+    fn carrier_for(&mut self, data_addr: &AddrMaybeCached) -> Arc<CarrierChoice> {
+        let key = data_addr.addr.clone();
+        Arc::clone(self.carriers.entry(key.clone()).or_insert_with(|| {
+            let choice = CarrierChoice::new(key.clone());
+            debug!(
+                endpoint = %key,
+                carrier = choice.carrier().as_str(),
+                "data endpoint will try this carrier first"
+            );
+            choice
+        }))
+    }
+
+    /// Join one claim to the session's lane allocator, starting it on first use.
+    ///
+    /// One allocator per session (the lane budget is the client's, so the claims
+    /// that share it are the claims a lane can move between), and it is what
+    /// lets an idle lane of one claim become a lane of a congested sibling.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    fn join_lane_pool(&mut self, endpoint: Endpoint, slot: &ServiceSlot, active: &ActiveService) {
+        let share = slot.channels.max(1);
+        let lend = slot.service.transparent_lend;
+        let pool = Arc::clone(self.lane_pool.get_or_insert_with(|| {
+            let pool = Arc::new(LanePool::new(
+                lend,
+                self.req_tx.clone(),
+                Arc::clone(&self.lane_drains),
+            ));
+            pool.spawn_ticker();
+            pool
+        }));
+        pool.register(
+            endpoint,
+            slot.service.transparent_tun.clone(),
+            Arc::clone(&active.args),
+            share,
+        );
     }
 
     /// Turn a registered service into a live one: resolve its data endpoint,
@@ -2682,28 +4431,62 @@ impl ClientSession {
         let pins = Arc::clone(&self.pins);
         #[cfg(not(feature = "multiplex"))]
         let pins = Arc::new(());
+        // A transparent service's lanes are the claim's carrier connections,
+        // and the allocator names the claim by the endpoint it carries. The
+        // registration already validated this address (`check_transparent_client`),
+        // so a parse that fails here means the config changed under us: the
+        // service still runs, it just has no claim to lend lanes to or from.
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        let lane = if slot.service.service_type == ServiceType::Transparent {
+            slot.service
+                .remote_bind_addr
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|addr| Endpoint::new(addr.ip(), addr.port()))
+        } else {
+            None
+        };
+
+        // The carrier decision for this service's data endpoint (the same one
+        // every service dialing it shares).
+        #[cfg(feature = "multiplex")]
+        let choice = self.carrier_for(&data_addr);
         let active = ActiveService {
             args: Arc::new(RunDataChannelArgs {
                 session_nonce: *nonce,
                 service_id: id,
                 remote_addr: data_addr,
                 connector: slot.transport.clone(),
+                #[cfg(feature = "multiplex")]
+                carrier: Arc::clone(&choice),
                 socket_opts: SocketOpts::from_client_cfg(&slot.service),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
+                #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+                noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(feature = "multiplex")]
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
                 #[cfg(feature = "multiplex")]
                 stripe_placements: StripePlacements::default(),
+                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                lane_ids: std::sync::atomic::AtomicU32::new(1),
             }),
             #[cfg(feature = "multiplex")]
             tunnel,
             #[cfg(feature = "multiplex")]
             pool_key,
+            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            lane,
         };
         open_channels(&active, slot.channels);
+        // The claim joins the session's allocator, which is what lets an idle
+        // lane of one claim become a lane of a congested sibling.
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        if let Some(endpoint) = lane {
+            self.join_lane_pool(endpoint, &slot, &active);
+        }
         self.services.insert(
             id,
             ServiceEntry {
@@ -2711,18 +4494,20 @@ impl ClientSession {
                 state: ServiceState::Active(Box::new(active)),
             },
         );
-        // A newly active (or newly gone) UDP service changes what the pool
-        // must be able to carry (D7).
+        // A newly active (or newly gone) service that draws from a pool — a
+        // UDP worker set, a claim's member set — changes what the pool must be
+        // able to carry (D7).
         #[cfg(feature = "multiplex")]
         self.refresh_pool_floors();
         Ok(())
     }
 
-    /// Recompute every pool's UDP-derived floor (D7) from the services that
+    /// Recompute every pool's data-derived floor (D7) from the services that
     /// are active right now, and hand it to the pool.
     ///
     /// The floor is `ceil(channels / streams-per-tunnel)` of the deepest
-    /// active UDP service, maintained across a tunnel's death: the pool may
+    /// active service that draws from a pool — a UDP worker set, or an L3
+    /// claim's member set — maintained across a tunnel's death: the pool may
     /// lose an idle tunnel to a failure without the floor moving, because the
     /// floor describes what the *services* need, not how many tunnels exist.
     #[cfg(feature = "multiplex")]
@@ -2736,14 +4521,13 @@ impl ClientSession {
             let Some(key) = active.pool_key.as_deref() else {
                 continue;
             };
-            if !matches!(entry.slot.service.service_type, ServiceType::Udp) {
+            if !matches!(
+                entry.slot.service.service_type,
+                ServiceType::Udp | ServiceType::Transparent
+            ) {
                 continue;
             }
-            let floor = crate::transport::pool::udp_floor_capped(
-                [entry.slot.channels],
-                cap,
-                entry.slot.data.max_tunnels,
-            );
+            let floor = crate::transport::pool::udp_floor([entry.slot.channels], cap);
             let slot = floors.entry(key).or_insert(0);
             *slot = (*slot).max(floor);
         }
@@ -2791,7 +4575,26 @@ impl ClientSession {
             return;
         };
         match &entry.state {
-            ServiceState::Active(active) => open_data_channel(active, stripe),
+            ServiceState::Active(active) => {
+                // A transparent claim's lanes are allotted, not asked for: the
+                // server asks for a replacement whenever one ends, and a lane
+                // the allocator retired on purpose is one the claim should not
+                // get back (the allocator lowered its target first). A lane that
+                // *failed* leaves the claim short, and this dials its
+                // replacement.
+                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                if let Some(endpoint) = active.lane
+                    && let Some(pool) = self.lane_pool.as_ref()
+                    && !pool.wants_another_lane(&endpoint)
+                {
+                    debug!(
+                        "Ignoring a data channel request for {id}: the claim holds the lanes it \
+                         was allotted"
+                    );
+                    return;
+                }
+                open_data_channel(active, stripe);
+            }
             ServiceState::Rejected => {
                 debug!("Ignoring a data channel request for rejected service {id}");
             }
@@ -2829,21 +4632,41 @@ impl ClientSession {
         // rebuilds both.
         debug!(service = %entry.slot.service.name, "Service dropped by the server, re-registering");
         entry.state = ServiceState::Registering;
-        // The service's data plane is gone with its registration, so its
-        // demand on the pools goes with it.
+        // The service's data plane is gone with its registration, so the floor
+        // its channels contributed goes with it.
         #[cfg(feature = "multiplex")]
         self.refresh_pool_floors();
         self.register(id, nonce, rd, wr).await
     }
 
+    /// Tell the lane allocator a service is gone, so its claim stops counting
+    /// against its carrier's budget.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    fn forget_claim(&self, id: ServiceId) {
+        let Some(entry) = self.services.get(&id) else {
+            return;
+        };
+        let ServiceState::Active(active) = &entry.state else {
+            return;
+        };
+        let Some(endpoint) = active.lane else {
+            return;
+        };
+        if let Some(pool) = self.lane_pool.as_ref() {
+            pool.unregister(&endpoint);
+        }
+    }
+
     /// Drop one service: the server releases its public endpoint and the
     /// session keeps serving its siblings.
     async fn deregister<W: AsyncWrite + Unpin>(&mut self, id: ServiceId, wr: &mut W) -> Result<()> {
+        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        self.forget_claim(id);
         if self.services.remove(&id).is_some() {
             debug!("Deregistering service {id}");
             write_session_cmd(wr, &SessionCmd::Deregister(id)).await?;
-            // A service that is gone asks for nothing: the pools it drew from
-            // may shrink now that its channels are no longer a floor (D7).
+            // A service that is gone asks for nothing: the floor its channels
+            // contributed is recomputed for the pools it drew from (D7).
             #[cfg(feature = "multiplex")]
             self.refresh_pool_floors();
         }
@@ -2862,6 +4685,22 @@ mod tests {
     )]
     use super::*;
 
+    /// A tunnel's byte counts accumulate per tunnel, and the snapshot is cumulative
+    /// so a policy can difference two of them into a window.
+    ///
+    /// The accumulator itself is covered by the multiplex module's tests (the
+    /// counters live on the pool's tunnels there); the *wiring* (counting every
+    /// read and write of a mux channel) is exercised by the mux end-to-end
+    /// suites, which carry traffic through it.
+    #[cfg(all(feature = "multiplex", test))]
+    #[test]
+    fn tunnel_stats_thread_starts_without_env() {
+        // The spawn call is what the old registry's `STARTED.once` did; a run
+        // with `MOLEHILL_TUNNEL_STATS` unset must start no thread and never
+        // panic — the reporter is strictly opt-in.
+        spawn_tunnel_stats();
+    }
+
     /// The literal the interop matrix greps for: a client that meets a server
     /// too old to answer has to *say* which dialect it speaks, and stop.
     #[test]
@@ -2874,7 +4713,7 @@ mod tests {
         );
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("protocol v4"),
+            msg.contains(&format!("protocol v{CURRENT_PROTO_VERSION}")),
             "the dialect must be named: {msg}"
         );
         assert!(

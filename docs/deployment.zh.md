@@ -6,6 +6,7 @@
 都由那篇页面负责。
 
 - [完整示例](#完整示例)
+- [透明(L3)服务](#透明l3服务)
 - [systemd](#systemd)
 - [容器](#容器)
 - [网络要求](#网络要求)
@@ -30,6 +31,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
@@ -44,6 +51,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# 必需:控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### Noise(加密传输)
@@ -94,6 +105,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 protocol = "udp"
 local_addr = "127.0.0.1:80"
@@ -109,6 +126,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# 必需:控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### 服务端与客户端合并到一个文件
@@ -124,6 +145,12 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
@@ -135,6 +162,10 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# 必需:控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
 
 ### 通过代理连接
@@ -147,13 +178,16 @@ default_token = "123"
 [client.control]
 default_remote_addr = "127.0.0.1:2333"
 
+[client.transport]
+type = "noise"
+proxy = "socks5://myuser:mypass@127.0.0.1:1080"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:5202"
-
-[client.transport]
-type = "plain"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
 ```
 
 ### iperf3 测试服务
@@ -167,6 +201,12 @@ default_token = "123"
 
 [client.control]
 default_remote_addr = "localhost:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
 
 [client.services.iperf3-udp]
 protocol = "udp"
@@ -188,14 +228,199 @@ allow_ports = ["5202"]
 
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
+# 必需:控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
 ```
+
+## 透明(L3)服务
+
+透明(L3)客户端让**客户端**成为公网 `ip:port` 的拥有者:
+服务端不绑定任何东西,只把整个 IP 包路由进隧道,由客户端内核应答访客。各个键、
+前置条件与确切的拒绝信息归
+[配置文档](./configuration.zh.md#透明l3服务)负责;本节讲的是运维方要搭建的
+网络。它仅支持 Linux,两端都需要 `CAP_NET_ADMIN`(各自要打开 TUN 设备),而且
+自己不配置任何网络。
+
+在进入配方之前先给一条容量建议:认领的内部流会摊在它的车道上,而同一客户端各认领的车道会
+随流量起落互相出借——但前提是预算给某条认领留下了余量(`[transparent.data].tunnels`,
+每条认领至少两条)。实测:当**载体连接**本身是瓶颈时(长途或丢包路径)收益很大,而在快速短
+路径上什么也买不到,代价是更多连接与更多 CPU;数字与 `lend = false` 开关见
+[配置文档](./configuration.zh.md)与[基准页](./benchmarks.zh.md)。
+
+服务端只有在**它自己的**配置要求时才提供 L3:下面 `server.toml` 里的
+`[server.transparent]` 就是那个开关,没有它,注册会在碰到任何设备之前被拒绝。
+把提供 L3 的服务端放在带该能力的 unit 下,只做 L4 的服务端放在不带该能力的
+unit 下(见 [systemd](#systemd))。
+
+两套配方都基于同样两个事实:
+
+- **所声明的地址不是监听器。** 服务端上没有任何东西可以绑定它;服务端需要一条
+  把它交给 TUN 设备的路由。
+- **地址归客户端所有。** 客户端的 TUN 设备承载所声明的地址,一条源地址规则把
+  本地应用发出的回包送回隧道。
+- **TUN 的 MTU 是包大小的杠杆——自 v0.11.0 起,它降为其中较小的一半。** 用户态数据面按
+  包付费,所以 MTU 决定同样的字节速率要花多少个包。同一台主机上实测:同一条穿过 L3 认领
+  的 bulk 流,用 8000 字节的 TUN MTU(链路 MTU 相应匹配)吞吐是 1400 字节时的 **1.84 倍**,
+  每字节 CPU 只有原来的**三分之一**——而且在这个包大小下,单条 L3 流与同一主机上的转发路径
+  打平(见[基准测试](benchmarks.zh.md#l3-数据面瓶颈在哪2026-10-10本模型))。v0.11.0 把
+  1400 字节下的差距也收窄了:守护进程现在以 `IFF_VNET_HDR` 附加设备并声明其分段 offload,
+  内核随之把 GSO 超级帧(最大 64 KiB 的单元)整块交给读端,而不是每次读一个 1400 字节的包
+  ——这个杠杆曾经买到的打包效果,现在由二进制自带。MTU 在两端之间路径确实允许时仍值得
+  调大(更少的每系统调用包头、更少的 ACK 流量),但 1400 字节的 TUN 不再把 bulk 流锁死在
+  逐包系统调用上。L3 路径不随连接数扩展,所以包大小——无论来自哪个来源——依然是关键的
+  那个杠杆。下面的配方用 1400,它能塞进任何承载隧道的路径;请把它提到路径实际允许的值。
+
+两套配方最终用同一份配置:
+
+```toml
+# server.toml - 最后一张表就是开关:没有它,本服务端会按策略拒绝透明注册,
+# 也完全不会打开 TUN 设备。
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+# 必需:控制通道始终使用 Noise
+[server.transport.noise]
+local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```toml
+# client.toml - 整个进程就是 L3 客户端:没有转发服务,没有要拨的地址,只有一条认领。
+[transparent]
+default_token = "change-me"
+tun = "molehill0"
+
+[transparent.control]
+default_remote_addr = "<server-address>:2333"
+
+# 必需:控制通道始终使用 Noise
+[transparent.transport.noise]
+remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+
+[transparent.claims.web]
+remote_bind_addr = "<public-ip>:8443"
+```
+
+设备名是按主机各自取的,因此两端的 `tun` 值不必相同。
+
+### 配方 A:地址被路由到服务端
+
+最干净、无 NAT 的情形:上游网络把所声明的地址(一条被路由的 /32,或交付给本
+主机的一个地址块中的地址)路由到服务端,而且该地址**没有**配在服务端任何接口
+上——于是发往它的包会被转发,这正是 TUN 设备需要的。服务端一侧只需要一条路由。
+
+```bash
+# ---------- 服务端 ----------
+# <public-ip> 由上游路由到本主机;它不在任何接口上
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo ip route add <public-ip>/32 dev molehill0
+# 访客的包从面向访客的接口进来,再被转发出去
+sudo sysctl -w net.ipv4.ip_forward=1
+# 注入的包携带的源地址是本栈在该设备上不期望看到的
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# ---------- 客户端 ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+# 所声明的地址,以及把这些回包送回隧道的策略:按源地址匹配,只影响该服务
+# 自己发出的流量
+sudo ip addr add <public-ip>/32 dev molehill0
+sudo ip rule add from <public-ip> lookup 100
+sudo ip route add default dev molehill0 table 100
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+```
+
+事后要核对两个路由决策:服务端上 `ip route get <public-ip>` 必须指向 TUN 设备;
+客户端上 `ip route get <visitor-ip> from <public-ip>` 也必须如此。
+
+### 配方 B:单 IP 服务端
+
+当所声明的地址就是服务端**自己**的公网 IP 时,一条路由还不够:内核会在任何更靠
+后的路由表被查询之前,就把发往本机地址的包本地投递。因此运维方在路由决策之前
+给所声明的端口打上 mark,并让被标记的包走自己的表。这里没有任何地址转换——
+mark 只用来选择路由——而且 mark 限定了端口,所以服务端自身的流量不受影响。
+
+```bash
+# ---------- 服务端 ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# 在路由决策之前给所声明的端口打 mark(iptables;用 nftables 时同一条规则以
+# `meta mark set 0x1` 结尾)。服务同时使用 UDP 时也要标记 UDP。发往
+# <public-ip> 本身的 ICMP 仍由服务端应答——这是共用一个地址的代价。
+sudo iptables -t mangle -A PREROUTING -d <public-ip> -p tcp --dport 8443 -j MARK --set-mark 0x1
+
+# 被标记的包必须在核内的 local 表(优先级 0)把发往本机地址的包本地投递之前
+# 到达表 100,因此把 local 查询移到 mark 规则之后;未标记的流量照旧走它。
+sudo ip rule del pref 0
+sudo ip rule add pref 200 lookup local
+sudo ip rule add pref 100 fwmark 0x1 lookup 100
+sudo ip route add default dev molehill0 table 100
+```
+
+客户端一侧与配方 A 完全相同:客户端声明的是谁的地址并不重要——它承载该地址,
+应用绑定该地址。事后 `ip route get <public-ip> mark 0x1` 必须指向 TUN 设备,
+`ip rule show` 里 mark 规则必须排在 local 查询之前。
+
+### 每种运行模式需要什么
+
+三种模式向主机索取的东西不同,只有一种需要额外的东西:
+
+| 需要什么 | `molehill --server`(转发) | `molehill --client`(转发) | L3 两端(`--server` + `--transparent`) |
+|---|---|---|---|
+| `CAP_NET_ADMIN` | 否 | 否 | **是,两端都要** —— 各自要连接一个 TUN 设备 |
+| TUN 设备 | 否 | 否 | **是,两端都要** —— 由运维方创建,不是守护进程 |
+| `net.ipv4.ip_forward = 1` | 否 | 否 | **是,服务端上** —— 它路由进 TUN 的包属于转发 |
+| TUN 与 `all` 上的 `rp_filter = 0` | 否 | 否 | **是** —— 注入的包携带的是访客的源地址 |
+| 1024 以下的端口 | 只有服务要求时才需要 | 否 | 只有认领要求时才需要 |
+
+其中两条值得说清楚,因为它们是部署真正会栽在上面的地方:
+
+- **只有提供 L3 的服务端才需要 `CAP_NET_ADMIN`。** 这项能力是由
+  `[server.transparent]` 表索取的,所以配置里没有它的 `molehill --server`
+  就没有这项能力,并按策略拒绝 L3 注册。只做转发的服务端什么都不需要,这正是
+  能力应该跟着需要它的那个单元走的原因(见 [systemd](#systemd))。
+- **`ip_forward` 是被检查的,不是被假设的。** 它关着的时候,内核会在守护进程
+  读到一个字节之前就丢弃所有发往认领地址的包:进程看到的是一个健康的 TUN 和
+  一个沉默的设备——这是唯一一个看起来什么都不像的失败形态。守护进程会在第一次
+  透明注册时拒绝,并给出要执行的 `sysctl` 命令行。
+
+### 运维注意事项
+
+- 上面的 `ip` 与 `sysctl` 命令都只是运行时状态。请用发行版的机制让它们持久化
+  (开机执行的单元、networkd/NetworkManager 的 dispatcher、`rp_filter` 两个键
+  用 `sysctl.d`);守护进程只在服务启动时校验它看到的东西。
+- `mtu 1400` 是守护进程自己的拒绝信息里给出的值,也是这两套配方使用的值。请把
+  它保持在路径 MTU 或以下:客户端内核根据 TUN 设备的 MTU 推导自己要宣告的 MSS,
+  隧道 MTU 小于路径 MTU 正是让分片不会超出路径的原因。
+- `MOLEHILL_L3_STATS=1`(见
+  [配置文档](./configuration.zh.md#诊断开关按需开启))每秒打印一次数据面的
+  计数,这是判断两端设备是否真的在过包的办法。
 
 ## systemd
 
 把 molehill 作为 systemd 服务运行,支持 root 与 rootless,以及多实例。
 单元名中 `molehills` 代表 `molehill --server`,`molehillc` 代表
 `molehill --client`,`molehill` 是自动判断模式。单元名里的 `@` 表示按
-配置文件实例化。配置文件建议权限 `600`(内含共享 token)。
+配置文件实例化。配置文件建议权限 `600`(内含共享 token)。提供透明服务的服务端
+需要 `CAP_NET_ADMIN` 才能打开自己的 TUN 设备——也只有这种服务端需要:这项能力是
+由 `[server.transparent]` 这张表索取的,所以配置里没有它的 `molehill --server`
+不需要该能力运行,并按策略拒绝 L3 注册。root 隐含具备;以其他用户运行的
+单元请使用下面单元里那行(默认注释掉的)`AmbientCapabilities=`。
 
 ```ini
 # molehills@.service - 每个配置一个服务端实例:systemctl enable molehills@app1 --now
@@ -208,6 +433,8 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+# 透明服务:进程要打开 TUN 设备。本单元不以 root 运行时取消注释。
+# AmbientCapabilities=CAP_NET_ADMIN
 
 # with root
 ExecStart=/usr/bin/molehill -s /etc/molehill/%i.toml
@@ -229,6 +456,8 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+# 透明服务:进程要打开 TUN 设备。本单元不以 root 运行时取消注释。
+# AmbientCapabilities=CAP_NET_ADMIN
 
 # with root
 ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
@@ -285,9 +514,9 @@ docker run -v /etc/molehill/server.toml:/app/server.toml:ro \
 ```
 
 镜像自带完整的默认特性集(`server`、`client`、`noise`、`hot-reload`、
-`multiplex`、`kcp`),所以 `default_carrier = "kcp"` 不需要换镜像。想要可
-复现的升级就固定 release tag(`ghcr.io/niyueee/molehill:v0.9.0`),而不是
-用 `:latest`。
+`multiplex`、`kcp`、`transparent`),所以数据面的 KCP 会话和透明(L3)服务
+都不需要换镜像。想要可复现的升级就固定 release tag
+(`ghcr.io/niyueee/molehill:v0.11.0`),而不是用 `:latest`。
 
 以 UID 1000 运行带来两个后果:
 
@@ -331,8 +560,8 @@ services:
 
 桥接网络变体(Docker Desktop,macOS/Windows):文件不变,两个服务都去掉
 `network_mode: host`,并给服务端加上 `ports:`——`"2333:2333"` 用于控制通道与
-TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(仅当某个服务使用
-`carrier = "kcp"` 时需要),再加每个对外暴露的服务端口(如 `"5202:5202"`);
+TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(数据面会优先尝试的 carrier),
+再加每个对外暴露的服务端口(如 `"5202:5202"`);
 客户端则通过 compose 的 DNS 名访问服务端,即
 `default_remote_addr = "molehill-server:2333"`。
 
@@ -371,10 +600,10 @@ WantedBy=multi-user.target
 - **服务端**必须能从互联网访问:`server.control.bind_addr`、
   `server.data.bind_addr`(设置时)和每个注册的 `remote_bind_addr` 都需要
   入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。服务使用
-  `carrier = "kcp"` 时还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
+  数据面会尝试 KCP,因此还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
   `server.data.bind_addr`,默认就是控制端口,同一端口号上 TCP 与 UDP 并存。
 - **客户端**只需要到 `server.control.bind_addr` 的出站访问(数据端点不同时
-  也包括它;TCP,`carrier = "kcp"` 时还包括 UDP);NAT 后不需要任何入站端口。
+  也包括它;TCP,数据面的 KCP 还包括 UDP);NAT 后不需要任何入站端口。
 - 容器部署:镜像以 UID 1000 运行,无法绑定 1024 以下的端口——端口与配置
   文件权限的后果见[容器](#容器)。
 - `client.control.default_remote_addr` 必须与 `server.control.bind_addr` 使用相同的

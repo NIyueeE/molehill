@@ -52,17 +52,21 @@ Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
 (machete, audit, deny, outdated, docs-sync, secret scan, the python gates)
 follow the same discipline.
 
-## Unsafe (the one opt-in module)
+## Unsafe (the opt-in modules)
 
 `unsafe_code` is **deny**, so an unexpected `unsafe` fails a plain
-`cargo build` and not only the `-D warnings` gate. Exactly one module may ask
-for it, per item, with `#[expect(unsafe_code, reason = "...")]` plus a
+`cargo build` and not only the `-D warnings` gate. The modules that need it ask
+per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 `// SAFETY:` comment directly above the item:
 
 - `src/transport/udp_batch.rs` — the `recvmmsg`/`sendmmsg` batching FFI
   (8 expectations: the zeroed `msghdr`/`sockaddr_storage` templates, the
   kernel-ABI `sockaddr` reinterpretation, the two `mmsg` calls, and three
   `Send`/`Sync` proofs for the reusable descriptor arrays);
+- `src/transparent/tun.rs` — the `TUNSETIFF` ioctl that binds an fd to a TUN
+  interface (1 expectation: the zeroed `ifreq`, the name copy bounded by
+  `IFNAMSIZ` into that zeroed buffer, and the `ioctl` call with the request the
+  kernel defines for exactly this struct);
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 

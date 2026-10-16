@@ -132,20 +132,10 @@ fn spawn_framing_stats() {
     });
 }
 /// The stream cap of one tunnel, from the same constant `mux_config` sets: the
-/// growth rule needs it to keep every tunnel strictly below the cap, because a
-/// cap hit makes the vendored engine log an unguarded `error!`.
+/// placement ceiling derives from it to keep every tunnel strictly below the
+/// cap, because a cap hit makes the vendored engine log an unguarded `error!`.
 pub(crate) fn stream_cap() -> usize {
     crate::common::constants::DEFAULT_MUX_MAX_STREAMS
-}
-
-/// Microseconds since the process's first use of the pool clock: the base the
-/// reservation-age metric is measured against (a monotonic clock, so it never
-/// jumps backwards).
-fn now_us() -> u64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// The next tunnel id: unique per process, so two pools' tunnels can never be
@@ -178,14 +168,14 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// The elastic pool: bookkeeping, placement, growth and shrink.
+// The pinned tunnel pool: bookkeeping, placement and repair.
 // ---------------------------------------------------------------------------
 use crate::transport::pool::{GrowReason, Placement, ShrinkReason, TunnelLoad};
 
-/// One tunnel's bookkeeping counters, shared by the pool's placement, shrink
-/// and telemetry code.
+/// One tunnel's bookkeeping counters, shared by the pool's placement and
+/// telemetry code.
 ///
-/// All three are atomics because placement reads them while it holds only a
+/// All of them are atomics because placement reads them while it holds only a
 /// shared borrow of the tunnel list: inserting an entry would otherwise need a
 /// write lock on the hot path of every data channel.
 #[derive(Debug, Default)]
@@ -195,13 +185,111 @@ pub(crate) struct TunnelCounters {
     streams: std::sync::atomic::AtomicUsize,
     /// Opens requested but not yet completed on this tunnel.
     pending: std::sync::atomic::AtomicUsize,
-    /// When the oldest *current* reservation was taken, as micros since the
-    /// process's first pool. An open that has waited longer than
-    /// `OPEN_WAIT_BUDGET` is the pool's "grow now" signal (`GrowReason::Wait`).
-    oldest_pending_us: std::sync::atomic::AtomicU64,
+    /// Bytes delivered from this tunnel's streams to the forwarding code.
+    ///
+    /// Counted per IO poll by [`crate::core::client::ClientDataChannel::Mux`]
+    /// through a relaxed add — the predecessor of this pair was a process-wide
+    /// `Mutex<HashMap>` the *same* poll took, which serialized every
+    /// multiplexed byte behind one lock for an opt-in diagnostic.
+    delivered: std::sync::atomic::AtomicU64,
+    /// Bytes the forwarding code handed to this tunnel's streams.
+    written: std::sync::atomic::AtomicU64,
+    /// The KCP session's own ARQ counters, when this tunnel rides KCP (see
+    /// [`crate::transport::health::SessionHealth`]): the retransmit share of the pair is
+    /// the per-tunnel signal a carrier policy judges. `None` on a TCP tunnel
+    /// — the kernel's TCP has no userspace retransmit counter to offer, which
+    /// is also why the carrier rule is one-sided by construction.
+    health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
+    /// What the **peer's** session for this tunnel has emitted and re-sent, as
+    /// the peer reports it (`ControlChannelCmd::TunnelHealth`).
+    ///
+    /// One session has an engine at each end, so a tunnel's real ARQ share is
+    /// both ends' counters together: a path that polices UDP destroys the
+    /// *sender's* datagrams, and on a downstream workload that sender is the
+    /// peer — measured at 22.9 % re-sent there against 0.04 % here. The
+    /// sequence is what makes a stale report (one that overtook a newer sample
+    /// in flight) ignorable.
+    peer: std::sync::Mutex<PeerHealth>,
+}
+
+/// The peer's last report for one tunnel: its counters and the report's
+/// sequence, or nothing until the first one arrives.
+#[derive(Debug, Default, Clone, Copy)]
+struct PeerHealth {
+    counters: Option<(u64, u64)>,
+    /// Bytes the peer's application *handed* this tunnel, cumulative. The
+    /// delivery ratio's numerator is this end's received bytes and its
+    /// denominator is this, so the pair says what fraction of what was offered
+    /// actually arrived — the distinction the ARQ share could not make.
+    handed: u64,
+    seq: Option<u8>,
 }
 
 impl TunnelCounters {
+    /// The tunnel's counters, with the KCP session's health when it rides KCP.
+    fn with_health(
+        health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            streams: std::sync::atomic::AtomicUsize::new(0),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::atomic::AtomicU64::new(0),
+            written: std::sync::atomic::AtomicU64::new(0),
+            health,
+            peer: std::sync::Mutex::new(PeerHealth::default()),
+        })
+    }
+
+    /// Bytes this end delivered off the tunnel to the forwarding code.
+    pub(crate) fn received(&self) -> u64 {
+        self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes the peer's application has handed this tunnel, as it reports them.
+    pub(crate) fn peer_handed(&self) -> u64 {
+        self.peer.lock().map_or(0, |peer| peer.handed)
+    }
+
+    /// The tunnel's ARQ counters **from both ends**, summed: what this end's
+    /// session emitted and re-sent, plus what the peer reports for the same
+    /// session. `None` on a TCP tunnel (no userspace ARQ at all).
+    ///
+    /// Summing is what makes the signal direction-independent, which is the
+    /// whole point of the peer's report: one session carries both directions,
+    /// and the loss that matters may be entirely on the other one.
+    pub(crate) fn health_counts(&self) -> Option<(u64, u64)> {
+        let local = self.health.as_ref()?.counts();
+        let peer = self
+            .peer
+            .lock()
+            .map(|peer| peer.counters)
+            .unwrap_or_default()
+            .unwrap_or((0, 0));
+        Some((
+            local.0.saturating_add(peer.0),
+            local.1.saturating_add(peer.1),
+        ))
+    }
+
+    /// Record the peer's report for this tunnel, ignoring one that arrives out
+    /// of order: the sequence is cumulative per tunnel connection, so an older
+    /// sample must not overwrite a newer one.
+    pub(crate) fn note_peer_health(&self, counters: (u64, u64), handed: u64, seq: u8) {
+        let Ok(mut peer) = self.peer.lock() else {
+            return;
+        };
+        let newer = peer.seq.is_none_or(|last| {
+            // `wrapping_sub` in `u8` space: a sequence that wrapped is still
+            // newer than the one before it, and one from two lives ago is not.
+            seq.wrapping_sub(last) != 0 && seq.wrapping_sub(last) < 128
+        });
+        if newer {
+            peer.counters = Some(counters);
+            peer.handed = handed;
+            peer.seq = Some(seq);
+        }
+    }
+
     fn load(&self) -> TunnelLoad {
         use std::sync::atomic::Ordering;
         TunnelLoad {
@@ -213,38 +301,40 @@ impl TunnelCounters {
         }
     }
 
-    /// Charge one open to this tunnel before it is awaited. The reservation's
-    /// age is what the wait rule reads, so the first of a burst sets it and
-    /// the last one to clear it resets it.
+    /// Charge one open to this tunnel before it is awaited.
     fn reserve(&self) {
         use std::sync::atomic::Ordering;
-        if self.pending.fetch_add(1, Ordering::Relaxed) == 0 {
-            self.oldest_pending_us.store(now_us(), Ordering::Relaxed);
-        }
+        self.pending.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The open failed or was abandoned: the reservation comes back.
     fn release(&self) {
         use std::sync::atomic::Ordering;
-        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.oldest_pending_us.store(0, Ordering::Relaxed);
-        }
+        self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// The open completed: the reservation becomes a live stream.
     fn charge(&self) {
         use std::sync::atomic::Ordering;
         self.streams.fetch_add(1, Ordering::Relaxed);
-        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.oldest_pending_us.store(0, Ordering::Relaxed);
-        }
+        self.pending.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// How long the oldest reservation on this tunnel has been waiting.
-    fn oldest_wait(&self) -> Option<std::time::Duration> {
+    /// Record what one IO poll moved across this tunnel (see the field docs).
+    fn count_bytes(&self, delivered: u64, written: u64) {
         use std::sync::atomic::Ordering;
-        let since = self.oldest_pending_us.load(Ordering::Relaxed);
-        (since != 0).then(|| std::time::Duration::from_micros(now_us().saturating_sub(since)))
+        self.delivered.fetch_add(delivered, Ordering::Relaxed);
+        self.written.fetch_add(written, Ordering::Relaxed);
+    }
+
+    /// The cumulative `(delivered, written)` pair, for the tunnel-stats line
+    /// and the pool snapshot's per-tunnel window.
+    fn bytes(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.delivered.load(Ordering::Relaxed),
+            self.written.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -254,7 +344,7 @@ impl TunnelCounters {
 /// wrapping it keeps the charge exact, because the stream is a `Drop` point no
 /// matter which task ends up holding it (a forwarded visitor, a stripe group,
 /// a pre-opened channel). A tunnel's stream count can therefore never leak past
-/// the stream's life, which is what the shrink predicate reads.
+/// the stream's life, which is what the placement ceiling reads.
 ///
 /// The lease *is* the stream the client's forwarding code carries (it
 /// implements both IO traits), so the charge lives exactly as long as the data
@@ -274,6 +364,14 @@ impl StreamLease {
     /// The tunnel this stream is charged to (the pin accounting's key).
     pub(crate) fn tunnel_id(&self) -> usize {
         self.tunnel_id
+    }
+
+    /// Record what one IO poll moved across the stream's tunnel: the
+    /// forwarding wrapper ([`crate::core::client::ClientDataChannel::Mux`])
+    /// calls this instead of the global registry its predecessor kept — see
+    /// [`TunnelCounters::count_bytes`].
+    pub(crate) fn count_bytes(&self, delivered: u64, written: u64) {
+        self.counters.count_bytes(delivered, written);
     }
 }
 
@@ -356,7 +454,7 @@ impl Carrier {
 /// One pool timeline entry: a size change and the reason for it.
 #[derive(Debug, Clone, Copy)]
 struct PoolEvent {
-    /// `true` for a growth, `false` for a shrink.
+    /// `true` for a repair, `false` for a death.
     grow: bool,
     /// `GrowReason::as_str` / `ShrinkReason::as_str`.
     reason: &'static str,
@@ -374,29 +472,46 @@ pub struct PoolSnapshot {
     pub carrier: &'static str,
     /// The number of live tunnels.
     pub size: usize,
-    /// The cap the pool may grow to (`[client.data.tcp|kcp].max_tunnels`).
-    pub max_tunnels: usize,
-    /// The UDP-derived floor the pool must not shrink below (D7).
+    /// How many tunnels the pool establishes (`[client.data].tunnels`).
+    /// A pool at this size is complete; one below it is repairing.
+    pub count: usize,
+    /// The UDP-derived floor the pool's configured count must cover (D7).
     pub udp_floor: usize,
-    /// Cumulative growths since the pool was created.
+    /// Cumulative establishments since the pool was created.
     pub grows: u64,
-    /// Cumulative shrinks since the pool was created.
+    /// Cumulative removals since the pool was created: dead tunnels and
+    /// completed carrier handovers. Dead entries are repaired; handovers retire
+    /// and replace exactly one old-carrier tunnel.
     pub shrinks: u64,
-    /// Per-tunnel `(streams, pending, pinned)`, in pool order.
-    pub tunnels: Vec<(usize, usize, usize)>,
+    /// Per-tunnel `(streams, pending, pinned, carrier)`, in pool order.
+    pub tunnels: Vec<(usize, usize, usize, Carrier)>,
+    /// Per-tunnel cumulative `(delivered, written)` bytes, in the same order as
+    /// [`PoolSnapshot::tunnels`]: the `MOLEHILL_TUNNEL_STATS` line's source and
+    /// the windowed per-tunnel evidence a carrier policy differences.
+    pub bytes: Vec<(u64, u64)>,
+    /// Per-tunnel KCP ARQ health, cumulative `(datagrams_out, retransmits)`,
+    /// in the same order — `None` where the tunnel does not ride KCP (a TCP
+    /// tunnel's retransmit state stays in the kernel). The carrier rule's
+    /// degradation signal: a healthy session re-sends ~nothing, a carrier
+    /// losing its traffic re-sends segments by the thousands (S1, round 37).
+    pub kcp_health: Vec<Option<(u64, u64)>>,
+    /// Whether each entry in `tunnels` accepts new streams.
+    pub draining: Vec<bool>,
+    /// Active handover as `(old tunnel id, target carrier, phase)`.
+    pub handover: Option<(usize, Carrier, &'static str)>,
 }
 
 impl PoolSnapshot {
     /// Established streams anywhere in the pool.
     #[must_use]
     pub fn streams(&self) -> usize {
-        self.tunnels.iter().map(|(s, _, _)| *s).sum()
+        self.tunnels.iter().map(|(s, _, _, _)| *s).sum()
     }
 
     /// The pool's pinned peers, summed over its tunnels.
     #[must_use]
     pub fn pinned(&self) -> usize {
-        self.tunnels.iter().map(|(_, _, p)| *p).sum()
+        self.tunnels.iter().map(|(_, _, p, _)| *p).sum()
     }
 }
 
@@ -407,30 +522,51 @@ struct PoolState {
     entries: Vec<PoolEntry>,
     /// Round-robin cursor: the tie-break of the least-loaded rule.
     next_cursor: usize,
-    /// Set while an open could not be answered immediately; the next
-    /// maintenance tick turns it into a growth.
-    demand: bool,
-    max_tunnels: usize,
+    /// The count this pool establishes and keeps. `entries.len() < count` means
+    /// a tunnel is missing and the repair tick will dial one; nothing else moves
+    /// this number.
+    count: usize,
+    /// At most one tunnel is drained for a carrier move at a time.
+    handover: Option<PoolHandover>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelPhase {
+    Serving,
+    Draining,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoverPhase {
+    Draining,
+    Dialing,
+}
+
+struct PoolHandover {
+    tunnel_id: usize,
+    target: Carrier,
+    phase: HandoverPhase,
+    /// When the current phase began: each phase has its own budget.
+    phase_since: std::time::Instant,
 }
 
 /// One live tunnel of a pool.
 struct PoolEntry {
+    /// The carrier this tunnel was established on. Per entry, not per pool: a
+    /// repair may ride a different one than the tunnels around it, and the
+    /// telemetry has to say what is true rather than what the pool was born as.
+    carrier: Carrier,
+    /// Draining entries keep established streams but receive no new opens.
+    phase: TunnelPhase,
     tunnel: ClientTunnel,
     /// Dropping this ends the driver; the pool holds it for the tunnel's whole
-    /// life so a shrink can actually release the connection.
+    /// life, so removal actually releases the connection.
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 impl PoolEntry {
     fn load(&self) -> TunnelLoad {
         self.tunnel.counters.load()
-    }
-}
-
-impl PoolState {
-    /// The load of every tunnel, in pool order.
-    fn loads(&self) -> Vec<TunnelLoad> {
-        self.entries.iter().map(PoolEntry::load).collect()
     }
 }
 
@@ -448,15 +584,24 @@ struct Reservation {
 
 /// What one pool needs to create a new tunnel: the dialer, plus the shutdown
 /// sender of the driver it started.
-type DialResult = Result<(ClientTunnel, tokio::sync::watch::Sender<bool>), String>;
+pub type DialResult = Result<(ClientTunnel, tokio::sync::watch::Sender<bool>), String>;
 
 /// The pool's way to add a tunnel. `ClientTunnel`s carry no index; the pool
 /// assigns one when it inserts the tunnel.
 pub type Dialer = std::sync::Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = DialResult> + Send>>
+    dyn Fn(Carrier) -> std::pin::Pin<Box<dyn std::future::Future<Output = DialResult> + Send>>
         + Send
         + Sync,
 >;
+
+/// Which carrier the pool should establish **next**.
+///
+/// A function rather than a value: the answer changes while the pool lives (the
+/// client's carrier choice falls back, and a quality decision can move it), and
+/// a pool that captured one carrier at birth kept repairing into a path that had
+/// stopped working — the defect this parameter exists to fix. The pool does not
+/// learn *why* the answer changed, only what it is.
+pub type PreferredCarrier = std::sync::Arc<dyn Fn() -> Carrier + Send + Sync>;
 
 /// Why an open failed.
 #[derive(Debug)]
@@ -466,8 +611,8 @@ pub(crate) enum OpenError {
     /// Every candidate tunnel refused the stream.
     Refused(crate::mux::ConnectionError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
-    /// the pool could not grow past it (its own `max_tunnels`, or the server's
-    /// `max_tunnels_per_client` valve).
+    /// the pool could not reach its count (its own `tunnels`, or the server's
+    /// `max_tunnels_per_client` valve), or the carrier's dial failed.
     ///
     /// A typed refusal rather than a queued open: the engine's cap is *fatal*
     /// to a tunnel, so the pool refuses one visitor instead of risking every
@@ -484,7 +629,8 @@ impl std::fmt::Display for OpenError {
             Self::Refused(e) => write!(f, "every tunnel refused the stream: {e}"),
             Self::AtCapacity => write!(
                 f,
-                "every tunnel is at its stream ceiling and the pool cannot grow"
+                "every tunnel is at its stream ceiling; this pool is at its configured tunnel \
+                 count (`tunnels`)"
             ),
         }
     }
@@ -492,23 +638,58 @@ impl std::fmt::Display for OpenError {
 
 /// The pool's shared state: what placement, the maintenance tick and the
 /// opt-in telemetry tasks read.
+/// One health sample: every tunnel's cumulative counters, keyed by tunnel id, in
+/// pool order — `(datagrams_out, retransmits, delivered, handed)`.
+///
+/// The first pair is this end's own ARQ (plus the peer's, summed) and the second
+/// is the **delivery pair**: what this end received off the tunnel against what
+/// the peer's application handed it. The rule judges on the second; the first is
+/// kept because it is what the telemetry shows and what the misfire was measured
+/// against.
+#[cfg(feature = "client")]
+type HealthSample = Vec<(usize, (u64, u64, u64, u64))>;
+
+/// The carrier rule's probe state: one at a time, or the backoff after one.
+///
+/// A probe is a tunnel handed to the carrier the pool is *not* riding, so the
+/// two carriers can be compared on the path they actually share — no local
+/// threshold separates a policed carrier from a merely lossy one (measured:
+/// the re-send share fires on both classes, the delivery ratio on neither,
+/// because a reliable ARQ turns a policed path into throughput). The only way
+/// to learn what the other carrier would do is to put a tunnel on it and
+/// compare what the two carry.
+#[cfg(feature = "client")]
+#[derive(Default)]
+struct ProbeState {
+    /// The carrier a probe tunnel was handed to, and when: `None` when no
+    /// probe is running. The probe's tunnel is whatever entry of the pool
+    /// rides this carrier — there is exactly one while a probe runs, and the
+    /// handover that created it is the pool's own mechanism.
+    active: Option<(Carrier, std::time::Instant)>,
+    /// No probe before this instant (`CARRIER_RULE_PROBE_BACKOFF` after one
+    /// came back empty).
+    backoff_until: Option<std::time::Instant>,
+}
+
 struct PoolShared {
     carrier: Carrier,
+    started: std::time::Instant,
+    diagnostic_handover_fired: std::sync::atomic::AtomicBool,
+    /// When this pool's diagnostic handover fires, read from the environment
+    /// **at pool creation**: the switch is documented as "that many seconds
+    /// after the pool starts", so each pool answers for itself. (A process
+    /// wide read would let whichever pool was created first consume the value
+    /// for every pool created after it — and a test binary that creates
+    /// several pools would hand the hatch to the first one only.)
+    hatch_at: Option<std::time::Duration>,
+
     /// The pool's key within its session: `session` (shared) or
     /// `service:<name>`.
     key: String,
-    /// Streams per tunnel (`DEFAULT_MUX_MAX_STREAMS`), the growth ceiling.
+    /// Streams per tunnel (`DEFAULT_MUX_MAX_STREAMS`): the engine cap the
+    /// placement ceiling leaves headroom below.
     stream_cap: usize,
-    /// `[client.data].idle_timeout`.
-    idle_timeout: std::time::Duration,
-    /// When the pool last had work (a stream, a reserved open or a pinned
-    /// peer): the shrink clock.
-    last_activity: std::sync::Mutex<std::time::Instant>,
-    /// The last growth: shrink waits the warm hold out from here.
-    last_grown: std::sync::Mutex<std::time::Instant>,
-    /// The last shrink: the next one waits the cooldown out from here.
-    last_shrunk: std::sync::Mutex<std::time::Instant>,
-    /// When a growth attempt last failed: the pool stops growing until
+    /// When a repair attempt last failed: the pool stops dialing until
     /// `GROW_FAILURE_COOLDOWN` has passed, or a tunnel dies (D14).
     grow_failed_at: std::sync::Mutex<Option<std::time::Instant>>,
     /// The UDP-derived floor (D7). The session maintains it from its active
@@ -520,11 +701,12 @@ struct PoolShared {
     shrinks: std::sync::atomic::AtomicU64,
     /// The pool timeline, drained once per second by the telemetry task.
     events: std::sync::Mutex<Vec<PoolEvent>>,
-    /// Set while the pool is growing or shrinking, so the two cannot overlap.
+    /// Set while the pool is establishing a tunnel, so two repair dials cannot
+    /// overlap.
     resizing: std::sync::atomic::AtomicBool,
-    /// Signalled when one growth attempt ends, worked or not. A cold pool's
-    /// losing opens wait on it for the tunnel the winner is dialing, instead
-    /// of reserving against an empty pool.
+    /// Signalled when one repair attempt ends, worked or not. An open that
+    /// found the pool empty waits on it for the tunnel the winner is dialing,
+    /// instead of reserving against an empty pool.
     grown: tokio::sync::Notify,
     /// Signalled when a tunnel's stream count drops, so an open that found
     /// every tunnel at its ceiling can re-read the pool instead of failing
@@ -534,17 +716,38 @@ struct PoolShared {
     /// Dropped with the last real user of the pool: the maintenance and
     /// telemetry tasks hold only a `Weak` and exit on it.
     alive: std::sync::Arc<()>,
+    /// The carrier rule's previous health sample (see `carrier_rule_step`):
+    /// `None` until the first tick, and replaced every tick after. A window
+    /// is this minus the previous — the same difference-two-snapshots shape
+    /// the lane policy keeps.
+    #[cfg(feature = "client")]
+    health_sample: std::sync::Mutex<Option<HealthSample>>,
+    /// How many consecutive ticks the carrier rule has held its verdict
+    /// (see [`CARRIER_RULE_CONFIRM_TICKS`]).
+    #[cfg(feature = "client")]
+    rule_streak: std::sync::Mutex<u32>,
+    /// The carrier rule's probe: which carrier a probe tunnel was handed to
+    /// and when, or the backoff that follows one that came back empty.
+    #[cfg(feature = "client")]
+    probe: std::sync::Mutex<ProbeState>,
+    /// Maintenance ticks since the pool started, so the rule can judge once per
+    /// [`CARRIER_RULE_WINDOW_TICKS`] rather than once per tick.
+    #[cfg(feature = "client")]
+    rule_tick: std::sync::atomic::AtomicU32,
+    /// Whether this pool's carrier rule runs at all, read from the
+    /// environment **at pool creation** (the hatch's pattern): a test builds
+    /// the rule on without touching process state.
+    #[cfg(feature = "client")]
+    rule_enabled: bool,
+    /// The data endpoint's carrier decision, when the pool's owner handed one
+    /// over: the authority a rule's move goes through, so a handover respects
+    /// the same switch cooldown every other switch does. `None` on pools
+    /// built without one (tests) — those move on the rule's own word.
+    #[cfg(feature = "client")]
+    carrier_choice: Option<std::sync::Arc<crate::transport::carrier::CarrierChoice>>,
 }
 
 impl PoolShared {
-    /// Note that the pool has work now: the shrink clock restarts.
-    fn touch(&self) {
-        *self
-            .last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
-    }
-
     /// Record one size change for the telemetry timeline. Bounded: a pool
     /// that flaps cannot grow the buffer without bound.
     fn push_event(&self, event: PoolEvent) {
@@ -638,10 +841,17 @@ impl PinRegistry {
             .copied()
             .unwrap_or(0)
     }
+
+    fn counts(&self) -> std::collections::HashMap<usize, usize> {
+        self.counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// A pool of parallel client tunnels (arm 1 of the transport comparison:
-/// N physical connections instead of one), with elastic size.
+/// N physical connections instead of one), pinned at its configured count.
 ///
 /// `open_stream` picks the least-loaded tunnel (by `streams + pending`), with
 /// the round-robin cursor as the tie-break; a tunnel whose driver died returns
@@ -651,10 +861,11 @@ impl PinRegistry {
 /// re-establishes the tunnels).
 ///
 /// `open_streams(n)` reserves all `n` before awaiting any, so a stripe group
-/// of K lands on K distinct tunnels whenever the pool has K (D24).
+/// of K lands on K distinct tunnels whenever the pool has K and shares them
+/// when it has fewer (D24).
 ///
-/// Clones share one state, so placement, growth and shrink see every service
-/// that uses the pool — which is the whole point of a shared pool.
+/// Clones share one state, so placement and repair see every service that uses
+/// the pool — which is the whole point of a shared pool.
 #[derive(Clone)]
 pub struct TunnelPool {
     inner: std::sync::Arc<TunnelPoolInner>,
@@ -663,54 +874,100 @@ pub struct TunnelPool {
 struct TunnelPoolInner {
     shared: std::sync::Arc<PoolShared>,
     state: parking_lot::Mutex<PoolState>,
-    /// Creates a new tunnel for a growth. `None` on a pool built without one.
+    /// Creates a new tunnel for a repair. `None` on a pool built without one.
     dial: Option<Dialer>,
-    /// The client's UDP pin accounting: a tunnel whose tunnel id appears here
-    /// with a non-zero count is pinned and must never be shrunk (D30).
+    /// The carrier a repair should establish now (see [`PreferredCarrier`]).
+    preferred: PreferredCarrier,
+    /// The client's UDP pin accounting: which peers end on which tunnel (D30).
     pins: std::sync::Arc<PinRegistry>,
 }
 
 impl TunnelPool {
     /// Wrap the tunnels an establishment pass already produced, on a pool that
-    /// cannot grow (no dialer).
+    /// cannot repair (no dialer).
     #[must_use]
     pub fn new(
         carrier: Carrier,
         key: String,
         initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
-        max_tunnels: usize,
-        idle_timeout: std::time::Duration,
+        tunnels: usize,
     ) -> TunnelPool {
         Self::with_dialer(
             carrier,
             key,
             initial,
-            max_tunnels,
-            idle_timeout,
+            tunnels,
             None,
             std::sync::Arc::new(PinRegistry::new()),
         )
     }
 
-    /// The same, with the dialer a growth uses (`None` on a pool that cannot
-    /// grow) and the client's UDP pin registry.
+    /// The same, with the dialer a repair uses (`None` on a pool that cannot
+    /// replace a dead tunnel) and the client's UDP pin registry.
     pub fn with_dialer(
         carrier: Carrier,
         key: String,
         initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
-        max_tunnels: usize,
-        idle_timeout: std::time::Duration,
+        tunnels: usize,
         dial: Option<Dialer>,
         pins: std::sync::Arc<PinRegistry>,
     ) -> TunnelPool {
-        let shared = std::sync::Arc::new(PoolShared {
+        Self::with_preference(
             carrier,
             key,
+            initial,
+            tunnels,
+            dial,
+            std::sync::Arc::new(move || carrier),
+            pins,
+        )
+    }
+
+    /// The same, with the carrier a repair should establish decided at dial time
+    /// rather than fixed at pool creation.
+    ///
+    /// This is the seam the resilience defect needed: a pool whose dialer is
+    /// pinned to the carrier it was born on keeps repairing into a path that has
+    /// stopped carrying it, while the client's own carrier choice has already
+    /// fallen back.
+    pub fn with_preference(
+        carrier: Carrier,
+        key: String,
+        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        tunnels: usize,
+        dial: Option<Dialer>,
+        preferred: PreferredCarrier,
+        pins: std::sync::Arc<PinRegistry>,
+    ) -> TunnelPool {
+        Self::with_choice(carrier, key, initial, tunnels, dial, preferred, pins, None)
+    }
+
+    /// The same, and the data endpoint's carrier decision beside it: the
+    /// carrier rule's moves go through the choice's `prefer`, so a handover
+    /// respects the switch cooldown the endpoint's other switches do. `None`
+    /// (tests, tooling) leaves the rule answering only to its own floors.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pool constructor is the one seam every caller builds a                   pool through; a params struct would fork the existing call                   sites for one optional the tests pass as None"
+    )]
+    pub fn with_choice(
+        carrier: Carrier,
+        key: String,
+        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        tunnels: usize,
+        dial: Option<Dialer>,
+        preferred: PreferredCarrier,
+        pins: std::sync::Arc<PinRegistry>,
+        carrier_choice: Option<std::sync::Arc<crate::transport::carrier::CarrierChoice>>,
+    ) -> TunnelPool {
+        let rule_enabled = carrier_rule_enabled();
+        let shared = std::sync::Arc::new(PoolShared {
+            carrier,
+            started: std::time::Instant::now(),
+            diagnostic_handover_fired: std::sync::atomic::AtomicBool::new(false),
+            hatch_at: diagnostic_handover_at(),
+            key,
             stream_cap: stream_cap(),
-            idle_timeout,
-            last_activity: std::sync::Mutex::new(std::time::Instant::now()),
-            last_grown: std::sync::Mutex::new(std::time::Instant::now()),
-            last_shrunk: std::sync::Mutex::new(std::time::Instant::now()),
             grow_failed_at: std::sync::Mutex::new(None),
             udp_floor: std::sync::atomic::AtomicUsize::new(0),
             grows: std::sync::atomic::AtomicU64::new(0),
@@ -720,15 +977,29 @@ impl TunnelPool {
             grown: tokio::sync::Notify::new(),
             capacity_freed: tokio::sync::Notify::new(),
             alive: std::sync::Arc::new(()),
+            #[cfg(feature = "client")]
+            health_sample: std::sync::Mutex::new(None),
+            #[cfg(feature = "client")]
+            rule_streak: std::sync::Mutex::new(0),
+            #[cfg(feature = "client")]
+            probe: std::sync::Mutex::new(ProbeState::default()),
+            #[cfg(feature = "client")]
+            rule_tick: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "client")]
+            rule_enabled,
+            #[cfg(feature = "client")]
+            carrier_choice,
         });
         let mut state = PoolState {
             entries: Vec::new(),
             next_cursor: 0,
-            demand: false,
-            max_tunnels: max_tunnels.max(1),
+            count: tunnels.max(1),
+            handover: None,
         };
         for (tunnel, shutdown) in initial {
             state.entries.push(PoolEntry {
+                carrier,
+                phase: TunnelPhase::Serving,
                 tunnel,
                 _shutdown: shutdown,
             });
@@ -738,12 +1009,13 @@ impl TunnelPool {
                 shared,
                 state: parking_lot::Mutex::new(state),
                 dial,
+                preferred,
                 pins,
             }),
         };
-        // The "cold + demand -> +1" rule has to be evaluated even when nothing
-        // else happens, and the shrink clock needs a heartbeat: one task per
-        // pool, exiting when the pool drops.
+        // The repair tick has to run even when nothing else happens, so a
+        // missing tunnel is dialed without a visitor arriving first: one task
+        // per pool, exiting when the pool drops.
         pool.spawn_maintenance();
         pool_stats::register(&pool.inner);
         LIVE_POOLS
@@ -752,6 +1024,698 @@ impl TunnelPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(std::sync::Arc::downgrade(&pool.inner));
         pool
+    }
+
+    #[cfg(feature = "client")]
+    fn diagnostic_handover(&self) {
+        let Some(at) = self.inner.shared.hatch_at else {
+            return;
+        }; // Once per pool: the hatch measures *one* switch. The flag is set when
+        // a handover starts, so a completed or timed-out one is never repeated;
+        // it is deliberately NOT consumed on a tick that finds no eligible
+        // candidate — a visitor mid-open or both tunnels busy is a moment's
+        // transient state, and burning the hatch on it would measure nothing.
+        if self.inner.shared.started.elapsed() < at
+            || self
+                .inner
+                .shared
+                .diagnostic_handover_fired
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        // `from` is the carrier the pool's tunnels actually ride — after a
+        // fallback a pool born on KCP may hold only TCP entries, and the hatch
+        // has to move one of *those* — and the target is the other one.
+        let state = self.inner.state.lock();
+        let Some(&from) = state
+            .entries
+            .iter()
+            .filter(|entry| entry.phase == TunnelPhase::Serving)
+            .map(|entry| &entry.carrier)
+            .next()
+        else {
+            return;
+        };
+        drop(state);
+        let target = match from {
+            Carrier::Kcp => Carrier::Tcp,
+            Carrier::Tcp => Carrier::Kcp,
+        };
+        if self.begin_handover(from, target) {
+            self.inner
+                .shared
+                .diagnostic_handover_fired
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            info!(
+                pool = %self.inner.shared.key,
+                from = from.as_str(),
+                to = target.as_str(),
+                "pool-stats: diagnostic tunnel carrier handover requested"
+            );
+        }
+    }
+
+    /// Log one judgement window: every tunnel's emitted/re-sent pair and its
+    /// share, whether or not the window produced a verdict.
+    ///
+    /// **Every** window, not only the ones that fire: the distribution of the
+    /// share across windows is what a detector has to survive, and a rule that
+    /// speaks only when it fires cannot show why it stayed silent — or how
+    /// close it came. One line per window per pool, at debug.
+    #[cfg(feature = "client")]
+    fn log_window(
+        &self,
+        last: &HealthSample,
+        now: &HealthSample,
+        firing: bool,
+        suspicion: Option<f64>,
+    ) {
+        // This runs every maintenance tick of every pool, and its body
+        // allocates (a Vec plus two Strings per tunnel) only to feed a DEBUG
+        // event: when the level is filtered out the event is dropped whole,
+        // strings and all. The gate makes the filtered case free, the same
+        // discipline `note_gauges` and `PhaseTimer` follow — the diagnostic
+        // costs nothing unless someone asked for it.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let window: Vec<(usize, u64, String, String)> = now
+            .iter()
+            .map(|(id, (out, ret, delivered, handed))| {
+                let before = last
+                    .iter()
+                    .find(|(p, _)| p == id)
+                    .map_or((*out, *ret, *delivered, *handed), |(_, quad)| *quad);
+                let emitted = out.saturating_sub(before.0);
+                let resent = ret.saturating_sub(before.1);
+                let share = window_share_pct(emitted, resent)
+                    .map_or_else(|| "-".to_owned(), |s| format!("{s:.2}"));
+                let got = delivered.saturating_sub(before.2);
+                let offered = handed.saturating_sub(before.3);
+                (
+                    *id,
+                    offered,
+                    share,
+                    format!("{:.1}", delivery_pct(got, offered)),
+                )
+            })
+            .collect();
+        debug!(
+            pool = %self.inner.shared.key,
+            firing,
+            suspicion = ?suspicion,
+            window = ?window,
+            "carrier rule window: (tunnel, handed, re-sent share%, delivered%)"
+        );
+    }
+
+    /// The quality rule the handover mechanism was built for: hand one KCP
+    /// tunnel over to TCP when its session is measurably losing traffic.
+    ///
+    /// The signal is the tunnel's own ARQ counters (see
+    /// [`crate::transport::health::SessionHealth`]): the retransmit share of what the
+    /// session emits. Measured before this existed (S1, round 37): a healthy
+    /// carrier re-sends ~nothing (`retransmits` 1 against `datagrams_out` in
+    /// the hundreds of thousands per cell), a carrier losing its traffic
+    /// re-sends by the thousands — a separation orders of magnitude wide, so
+    /// the floors below sit far inside it and far above scatter. TCP has no
+    /// userspace equivalent, so the rule is **one-sided by construction**: it
+    /// moves KCP → TCP on KCP's own evidence, and never judges a TCP tunnel
+    /// (the kernel keeps its retransmit state where userspace cannot read
+    /// it); a move back is the L3 policy's business, driven by that rule's
+    /// evidence chain.
+    ///
+    /// The window is `carrier_health_window()`'s last sample minus this one,
+    /// per tunnel — the same difference-two-snapshots shape the lane policy
+    /// uses. [`CARRIER_RULE_MIN_DATAGRAMS`] keeps a quiet session from being
+    /// judged on one stray retransmit; [`CARRIER_RULE_RETRANSMIT_SHARE_PCT`]
+    /// is the share at which the cell the S1 ran on says the carrier is
+    /// losing (1 % loss path, KCP re-sending 5.7 % at its ceiling); a
+    /// retransmitting tunnel is preferred for the move over a clean one of
+    /// the same carrier (the worst lane leaves first, as the lane policy
+    /// retires its worst).
+    ///
+    /// The pool keeps the verdict for [`CARRIER_RULE_CONFIRM_TICKS`]
+    /// maintenance ticks (one per 50 ms tick here, unlike the lane policy's
+    /// one-second ticks — a burst of loss is minutes long by these units
+    /// before anything moves) before asking [`Self::begin_handover`], and the
+    /// endpoint's [`crate::transport::carrier::CarrierChoice::prefer`] is the
+    /// authority: the pool itself only moves a tunnel, the *choice* moves
+    /// when the policy says so, under the same 120 s cooldown every other
+    /// switch respects. `MOLEHILL_TUNNEL_CARRIER_RULE=0` switches the whole
+    /// rule off (the hatch's `MOLEHILL_TUNNEL_SWITCH_AT` stays independent of
+    /// it — one is a measurement instrument, the other a policy).
+    #[cfg(feature = "client")]
+    fn carrier_rule_step(&self) {
+        if !self.inner.shared.rule_enabled {
+            return;
+        }
+        // A forced carrier is the run's answer, not a preference to be argued
+        // with (the same guard the lane policy's carrier_step keeps): the
+        // environment pinned the carrier for a measurement, and moving
+        // tunnels against it would poison the arm.
+        if crate::transport::carrier::forced_carrier().is_some() {
+            return;
+        }
+        // Judge once per window, not once per tick: the volume floor is a
+        // *window* floor, and a 50 ms window cannot hold enough datagrams to
+        // meet it on a slow path (see `CARRIER_RULE_MIN_DATAGRAMS`).
+        let tick = self
+            .inner
+            .shared
+            .rule_tick
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        if !tick.is_multiple_of(CARRIER_RULE_WINDOW_TICKS) {
+            return;
+        }
+        let now = self.health_sample();
+        let mut previous = self
+            .inner
+            .shared
+            .health_sample
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(last) = previous.replace(now.clone()) else {
+            return; // a first sample is a baseline, not a window
+        };
+        let verdict = carrier_rule_verdict(&last, &now);
+        // The suspicion half: the worst re-sent share on any tunnel carrying
+        // material traffic. The delivery verdict above names a tunnel that
+        // *stops* delivering; the share names a sender that is *fighting* the
+        // path — on the policed condition it is the only local signal that
+        // fires at all (measured: 27 % there, delivery pinned at 99 % by the
+        // ARQ's own re-sends), and it fires on a merely lossy path too, which
+        // is why what it earns is a probe rather than a move.
+        let share = carrier_rule_suspicion(&last, &now);
+        self.log_window(&last, &now, verdict.is_some(), share);
+        // An active probe is judged on every window, whether or not a
+        // suspicion fired in it: the probe's verdict comes from the two
+        // carriers' carried bytes, and gating it on the sender would gate the
+        // answer on the metric measured to be the wrong shape.
+        self.probe_judge(&last, &now);
+        drop(previous);
+        let Some((tunnel_id, share_pct)) = verdict else {
+            // No delivery verdict: the streak resets (one clean tick is
+            // enough — the confirm ticks exist to ride out bursts, not to
+            // require a unanimous history). A share suspicion starts a probe
+            // directly: it needs no confirm streak, because nothing moves on
+            // it — the probe measures and the comparison decides.
+            if share.is_some() && self.probe_step() {
+                return;
+            }
+            *self
+                .inner
+                .shared
+                .rule_streak
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+            return;
+        };
+        let mut streak = self
+            .inner
+            .shared
+            .rule_streak
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *streak += 1;
+        if *streak < CARRIER_RULE_CONFIRM_TICKS {
+            return;
+        }
+        *streak = 0;
+        drop(streak);
+        // The suspicion is confirmed — but the sender's own share cannot tell
+        // a policed carrier from a merely lossy one (measured, round 6: it
+        // fires on both classes), so the confirmed move is a **probe**, not a
+        // flip: hand one tunnel to the other carrier and let the two carry
+        // the same path side by side. `probe_step` starts it, or `false`
+        // means no probe is possible right now (a one-tunnel pool, a handover
+        // already in flight, the backoff still running) and the flip below
+        // is what the suspicion earned instead.
+        if self.probe_step() {
+            return;
+        }
+        // The move: exclude the tunnel from new placements, and flip the
+        // endpoint's choice so every later dial rides TCP under the switch
+        // cooldown. `prefer` is refused inside the cooldown — then the
+        // handover does not start either: a carrier that cannot change yet
+        // must not have a tunnel taken out of service for it.
+        let switched = self
+            .inner
+            .shared
+            .carrier_choice
+            .as_deref()
+            .is_none_or(|choice| {
+                choice.prefer(
+                    Carrier::Tcp,
+                    &format!(
+                        "tunnel {tunnel_id} re-sent {share_pct:.1}% of its datagrams over the window"
+                    ),
+                )
+            });
+        if !switched {
+            debug!(
+                pool = %self.inner.shared.key,
+                "carrier rule: move to tcp deferred by the switch cooldown"
+            );
+            return;
+        }
+        if self.begin_handover(Carrier::Kcp, Carrier::Tcp) {
+            info!(
+                pool = %self.inner.shared.key,
+                tunnel = tunnel_id,
+                share = format!("{share_pct:.1}%"),
+                "carrier rule: tunnel re-sent its share of the window; \
+                 handing it over to tcp"
+            );
+        }
+    }
+
+    /// One sample of every tunnel's KCP health, keyed by tunnel id, in pool
+    /// order — the rule's window input.
+    #[cfg(feature = "client")]
+    fn health_sample(&self) -> HealthSample {
+        // The rule's own tick may block briefly on the state lock (a
+        // placement holding it): a skipped sample would widen the next
+        // window's baseline instead of the window, so the rule waits rather
+        // than skips. The telemetry path keeps its `try_lock`.
+        let state = self.inner.state.lock();
+        state
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    e.tunnel.id,
+                    // The ARQ pair (both ends summed — the peer's report is what
+                    // makes it direction-independent) and the delivery pair: what
+                    // this end received off the tunnel against what the peer's
+                    // application handed it. The rule judges on the second.
+                    {
+                        let arq = e.tunnel.counters.health_counts().unwrap_or((0, 0));
+                        (
+                            arq.0,
+                            arq.1,
+                            e.tunnel.counters.received(),
+                            e.tunnel.counters.peer_handed(),
+                        )
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Record one tunnel's peer-side health report.
+    ///
+    /// The client is the deciding end and the tunnels are named by the id it
+    /// assigned them (`next_tunnel_id`), so a report is routed by that id alone —
+    /// there is no per-service ambiguity to resolve, and a tunnel the pool no
+    /// longer holds (a report in flight when it was repaired) is simply dropped.
+    /// Returns the tunnel's counters **after** recording the report — both ends
+    /// summed — so the caller can see the value it just contributed to, or
+    /// `None` when this pool does not hold that tunnel.
+    pub fn note_peer_health(
+        &self,
+        tunnel: crate::protocol::TunnelId,
+        counters: (u64, u64),
+        handed: u64,
+        seq: u8,
+    ) -> Option<(u64, u64)> {
+        let wanted = usize::try_from(u32::from_be_bytes(tunnel.0)).unwrap_or(usize::MAX);
+        let state = self.inner.state.lock();
+        let Some(entry) = state
+            .entries
+            .iter()
+            .find(|entry| entry.tunnel.id() == wanted)
+        else {
+            debug!(
+                pool = %self.inner.shared.key,
+                tunnel = wanted,
+                held = ?state.entries.iter().map(|e| e.tunnel.id()).collect::<Vec<_>>(),
+                "peer health report for a tunnel this pool does not hold"
+            );
+            return None;
+        };
+        entry
+            .tunnel
+            .counters
+            .note_peer_health(counters, handed, seq);
+        entry.tunnel.counters.health_counts()
+    }
+
+    /// Start the rule's probe, or report that one is already running: `true`
+    /// means a probe is now active (the caller's flip waits for its verdict),
+    /// `false` that none was possible and the caller should act on its own
+    /// suspicion.
+    ///
+    /// A probe is one tunnel of the pool handed to the carrier the pool is
+    /// not riding — the same `begin_handover` every move uses, the difference
+    /// is intent: the pool's own carrier choice stays where it is and the
+    /// probe is *measured* (per-window carried bytes, from the same health
+    /// sample the rule already takes) until the two carriers separate or the
+    /// budget runs out. A probe that came back empty parks the pool in
+    /// [`CARRIER_RULE_PROBE_BACKOFF`] instead of being retried at the next
+    /// window.
+    #[cfg(feature = "client")]
+    fn probe_step(&self) -> bool {
+        let mut probe = self
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probe.active.is_some() {
+            return true; // already running; `probe_judge` owns its verdict
+        }
+        if probe
+            .backoff_until
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return false;
+        }
+        // The probe rides the carrier the pool is NOT on: a Kcp pool probes
+        // tcp, and a Tcp pool probes kcp (the shape the lane policy's
+        // suspicion-driven probe takes on its own scale).
+        let probed = match self.inner.shared.carrier {
+            Carrier::Kcp => Carrier::Tcp,
+            Carrier::Tcp => Carrier::Kcp,
+        };
+        if self.begin_handover(self.inner.shared.carrier, probed) {
+            probe.active = Some((probed, std::time::Instant::now()));
+            info!(
+                pool = %self.inner.shared.key,
+                probe = probed.as_str(),
+                "carrier rule: suspicion confirmed; probing the other carrier \
+                 with one tunnel"
+            );
+            true
+        } else {
+            // Nothing to probe with (a one-tunnel pool, or a handover already
+            // in flight): the ordinary flip is the only move available.
+            false
+        }
+    }
+
+    /// Judge the running probe on one window: the pool carrier's per-tunnel
+    /// carried bytes against the probe tunnel's, acted on when they separate.
+    ///
+    /// A probe that stays inconclusive for [`CARRIER_RULE_PROBE_MAX`] is
+    /// given back (and its backoff starts) here rather than by `probe_step`,
+    /// because this is where the windows are — the caller already took the
+    /// health sample the verdict reads.
+    #[cfg(feature = "client")]
+    fn probe_judge(&self, last: &HealthSample, now: &HealthSample) {
+        let seconds = f64::from(CARRIER_RULE_WINDOW_TICKS) * 0.05;
+        let probe_tunnel = {
+            let probe = self
+                .inner
+                .shared
+                .probe
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match probe.active {
+                Some((probed, started)) if started.elapsed() <= CARRIER_RULE_PROBE_MAX => probed,
+                Some((probed, _)) => {
+                    // Inconclusive for the whole budget: the probe comes back
+                    // and the pool pays its backoff before suspecting again.
+                    let mut probe = self
+                        .inner
+                        .shared
+                        .probe
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if probe.active.is_some() {
+                        probe.active = None;
+                        probe.backoff_until =
+                            Some(std::time::Instant::now() + CARRIER_RULE_PROBE_BACKOFF);
+                        drop(probe);
+                        info!(
+                            pool = %self.inner.shared.key,
+                            "carrier rule: probe inconclusive for its whole budget; \
+                             giving the tunnel back and backing off"
+                        );
+                        self.begin_handover(probed, self.inner.shared.carrier);
+                    }
+                    return;
+                }
+                None => return,
+            }
+        };
+        let Some(probe_id) = self.probe_tunnel_of(probe_tunnel) else {
+            // The probe's tunnel is gone (a repair removed it, or the handover
+            // that dialled it has not completed): there is nothing to compare.
+            return;
+        };
+        let (chosen_bytes, probe_bytes) = probe_carried_bytes(last, now, probe_id);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a window's byte counts are far below 2^53, the point where an f64 stops \
+                      counting integers exactly"
+        )]
+        let (chosen_per_s, probe_per_s) =
+            (chosen_bytes as f64 / seconds, probe_bytes as f64 / seconds);
+        // A probe whose window carried (near) nothing has not been measured:
+        // placement routes new streams to it, but a window can close before
+        // the first open lands. Judging an idle tunnel against a busy
+        // incumbent reads "carries less" on zero evidence and gives the probe
+        // back — measured, four probes in a row reverted on exactly that
+        // artifact. Hold until the probed carrier has carried material
+        // traffic; the budget expires it if the routing never fills it.
+        if probe_per_s < CARRIER_RULE_PROBE_MIN_BYTES_PER_S {
+            return;
+        }
+        match probe_verdict(chosen_per_s, probe_per_s) {
+            ProbeVerdict::Hold => {}
+            ProbeVerdict::Move => {
+                if !self.probe_conclude(probe_tunnel) {
+                    return;
+                }
+                info!(
+                    pool = %self.inner.shared.key,
+                    probe_bytes_per_s = format!("{probe_per_s:.0}"),
+                    chosen_bytes_per_s = format!("{chosen_per_s:.0}"),
+                    "carrier rule: the probe's carrier carries materially more; \
+                     moving the pool to it"
+                );
+                let switched = self
+                    .inner
+                    .shared
+                    .carrier_choice
+                    .as_deref()
+                    .is_none_or(|choice| {
+                        choice.prefer(
+                            probe_tunnel,
+                            &format!(
+                                "probe tunnel carried {probe_per_s:.0} B/s against \
+                                 {chosen_per_s:.0} B/s on the pool's carrier"
+                            ),
+                        )
+                    });
+                if switched {
+                    // The probe's tunnel is the seed of the new carrier: the
+                    // move hands a tunnel of the *old* carrier to the probed
+                    // one, which is what flips the pool's entries over.
+                    self.begin_handover(self.inner.shared.carrier, probe_tunnel);
+                }
+            }
+            ProbeVerdict::Revert => {
+                if !self.probe_conclude(probe_tunnel) {
+                    return;
+                }
+                // The probed carrier carried less: the suspicion was a lossy
+                // path, not a policed one, and probing again at the next
+                // window would be churn. The backoff is what makes a healthy
+                // path pay one split tunnel for half a minute and nothing
+                // after ([`CARRIER_RULE_PROBE_BACKOFF`]).
+                self.inner
+                    .shared
+                    .probe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .backoff_until = Some(std::time::Instant::now() + CARRIER_RULE_PROBE_BACKOFF);
+                info!(
+                    pool = %self.inner.shared.key,
+                    probe_bytes_per_s = format!("{probe_per_s:.0}"),
+                    chosen_bytes_per_s = format!("{chosen_per_s:.0}"),
+                    "carrier rule: the probe's carrier carries materially less; \
+                     giving the tunnel back and backing off"
+                );
+                self.begin_handover(probe_tunnel, self.inner.shared.carrier);
+            }
+        }
+    }
+
+    /// Close out a probe whose verdict has been acted on, or `false` when
+    /// another path (the budget expiring mid-window) closed it first.
+    #[cfg(feature = "client")]
+    fn probe_conclude(&self, probed: Carrier) -> bool {
+        let mut probe = self
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probe.active.as_ref().is_none_or(|(p, _)| *p != probed) {
+            return false;
+        }
+        probe.active = None;
+        true
+    }
+
+    /// The pool's probe tunnel: the one entry riding `carrier` that the rest
+    /// of the pool does not. There is exactly one while a probe runs — the
+    /// handover that created it removed its old-carrier twin — and `None`
+    /// when the handover is still dialling (no entry rides the probed carrier
+    /// yet).
+    #[cfg(feature = "client")]
+    fn probe_tunnel_of(&self, probed: Carrier) -> Option<usize> {
+        let state = self.inner.state.lock();
+        let candidates: Vec<usize> = state
+            .entries
+            .iter()
+            .filter(|entry| entry.phase == TunnelPhase::Serving && entry.carrier == probed)
+            .map(|entry| entry.tunnel.id())
+            .collect();
+        match candidates.as_slice() {
+            [id] => Some(*id),
+            // Zero: the probe's replacement is still dialling. More than one:
+            // a repair raced the probe and dialled onto the probed carrier
+            // too — the comparison is ambiguous, so it waits for the pool to
+            // settle rather than read two tunnels as one probe.
+            _ => None,
+        }
+    }
+
+    /// Begin a no-disruption carrier handover: exclude one unpinned tunnel of
+    /// `from` from future placement. Its live streams stay on it; the repair
+    /// dials its replacement on `target` once the entry drains to zero.
+    fn begin_handover(&self, from: Carrier, target: Carrier) -> bool {
+        if from == target {
+            return false;
+        }
+        let mut state = self.inner.state.lock();
+        if state.handover.is_some()
+            || state
+                .entries
+                .iter()
+                .filter(|entry| entry.phase == TunnelPhase::Serving)
+                .count()
+                <= 1
+        {
+            return false;
+        }
+        let pin_counts = self.inner.pins.counts();
+        let Some(entry) = state
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.phase == TunnelPhase::Serving && entry.carrier == from)
+            .filter(|entry| pin_counts.get(&entry.tunnel.id()).copied().unwrap_or(0) == 0)
+            .min_by_key(|entry| entry.load().total())
+        else {
+            return false;
+        };
+        let tunnel_id = entry.tunnel.id();
+        entry.phase = TunnelPhase::Draining;
+        let now = std::time::Instant::now();
+        state.handover = Some(PoolHandover {
+            tunnel_id,
+            target,
+            phase: HandoverPhase::Draining,
+            phase_since: now,
+        });
+        true
+    }
+
+    fn handover_step(&self) {
+        let mut state = self.inner.state.lock();
+        let Some(handover) = state.handover.as_ref() else {
+            return;
+        };
+        // Every phase is bounded, for the reason the lane drain has a budget:
+        // a pool one tunnel short for ever is worse than the carrier the
+        // handover was trying to leave.
+        let elapsed = handover.phase_since.elapsed();
+        let budget = match handover.phase {
+            // Draining waits for live streams to end on their own — a long
+            // flow finishes where it is. Past the budget the move is called
+            // off and the tunnel returns to service.
+            HandoverPhase::Draining => crate::transport::carrier::SWITCH_COOLDOWN,
+            // Dialing waits for one replacement, which a healthy dial answers
+            // well inside the slowest carrier's own establish timeout; a
+            // target that cannot be established (UDP blocked, server down)
+            // releases the record so repair dials the live preference instead.
+            HandoverPhase::Dialing => crate::transport::pool::COLD_GROW_WAIT,
+        };
+        let tunnel_id = handover.tunnel_id;
+        let phase = handover.phase;
+        if elapsed < budget {
+            if phase == HandoverPhase::Dialing {
+                return;
+            }
+        } else {
+            state.handover = None;
+            if phase == HandoverPhase::Draining
+                && let Some(entry) = state
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.tunnel.id() == tunnel_id)
+            {
+                entry.phase = TunnelPhase::Serving;
+            }
+            debug!(
+                pool = %self.inner.shared.key,
+                phase = match phase {
+                    HandoverPhase::Draining => "draining",
+                    HandoverPhase::Dialing => "dialing",
+                },
+                "carrier handover timed out; pool resumes its ordinary repair"
+            );
+            return;
+        }
+        let Some(index) = state
+            .entries
+            .iter()
+            .position(|entry| entry.tunnel.id() == tunnel_id)
+        else {
+            state.handover = None;
+            return;
+        };
+        if !state.entries[index].tunnel.is_alive() {
+            state.entries.remove(index);
+            state.handover = None;
+            drop(state);
+            self.release_growth_hold();
+            return;
+        }
+        let load = state.entries[index].load();
+        let pinned = self.inner.pins.pinned_on(handover.tunnel_id);
+        if load.streams == 0 && load.pending == 0 && pinned == 0 {
+            if let Some(handover) = state.handover.as_mut() {
+                handover.phase = HandoverPhase::Dialing;
+                handover.phase_since = std::time::Instant::now();
+            }
+            let entry = state.entries.remove(index);
+            drop(entry);
+            let from = state.entries.len() + 1;
+            let to = state.entries.len();
+            drop(state);
+            self.inner
+                .shared
+                .shrinks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.shared.push_event(PoolEvent {
+                grow: false,
+                reason: "handover",
+                from,
+                to,
+            });
+            info!(
+                pool = %self.inner.shared.key,
+                waited_ms = elapsed.as_millis(),
+                "pool-stats: carrier handover drained tunnel"
+            );
+            self.release_growth_hold();
+        }
     }
 
     /// The pool's key within its session (`session`, or `service:<name>`).
@@ -773,7 +1737,7 @@ impl TunnelPool {
         self.inner.state.lock().entries.len()
     }
 
-    /// The UDP-derived floor (D7) this pool must not shrink below.
+    /// The UDP-derived floor (D7) the pool's configured count must cover.
     pub fn set_udp_floor(&self, floor: usize) {
         self.inner
             .shared
@@ -790,11 +1754,15 @@ impl TunnelPool {
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: 0,
-            max_tunnels: 0,
+            count: 0,
             udp_floor: 0,
             grows: 0,
             shrinks: 0,
             tunnels: Vec::new(),
+            bytes: Vec::new(),
+            kcp_health: Vec::new(),
+            draining: Vec::new(),
+            handover: None,
         })
     }
 
@@ -807,7 +1775,7 @@ impl TunnelPool {
             key: self.inner.shared.key.clone(),
             carrier: self.inner.shared.carrier.as_str(),
             size: state.entries.len(),
-            max_tunnels: state.max_tunnels,
+            count: state.count,
             udp_floor: self.inner.shared.udp_floor.load(Ordering::Relaxed),
             grows: self.inner.shared.grows.load(Ordering::Relaxed),
             shrinks: self.inner.shared.shrinks.load(Ordering::Relaxed),
@@ -820,9 +1788,35 @@ impl TunnelPool {
                         load.streams,
                         load.pending,
                         self.inner.pins.pinned_on(e.tunnel.id()),
+                        e.carrier,
                     )
                 })
                 .collect(),
+            bytes: state
+                .entries
+                .iter()
+                .map(|e| e.tunnel.counters.bytes())
+                .collect(),
+            // The rule's own reading — both ends summed — rather than this
+            // end's half: an operator watching the line sees what the policy
+            // acts on, and the peer's half is where a policed path shows up.
+            kcp_health: state
+                .entries
+                .iter()
+                .map(|e| e.tunnel.counters.health_counts())
+                .collect(),
+            draining: state
+                .entries
+                .iter()
+                .map(|entry| entry.phase == TunnelPhase::Draining)
+                .collect(),
+            handover: state.handover.as_ref().map(|handover| {
+                let phase = match handover.phase {
+                    HandoverPhase::Draining => "draining",
+                    HandoverPhase::Dialing => "dialing",
+                };
+                (handover.tunnel_id, handover.target, phase)
+            }),
         })
     }
 
@@ -852,38 +1846,36 @@ impl TunnelPool {
 
     /// Open one stream, on the least-loaded tunnel.
     ///
-    /// A cold pool grows synchronously here, so the first open of a cold pool
-    /// answers with a fresh tunnel instead of failing; every other growth
-    /// happens on the maintenance tick. The reservation is charged before the
-    /// first `await`, which is what makes back-to-back opens land on distinct
-    /// tunnels while the pool has them.
+    /// An empty pool repairs synchronously here — the state a start whose
+    /// establishment dials all failed leaves — so the first open answers with a
+    /// fresh tunnel instead of failing; every other repair happens on the
+    /// maintenance tick. The reservation is charged before the first `await`,
+    /// which is what makes back-to-back opens land on distinct tunnels while the
+    /// pool has them.
     pub(crate) async fn open_stream(&self) -> Result<StreamLease, OpenError> {
         self.open_avoiding(&[]).await
     }
 
     /// Open one stream for a stripe of a group, on a tunnel the group does not
-    /// already occupy (D24 structural).
+    /// already occupy *while one is left* (D24 structural).
     ///
     /// `used` are the process-unique tunnel ids the group's earlier stripes
     /// took and `stripes` is the group's K — the server names the group before
     /// its channels are opened, which is what lets the client do what the
     /// placement rule alone never could.
     ///
-    /// The pool grows to `min(stripes, max_tunnels)` *first*: a pool with fewer
-    /// tunnels than the group has stripes cannot place two of them apart
-    /// however placement chooses, and a cold pool — the elastic pool's default
-    /// state — has *none*, while a group's K streams sit below the growth
-    /// rule's per-tunnel threshold (7 on the shipped cap), so nothing else in
-    /// this path would ever have asked for a second tunnel. The growth is
-    /// bounded by the group's own K and by `max_tunnels`, and a refusal (D14) or
-    /// a pool that cannot grow stops it; the placement below then shares what
-    /// there is.
+    /// A pinned pool cannot dial a tunnel per stripe. The exclusion is a
+    /// preference with a floor: the group spreads over the tunnels that exist
+    /// and, when it has more stripes than the pool has members, its extra
+    /// stripes share them rather than failing.
     pub(crate) async fn open_stream_on_distinct(
         &self,
         used: &[usize],
         stripes: usize,
     ) -> Result<StreamLease, OpenError> {
-        self.grow_for_stripes(stripes).await;
+        // `stripes` stays in the signature because the caller still sizes the
+        // request by it; placement reads only the group's occupied tunnels.
+        let _ = stripes;
         self.open_avoiding(used).await
     }
 
@@ -892,8 +1884,8 @@ impl TunnelPool {
     /// list — see [`Self::open_stream_on_distinct`]).
     async fn open_avoiding(&self, avoid: &[usize]) -> Result<StreamLease, OpenError> {
         if self.size() == 0 {
-            self.grow(GrowReason::Cold).await;
-            // The growth above is a no-op when another task already holds the
+            self.grow(GrowReason::Repair).await;
+            // The repair above is a no-op when another task already holds the
             // resize flag, so a *concurrent* first open would reserve against
             // a still-empty pool and fail (`NoTunnel`) while the winner is
             // dialing the very tunnel it needs. Wait for that attempt instead;
@@ -903,11 +1895,6 @@ impl TunnelPool {
                     .await;
         }
         let ceiling = self.ceiling();
-        // Grow *before* placing, not (only) after: a burst that arrives while
-        // every tunnel already sits at the growth threshold must spread over
-        // the tunnels it will use, not land all of it on one and queue its
-        // interactive and control streams behind that bulk.
-        self.grow_before_placing().await;
         let avoid = self.indices_of(avoid);
         let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
             // Nothing under the ceiling. An empty pool is a different failure
@@ -917,12 +1904,10 @@ impl TunnelPool {
             if self.size() == 0 {
                 return Err(OpenError::NoTunnel);
             }
-            // Every tunnel carries as many streams as it may. Growth is the
-            // rule's answer, so ask for it and give a retiring stream (or the
-            // tick) a moment before refusing this visitor: without the wait a
-            // pool that cannot grow would fail whichever open happened to
-            // arrive while every tunnel sat exactly at the ceiling.
-            self.demand();
+            // Every tunnel carries as many streams as it may, and a pinned pool
+            // cannot dial its way out: give a retiring stream a moment before
+            // refusing this visitor, so a burst that meets a full pool is
+            // served by the streams retiring under it.
             let freed = self.inner.shared.capacity_freed.notified();
             tokio::pin!(freed);
             // Register before the second look, or a retirement landing in
@@ -932,6 +1917,12 @@ impl TunnelPool {
                 let _ = tokio::time::timeout(crate::transport::pool::CAPACITY_WAIT, freed).await;
             }
             let Some(reservation) = self.reserve(&[], &avoid, ceiling) else {
+                // The final refusal: every serving tunnel is at the ceiling,
+                // and no stream retired inside the budget. During a handover,
+                // this is short-lived placement pressure, not pool saturation.
+                if self.inner.state.lock().handover.is_none() {
+                    self.report_saturation();
+                }
                 return Err(OpenError::AtCapacity);
             };
             return self.complete(reservation, &avoid).await;
@@ -949,79 +1940,41 @@ impl TunnelPool {
         crate::transport::pool::tunnel_ceiling(self.inner.shared.stream_cap)
     }
 
-    /// Grow one tunnel when the next open would add to a tunnel that is already
-    /// at the growth threshold, so the burst spreads *before* it is placed.
+    /// Say once, per process, that placement is what refused a visitor: a
+    /// pinned pool cannot dial its way out, so the fix is a wider
+    /// `[client.data.<carrier>].tunnels`.
     ///
-    /// The maintenance tick grows too, but it samples at 50 ms intervals: a
-    /// burst of K back-to-back opens (a 20-stream bulk test) completes long
-    /// before the first tick sees it, so every one of them places on the same
-    /// tunnel and the tick can only fix the *next* burst. Growing in the open
-    /// path is what makes the spreading synchronous, at the cost of one dial
-    /// for the opens that trip the rule — the same dial the cold path already
-    /// pays, and never one for an open that does not need it.
-    ///
-    /// Every guard turns this into a no-op, and they are all conditions under
-    /// which growing is wrong or already happening: a growth is in flight, a
-    /// refused growth is still holding the pool back (D14), the pool is at its
-    /// own `max_tunnels`, or the pool is cold (which [`Self::open_stream`]
-    /// grew synchronously above). The dial is bounded by the carrier's own
-    /// establish timeout, exactly like the cold path's.
-    async fn grow_before_placing(&self) {
-        use std::sync::atomic::Ordering;
-        if self.inner.shared.resizing.load(Ordering::Acquire) || self.growth_held_off() {
-            return;
-        }
-        let grow_at = crate::transport::pool::tunnel_grow_at(self.inner.shared.stream_cap);
-        let busy = {
-            let state = self.inner.state.lock();
-            let size = state.entries.len();
-            size > 0
-                && size < state.max_tunnels
-                && state.entries.iter().any(|e| e.load().total() >= grow_at)
-        };
-        if busy {
-            self.grow(GrowReason::Load).await;
-        }
-    }
-
-    /// Grow until the pool can place `target` tunnels apart, one dial at a
-    /// time and never past `max_tunnels`.
-    ///
-    /// Every stripe group pays this once: K stripes need K tunnels to be spread
-    /// over, and the pool's other growth rules are load-based, so a group whose
-    /// K streams sit below the per-tunnel threshold would never trigger one
-    /// (that is exactly how a cold pool ended up carrying a whole group on one
-    /// tunnel). The one-at-a-time shape is the pool's own: `grow` is guarded by
-    /// a resize flag, so K concurrent stripe placements take turns dialing
-    /// instead of racing, and each turn is one dial rather than a storm.
-    ///
-    /// Terminating by construction: every iteration either returns or leaves
-    /// the pool bigger, and the target is capped by `max_tunnels`. A refused
-    /// growth holds the loop off for its cooldown (D14), and a pool whose dialer
-    /// cannot add a tunnel returns instead of spinning.
-    async fn grow_for_stripes(&self, target: usize) {
-        let target = target.max(1);
-        loop {
-            let (size, cap) = {
-                let state = self.inner.state.lock();
-                (state.entries.len(), state.max_tunnels)
-            };
-            let target = target.min(cap);
-            if size >= target || self.growth_held_off() {
-                return;
-            }
-            self.grow(GrowReason::Stripe).await;
-            // Wait for the growth in flight — someone else's as much as ours —
-            // before re-reading the size: placing against the still-small pool
-            // is the very thing this loop exists to avoid.
-            self.await_growth(target).await;
-            if self.size() <= size {
-                // No tunnel was added and none is being dialed any more: the
-                // pool cannot grow (no dialer, or a refusal that now holds it
-                // back). The placement that follows shares what there is.
-                return;
-            }
-        }
+    /// INFO on the first report and DEBUG afterwards — a saturated pool under
+    /// load would otherwise repeat the line for every refused visitor — and the
+    /// line names the configured count, the ceiling and the key to raise.
+    /// Returns which of the two this call was, so a test can pin the once-only
+    /// semantics.
+    fn report_saturation(&self) -> bool {
+        let count = self.inner.state.lock().count;
+        let ceiling = self.ceiling();
+        let carrier = self.inner.shared.carrier.as_str();
+        POOL_SATURATED.report(
+            || {
+                info!(
+                    pool = %self.inner.shared.key,
+                    carrier,
+                    count,
+                    ceiling,
+                    "pool-stats: pool at its stream ceiling; raise [client.data.{carrier}].tunnels"
+                );
+                true
+            },
+            || {
+                debug!(
+                    pool = %self.inner.shared.key,
+                    carrier,
+                    count,
+                    ceiling,
+                    "pool-stats: pool still at its stream ceiling"
+                );
+                false
+            },
+        )
     }
 
     /// The pool indices of the tunnels named by `ids`, as of now.
@@ -1087,10 +2040,43 @@ impl TunnelPool {
     /// not recorded its tunnel yet.
     fn reserve(&self, tried: &[usize], avoid: &[usize], ceiling: usize) -> Option<Reservation> {
         let mut state = self.inner.state.lock();
-        let loads = state.loads();
+        let loads: Vec<TunnelLoad> = state.entries.iter().map(PoolEntry::load).collect();
         let cursor = state.next_cursor;
         state.next_cursor = cursor.wrapping_add(1);
-        let order = crate::transport::pool::order_candidates(&loads, cursor);
+        let mut order: Vec<usize> = crate::transport::pool::order_candidates(&loads, cursor)
+            .into_iter()
+            .filter(|index| {
+                state
+                    .entries
+                    .get(*index)
+                    .is_some_and(|entry| entry.phase == TunnelPhase::Serving)
+            })
+            .collect();
+        // While a carrier probe runs, every new stream the visitor opens is
+        // routed to the probe tunnel first: the comparison is meaningless
+        // unless the probed carrier carries traffic, and a probe that sits
+        // idle measures nothing while the incumbent's windows keep confirming
+        // its own lead (measured: four probes gave back on a first window of
+        // zero carried bytes against 3 MB/s on the incumbent — an idle
+        // tunnel, not a verdict). A stream here is one open; the probe's
+        // budget is seconds, and the drain hands its streams back if the
+        // verdict is Revert.
+        #[cfg(feature = "client")]
+        if let Some((probed, _)) = self
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            && let Some(probe_index) = state
+                .entries
+                .iter()
+                .position(|entry| entry.phase == TunnelPhase::Serving && entry.carrier == probed)
+        {
+            order.retain(|index| *index != probe_index);
+            order.insert(0, probe_index);
+        }
         // The group's own tunnels first: a stripe takes one its siblings do not
         // have yet, and only when every tunnel is already part of the group (a
         // pool the group cannot spread over) does the exclusion give way — the
@@ -1098,8 +2084,8 @@ impl TunnelPool {
         let candidates = crate::transport::pool::order_candidates_for(&order, tried, avoid);
         // The least-loaded untried tunnel with pending budget left; when every
         // candidate is at its budget, the least-loaded untried one still takes
-        // the open — refusing a visitor outright is worse, and a full budget is
-        // exactly the demand the growth rule reads.
+        // the open — refusing a visitor outright is worse than queueing it
+        // behind the driver's own bounded request queue.
         //
         // The stream ceiling is a hard bound, unlike the pending budget, and it
         // has no fallback: a tunnel at the ceiling is *never* given another
@@ -1111,7 +2097,7 @@ impl TunnelPool {
         let mut over_budget = None;
         let mut chosen = None;
         for index in candidates.iter().copied() {
-            let Some(load) = loads.get(index) else {
+            let Some(load) = state.entries.get(index).map(PoolEntry::load) else {
                 continue;
             };
             if load.total() >= ceiling {
@@ -1127,14 +2113,13 @@ impl TunnelPool {
         let index = chosen.or(over_budget)?;
         let entry = state.entries.get(index)?;
         entry.tunnel.counters.reserve();
-        let load = loads.get(index).copied().unwrap_or_default();
+        let load = entry.load();
         // The worst eligible candidate: what the placement rule gave up by not
         // picking it. S1's spread is `worst - best`.
         let worst = order
             .last()
-            .and_then(|i| loads.get(*i))
-            .copied()
-            .unwrap_or_default();
+            .and_then(|i| state.entries.get(*i))
+            .map_or_else(TunnelLoad::default, PoolEntry::load);
         Some(Reservation {
             index,
             pool: std::sync::Arc::downgrade(&self.inner.shared),
@@ -1157,12 +2142,12 @@ impl TunnelPool {
     /// so a refused stripe still prefers a tunnel its group does not have (see
     /// [`Self::open_stream_on_distinct`]).
     ///
-    /// `TooManyStreams` means "the pool should grow", never "the tunnel is
-    /// dead": it is counted as a refusal, the reservation is released, and the
-    /// demand flag makes the next maintenance tick add a tunnel. The growth
-    /// rule keeps every tunnel strictly below its cap precisely so this path
-    /// stays rare — the vendored engine logs an unguarded `error!` on a cap
-    /// hit, and `tests/log_budget_test.rs` fails a healthy run with one ERROR.
+    /// `TooManyStreams` means "this tunnel is full", never "the tunnel is
+    /// dead": it is counted as a refusal and the open falls through to the
+    /// next candidate. The placement ceiling keeps every tunnel strictly below
+    /// the engine's cap precisely so this path stays rare — the vendored engine
+    /// logs an unguarded `error!` on a cap hit, and `tests/log_budget_test.rs`
+    /// fails a healthy run with one ERROR.
     async fn complete(
         &self,
         reservation: Reservation,
@@ -1185,7 +2170,6 @@ impl TunnelPool {
                 // measured against a value the open itself changed (it went
                 // negative on a single-tunnel pool, which is what caught this).
                 placement.chosen_load = counters.load();
-                self.inner.shared.touch();
                 PlacementStats::record(placement, started.elapsed(), None);
                 Ok(StreamLease {
                     stream,
@@ -1202,10 +2186,8 @@ impl TunnelPool {
                     "pool-stats: tunnel refused an open: {e}"
                 );
                 let note = if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
-                    // A cap hit is a growth signal, never a death: record it
-                    // and stop here so the caller (and the maintenance tick)
-                    // sees the demand.
-                    self.demand();
+                    // A cap hit is a refusal of this open, never a death:
+                    // record it and report it back to the caller.
                     PlacementStats::record(placement, started.elapsed(), Some("too_many_streams"));
                     return Err(OpenError::Refused(e));
                 } else {
@@ -1234,7 +2216,6 @@ impl TunnelPool {
                             let counters = std::sync::Arc::clone(&next.tunnel.counters);
                             counters.charge();
                             next.placement.chosen_load = counters.load();
-                            self.inner.shared.touch();
                             PlacementStats::record(
                                 next.placement,
                                 started.elapsed(),
@@ -1249,9 +2230,7 @@ impl TunnelPool {
                         }
                         Err(e) => {
                             next.tunnel.counters.release();
-                            if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
-                                self.demand();
-                            } else if matches!(e, crate::mux::ConnectionError::Closed) {
+                            if matches!(e, crate::mux::ConnectionError::Closed) {
                                 // Another dead tunnel: same as above (D14).
                                 next.tunnel.mark_dead();
                                 self.release_growth_hold();
@@ -1260,17 +2239,10 @@ impl TunnelPool {
                         }
                     }
                 }
-                self.demand();
                 PlacementStats::record(placement, started.elapsed(), Some(note));
                 Err(OpenError::Refused(last))
             }
         }
-    }
-
-    /// Note that an open was not answered immediately: the next maintenance
-    /// tick grows the pool.
-    fn demand(&self) {
-        self.inner.state.lock().demand = true;
     }
 
     /// Add one tunnel.
@@ -1281,7 +2253,7 @@ impl TunnelPool {
         }
         let result = self.grow_locked(reason).await;
         self.inner.shared.resizing.store(false, Ordering::Release);
-        // Whoever waited on a cold pool re-reads the size here and either
+        // Whoever waited on an empty pool re-reads the size here and either
         // places its open or fails on its own.
         self.inner.shared.grown.notify_waiters();
         match result {
@@ -1335,31 +2307,49 @@ impl TunnelPool {
         let Some(dial) = self.inner.dial.clone() else {
             return Err("the pool has no dialer".to_owned());
         };
-        let (size, max) = {
+        let (size, count) = {
             let state = self.inner.state.lock();
-            (state.entries.len(), state.max_tunnels)
+            (state.entries.len(), state.count)
         };
-        if size >= max {
-            return Err(format!("already at max_tunnels ({max})"));
+        if size >= count {
+            return Err(format!("already at the configured tunnel count ({count})"));
         }
-        let (tunnel, shutdown) = dial().await?;
+        // A deliberate replacement follows the requested target even when the
+        // endpoint choice has not committed yet; ordinary repairs follow the
+        // current preference, including a fallback that happened mid-dial.
+        let wanted = self
+            .inner
+            .state
+            .lock()
+            .handover
+            .as_ref()
+            .filter(|handover| handover.phase == HandoverPhase::Dialing)
+            .map_or_else(|| (self.inner.preferred)(), |handover| handover.target);
+        let (tunnel, shutdown) = dial(wanted).await?;
         let mut state = self.inner.state.lock();
-        if state.entries.len() >= state.max_tunnels {
-            return Err("the pool reached max_tunnels while dialing".to_owned());
+        if state.entries.len() >= state.count {
+            return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
         state.entries.push(PoolEntry {
+            carrier: wanted,
+            phase: TunnelPhase::Serving,
             tunnel,
             _shutdown: shutdown,
         });
+        if state.handover.as_ref().is_some_and(|handover| {
+            handover.phase == HandoverPhase::Dialing
+                && state
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.carrier == handover.target)
+                    .count()
+                    >= 1
+        }) {
+            state.handover = None;
+        }
         let to = state.entries.len();
         drop(state);
-        *self
-            .inner
-            .shared
-            .last_grown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
         self.inner.shared.grows.fetch_add(1, Ordering::Relaxed);
         self.inner.shared.push_event(PoolEvent {
             grow: true,
@@ -1367,46 +2357,43 @@ impl TunnelPool {
             from,
             to,
         });
-        // Growth is a lifecycle event: one INFO line per size change.
+        // A repair is a lifecycle event: one INFO line per size change. The
+        // carrier named is the one the new tunnel actually rides (`wanted`) —
+        // the pool's birth carrier would hide a handover's replacement (and
+        // did: a switched run read `carrier="kcp"` for every repair while the
+        // truth lived only in the pool-stats timeline).
         info!(
             pool = %self.inner.shared.key,
-            carrier = self.inner.shared.carrier.as_str(),
+            carrier = wanted.as_str(),
             reason = reason.as_str(),
             from,
             to,
-            "pool-stats: tunnel pool grew"
+            "pool-stats: tunnel pool repaired"
         );
-        self.inner.shared.touch();
         Ok(())
     }
 
-    /// Remove one tunnel when the whole pool is idle, unpinned and past its
-    /// idle timeout. Returns whether one was removed.
     /// Remove every tunnel whose driver has ended.
     ///
-    /// [`Self::shrink_if_idle`] is the pool's only other removal path, and it
-    /// needs the *whole* pool quiet: one stream that outlives its connection
-    /// keeps a dead tunnel — and its slot against `max_tunnels` — in the pool
-    /// for the life of the session. The measured shape is a stage transition
-    /// where the connection dies but its last stream is still held, so
-    /// `streams > 0` blocks the idle rule indefinitely while placement keeps
-    /// handing the corpse new opens, every one of which fails with `Closed`.
+    /// A dead tunnel is removed whatever it carries: the alternative (a
+    /// removal gated on the whole pool being quiet) keeps a corpse — and its
+    /// slot against the configured count — in the pool for as long as one
+    /// stream outlives its connection, while placement keeps handing the
+    /// corpse new opens, every one of which fails with `Closed`.
     ///
-    /// Reaping is therefore not policy: it has no idle, warm or cooldown gate
+    /// Reaping is therefore not policy: it has no idle or cooldown gate
     /// and the dead tunnel's load is irrelevant (those streams are already
-    /// broken). What it owes the pool afterwards is a replacement, so a reap
-    /// raises `demand` when the dead tunnel was carrying something and the
-    /// next tick grows; D14's growth hold is released too, because a death is
-    /// the event that makes a retry meaningful.
+    /// broken). What it owes the pool afterwards is a replacement — the repair
+    /// tick dials one for every missing member, whether or not the corpse was
+    /// carrying — and D14's dial hold is released, because a death is the event
+    /// that makes a retry meaningful.
     fn reap_dead(&self) -> bool {
-        use std::sync::atomic::Ordering;
         let (from, to) = {
             let mut state = self.inner.state.lock();
             if state.entries.iter().all(|e| e.tunnel.is_alive()) {
                 return false;
             }
             let from = state.entries.len();
-            let mut carried = false;
             let mut index = 0;
             while index < state.entries.len() {
                 if state.entries[index].tunnel.is_alive() {
@@ -1414,22 +2401,27 @@ impl TunnelPool {
                 } else {
                     // Dropping the entry drops the driver's shutdown sender:
                     // whatever the task was still doing ends here.
-                    let entry = state.entries.remove(index);
-                    carried |= entry.load().total() > 0;
+                    state.entries.remove(index);
                 }
             }
-            state.demand |= carried;
             (from, state.entries.len())
         };
         self.release_growth_hold();
-        self.inner.shared.shrinks.fetch_add(1, Ordering::Relaxed);
+        if to < from {
+            self.inner
+                .shared
+                .shrinks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.inner.shared.push_event(PoolEvent {
             grow: false,
             reason: ShrinkReason::Dead.as_str(),
             from,
             to,
         });
-        // A death is a lifecycle event: one INFO line per size change.
+        // A death is a lifecycle event: one INFO line per size change. It is
+        // not a shrink — a pinned pool replaces what it lost, and the repair
+        // that follows is logged as the establishment it is.
         info!(
             pool = %self.inner.shared.key,
             carrier = self.inner.shared.carrier.as_str(),
@@ -1441,212 +2433,42 @@ impl TunnelPool {
         true
     }
 
-    fn shrink_if_idle(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        let now = std::time::Instant::now();
-        {
-            let state = self.inner.state.lock();
-            let busy = state.entries.iter().any(|e| {
-                let load = e.load();
-                load.total() > 0 || self.inner.pins.pinned_on(e.tunnel.id()) > 0
-            });
-            if busy {
-                drop(state);
-                self.inner.shared.touch();
-                return false;
-            }
-        }
-        let idle = self
-            .inner
-            .shared
-            .last_activity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= self.inner.shared.idle_timeout;
-        let warm = self
-            .inner
-            .shared
-            .last_grown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= crate::transport::pool::MIN_WARM_HOLD;
-        let cooled = self
-            .inner
-            .shared
-            .last_shrunk
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .elapsed()
-            >= crate::transport::pool::SHRINK_COOLDOWN;
-        let floor = self.inner.shared.udp_floor.load(Ordering::Relaxed).max(1);
-        let victim = {
-            let state = self.inner.state.lock();
-            let size = state.entries.len();
-            if size <= floor {
-                return false;
-            }
-            state.entries.iter().position(|e| {
-                let mut load = e.load();
-                // The client's own pin count is the authoritative one (the
-                // server's affinity table is the same fact, seen from the
-                // other end).
-                load.pinned = self.inner.pins.pinned_on(e.tunnel.id());
-                crate::transport::pool::may_shrink(size, floor, load, idle, warm, cooled)
-            })
-        };
-        let Some(victim) = victim else {
-            return false;
-        };
-        if self.inner.shared.resizing.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let removed = {
-            let mut state = self.inner.state.lock();
-            let from = state.entries.len();
-            if victim >= from {
-                None
-            } else {
-                let entry = state.entries.remove(victim);
-                Some((entry, from, state.entries.len()))
-            }
-        };
-        self.inner.shared.resizing.store(false, Ordering::Release);
-        let Some((entry, from, to)) = removed else {
-            return false;
-        };
-        // Dropping the entry drops the driver's shutdown sender: the physical
-        // connection goes away with the tunnel.
-        drop(entry);
-        // The pool is smaller than it was, so a refused growth is worth
-        // re-attempting (D14).
-        self.release_growth_hold();
-        *self
-            .inner
-            .shared
-            .last_shrunk
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
-        self.inner.shared.touch();
-        self.inner.shared.shrinks.fetch_add(1, Ordering::Relaxed);
-        self.inner.shared.push_event(PoolEvent {
-            grow: false,
-            reason: ShrinkReason::Idle.as_str(),
-            from,
-            to,
-        });
-        // Shrink is a lifecycle event: one INFO line per size change.
-        info!(
-            pool = %self.inner.shared.key,
-            carrier = self.inner.shared.carrier.as_str(),
-            reason = ShrinkReason::Idle.as_str(),
-            from,
-            to,
-            "pool-stats: tunnel pool shrank"
-        );
-        true
+    /// The maintenance tick, in repair form.
+    ///
+    /// A pinned pool has exactly one thing to reconcile: how many tunnels it
+    /// holds against how many it was configured to hold. A dead one is reaped
+    /// and replaced in the same tick — that is *repair*, not growth, and it is
+    /// the only establishment that happens after service start. Everything
+    /// else that used to live here (grow on load, grow for a stripe group,
+    /// grow to the UDP floor, shrink when idle) is gone: capacity is a function
+    /// of configuration, so it cannot depend on what the pool was doing a
+    /// minute ago.
+    async fn maintain(&self) {
+        #[cfg(feature = "client")]
+        self.diagnostic_handover();
+        #[cfg(feature = "client")]
+        self.carrier_rule_step();
+        self.reap_dead();
+        self.handover_step();
+        self.repair().await;
     }
 
-    /// The maintenance tick: the growth and shrink rules of
-    /// [`crate::transport::pool`], evaluated for one pool.
-    async fn maintain(&self) {
-        // A dead tunnel leaves before any growth or shrink decision reads the
-        // pool: freeing its slot is what lets the replacement be dialed in
-        // this same tick. Unlike a shrink, the reap does not end the tick.
-        self.reap_dead();
-        if self.shrink_if_idle() {
-            return;
-        }
-        let reason = {
-            let mut state = self.inner.state.lock();
-            let loads: Vec<TunnelLoad> = state.entries.iter().map(PoolEntry::load).collect();
-            let size = loads.len();
-            let busy = loads.iter().any(|l| l.total() > 0)
-                || state
-                    .entries
-                    .iter()
-                    .any(|e| self.inner.pins.pinned_on(e.tunnel.id()) > 0);
-            let floor = self
-                .inner
-                .shared
-                .udp_floor
-                .load(std::sync::atomic::Ordering::Relaxed);
-            let demand = std::mem::take(&mut state.demand);
-            if size == 0 {
-                // Cold: nothing to place a stream on. Grow only when a service
-                // asked for one (or the UDP floor requires it).
-                (demand || floor > size).then_some(GrowReason::Cold)
-            } else if floor > size {
-                // The UDP-derived floor is a requirement, not a suggestion.
-                Some(GrowReason::UdpFloor)
-            } else if demand {
-                Some(GrowReason::Demand)
-            } else if state.entries.iter().any(|e| {
-                e.tunnel
-                    .counters
-                    .oldest_wait()
-                    .is_some_and(|w| w > crate::transport::pool::OPEN_WAIT_BUDGET)
-            }) {
-                // An open that has been waiting longer than the budget means
-                // the pool has no ready stream for it: grow.
-                Some(GrowReason::Wait)
-            } else if !busy {
-                None
-            } else {
-                // Both questions matter, and the per-tunnel one is the stricter
-                // of the two above size 1: the pool's total threshold scales
-                // with its size (a tunnel of a 4-tunnel pool reaches 4x its
-                // share before the total crosses), while the placement ceiling
-                // does not. Growing on the per-tunnel rule is what keeps
-                // `TUNNEL_STREAM_CEILING` from ever being placement's answer.
-                let used: usize = loads.iter().map(|l| l.total()).sum();
-                let cap = self.inner.shared.stream_cap;
-                let total_busy = used > crate::transport::pool::grow_threshold(size, cap);
-                let tunnel_busy = loads
-                    .iter()
-                    .any(|l| l.total() >= crate::transport::pool::tunnel_grow_at(cap));
-                (total_busy || tunnel_busy).then_some(GrowReason::Load)
-            }
+    /// Dial until the pool holds its configured count again.
+    ///
+    /// One dial per call, guarded by the same resize flag a cold open used: the
+    /// next tick continues where this one stopped, and a refusal (the server's
+    /// valve, an unreachable endpoint) holds the pool back for
+    /// [`crate::transport::pool::GROW_FAILURE_COOLDOWN`] rather than letting a
+    /// 50 ms tick become a dial storm.
+    async fn repair(&self) {
+        let (size, target) = {
+            let state = self.inner.state.lock();
+            (state.entries.len(), state.count)
         };
-        // An idle pool just keeps its shrink clock running.
-        let Some(reason) = reason else {
-            return;
-        };
-        if self.growth_held_off() {
-            // D14: a refused growth stops growth. The demand flag was consumed
-            // above, so this tick does nothing; the next attempt waits the
-            // cooldown out, or a tunnel's death releases the hold. The cold
-            // path in `open_stream` is deliberately not gated — it is driven by
-            // an arriving visitor, not by this tick, so it cannot become a
-            // storm.
+        if size >= target || self.growth_held_off() {
             return;
         }
-        if reason == GrowReason::UdpFloor {
-            // Grow straight to the floor, one tunnel at a time (each step
-            // re-reads the size, so a racing shrink cannot overshoot).
-            loop {
-                let (size, floor, max) = {
-                    let state = self.inner.state.lock();
-                    (
-                        state.entries.len(),
-                        self.inner
-                            .shared
-                            .udp_floor
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        state.max_tunnels,
-                    )
-                };
-                if size >= floor || size >= max {
-                    break;
-                }
-                if self.grow_locked(GrowReason::UdpFloor).await.is_err() {
-                    break;
-                }
-            }
-            return;
-        }
-        self.grow(reason).await;
+        self.grow(GrowReason::Repair).await;
     }
 
     /// Start the per-pool maintenance task; it exits with the pool.
@@ -1673,6 +2495,12 @@ impl TunnelPool {
 /// A refused growth: INFO once per process, DEBUG after (the maintenance tick
 /// re-attempts it, so it can repeat — see `GROW_FAILURE_COOLDOWN`).
 static GROW_REFUSED: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
+
+/// A pool whose every tunnel is at its stream ceiling and whose count is
+/// already established: the one refusal a pinned pool cannot dial its way out
+/// of, so it is worth one INFO line naming the key to raise. INFO once per
+/// process, DEBUG afterwards — see [`TunnelPool::report_saturation`].
+static POOL_SATURATED: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
 
 /// Every live pool of this process, weak: the integration suite reads the
 /// pool's own state here instead of guessing it from the telemetry text, and
@@ -1934,6 +2762,356 @@ mod pool_stats {
     }
 }
 
+/// The least the **peer** must have handed a tunnel in one window for the window
+/// to be judged at all.
+///
+/// A quiet tunnel's ratio is noise (one byte delivered of two is 50 %), so the
+/// verdict needs a volume behind it: 64 KiB per window is a couple of
+/// milliseconds of even a policed path's traffic and orders of magnitude above a
+/// keepalive-only session.
+const CARRIER_RULE_MIN_HANDED_BYTES: u64 = 64 * 1024;
+
+/// The delivery ratio below which a tunnel is judged to be losing its traffic,
+/// in percent: what this end received against what the peer handed over.
+///
+/// **It fires on neither class, and that is measured rather than assumed.** On
+/// the policed path this end receives *everything* the peer hands over — 100.0 %
+/// with the tunnel's `handed` sitting at the policer's own ceiling — because KCP
+/// is reliable: a dropped datagram is re-sent until it arrives, so a policed
+/// carrier surfaces as **throughput**, not as a delivery gap. A threshold on any
+/// local quantity therefore cannot separate the classes (the re-send share fires
+/// on both, this ratio on neither), and the rule's next form is the comparison
+/// the L3 lane policy already makes: put a tunnel on the other carrier and see
+/// which one carries more (HANDOFF.md, round 7).
+///
+/// The historical calibration, kept because the constant still bounds the
+/// verdict: measured on the two
+/// classes (HANDOFF.md, round 6-7): a UDP-policed path — where the handover to
+/// TCP is worth 10-13x — delivers ~10-20 % of what the server hands it, while the
+/// healthy lossy class, where KCP is the carrier to keep, delivers ~95-100 %.
+/// The two do not overlap, which is why a floor here can be both sensitive and
+/// safe; 60 % sits between them with a 3x margin below and a 1.6x margin above.
+/// The residues that keep a healthy tunnel below 100 % (the multiplexer's own
+/// framing, a stream retiring mid-window) are a few percent, not tens.
+const CARRIER_RULE_MIN_DELIVERY_PCT: f64 = 60.0;
+
+/// How many maintenance ticks make one judgement window (50 ms each: a second).
+///
+/// Lengthening the window is what lets a *slow* carrier be judged at all; the
+/// share is a ratio, so a longer window costs nothing but the time to fill it,
+/// and the confirm count below is then counted in windows rather than ticks.
+const CARRIER_RULE_WINDOW_TICKS: u32 = 20;
+
+/// How many consecutive **windows** the verdict must hold before the move.
+/// With the window at [`CARRIER_RULE_WINDOW_TICKS`], three of them are three
+/// seconds of sustained degradation — a loss event that lasts longer than an RTO
+/// cycle is a path property, not a burst, which is the same judgment the lane
+/// policy's three one-second ticks make at its scale.
+const CARRIER_RULE_CONFIRM_TICKS: u32 = 3;
+
+/// How much more one carrier's tunnels must carry before the pool moves a
+/// tunnel to it (or gives a probe back).
+///
+/// A ratio, not a margin, and the same 1.5 the lane policy uses: the measured
+/// separation on the cells where the carriers diverge is 1.9x and up (and
+/// 10-13x on the policed one), while the cells where they are level sit near
+/// 1.0.
+const CARRIER_RULE_PROBE_EDGE: f64 = 1.5;
+
+/// How long a probe runs before it is given back if the comparison stays
+/// inconclusive.
+///
+/// A probe splits the pool's tunnels between the carriers, so an inconclusive
+/// one is a cost paid for nothing: 30 s is far longer than the seconds a
+/// divergent cell needs to separate and short enough not to hold a split for
+/// a whole run.
+const CARRIER_RULE_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a pool waits before probing again after one came back empty.
+///
+/// The suspicion that starts a probe fires on a merely lossy path too — that
+/// is measured (round 6) and unavoidable, because a lossy path re-sends
+/// heavily whether or not it is the right carrier. What keeps that from
+/// becoming churn is this backoff: a probe that came back does not go out
+/// again for ten minutes, so a healthy path pays one split tunnel for half a
+/// minute and then nothing for the rest of it.
+const CARRIER_RULE_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The re-sent share above which a window *suspects* the carrier and starts a
+/// probe — the share floor the S1 cells calibrated (5.7 % at a saturated
+/// ceiling) and the wiring run re-measured at the other extreme (0.6 % where
+/// traffic merely flows), kept here not as a verdict but as the trigger of
+/// the comparison that decides. Measured on the policed condition the share
+/// is the only local signal that fires at all (27 % there, 3.5 % median
+/// healthy — delivery stays at 99 % because the ARQ re-sends until it
+/// arrives), and it also fires on a merely lossy path, which is exactly why
+/// it starts a probe rather than a move: the share says the sender is
+/// fighting the path, the probe says which carrier is winning.
+const CARRIER_RULE_SUSPICION_SHARE_PCT: f64 = 4.0;
+
+/// The least the probe tunnel must carry in one window before its window is
+/// a measurement: below it the comparison holds rather than reverts, because
+/// an idle tunnel against a busy incumbent reads "carries less" on zero
+/// evidence. Half the window's share floor, rounded to the byte — enough to
+/// prove traffic was routed, far below anything worth calling a rate.
+const CARRIER_RULE_PROBE_MIN_BYTES_PER_S: f64 = 8_192.0;
+
+/// The rule's switch: `MOLEHILL_TUNNEL_CARRIER_RULE=1` turns it on for the
+/// process. **Off by default**, deliberately, and the first wiring run is
+/// the measurement that decided it: the only signal the rule can read — the
+/// sender's own retransmit share — is *rate-dependent*. On the S1 cells that
+/// saturated into the lossy path the share was 5.7 %; on the paced cell
+/// where traffic actually flowed at that same 1 % loss, the probed reading
+/// was **0.6 %** — under the floor, so the rule sat silent while the
+/// carriers still diverged in delivered loss. The reason is the same
+/// asymmetry the L3 evidence chain was built around: the loss that matters
+/// happens at the *peer's* queue, and a sender's ARQ counters only see the
+/// part the path itself dropped. A floor calibrated on the saturated cells
+/// cannot fire on the others, and lowering it without a measurement behind
+/// the new number would be guessing. The rule, its floors and its plumbing
+/// stay; turning it on is an operator's (or a measurement's) decision, and
+/// the peer-side report that would make the sender's signal honest — the L4
+/// analogue of the lane `CarrierReport` — is the recorded next instrument.
+fn carrier_rule_enabled() -> bool {
+    // Read at pool creation, uncached: the hatch's round-36 lesson applies
+    // verbatim (a process-wide cache would let whichever pool was created
+    // first pin the answer onto every pool after it).
+    std::env::var("MOLEHILL_TUNNEL_CARRIER_RULE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// One window's verdict: the tunnel id to hand over and the retransmit share
+/// that justified it, when any tunnel of the pool is measurably losing.
+///
+/// The window is `previous` minus `now`, per tunnel id (tunnels that joined
+/// between the samples have no window and are not evidence — the safe
+/// direction, as the lane policy puts it). The worst *retransmitting* tunnel
+/// wins: the move retires the one whose loss the replacement has to beat.
+#[must_use]
+/// One window's re-sent share, in percent, or `None` when nothing was emitted
+/// (a quiet tunnel's share is not zero, it is undefined).
+fn window_share_pct(emitted: u64, resent: u64) -> Option<f64> {
+    if emitted == 0 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the window's datagram counts are far below 2^53, the point where an f64 \
+                  stops counting integers exactly"
+    )]
+    let share = 100.0 * resent as f64 / emitted as f64;
+    Some(share)
+}
+
+/// The verdict: a tunnel that delivered **a fraction of what the peer handed
+/// it** is a carrier losing traffic.
+///
+/// This replaces the re-sent share, which was measured not to discriminate: a
+/// lossy-but-viable path re-sends heavily and is still the carrier to keep
+/// (healthy median 3.5 % share, policed 28.7 %, overlapping around any floor),
+/// while the delivery ratio separates them by a wide margin because it measures
+/// the *path*, not the protocol's own recovery behaviour. A tunnel needs enough
+/// handed over in the window to be judged at all; the worst ratio wins, ties to
+/// the lower tunnel id so the confirm streak keeps meaning one tunnel.
+/// What one comparison window decided about the probe tunnel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// The probed carrier carries materially more: move the pool to it.
+    Move,
+    /// The probed carrier carries materially less: give the probe back.
+    Revert,
+    /// No separation: keep the probe and look again next window.
+    Hold,
+}
+
+/// Compare what the two carriers carried, in bytes per second per tunnel.
+///
+/// This is the L4 half of the shape the L3 lane policy already uses: no local
+/// threshold can separate a policed carrier from a merely lossy one — measured,
+/// the re-send share fires on both classes and the delivery ratio on neither,
+/// because a reliable ARQ turns a policed path into *throughput* (HANDOFF.md,
+/// rounds 6-7). The only way to learn what the other carrier would do is to put
+/// a tunnel on it and compare what the two carry.
+///
+/// Both inputs are the window's carried bytes **per second** (the window's
+/// bytes over the window's seconds), so the comparison survives windows of
+/// different lengths. `probe_bytes_per_s` is judged against the pool's own
+/// carrier's *average* tunnel (`chosen_bytes_per_s`): the probe is one tunnel,
+/// the incumbent is several, and a raw byte total would let the incumbent win
+/// by counting, not by carrying.
+#[must_use]
+pub fn probe_verdict(chosen_bytes_per_s: f64, probe_bytes_per_s: f64) -> ProbeVerdict {
+    if chosen_bytes_per_s <= 0.0 && probe_bytes_per_s <= 0.0 {
+        // Nothing moved through either side: there is nothing to compare, and
+        // calling it here is how a probe would flunk an idle path.
+        return ProbeVerdict::Hold;
+    }
+    if probe_bytes_per_s > chosen_bytes_per_s * CARRIER_RULE_PROBE_EDGE {
+        ProbeVerdict::Move
+    } else if chosen_bytes_per_s > probe_bytes_per_s * CARRIER_RULE_PROBE_EDGE {
+        ProbeVerdict::Revert
+    } else {
+        ProbeVerdict::Hold
+    }
+}
+
+/// The bytes the two sides carried in one window: the pool carrier's tunnels
+/// (every tunnel but the probe's, averaged — see [`probe_verdict`]) against
+/// the probe tunnel's own.
+///
+/// A tunnel that joined between the samples has no window and contributes
+/// nothing — the same safe direction the verdict takes: absence is not
+/// evidence. The probe tunnel is excluded from the average even if it is the
+/// only tunnel on the probed carrier (its twin on the pool's carrier was
+/// removed by the handover).
+#[cfg(feature = "client")]
+fn probe_carried_bytes(last: &HealthSample, now: &HealthSample, probe_tunnel: usize) -> (u64, u64) {
+    let window = |sample: &HealthSample| -> Vec<(usize, u64)> {
+        sample
+            .iter()
+            .map(|(id, (_, _, delivered, _))| {
+                let before = last
+                    .iter()
+                    .find(|(p, _)| p == id)
+                    .map_or(0u64, |(_, quad)| quad.2);
+                (*id, delivered.saturating_sub(before))
+            })
+            .collect()
+    };
+    let deltas = window(now);
+    let mut chosen: Vec<u64> = Vec::new();
+    let mut probe = 0u64;
+    for (id, delivered) in deltas {
+        if id == probe_tunnel {
+            probe = delivered;
+        } else {
+            chosen.push(delivered);
+        }
+    }
+    let chosen_avg = if chosen.is_empty() {
+        0
+    } else {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a window's byte counts are far below 2^53, the point where an f64 stops \
+                      counting integers exactly"
+        )]
+        let sum = chosen.iter().sum::<u64>() as f64;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "tunnel counts are single digits"
+        )]
+        let n = chosen.len() as f64;
+        // An average of byte counts rounds down to the byte; the verdict
+        // compares ratios, where one byte cannot matter.
+        let avg = sum / n;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "see above: the fractional byte is noise next to a 1.5x edge"
+        )]
+        let rounded = avg as u64;
+        rounded
+    };
+    (chosen_avg, probe)
+}
+
+/// The rule's suspicion: the worst re-sent share on any tunnel that carried
+/// material traffic in the window, or `None` when no tunnel crossed
+/// [`CARRIER_RULE_SUSPICION_SHARE_PCT`]. `Some` starts a probe — never a
+/// move — because the share cannot tell a policed carrier from a merely
+/// lossy one (measured, rounds 6-7): the comparison can.
+#[cfg(feature = "client")]
+fn carrier_rule_suspicion(previous: &HealthSample, now: &HealthSample) -> Option<f64> {
+    let mut worst: Option<f64> = None;
+    for (id, (emitted_now, resent_now, _, handed_now)) in now {
+        let Some((_, (out_prev, ret_prev, _, handed_prev))) =
+            previous.iter().find(|(p, _)| p == id)
+        else {
+            continue;
+        };
+        let handed = handed_now.saturating_sub(*handed_prev);
+        if handed < CARRIER_RULE_MIN_HANDED_BYTES {
+            continue;
+        }
+        let emitted = emitted_now.saturating_sub(*out_prev);
+        let resent = resent_now.saturating_sub(*ret_prev);
+        let Some(share) = window_share_pct(emitted, resent) else {
+            continue;
+        };
+        if share >= CARRIER_RULE_SUSPICION_SHARE_PCT && worst.is_none_or(|best| share > best) {
+            worst = Some(share);
+        }
+    }
+    worst
+}
+
+#[cfg(feature = "client")]
+fn carrier_rule_verdict(previous: &HealthSample, now: &HealthSample) -> Option<(usize, f64)> {
+    let mut worst: Option<(usize, f64)> = None;
+    for (id, (_, _, delivered_now, handed_now)) in now {
+        let Some((_, (_, _, delivered_prev, handed_prev))) = previous.iter().find(|(p, _)| p == id)
+        else {
+            continue;
+        };
+        let delivered = delivered_now.saturating_sub(*delivered_prev);
+        let handed = handed_now.saturating_sub(*handed_prev);
+        if handed < CARRIER_RULE_MIN_HANDED_BYTES {
+            continue;
+        }
+        let delivered_ratio_pct = delivery_pct(delivered, handed);
+        if delivered_ratio_pct >= CARRIER_RULE_MIN_DELIVERY_PCT {
+            continue;
+        }
+        // Lowest ratio first; ties to the lower tunnel id (see above).
+        if worst.is_none_or(|(_, best)| delivered_ratio_pct < best) {
+            worst = Some((*id, delivered_ratio_pct));
+        }
+    }
+    worst
+}
+
+/// What fraction of what the peer handed a tunnel this end received, in percent.
+fn delivery_pct(delivered: u64, handed: u64) -> f64 {
+    if handed == 0 {
+        return 100.0;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a window's byte counts are far below 2^53, the point where an f64 stops \
+                  counting integers exactly"
+    )]
+    let pct = 100.0 * delivered.min(handed) as f64 / handed as f64;
+    pct
+}
+
+/// The hatch's offset, read **per pool** at the moment the pool is created:
+/// the documented contract is "at that many seconds after a multiplexed pool
+/// starts", so every pool must see the value that is set when *it* begins —
+/// a process-wide cache would pin the first pool's answer onto every pool a
+/// long-lived process builds after it. A value that is not a whole number of
+/// seconds is reported once per process (the condition can repeat at every
+/// pool creation) and ignored.
+fn diagnostic_handover_at() -> Option<std::time::Duration> {
+    static INVALID: crate::logging::RepeatNotice = crate::logging::RepeatNotice::new();
+    let raw = std::env::var("MOLEHILL_TUNNEL_SWITCH_AT").ok()?;
+    let Ok(secs) = raw.trim().parse::<u64>() else {
+        INVALID.report(
+            || {
+                tracing::warn!(
+                    "MOLEHILL_TUNNEL_SWITCH_AT={raw:?} is not a whole number of seconds; ignoring it"
+                );
+            },
+            || {
+                tracing::debug!(
+                    "MOLEHILL_TUNNEL_SWITCH_AT={raw:?} is not a whole number of seconds; ignoring it"
+                );
+            },
+        );
+        return None;
+    };
+    Some(std::time::Duration::from_secs(secs))
+}
+
 impl TunnelPool {
     /// Emit the pool's line, with the timeline of the changes since the last
     /// one. Called once per second by the `MOLEHILL_POOL_STATS` reporter.
@@ -1955,7 +3133,27 @@ impl TunnelPool {
         let tunnels: Vec<String> = snapshot
             .tunnels
             .iter()
-            .map(|(streams, pending, pinned)| format!("{streams}/{pending}/{pinned}"))
+            .zip(&snapshot.draining)
+            .map(|((streams, pending, pinned, carrier), draining)| {
+                format!(
+                    "{streams}/{pending}/{pinned}/{}/{}",
+                    carrier.as_str(),
+                    if *draining { "draining" } else { "serving" }
+                )
+            })
+            .collect();
+        let handover = snapshot.handover.map_or_else(
+            || "-".to_owned(),
+            |(tunnel, target, phase)| format!("{tunnel}/{}:{phase}", target.as_str()),
+        );
+        // The KCP half of the carrier rule's evidence, on the same line:
+        // per-tunnel cumulative `(datagrams_out, retransmits)` — `-` where the
+        // tunnel does not ride KCP. A reader that differences two lines per
+        // tunnel sees exactly the window the rule judges.
+        let health: Vec<String> = snapshot
+            .kcp_health
+            .iter()
+            .map(|h| h.map_or_else(|| "-".to_owned(), |(out, ret)| format!("{out}/{ret}")))
             .collect();
         let timeline: Vec<String> = events
             .iter()
@@ -1973,7 +3171,7 @@ impl TunnelPool {
             pool = %snapshot.key,
             carrier = snapshot.carrier,
             size = snapshot.size,
-            max_tunnels = snapshot.max_tunnels,
+            count = snapshot.count,
             udp_floor = snapshot.udp_floor,
             streams = snapshot.streams(),
             pinned = snapshot.pinned(),
@@ -1981,6 +3179,8 @@ impl TunnelPool {
             timeline = %if timeline.is_empty() { "-".to_owned() } else { timeline.join(" ") },
             grows = snapshot.grows,
             shrinks = snapshot.shrinks,
+            handover = %handover,
+            kcp_health = %health.join(","),
             "pool-stats: tunnel pool timeline"
         );
     }
@@ -2022,6 +3222,24 @@ impl ClientTunnel {
     /// driver also exits when the underlying connection dies.
     pub fn start<I>(
         io: I,
+        config: Config,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> ClientTunnel
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start_with_health(io, None, config, shutdown)
+    }
+
+    /// The same, carrying the KCP session's ARQ health when the tunnel's
+    /// connection is a KCP session (see [`crate::transport::health::SessionHealth`]): the
+    /// counters live on the tunnel's own bookkeeping, so the pool reads this
+    /// tunnel's retransmit share apart from every other tunnel's. A TCP
+    /// tunnel passes `None` — the kernel keeps its retransmit state where
+    /// userspace cannot read it.
+    pub fn start_with_health<I>(
+        io: I,
+        health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
         config: Config,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> ClientTunnel
@@ -2139,7 +3357,7 @@ impl ClientTunnel {
 
         ClientTunnel {
             id: next_tunnel_id(),
-            counters: std::sync::Arc::new(TunnelCounters::default()),
+            counters: TunnelCounters::with_health(health),
             alive,
             open_tx,
         }
@@ -2187,6 +3405,521 @@ mod tests {
     )]
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The carrier rule's verdict: a tunnel that delivered a fraction of what
+    /// the peer handed it is named; a merely lossy-but-delivering window is not
+    /// (that was the old signal's misfire), nor is a window with too little
+    /// handed over, nor a tunnel that joined between the samples.
+    #[test]
+    fn the_carrier_rule_judges_a_tunnel_that_stops_delivering() {
+        const MIB: u64 = 1 << 20;
+        // A baseline window: some traffic, some re-sends, and the peer handing
+        // the tunnel 8 MiB more.
+        let before = vec![(7usize, (100_000u64, 1u64, 5 * MIB, 5 * MIB))];
+        // Healthy-but-lossy: 11.4 % re-sent share (the old signal would have
+        // fired) and 94 % delivered (the carrier is doing its job).
+        let delivering = vec![(7, (200_000, 11_401, 5 * MIB + 7_900_000, 13 * MIB))];
+        assert_eq!(
+            carrier_rule_verdict(&before, &delivering),
+            None,
+            "re-sending is not the signal"
+        );
+
+        // Policed: the same handed over, 1.2 MiB delivered — 14 %.
+        let policed = vec![(7, (200_000, 11_401, 5 * MIB + 1_200_000, 13 * MIB))];
+        let (id, pct) = carrier_rule_verdict(&before, &policed)
+            .expect("a tunnel that stops delivering is the signal");
+        assert_eq!(id, 7);
+        assert!((pct - 14.3).abs() < 0.5, "{pct}");
+
+        // Too little handed over in the window to judge anything.
+        let tiny = vec![(7, (100, 0, 5 * MIB + 4, 5 * MIB + 4_096))];
+        assert_eq!(carrier_rule_verdict(&before, &tiny), None);
+
+        // A tunnel that joined between the samples has no window.
+        let joined = vec![(9, (100, 0, 1, MIB))];
+        assert_eq!(carrier_rule_verdict(&before, &joined), None);
+    }
+
+    /// The probe lifecycle on a real pool: the delivery signal confirms, a
+    /// tunnel is handed to the other carrier, and the *carried bytes* decide —
+    /// more, and the endpoint's choice moves (`prefer` is the authority, the
+    /// switch cooldown included); less, and the tunnel comes back with a
+    /// backoff. The verdicts are driven by the same per-tunnel byte counters
+    /// the pool snapshot exposes, exactly as production feeds them.
+    #[tokio::test]
+    #[expect(
+        unsafe_code,
+        reason = "edition 2024 makes env mutation unsafe; the switch is read per pool at                   creation and this suite is serial, so the value is set before the pool exists"
+    )]
+    async fn the_probe_moves_the_pool_when_the_probed_carrier_carries_more() {
+        // SAFETY: single-threaded test process; read at this pool's creation
+        // (below), before any other pool in the suite is built.
+        unsafe {
+            std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
+        }
+        // A Kcp-carrier pool with a live choice: the probe hands a tunnel to
+        // tcp, and a Move verdict goes through the choice's `prefer`.
+        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Kcp, 2, 2);
+        let counters: Vec<std::sync::Arc<TunnelCounters>> = {
+            let state = pool.inner.state.lock();
+            state
+                .entries
+                .iter()
+                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .collect()
+        };
+
+        // Baseline window: the peer hands both tunnels 8 MiB and this end
+        // delivers nearly all of it — then the losing windows the rule reads.
+        let mut seq = 0u8;
+        let mut handed_total: u64 = 0;
+        let mut window = |delivered: u64, handed: u64| {
+            seq = seq.wrapping_add(1);
+            handed_total = handed_total.saturating_add(handed);
+            for counters in &counters {
+                counters
+                    .delivered
+                    .fetch_add(delivered, std::sync::atomic::Ordering::Relaxed);
+                counters.note_peer_health((100_000, 1_000), handed_total, seq);
+            }
+        };
+        window(7 << 20, 8 << 20);
+        for _ in 0..20 {
+            pool.carrier_rule_step();
+        }
+        assert!(
+            pool.inner.shared.probe.lock().unwrap().active.is_none(),
+            "a delivering window starts nothing"
+        );
+
+        // Losing windows until the suspicion confirms and the probe starts:
+        // the peer keeps handing 8 MiB, this end delivers 1 MiB — 12.5 %.
+        for _ in 0..200 {
+            window(1 << 20, 8 << 20);
+            for _ in 0..20 {
+                pool.carrier_rule_step();
+            }
+            if pool.inner.shared.probe.lock().unwrap().active.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let probed = pool
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|(carrier, _)| *carrier)
+            .expect("the confirmed suspicion starts a probe");
+        assert_eq!(probed, Carrier::Tcp, "a Kcp pool probes tcp");
+        assert!(
+            pool.snapshot().handover.is_some(),
+            "the probe is a real handover: {snap:?}",
+            snap = pool.snapshot()
+        );
+
+        // Wait for the handover to dial the probe's replacement, then let the
+        // probe tunnel carry materially more than the incumbent tunnels: the
+        // written half of the byte counters is what `probe_carried_bytes`
+        // differences, and a window of 4 MiB against 1 MiB is 4x — past the
+        // 1.5x edge with the measured 1.9x+ of the divergent cells to spare.
+        for _ in 0..400 {
+            pool.maintain().await;
+            if pool.probe_tunnel_of(probed).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let probe_id = pool
+            .probe_tunnel_of(probed)
+            .expect("the probe's tunnel arrives with the handover's dial");
+        // One more losing window so the suspicion's health sample has a
+        // baseline, then the probe's carrying window.
+        window(1 << 20, 8 << 20);
+        let probe_counters: std::sync::Arc<TunnelCounters> = {
+            let state = pool.inner.state.lock();
+            state
+                .entries
+                .iter()
+                .find(|e| e.tunnel.id() == probe_id)
+                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .expect("the probe tunnel is held")
+        };
+        probe_counters
+            .delivered
+            .fetch_add(4 << 20, std::sync::atomic::Ordering::Relaxed);
+        for counters in &counters {
+            if !std::sync::Arc::ptr_eq(counters, &probe_counters) {
+                counters
+                    .delivered
+                    .fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        for _ in 0..20 {
+            pool.carrier_rule_step();
+        }
+        assert!(
+            choice.carrier() == Carrier::Tcp,
+            "a Move verdict moves the endpoint's choice: {snap:?}",
+            snap = pool.snapshot()
+        );
+        assert!(
+            pool.inner.shared.probe.lock().unwrap().active.is_none(),
+            "the verdict closes the probe"
+        );
+    }
+
+    /// The other half of the same lifecycle: a probe whose carrier carries
+    /// clearly less gives the tunnel back and parks the pool in its backoff,
+    /// so a merely lossy path pays one split tunnel and then nothing.
+    /// Needs both carriers: a probe hands a tunnel to the carrier the pool is
+    /// not riding, and a build without `kcp` has only one to ride.
+    #[cfg(feature = "kcp")]
+    #[tokio::test]
+    #[expect(
+        unsafe_code,
+        reason = "edition 2024 makes env mutation unsafe; the switch is read per pool at                   creation and this suite is serial, so the value is set before the pool exists"
+    )]
+    async fn the_probe_gives_the_tunnel_back_when_the_probed_carrier_carries_less() {
+        // SAFETY: single-threaded test process; read at this pool's creation
+        // (below), before any other pool in the suite is built.
+        unsafe {
+            std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
+        }
+        let (pool, _rxs, choice) = duplex_pool_with_choice(Carrier::Kcp, 2, 2);
+        let counters: Vec<std::sync::Arc<TunnelCounters>> = {
+            let state = pool.inner.state.lock();
+            state
+                .entries
+                .iter()
+                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .collect()
+        };
+        let mut seq = 0u8;
+        let mut handed_total: u64 = 0;
+        let mut window = |delivered: u64, handed: u64| {
+            seq = seq.wrapping_add(1);
+            handed_total = handed_total.saturating_add(handed);
+            for counters in &counters {
+                counters
+                    .delivered
+                    .fetch_add(delivered, std::sync::atomic::Ordering::Relaxed);
+                counters.note_peer_health((100_000, 1_000), handed_total, seq);
+            }
+        };
+        window(7 << 20, 8 << 20);
+        for _ in 0..20 {
+            pool.carrier_rule_step();
+        }
+        for _ in 0..200 {
+            window(1 << 20, 8 << 20);
+            for _ in 0..20 {
+                pool.carrier_rule_step();
+            }
+            if pool.inner.shared.probe.lock().unwrap().active.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let probed = pool
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .map(|(carrier, _)| *carrier)
+            .expect("the suspicion starts a probe");
+        for _ in 0..400 {
+            pool.maintain().await;
+            if pool.probe_tunnel_of(probed).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let probe_id = pool
+            .probe_tunnel_of(probed)
+            .expect("the probe's tunnel arrives");
+        window(1 << 20, 8 << 20);
+        // The probe carries a *tenth* of the incumbent average: a clear
+        // Revert — and above the idle-window floor, so the comparison is a
+        // measurement and not the routing artifact the floor exists to hold.
+        let probe_counters: std::sync::Arc<TunnelCounters> = {
+            let state = pool.inner.state.lock();
+            state
+                .entries
+                .iter()
+                .find(|e| e.tunnel.id() == probe_id)
+                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .expect("the probe tunnel is held")
+        };
+        probe_counters
+            .delivered
+            .fetch_add(8_192 * 20, std::sync::atomic::Ordering::Relaxed);
+        for counters in &counters {
+            if !std::sync::Arc::ptr_eq(counters, &probe_counters) {
+                counters
+                    .delivered
+                    .fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        for _ in 0..20 {
+            pool.maintain().await;
+        }
+        {
+            // Scoped: the guard must not cross the `await` below (clippy's
+            // await-holding check, and the right discipline anyway).
+            let probe = pool.inner.shared.probe.lock().unwrap();
+            assert!(probe.active.is_none(), "a Revert verdict closes the probe");
+            assert!(
+                probe
+                    .backoff_until
+                    .is_some_and(|until| until > std::time::Instant::now()),
+                "a probe that came back parks the pool in its backoff"
+            );
+        }
+        assert_eq!(
+            choice.carrier(),
+            Carrier::Kcp,
+            "a Revert verdict leaves the endpoint's choice alone"
+        );
+        // Same reason as the Move test: the registry entry must expire before
+        // the parallel byte-sum test reads it.
+        drop(pool);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    /// The whole chain, not just the verdict: the rule reads the pool's own
+    /// counters, confirms over windows, and hands a tunnel over to TCP — with
+    /// the replacement dialed by the repair path exactly as in production.
+    #[tokio::test]
+    #[expect(
+        unsafe_code,
+        reason = "edition 2024 makes env mutation unsafe; the switch's one reader caches in a \
+                  OnceLock, this suite is serial, and the value is set before any pool in \
+                  the test exists"
+    )]
+    async fn the_carrier_rule_hands_a_tunnel_over_after_its_ticks() {
+        // SAFETY: single-threaded test process; the variable is read once per
+        // process by `carrier_rule_enabled`, before this test touches it.
+        unsafe {
+            std::env::set_var("MOLEHILL_TUNNEL_CARRIER_RULE", "1");
+        }
+        // A Kcp-carrier pool: the rule's move is Kcp → Tcp, and a handover
+        // looks for Kcp entries in the pool it runs on.
+        let (pool, _rxs) = duplex_pool_on(Carrier::Kcp, 2, 2);
+        let counters: Vec<std::sync::Arc<TunnelCounters>> = {
+            let state = pool.inner.state.lock();
+            state
+                .entries
+                .iter()
+                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .collect()
+        };
+
+        // A baseline window: the peer hands each tunnel 8 MiB and this end
+        // delivers nearly all of it — the healthy-lossy shape the old re-send
+        // share misfired on.
+        let mut seq = 0u8;
+        let mut handed_total: u64 = 0;
+        // Deltas in, cumulative counters out: the peer's report and this end's
+        // own counter are both cumulative for the connection's life, and the rule
+        // is what differences them.
+        let mut window = |delivered: u64, handed: u64| {
+            seq = seq.wrapping_add(1);
+            handed_total = handed_total.saturating_add(handed);
+            for counters in &counters {
+                counters
+                    .delivered
+                    .fetch_add(delivered, std::sync::atomic::Ordering::Relaxed);
+                counters.note_peer_health((100_000, 1_000), handed_total, seq);
+            }
+        };
+        window(7 << 20, 8 << 20);
+        // One window is 20 maintenance ticks; the pool's own task shares this
+        // rule, so the test drives enough ticks and asserts the *outcome*.
+        for _ in 0..20 {
+            pool.carrier_rule_step();
+        }
+        assert!(pool.snapshot().handover.is_none());
+
+        // Losing windows until the handover fires: the peer keeps handing over
+        // 8 MiB and this end delivers 1 MiB of it — 12.5 %.
+        for _ in 0..200 {
+            window(1 << 20, 8 << 20);
+            for _ in 0..20 {
+                pool.carrier_rule_step();
+            }
+            if pool.snapshot().handover.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let snap = pool.snapshot();
+        assert!(
+            snap.handover.is_some(),
+            "a tunnel that stops delivering hands over: {snap:?}"
+        );
+        assert_eq!(
+            snap.handover.as_ref().map(|(_, to, _)| *to),
+            Some(Carrier::Tcp),
+            "the replacement rides tcp: {snap:?}"
+        );
+
+        // After the fire, a window that delivers again resets the streak: the
+        // rule waits for a fresh verdict before it can move another tunnel.
+        window(8 << 20, 8 << 20);
+        for _ in 0..20 {
+            pool.carrier_rule_step();
+        }
+        assert_eq!(
+            *pool.inner.shared.rule_streak.lock().unwrap(),
+            0,
+            "a delivering window resets the streak after the move"
+        );
+    }
+
+    /// The suspicion: a tunnel re-sending a share of its window *suspects*
+    /// the carrier and starts the probe — measured on the policed condition
+    /// (27 % share, delivery pinned at 99 %) this is the only local signal
+    /// that fires at all; a healthy sender (3.5 % median) suspects nothing.
+    #[test]
+    fn the_share_suspicion_starts_what_the_probe_decides() {
+        const MIB: u64 = 1 << 20;
+        let before = vec![(7usize, (100_000u64, 1u64, 5 * MIB, 5 * MIB))];
+        // Policed-shaped: 27 % re-sent, everything delivered — the delivery
+        // verdict reads nothing here and the share must.
+        let policed = vec![(7, (200_000, 27_000, 5 * MIB + 8 * MIB, 13 * MIB))];
+        assert_eq!(carrier_rule_verdict(&before, &policed), None);
+        let share = carrier_rule_suspicion(&before, &policed).expect("27 % suspects");
+        assert!(share > 20.0, "{share}");
+
+        // Healthy: 3.5 % re-sent — no suspicion.
+        let healthy = vec![(7, (200_000, 3_500, 5 * MIB + 8 * MIB, 13 * MIB))];
+        assert_eq!(carrier_rule_suspicion(&before, &healthy), None);
+
+        // A tunnel carrying too little to judge suspects nothing: one stray
+        // re-send must not start a probe.
+        let tiny = vec![(7, (100, 20, 5 * MIB + 4_096, 5 * MIB + 4_096))];
+        assert_eq!(carrier_rule_suspicion(&before, &tiny), None);
+
+        // A tunnel that joined between the samples has no window.
+        let joined = vec![(9, (100_000, 50_000, 1, MIB))];
+        assert_eq!(carrier_rule_suspicion(&before, &joined), None);
+    }
+
+    /// The probe's verdict: the two carriers' carried bytes per second per
+    /// tunnel, separated by the same 1.5x edge the lane policy uses. An idle
+    /// path is held, not failed — calling it is how a probe would flunk a
+    /// quiet tunnel.
+    #[test]
+    fn the_probe_verdict_separates_the_carriers() {
+        use ProbeVerdict::{Hold, Move, Revert};
+
+        // Level: within the edge either way — hold, and look again.
+        assert_eq!(probe_verdict(100.0, 120.0), Hold);
+        assert_eq!(probe_verdict(100.0, 150.0), Hold, "1.5x is the edge itself");
+        assert_eq!(probe_verdict(150.0, 100.0), Hold);
+
+        // The measured separation on the divergent cells is 1.9x and up, so
+        // the probe has room: a probed carrier carrying half again or more
+        // than the incumbent's average tunnel moves the pool, and carrying
+        // clearly less gives the tunnel back.
+        assert_eq!(probe_verdict(100.0, 151.0), Move);
+        assert_eq!(probe_verdict(100.0, 20.0), Revert);
+        assert_eq!(
+            probe_verdict(0.0, 1.0),
+            Move,
+            "an idle incumbent loses to anything"
+        );
+
+        // Nothing moved through either side: nothing to compare, and a probe
+        // that called it here would flunk an idle path.
+        assert_eq!(probe_verdict(0.0, 0.0), Hold);
+    }
+
+    /// The probe's window arithmetic: the pool carrier's tunnels average
+    /// (a probe is one tunnel, the incumbent several), the probe tunnel is
+    /// excluded from that average, and a tunnel with no previous sample
+    /// contributes nothing.
+    #[test]
+    fn probe_carried_bytes_averages_the_incumbent_tunnels() {
+        const MIB: u64 = 1 << 20;
+        // Cumulative delivered bytes: two incumbent tunnels and the probe.
+        let last = vec![
+            (1usize, (0u64, 0, MIB, MIB)),
+            (2, (0, 0, MIB, MIB)),
+            (9, (0, 0, 0, MIB)),
+        ];
+        let now = vec![
+            (1, (0, 0, 3 * MIB, MIB)),
+            (2, (0, 0, MIB + MIB / 2, MIB)),
+            (9, (0, 0, 3 * MIB, MIB)),
+        ];
+        let (chosen, probe) = probe_carried_bytes(&last, &now, 9);
+        // Incumbents moved 2 MiB and 0.5 MiB; their average is 1.25 MiB.
+        assert_eq!(chosen, MIB + MIB / 4, "the incumbent tunnels average");
+        assert_eq!(probe, 3 * MIB, "the probe tunnel's own window");
+
+        // A tunnel that joined between the samples has no window.
+        let joined_last = vec![(7usize, (0, 0, MIB, MIB))];
+        let joined_now = vec![(7, (0, 0, MIB + 1, MIB))];
+        let (chosen, probe) = probe_carried_bytes(&joined_last, &joined_now, 7);
+        assert_eq!(probe, 1, "the probe's own window is counted");
+        assert_eq!(chosen, 0, "an incumbent with no window contributes nothing");
+    }
+
+    /// A tunnel's byte counts accumulate per tunnel, and the pool snapshot
+    /// exposes them cumulatively so a policy can difference two snapshots into
+    /// a window.
+    ///
+    /// This tests the accumulator; the *wiring* (counting every read and write
+    /// of a mux channel) is exercised by the mux end-to-end suites, which
+    /// carry traffic through the forwarding wrapper that calls it.
+    #[tokio::test]
+    async fn tunnel_byte_counts_accumulate_per_tunnel() {
+        let (pool, _rxs) = duplex_pool(2, 2);
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            streams.push(pool.open_stream().await.expect("an open"));
+        }
+        // Two polls on the first tunnel, one on the second, on both sides of
+        // the counter: the pairs add up apart, never mixed.
+        streams[0].count_bytes(100, 10);
+        streams[1].count_bytes(7, 0);
+        streams[0].count_bytes(50, 5);
+
+        let snap = pool.snapshot();
+        // The snapshot carries one pair per tunnel, in pool order; the
+        // counting itself is verified by summing: 150/15 on the tunnel that
+        // took both polls, 7/0 on the other.
+        let total_delivered: u64 = snap.bytes.iter().map(|(d, _)| *d).sum();
+        let total_written: u64 = snap.bytes.iter().map(|(_, w)| *w).sum();
+        assert_eq!(total_delivered, 157, "delivered adds up across tunnels");
+        assert_eq!(total_written, 15, "written adds up across tunnels");
+        assert_eq!(snap.bytes.len(), 2, "one pair per tunnel: {snap:?}");
+        // The client's own read of the same counters (the tunnel-stats line's
+        // source) sees this pool's pair among the process's live pools. The
+        // process total is asserted as a *superset*, not an equality: the
+        // suite runs its pools in parallel, and another test's pool carrying
+        // its own bytes is not this test's subject.
+        let seen = crate::core::client::tunnel_bytes();
+        assert!(
+            seen.iter().any(|(d, w)| *d >= 150 && *w >= 15),
+            "tunnel_bytes carries this pool's counted pair: {seen:?}"
+        );
+        let seen_delivered: u64 = seen.iter().map(|(d, _)| *d).sum();
+        let seen_written: u64 = seen.iter().map(|(_, w)| *w).sum();
+        assert!(
+            seen_delivered >= 157 && seen_written >= 15,
+            "{seen_delivered} {seen_written}"
+        );
+    }
 
     #[tokio::test]
     async fn client_opens_streams_server_receives() {
@@ -2457,10 +4190,21 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// A pool over `n` in-memory tunnels. The caller keeps the shutdown
-    /// senders; the pool drops its own copy of each tunnel's when it removes
-    /// the tunnel.
-    fn duplex_pool(n: usize, max_tunnels: usize) -> (TunnelPool, Vec<mpsc::Receiver<MuxStream>>) {
+    /// A pool over `n` in-memory tunnels, pinned at its configured `count`.
+    /// The caller keeps the shutdown senders; the pool drops its own copy of
+    /// each tunnel's when it removes the tunnel.
+    fn duplex_pool(n: usize, count: usize) -> (TunnelPool, Vec<mpsc::Receiver<MuxStream>>) {
+        duplex_pool_on(Carrier::Tcp, n, count)
+    }
+
+    /// The same, on the named carrier: the carrier rule's tests need a pool
+    /// whose entries ride Kcp, because its move is `Kcp → Tcp` and a
+    /// `begin_handover` refuses to look for Kcp entries in a Tcp pool.
+    fn duplex_pool_on(
+        carrier: Carrier,
+        n: usize,
+        count: usize,
+    ) -> (TunnelPool, Vec<mpsc::Receiver<MuxStream>>) {
         let mut tunnels = Vec::new();
         let mut rxs = Vec::new();
         for _ in 0..n {
@@ -2471,23 +4215,81 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             std::mem::forget(shutdown_tx);
             tunnels.push((
-                ClientTunnel::start(client_io, mux_config(), shutdown_rx),
+                ClientTunnel::start_with_health(
+                    client_io,
+                    Some(crate::transport::health::SessionHealth::new()),
+                    mux_config(),
+                    shutdown_rx,
+                ),
                 tokio::sync::watch::channel(false).0,
             ));
             rxs.push(rx);
         }
-        let pool = TunnelPool::new(
-            Carrier::Tcp,
-            "test".to_owned(),
-            tunnels,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
-        );
+        let pool = TunnelPool::new(carrier, "test".to_owned(), tunnels, count);
         (pool, rxs)
     }
 
+    /// The duplex pool with a live `CarrierChoice` installed, so a probe's
+    /// `Move` verdict has the authority to act on: the rule's moves go through
+    /// `prefer`, and a pool without a choice can still hand a tunnel over but
+    /// cannot move the endpoint.
+    fn duplex_pool_with_choice(
+        carrier: Carrier,
+        n: usize,
+        count: usize,
+    ) -> (
+        TunnelPool,
+        Vec<mpsc::Receiver<MuxStream>>,
+        std::sync::Arc<crate::transport::carrier::CarrierChoice>,
+    ) {
+        // `CarrierChoice::new` already returns an `Arc<Self>`.
+        let choice = crate::transport::carrier::CarrierChoice::new("probe-test:1");
+        let (pool, rxs) = {
+            let mut tunnels = Vec::new();
+            let mut rxs = Vec::new();
+            for _ in 0..n {
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                let (tx, rx) = mpsc::channel(8);
+                tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                tunnels.push((
+                    ClientTunnel::start_with_health(
+                        client_io,
+                        Some(crate::transport::health::SessionHealth::new()),
+                        mux_config(),
+                        shutdown_rx,
+                    ),
+                    tokio::sync::watch::channel(false).0,
+                ));
+                rxs.push(rx);
+            }
+            let pins = std::sync::Arc::new(PinRegistry::new());
+            // A dialer is part of the probe's own mechanics: the handover's
+            // Dialing phase dials the probe's replacement through it, so a
+            // fixture without one can never produce the tunnel the probe is
+            // supposed to measure.
+            let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
+                Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
+            });
+            (
+                TunnelPool::with_choice(
+                    carrier,
+                    "test".to_owned(),
+                    tunnels,
+                    count,
+                    Some(dial),
+                    std::sync::Arc::new(move || carrier),
+                    pins,
+                    Some(std::sync::Arc::clone(&choice)),
+                ),
+                rxs,
+            )
+        };
+        (pool, rxs, choice)
+    }
+
     /// One in-memory tunnel whose server side drains every stream it is sent:
-    /// the unit these pool fixtures are built from, and the unit a *growth*
+    /// the unit these pool fixtures are built from, and the unit a *repair*
     /// dials.
     fn duplex_tunnel() -> ClientTunnel {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -2499,10 +4301,10 @@ mod tests {
         ClientTunnel::start(client_io, mux_config(), shutdown_rx)
     }
 
-    /// A pool that starts with `n` in-memory tunnels and can grow up to
-    /// `max_tunnels`: every growth dials one more.
-    fn growable_pool(n: usize, max_tunnels: usize) -> TunnelPool {
-        let dial: Dialer = std::sync::Arc::new(|| {
+    /// A pool that starts with `n` in-memory tunnels and is configured for
+    /// `count`: every repair dials one more, until the count is reached.
+    fn growable_pool(n: usize, count: usize) -> TunnelPool {
+        let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
             Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
         });
         let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
@@ -2512,21 +4314,20 @@ mod tests {
             Carrier::Tcp,
             "stripes".to_owned(),
             initial,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
+            count,
             Some(dial),
             std::sync::Arc::new(PinRegistry::new()),
         )
     }
 
-    /// The same, with the dialer counted: how many times the pool grew, as a
-    /// number a test can assert on.
+    /// The same, with the dialer counted: how many times the pool repaired, as
+    /// a number a test can assert on.
     fn counting_pool(
         n: usize,
-        max_tunnels: usize,
+        count: usize,
         dials: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> TunnelPool {
-        let dial: Dialer = std::sync::Arc::new(move || {
+        let dial: Dialer = std::sync::Arc::new(move |_: Carrier| {
             let dials = std::sync::Arc::clone(&dials);
             Box::pin(async move {
                 dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2540,8 +4341,7 @@ mod tests {
             Carrier::Tcp,
             "stripes".to_owned(),
             initial,
-            max_tunnels,
-            std::time::Duration::from_secs(60),
+            count,
             Some(dial),
             std::sync::Arc::new(PinRegistry::new()),
         )
@@ -2567,96 +4367,92 @@ mod tests {
         used
     }
 
-    /// The eager stripe growth's price, which HANDOFF recorded as a cost with
-    /// no test behind it: the *first* group to meet a pool with fewer tunnels
-    /// than the group has stripes dials the difference, and it is `K-1` extra
-    /// dials on a pool that already has one — the cold dial a plain visitor
-    /// would have paid anyway is the K-th.
+    /// A stripe group larger than its pool shares the tunnels that exist
+    /// instead of dialing: `k > count` distinct-stripe opens all succeed, the
+    /// pool stays exactly `count`, and the dialer is never called.
     ///
-    /// Exact, because the dialer is this test's: between the opens below, only
-    /// the pool's own growth rules can call it, and the count is what they
-    /// cost. It would catch the guarantee being dropped (the group then places
-    /// on the tunnels that exist, and no dial happens) and the growth being
-    /// paid per *stripe request* instead of once per pool (K² dials).
+    /// The group's exclusion is a preference, not a constraint (D24), and a
+    /// pinned pool cannot dial a tunnel per stripe: capacity is what the
+    /// configuration says, so the extra stripes ride the tunnels the group
+    /// already has.
     #[tokio::test]
-    async fn a_stripe_group_dials_a_cold_pool_up_to_its_stripe_count_once() {
+    async fn a_stripe_group_larger_than_the_pool_shares_it_without_dialing() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
 
-        // A cold pool: no tunnels at all, the elastic pool's default state.
-        let cold_dials = Arc::new(AtomicUsize::new(0));
-        let pool = counting_pool(0, 4, Arc::clone(&cold_dials));
-        assert_eq!(pool.size(), 0, "the pool starts cold");
+        const COUNT: usize = 2;
+        const STRIPES: usize = 5;
+        let dials = Arc::new(AtomicUsize::new(0));
+        let pool = counting_pool(COUNT, COUNT, Arc::clone(&dials));
+        assert_eq!(
+            pool.snapshot().count,
+            COUNT,
+            "the configured count is reported"
+        );
 
-        let used = open_one_stripe_group(&pool, 4).await;
+        let used = open_one_stripe_group(&pool, STRIPES).await;
+        assert_eq!(used.len(), STRIPES, "every stripe of the group opened");
         assert_eq!(
-            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "a cold pool must dial once per stripe: K dials, of which K-1 are the group's own"
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a pinned pool never dials for a stripe group"
         );
-        assert_eq!(
-            pool.snapshot().grows,
-            4,
-            "the same number through the counter the telemetry and the suite read"
-        );
-        assert_eq!(pool.size(), 4, "the group grew the pool to its own count");
+        assert_eq!(pool.size(), COUNT, "the pool stays at its configured count");
+        assert_eq!(pool.snapshot().grows, 0, "no establishment was recorded");
         assert_eq!(
             used.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "the four stripes must be on four distinct tunnels: {used:?}"
-        );
-
-        // A second group of the same pool: warm for `idle_timeout`, so the
-        // growth is once per pool, not once per group.
-        let used2 = open_one_stripe_group(&pool, 4).await;
-        assert_eq!(
-            cold_dials.load(std::sync::atomic::Ordering::SeqCst),
-            4,
-            "a warm pool's second group must dial nothing"
-        );
-        assert_eq!(
-            used2.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "the second group must also be spread over four tunnels: {used2:?}"
-        );
-
-        // The same growth on a pool that already has one tunnel: three dials,
-        // which is the K-1 every operator pays on the first striped visitor.
-        let warm_dials = Arc::new(AtomicUsize::new(0));
-        let warm = counting_pool(1, 4, Arc::clone(&warm_dials));
-        let used3 = open_one_stripe_group(&warm, 4).await;
-        assert_eq!(
-            warm_dials.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "one existing tunnel plus a group of K costs K-1 dials"
-        );
-        assert_eq!(
-            used3.iter().collect::<std::collections::HashSet<_>>().len(),
-            4,
-            "K-1 dials must have left K tunnels to spread over: {used3:?}"
+            COUNT,
+            "the group spreads over the tunnels it has, sharing them: {used:?}"
         );
     }
 
-    /// D14's other half: a refused growth *stops* growth. The maintenance tick
-    /// runs every 50 ms, so without the hold a client at the server's
-    /// `max_tunnels_per_client` cap would dial-and-be-refused twenty times a
-    /// second against the server's accept path.
+    /// D14's other half: a refused repair *stops* the repair dials. The
+    /// maintenance tick runs every 50 ms, so without the hold a client at the
+    /// server's `max_tunnels_per_client` cap would dial-and-be-refused twenty
+    /// times a second against the server's accept path.
     #[tokio::test]
-    async fn a_refused_growth_holds_the_pool_back() {
-        // No dialer: every growth attempt fails, which is the shape the
-        // server's tunnel refusal takes at the pool.
-        let (pool, _rxs) = duplex_pool(0, 4);
+    async fn a_refused_repair_holds_the_pool_back() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A dialer that always refuses, counted: the shape the server's
+        // `max_tunnels_per_client` valve takes at the pool.
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let dial: Dialer = Arc::new(move |_: Carrier| {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err("refused by the server's tunnel valve".to_owned())
+            })
+        });
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "refused".to_owned(),
+            Vec::new(),
+            4,
+            Some(dial),
+            Arc::new(PinRegistry::new()),
+        );
         assert!(!pool.growth_held_off(), "nothing has failed yet");
 
-        pool.grow(GrowReason::Cold).await;
+        pool.grow(GrowReason::Repair).await;
         assert!(
             pool.growth_held_off(),
-            "a failed growth must hold growth off"
+            "a failed repair must hold the next one off"
         );
 
-        // With demand behind it, the tick still does not dial again.
-        pool.demand();
-        pool.maintain().await;
+        // While the hold stands, no tick dials again.
+        let attempts = dials.load(Ordering::SeqCst);
+        assert!(attempts >= 1, "the refused repair was attempted");
+        for _ in 0..5 {
+            pool.maintain().await;
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            attempts,
+            "no dial while the repair is held off"
+        );
         assert_eq!(pool.snapshot().size, 0, "no tunnel appeared while held");
 
         // A tunnel dying (or one being removed) is what makes a retry
@@ -2671,7 +4467,7 @@ mod tests {
     /// **distinct** tunnels whenever the pool has K.
     #[tokio::test]
     async fn back_to_back_opens_land_on_distinct_tunnels() {
-        let (pool, _rxs) = duplex_pool(4, 8);
+        let (pool, _rxs) = duplex_pool(4, 4);
         let mut streams = Vec::new();
         for _ in 0..3 {
             streams.push(pool.open_stream().await.expect("an open"));
@@ -2680,7 +4476,7 @@ mod tests {
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(
             used.iter().filter(|n| **n > 0).count(),
@@ -2692,12 +4488,14 @@ mod tests {
             3,
             "one stream per tunnel, none doubled up: {used:?}"
         );
+        assert_eq!(pool.size(), 4, "the pool is exactly its count: {used:?}");
+        assert_eq!(pool.snapshot().count, 4);
         drop(streams);
     }
 
-    /// More opens than tunnels still all produce a stream: the pool reuses
-    /// what it has (and the maintenance rule grows it when the demand is real)
-    /// instead of failing a visitor.
+    /// More opens than tunnels still all produce a stream: a pinned pool
+    /// reuses what it has instead of failing a visitor, and the extra opens
+    /// never push it past its configured count.
     #[tokio::test]
     async fn more_opens_than_tunnels_still_answer_every_open() {
         let (pool, _rxs) = duplex_pool(2, 2);
@@ -2710,61 +4508,17 @@ mod tests {
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(used, vec![2, 2], "the pool reuses both tunnels: {used:?}");
-        drop(streams);
-    }
-
-    /// D24 structural, at the pool's own level: a stripe group's K opens land
-    /// on K *distinct* tunnels even from a pool that has fewer — one, here,
-    /// which is the state a cold pool reaches after its first visitor. The
-    /// group-aware open grows the pool to its K first and then avoids the
-    /// tunnels its earlier stripes took; the load rule alone could not have
-    /// done it, because K concurrent streams sit below the growth threshold.
-    #[tokio::test]
-    async fn a_stripe_group_grows_the_pool_and_spreads_over_distinct_tunnels() {
-        const STRIPES: usize = 3;
-        let pool = growable_pool(1, 4);
-        let mut used: Vec<usize> = Vec::new();
-        let mut streams = Vec::new();
-        for _ in 0..STRIPES {
-            let lease = pool
-                .open_stream_on_distinct(&used, STRIPES)
-                .await
-                .expect("a stripe open");
-            used.push(lease.tunnel_id());
-            streams.push(lease);
-        }
-        assert_eq!(
-            pool.size(),
-            STRIPES,
-            "the group must have grown the pool to one tunnel per stripe"
-        );
-        let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
-        assert_eq!(
-            distinct.len(),
-            STRIPES,
-            "{STRIPES} stripes must occupy {STRIPES} distinct tunnels: {used:?}"
-        );
-        let per_tunnel: Vec<usize> = pool
-            .snapshot()
-            .tunnels
-            .iter()
-            .map(|(streams, _, _)| *streams)
-            .collect();
-        assert_eq!(
-            per_tunnel,
-            vec![1; STRIPES],
-            "one stripe per tunnel, none doubled up: {per_tunnel:?}"
-        );
+        assert_eq!(pool.size(), 2, "the pool never grows for load");
         drop(streams);
     }
 
     /// Correctness first: a group the pool cannot spread over still opens
-    /// every stripe. `max_tunnels` is the cap, so the third and fourth stripe
-    /// reuse the two tunnels — exactly the behaviour a striped visitor had
-    /// before the group had a name, and the reason the exclusion is a
+    /// every stripe. `count` is the pool's width, so the third and fourth
+    /// stripe reuse the two tunnels — exactly the behaviour a striped visitor
+    /// had before the group had a name, and the reason the exclusion is a
     /// preference rather than a constraint.
     #[tokio::test]
     async fn a_stripe_group_the_pool_cannot_spread_over_still_opens() {
@@ -2779,18 +4533,19 @@ mod tests {
             used.push(lease.tunnel_id());
             streams.push(lease);
         }
-        assert_eq!(pool.size(), 2, "the cap bounds the growth");
+        assert_eq!(pool.size(), 2, "the count bounds the spread");
+        assert_eq!(pool.snapshot().count, 2);
         let distinct: std::collections::HashSet<usize> = used.iter().copied().collect();
         assert_eq!(
             distinct.len(),
             2,
-            "the group can only spread as far as the cap allows: {used:?}"
+            "the group can only spread as far as the pool allows: {used:?}"
         );
         let per_tunnel: Vec<usize> = pool
             .snapshot()
             .tunnels
             .iter()
-            .map(|(streams, _, _)| *streams)
+            .map(|(streams, _, _, _)| *streams)
             .collect();
         assert_eq!(
             per_tunnel,
@@ -2811,139 +4566,143 @@ mod tests {
         assert_eq!(pool.snapshot().streams(), 0);
     }
 
-    /// A cold pool grows on the first open when it has a dialer, instead of
-    /// refusing it: `max_tunnels` is the cap, and the growth respects it.
+    /// The placement ceiling is the only oversubscription protection a pinned
+    /// pool has: a pool at its count whose every tunnel sits at the ceiling
+    /// waits [`crate::transport::pool::CAPACITY_WAIT`] out and then refuses the
+    /// visitor — telling the operator once, at INFO, which key widens the pool
+    /// — and a stream retiring under the wait lets the next one in.
     #[tokio::test]
-    async fn a_cold_pool_grows_up_to_its_cap() {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        let dial: Dialer = std::sync::Arc::new(move || {
-            let counter = std::sync::Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                let (tx, rx) = mpsc::channel(8);
-                std::mem::forget(rx);
-                let server = tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-                std::mem::forget(server);
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                std::mem::forget(shutdown_tx);
-                Ok((
-                    ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                    tokio::sync::watch::channel(false).0,
-                ))
-            })
-        });
-        let pool = TunnelPool::with_dialer(
-            Carrier::Tcp,
-            "cold".to_owned(),
-            Vec::new(),
-            2,
-            std::time::Duration::from_secs(60),
-            Some(dial),
-            std::sync::Arc::new(PinRegistry::new()),
-        );
-        assert_eq!(pool.size(), 0);
-        let first = pool.open_stream().await.expect("the cold pool must grow");
-        assert_eq!(pool.size(), 1, "one open grows the pool by one tunnel");
-        assert_eq!(pool.snapshot().grows, 1);
-        // The cap: even a second cold open cannot push it past `max_tunnels`.
-        drop(first);
-        let second = pool.open_stream().await.expect("the pool still serves");
-        assert!(pool.size() <= 2, "the cap is max_tunnels");
-        drop(second);
-        assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            pool.size(),
-            "the dialer is called once per tunnel"
-        );
-    }
+    async fn a_pool_at_its_placement_ceiling_waits_then_refuses() {
+        // The saturation notice is process-wide, and this is the only test that
+        // drives a pool into saturation.
+        POOL_SATURATED.clear();
+        let (pool, _rxs) = duplex_pool(1, 1);
+        let ceiling = pool.ceiling();
+        assert_eq!(pool.size(), 1, "the pool is its configured count");
 
-    /// A burst spreads *while it is placed*, not on the next maintenance tick.
-    ///
-    /// The rule this pins: an open that would add to a tunnel already at the
-    /// growth threshold grows first, so a K-open burst (a 20-stream bulk test)
-    /// lands on the tunnels it will use instead of stacking all of it on one —
-    /// the head-of-line blocking that queue a shared tunnel's interactive and
-    /// control streams behind the bulk. The maintenance tick would fix the
-    /// *next* burst 50 ms later; this makes the first one spread too.
-    ///
-    /// Falsified by reverting to place-then-grow: the whole burst stacks on
-    /// the one cold tunnel (10 streams on one tunnel against a threshold of
-    /// 7), which is the shape the two-stage rate reproduction measured.
-    #[tokio::test]
-    async fn a_burst_spreads_over_tunnels_while_it_is_placed() {
-        const OPENS: usize = 10;
-        // One live duplex tunnel to start from, its inbound drained so every
-        // stream the pool opens is accepted by the tunnel's server side.
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (tx, mut first_rx) = mpsc::channel::<MuxStream>(8);
-        tokio::spawn(async move { while first_rx.recv().await.is_some() {} });
-        tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        std::mem::forget(shutdown_tx);
-
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = std::sync::Arc::clone(&calls);
-        // A dialer that mints a live duplex tunnel per call: the burst's growth
-        // is a real dial, drained so the tunnel can accept every stream.
-        let dial: Dialer = std::sync::Arc::new(move || {
-            let counter = std::sync::Arc::clone(&counter);
-            Box::pin(async move {
-                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                let (tx, mut rx) = mpsc::channel::<MuxStream>(8);
-                tokio::spawn(async move { while rx.recv().await.is_some() {} });
-                tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                std::mem::forget(shutdown_tx);
-                Ok((
-                    ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                    tokio::sync::watch::channel(false).0,
-                ))
-            })
-        });
-        let pool = TunnelPool::with_dialer(
-            Carrier::Tcp,
-            "burst".to_owned(),
-            vec![(
-                ClientTunnel::start(client_io, mux_config(), shutdown_rx),
-                tokio::sync::watch::channel(false).0,
-            )],
-            4,
-            std::time::Duration::from_secs(60),
-            Some(dial),
-            std::sync::Arc::new(PinRegistry::new()),
-        );
-
-        let mut live = Vec::new();
-        for _ in 0..OPENS {
-            live.push(pool.open_stream().await.expect("burst open"));
+        let mut held = Vec::new();
+        for _ in 0..ceiling {
+            held.push(pool.open_stream().await.expect("an open under the ceiling"));
         }
-        // Read immediately: the maintenance tick (50 ms) would grow the pool
-        // anyway, so a *late* read cannot distinguish the two rules.
-        let snap = pool.snapshot();
-        let streams: Vec<usize> = snap.tunnels.iter().map(|(s, _, _)| *s).collect();
-        assert!(
-            snap.size >= 2,
-            "the burst must grow the pool while it is placed, not on the next tick: {streams:?}"
-        );
-        assert!(
-            streams.iter().copied().max().unwrap_or(0) < OPENS,
-            "no tunnel may carry the whole burst: {streams:?}"
-        );
         assert_eq!(
-            calls.load(std::sync::atomic::Ordering::Relaxed),
-            snap.size - 1,
-            "one dial per tunnel the burst added"
+            pool.snapshot()
+                .tunnels
+                .iter()
+                .map(|(streams, _, _, _)| *streams)
+                .sum::<usize>(),
+            ceiling,
+            "every stream slot this pool has is taken"
         );
-        drop(live);
+
+        let refusal = pool.open_stream().await;
+        assert!(
+            matches!(&refusal, Err(OpenError::AtCapacity)),
+            "a pool at its ceiling must refuse with AtCapacity after the wait: {:?}",
+            refusal.map(|_| ())
+        );
+
+        // That refusal reported the saturation (INFO); the notice fires once
+        // per process, so the next ones are DEBUG-only.
+        assert!(
+            !pool.report_saturation(),
+            "the refusal above must have been the first report"
+        );
+        assert!(
+            !pool.report_saturation(),
+            "the notice must not fire twice per process"
+        );
+        POOL_SATURATED.clear();
+        assert!(
+            pool.report_saturation(),
+            "a cleared notice reports the next saturation again"
+        );
+        assert!(!pool.report_saturation(), "and only once each time");
+
+        // One stream retires: the next visitor is served by the pool that
+        // exists, with no dial and no new tunnel.
+        held.pop();
+        let next = pool
+            .open_stream()
+            .await
+            .expect("a retiring stream must let the next visitor in");
+        assert_eq!(pool.size(), 1, "the pool never dialed for the visitor");
+        drop(next);
+        drop(held);
     }
 
-    /// The client's pin count is what gates the shrink (D30): a tunnel with a
-    /// pinned peer is not removable even when it has no streams.
+    /// A pool that came up short of its configured count repairs to it: the
+    /// dialer is called once per missing tunnel and never past `count`.
+    ///
+    /// The pool starts with no tunnel at all — the state a service start whose
+    /// establishment dials all failed leaves — so the open path dials one to
+    /// answer its visitor and the maintenance tick finishes the repair.
     #[tokio::test]
-    async fn a_pinned_tunnel_is_not_shrinkable() {
+    async fn a_pool_short_of_its_count_repairs_up_to_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const COUNT: usize = 3;
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        let dial: Dialer = std::sync::Arc::new(move |_: Carrier| {
+            let counter = std::sync::Arc::clone(&counter);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            })
+        });
+        let pool = TunnelPool::with_dialer(
+            Carrier::Tcp,
+            "short".to_owned(),
+            Vec::new(),
+            COUNT,
+            Some(dial),
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+        assert_eq!(pool.size(), 0, "the pool started with no tunnel");
+        assert_eq!(
+            pool.snapshot().count,
+            COUNT,
+            "but it is configured for its count"
+        );
+
+        let first = pool
+            .open_stream()
+            .await
+            .expect("the first open repairs a tunnel");
+        assert_eq!(pool.size(), 1, "the open dialed exactly one tunnel");
+        assert_eq!(pool.snapshot().grows, 1);
+        drop(first);
+
+        // The tick keeps repairing, one dial at a time, until the count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.size() < COUNT && std::time::Instant::now() < deadline {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), COUNT, "the repair stopped at the count");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            COUNT,
+            "one dial per missing tunnel, never more"
+        );
+
+        // A complete pool has nothing to repair.
+        for _ in 0..5 {
+            pool.maintain().await;
+        }
+        assert_eq!(pool.size(), COUNT, "a complete pool stays at its count");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            COUNT,
+            "a complete pool dials nothing"
+        );
+    }
+
+    /// The client's pin count is the UDP affinity accounting the hub and the
+    /// snapshot read: a bound, active peer shows up against its tunnel, and
+    /// releasing it takes the count back to zero.
+    #[tokio::test]
+    async fn pin_accounting_tracks_the_tunnels_peers() {
         let (pool, _rxs) = duplex_pool(2, 2);
         let id = pool
             .inner
@@ -2996,7 +4755,9 @@ mod tests {
         // Two tunnels, four opens: the least-loaded rule must place two
         // streams on each tunnel, and every stream must survive a full round
         // trip. Each stream carries its own payload, so the assertions do not
-        // depend on which tunnel the placement picked.
+        // depend on which tunnel the placement picked. A second burst then
+        // takes the stream count past the pool's width: the extra streams
+        // spread over the same two tunnels and the pool never grows.
         const TUNNELS: usize = 2;
         const OPENS: usize = 4;
 
@@ -3032,12 +4793,11 @@ mod tests {
             per_tunnel_counts.push((counter, server));
         }
 
-        let pool = TunnelPool::new(
-            Carrier::Tcp,
-            "test".to_owned(),
-            tunnels,
-            4,
-            std::time::Duration::from_secs(60),
+        let pool = TunnelPool::new(Carrier::Tcp, "test".to_owned(), tunnels, TUNNELS);
+        assert_eq!(
+            pool.snapshot().count,
+            TUNNELS,
+            "the pinned count is reported"
         );
 
         let mut live = Vec::new();
@@ -3058,10 +4818,32 @@ mod tests {
             pool.snapshot()
                 .tunnels
                 .iter()
-                .map(|(s, _, _)| *s)
+                .map(|(s, _, _, _)| *s)
                 .collect::<Vec<_>>(),
             vec![OPENS / TUNNELS; TUNNELS],
             "the least-loaded rule must spread four opens evenly over two tunnels"
+        );
+
+        // More opens than the pool is wide: they are placed on the tunnels
+        // that exist, and the pinned pool never dials a third.
+        for i in 0..OPENS {
+            let mut s = pool.open_stream().await.unwrap();
+            s.write_all(format!("more{i:04}").as_bytes()).await.unwrap();
+            s.flush().await.unwrap();
+            let mut ok = [0u8; 2];
+            s.read_exact(&mut ok).await.unwrap();
+            assert_eq!(&ok, b"ok");
+            live.push(s);
+        }
+        assert_eq!(pool.size(), TUNNELS, "the pool never grows for load");
+        assert_eq!(
+            pool.snapshot()
+                .tunnels
+                .iter()
+                .map(|(s, _, _, _)| *s)
+                .collect::<Vec<_>>(),
+            vec![2 * OPENS / TUNNELS; TUNNELS],
+            "the extra streams spread over the same tunnels"
         );
         drop(live);
         drop(pool);
@@ -3073,7 +4855,7 @@ mod tests {
                 .await
                 .expect("tunnel counter did not finish")
                 .unwrap();
-            assert_eq!(count, OPENS / TUNNELS, "streams were not spread evenly");
+            assert_eq!(count, 2 * OPENS / TUNNELS, "streams were not spread evenly");
         }
     }
 
@@ -3097,8 +4879,7 @@ mod tests {
             Carrier::Tcp,
             "test".to_owned(),
             vec![(t1, shutdown1.clone()), (t2, shutdown2)],
-            4,
-            std::time::Duration::from_secs(60),
+            2,
         );
 
         // Sanity: both tunnels work.
@@ -3148,17 +4929,150 @@ mod tests {
         tx.send(true).unwrap();
     }
 
-    /// A tunnel whose connection dies must leave the pool even while it still
-    /// "holds" a stream, and the pool must dial a replacement.
+    /// A tunnel whose connection dies leaves the pool even while it still
+    /// "holds" a stream, and the pool dials its replacement.
     ///
-    /// `shrink_if_idle` requires the *whole* pool to be quiet, so before the
-    /// reap one stream that outlives its connection kept a corpse placeable
-    /// for the session's life. `max_tunnels = 1` makes the assertion sharp:
-    /// while the corpse occupies the only slot there is no room for a
-    /// replacement, so an open after the death can only succeed if the dead
-    /// tunnel was actually removed.
+    /// **A repair asks for the carrier the endpoint prefers now, not the one the
+    /// pool was born on.**
+    ///
+    /// The pool's carrier is part of its identity, and its dialer used to be
+    /// built for that one carrier at pool creation — so a pool that came up on
+    /// KCP kept repairing into KCP after UDP stopped working, which is the
+    /// defect this seam exists for. The fixture makes the two answers differ on
+    /// purpose: born on TCP, preferring KCP, and the *first* repair must ask for
+    /// KCP.
     #[tokio::test]
-    async fn a_dead_tunnel_is_reaped_and_replaced() {
+    async fn a_handover_excludes_new_streams_until_existing_lease_ends() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dials = std::sync::Arc::new(AtomicUsize::new(0));
+        let recorder = std::sync::Arc::clone(&dials);
+        let dial: Dialer = std::sync::Arc::new(move |carrier| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(carrier, Carrier::Tcp);
+                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+            })
+        });
+        let initial = vec![
+            (duplex_tunnel(), tokio::sync::watch::channel(false).0),
+            (duplex_tunnel(), tokio::sync::watch::channel(false).0),
+        ];
+        let pool = TunnelPool::with_preference(
+            Carrier::Kcp,
+            "handover".to_owned(),
+            initial,
+            2,
+            Some(dial),
+            std::sync::Arc::new(|| Carrier::Tcp),
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+        let held = pool.open_stream().await.unwrap();
+        assert!(pool.begin_handover(Carrier::Kcp, Carrier::Tcp));
+        let snapshot = pool.snapshot();
+        assert!(
+            snapshot
+                .draining
+                .iter()
+                .enumerate()
+                .any(|(index, draining)| *draining && snapshot.tunnels[index].3 == Carrier::Kcp),
+            "a KCP tunnel is unavailable to placement: {snapshot:?}"
+        );
+        assert!(
+            snapshot.handover.is_some_and(|(_, carrier, phase)| {
+                carrier == Carrier::Tcp && phase == "draining"
+            }),
+            "target carrier and phase are visible: {snapshot:?}"
+        );
+        assert!(snapshot.draining.iter().any(|is_draining| *is_draining));
+        let replacement_stream = pool.open_stream().await.unwrap();
+        assert!(
+            snapshot.draining.iter().any(|draining| *draining),
+            "pool must mark old carrier entry unavailable"
+        );
+        let serving_index = snapshot
+            .draining
+            .iter()
+            .position(|draining| !draining)
+            .unwrap();
+        let serving_id = pool.inner.state.lock().entries[serving_index].tunnel.id();
+        assert_eq!(replacement_stream.tunnel_id(), serving_id);
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "busy tunnel stays intact");
+        drop(held);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dials.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "handover replaces one tunnel"
+        );
+        assert_eq!(pool.size(), 2, "pool count is preserved");
+        assert!(
+            pool.snapshot().handover.is_none(),
+            "target tunnel completed handover"
+        );
+        assert!(
+            pool.snapshot()
+                .tunnels
+                .iter()
+                .any(|tunnel| tunnel.3 == Carrier::Tcp)
+        );
+        drop(replacement_stream);
+        drop(pool);
+    }
+
+    #[tokio::test]
+    async fn a_repair_establishes_the_preferred_carrier() {
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&asked);
+        let dial: Dialer = std::sync::Arc::new(move |carrier: Carrier| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder.lock().unwrap().push(carrier);
+                Err("no server in this test".to_owned())
+            })
+        });
+        let preferred: PreferredCarrier = std::sync::Arc::new(|| Carrier::Kcp);
+        // Empty pool, count 1: the maintenance tick's first act is a repair.
+        let _pool = TunnelPool::with_preference(
+            Carrier::Tcp,
+            "preferred".to_owned(),
+            Vec::new(),
+            1,
+            Some(dial),
+            preferred,
+            std::sync::Arc::new(PinRegistry::new()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !asked.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let seen = asked.lock().unwrap().clone();
+        assert_eq!(
+            seen.first().copied(),
+            Some(Carrier::Kcp),
+            "the repair must ask for the preferred carrier, not the pool's birth one: {seen:?}"
+        );
+    }
+
+    /// The old pool asked for a replacement only when the dead tunnel had
+    /// carried something, and its idle shrink needed the *whole* pool quiet —
+    /// so a stream that outlived its connection kept a corpse placeable for
+    /// the session's life. Repair is by count alone. `count = 1` makes the
+    /// assertion sharp: there is no room for the replacement until the corpse
+    /// has actually been removed.
+    #[tokio::test]
+    async fn a_dead_tunnel_holding_a_stream_is_reaped_and_repaired() {
+        use std::sync::atomic::Ordering;
+
         let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // The initial tunnel, plus the server task whose abort kills it.
@@ -3171,10 +5085,10 @@ mod tests {
         let t0 = ClientTunnel::start(client_io, mux_config(), shutdown0_rx);
 
         let dials_for_dialer = std::sync::Arc::clone(&dials);
-        let dialer: Dialer = std::sync::Arc::new(move || {
+        let dialer: Dialer = std::sync::Arc::new(move |_: Carrier| {
             let dials = std::sync::Arc::clone(&dials_for_dialer);
             Box::pin(async move {
-                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dials.fetch_add(1, Ordering::Relaxed);
                 let (client_io, server_io) = tokio::io::duplex(64 * 1024);
                 let (tx, rx) = mpsc::channel(8);
                 // Keep the receiver: a dropped one ends the server task and
@@ -3193,42 +5107,130 @@ mod tests {
             Carrier::Tcp,
             "test".to_owned(),
             vec![(t0, shutdown0)],
-            1, // no room for a replacement until the dead one is gone
-            std::time::Duration::from_secs(60),
+            1,
             Some(dialer),
             std::sync::Arc::new(PinRegistry::new()),
         );
 
-        // Hold a stream, so the tunnel is not "idle" and `may_shrink` can
-        // never be the path that removes it.
+        // Hold a stream, so the tunnel is busy when its peer goes away: a
+        // death is repaired whether or not the tunnel was carrying, and the
+        // held stream must not keep the corpse in the pool.
         let held = pool.open_stream().await.unwrap();
         assert_eq!(pool.size(), 1);
-        assert_eq!(dials.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(dials.load(Ordering::Relaxed), 0);
 
         // The peer goes away: the driver observes the closed duplex and ends.
         server0.abort();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut served = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if pool.open_stream().await.is_ok() {
-                served = true;
+            let dead = pool
+                .inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| !e.tunnel.is_alive());
+            if dead {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(served, "the pool never replaced the dead tunnel");
-        assert!(
-            dials.load(std::sync::atomic::Ordering::Relaxed) >= 1,
-            "the replacement must be dialed, not conjured"
+
+        // The tick reaps the corpse and dials exactly one replacement, whoever
+        // gets there first (the pool's own task or this call).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.size() < 1 && std::time::Instant::now() < deadline {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), 1, "the count is restored");
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            1,
+            "exactly one replacement is dialed for one death"
         );
         assert!(
-            pool.snapshot().shrinks >= 1,
-            "a reap is a recorded size change"
+            pool.inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| e.tunnel.is_alive()),
+            "the only member of the pool is the live replacement"
         );
+        assert!(pool.snapshot().grows >= 1, "the repair is recorded");
+
+        // The replacement serves visitors.
+        let served = pool
+            .open_stream()
+            .await
+            .expect("the replacement must serve the next visitor");
+        drop(served);
 
         drop(held);
         drop(pool);
+    }
+
+    /// A tunnel that never carried a stream is replaced just the same.
+    ///
+    /// The old pool only raised `demand` when the dead tunnel had carried
+    /// something, so an idle corpse — the common case, a carrier connection
+    /// that died between visitors — stayed in the pool. Repair is by count
+    /// alone, so idleness changes nothing.
+    #[tokio::test]
+    async fn an_idle_dead_tunnel_is_replaced_too() {
+        use std::sync::atomic::Ordering;
+
+        const COUNT: usize = 2;
+        let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = counting_pool(COUNT, COUNT, std::sync::Arc::clone(&dials));
+        assert_eq!(pool.size(), COUNT);
+        assert_eq!(pool.snapshot().streams(), 0, "both tunnels are idle");
+
+        // Kill one from the pool's side: the state a peer that went away
+        // leaves behind (an open that saw `Closed` marks it exactly so).
+        let victim = pool
+            .inner
+            .state
+            .lock()
+            .entries
+            .first()
+            .map(|e| e.tunnel.clone())
+            .expect("two tunnels");
+        victim.mark_dead();
+
+        // The tick reaps it and dials one replacement, up to the count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            pool.maintain().await;
+            if pool.size() >= COUNT && dials.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(pool.size(), COUNT, "the count is restored");
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "one idle death, one replacement"
+        );
+        assert!(pool.snapshot().grows >= 1, "the repair is recorded");
+        assert!(
+            pool.inner
+                .state
+                .lock()
+                .entries
+                .iter()
+                .all(|e| e.tunnel.is_alive()),
+            "every member of the pool is live again"
+        );
+        assert_eq!(
+            pool.snapshot().tunnels.len(),
+            COUNT,
+            "the replacement is a live member of the pool"
+        );
     }
 }

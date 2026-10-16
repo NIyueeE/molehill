@@ -90,6 +90,22 @@ if [ -n "$channel" ]; then
   expect "toolchain channel documented: $channel" README.zh.md "channel = \"$channel\""
 fi
 
+# 4b) the feature table is a registry: every public feature name (every row
+#     except `default`) must be documented in the build guide — the page that
+#     owns "what can be compiled". A name documented nowhere is either a dead
+#     pipeline row (a `--features` name that gates no code — the rustc
+#     `unexpected_cfgs` warning catches the gate side, this catches the table
+#     side) or a real feature whose existence is undiscoverable; both fail.
+#     This is what keeps the rule "a feature is named by intent, and every
+#     name in the table is public API" mechanical.
+while IFS= read -r feature; do
+  [ -n "$feature" ] || continue
+  expect "feature documented: $feature" docs/build-guide.md '`'"$feature"'`'
+done < <(awk '/^\[features\]/{f=1;next} /^\[/{f=0}
+              f && /=/ && $0 !~ /^[ \t]*#/ {
+                split($0,a,"="); k=a[1]; gsub(/[ \t]/,"",k); if (k != "" && k != "default") print k
+              }' Cargo.toml)
+
 # 5) justfile recipes documented on the landing pages
 expect "just setup documented" README.md 'just setup'
 expect "just setup documented" README.zh.md 'just setup'
@@ -97,10 +113,11 @@ expect "just check documented" README.md 'just check'
 expect "just check documented" README.zh.md 'just check'
 # The benchmark commands live on the method's page (one topic, one home);
 # the READMEs link to it instead of repeating the recipe.
-expect "just soak documented" docs/benchmarks.md 'just soak'
-expect "just soak documented (zh)" docs/benchmarks.zh.md 'just soak'
-expect "just soak-check documented" docs/benchmarks.md 'just soak-check'
-expect "just soak-peers documented" docs/benchmarks.md 'just soak-peers'
+expect "just bench documented" docs/benchmarks.md 'just bench'
+expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
+expect "just bench-gate documented" docs/benchmarks.md 'just bench-gate'
+expect "just bench-gate documented (zh)" docs/benchmarks.zh.md 'just bench-gate'
+expect "just bench-peers documented" docs/benchmarks.md 'just bench-peers'
 
 # 6) hooks activation instruction
 expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'
@@ -205,6 +222,104 @@ if [ -f githooks/pre-tag ]; then
 else
   echo "  FAIL  githooks/pre-tag missing (light release review, see AGENTS.md §5)" >&2
   errors=$((errors + 1))
+fi
+
+# 15) the bench model's registry is documented. Every metric and scenario the
+#     model declares must appear on the method's page in both languages: a
+#     metric added to model.py without a row in benchmarks.md is a metric no
+#     reader can look up, and the model's whole claim is that a number without a
+#     definition does not exist.
+while IFS= read -r metric; do
+  [ -n "$metric" ] || continue
+  expect "bench metric documented: $metric" docs/benchmarks.md "\`$metric\`"
+  expect "bench metric documented (zh): $metric" docs/benchmarks.zh.md "\`$metric\`"
+done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' benches/scripts/bench/model.py | sort -u)
+while IFS= read -r scenario; do
+  [ -n "$scenario" ] || continue
+  expect "bench scenario documented: $scenario" docs/benchmarks.md "\`$scenario\`"
+  expect "bench scenario documented (zh): $scenario" docs/benchmarks.zh.md "\`$scenario\`"
+done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' benches/scripts/bench/model.py | sort -u)
+expect "just bench-selfcheck documented" docs/checks.md 'just bench-selfcheck'
+expect "just bench documented" docs/benchmarks.md 'just bench'
+expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
+expect "just bench-doctor documented" docs/benchmarks.md 'just bench-doctor'
+expect "just bench-compare documented" docs/benchmarks.md 'just bench-compare'
+
+# 16) a key the parser refuses must be in the configuration page's removed-keys
+#     tables. The parser carries the registry (REMOVED_KEYS: the keys it refuses,
+#     with the advice it hands back), and a refusal the page does not document is
+#     an upgrade that dead-ends: the user is told what to remove and never what
+#     to write. The reverse drift is what makes this worth having at all — a page
+#     that still lists `carrier` among the keys to write, for a carrier that is
+#     chosen at runtime, passes every other gate here because `carrier` shows up
+#     in prose and in a diagram rather than in a TOML block.
+#
+#     The page writes a key as `[client.data].default_carrier`, so both sides are
+#     normalised before they are compared: brackets dropped, and the page's
+#     `<name>` read as the parser's `*`.
+#     The comparison is made against a normalised copy of the page rather than
+#     by massaging the pattern, so a pattern keeps its own spelling.
+normalised=$(mktemp)
+sed -e 's/\[//g' -e 's/\]//g' -e 's/<name>/*/g' docs/configuration.md > "$normalised"
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  if grep -qF -- "$key" "$normalised"; then
+    echo "  ok    removed key documented: $key"
+  else
+    echo "  FAIL  removed key $key is refused by the parser but has no row in the configuration page's removed-keys tables" >&2
+    errors=$((errors + 1))
+  fi
+done < <(awk '/^const REMOVED_KEYS/{f=1;next} f&&/^\];/{exit} f{
+  if ($0 ~ /^[[:space:]]*\([[:space:]]*$/) { want=1; next }
+  if (want && $0 ~ /^[[:space:]]*"[a-z][a-zA-Z0-9_.*]*",[[:space:]]*$/) {
+    gsub(/[^a-zA-Z0-9_.*]/,"",$0); print; want=0
+  }
+}' src/config/parsing.rs)
+rm -f "$normalised"
+
+# 17) the explicit feature lists that build the release artifacts must be
+#     Cargo.toml's default set. Three places name it in full — release.yml's
+#     musl entries (the container image), the CI musl job that exists to check
+#     that very build, and `just container` — and they have drifted twice: `kcp`
+#     (v0.10.0) and `transparent` (v0.11.0, where the CI job's list was the one
+#     left behind, so no musl build had ever compiled the L3 code the release
+#     shipped). Cargo.toml is the single source; a list that is not the default
+#     set is a release artifact that is not the default build.
+default_features=$(
+  awk '/^default = \[/{f=1;next} f&&/^\]/{exit} f{
+         gsub(/[",[:space:]]/,""); if ($0 != "") print
+       }' Cargo.toml | paste -sd, -
+)
+release_musl=$(
+  awk '/x86_64-unknown-linux-musl/{seen=1}
+       seen && /^[[:space:]]*features:/{sub(/^[[:space:]]*features:[[:space:]]*/,""); print; exit}' \
+    .github/workflows/release.yml
+)
+ci_musl=$(
+  awk '/x86_64-unknown-linux-musl/{seen=1}
+       seen {for (i=1;i<=NF;i++) if ($i=="--features") {print $(i+1); exit}}' \
+    .github/workflows/ci.yml
+)
+just_container=$(
+  awk '/^container:/{seen=1}
+       seen {for (i=1;i<=NF;i++) if ($i=="--features") {print $(i+1); exit}}' justfile
+)
+if [ -z "$default_features" ]; then
+  echo "  FAIL  no default feature set read from Cargo.toml [features]" >&2
+  errors=$((errors + 1))
+else
+  for named in "release.yml musl entries=$release_musl" \
+               "CI musl job=$ci_musl" \
+               "just container=$just_container"; do
+    label="${named%%=*}"
+    value="${named#*=}"
+    if [ "$value" = "$default_features" ]; then
+      echo "  ok    $label build the default feature set"
+    else
+      echo "  FAIL  $label build '$value', not Cargo.toml's default set '$default_features'" >&2
+      errors=$((errors + 1))
+    fi
+  done
 fi
 
 # soft notice: stale upstream references are expected only in provenance docs

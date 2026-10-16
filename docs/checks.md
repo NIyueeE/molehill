@@ -4,7 +4,7 @@ Three layered gates guard the repository, split by moment and weight:
 
 | Moment | Gate | Weight | What it guards |
 |--------|------|--------|----------------|
-| every commit | `githooks/pre-commit` | fast (~1 min) | code quality: fmt, secrets, machete, docs sync, ruff lint + format, clippy ×2 |
+| every commit | `githooks/pre-commit` | fast (~1 min) | code quality: fmt, secrets, machete, docs sync, ruff lint + format, bench-model self-check, clippy ×2 |
 | every push | `githooks/pre-push` | heavy (minutes) | security & dependency policy & freshness & tests (audit, deny, outdated, test) |
 | every release tag | `githooks/pre-tag` | light (seconds) | release state: tag↔version, changelog section, bench assets, container-job greps + advisory checklist |
 
@@ -44,8 +44,23 @@ running anything and take a two-gate path instead:
 
 | Where | Runs | Skips |
 |---|---|---|
-| `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, both ruff gates, both clippy passes |
+| `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, both ruff gates, the bench-model self-check, both clippy passes |
 | `githooks/pre-push` | `githooks/check-docs` | audit, deny, outdated, tests |
+
+A change limited to `benches/scripts/**` takes the same shortcut, in both
+hooks (classified by `githooks/benches-only`): the scripts are runtime
+tooling — `uv run` entries and shell helpers — never compiled, linked or
+depended on by any Rust target, so fmt, machete, both clippy passes and the
+whole heavy chain cannot move. The gates that can move all still run: the
+secret scan, the docs check, both ruff gates and the bench-model self-check
+in pre-commit; the docs check in pre-push. A push mixing docs with benches —
+or either with code — fails both classifiers and takes the full chain. CI
+does **not** take
+this shortcut (`ci.yml`'s only ignore-list is the docs one), so a benches-only
+change still runs the full Rust chain there — the hook path is a latency
+split, never a coverage split, and the classification is deliberately wider
+than "python": the shell helpers under `benches/scripts/` are equally
+compile-free.
 
 Three properties make this safe rather than a bypass:
 
@@ -74,11 +89,12 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 | 1 | fmt | `cargo fmt --all -- --check` | code style |
 | 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
 | 3 | machete | `cargo machete` | unused dependencies |
-| 4 | docs | `githooks/check-docs` | docs ↔ code alignment |
+| 4 | docs | `githooks/check-docs` | docs ↔ code alignment (includes the feature-name registry: every `[features]` row must be documented in docs/build-guide.md; and the explicit feature lists that build the release artifacts — `release.yml`'s musl entries, the CI musl job, `just container` — must equal Cargo.toml's default set) |
 | 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
 | 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
-| 7 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
-| 8 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
+| 7 | bench model | `uv run benches/scripts/bench/bench.py selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |
+| 8 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
+| 9 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
 
 Note the template difference: clippy runs twice (default features, then
 `server,client` only) instead of once with `--all-features`, because the
@@ -89,10 +105,10 @@ default-feature pass never compiles. `just check` runs the identical chain.
 
 | # | Gate | Command | Purpose |
 |---|------|---------|---------|
-| 9 | audit | `cargo audit` | RustSec security advisories |
-| 10 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
-| 11 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
-| 12 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
+| 10 | audit | `cargo audit` | RustSec security advisories |
+| 11 | deny | `cargo deny check` | licenses / bans / advisories policy (deny.toml) |
+| 12 | outdated | `cargo outdated --root-deps-only` | outdated direct dependencies |
+| 13 | test | `cargo test --quiet -- --test-threads=1` | test suite (serial by design) |
 
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.
@@ -111,11 +127,11 @@ commit; nothing here is a heavy gate.
 
 | # | Check | Purpose |
 |---|-------|---------|
-| 13 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
-| 14 | exactly one dated `## [x.y.z] - YYYY-MM-DD` section in `CHANGELOG.md`, with prose in it and an empty `## [Unreleased]` | release notes single source |
-| 15 | `results-soak-vX.Y.Z.json` + `assets/soak-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
-| 16 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
-| 17 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
+| 14 | tag name ↔ `Cargo.toml` version; `Cargo.lock` in sync | release identity |
+| 15 | exactly one dated `## [x.y.z] - YYYY-MM-DD` section in `CHANGELOG.md`, with prose in it and an empty `## [Unreleased]` | release notes single source |
+| 16 | `benches/records/results-bench-vX.Y.Z.json` + `assets/bench-vX.Y.Z.png` committed, **and the results file's recorded revision has no code change between it and the reviewed commit** | benchmark ritual deliverables, and numbers that describe the state being released (AGENTS.md §10, "prove provenance") |
+| 17 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
+| 18 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 
 At tag creation (local mode only) it additionally requires a clean working
 tree and that the tag does not exist yet. On a tag push (evaluated against a
@@ -136,13 +152,14 @@ Other recipes: `just fmt` / `just py-fmt` (auto-fix), `just test` (the full
 serial suite), `just test-fast` (lib tests + the core integration subset,
 ~1 min), `just powerset` (feature powerset via cargo-hack, CI's `features`
 job), `just py-lint` (both ruff gates, also in the pre-commit gate),
-`just bench-deps` (iperf3 + tc/netem on the benchmark host), `just soak`
-(the tool under test through the scripted workload and stage schedule),
-`just soak-peers` (fetch the peer tools' latest release binaries),
-`just soak-plot` (charts + markdown tables from the latest results file),
-`just soak-check` (the gate: latest results vs the previous release's file;
-`--screen <file>` for a development A/B verdict), `just container` (scratch
-image), `just interop` (the interop matrix, below).
+`just bench-selfcheck` (the performance model's own checks, also in the
+pre-commit gate), `just bench-deps` (iperf3 + iproute2 on the benchmark host),
+`just bench-peers` (fetch the peer tools' latest release binaries),
+`just bench-plot` (charts + markdown tables from a results file),
+`just bench-gate` (the release gate: coverage, the endpoint invariant, the SLO,
+drift, wedges, the ramp, and the regression half against a baseline),
+`just container` (scratch image), `just interop` (the interop matrix, below).
+The performance model's own commands are in the section below.
 
 ## Outside the chain: the interop matrix (`just interop`)
 
@@ -158,7 +175,7 @@ this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
 release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
 `cargo test --test interop_test`. Three cases, all of them about a refusal
 being *local*: an old server refuses the new client's dialect, a new server
-refuses the old client's dialect (v0.10 serves v4 only), and an old server
+refuses the old client's dialect (a release serves one dialect), and an old server
 refuses an unknown dialect — each on that connection alone, while the same
 process keeps serving a client of its own version.
 
@@ -168,6 +185,62 @@ trust one. It is a local and pre-release step — `docs/release.md` lists it in
 the tag ritual, and `tests/interop_test.rs` **skips loudly** (never silently)
 when `MOLEHILL_OLD_BIN` is unset, so a plain `cargo test` stays honest about
 what it did not check.
+
+### Transparent-L3 acceptance (`just l3-accept`)
+
+`just l3-accept` runs `benches/scripts/l3/run.sh`: three network namespaces, a
+real `molehill` server and client, and a visitor whose connection is owned by
+the **client** namespace — the server routes the packets into its TUN while
+holding no socket and no conntrack entry for the flow, and the backend sees the
+visitor's real address.
+
+It also measures: each arm is bracketed by `/proc/net/dev` samples inside the
+namespaces, and `benches/scripts/l3/wire_report.py` turns them into carried
+packet sizes and the ceiling a header compressor could reach. The method and the
+numbers it produced belong to [benchmarks.md](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness);
+its verdict was that compression is not worth building.
+
+The same run also covers the server's own switch, negatively: it restarts the
+server without `[server.transparent]` **after deleting that namespace's TUN
+device**, so the refusal it asserts on must be the policy one — a server that
+checked the interface first would answer with the missing-device recipe
+instead. That ordering is the point: a client's registration must never be what
+makes a server reach for `/dev/net/tun`.
+
+It is Linux-only (a TUN device) and root-only (`CAP_NET_ADMIN`) for its veth
+pairs, TUN devices, routes and `ip rule`, so it is **not** part of `just check`
+or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
+command and exits 77, never a silent pass. The daemon configures no network
+itself; the harness is the operator.
+
+### The performance model (`just bench`)
+
+`benches/scripts/bench/` is the repository's measurement standard and its only
+runner: a declared metric registry, one topology for every arm (the product's
+configurations, the reference tools and a control with no tool in the path),
+scenarios that each state the claim they support, conditions and timelines that
+change the path in place, and verdicts that clear the run's own measured noise
+floor before they claim anything. Its method is owned by
+[benchmarks.md](benchmarks.md#the-bench-model-the-measurement-standard).
+
+Two of its commands are in the check chain, and the rest are measurements:
+
+| Command | In the chain? | What it is |
+|---|---|---|
+| `just bench-selfcheck` | **yes** — a fast gate in `githooks/pre-commit` | the model's own checks: the metric registry is consistent, the verdict rules do what they say, comparability refuses what it must, the probes compile. No root, no topology, about a second. |
+| `just bench` | no | a campaign (`--profile smoke\|dev\|full\|stage\|soak\|screen\|sweep`): root-only (three network namespaces), minutes to hours, results outside the tree unless `--out` says otherwise |
+| `just bench-doctor` | no | what this host can measure, and what it cannot (root, TUN, iperf3, the peer binaries) |
+| `just bench-list` | no | the registry: every metric, condition, timeline, arm and profile |
+| `just bench-report` / `just bench-compare` / `just bench-gate` | no | render a stored run; A/B two of them (or refuse); gate a release run |
+| `just bench-plot` | no | the charts and markdown tables of a results file |
+| `just bench-peers` | no | fetch the peer tools' release binaries into `~/tmp/bench-peers` |
+
+The model asserts nothing about the tool and gates nothing in CI: it produces
+numbers and verdicts, the gate decides whether a *release* run may be published,
+and `docs/release.md` owns the ritual. Keeping its self-check in the fast gate
+is what keeps the *rules* enforced even when nobody is measuring — a metric
+definition that contradicts the code, or a comparability rule that stopped
+refusing, fails a commit rather than a campaign.
 
 ## When a gate blocks you
 

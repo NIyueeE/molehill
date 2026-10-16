@@ -1,5 +1,5 @@
-//! The elastic tunnel pool's *policy*: the internal constants, the placement
-//! arithmetic and the shrink predicate.
+//! The pinned tunnel pool's *policy*: the internal constants, the placement
+//! arithmetic and the placement ceiling.
 //!
 //! The pool's runtime lives in [`crate::transport::multiplex`] (it owns the
 //! tunnels, the driver tasks and the telemetry); everything in this module is
@@ -8,78 +8,42 @@
 //! observation, and a knob nobody has measured is a knob nobody can defend
 //! (see HANDOFF.md D15 — the benchmark matrices are what promote one to a
 //! configuration key).
+//!
+//! A pinned pool establishes its configured `count` tunnels at service start
+//! and keeps them; the only runtime establishment is *repair* (a dead tunnel
+//! is re-dialed), so this module no longer carries growth or shrink rules.
 
-/// Grow when a tunnel's usage reaches this fraction of its stream capacity, or
-/// when the pool's total reaches the same fraction of its total capacity.
-///
-/// The number was 80 % (51 streams of a 64-stream tunnel) until a release
-/// sweep measured what that actually does. Both the mixed soak workload and a
-/// 20-stream `iperf3` bulk test peak *below* 51 concurrent streams, so the rule
-/// never fired: the pool stayed at one tunnel, and one TCP tunnel carrying
-/// twenty bulk streams plus a control channel is exactly the head-of-line
-/// blocking this pool exists to avoid. The backend said so directly —
-/// `iperf3: error - idle timeout for receiving data`, waiting for a summary
-/// behind its own bulk data (HANDOFF.md).
-///
-/// The rule is therefore about *how much one tunnel should carry*, not about
-/// how close it is to the engine's cap: 12 % of 64 is 7 concurrent streams,
-/// which is where a shared tunnel starts to queue an interactive or control
-/// stream behind bulk traffic. The pool's own `max_tunnels` bounds the result
-/// (4 tunnels by default, ~32 concurrent streams per service — the same order
-/// as the four pre-opened channels v0.9.1 used to get this property for free).
-///
-/// The threshold is read in two places: the maintenance tick, and the open
-/// path (`grow_before_placing`, which is what makes a *burst* spread while it
-/// is placed rather than on the tick that follows it).
-pub(crate) const GROW_PERCENT: usize = 12;
-
-/// How long the pool stays warm after a growth before a shrink may remove a
-/// tunnel. Without it, a pool grown for one burst shrinks immediately after
-/// it — and the next burst pays the grow again.
-pub(crate) const MIN_WARM_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long after a shrink the pool waits before considering another one.
-/// Shrink is deliberately unhurried: a mistake costs the next visitor a
-/// tunnel establishment.
-pub(crate) const SHRINK_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How often a live pool re-evaluates its size.
+/// How often a live pool reconciles its size against its configured count.
 pub(crate) const MAINTAIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// How long a pool waits after a growth attempt failed before it tries again.
+/// How long a pool waits after a repair dial failed before it tries again.
 ///
 /// D14's other half: a refusal (the server's `max_tunnels_per_client` valve, or
-/// a dial that could not be established) must *stop* growth, not merely fail it
-/// — the maintenance tick runs every 50 ms, so without this the client would
-/// dial-and-be-refused twenty times a second against the server's accept path.
-/// The wait is cut short by the two events that make a retry meaningful: a
-/// tunnel dying, and the pool having shrunk.
+/// a dial that could not be established) must *stop* the repair dials, not
+/// merely fail one — the maintenance tick runs every 50 ms, so without this the
+/// client would dial-and-be-refused twenty times a second against the server's
+/// accept path. The wait is cut short by the event that makes a retry
+/// meaningful: a tunnel dying.
 pub(crate) const GROW_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long an open waits for a growth that is already in flight.
+/// How long an open waits for a repair that is already in flight.
 ///
-/// A burst of opens on a cold pool — a stripe group's K channels arrive
+/// A burst of opens on an empty pool — a stripe group's K channels arrive
 /// back-to-back — must not have all but one of them race past the in-flight
-/// growth and fail on an empty pool: they wait for it instead. This budget is a
-/// backstop, not the expected path: a growth either finishes or fails, and a
-/// caller that waited it out then reports the pool's real state instead of
-/// hanging on a `resizing` flag some panicked task left set.
+/// repair and fail on the still-empty pool: they wait for it instead. This
+/// budget is a backstop, not the expected path: a repair either finishes or
+/// fails, and a caller that waited it out then reports the pool's real state
+/// instead of hanging on a `resizing` flag some panicked task left set.
 pub(crate) const GROW_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// An open that waited longer than this means the pool has no spare stream
-/// ready: grow. The condition is the *real* open latency (which includes one
-/// round trip to the server), and it is only ever consulted for opens that
-/// have not completed yet.
-pub(crate) const OPEN_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// How long a *cold* pool's open waits for the growth already in flight before
+/// How long an empty pool's open waits for the repair already in flight before
 /// giving up on it.
 ///
 /// Only one open wins the pool's resize flag; the others must wait for the
-/// tunnel that grow is dialing, or they would reserve against an empty pool
+/// tunnel the repair is dialing, or they would reserve against an empty pool
 /// and fail a visitor the winner is already answering — observed as a striped
 /// group that never completes (four channel opens, three `NoTunnel` failures).
-/// The grow's own completion signal is the normal path; this bounds the wait
+/// The repair's own completion signal is the normal path; this bounds the wait
 /// for a dialer that never returns, so it has to cover the slowest carrier's
 /// dial timeout (`KCP_ESTABLISH_TIMEOUT`, 10 s).
 pub(crate) const COLD_GROW_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -100,8 +64,9 @@ pub(crate) const OPEN_BUDGET: usize = 16;
 /// `DEFAULT_MUX_MAX_STREAMS` (64). The gap is not cosmetic: a 65th inbound
 /// stream is refused (the engine used to terminate the *whole connection* for
 /// it — see `mux/connection.rs`), and a refused stream is a visitor that fails.
-/// Crossing the ceiling needed a pool that could not grow (the server's
-/// `max_tunnels_per_client` valve, or `max_tunnels` itself) while the load kept
+/// Crossing the ceiling needed a pool that could not reach its configured
+/// count (the server's `max_tunnels_per_client` valve, an unreachable
+/// endpoint, or a `tunnels` count below the load) while the load kept
 /// arriving, which is exactly what a bulk run does; the reservation is charged
 /// before the first `await`, so the ceiling has to bound `streams + pending`,
 /// not the established count alone.
@@ -109,16 +74,17 @@ pub(crate) const OPEN_BUDGET: usize = 16;
 /// 56 leaves 8 slots of headroom: room for a stream the peer has not released
 /// yet (the engine drops a stream from its map on the *local* handle, so the
 /// two sides can disagree by a few during a teardown) and for the engine's own
-/// bookkeeping. It is deliberately above the growth rule's per-tunnel
-/// threshold (`tunnel_grow_at`, 7 on the shipped cap), so the growth rule
-/// fires long before placement ever reaches it.
+/// bookkeeping.
 ///
-/// The ceiling is a *soft* bound in the sense that reaching the engine's cap is
-/// no longer fatal: `mux/connection.rs` refuses the stream that would cross it
-/// instead of terminating the connection (see the comment there — the old
-/// behaviour took every stream on the tunnel down with it). The ceiling still
-/// exists because refusing a stream is worse than placing it elsewhere, and
-/// because a pool that grows is a pool that serves.
+/// Placement is the *only* oversubscription protection a pinned pool has: it
+/// cannot grow for load, so when every tunnel is at the ceiling an open waits
+/// [`CAPACITY_WAIT`] for a stream to retire and is then refused with
+/// `OpenError::AtCapacity`. The ceiling is a *soft* bound in the sense that
+/// reaching the engine's cap is not fatal: `mux/connection.rs` refuses the
+/// stream that would cross it instead of terminating the connection (see the
+/// comment there — the old behaviour took every stream on the tunnel down with
+/// it). Refusing a stream is still worse than placing it elsewhere, which is
+/// why the ceiling sits strictly below the engine's own cap.
 pub(crate) const TUNNEL_STREAM_CEILING: usize = 56;
 
 /// The streams one tunnel may carry, never above the engine's own cap.
@@ -127,9 +93,7 @@ pub(crate) const TUNNEL_STREAM_CEILING: usize = 56;
 /// ([`TUNNEL_STREAM_CEILING`], the one that caps one tunnel's concurrency for
 /// any engine cap) and a proportional headroom for a cap small enough that the
 /// absolute one would not leave any. The headroom is an eighth of the cap, at
-/// least one stream, which leaves the proportional ceiling well above
-/// [`tunnel_grow_at`]'s 12 %: growth must fire before placement refuses,
-/// whatever the cap.
+/// least one stream, so the ceiling is always strictly below the engine's cap.
 #[must_use]
 pub(crate) fn tunnel_ceiling(stream_cap: usize) -> usize {
     let headroom = (stream_cap / 8).max(1);
@@ -139,7 +103,7 @@ pub(crate) fn tunnel_ceiling(stream_cap: usize) -> usize {
 }
 
 /// How long an open waits for a stream to retire when every tunnel is at the
-/// ceiling and the pool cannot grow.
+/// ceiling and the pool is already at its configured count.
 ///
 /// Bounded on purpose: a refused visitor is a failure this pool can report,
 /// while an open that waits forever is a hung connection nobody can attribute.
@@ -148,39 +112,22 @@ pub(crate) fn tunnel_ceiling(stream_cap: usize) -> usize {
 pub(crate) const CAPACITY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Why the pool changed size. Rendered verbatim in the `pool-stats` timeline.
+///
+/// A pinned pool establishes its configured count at service start; the one
+/// size change left to record is a *repair* after a tunnel died. There is no
+/// load growth and no idle shrink — capacity is a function of configuration,
+/// and a deployment's throughput must not depend on what it happened to be
+/// doing a minute ago.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrowReason {
-    /// The pool had no tunnel and a service asked for one.
-    Cold,
-    /// Every tunnel is at or above `GROW_PERCENT` of its cap.
-    Load,
-    /// An open waited longer than `OPEN_WAIT_BUDGET`.
-    Wait,
-    /// The UDP-derived floor (D7) is above the current size.
-    UdpFloor,
-    /// An open was left queueing (a refused open, or a tunnel whose open budget
-    /// was full): the demand flag is set and the next maintenance tick adds a
-    /// tunnel. A stream-cap hit arrives here too — it is a growth signal, never
-    /// a tunnel's death.
-    Demand,
-    /// A stripe group asked for one more tunnel so its stripes can land apart
-    /// (D24). The only growth a *request* triggers by itself rather than
-    /// through load or demand: a group of K needs K tunnels to be spread over,
-    /// and its K streams sit below the load threshold, so no other rule would
-    /// ever have added the second tunnel. Bounded by the group's own K and by
-    /// `max_tunnels`.
-    Stripe,
+    /// A tunnel was lost (or never came up) and the count is short.
+    Repair,
 }
 
 impl GrowReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Cold => "cold",
-            Self::Load => "load",
-            Self::Wait => "wait",
-            Self::UdpFloor => "udp_floor",
-            Self::Demand => "demand",
-            Self::Stripe => "stripe",
+            Self::Repair => "repair",
         }
     }
 }
@@ -188,26 +135,21 @@ impl GrowReason {
 /// Why the pool removed a tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShrinkReason {
-    /// No streams, no pending opens, no pinned peers, idle past the timeout.
-    Idle,
     /// The tunnel's driver ended: the connection is gone, whatever its load
-    /// says. Removal here is not a policy decision, so it bypasses every
-    /// idle/warm/cooldown gate — a dead tunnel that "holds" a stream is
-    /// exactly the state that used to be unreachable (`shrink_if_idle` needs
-    /// the whole pool empty, so one stuck stream kept a corpse forever).
+    /// says. Removal here is not a policy decision, and the repair tick
+    /// replaces it — a pinned pool keeps its count.
     Dead,
 }
 
 impl ShrinkReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::Idle => "idle",
             Self::Dead => "dead",
         }
     }
 }
 
-/// The per-tunnel bookkeeping the placement and shrink rules read.
+/// The per-tunnel bookkeeping the placement rule reads.
 ///
 /// `streams` counts *established* streams, `pending` counts opens that were
 /// reserved but have not completed, and `pinned` counts the peers whose
@@ -274,8 +216,8 @@ pub(crate) fn order_candidates(loads: &[TunnelLoad], start: usize) -> Vec<usize>
 ///   knows is dead or full;
 /// - `avoid` — the tunnels a stripe group already occupies. That one is a
 ///   *preference*, not a constraint: when every candidate is in it (a pool
-///   smaller than the group's stripe count, or one whose growth was refused),
-///   the unfiltered order answers instead. A group that cannot spread must
+///   smaller than the group's stripe count — a pinned pool cannot dial more for
+///   it), the unfiltered order answers instead. A group that cannot spread must
 ///   still forward — correctness first, exactly as before the group had a name
 ///   (D24).
 ///
@@ -299,51 +241,24 @@ pub(crate) fn order_candidates_for(
     candidates
 }
 
-/// The stream-cap headroom the grow rule uses: `size * cap * fraction`.
+/// The UDP-derived floor (D7): how many tunnels the deepest UDP service of a
+/// carrier needs so its configured workers keep distinct paths.
 ///
-/// The threshold is compared against the pool's *total* usage, which is
-/// exactly "every tunnel is at least `GROW_PERCENT` of its cap"
-/// once placement has spread the load the way it does — and unlike a
-/// per-tunnel comparison it stays reachable for a tunnel the pool just added.
-pub(crate) fn grow_threshold(size: usize, stream_cap: usize) -> usize {
-    // The pool size and the stream cap are small counters; this is the
-    // integer form of `size * cap * 12 / 100`, with the fraction's own
-    // precision immaterial at these magnitudes.
-    size * stream_cap * GROW_PERCENT / 100
-}
-
-/// The streams one tunnel carries before the pool grows, whatever its size.
-///
-/// [`grow_threshold`] answers "is the pool as a whole busy"; this answers "is
-/// *this* tunnel busy", which is the question that decides whether a cap is
-/// reachable. They agree at size 1 and diverge above it — the total threshold
-/// scales with the pool, so a tunnel of a 4-tunnel pool is at 4x its share
-/// before the total crosses — and it is the per-tunnel one that must fire
-/// first, because only it can keep every tunnel under
-/// [`TUNNEL_STREAM_CEILING`].
-#[must_use]
-pub(crate) fn tunnel_grow_at(stream_cap: usize) -> usize {
-    (stream_cap * GROW_PERCENT / 100).max(1)
-}
-
-/// The UDP-derived floor (D7): the number of tunnels that must stay for the
-/// deepest active UDP service to keep its configured workers.
-///
-/// `pool_size` is the service's channel count (`udp_workers` after the
-/// configuration milestone) and `stream_cap` the per-tunnel stream ceiling, so
-/// the floor is `ceil(channels / cap)` — the smallest pool that can carry all
-/// of the service's channels *at once*.
+/// `active_channels` is each service's channel count (`udp_workers`) and
+/// `stream_cap` the per-tunnel stream ceiling, so the floor is
+/// `ceil(channels / cap)` — the smallest pool that can carry all of a service's
+/// channels *at once*.
 ///
 /// The floor is the larger of that capacity term and the service's own worker
 /// count (capped at `cap` by the `ceil` term when the workers do not fit): a
 /// service configured with N workers is asking for N paths, and the pool it
-/// draws from keeps at least N tunnels so those paths are spread rather than
-/// stacked. The pool's `max_tunnels` bounds the demand, so a service cannot
-/// force a pool beyond its cap.
+/// draws from establishes at least N tunnels so those paths are spread rather
+/// than stacked. An explicit `tunnels` below this floor is refused by the
+/// configuration layer (the pinned pool cannot grow to meet it); an unset one
+/// resolves to `max(default, floor)`.
 ///
 /// An inactive service contributes nothing; the floor is what *active* UDP
-/// demand needs, which is why it is maintained across a tunnel's death rather
-/// than recomputed from the dead pool.
+/// demand needs.
 pub(crate) fn udp_floor(
     active_channels: impl IntoIterator<Item = usize>,
     stream_cap: usize,
@@ -356,50 +271,14 @@ pub(crate) fn udp_floor(
         .unwrap_or(0)
 }
 
-/// The same floor, with the pool's own cap applied: a service may not demand
-/// more tunnels than the pool is allowed to grow to.
-pub(crate) fn udp_floor_capped(
-    active_channels: impl IntoIterator<Item = usize>,
-    stream_cap: usize,
-    max_tunnels: usize,
-) -> usize {
-    udp_floor(active_channels, stream_cap).min(max_tunnels.max(1))
-}
-
-/// Whether one tunnel may be removed from a pool of `size`, given the whole
-/// pool's state.
-///
-/// Shrink is conservative by construction (D26, D30): the pool must be above
-/// its floor, the tunnel must be completely idle (no established stream, no
-/// pending open, no pinned peer), and the pool must have been quiet for the
-/// caller's `idle_timeout` — the caller owns the clock, this predicate owns
-/// the conditions.
-pub(crate) fn may_shrink(
-    size: usize,
-    floor: usize,
-    load: TunnelLoad,
-    idle: bool,
-    warm_hold_elapsed: bool,
-    cooldown_elapsed: bool,
-) -> bool {
-    size > floor
-        && load.streams == 0
-        && load.pending == 0
-        && load.pinned == 0
-        && idle
-        && warm_hold_elapsed
-        && cooldown_elapsed
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The placement ceiling is the pool's promise that the engine's own cap
-    /// is unreachable. Two properties matter: it stays strictly below the cap,
-    /// and — wherever it is the *binding* bound, i.e. below what the growth
-    /// rule reacts to — growth fires first, so a refusal only ever follows a
-    /// growth attempt rather than replacing one.
+    /// The placement ceiling is the pool's promise that the engine's own cap is
+    /// unreachable: it stays strictly below the cap for every cap, and the
+    /// headroom never disappears. Placement is the only oversubscription
+    /// protection a pinned pool has.
     #[test]
     fn the_placement_ceiling_keeps_headroom_below_the_engine_cap() {
         for cap in [4usize, 16, 32, 64, 128, 256] {
@@ -408,20 +287,13 @@ mod tests {
                 ceiling < cap,
                 "the ceiling ({ceiling}) must stay below the engine's cap ({cap})"
             );
-            let grow_at = tunnel_grow_at(cap);
-            assert!(
-                grow_at <= ceiling || ceiling == TUNNEL_STREAM_CEILING,
-                "at cap {cap} the ceiling ({ceiling}) binds before growth ({grow_at}) does"
-            );
         }
-        // The shipped cap: growth at 7, placement refuses at 56, the engine
-        // refuses a stream at 64 (and, since the connection no longer
-        // terminates, that refusal costs one visitor). Growth fires far below
-        // the ceiling on purpose — see `GROW_PERCENT`.
-        assert_eq!(tunnel_grow_at(64), 7);
+        // The shipped cap: placement refuses at 56, the engine refuses a stream
+        // at 64 (and, since the connection no longer terminates, that refusal
+        // costs one visitor).
         assert_eq!(tunnel_ceiling(64), 56);
-        // A cap too small for the absolute ceiling still yields a usable one
-        // that growth reaches first.
+        // A cap too small for the absolute ceiling still yields a usable one:
+        // the proportional headroom binds instead.
         assert_eq!(tunnel_ceiling(16), 14);
         assert_eq!(tunnel_ceiling(4), 3);
     }
@@ -437,53 +309,6 @@ mod tests {
         assert_eq!(udp_floor([64], 64), 64);
         assert_eq!(udp_floor([65], 64), 65);
         assert_eq!(udp_floor([2, 130], 64), 130, "the deepest service wins");
-        // The pool's own cap bounds the demand.
-        assert_eq!(udp_floor_capped([130], 64, 2), 2);
-        assert_eq!(udp_floor_capped([2], 64, 3), 2);
-        assert_eq!(udp_floor_capped([2], 64, 1), 1);
-    }
-
-    #[test]
-    fn shrink_needs_every_condition() {
-        let idle = TunnelLoad::default();
-        assert!(may_shrink(2, 1, idle, true, true, true));
-        // A pinned peer keeps the tunnel even when it has no streams (D30).
-        let pinned = TunnelLoad {
-            pinned: 1,
-            ..Default::default()
-        };
-        assert!(!may_shrink(2, 1, pinned, true, true, true));
-        // A live stream, a reserved open, the floor, the idle clock, the warm
-        // hold and the cooldown each veto on their own.
-        assert!(!may_shrink(
-            2,
-            1,
-            TunnelLoad {
-                streams: 1,
-                ..Default::default()
-            },
-            true,
-            true,
-            true
-        ));
-        assert!(!may_shrink(
-            2,
-            1,
-            TunnelLoad {
-                pending: 1,
-                ..Default::default()
-            },
-            true,
-            true,
-            true
-        ));
-        assert!(
-            !may_shrink(1, 1, idle, true, true, true),
-            "never below the floor"
-        );
-        assert!(!may_shrink(2, 1, idle, false, true, true));
-        assert!(!may_shrink(2, 1, idle, true, false, true));
-        assert!(!may_shrink(2, 1, idle, true, true, false));
     }
 
     #[test]
@@ -510,13 +335,6 @@ mod tests {
         let tied = [TunnelLoad::default(), TunnelLoad::default()];
         assert_eq!(order_candidates(&tied, 0), vec![0, 1]);
         assert_eq!(order_candidates(&tied, 1), vec![1, 0]);
-    }
-
-    #[test]
-    fn grow_threshold_tracks_size() {
-        assert_eq!(grow_threshold(1, 64), 7);
-        assert_eq!(grow_threshold(4, 64), 30);
-        assert_eq!(grow_threshold(0, 64), 0);
     }
 
     /// The stripe exclusion is a preference with a floor: a group's next stripe

@@ -1,0 +1,1017 @@
+#!/usr/bin/env bash
+# Transparent-L3 acceptance harness: the REAL molehill binaries in a
+# three-namespace topology, plus the evidence that the CLIENT owns the public
+# ip:port and the server holds no connection state for the visitor's flow.
+#
+#   sudo -n bash benches/scripts/l3/run.sh
+#
+# Root-only and Linux-only: it creates veth pairs, two TUN devices, routes and
+# an ip rule. It is deliberately outside the check chain -- see docs/checks.md,
+# "Outside the chain". LOG overrides the artifact directory (/tmp/l3-accept).
+#
+# What a green run proves, end to end:
+#   1. a visitor reaches a service behind NAT, with no NAT anywhere;
+#   2. the service sees the VISITOR's real address (transparency);
+#   3. the server namespace holds NO connection state for the visitor's flow;
+#   4. the client namespace owns the accepted connection;
+#   5. the bulk arm round-trips byte-exactly (no PMTU black hole), and so do 2000
+#      small request/response round trips;
+#   6. 16 concurrent flows stay byte-exact too, and the run reports what each
+#      arm costs on the wire, on the CPU and what share of it a header
+#      compressor could reach (benches/scripts/l3/wire_report.py);
+#   7. a server whose config has no `[server.transparent]` refuses the
+#      registration BY POLICY, before it looks at a device (its device is
+#      deleted for that run, so the order is proven rather than asserted);
+#   8. with CLAIM_LANES > 1 the claim holds that many carrier connections, its
+#      flows are spread across them, and every arm above is still byte-exact;
+#   9. with CLAIM_LANE_CAP below CLAIM_LANES the server's valve (which counts a
+#      claim's lanes) refuses the surplus with one line naming the cap, and the
+#      claim keeps serving byte-exactly on the lanes it got;
+#  10. with LENDING=off the mechanism is off: the same two claims and the same
+#      load produce no lent lane at all, which is what `[transparent.data].lend`
+#      promises and what the model's `l3-budget10-nolend` arm measures;
+#  11. with IDLE_CLAIM=1 a second, idle claim holds lanes beside the busy one,
+#      the lane allocator lends an idle lane of it to the claim carrying more
+#      flows than lanes, and the busy workload stays byte-exact through the
+#      change (a lane moves; a flow never does).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$HERE/../../.." && pwd)"
+LOG="${LOG:-/tmp/l3-accept}"
+# Which build the run measures. `debug` is the default because it builds
+# fastest; `release` is what an operator runs, and the two do not cost the same
+# per packet, so a run that is quoted as the path's cost should say which one it
+# measured (`PROFILE_BUILD=release`).
+PROFILE_BUILD="${PROFILE_BUILD:-debug}"
+if [ "$PROFILE_BUILD" = "release" ]; then
+    BUILD_ARGS="--release"
+    BIN="$ROOT/target/release/molehill"
+else
+    BUILD_ARGS=""
+    BIN="$ROOT/target/debug/molehill"
+fi
+
+# A silent pass without root would be worse than a failure: exit 77 is the
+# "skipped" status, and the exact command to run is part of the message.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "SKIP l3-accept: it needs root for namespaces, TUN devices and routes." >&2
+    echo "     re-run it as: sudo -n bash $HERE/run.sh" >&2
+    exit 77
+fi
+
+case "$LOG" in
+"" | "/")
+    echo "refusing LOG=$LOG" >&2
+    exit 2
+    ;;
+esac
+
+for tool in ip ss sysctl uv cargo; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "missing required tool: $tool" >&2
+        exit 1
+    fi
+done
+if [ ! -c /dev/net/tun ]; then
+    echo "/dev/net/tun is missing: the harness and the daemons need the TUN driver" >&2
+    exit 1
+fi
+
+# The topology under test. The daemon configures no network itself, so all of
+# this is the operator side of the contract (src/transparent/check.rs verifies
+# the parts it depends on).
+NS_VIS=l3vis
+NS_SRV=l3srv
+NS_CLI=l3cli
+VIS_IP=10.10.0.2
+SRV_VIS_IP=10.10.0.254
+SRV_CLI_IP=10.30.0.1
+CLI_IP=10.30.0.2
+PUBLIC_IP=10.99.0.1
+PUBLIC_PORT=8443
+# The second claim's port, used only when IDLE_CLAIM is set (see write_configs).
+IDLE_PORT=$((PUBLIC_PORT + 1))
+CONTROL_PORT=2333
+TUN_SRV=l3srv0
+TUN_CLI=l3cli0
+ROUTE_TABLE=100
+# The control channel must use Noise (it publishes the session nonce the data
+# lanes authenticate with), and this harness writes both ends' configs, so a
+# run cannot start without a pair. This one is a MEASUREMENT pair, published
+# here on purpose: it guards nothing (three throwaway namespaces) and a reader
+# reproducing the run must get the same config. A deployment generates its own
+# with `molehill --genkey`.
+NOISE_SERVER_PRIVATE="kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+NOISE_CLIENT_REMOTE_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+TUN_MTU="${TUN_MTU:-1400}"
+# The veth MTU, i.e. how large a segment the tunnel's own TCP may carry. Raising
+# it (with TUN_MTU) is the experiment that separates per-packet cost from
+# per-byte cost: the same bytes in a quarter of the packets.
+LINK_MTU="${LINK_MTU:-1500}"
+# The bulk arm's size. Long enough to resolve the CPU counters (100 Hz) when a
+# run needs that: BULK_BYTES=2000000.
+BULK_BYTES="${BULK_BYTES:-200000}"
+# The bulk arm streams in chunks of this size rather than sending one blob and
+# reading afterwards: a send-then-read workload whose size exceeds the buffers
+# deadlocks against an echo that must read to reply (the visitor waits for the
+# echo, the echo waits for the visitor to read), which is a property of that
+# workload and not of the tunnel. Chunked round trips exercise the same
+# full-size packets without it.
+BULK_CHUNK="${BULK_CHUNK:-65536}"
+# The small-packet arm's instrument: strict round trips of this size. Both are
+# recorded with the numbers, because they are what the numbers mean.
+SMALL_REQUESTS="${SMALL_REQUESTS:-2000}"
+SMALL_BYTES="${SMALL_BYTES:-64}"
+# Optional lane budget for the claim (`[transparent.data].tunnels`). Empty
+# writes nothing (the product's one connection per claim); 2 or more asks for
+# several lanes, which is what makes this run prove that a claim's flows are
+# spread over several carrier connections and still arrive byte-exact.
+CLAIM_LANES="${CLAIM_LANES:-}"
+# Optional cap on the carrier connections one client may hold, written into the
+# server (`[server.data].max_tunnels_per_client`). Empty writes nothing (the
+# product's unlimited default); a value below CLAIM_LANES makes the run prove
+# that the operator's valve counts a claim's lanes and refuses the surplus while
+# the claim keeps serving on what it got.
+CLAIM_LANE_CAP="${CLAIM_LANE_CAP:-}"
+# Add a second claim that carries no traffic at all (`idle`, on PUBLIC_PORT+1).
+# It exists so a run can prove the lane allocator's whole point — an idle claim's
+# lane becoming a busy claim's lane — which needs two claims and can therefore
+# only be shown when it is asked for: the default topology stays one claim.
+IDLE_CLAIM="${IDLE_CLAIM:-}"
+# `[transparent.data].lend` for the lending section below. Empty leaves the key
+# out (the product's `true`); `off` writes `false`, which is the control for the
+# mechanism: same claims, same load, no lane moves.
+LENDING="${LENDING:-}"
+# The multi-flow arm: N connections at once, each doing its own strict round
+# trips. This is where packets queue, so it is the arm that says what several
+# visitors through one claim cost (and the only one a queue-per-CPU change
+# could ever show up in).
+CONCURRENT_CONNS="${CONCURRENT_CONNS:-16}"
+CONCURRENT_REQUESTS="${CONCURRENT_REQUESTS:-200}"
+# Optional attribution: sample both daemons for this many seconds, starting with
+# the measurement section, and print the self-time report. The counters say what
+# an arm costs; this says where it went. Tune the arm sizes so one arm dominates
+# the window (see docs/benchmarks.md).
+PROFILE="${PROFILE:-}"
+# Long enough that the socket and conntrack snapshots are taken while the
+# visitor's connection is unmistakably live.
+HOLD_SECONDS=5
+
+PIDS=()
+
+# Deleting a namespace removes everything the harness installed inside it: the
+# veth end, the TUN device, and every route and rule on top of them.
+topology_down() {
+    for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
+        ip netns del "$ns" 2>/dev/null || true
+    done
+}
+
+# Kill whatever is still inside a namespace. PID-based on purpose: a pattern
+# kill can match the calling shell.
+kill_namespace() {
+    local ns="$1" pids
+    pids="$(ip netns pids "$ns" 2>/dev/null || true)"
+    if [ -n "$pids" ]; then
+        kill $pids 2>/dev/null || true
+        sleep 0.2
+        pids="$(ip netns pids "$ns" 2>/dev/null || true)"
+        if [ -n "$pids" ]; then
+            kill -9 $pids 2>/dev/null || true
+        fi
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    set +e
+    for p in "${PIDS[@]}"; do
+        kill "$p" 2>/dev/null
+    done
+    sleep 0.3
+    for p in "${PIDS[@]}"; do
+        kill -9 "$p" 2>/dev/null
+    done
+    for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
+        kill_namespace "$ns"
+        ip netns del "$ns" 2>/dev/null
+    done
+    for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
+        if ip netns list 2>/dev/null | grep -q "^$ns"; then
+            echo "WARNING: $ns survived teardown; remove it with: ip netns del $ns" >&2
+        fi
+    done
+    exit "$rc"
+}
+trap cleanup EXIT
+
+# A missing log is itself diagnostic: the process died before writing one.
+dump_log() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        cat "$file" >&2
+    else
+        echo "(no log at $file)" >&2
+    fi
+}
+
+# Packet and byte counters for the interfaces a measurement arm cares about,
+# read inside the namespaces that own them. For a tun device the host's view is
+# the L3 path's: `rx` is what userspace wrote into the kernel, `tx` is what the
+# kernel routed out to userspace. The client's veth is the tunnel's wire.
+dev_snapshot() {
+    local out="$1"
+    : >"$out"
+    for ns in "$NS_CLI" "$NS_SRV"; do
+        ip netns exec "$ns" cat /proc/net/dev \
+            | awk -v ns="$ns" '/:/ { print "iface " ns " " $1, $2, $3, $10, $11 }' \
+            | sed 's/://' >>"$out"
+    done
+    # CPU the two daemons spend on the arm, in clock ticks (100/s): the
+    # difference between "this path is cheap" and "this path is a core".
+    cpu_ticks "$CLI_PID" client >>"$out"
+    cpu_ticks "$SRV_PID" server >>"$out"
+}
+
+# utime + stime of one process, in ticks. The tokio runtime's threads are all
+# in this process, so one number covers the whole data path.
+cpu_ticks() {
+    local pid="$1" who="$2"
+    if [ -r "/proc/$pid/stat" ]; then
+        awk -v who="$who" '{ print "cpu", who, $14 + $15 }' "/proc/$pid/stat"
+    fi
+}
+
+# One arm's counters, turned into carried packet sizes and the ceiling any
+# header compressor could reach (the reasoning is wire_report.py's docstring).
+wire_report() {
+    uv run "$HERE/wire_report.py" --label "$1" --before "$2" --after "$3" \
+        --client-tun "$TUN_CLI" --server-tun "$TUN_SRV" --tunnel v-cli | tee "$4"
+}
+
+# Poll a log for a readiness line instead of sleeping blind.
+wait_for() {
+    local file="$1" pattern="$2"
+    for _ in $(seq 1 100); do
+        if grep -qE "$pattern" "$file" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "TIMEOUT waiting for /$pattern/ in $file" >&2
+    tail -n 20 "$file" >&2 || true
+    return 1
+}
+
+# The server's own readiness signal: its control listener.
+wait_port() {
+    local ns="$1" port="$2"
+    for _ in $(seq 1 100); do
+        if ip netns exec "$ns" ss -tln 2>/dev/null | grep -qE ":$port[[:space:]]"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "TIMEOUT waiting for $ns to listen on :$port" >&2
+    return 1
+}
+
+require_alive() {
+    local pid="$1" name="$2" file="$3"
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "$name exited before the service was ready; its log:" >&2
+        dump_log "$file"
+        exit 1
+    fi
+}
+
+# One ESTAB row holds both literals: how the socket verdicts pin the live flow.
+# The state is part of the match because a closed connection lingers as
+# TIME-WAIT with the same local address, which would otherwise look alive.
+estab_line_has_both() {
+    awk -v first="$2" -v second="$3" \
+        '$1 ~ /^ESTAB/ && index($0, first) && index($0, second) { found = 1 }
+         END { exit(found ? 0 : 1) }' "$1"
+}
+
+topology_up() {
+    # A namespace left over from an aborted run would fail every add below.
+    topology_down
+
+    ip netns add "$NS_VIS"
+    ip netns add "$NS_SRV"
+    ip netns add "$NS_CLI"
+
+    # visitor <-> server, and server <-> client (the client dials out).
+    ip link add v-vis type veth peer name v-srv
+    ip link set v-vis netns "$NS_VIS"
+    ip link set v-srv netns "$NS_SRV"
+    ip link add v-cli type veth peer name v-srv2
+    ip link set v-srv2 netns "$NS_SRV"
+    ip link set v-cli netns "$NS_CLI"
+
+    ip -n "$NS_VIS" addr add "$VIS_IP/24" dev v-vis
+    ip -n "$NS_SRV" addr add "$SRV_VIS_IP/24" dev v-srv
+    ip -n "$NS_SRV" addr add "$SRV_CLI_IP/24" dev v-srv2
+    ip -n "$NS_CLI" addr add "$CLI_IP/24" dev v-cli
+
+    for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
+        ip -n "$ns" link set lo up
+    done
+    ip -n "$NS_VIS" link set v-vis up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv up mtu "$LINK_MTU"
+    ip -n "$NS_SRV" link set v-srv2 up mtu "$LINK_MTU"
+    ip -n "$NS_CLI" link set v-cli up mtu "$LINK_MTU"
+
+    ip -n "$NS_VIS" route add default via "$SRV_VIS_IP"
+
+    # The TUN devices exist before the daemons start: they attach to the name
+    # and refuse to create a device themselves (src/transparent/check.rs).
+    ip -n "$NS_SRV" tuntap add dev "$TUN_SRV" mode tun
+    ip -n "$NS_SRV" link set "$TUN_SRV" up mtu "$TUN_MTU"
+    ip -n "$NS_SRV" route add "$PUBLIC_IP/32" dev "$TUN_SRV"
+
+    ip -n "$NS_CLI" tuntap add dev "$TUN_CLI" mode tun
+    ip -n "$NS_CLI" link set "$TUN_CLI" up mtu "$TUN_MTU"
+    ip -n "$NS_CLI" addr add "$PUBLIC_IP/32" dev "$TUN_CLI"
+    # Source policy, not a destination route: every reply from the owned
+    # address goes back into the tunnel, whatever it is addressed to.
+    ip -n "$NS_CLI" rule add from "$PUBLIC_IP" lookup "$ROUTE_TABLE"
+    ip -n "$NS_CLI" route add default dev "$TUN_CLI" table "$ROUTE_TABLE"
+
+    # The client's control channel dials the server on the visitor link, so it
+    # needs a way out through the server. The rule above stays ahead of it
+    # (pref 32765 < main's 32766), so only the owned address is diverted.
+    ip -n "$NS_CLI" route add default via "$SRV_CLI_IP"
+
+    # Forwarding, and no reverse-path filtering: the tunnel injects packets
+    # whose source is the visitor's, which a strict rp_filter would drop.
+    for ns in "$NS_VIS" "$NS_SRV" "$NS_CLI"; do
+        ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1
+        ip netns exec "$ns" sysctl -qw net.ipv4.conf.all.rp_filter=0
+        ip netns exec "$ns" sysctl -qw net.ipv4.conf.default.rp_filter=0
+    done
+    ip netns exec "$NS_SRV" sysctl -qw "net.ipv4.conf.$TUN_SRV.rp_filter=0"
+    ip netns exec "$NS_CLI" sysctl -qw "net.ipv4.conf.$TUN_CLI.rp_filter=0"
+}
+
+write_configs() {
+    # Every claim the client will make has to be allowed on the server, so the
+    # allow-list follows the topology the run asked for.
+    if [ -n "$IDLE_CLAIM" ]; then
+        ALLOW_PORTS="\"$PUBLIC_PORT\", \"$IDLE_PORT\""
+    else
+        ALLOW_PORTS="\"$PUBLIC_PORT\""
+    fi
+    cat >"$LOG/server.toml" <<TOML
+[server]
+default_token = "bench"
+allow_ports = [$ALLOW_PORTS]
+
+[server.control]
+bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[server.transparent]
+tun = "$TUN_SRV"
+
+[server.transport.noise]
+local_private_key = "$NOISE_SERVER_PRIVATE"
+TOML
+    # The operator's valve is a server-side policy, so it goes in the server's
+    # own table — and it counts a claim's lanes, which is what a run with
+    # CLAIM_LANE_CAP below CLAIM_LANES proves.
+    if [ -n "$CLAIM_LANE_CAP" ]; then
+        printf '\n[server.data]\nmax_tunnels_per_client = %s\n' "$CLAIM_LANE_CAP" >>"$LOG/server.toml"
+    fi
+
+    cat >"$LOG/client.toml" <<TOML
+[transparent]
+default_token = "bench"
+tun = "$TUN_CLI"
+
+[transparent.control]
+default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[transparent.transport.noise]
+remote_public_key = "$NOISE_CLIENT_REMOTE_PUBLIC"
+TOML
+    # The claim's lane budget is the product's default (one connection per
+    # claim) unless the run names one. The table has to precede the claim, or
+    # the key would land in the claim's own table.
+    if [ -n "$LENDING" ]; then
+        # `off` is the only accepted value: a typo must not silently measure the
+        # default (the same rule the model's arm parser keeps).
+        [ "$LENDING" = "off" ] || {
+            echo "LENDING must be 'off' when set, got '$LENDING'" >&2
+            exit 2
+        }
+    fi
+    # One table, one write: both knobs live in `[transparent.data]`, and a
+    # second header would be a duplicate key the loader refuses.
+    if [ -n "$LENDING" ] || [ -n "$CLAIM_LANES" ]; then
+        printf '\n[transparent.data]\n' >>"$LOG/client.toml"
+        if [ -n "$LENDING" ]; then
+            printf 'lend = false\n' >>"$LOG/client.toml"
+        fi
+        if [ -n "$CLAIM_LANES" ]; then
+            printf 'tunnels = %s\n' "$CLAIM_LANES" >>"$LOG/client.toml"
+        fi
+    fi
+    cat >>"$LOG/client.toml" <<TOML
+
+[transparent.claims.web]
+remote_bind_addr = "$PUBLIC_IP:$PUBLIC_PORT"
+TOML
+    # The second claim, when the run wants one: it is a claim like any other
+    # (same lane budget, same carrier) and the point is that nothing is sent to
+    # it, so every lane it holds is idle.
+    if [ -n "$IDLE_CLAIM" ]; then
+        cat >>"$LOG/client.toml" <<TOML
+
+[transparent.claims.idle]
+remote_bind_addr = "$PUBLIC_IP:$IDLE_PORT"
+TOML
+    fi
+}
+
+# The same server without `[server.transparent]`: the negative half of the
+# policy. Serving L3 is the server operator's decision, so this server must
+# refuse the registration *by policy* — and before it looks at a device.
+write_no_l3_config() {
+    cat >"$LOG/server-no-l3.toml" <<TOML
+[server]
+default_token = "bench"
+allow_ports = ["$PUBLIC_PORT"]
+
+[server.control]
+bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
+
+[server.transport.noise]
+local_private_key = "$NOISE_SERVER_PRIVATE"
+TOML
+}
+
+echo "================= BUILD ================="
+mkdir -p "$LOG"
+if ! (cd "$ROOT" && cargo build $BUILD_ARGS) >"$LOG/cargo-build.log" 2>&1; then
+    echo "cargo build failed; refusing to run against a stale or missing binary:" >&2
+    tail -n 30 "$LOG/cargo-build.log" >&2
+    exit 1
+fi
+if [ ! -x "$BIN" ]; then
+    echo "no executable at $BIN after the build" >&2
+    exit 1
+fi
+echo "binary: $BIN ($PROFILE_BUILD)"
+sha256sum "$BIN" | tee "$LOG/binary.sha256"
+"$BIN" --version 2>&1 | tee "$LOG/binary.version" || true
+
+echo
+echo "================= CONFIG ================="
+write_configs
+echo "--- server.toml ---"
+cat "$LOG/server.toml"
+echo "--- client.toml ---"
+cat "$LOG/client.toml"
+
+echo
+echo "================= TOPOLOGY ================="
+topology_up
+echo "$NS_VIS $VIS_IP/24 -> $SRV_VIS_IP | $NS_SRV $SRV_CLI_IP/24 | $NS_CLI $CLI_IP/24 owns $PUBLIC_IP"
+
+echo
+echo "================= SERVICES ================="
+# The service, inside the client namespace, bound to the public address the
+# client owns. Its log is the transparency proof.
+ip netns exec "$NS_CLI" uv run "$HERE/echo_service.py" --bind "$PUBLIC_IP:$PUBLIC_PORT" \
+    >"$LOG/echo.log" 2>&1 &
+ECHO_PID=$!
+PIDS+=("$ECHO_PID")
+wait_for "$LOG/echo.log" "^ECHO READY" || exit 1
+echo "echo service ready (pid $ECHO_PID)"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/server.log" 2>&1 &
+SRV_PID=$!
+PIDS+=("$SRV_PID")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/server.log"
+    exit 1
+fi
+echo "server listening on :$CONTROL_PORT (pid $SRV_PID)"
+
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/client.log" 2>&1 &
+CLI_PID=$!
+PIDS+=("$CLI_PID")
+echo "client started (pid $CLI_PID)"
+
+echo
+echo "--- waiting for the transparent path (visitor -> server -> TUN -> client) ---"
+READY=0
+for _ in $(seq 1 60); do
+    require_alive "$SRV_PID" "the server" "$LOG/server.log"
+    require_alive "$CLI_PID" "the client" "$LOG/client.log"
+    if ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+        --payload probe --timeout 1 >"$LOG/visitor-probe.log" 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$READY" -ne 1 ]; then
+    echo "FAIL the service never became reachable from the visitor" >&2
+    for f in visitor-probe server client; do
+        echo "--- $f log ---" >&2
+        dump_log "$LOG/$f.log"
+    done
+    exit 1
+fi
+cat "$LOG/visitor-probe.log"
+
+echo
+echo "================= VISITOR ================="
+# The visitor holds its connection open (--hold) so the snapshots below are
+# taken while the flow is live; the verdict reads its exit code after.
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --hold "$HOLD_SECONDS" >"$LOG/visitor.log" 2>&1 &
+VISITOR_PID=$!
+wait_for "$LOG/visitor.log" "^VISITOR " || exit 1
+cat "$LOG/visitor.log"
+
+VIS_PORT="$(sed -n 's/^CONNECTED [0-9.]*://p' "$LOG/visitor.log" | head -n 1)"
+PEER_LITERAL="$VIS_IP"
+if [ -n "$VIS_PORT" ]; then
+    PEER_LITERAL="$VIS_IP:$VIS_PORT"
+fi
+
+echo
+echo "================= EVIDENCE ================="
+echo "--- echo service log (PEER is the transparency proof) ---"
+cat "$LOG/echo.log"
+echo "--- TCP sockets in the SERVER namespace (expect no :$PUBLIC_PORT) ---"
+ip netns exec "$NS_SRV" ss -tan | tee "$LOG/srv-sockets.txt"
+echo "--- TCP sockets in the CLIENT namespace (expect $PUBLIC_IP:$PUBLIC_PORT <- $VIS_IP) ---"
+ip netns exec "$NS_CLI" ss -tan | tee "$LOG/cli-sockets.txt"
+# Liveness is judged from the captured evidence, not from the visitor process:
+# a process can outlive its connection, and a closed flow lingers as TIME-WAIT
+# with the same local address, which a bare "is the PID alive" would miss.
+SNAPSHOT_LIVE=0
+if estab_line_has_both "$LOG/cli-sockets.txt" "$PUBLIC_IP:$PUBLIC_PORT" "$PEER_LITERAL"; then
+    SNAPSHOT_LIVE=1
+else
+    echo "the client snapshot has no live ESTAB connection for $PEER_LITERAL" >&2
+fi
+echo "--- conntrack in the SERVER namespace (expect no entry for the flow) ---"
+if ip netns exec "$NS_SRV" cat /proc/net/nf_conntrack >"$LOG/srv-conntrack.txt" 2>/dev/null; then
+    if [ -s "$LOG/srv-conntrack.txt" ]; then
+        cat "$LOG/srv-conntrack.txt"
+    else
+        echo "(table present and empty)"
+    fi
+else
+    echo "(no conntrack table in $NS_SRV: nothing to track with)"
+fi
+echo "--- server routing decision for the public address ---"
+ip netns exec "$NS_SRV" ip route get "$PUBLIC_IP" | tee "$LOG/srv-route.txt"
+echo "--- client routing decision for the visitor, sourced from the public address ---"
+ip netns exec "$NS_CLI" ip route get "$VIS_IP" from "$PUBLIC_IP" | tee "$LOG/cli-route.txt"
+
+VISITOR_RC=0
+wait "$VISITOR_PID" || VISITOR_RC=$?
+
+echo
+
+# Attribution, when asked for: `perf record` follows both daemons for $PROFILE
+# seconds while the arms below run.
+PERF_PID=""
+if [ -n "$PROFILE" ]; then
+    if ! command -v perf >/dev/null 2>&1; then
+        echo "PROFILE=$PROFILE was asked for, but perf is not installed" >&2
+        exit 1
+    fi
+    perf record -o "$LOG/perf.data" -F 999 -p "$SRV_PID" -p "$CLI_PID" -- sleep "$PROFILE" \
+        >"$LOG/perf-record.log" 2>&1 &
+    PERF_PID=$!
+    PIDS+=("$PERF_PID")
+    sleep 0.3
+    echo "profiling $SRV_PID and $CLI_PID for ${PROFILE}s"
+fi
+
+echo "================= BULK / MTU ================="
+# 200 KB through the tunnel: many segments. The client's TUN MTU (1400) is the
+# smallest on the path, so the MSS it advertises keeps every segment inside
+# it -- the PMTU black hole is avoided by construction, not by clamping.
+dev_snapshot "$LOG/bulk.before"
+BULK_START=$(date +%s.%N)
+BULK_RC=0
+BULK_ROUNDS=$((BULK_BYTES / BULK_CHUNK))
+[ "$BULK_ROUNDS" -ge 1 ] || BULK_ROUNDS=1
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk.log" 2>&1 || BULK_RC=$?
+BULK_END=$(date +%s.%N)
+dev_snapshot "$LOG/bulk.after"
+cat "$LOG/visitor-bulk.log"
+awk -v s="$BULK_START" -v e="$BULK_END" -v n="$BULK_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "elapsed %.3fs, %.2f Mbit/s round-trip (diagnostic, not a benchmark)\n",
+        d, 2 * n * 8 / d / 1e6
+}'
+wire_report "bulk ${BULK_BYTES}B" "$LOG/bulk.before" "$LOG/bulk.after" "$LOG/bulk.report"
+
+echo
+echo "================= SMALL PACKETS ================="
+# The workload a header compressor lives or dies by: one strict round trip at a
+# time, so both directions carry many small segments instead of a few full ones.
+# $SMALL_REQUESTS x $SMALL_BYTES is the instrument; it is recorded with the
+# numbers because it decides them (§10, "instrument parameters are part of the
+# method").
+dev_snapshot "$LOG/small.before"
+SMALL_START=$(date +%s.%N)
+SMALL_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$SMALL_REQUESTS" --size "$SMALL_BYTES" >"$LOG/visitor-small.log" 2>&1 \
+    || SMALL_RC=$?
+SMALL_END=$(date +%s.%N)
+dev_snapshot "$LOG/small.after"
+cat "$LOG/visitor-small.log"
+awk -v s="$SMALL_START" -v e="$SMALL_END" -v n="$SMALL_REQUESTS" -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d round trips of %d B in %.3fs, %.0f round trips/s (diagnostic, not a benchmark)\n",
+        n, b, d, n / d
+}'
+wire_report "small ${SMALL_REQUESTS}x${SMALL_BYTES}B" "$LOG/small.before" "$LOG/small.after" \
+    "$LOG/small.report"
+
+echo
+echo "================= MANY FLOWS ================="
+# The same round trips on $CONCURRENT_CONNS connections at once. Unlike the arm
+# above, packets queue here, so this is where batching pays and where a limit
+# that is per-core (one reader, one channel task per direction) shows up as a
+# rate that does not grow with the flow count.
+dev_snapshot "$LOG/many.before"
+MANY_START=$(date +%s.%N)
+MANY_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-many.log" 2>&1 || MANY_RC=$?
+MANY_END=$(date +%s.%N)
+dev_snapshot "$LOG/many.after"
+cat "$LOG/visitor-many.log"
+awk -v s="$MANY_START" -v e="$MANY_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    -v b="$SMALL_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips of %d B in %.3fs, %.0f round trips/s aggregate \
+(diagnostic, not a benchmark)\n", c, n, b, d, c * n / d
+}'
+wire_report "many ${CONCURRENT_CONNS}x${CONCURRENT_REQUESTS}x${SMALL_BYTES}B" \
+    "$LOG/many.before" "$LOG/many.after" "$LOG/many.report"
+
+echo
+echo "================= CONTROL: STRAIGHT AT THE SERVICE ================="
+# The same flows with the tunnel out of the path: the visitor runs inside the
+# client namespace, where the service is simply a local listener. Without this
+# control a slow probe and a slow tunnel are indistinguishable from the arm
+# above (the soak model's rule, and the reason its UDP probe ends with a
+# straight-at-the-sink step). It measures the probe and the echo service, not
+# molehill.
+CONTROL_RC=0
+CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/visitor-control.log" 2>&1 || CONTROL_RC=$?
+CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-control.log"
+awk -v s="$CONTROL_START" -v e="$CONTROL_END" -v c="$CONCURRENT_CONNS" -v n="$CONCURRENT_REQUESTS" \
+    'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%d flows x %d round trips straight at the service: %.0f round trips/s aggregate \
+(control, no tunnel, diagnostic)\n", c, n, c * n / d
+}'
+
+echo
+if [ -n "$PERF_PID" ]; then
+    wait "$PERF_PID" || true
+    perf report --stdio -i "$LOG/perf.data" --percent-limit 1 >"$LOG/perf.report" 2>&1 || true
+    echo "--- perf report (self time, by symbol) ---"
+    sed -n '/^# Overhead/,$p' "$LOG/perf.report" | head -30
+fi
+
+echo "--- control: the same $((${BULK_BYTES} / 1000)) KB straight at the service ---"
+BULK_CONTROL_RC=0
+BULK_CONTROL_START=$(date +%s.%N)
+ip netns exec "$NS_CLI" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --requests "$BULK_ROUNDS" --size "$BULK_CHUNK" >"$LOG/visitor-bulk-control.log" 2>&1 \
+    || BULK_CONTROL_RC=$?
+BULK_CONTROL_END=$(date +%s.%N)
+cat "$LOG/visitor-bulk-control.log"
+awk -v s="$BULK_CONTROL_START" -v e="$BULK_CONTROL_END" -v n="$BULK_BYTES" 'BEGIN {
+    d = e - s
+    if (d <= 0) d = 0.000001
+    printf "%.2f Mbit/s round-trip straight at the service (control, no tunnel, diagnostic)\n",
+        2 * n * 8 / d / 1e6
+}'
+
+echo
+echo
+echo "================= LENDING: AN IDLE CLAIM GIVES A LANE UP ================="
+# The lane allocator's whole point, and the one thing only an end-to-end run can
+# show: a claim carrying more flows than it has lanes takes an idle lane from a
+# claim that has one to spare. Two claims — `web`, carrying the 16-flow arm, and
+# `idle`, carrying nothing — share a lane budget of four, so each starts with two
+# and the busy one is short of fourteen. The allocator lends what the idle claim
+# can spare (it keeps one lane: a claim is always reachable), the busy claim
+# grows, and the workload must stay byte-exact through the change: a lane moves,
+# a flow never does.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=1
+CLAIM_LANES=4
+LENDING=""
+write_configs
+echo "--- server.toml (lending) ---"
+cat "$LOG/server.toml"
+echo "--- client.toml (lending) ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/lend-server.log" 2>&1 &
+LEND_SRV=$!
+PIDS+=("$LEND_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the lending server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/lend-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/lend-client.log" 2>&1 &
+LEND_CLI=$!
+PIDS+=("$LEND_CLI")
+
+# The busy claim's flow count is what makes it short of lanes, so the load runs
+# in the background while the allocator looks, and the change happens under it.
+LEND_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/lend-visitor.log" 2>&1 &
+LEND_VISITOR=$!
+LEND_LENT=0
+if wait_for "$LOG/lend-client.log" "lent lane"; then
+    LEND_LENT=1
+fi
+wait "$LEND_VISITOR" || LEND_RC=$?
+cat "$LOG/lend-visitor.log"
+echo "--- lending client log (the allocator's lines) ---"
+grep "Lane allocator" "$LOG/lend-client.log" || true
+
+echo
+echo "================= LENDING OFF: THE SPLIT STAYS STATIC ================="
+# The mechanism's control, and the only end-to-end proof of the key itself: the
+# same two claims and the same load as the section above, with
+# `[transparent.data].lend = false`. The busy claim must keep the two lanes its
+# share gave it — no lane is lent, however short of lanes it is — and the
+# workload must still be byte-exact, because "off" is the static shape the
+# configuration asked for, not a degradation.
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=1
+CLAIM_LANES=4
+LENDING=off
+write_configs
+echo "--- client.toml (lending off) ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/nolend-server.log" 2>&1 &
+NOLEND_SRV=$!
+PIDS+=("$NOLEND_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the lending-off server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/nolend-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/nolend-client.log" 2>&1 &
+NOLEND_CLI=$!
+PIDS+=("$NOLEND_CLI")
+
+NOLEND_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    --connections "$CONCURRENT_CONNS" --requests "$CONCURRENT_REQUESTS" --size "$SMALL_BYTES" \
+    >"$LOG/nolend-visitor.log" 2>&1 &
+NOLEND_VISITOR=$!
+# Long enough that the allocator's tick has run many times over the load: the
+# absence below is a measured absence, not a race with the first tick.
+wait "$NOLEND_VISITOR" || NOLEND_RC=$?
+sleep 2
+cat "$LOG/nolend-visitor.log"
+echo "--- lending-off client log (the allocator's lines, expected: none) ---"
+grep "Lane allocator" "$LOG/nolend-client.log" || echo "(none)"
+
+echo
+echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
+# `[server.data].max_tunnels_per_client` is the server operator's cap on the
+# carrier connections ONE client may hold — and a claim's lane is one of them,
+# which is the half that used to be unbounded. With a cap of 1 against a claim
+# that asks for 2, the surplus lane must be refused with a line naming the cap,
+# and the claim must keep serving byte-exactly on the lane it got. The lane
+# budget is a client-side key and the cap is a server-side one, so this is the
+# only run where the two halves are proven to meet.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
+sleep 0.5
+IDLE_CLAIM=""
+CLAIM_LANES=2
+CLAIM_LANE_CAP=1
+LENDING=""
+
+write_configs
+echo "--- server-valve.toml ---"
+cat "$LOG/server.toml"
+echo "--- client-valve.toml ---"
+cat "$LOG/client.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server.toml" >"$LOG/valve-server.log" 2>&1 &
+VALVE_SRV=$!
+PIDS+=("$VALVE_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the valve server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/valve-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/valve-client.log" 2>&1 &
+VALVE_CLI=$!
+PIDS+=("$VALVE_CLI")
+
+VALVE_REFUSED=0
+# Wait for the refusal itself rather than for a fixed delay; the lane budget is
+# established at service start, so the line is the client's second lane meeting
+# the cap.
+if wait_for "$LOG/valve-server.log" "Refused a transparent lane"; then
+    VALVE_REFUSED=1
+fi
+echo "--- valve server log ---"
+cat "$LOG/valve-server.log"
+
+# The claim must still serve: the lane it kept is a working data path, and the
+# workload is the same strict round-trip suite the main run uses.
+VALVE_RC=0
+ip netns exec "$NS_VIS" uv run "$HERE/visitor.py" --target "$PUBLIC_IP:$PUBLIC_PORT" \
+    >"$LOG/valve-visitor.log" 2>&1 || VALVE_RC=$?
+cat "$LOG/valve-visitor.log"
+
+echo
+echo "================= NEGATIVE: NO SERVER SWITCH ================="
+# The switch is the *server's*: a server whose config has no
+# `[server.transparent]` must refuse a transparent registration by policy, and
+# must do so before it looks at a device. The order is proven, not asserted:
+# the device is DELETED from the server namespace first, so an implementation
+# that checked the interface first would answer with the "does not exist"
+# recipe instead of the policy refusal.
+kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
+kill "$VALVE_SRV" "$VALVE_CLI" 2>/dev/null || true
+kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
+kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true
+sleep 0.5
+ip netns exec "$NS_SRV" ip link del "$TUN_SRV"
+write_no_l3_config
+echo "--- server-no-l3.toml ---"
+cat "$LOG/server-no-l3.toml"
+
+ip netns exec "$NS_SRV" "$BIN" --server "$LOG/server-no-l3.toml" >"$LOG/no-l3-server.log" 2>&1 &
+NO_L3_SRV=$!
+PIDS+=("$NO_L3_SRV")
+if ! wait_port "$NS_SRV" "$CONTROL_PORT"; then
+    echo "the no-L3 server never listened on :$CONTROL_PORT" >&2
+    dump_log "$LOG/no-l3-server.log"
+    exit 1
+fi
+ip netns exec "$NS_CLI" "$BIN" --transparent "$LOG/client.toml" >"$LOG/no-l3-client.log" 2>&1 &
+NO_L3_CLI=$!
+PIDS+=("$NO_L3_CLI")
+
+# Wait for the refusal itself rather than for a fixed delay.
+if ! wait_for "$LOG/no-l3-server.log" "does not serve transparent"; then
+    echo "the no-L3 server never logged a refusal" >&2
+    dump_log "$LOG/no-l3-server.log"
+fi
+echo "--- no-L3 server log ---"
+cat "$LOG/no-l3-server.log"
+echo "--- no-L3 client log ---"
+cat "$LOG/no-l3-client.log" 2>/dev/null || true
+
+echo
+echo "================= VERDICT ================="
+FAILURES=0
+pass() {
+    echo "PASS $1"
+}
+fail() {
+    echo "FAIL $1"
+    FAILURES=$((FAILURES + 1))
+}
+
+if [ "$VISITOR_RC" -eq 0 ]; then
+    pass "echo round-trip"
+else
+    fail "echo round-trip (visitor exit $VISITOR_RC)"
+fi
+
+if grep -qF "PEER $VIS_IP:" "$LOG/echo.log" \
+    && { [ -z "$VIS_PORT" ] || grep -qF "PEER $PEER_LITERAL" "$LOG/echo.log"; }; then
+    pass "backend saw the visitor's real address"
+else
+    fail "backend saw the visitor's real address (expected PEER $PEER_LITERAL in the echo log)"
+fi
+
+if [ "$SNAPSHOT_LIVE" -ne 1 ]; then
+    fail "server holds no connection state for the visitor flow (no live ESTAB row for $PEER_LITERAL)"
+elif grep -qF ":$PUBLIC_PORT" "$LOG/srv-sockets.txt"; then
+    fail "server holds no connection state for the visitor flow (a socket on $PUBLIC_PORT is in $NS_SRV)"
+elif grep -qE "dst=$PUBLIC_IP|dport=$PUBLIC_PORT" "$LOG/srv-conntrack.txt"; then
+    fail "server holds no connection state for the visitor flow (conntrack has an entry)"
+else
+    pass "server holds no connection state for the visitor flow"
+fi
+
+if [ "$SNAPSHOT_LIVE" -ne 1 ]; then
+    fail "the client namespace owns the accepted connection (no live ESTAB row for $PEER_LITERAL)"
+elif ! estab_line_has_both "$LOG/cli-sockets.txt" "$PUBLIC_IP:$PUBLIC_PORT" "$VIS_IP"; then
+    fail "the client namespace owns the accepted connection (no $PUBLIC_IP:$PUBLIC_PORT <- $VIS_IP row)"
+else
+    pass "the client namespace owns the accepted connection"
+fi
+
+if [ "$BULK_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-bulk.log"; then
+    pass "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
+else
+    fail "$((BULK_BYTES / 1000)) KB streamed in $((BULK_CHUNK / 1000)) KB chunks (no MTU black hole)"
+fi
+
+if [ "$SMALL_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-small.log"; then
+    pass "$SMALL_REQUESTS small round trips stay byte-exact"
+else
+    fail "$SMALL_REQUESTS small round trips stay byte-exact (exit $SMALL_RC)"
+fi
+
+if [ "$CONTROL_RC" -ne 0 ] || [ "$BULK_CONTROL_RC" -ne 0 ]; then
+    fail "a control arm passed no tunnel and still failed (exit $CONTROL_RC/$BULK_CONTROL_RC)"
+else
+    pass "control arms: the same workloads straight at the service, no tunnel"
+fi
+
+if [ "$MANY_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/visitor-many.log"; then
+    pass "$CONCURRENT_CONNS concurrent flows stay byte-exact"
+else
+    fail "$CONCURRENT_CONNS concurrent flows stay byte-exact (exit $MANY_RC)"
+fi
+
+if grep -qF "does not serve transparent (L3) services" "$LOG/no-l3-server.log"; then
+    pass "a server without [server.transparent] refuses L3 by policy"
+else
+    fail "a server without [server.transparent] refuses L3 by policy"
+fi
+
+# The device is gone in that run, so a missing-interface recipe in the log would
+# mean the policy check ran second — the exact ordering this milestone exists
+# for.
+if grep -qF "does not exist" "$LOG/no-l3-server.log"; then
+    fail "the policy refusal comes before the device is looked at (the log carries the missing-interface recipe)"
+else
+    pass "the policy refusal comes before the device is looked at"
+fi
+
+if [ "$LEND_LENT" -eq 1 ]; then
+    pass "an idle claim lends a lane to the claim carrying more flows than lanes"
+else
+    fail "the allocator never lent a lane between the two claims"
+fi
+
+if [ "$LEND_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/lend-visitor.log"; then
+    pass "the busy claim stays byte-exact through the lane change"
+else
+    fail "the busy claim lost traffic while a lane was lent (exit $LEND_RC)"
+fi
+
+if [ "$NOLEND_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/nolend-visitor.log" &&
+    ! grep -q "Lane allocator" "$LOG/nolend-client.log"; then
+    pass "with [transparent.data].lend = false no lane moves, and the claim serves byte-exactly"
+else
+    fail "lending-off either moved a lane or lost the workload (exit $NOLEND_RC)"
+fi
+
+if [ "$VALVE_REFUSED" -eq 1 ]; then
+    pass "the operator's valve refuses a claim's surplus lane, naming the cap"
+else
+    fail "the operator's valve never refused the lane over the cap"
+fi
+
+if [ "$VALVE_RC" -eq 0 ] && grep -q "^VISITOR OK" "$LOG/valve-visitor.log"; then
+    pass "the claim serves byte-exactly on the lanes it got"
+else
+    fail "the claim stopped serving once a lane was refused (exit $VALVE_RC)"
+fi
+
+exit "$FAILURES"

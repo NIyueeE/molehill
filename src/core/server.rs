@@ -6,6 +6,9 @@ use crate::config::ConfigChange;
 use crate::config::{Config, ServerConfig, ServiceType};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
+// Read only where multiplexed tunnels exist (the mux stream path).
+#[cfg(feature = "multiplex")]
+use crate::protocol::read_tunnel_prologue;
 use crate::protocol::{
     self, Ack, CURRENT_PROTO_VERSION, Carrier, ControlChannelCmd, DataChannelCmd,
     HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, ServiceId,
@@ -86,11 +89,11 @@ const CHAN_SIZE: usize = 2048; // The capacity of various chans
 /// How long the visitor-pairing loop waits for a data channel before asking
 /// for another one.
 ///
-/// It has to be comfortably above a *legitimate* slow open — a cold pool dials
-/// a tunnel, and the client's own cold-growth budget is 15 s — so that ordinary
-/// work is never re-requested. Its job is not to time a healthy open out; it is
-/// to stop one unanswerable request from parking the accept loop, which stalls
-/// the whole service (see `pair_visitor`).
+/// It has to be comfortably above a *legitimate* slow open — opening a channel
+/// on an empty pool dials a tunnel, and the client's own wait budget for that
+/// is 15 s — so that ordinary work is never re-requested. Its job is not to
+/// time a healthy open out; it is to stop one unanswerable request from parking
+/// the accept loop, which stalls the whole service (see `pair_visitor`).
 const PAIR_WAIT_BUDGET: Duration = Duration::from_secs(5);
 
 /// How many `PAIR_WAIT_BUDGET` waits one visitor gets before it is shed.
@@ -113,6 +116,13 @@ struct RegisteredService {
     bind_addr: SocketAddr,
     /// Receive buffer size for UDP datagrams; ignored for TCP services.
     udp_buffer_size: usize,
+    /// The TUN device a transparent service's data path attaches to
+    /// (`[server.transparent].tun`); `None` for every other service type.
+    #[cfg_attr(
+        not(all(feature = "transparent", target_os = "linux")),
+        expect(dead_code, reason = "read only by the transparent data path")
+    )]
+    transparent_tun: Option<String>,
 }
 
 // The entrypoint of running a server
@@ -212,6 +222,119 @@ struct TunnelGuard(TunnelCount);
 impl Drop for TunnelGuard {
     fn drop(&mut self) {
         self.0.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The session counter a transparent service charges its lanes to, when this
+/// build has one.
+///
+/// `[server.data].max_tunnels_per_client` was checked on the tunnel hello, so it
+/// counted multiplexed tunnels and nothing else — and a transparent claim's lane
+/// is a plain data channel of its own, which made a claim's carrier connections
+/// the one kind of establishment no server-side policy bounded. The counter is
+/// the same one the tunnel valve uses. A build without the `multiplex` feature
+/// has no session counter at all (and there every data channel is a connection
+/// of its own), so its lanes are bounded by nothing — [`LaneValve::reserve`]
+/// says so rather than pretending.
+#[cfg(feature = "multiplex")]
+type LaneCounter = Option<TunnelCount>;
+#[cfg(not(feature = "multiplex"))]
+type LaneCounter = ();
+
+/// What a transparent service charges its lanes to: the session's counter and
+/// the operator's cap.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[derive(Clone, Default)]
+struct LaneValve {
+    counter: LaneCounter,
+    /// `[server.data].max_tunnels_per_client`; `0` is unlimited.
+    cap: usize,
+}
+
+/// A build without the transparent data path has no lane to charge. The type
+/// stays, so the plumbing that carries it reads the same everywhere, and it is
+/// zero-sized.
+#[cfg(not(all(feature = "transparent", target_os = "linux")))]
+#[derive(Clone, Default)]
+struct LaneValve;
+
+impl LaneValve {
+    /// The valve one session's services charge their lanes to.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    fn new(counter: LaneCounter, cap: usize) -> Self {
+        Self { counter, cap }
+    }
+
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    fn new(_counter: LaneCounter, _cap: usize) -> Self {
+        Self
+    }
+
+    /// Reserve one of a client's carrier connections for a lane.
+    ///
+    /// `Err(held)` is the number of connections the client already holds, for
+    /// the refusal line — the same contract as the tunnel valve's.
+    #[cfg(all(feature = "transparent", target_os = "linux", feature = "multiplex"))]
+    fn reserve(&self) -> std::result::Result<Option<TunnelGuard>, usize> {
+        match &self.counter {
+            Some(count) => count.try_reserve(self.cap).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// A build without the `multiplex` feature has no session counter, so it has
+    /// no lane valve either: every channel is a connection of its own there, and
+    /// nothing counts them.
+    #[cfg(all(
+        feature = "transparent",
+        target_os = "linux",
+        not(feature = "multiplex")
+    ))]
+    fn reserve(&self) -> std::result::Result<Option<()>, usize> {
+        Ok(None)
+    }
+}
+
+/// What a transparent service carries in from its registration: the address
+/// claim it holds for its lifetime, and the valve its lanes are charged to.
+///
+/// One value rather than two parameters because the two travel together and
+/// only the transparent data path reads them — without that path there is no
+/// lane to charge, and the type is just the claim.
+struct TransparentContext {
+    /// Held for the service's lifetime: the address stays claimed until this
+    /// task ends. Read only by the transparent data path.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    claim: Option<Claim>,
+    /// The session's lane valve.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    lane_valve: LaneValve,
+    /// Where the claim's per-lane counters are reported to its client.
+    ///
+    /// The deciding end is the client, and the loss that matters on a
+    /// transparent claim happens here (this end reads the visitor's traffic off
+    /// its own device and offers it to the lanes), so the client cannot see it
+    /// without being told.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    sink: ControlSink,
+}
+
+impl TransparentContext {
+    /// What a registration hands the service it just accepted.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    fn new(claim: Option<Claim>, lane_valve: LaneValve, sink: ControlSink) -> Self {
+        Self {
+            claim,
+            lane_valve,
+            sink,
+        }
+    }
+
+    /// A build without the transparent data path has no lane to charge and no
+    /// claim to hold, so there is nothing to carry.
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    fn new(_claim: Option<Claim>, _lane_valve: LaneValve, _sink: ControlSink) -> Self {
+        Self {}
     }
 }
 
@@ -397,9 +520,16 @@ struct ServerShared {
 /// Shared state for the lazily-bound KCP listener: bound on the first
 /// registration that declares the `kcp` carrier (client-first), once per
 /// server process.
+///
+/// The acceptor is held **weakly** here, and the listener task holds the only
+/// strong reference: the UDP socket must close when the server stops, and a KCP
+/// *session* outlives the accept loop (it keeps this shared state to reach the
+/// registry and the valve). A strong reference here would therefore keep the
+/// data port bound for as long as any session drained — which, in-process, is
+/// how a restarted server ends up refused with "address already in use".
 #[cfg(feature = "kcp")]
 struct KcpListenerState {
-    acceptor: tokio::sync::Mutex<Option<Arc<KcpAcceptor>>>,
+    acceptor: tokio::sync::Mutex<Option<std::sync::Weak<KcpAcceptor>>>,
 }
 
 #[cfg(feature = "kcp")]
@@ -423,7 +553,7 @@ async fn ensure_kcp_listener(
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
     let mut guard = shared.kcp.acceptor.lock().await;
-    if guard.is_some() {
+    if guard.as_ref().is_some_and(|weak| weak.strong_count() > 0) {
         return Ok(());
     }
     let acceptor = KcpAcceptor::bind(server_config.data_bind_addr())
@@ -437,14 +567,14 @@ async fn ensure_kcp_listener(
     })?;
     info!("Listening for KCP tunnels at {bound}");
     let acceptor = Arc::new(acceptor);
-    tokio::spawn(run_kcp_tunnel_listener(
-        Arc::clone(&acceptor),
+    *guard = Some(Arc::downgrade(&acceptor));
+    tokio::spawn(run_kcp_listener(
+        acceptor,
         Arc::clone(&registry),
         Arc::clone(&shared),
         shared.shutdown_tx.subscribe(),
         server_config.max_tunnels_per_client(),
     ));
-    *guard = Some(acceptor);
     Ok(())
 }
 
@@ -689,10 +819,11 @@ async fn handle_connection(
             do_session_handshake(conn, registry, server_config, shared).await?;
         }
         DataChannelHello(_, nonce) => {
-            // A direct data channel names its service in the 4 bytes right
-            // after the hello.
+            // A direct data channel names its service right after the hello;
+            // a transparent lane names itself beside it (see
+            // `read_channel_prologue`).
             let service_id = read_stream_prologue(&mut conn).await?;
-            do_v4_data_channel(conn, registry, nonce, service_id).await?;
+            do_v4_data_channel(tcp_data_channel(conn), registry, nonce, service_id).await?;
         }
         #[cfg(feature = "multiplex")]
         Hello::DataChannelTunnelHello(_, nonce) => {
@@ -721,6 +852,9 @@ async fn handle_connection(
 struct Registered {
     service: RegisteredService,
     bound: BoundEndpoint,
+    /// A transparent service's claim on its public endpoint, held for the
+    /// service's lifetime so a second client cannot claim the same `ip:port`.
+    claim: Option<Claim>,
 }
 
 /// The outcome of one registration attempt.
@@ -731,6 +865,27 @@ enum Registration {
     /// `Ack::RegisterRejected`; a v3 connection ends after it, while a v4
     /// session rejects only that service and stays up.
     Rejected(String),
+}
+
+/// The TUN device this server routes transparent services into, or the policy
+/// refusal to answer a registration with.
+///
+/// `[server.transparent]` **is** the switch. Serving L3 is what asks this
+/// process for `CAP_NET_ADMIN` and a device, so it is the operator's decision,
+/// taken statically in the server's own configuration — never a remote
+/// client's, whose registration arrives at runtime and could otherwise be what
+/// makes this host reach for `/dev/net/tun`. A server without the table
+/// therefore refuses by policy, before any device is looked at.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
+    match server_config.transparent.as_ref() {
+        Some(transparent) => Ok(&transparent.tun),
+        None => Err(
+            "This server does not serve transparent (L3) services: `[server.transparent]` is \
+             not configured"
+                .to_string(),
+        ),
+    }
 }
 
 /// Validate one service registration against the server's policy and bind its
@@ -792,11 +947,70 @@ async fn register_service(
         }
     }
 
+    // A transparent service claims a public address this host never binds, so
+    // four things have to hold before it is accepted: this server serves L3 at
+    // all (the operator's own `[server.transparent]`, checked first so that a
+    // client's registration is never what makes this process reach for a
+    // device), the build and platform can carry it, the routing contract is
+    // satisfiable (the operator's TUN device exists), and no other service
+    // already owns that address.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    let (claim, transparent_tun) = {
+        if reg.service_type == ServiceType::Transparent {
+            let tun = match transparent_tun_for(server_config) {
+                Ok(tun) => tun,
+                Err(reason) => {
+                    warn!(service = %reg.name, "{reason}");
+                    return Ok(Registration::Rejected(reason));
+                }
+            };
+            if let Err(e) = crate::transparent::check::require_interface(tun) {
+                let reason = format!("{e:#}");
+                warn!(service = %reg.name, "Registration failed: {reason}");
+                return Ok(Registration::Rejected(reason));
+            }
+            // The kernel must forward the claimed addresses into the device;
+            // off, every claim's packets die in the kernel and the operator
+            // sees silence. Checked here (the first transparent registration)
+            // rather than at startup: serving L3 is this table's switch, and
+            // a server that never serves it never needs the sysctl.
+            if let Err(e) = crate::transparent::check::check_server() {
+                let reason = format!("{e:#}");
+                warn!(service = %reg.name, "Registration failed: {reason}");
+                return Ok(Registration::Rejected(reason));
+            }
+            let Some(held) = Claim::acquire(reg.bind_addr) else {
+                let reason = format!(
+                    "Address {} is already claimed by another transparent service on this server",
+                    reg.bind_addr
+                );
+                warn!(service = %reg.name, "{reason}");
+                return Ok(Registration::Rejected(reason));
+            };
+            (Some(held), Some(tun.to_string()))
+        } else {
+            (None, None)
+        }
+    };
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    let (claim, transparent_tun): (Option<Claim>, Option<String>) = {
+        if reg.service_type == ServiceType::Transparent {
+            let reason = "This server cannot serve `protocol = \"transparent\"`: it carries \
+                          whole IP packets through a TUN device, which needs a Linux build with \
+                          the `transparent` feature. This build does not have it."
+                .to_string();
+            warn!(service = %reg.name, "{reason}");
+            return Ok(Registration::Rejected(reason));
+        }
+        (None, None)
+    };
+
     let service = RegisteredService {
         name: reg.name.clone(),
         service_type: reg.service_type,
         bind_addr: reg.bind_addr,
         udp_buffer_size: reg.udp_buffer_size as usize,
+        transparent_tun,
     };
 
     // Bind the public endpoint eagerly so that conflicts are reported
@@ -805,6 +1019,7 @@ async fn register_service(
         Ok(bound) => Ok(Registration::Accepted(Box::new(Registered {
             service,
             bound,
+            claim,
         }))),
         Err(e) => {
             let reason = format!("{e:#}");
@@ -913,15 +1128,11 @@ async fn do_session_handshake(
 
     let reason = loop {
         tokio::select! {
-            cmd = read_session_cmd(&mut rd) => match cmd {
-                Ok(SessionCmd::Register(reg)) => {
-                    if let Err(e) = ctx.register(&reg).await {
-                        break e;
-                    }
+            cmd = read_session_cmd(&mut rd) => {
+                if let Some(reason) = handle_session_cmd(&ctx, &heartbeat_tx, cmd).await? {
+                    break reason;
                 }
-                Ok(SessionCmd::Deregister(service_id)) => ctx.deregister(service_id).await,
-                Err(e) => break e,
-            },
+            }
             () = time::sleep(Duration::from_secs(heartbeat_interval)), if heartbeat_interval != 0 => {
                 if heartbeat_tx.send(heartbeat.clone()).is_err() {
                     break anyhow!("The session writer is gone");
@@ -955,6 +1166,68 @@ async fn do_session_handshake(
     Ok(())
 }
 
+/// Serve one command from a session's client; `Some(reason)` ends the session.
+///
+/// Split out of the session loop so the loop is the wiring and this is the
+/// policy: what each command does, and which failure is the session's end.
+async fn handle_session_cmd(
+    ctx: &SessionCtx,
+    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    cmd: Result<SessionCmd>,
+) -> Result<Option<anyhow::Error>> {
+    match cmd {
+        Ok(SessionCmd::Register(reg)) => {
+            if let Err(e) = ctx.register(&reg).await {
+                return Ok(Some(e));
+            }
+        }
+        Ok(SessionCmd::Deregister(service_id)) => ctx.deregister(service_id).await,
+        // A claim's lane is being retired, and its dialer needs this end's half
+        // of the agreement: the client cannot see the flows *this* end placed on
+        // the lane, and ending it on the client's word alone is how a peer kept
+        // writing into a connection nothing read (HANDOFF.md, the retired-lane
+        // black hole).
+        Ok(SessionCmd::DrainLane(id, lane)) => {
+            if !answer_lane_drain(ctx, writer, id, lane, true).await? {
+                return Ok(Some(anyhow!("The session writer is gone")));
+            }
+        }
+        Ok(SessionCmd::CancelDrain(id, lane)) => {
+            if !answer_lane_drain(ctx, writer, id, lane, false).await? {
+                return Ok(Some(anyhow!("The session writer is gone")));
+            }
+        }
+        Err(e) => return Ok(Some(e)),
+    }
+    Ok(None)
+}
+
+/// Answer one lane-drain command, and say whether the session writer took it.
+///
+/// The answer is this end's half of a two-sided retirement, and it is the only
+/// thing the client's dialer can learn about the flows *this* end placed on the
+/// lane.
+async fn answer_lane_drain(
+    ctx: &SessionCtx,
+    writer: &mpsc::UnboundedSender<Vec<u8>>,
+    service_id: ServiceId,
+    lane: [u8; 4],
+    drain: bool,
+) -> Result<bool> {
+    let ack = ctx.lane_drain(service_id, lane, drain).await;
+    let sent = writer.send(postcard::to_stdvec(&ack)?).is_ok();
+    if sent {
+        // A lane's retirement is a lifecycle event, not one connection's
+        // business: the operator sees the same fact the client does (once per
+        // drain, and a drain is rate-limited by the policy that asks for it).
+        info!(
+            "Lane {lane:?} of service {service_id}: drain {} answered {ack:?}",
+            if drain { "requested" } else { "cancelled" }
+        );
+    }
+    Ok(sent)
+}
+
 /// One v4 session's registration path: the session it belongs to, plus the
 /// server-side policy every registration is checked against.
 struct SessionCtx {
@@ -978,6 +1251,85 @@ impl SessionCtx {
             .get(&self.nonce)
             .map(|session| session.write_tx.clone())
             .ok_or_else(|| anyhow!("The control session is gone"))
+    }
+
+    /// Start or call off the drain of one of a claim's lanes, and build the
+    /// answer the client reads.
+    ///
+    /// This end's half of a two-sided retirement: it stops placing **new**
+    /// flows in the lane, and says whether it still holds any of its own. The
+    /// flows a drain has to wait for are the ones *this* end placed — the
+    /// dialer cannot see them, which is why the agreement exists at all.
+    ///
+    /// A lane this end does not hold (already ended, or never its business)
+    /// answers `LANE_DRAIN_UNKNOWN` rather than pretending to have drained
+    /// something: the client then keeps the lane instead of retiring a
+    /// connection on an answer about nothing.
+    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    async fn lane_drain(
+        &self,
+        service_id: ServiceId,
+        lane: [u8; 4],
+        drain: bool,
+    ) -> ControlChannelCmd {
+        use crate::protocol::{
+            LANE_DRAIN_CANCELLED, LANE_DRAIN_PENDING, LANE_DRAIN_READY, LANE_DRAIN_UNKNOWN, LaneId,
+        };
+        use crate::transparent::hub::TunHub;
+        use crate::transparent::{Direction, Endpoint};
+
+        let ack = |state| ControlChannelCmd::LaneDrainAck(service_id, lane, state);
+        let Some(handle) = self
+            .registry
+            .sessions
+            .read()
+            .await
+            .get(&self.nonce)
+            .and_then(|session| session.services.get(&service_id))
+            .cloned()
+        else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        // The transparent device is a server-wide setting: the service's data
+        // path is a hub keyed by that device and the endpoint it claimed.
+        let Ok(tun) = transparent_tun_for(&self.server_config) else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        let Ok(hub) = TunHub::get_or_spawn(tun, Direction::Destination) else {
+            return ack(LANE_DRAIN_UNKNOWN);
+        };
+        let endpoint = Endpoint::new(handle.endpoint.ip(), handle.endpoint.port());
+        let lane = LaneId(lane);
+        if !drain {
+            return match hub.cancel_drain(&endpoint, lane) {
+                Some(()) => ack(LANE_DRAIN_CANCELLED),
+                None => ack(LANE_DRAIN_UNKNOWN),
+            };
+        }
+        match hub.begin_drain(&endpoint, lane) {
+            Some(true) => ack(LANE_DRAIN_READY),
+            Some(false) => ack(LANE_DRAIN_PENDING),
+            None => ack(LANE_DRAIN_UNKNOWN),
+        }
+    }
+
+    /// A build without the transparent data path has no lane to drain; the
+    /// answer is the same one an unknown lane gets, so the client's handling is
+    /// one shape.
+    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "the two shapes of this method are one call site: the build that has lanes \
+                  reaches the hub, and the one that does not answers from here"
+    )]
+    async fn lane_drain(
+        &self,
+        service_id: ServiceId,
+        lane: [u8; 4],
+        _drain: bool,
+    ) -> ControlChannelCmd {
+        ControlChannelCmd::LaneDrainAck(service_id, lane, crate::protocol::LANE_DRAIN_UNKNOWN)
     }
 
     /// Frame an ack for the session's writer exactly as a connection write
@@ -1028,12 +1380,30 @@ impl SessionCtx {
                 }
                 Registration::Accepted(registered) => registered,
             };
-        let Registered { service, bound } = *registered;
+        let Registered {
+            service,
+            bound,
+            claim,
+        } = *registered;
 
         // The verdict precedes any command for this service: everything the
         // per-service task queues goes through the same writer, so answering
         // first keeps `Ok` ahead of the first `CreateDataChannelFor`.
         self.send_ack(&Ack::Ok).await?;
+
+        // A claim's lanes are charged to the session's valve as they arrive
+        // (see `LaneValve`). The counter is cloned here, so the transparent
+        // supervisor never has to reach back into the registry on the lane path.
+        #[cfg(feature = "multiplex")]
+        let lane_counter = {
+            let sessions = self.registry.sessions.read().await;
+            sessions
+                .get(&self.nonce)
+                .map(|session| session.tunnels.clone())
+        };
+        #[cfg(not(feature = "multiplex"))]
+        let lane_counter = ();
+        let lane_valve = LaneValve::new(lane_counter, self.server_config.max_tunnels_per_client());
 
         let handle = ControlChannelHandle::new(
             ControlSink::Session {
@@ -1042,15 +1412,17 @@ impl SessionCtx {
             },
             &service,
             bound,
+            claim,
             // The session owns the cadence (`Ack::SessionOk` declared it), so
             // this service's own heartbeat is off: the per-service task only
             // turns its pool's requests into tagged commands.
             0,
-            // v4 registrations carry no `pool_size`: the tunnel pool is a
-            // client-side, per-carrier concern and grows on demand — one
-            // request per visitor, or one per stripe for a striped gather
-            // (see `pair_striped_group`).
-            0,
+            // The valve a transparent service charges its lanes to. A v4
+            // registration carries no `pool_size`: the tunnel pool is a
+            // client-side, per-carrier concern sized by the client's own
+            // configuration — one request per visitor, or one per stripe for a
+            // striped gather (see `pair_striped_group`).
+            lane_valve,
             stripe_count(&self.server_config),
         );
 
@@ -1091,14 +1463,21 @@ impl SessionCtx {
 
 /// One end of a forwarded connection, as handed to the connection pool.
 ///
-/// With the `multiplex` feature a data channel is either a plain transport
-/// stream (no-mux mode) or one yamux stream of the client's tunnel.
+/// With the `multiplex` feature a data channel is a plain transport stream
+/// (no-mux mode), one yamux stream of the client's tunnel, or — with the `kcp`
+/// carrier — a KCP session that *is* the channel.
 #[cfg(not(feature = "multiplex"))]
 type DataChannel = ServerStream;
 
 #[cfg(feature = "multiplex")]
 enum DataChannel {
     Raw(ServerStream),
+    /// A direct channel over KCP: no yamux above it, the session's own byte
+    /// stream is the channel. With the data plane's shape derived from the
+    /// service type, this is a transparent claim's lane: a KCP carrier with no
+    /// multiplexer over it.
+    #[cfg(feature = "kcp")]
+    RawKcp(crate::transport::kcp::KcpTunnelStream),
     Mux(crate::transport::MuxStream),
 }
 
@@ -1122,6 +1501,8 @@ impl tokio::io::AsyncRead for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -1136,6 +1517,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -1145,6 +1528,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
@@ -1154,6 +1539,8 @@ impl tokio::io::AsyncWrite for DataChannel {
     ) -> std::task::Poll<std::io::Result<()>> {
         match &mut *self {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "kcp")]
+            DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -1164,8 +1551,13 @@ impl tokio::io::AsyncWrite for DataChannel {
 /// A channel for a service that is not registered (a stale one, or an id the
 /// client never registered) is dropped here; the session — and every other
 /// service on it — is untouched.
+///
+/// The carrier decides how the channel was dialed (TCP, or a KCP session when
+/// the client declared that carrier for a direct service), not what happens
+/// here: once the prologue is read, every direct channel is one byte stream
+/// handed to the service's pool.
 async fn do_v4_data_channel(
-    conn: ServerStream,
+    conn: DataChannel,
     registry: Arc<Registry>,
     nonce: Nonce,
     service_id: ServiceId,
@@ -1177,13 +1569,19 @@ async fn do_v4_data_channel(
         return Ok(());
     };
 
-    conn.hint(SocketOpts::for_service(None));
     handle
         .data_channel
-        .send(new_data_channel(conn))
+        .send(conn)
         .await
-        .with_context(|| "Data channel for a stale control session")?;
+        .map_err(|_| anyhow!("Data channel for a stale control session"))?;
     Ok(())
+}
+
+/// A direct data channel accepted on the TCP data listener: apply the
+/// per-connection TCP options first — there is a socket to apply them to.
+fn tcp_data_channel(conn: ServerStream) -> DataChannel {
+    conn.hint(SocketOpts::for_service(None));
+    new_data_channel(conn)
 }
 
 /// A v4 multiplex tunnel: it belongs to the session, not to a service, and
@@ -1234,6 +1632,9 @@ async fn do_v4_tunnel(
             nonce,
         },
         Some(slot),
+        // A TCP tunnel has no userspace ARQ to report: its retransmit state is
+        // the kernel's, which is also why the carrier rule is one-sided.
+        None,
     )
     .await
 }
@@ -1326,6 +1727,23 @@ fn report_tunnel_violation(service_id: ServiceId, why: &str) {
     );
 }
 
+/// Report a transparent lane the valve refused: once per process at `info` —
+/// the operator wrote the cap, so this is it biting — then at `debug`.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn report_lane_refusal(held: usize, cap: usize) {
+    static LANE_REFUSALS: RepeatNotice = RepeatNotice::new();
+    LANE_REFUSALS.report(
+        || {
+            info!(
+                "Refused a transparent lane: this client already holds {held} carrier \
+                 connections and `[server.data].max_tunnels_per_client` is {cap}. Further \
+                 refusals are logged at debug level."
+            );
+        },
+        || debug!("Refused a transparent lane over the cap of {cap} (client holds {held})"),
+    );
+}
+
 /// Which session a tunnel's streams belong to.
 ///
 /// The tunnel belongs to the session as a whole: each stream's 4-byte prologue
@@ -1357,6 +1775,14 @@ async fn upgrade_to_tunnel<S>(
     mut conn: S,
     owner: TunnelOwner,
     session: Option<SessionTunnel>,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without multiplex there are no tunnels to report on"
+        )
+    )]
+    health: Option<Arc<crate::transport::health::SessionHealth>>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -1364,6 +1790,17 @@ where
     write_and_flush(&mut conn, &postcard::to_stdvec(&Ack::Ok)?).await?;
     let config = crate::transport::multiplex::mux_config();
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<crate::transport::MuxStream>(64);
+    // What this end hands the tunnel, counted above the wire: the delivery ratio
+    // needs the offered bytes, and a policer drops them in flight, so counting
+    // lower down would count what arrived instead (see `CountingTunnel`).
+    #[cfg(feature = "multiplex")]
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    #[cfg(feature = "multiplex")]
+    let read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The reporter outlives this scope and the driver task owns the adapter's
+    // reference, so the count is shared by clone rather than moved twice.
+    #[cfg(feature = "multiplex")]
+    let reported_written = Arc::clone(&written);
     tokio::spawn(async move {
         // Held until this tunnel's IO ends — the slot's term in the session's
         // tunnel count is exactly the tunnel's own lifetime — and ended by the
@@ -1376,7 +1813,15 @@ where
             None => (None, None),
         };
         let _slot = slot;
-        let tunnel = crate::transport::multiplex::run_server_tunnel(conn, config, bridge_tx);
+        let tunnel = crate::transport::multiplex::run_server_tunnel(
+            CountingTunnel {
+                inner: conn,
+                written: Arc::clone(&written),
+                read: Arc::clone(&read),
+            },
+            config,
+            bridge_tx,
+        );
         match ended.as_mut() {
             Some(ended) => {
                 tokio::select! {
@@ -1388,9 +1833,32 @@ where
         }
         debug!("Multiplexed data tunnel closed");
     });
+    // The identity a health report is attributed by: the client's own name for
+    // this connection, which its stream prologue carries. The mux driver cannot
+    // read it (it owns the connection but not the streams) and the dispatch
+    // cannot read the health (it owns the streams but not the connection), so the
+    // two meet in this slot, and the reporter below waits on it.
+    #[cfg(feature = "multiplex")]
+    let tunnel_id: Arc<std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>> =
+        Arc::new(std::sync::OnceLock::new());
+    #[cfg(feature = "multiplex")]
+    spawn_tunnel_health_reporter(
+        health,
+        reported_written,
+        Arc::clone(&tunnel_id),
+        Arc::clone(&owner.sessions),
+        owner.nonce,
+    );
     tokio::spawn(async move {
         while let Some(mut stream) = bridge_rx.recv().await {
-            let Some(queue) = route_tunnel_stream(&mut stream, &owner.sessions, &owner.nonce).await
+            let Some(queue) = route_tunnel_stream(
+                &mut stream,
+                &owner.sessions,
+                &owner.nonce,
+                #[cfg(feature = "multiplex")]
+                &tunnel_id,
+            )
+            .await
             else {
                 // A stream this session may not carry: dropped here, never the
                 // tunnel or the session.
@@ -1402,6 +1870,161 @@ where
         }
     });
     Ok(())
+}
+
+/// A tunnel connection that counts what passes through it.
+///
+/// The **written** count is what this end handed the tunnel, and it is the
+/// numerator the delivery ratio does not have: a policer drops those bytes in
+/// flight, so counting them anywhere below the wire would count what arrived
+/// instead of what was offered — which is the whole distinction the carrier rule
+/// needs (HANDOFF.md, round 6). The read count rides along for symmetry and for
+/// the pool-stats line's sake.
+#[cfg(feature = "multiplex")]
+struct CountingTunnel<S> {
+    inner: S,
+    written: Arc<std::sync::atomic::AtomicU64>,
+    read: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(feature = "multiplex")]
+impl<S: AsyncRead + Unpin> AsyncRead for CountingTunnel<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            let moved = buf.filled().len().saturating_sub(before);
+            self.read
+                .fetch_add(u64::try_from(moved).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingTunnel<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &polled {
+            self.written
+                .fetch_add(u64::try_from(*n).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Report one tunnel's KCP health back to the end that dialed it.
+///
+/// The deciding end chooses a tunnel's carrier, and on a path that polices UDP
+/// the evidence it needs is here: the packets this server sends into a policed
+/// carrier never arrive, so this session's ARQ re-sends them, and the client —
+/// which only ever sees what arrived — reads nothing of it. Measured on the
+/// `udp_throttled` condition: this end re-sent **22.9 %** of what it emitted
+/// while the client's own counters read 0.04 %. One frame per change, on the
+/// session's own control writer, so nothing new is opened for it.
+///
+/// The report starts once the tunnel's identity is known — its first stream's
+/// prologue carries it — and the task ends with the session it reports on: the
+/// `Weak` is all it holds of the health, so a dead tunnel takes its reporter
+/// with it rather than leaving one polling a number nobody owns.
+#[cfg(feature = "multiplex")]
+fn spawn_tunnel_health_reporter(
+    health: Option<Arc<crate::transport::health::SessionHealth>>,
+    handed: Arc<std::sync::atomic::AtomicU64>,
+    tunnel_id: Arc<std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>>,
+    sessions: Arc<RwLock<SessionMap>>,
+    nonce: Nonce,
+) {
+    const SAMPLE: std::time::Duration = std::time::Duration::from_millis(50);
+    let Some(health) = health.map(|h| Arc::downgrade(&h)) else {
+        // A TCP tunnel: the kernel holds its retransmit state and there is
+        // nothing here to report.
+        return;
+    };
+    tokio::spawn(async move {
+        let mut sent: Option<(u64, u64, u64)> = None;
+        let mut seq: u8 = 0;
+        let mut announced = false;
+        loop {
+            tokio::time::sleep(SAMPLE).await;
+            let Some(health) = health.upgrade() else {
+                // The session is gone: so is the tunnel this reported on.
+                return;
+            };
+            let counters = health.counts();
+            let handed = handed.load(Ordering::Relaxed);
+            if sent == Some((counters.0, counters.1, handed)) {
+                continue;
+            }
+            sent = Some((counters.0, counters.1, handed));
+            let Some((service_id, tunnel)) = tunnel_id.get().copied() else {
+                // No stream has named this tunnel yet: there is no identity to
+                // attribute a report to, and no traffic to have lost either.
+                continue;
+            };
+            seq = seq.wrapping_add(1);
+            let cmd = ControlChannelCmd::TunnelHealth(
+                service_id,
+                tunnel.0,
+                u32::try_from(counters.0).unwrap_or(u32::MAX).to_be_bytes(),
+                u32::try_from(counters.1).unwrap_or(u32::MAX).to_be_bytes(),
+                u32::try_from(handed).unwrap_or(u32::MAX).to_be_bytes(),
+                seq,
+            );
+            let Ok(frame) = postcard::to_stdvec(&cmd) else {
+                return;
+            };
+            let write_tx = sessions
+                .read()
+                .await
+                .get(&nonce)
+                .map(|session| session.write_tx.clone());
+            let Some(write_tx) = write_tx else {
+                return;
+            };
+            if !announced {
+                // Once per tunnel: the report is a fact about this connection,
+                // and its first frame is what proves the path end to end.
+                announced = true;
+                debug!(
+                    service = %hex::encode(service_id.0),
+                    tunnel = tunnel.0.iter().fold(String::new(), |mut acc, b| {
+                        use std::fmt::Write as _;
+                        let _ = write!(acc, "{b:02x}");
+                        acc
+                    }),
+                    emitted = counters.0,
+                    resent = counters.1,
+                    "Reporting a tunnel's session health to its dialing end"
+                );
+            }
+            if write_tx.send(frame).is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// Resolve one inbound v4 tunnel stream to the queue of the service it names.
@@ -1420,16 +2043,33 @@ async fn route_tunnel_stream<S>(
     stream: &mut S,
     sessions: &RwLock<SessionMap>,
     nonce: &Nonce,
+    #[cfg_attr(
+        not(feature = "multiplex"),
+        expect(
+            unused_variables,
+            reason = "without multiplex there are no tunnels to report on"
+        )
+    )]
+    tunnel_id: &std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>,
 ) -> Option<mpsc::Sender<DataChannel>>
 where
     S: AsyncRead + Unpin,
 {
-    let Ok(service_id) = read_stream_prologue(stream).await else {
+    let Ok((service_id, tunnel)) = read_tunnel_prologue(stream).await else {
         // The stream ended before naming a service (a client that opened it
         // and hung up): nothing to route it to.
         debug!("Dropped a tunnel stream with no prologue");
         return None;
     };
+    // The tunnel a stream arrived on is the connection the *client's* pool
+    // holds, and it is the key a per-tunnel report is attributed by — the
+    // identity that lets this end say what it offered that connection rather
+    // than the pool it belongs to.
+    // The tunnel's identity, recorded once and never overwritten: a tunnel's
+    // first stream names it, and every later stream of the same connection names
+    // the same pair.
+    let _ = tunnel_id.set((service_id, tunnel));
+    tracing::trace!("Stream for service {service_id} arrived on tunnel {tunnel}");
     let queue = sessions
         .read()
         .await
@@ -1443,11 +2083,17 @@ where
     Some(queue)
 }
 
-/// Accept KCP tunnel sessions (arm 2 of the transport comparison) and
-/// upgrade each into a yamux data tunnel. Sessions authenticate exactly like
-/// TCP tunnels: the hello carries the control session's nonce.
+/// Accept KCP sessions (arm 2 of the transport comparison) and serve whatever
+/// the hello on them turns out to be.
+///
+/// One listener serves both data-plane shapes, exactly as the TCP data
+/// listener does: a **tunnel** hello opens a yamux session (the `multiplex`
+/// mode), a **data channel** hello is a direct channel whose carrier happens to
+/// be KCP. Which one it is, is the client's own declaration — the same
+/// `carrier` it registered the service with — so nothing here needs a
+/// configuration of its own.
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
-async fn run_kcp_tunnel_listener(
+async fn run_kcp_listener(
     acceptor: Arc<KcpAcceptor>,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
@@ -1464,7 +2110,7 @@ async fn run_kcp_tunnel_listener(
                 let shared = Arc::clone(&shared);
                 tokio::spawn(
                     async move {
-                        if let Err(e) = handle_kcp_tunnel_session(
+                        if let Err(e) = handle_kcp_session(
                             session,
                             registry,
                             shared,
@@ -1483,10 +2129,10 @@ async fn run_kcp_tunnel_listener(
     debug!("KCP tunnel listener stopped");
 }
 
-/// Validate one accepted KCP session (optional Noise handshake + tunnel
-/// hello) and hand it to the shared tunnel upgrade path.
+/// Open one accepted KCP session (transport selector, optional Noise
+/// handshake), read the hello, and hand it to the path its variant names.
 #[cfg(all(feature = "kcp", feature = "multiplex"))]
-async fn handle_kcp_tunnel_session(
+async fn handle_kcp_session(
     mut session: crate::transport::kcp::AcceptedSession,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
@@ -1516,7 +2162,7 @@ async fn handle_kcp_tunnel_session(
                 KcpTunnelStream::Noise(Box::new(
                     tokio::time::timeout(deadline, keys.wrap_responder(session.stream))
                         .await
-                        .with_context(|| "KCP tunnel noise handshake timed out")??,
+                        .with_context(|| "KCP session noise handshake timed out")??,
                 ))
             }
             #[cfg(not(feature = "noise"))]
@@ -1530,15 +2176,40 @@ async fn handle_kcp_tunnel_session(
         other => bail!("Unknown transport selector {other:#04x}"),
     };
 
-    // Read and validate the tunnel hello, then run the shared upgrade.
-    let (owner, nonce) =
-        tokio::time::timeout(deadline, validate_tunnel_hello(&mut io, &registry, "KCP"))
-            .await
-            .with_context(|| "KCP tunnel hello timed out")??;
+    // The hello names the shape: a tunnel (multiplex mode, yamux above this
+    // stream) or a direct data channel (the session *is* the channel).
+    let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
+        .await
+        .with_context(|| "KCP hello timed out")??;
+    match hello {
+        Hello::DataChannelHello(_, nonce) => {
+            let service_id = read_stream_prologue(&mut io).await?;
+            do_v4_data_channel(DataChannel::RawKcp(io), registry, nonce, service_id).await
+        }
+        Hello::DataChannelTunnelHello(_, nonce) => {
+            let owner = tunnel_owner(&registry, nonce, "KCP").await?;
+            serve_kcp_tunnel(io, owner, nonce, registry, max_tunnels_per_client).await
+        }
+        other @ Hello::ControlChannelHello(..) => {
+            bail!("Expected a data-plane hello on the KCP session, got {other:?}")
+        }
+    }
+}
 
-    // A KCP tunnel is one of the client's multiplexed tunnels and takes a
-    // slot exactly like a TCP one: the valve must not be bypassable by
-    // choosing the other carrier.
+/// Reserve the tunnel's slot on its session and run the shared upgrade.
+///
+/// A KCP tunnel is one of the client's multiplexed tunnels and takes a slot
+/// exactly like a TCP one: the valve must not be bypassable by choosing the
+/// other carrier. Shared by the TCP and KCP accept paths so the two cannot
+/// disagree about the cap.
+#[cfg(all(feature = "kcp", feature = "multiplex"))]
+async fn serve_kcp_tunnel(
+    mut io: crate::transport::kcp::KcpTunnelStream,
+    owner: TunnelOwner,
+    nonce: Nonce,
+    registry: Arc<Registry>,
+    max_tunnels_per_client: usize,
+) -> Result<()> {
     let session = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
         TunnelSlot::Held(slot) => Some(slot),
         TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
@@ -1554,45 +2225,40 @@ async fn handle_kcp_tunnel_session(
         }
     };
 
-    upgrade_to_tunnel(io, owner, session).await
+    let health = io.health();
+    upgrade_to_tunnel(io, owner, session, Some(health)).await
 }
 
-/// Read the tunnel hello on a freshly established tunnel stream (any arm)
-/// and resolve the session it belongs to via the session nonce.
+/// Resolve the session a validated tunnel hello names.
 ///
 /// A tunnel names its session only; every stream inside it names its own
-/// service (see `TunnelOwner::Session`).
+/// service (see [`TunnelOwner`]). `arm` is the carrier's name, so a stale nonce
+/// says which listener saw it.
+///
+/// The KCP listener is the only caller: the TCP path builds its owner inline
+/// (it has no arm name to report).
 #[cfg(all(feature = "multiplex", feature = "kcp"))]
-async fn validate_tunnel_hello<S>(
-    conn: &mut S,
-    registry: &Registry,
-    arm: &str,
-) -> Result<(TunnelOwner, Nonce)>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let (_version, hello) = read_hello(conn).await?;
-    match hello {
-        Hello::DataChannelTunnelHello(_, nonce) => {
-            if !registry.sessions.read().await.contains_key(&nonce) {
-                bail!("{arm} tunnel hello carried an incorrect nonce");
-            }
-            Ok((
-                TunnelOwner {
-                    sessions: Arc::clone(&registry.sessions),
-                    nonce,
-                },
-                nonce,
-            ))
-        }
-        other => bail!("Expected a tunnel hello on the {arm} tunnel, got {other:?}"),
+async fn tunnel_owner(registry: &Registry, nonce: Nonce, arm: &str) -> Result<TunnelOwner> {
+    if !registry.sessions.read().await.contains_key(&nonce) {
+        bail!("{arm} tunnel hello carried an incorrect nonce");
     }
+    Ok(TunnelOwner {
+        sessions: Arc::clone(&registry.sessions),
+        nonce,
+    })
 }
 
 /// A live control channel, kept alive by holding the three channel
 /// senders: dropping the handle shuts the control channel down (each is
 /// a `Sender`, so the type carries the direction).
 pub struct ControlChannelHandle {
+    /// The public endpoint this service serves.
+    ///
+    /// Carried here because a session-level command that concerns one service
+    /// (a lane drain) has to reach that service's *data path*, and the hub is
+    /// keyed by the claimed endpoint — the registration itself is not retained
+    /// anywhere the session can read.
+    endpoint: SocketAddr,
     // Shutdown the control channel by dropping it
     shutdown: broadcast::Sender<bool>,
     data_channel: mpsc::Sender<DataChannel>,
@@ -1621,6 +2287,7 @@ impl ControlChannelHandle {
 impl Clone for ControlChannelHandle {
     fn clone(&self) -> Self {
         ControlChannelHandle {
+            endpoint: self.endpoint,
             shutdown: self.shutdown.clone(),
             data_channel: self.data_channel.clone(),
             data_ch_req: self.data_ch_req.clone(),
@@ -1632,6 +2299,41 @@ impl Clone for ControlChannelHandle {
 enum BoundEndpoint {
     Tcp(TcpListener),
     Udp(UdpSocket),
+    /// A transparent service binds nothing: the address lives on the client's
+    /// TUN device, and the server only routes packets into the tunnel. The
+    /// claim (`Registered::claim`) is what keeps the address unique here.
+    Transparent,
+}
+
+/// Every public endpoint a transparent service has claimed on this server.
+///
+/// The routing that feeds the tunnel is per address, so a second claimant
+/// would silently steal the first one's visitors; a claim makes that a precise
+/// rejection instead.
+static CLAIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<SocketAddr>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// A held claim on one public endpoint, released when the service ends.
+struct Claim(SocketAddr);
+
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(dead_code, reason = "transparent registrations are refused here")
+)]
+impl Claim {
+    /// `None` when another service already owns the endpoint.
+    fn acquire(addr: SocketAddr) -> Option<Self> {
+        let mut claims = CLAIMS.lock().ok()?;
+        claims.insert(addr).then_some(Claim(addr))
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Ok(mut claims) = CLAIMS.lock() {
+            claims.remove(&self.0);
+        }
+    }
 }
 
 /// Bind the service's public endpoint.
@@ -1643,6 +2345,8 @@ async fn bind_service_endpoint(service: &RegisteredService) -> std::io::Result<B
         ServiceType::Udp => UdpSocket::bind(service.bind_addr)
             .await
             .map(BoundEndpoint::Udp),
+        // Nothing to bind on this host: the address is the client's.
+        ServiceType::Transparent => Ok(BoundEndpoint::Transparent),
     }
 }
 
@@ -1724,7 +2428,10 @@ enum DataChannelRequest {
 ///
 /// A v3 service owns its control connection; a v4 service shares the
 /// session's, so its commands are framed into the session's single writer
-/// instead.
+/// instead. `Clone` because a service's data path may need to report something
+/// of its own (a transparent claim's per-lane counters) without going through
+/// the request queue that exists for channels.
+#[derive(Clone)]
 enum ControlSink {
     Session {
         service_id: ServiceId,
@@ -1735,7 +2442,7 @@ enum ControlSink {
 impl ControlSink {
     /// Send one already-framed command, queued for the session's writer — the
     /// only task that touches that socket.
-    fn send(&mut self, data: &[u8]) -> Result<()> {
+    fn send(&self, data: &[u8]) -> Result<()> {
         match self {
             ControlSink::Session { write_tx, .. } => write_tx
                 .send(data.to_vec())
@@ -1776,8 +2483,9 @@ impl ControlChannelHandle {
         sink: ControlSink,
         service: &RegisteredService,
         bound: BoundEndpoint,
+        claim: Option<Claim>,
         heartbeat_interval: u64,
-        pool_size: usize,
+        lane_valve: LaneValve,
         stripe_count: usize,
     ) -> ControlChannelHandle {
         // Create a shutdown channel
@@ -1788,13 +2496,6 @@ impl ControlChannelHandle {
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
-
-        // Cache some data channels for later use
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(DataChannelRequest::Plain) {
-                debug!("Failed to request data channel {}", e);
-            }
-        }
 
         // A v4 service's pool death has to reach the client, and the session
         // owns the connection: the wrapper below reports a *failed* pool task
@@ -1818,6 +2519,11 @@ impl ControlChannelHandle {
         // public listener, so without that the port stays occupied with
         // nothing serving it and the next registration of that service is
         // rejected with "Port N is already in use".
+        // A transparent claim's data path reports its per-lane counters through
+        // the same sink the control channel uses: the session's writer is the
+        // only task that touches the control socket, so nothing else may write
+        // to it.
+        let report_sink = sink.clone();
         let ch = ControlChannel {
             sink,
             shutdown_rx,
@@ -1886,13 +2592,407 @@ impl ControlChannelHandle {
                     .instrument(Span::current()),
                 );
             }
+            // A transparent service binds nothing: its packets arrive on the
+            // operator's TUN, and this task moves them to and from the tunnel.
+            BoundEndpoint::Transparent => spawn_transparent_service(
+                service,
+                data_ch_rx,
+                data_ch_req_tx.clone(),
+                shutdown_rx_clone,
+                control_task,
+                TransparentContext::new(claim, lane_valve, report_sink),
+                pool_died_tx,
+            ),
         }
 
         ControlChannelHandle {
+            endpoint: service.bind_addr,
             shutdown: shutdown_tx,
             data_channel: data_ch_tx,
             data_ch_req: data_ch_req_tx,
         }
+    }
+}
+
+/// How long to wait before answering a replacement transparent channel with the
+/// start command.
+///
+/// A replacement is requested when a member of the claim ends; without a pause,
+/// a peer that refuses the start command instantly would be asked again just as
+/// instantly.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often a transparent claim reports its per-lane counters to its client.
+///
+/// One second, the same cadence as the `l3-stats` line and the allocator's own
+/// tick: a policy compares deltas between consecutive samples, so a slower
+/// report would make every window a guess, and a faster one would spend the
+/// session's single writer on telemetry. Only lanes whose counters *moved* are
+/// sent, so a quiet claim costs nothing.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+const LANE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Aborts a claim's lane reporter when the claim's task ends.
+///
+/// A guard rather than an explicit abort at each exit: `run_transparent_service`
+/// returns from several arms (shutdown, a dead control task, the channel queue
+/// closing), and a reporter that outlived its claim would keep a session writer
+/// alive and report lanes nobody holds.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+struct LaneReporter(tokio::task::JoinHandle<()>);
+
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+impl Drop for LaneReporter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Report one claim's per-lane counters to its client, until dropped.
+///
+/// This is the half of the evidence the client cannot produce: on a transparent
+/// claim the loss that matters happens *here*, where the visitor's packets are
+/// read off the device and offered to the lanes, and the client only ever sees
+/// what arrived. A lane whose queue refuses a large share of what it is offered
+/// is a carrier that is not delivering, and without this report the end that
+/// decides which carrier to use has no way to know.
+///
+/// The same task carries the other thing the client cannot know: when a lane it
+/// asked to drain has become empty **on this end**. The dialer sees only its own
+/// flows, so a lane may only be retired once this answer arrives — the retired
+/// lane black hole is exactly a peer that kept writing into a connection the
+/// other end had let go.
+///
+/// Only lanes whose counters moved since the last sample are sent: a claim that
+/// is quiet (or whose lanes are carrying everything) costs no control traffic,
+/// and the client's own staleness rule is what bounds a lane that stops
+/// reporting.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+fn spawn_lane_reporter(
+    hub: std::sync::Arc<crate::transparent::hub::TunHub>,
+    endpoint: crate::transparent::Endpoint,
+    sink: ControlSink,
+) -> LaneReporter {
+    use crate::protocol::{ControlChannelCmd, LANE_DRAIN_READY};
+    let service_id = sink.service_id();
+    let task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(LANE_REPORT_INTERVAL);
+        // Per lane: the sequence the client uses to tell a fresh report from a
+        // late one, and the last counters sent so a quiet lane is skipped.
+        let mut seq: std::collections::HashMap<crate::protocol::LaneId, u8> =
+            std::collections::HashMap::new();
+        let mut sent: std::collections::HashMap<crate::protocol::LaneId, (u64, u64)> =
+            std::collections::HashMap::new();
+        // Lanes already answered "ready": the answer is re-sent only when the
+        // lane is drained again, not every second for a lane that stays empty.
+        let mut ready_sent: std::collections::HashSet<crate::protocol::LaneId> =
+            std::collections::HashSet::new();
+        loop {
+            tick.tick().await;
+            for member in hub.member_stats() {
+                if member.endpoint != endpoint {
+                    continue;
+                }
+                let Some(lane) = member.lane else {
+                    continue;
+                };
+                // The peer's half of a retirement: this end holds no flow in a
+                // lane the *peer* asked to drain. The local `draining` mark is
+                // deliberately not the trigger — that one is this end retiring
+                // a lane of its own, and answering "ready" for it would tell the
+                // peer about a decision it never asked about.
+                if member.peer_draining && member.active_flows == 0 {
+                    if ready_sent.insert(lane.id) {
+                        let ack = ControlChannelCmd::LaneDrainAck(
+                            service_id,
+                            lane.id.0,
+                            LANE_DRAIN_READY,
+                        );
+                        let Ok(frame) = postcard::to_stdvec(&ack) else {
+                            return;
+                        };
+                        if sink.send(&frame).is_err() {
+                            return;
+                        }
+                    }
+                } else if !member.peer_draining {
+                    ready_sent.remove(&lane.id);
+                }
+                let counters = (
+                    member.counters.offered_packets,
+                    member.counters.overflow_packets,
+                );
+                if sent.get(&lane.id) == Some(&counters) {
+                    continue;
+                }
+                sent.insert(lane.id, counters);
+                let n = seq.entry(lane.id).or_insert(0);
+                *n = n.wrapping_add(1);
+                let cmd = ControlChannelCmd::CarrierReport(
+                    service_id,
+                    lane.id.0,
+                    // The counters are cumulative for the lane's life and
+                    // saturate: a lane that wrapped a `u32` would have carried
+                    // 4 billion packets, and the client's window is seconds.
+                    u32::try_from(counters.0).unwrap_or(u32::MAX).to_be_bytes(),
+                    u32::try_from(counters.1).unwrap_or(u32::MAX).to_be_bytes(),
+                    *n,
+                );
+                let Ok(frame) = postcard::to_stdvec(&cmd) else {
+                    return;
+                };
+                if sink.send(&frame).is_err() {
+                    // The session is gone: nothing left to report to.
+                    return;
+                }
+            }
+        }
+    });
+    LaneReporter(task)
+}
+
+/// The member set as its supervisor sees it: how many members have ended.
+///
+/// A member's end is the claim's only event that asks for something — one more
+/// channel — and it is also what makes an arriving channel a *replacement*
+/// rather than part of the set the client opened in one go. Both halves of that
+/// rule live here so they can be read (and tested) without a TUN device: the
+/// loop below is plumbing, this is the policy.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[derive(Default)]
+struct MemberSupervisor {
+    ended: usize,
+}
+
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+impl MemberSupervisor {
+    /// Whether a channel arriving now is a replacement, and therefore paced.
+    ///
+    /// The claim's own channels start at once; only a channel that follows a
+    /// member's death waits out [`TRANSPARENT_REPLACE_BACKOFF`], so a client
+    /// that cannot serve the start command is not polled in a tight loop while
+    /// a fresh claim still comes up at full width.
+    fn paces_arrivals(&self) -> bool {
+        self.ended > 0
+    }
+
+    /// One member ended: the claim is short exactly one channel, so this is the
+    /// request that goes to the client — one per end, never one per two.
+    fn member_ended(&mut self) -> DataChannelRequest {
+        self.ended += 1;
+        DataChannelRequest::Plain
+    }
+}
+
+/// Serve one transparent service: take the channels the client opened when its
+/// registration was accepted, hand the device's packets to them, and inject what
+/// comes back.
+///
+/// The claim is carried by a **member set**, and this task is its supervisor:
+/// every channel that arrives becomes one member, runs for its own lifetime,
+/// and its end asks for a replacement — the client opens on demand, the same
+/// path a UDP worker's replacement takes, and the tunnel pool places it.
+///
+/// The server is not told how many members the client configured (the
+/// registration carries no channel count) and does not need to be: the channels
+/// the client opens *are* the set, and the hub discovers its width from the
+/// members that actually join. A member's end does not narrow it — the slot is
+/// kept, so the surviving flows stay where they are — and the replacement
+/// inherits the slot its predecessor held.
+#[cfg(all(feature = "transparent", target_os = "linux"))]
+async fn run_transparent_service<C>(
+    mut data_ch_rx: mpsc::Receiver<C>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
+    tun: String,
+    endpoint: SocketAddr,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+    mut control_task: tokio::task::JoinHandle<()>,
+    transparent: TransparentContext,
+) -> Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::transparent::hub::{TunHub, forward_transparent};
+    use crate::transparent::{Direction, Endpoint};
+
+    // The hub owns the data path's counters, so every member of a claim counts
+    // into the same line.
+    let hub = TunHub::get_or_spawn(&tun, Direction::Destination)?;
+    let endpoint = Endpoint::new(endpoint.ip(), endpoint.port());
+    let TransparentContext {
+        claim: _claim,
+        lane_valve,
+        sink,
+    } = transparent;
+
+    // The claim's lanes are reported to its client for as long as the claim
+    // lives: the client decides which carrier a lane should ride, and the loss
+    // that decides it happens here, where the device's packets are offered to
+    // the lanes. The guard aborts the reporter on every exit from this function.
+    let _reporter = spawn_lane_reporter(Arc::clone(&hub), endpoint, sink);
+
+    let start_cmd = Arc::new(postcard::to_stdvec(
+        &DataChannelCmd::StartForwardTransparent,
+    )?);
+    // What the claim has lost, and what that makes of the channels arriving.
+    let mut lost_members = MemberSupervisor::default();
+    // Dropping the set aborts every member still running: a claim that goes
+    // away (shutdown, a dead control session, a deregistration) takes its
+    // channels with it.
+    let mut members = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            channel = data_ch_rx.recv() => {
+                // The lane the client named rides with the channel: the hub
+                // attributes its counters to that connection, so the end that
+                // decides can be told about the lane that actually carried the
+                // traffic (a slot index is this end's own bookkeeping and is
+                // reused by a replacement).
+                let Some(mut channel) = channel else {
+                    return Ok(());
+                };
+                // The lane the client named rides in the prologue's second
+                // half, read *here* rather than where the service id was: the
+                // lane is a claim's business, and this is the only place that
+                // knows the channel is one. A channel that cannot name its lane
+                // is dropped — reading nothing would leave its bytes to be
+                // parsed as frames, and a lane nobody can attribute is exactly
+                // what this is here to end.
+                #[cfg(all(feature = "multiplex", target_os = "linux"))]
+                let named_lane = match crate::protocol::read_lane_half(&mut channel).await {
+                    Ok(lane) => Some(lane),
+                    Err(e) => {
+                        debug!("Transparent channel for {endpoint} named no lane: {e:#}");
+                        continue;
+                    }
+                };
+                #[cfg(not(all(feature = "multiplex", target_os = "linux")))]
+                let named_lane = None;
+                // The operator's valve counts these lanes too: a claim's channel
+                // is a carrier connection of its own, and before this it was the
+                // one kind of establishment nothing bounded. The reservation is
+                // held for as long as the lane runs (moved into the member task
+                // below), so a lane that ends gives its slot back.
+                let valve_slot = match lane_valve.reserve() {
+                    Ok(lane) => lane,
+                    Err(held) => {
+                        report_lane_refusal(held, lane_valve.cap);
+                        continue;
+                    }
+                };
+                let hub = Arc::clone(&hub);
+                let start_cmd = Arc::clone(&start_cmd);
+                // The first channels of a fresh claim start at once — they are
+                // the member set the client just opened, not replacements —
+                // while a channel that arrives after a member ended is paced:
+                // a client that cannot serve the start command (an older build,
+                // a broken data path of its own) must not be polled in a tight
+                // loop.
+                let paced = lost_members.paces_arrivals();
+                members.spawn(async move {
+                    // Held for the lane's whole life: dropping it (the lane
+                    // ending, however it ends) releases the session slot.
+                    let _valve_slot = valve_slot;
+                    if paced {
+                        tokio::time::sleep(TRANSPARENT_REPLACE_BACKOFF).await;
+                    }
+                    if let Err(e) = write_and_flush(&mut channel, &start_cmd).await {
+                        debug!("Transparent channel for {endpoint} died before starting: {e:#}");
+                        return;
+                    }
+                    // The receiving end does not choose the carrier: a lane
+                    // arrives on whichever listener the client reached, and the
+                    // policy that reads this runs where the choice is made. It
+                    // *does* record which lane it was — the client named it in
+                    // the prologue — so this end's counters can be attributed
+                    // to the connection that carried the traffic.
+                    if let Err(e) =
+                        forward_transparent(channel, hub, endpoint, named_lane, None).await
+                    {
+                        debug!("Transparent channel for {endpoint} ended: {e:#}");
+                    }
+                });
+            }
+            joined = members.join_next(), if !members.is_empty() => {
+                if let Some(Err(e)) = joined {
+                    error!("A transparent member task for {endpoint} failed: {e}");
+                }
+                // A member ended: the claim is short one channel, so ask for a
+                // replacement and keep holding the address while the client
+                // opens it. The slot it held stays in the claim's set, so the
+                // flows placed in it resume on the replacement.
+                let _ = data_ch_req_tx.send(lost_members.member_ended());
+            }
+            _ = shutdown_rx.recv() => return Ok(()),
+            _ = &mut control_task => return Ok(()),
+        }
+    }
+}
+
+/// Start a transparent service's data path.
+///
+/// Not a pool runner: there is no listener to accept on. It supervises the
+/// **member set** of the endpoint the client claimed — the channels the client
+/// opened when its registration was accepted — moving packets between the
+/// operator's TUN device and whoever holds a slot, and asking for a replacement
+/// whenever one ends.
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(
+        unused_variables,
+        clippy::needless_pass_by_value,
+        reason = "the transparent data path is compiled out on this build, so the task this \
+                  starts can never run; the parameters are what keep the signature and the \
+                  call site one shape in every build"
+    )
+)]
+fn spawn_transparent_service(
+    service: &RegisteredService,
+    data_ch_rx: mpsc::Receiver<DataChannel>,
+    data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
+    shutdown_rx: broadcast::Receiver<bool>,
+    control_task: tokio::task::JoinHandle<()>,
+    transparent: TransparentContext,
+    pool_died_tx: mpsc::UnboundedSender<()>,
+) {
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    {
+        let tun = service.transparent_tun.clone().unwrap_or_default();
+        let endpoint = service.bind_addr;
+        tokio::spawn(
+            async move {
+                if let Err(e) = run_transparent_service(
+                    data_ch_rx,
+                    data_ch_req_tx,
+                    tun,
+                    endpoint,
+                    shutdown_rx,
+                    control_task,
+                    transparent,
+                )
+                .await
+                {
+                    error!("{:#}", e);
+                    report_pool_death(&pool_died_tx);
+                }
+            }
+            .instrument(Span::current()),
+        );
+    }
+    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    {
+        // A registration is refused long before this on such a build; the
+        // parameters are consumed so the signature stays one shape.
+        let _ = (
+            service,
+            data_ch_rx,
+            data_ch_req_tx,
+            shutdown_rx,
+            control_task,
+            pool_died_tx,
+        );
     }
 }
 
@@ -2351,24 +3451,24 @@ async fn serve_tcp_visitor<C>(
                 PairOutcome::Shed | PairOutcome::Stop => return,
             }
         }
-    } else {
-        // The gather is atomic: hold the group lock for the whole attempt so
-        // concurrent visitors cannot interleave their K channels.
-        let _gather = pool.stripe_gather.lock().await;
-        // The boolean told the accept loop to stop; for one visitor both
-        // outcomes are "nothing left to do here".
-        if let Err(e) = pair_striped_group(
-            incoming,
-            pool.stripe_count,
-            &pool.data_ch_rx,
-            &pool.data_ch_req_tx,
-            &mut shutdown_rx,
-            &mut control_alive,
-        )
-        .await
-        {
-            debug!("Striped pairing failed: {e:#}");
-        }
+    }
+
+    // The gather is atomic: hold the group lock for the whole attempt so
+    // concurrent visitors cannot interleave their K channels.
+    let _gather = pool.stripe_gather.lock().await;
+    // The boolean told the accept loop to stop; for one visitor both
+    // outcomes are "nothing left to do here".
+    if let Err(e) = pair_striped_group(
+        incoming,
+        pool.stripe_count,
+        &pool.data_ch_rx,
+        &pool.data_ch_req_tx,
+        &mut shutdown_rx,
+        &mut control_alive,
+    )
+    .await
+    {
+        debug!("Striped pairing failed: {e:#}");
     }
 }
 
@@ -2414,8 +3514,8 @@ where
         // One striped request per stripe, before the first wait: the
         // unstriped path asks for its channel this way, and a striped gather
         // that does not ask simply waits for channels nobody was told to
-        // open — the shape of the original defect (a cold pool never
-        // pre-opened anything, so the gather hung until the visitor's own
+        // open — the shape of the original defect (the client used to
+        // pre-open nothing, so the gather hung until the visitor's own
         // read timed out). A request the client refuses is answered with
         // nothing at all, which is why the wait below re-asks.
         for index in 0..stripes {
@@ -3117,6 +4217,76 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
+    /// A lane and a tunnel draw on the **same** session counter, which is what
+    /// makes `[server.data].max_tunnels_per_client` a bound on the carrier
+    /// connections one client holds rather than on one kind of them.
+    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    // The module-level waiver cannot carry `expect_used`: this test is gated on
+    // three cfgs, so most builds would leave the module's expectation
+    // unfulfilled.
+    #[expect(
+        clippy::expect_used,
+        reason = "the test asserts on reservations it just made"
+    )]
+    #[test]
+    fn a_lane_and_a_tunnel_share_one_session_counter() {
+        let count = TunnelCount::default();
+        let valve = LaneValve::new(Some(count.clone()), 1);
+
+        // The tunnel valve takes the only slot this cap allows.
+        let tunnel = count.try_reserve(1).expect("the tunnel holds the one slot");
+        assert!(
+            matches!(valve.reserve(), Err(1)),
+            "a lane must see the slot the tunnel holds, and the count with it"
+        );
+
+        // Releasing it lets a lane in, and the lane's own guard gives it back.
+        drop(tunnel);
+        let lane = valve.reserve().expect("the lane gets the released slot");
+        assert!(
+            matches!(valve.reserve(), Err(1)),
+            "the lane's slot is held while the lane runs"
+        );
+        drop(lane);
+        assert!(valve.reserve().is_ok(), "a released lane slot is reusable");
+
+        // A build (or a session) with no counter never refuses, and an unlimited
+        // cap is the default: `Err` is about the cap, not about the counter.
+        let unlimited = LaneValve::new(None, 0);
+        assert!(unlimited.reserve().is_ok());
+        let uncapped = LaneValve::new(Some(TunnelCount::default()), 0);
+        assert!(
+            uncapped.reserve().is_ok() && uncapped.reserve().is_ok(),
+            "0 is unlimited"
+        );
+    }
+
+    /// Serving L3 is the *server operator's* decision: without the table a
+    /// transparent registration is refused by policy — with a reason that names
+    /// the missing switch, not a missing device — and with it the device named
+    /// there is what the data path gets. `[server.transparent]` is an `Option`
+    /// for exactly this reason: a defaulted table would leave this process
+    /// armed to attach a device the operator never asked for.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn the_server_switch_governs_transparent_registrations() {
+        let mut server = ServerConfig::default();
+        let refusal = transparent_tun_for(&server).unwrap_err();
+        assert!(
+            refusal.contains("[server.transparent]"),
+            "the refusal must name the missing switch, got: {refusal}"
+        );
+
+        server.transparent = Some(crate::config::parsing::TransparentConfig {
+            tun: "l3test0".to_string(),
+        });
+        assert_eq!(
+            transparent_tun_for(&server).unwrap(),
+            "l3test0",
+            "the device comes from the table the operator wrote"
+        );
+    }
+
     /// The operator's valve, at the level the tunnel path reads it: a cap of
     /// `N` admits N live tunnels and refuses the next, and a refused tunnel
     /// leaves the count alone. `0` is unlimited.
@@ -3219,6 +4389,7 @@ mod tests {
             services.insert(
                 ServiceId::new(*id),
                 ControlChannelHandle {
+                    endpoint: "127.0.0.1:0".parse().unwrap(),
                     shutdown: shutdown_tx,
                     data_channel: data_ch_tx.clone(),
                     data_ch_req: request_tx,
@@ -3240,8 +4411,13 @@ mod tests {
 
     /// Write a stream's 4-byte service prologue.
     #[cfg(feature = "multiplex")]
+    /// The prologue a stream of a multiplexed tunnel opens with: the service,
+    /// then the tunnel it rides (see `write_tunnel_prologue`).
     async fn write_prologue(tx: &mut tokio::io::DuplexStream, id: u32) {
-        tx.write_all(&id.to_be_bytes()).await.unwrap();
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&id.to_be_bytes());
+        buf[4..].copy_from_slice(&1u32.to_be_bytes());
+        tx.write_all(&buf).await.unwrap();
         tx.flush().await.unwrap();
     }
 
@@ -3277,7 +4453,7 @@ mod tests {
         // A registered service's stream lands on *that* service's queue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 1).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("a registered service must route");
         assert!(routed.same_channel(&queue_a));
@@ -3287,7 +4463,7 @@ mod tests {
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 9).await;
         assert!(
-            route_tunnel_stream(&mut rx, &sessions, &nonce)
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
                 .await
                 .is_none()
         );
@@ -3296,7 +4472,7 @@ mod tests {
         let (tx, mut rx) = tokio::io::duplex(64);
         drop(tx);
         assert!(
-            route_tunnel_stream(&mut rx, &sessions, &nonce)
+            route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
                 .await
                 .is_none()
         );
@@ -3306,7 +4482,7 @@ mod tests {
         // streams of several services, each routed by its own prologue.
         let (mut tx, mut rx) = tokio::io::duplex(64);
         write_prologue(&mut tx, 2).await;
-        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce)
+        let routed = route_tunnel_stream(&mut rx, &sessions, &nonce, &std::sync::OnceLock::new())
             .await
             .expect("the sibling service must route too");
         assert!(routed.same_channel(&queue_b));
@@ -3479,5 +4655,32 @@ mod tests {
             data_channel_cmd(service, &DataChannelRequest::Plain),
             ControlChannelCmd::CreateDataChannelFor(id) if id == service
         ));
+    }
+
+    /// A claim's member set: its first channels are the set the client opened
+    /// and start at once, and from the first member's death on every arriving
+    /// channel is a replacement and is paced. Each end asks for exactly one
+    /// channel — one death, one request — because a claim short two members
+    /// must be repaired twice, not once.
+    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[test]
+    fn a_member_end_makes_the_next_channel_a_paced_replacement() {
+        let mut supervisor = MemberSupervisor::default();
+        assert!(
+            !supervisor.paces_arrivals(),
+            "the set the client opened in one go is not paced"
+        );
+        assert!(
+            matches!(supervisor.member_ended(), DataChannelRequest::Plain),
+            "one member's end asks for one plain channel"
+        );
+        assert!(
+            supervisor.paces_arrivals(),
+            "a channel arriving after a death is a replacement, and is paced"
+        );
+        assert!(
+            matches!(supervisor.member_ended(), DataChannelRequest::Plain),
+            "a second end is a second request, never one for two"
+        );
     }
 }

@@ -153,9 +153,9 @@ code-level.**
   still in development it is still being defined, so commands may be extended
   **in place** under that number; once the tag exists, the next change to the
   wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
-  — the first three read off each tag's `CURRENT_PROTO_VERSION`, 0.10 off
-  `src/protocol.rs` at HEAD, because the tag that would confirm it does not
-  exist yet.
+  — each read off its tag's `CURRENT_PROTO_VERSION`. The unreleased line on top
+  of v0.10.0 is v5; it has no tag yet, so its commands may still be extended in
+  place.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -178,10 +178,10 @@ code-level.**
      front of the real section would be published as the notes);
   4. `just check` is green on the tagged commit;
   5. the benchmark ritual is done (docs/release.md):
-     `results-soak-vX.Y.Z.json`, the new chart, and the README benchmark
-     table are refreshed in the release commit, and `just soak-check` is
-     green against the previous tag — capacity, SLO and drift must not
-     regress.
+     `benches/records/results-bench-vX.Y.Z.json`, the chart set, and the README
+     benchmark table are refreshed in the release commit, and `just bench-gate`
+     is green against the previous release — coverage, the SLO, drift and the
+     capacity ramp must not regress.
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 - **Mechanics live in [docs/release.md](docs/release.md)**: the exact changelog
@@ -221,12 +221,18 @@ Details: [docs/release.md](docs/release.md).
   release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
   runs the identical chain when the change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
-  docs-alignment check instead — the one gate such a change can break. **The
-  hooks mirror that split** (`githooks/docs-only` classifies the staged paths
-  or the pushed range): pre-commit keeps only the secret scan and the docs
-  check, pre-push keeps only the docs check, and anything ambiguous — an empty
-  change set, a new branch, a tag push, a commit mixing docs with code — falls
-  back to the full chain. Deleting the classifier restores the full chain,
+  docs-alignment check instead — the one gate such a change can break. A
+  benches-only change (`benches/scripts/**`) skips the cargo gates of the
+  fast gate for the same reason — the scripts are runtime tooling, never
+  compiled — and pre-push skips the heavy gates for it too (audit, deny,
+  outdated and tests cannot move), while CI keeps the full chain.
+  **The hooks mirror that split** (`githooks/docs-only` and
+  `githooks/benches-only` classify the staged paths or the pushed range):
+  pre-commit keeps the secret scan and the docs check, plus the two ruff
+  gates and the bench-model self-check for a benches-only change; pre-push
+  keeps only the docs check; and anything ambiguous — an empty change set, a
+  new branch, a tag push, a commit mixing docs or benches with code — falls
+  back to the full chain. Deleting a classifier restores the full chain,
   which is the safe direction. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by
@@ -349,12 +355,30 @@ revision) and are as binding as the lint discipline in §2.
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
   every reader of a key you touch, and keep a completeness gate in the
-  ritual (`soak_check.py`: the completeness of every test's series, the
-  endpoint invariant, the SLO verdicts).
+  ritual (`bench.py gate`: the coverage of every declared cell, the endpoint
+  invariant, the SLO verdicts, the drift and wedge axes).
 - **Prove provenance.** A run must correspond to a committed revision and a
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that
   way, and its numbers would have described code that no longer existed).
+- **A performance claim about a change is made with the bench model.**
+  `benches/scripts/bench/` is the standard: a metric exists only as a
+  declaration in `model.METRICS` (unit, direction, denominator, the workloads
+  that can produce it, the smallest difference worth calling a claim), every
+  scenario runs against a control arm with no tool in the path, a run records
+  its whole method as a fingerprint before its first sample, and a difference
+  is only a claim when it clears both the metric's materiality floor and the
+  run's *own measured noise* (`--aa`; the floors are printed with the tables).
+  A number produced any other way is context, not evidence. The sweep a release
+  publishes *is* the model's `sweep` profile — the timeline and capacity
+  scenarios over the product and the reference tools — so there is one runner,
+  one schema and one gate; the records measured with the model it replaced stay
+  in `benches/records/` as published history and are never a regression
+  baseline (the gate refuses a baseline whose method record does not match).
+  Adding a metric means adding its declaration, its scenario support and its
+  row on the benchmarks page (both languages): `githooks/check-docs` fails a
+  registry entry that is not documented, and `just bench-selfcheck` — a fast
+  gate — fails a declaration the code contradicts.
 - **Docs move with the data.** The method's public home is
   `docs/benchmarks.md` (+ `.zh.md`): it owns what is measured, how to read a
   chart, the stage schedule, the test types, the per-decision measurements and
@@ -377,20 +401,22 @@ pointers, not copies:
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
   `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels, in the default set); `embedded` (minimal).
+  KCP-over-UDP data tunnels, in the default set); `transparent` (a
+  client-owned public `ip:port` carried as whole IP packets over a TUN device,
+  Linux only, in the default set); `embedded` (minimal).
   Clippy runs twice in the pre-commit gate: the second pass covers the
   minimal no-default-features `server,client` build that the default-feature
   pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v4, one control session per endpoint; the rule and the
+- **Protocol**: v5, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
   `opt-level = "z"`, `bench`) and the scratch container image are
   [docs/build-guide.md](docs/build-guide.md).
-- **Unsafe** is denied crate-wide; the one module that opts in per item, the
+- **Unsafe** is denied crate-wide; the modules that opt in per item, the
   `src/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
 - **Bench/test entries are PEP 723 python scripts run via `uv run`**; their

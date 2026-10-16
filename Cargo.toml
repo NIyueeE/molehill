@@ -1,9 +1,9 @@
 [package]
 name = "molehill-rathole"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 authors = ["niyue <n1yu3@proton.me>"]
-description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok."
+description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok, with transparent (L3) clients that own their own public IP."
 license = "Apache-2.0"
 repository = "https://github.com/NIyueeE/molehill"
 readme = "README.md"
@@ -22,6 +22,7 @@ default = [
     "hot-reload",
     "multiplex",
     "kcp",
+    "transparent",
 ]
 
 # Run as a server
@@ -29,7 +30,7 @@ server = []
 # Run as a client
 client = []
 
-# Noise support. The `snow` feature pulls the ring-accelerated resolver:
+# Noise support. The `snow` dependency pulls the ring-accelerated resolver:
 # the ChaCha20-Poly1305 data path runs ring's hardware-dispatched
 # implementation for every pattern (the handshake hash — BLAKE2s by
 # default, SHA-256/SHA-512 for other patterns — falls back to the
@@ -37,10 +38,10 @@ client = []
 # record stream is vendored in-repo (src/transport/noise_stream.rs,
 # ported from the unmaintained snowstorm crate, adapted to snow 0.10),
 # which needs pin-project.
-noise = ["base64", "snow", "pin-project"]
+noise = ["dep:base64", "dep:snow", "dep:pin-project"]
 
 # Configuration hot-reload support
-hot-reload = ["notify"]
+hot-reload = ["dep:notify"]
 
 # Multiplex many data channels over one physical connection (yamux engine,
 # maintained in-repo under src/mux)
@@ -55,9 +56,13 @@ console = ["console-subscriber", "tokio/tracing"]
 # A KCP tunnel is a mux tunnel over UDP: the feature implies `multiplex`.
 # In the default set so one release binary covers all comparison arms.
 kcp = [ "multiplex"]
-snow = ["dep:snow"]
-pin-project = ["dep:pin-project"]
-base64 = ["dep:base64"]
+# Transparent (L3) services: the client owns the public `ip:port` instead of
+# the server binding it, so the visitor's packets reach the client's TUN device
+# and its kernel answers them -- the backend sees the visitor's real address
+# and the server holds no connection state. Linux only (it needs a TUN device
+# and CAP_NET_ADMIN on both ends); a config that asks for one on another
+# platform is refused with a precise reason.
+transparent = []
 
 [profile.release]
 panic = "abort"
@@ -111,8 +116,9 @@ thiserror = "2.0.20"
 libc = "0.2.189"
 parking_lot = { version = "0.12.5", optional = true }
 nohash-hasher = { version = "0.2.0", optional = true }
-nix = { version = "0.31.3", features = ["socket"] }
+nix = { version = "0.31.3", features = ["socket", "net"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+serde_json = "1.0.154"
 
 [build-dependencies]
 vergen = { version = "10.0.2", default-features = false, features = ["build", "cargo"] }

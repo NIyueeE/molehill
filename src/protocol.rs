@@ -15,7 +15,8 @@ const _PROTO_V0: u8 = 0u8;
 const _PROTO_V1: u8 = 1u8;
 const _PROTO_V2: u8 = 2u8;
 const _PROTO_V3: u8 = 3u8;
-const PROTO_V4: u8 = 4u8;
+const _PROTO_V4: u8 = 4u8;
+const PROTO_V5: u8 = 5u8;
 
 /// v4: every connection starts with a one-byte transport selector (`0x00`
 /// plain / `0x01` noise) so the server can accept both transports on one
@@ -34,27 +35,42 @@ const PROTO_V4: u8 = 4u8;
 /// [`ControlChannelCmd::CreateDataChannelForStripe`], carrying the group's
 /// fixed 4-byte id and the stripe's index and count, so the client knows which
 /// opens belong together and reserves one tunnel per stripe. Before this the K
-/// requests were indistinguishable from K separate visitors, and a cold pool —
-/// the elastic pool's default state is *zero* tunnels — placed the whole group
-/// on one tunnel: the group still worked, but the spread D24 asks for was gone.
+/// requests were indistinguishable from K separate visitors, and the whole group
+/// landed on one tunnel: the group still worked, but the spread D24 asks for
+/// was gone.
 /// The data plane (hellos, prologue, the striping frames) is unchanged.
 ///
-/// Which dialect a release speaks, and when the number moves: AGENTS.md §5.
-pub const PROTO_V4_VERSION: ProtocolVersion = PROTO_V4;
+/// v4's number, kept for the refusal tests: this build speaks v5 and a v4
+/// hello must be turned away with the version the peer actually sent.
+#[cfg(test)]
+pub const PROTO_V4_VERSION: ProtocolVersion = _PROTO_V4;
+
+/// v5 adds one service type and one data-channel command, nothing else: a
+/// registration may declare `ServiceType::Transparent`, whose `bind_addr` is a
+/// public `ip:port` the client *claims* rather than a listener the server
+/// binds, and whose data channel carries whole IP packets — framed
+/// `[u16 length][packet]` by [`IpTraffic`] — once the server has announced it
+/// with [`DataChannelCmd::StartForwardTransparent`]. The server keeps no
+/// per-visitor state for such a service: it routes packets it was given by the
+/// host's own routing, and the client's kernel owns the connections.
+///
+/// The selector byte, the session handshake, the service prologue, the
+/// striping frames and the UDP framing are unchanged from v4.
+pub const PROTO_V5_VERSION: ProtocolVersion = PROTO_V5;
 
 /// The dialect this build *speaks*: the version it puts in the hellos it
 /// originates. It is deliberately separate from [`SUPPORTED_PROTO_VERSIONS`],
 /// because a server has to keep serving the dialects it no longer speaks.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V4_VERSION;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V5_VERSION;
 
 /// The dialect a *server* accepts, and the only one it speaks.
 ///
-/// v3 (one service per control connection, a registration carrying a requested
-/// channel count) stopped being served when v4 landed in 0.10.0: this project
-/// is self-hosted, both ends are the same binary, and a wire break is
-/// announced on the connection it happens on (see [`read_hello`]). Anything
-/// else is refused there, loudly, with the version the peer actually sent.
-pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V4_VERSION];
+/// v4 (one control session per endpoint, service-id-carrying commands) stopped
+/// being served when v5 landed: this project is self-hosted, both ends are the
+/// same binary, and a wire break is announced on the connection it happens on
+/// (see [`read_hello`]). Anything else is refused there, loudly, with the
+/// version the peer actually sent.
+pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V5_VERSION];
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
@@ -78,14 +94,14 @@ pub enum Carrier {
 }
 
 impl Carrier {
-    /// Map the client's config-side carrier to the wire value. Only
-    /// exists with the `multiplex` feature (the `DataCarrier` type is
-    /// feature-gated); without it the data plane is always TCP.
+    /// The wire value of the carrier the client will try first. Only exists with
+    /// the `multiplex` feature (the runtime carrier type is feature-gated);
+    /// without it the data plane is always TCP.
     #[cfg(feature = "multiplex")]
-    pub fn from_data_carrier(c: crate::config::DataCarrier) -> Carrier {
+    pub fn from_data_carrier(c: crate::transport::multiplex::Carrier) -> Carrier {
         match c {
-            crate::config::DataCarrier::Tcp => Carrier::Tcp,
-            crate::config::DataCarrier::Kcp => Carrier::Kcp,
+            crate::transport::multiplex::Carrier::Tcp => Carrier::Tcp,
+            crate::transport::multiplex::Carrier::Kcp => Carrier::Kcp,
         }
     }
 }
@@ -98,8 +114,8 @@ impl Carrier {
 /// client and validated against the server-side policy (`allow_ports`).
 ///
 /// It carries no channel count: the tunnel pool is the client's own,
-/// per-carrier concern and grows on demand (D5), so a registration asks for
-/// the service and nothing about how it will be carried.
+/// per-carrier concern, sized there (D5), so a registration asks for the
+/// service and nothing about how it will be carried.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ServiceRegistration {
     pub name: String,
@@ -144,6 +160,106 @@ impl std::fmt::Display for ServiceId {
     }
 }
 
+/// The identity of one **physical** data connection — a transparent lane, or
+/// one tunnel of a pool.
+///
+/// Four wire bytes, never a varint, for the reason [`ServiceId`] states: every
+/// command that carries one has a value-independent length, so a tag-dispatched
+/// reader knows exactly how many bytes follow.
+///
+/// This exists because a carrier's quality can only be compared *per lane*, and
+/// a lane is not its slot: a slot is a routing index one end reuses (a
+/// replacement inherits its predecessor's), while a lane is the connection that
+/// actually rode some carrier for some stretch of time. Two ends agree on a
+/// lane because its dialer named it in the prologue, not because both counted
+/// to the same index — which is what lets the *other* end say what it received
+/// from a lane this end can no longer see (a retired one included).
+///
+/// Unique per control session, and meaningless across sessions: it is a
+/// correlation key for the lifetime of one session, not a global name.
+#[cfg_attr(
+    not(any(
+        feature = "client",
+        all(feature = "transparent", feature = "multiplex")
+    )),
+    expect(
+        dead_code,
+        reason = "a lane id is named by a client and read by the transparent server path; \
+                  a build with neither has no lane to name"
+    )
+)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LaneId(pub [u8; 4]);
+
+// `get` is reached through `Display`, which is never dead (a trait impl is
+// reachable by construction); `new` is what a build that dials a lane uses, and
+// a build that only carries the type in a signature has no lane to mint.
+impl LaneId {
+    /// Wrap a numeric id as its big-endian wire form.
+    #[cfg_attr(
+        not(all(feature = "transparent", feature = "multiplex")),
+        expect(
+            dead_code,
+            reason = "only a transparent build mints a lane id; the others carry the type"
+        )
+    )]
+    #[must_use]
+    pub fn new(raw: u32) -> Self {
+        LaneId(raw.to_be_bytes())
+    }
+
+    /// The numeric form, for logs and for the client's own bookkeeping.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+}
+
+impl std::fmt::Display for LaneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+/// The identity of one **multiplexed tunnel**, as the end that dialed it names
+/// it.
+///
+/// Four raw bytes, never a varint, for the reason [`ServiceId`] states. A tunnel
+/// is a physical connection the client's pool holds, and its id is what lets the
+/// server attribute what it offered and what that tunnel's streams refused —
+/// per *tunnel*, not per pool, because a pool's tunnels can end up on different
+/// carriers (a repair rides the one the endpoint prefers now).
+///
+/// It rides in a stream's prologue rather than in the tunnel hello, which is
+/// where it started: the hello has no length prefix and every variant is the
+/// same size, so a field there would have to be added to all three, while the
+/// prologue is one path that already exists on both ends.
+#[cfg(feature = "multiplex")]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TunnelId(pub [u8; 4]);
+
+#[cfg(feature = "multiplex")]
+impl TunnelId {
+    /// Wrap a numeric id as its big-endian wire form.
+    #[must_use]
+    pub fn new(raw: u32) -> Self {
+        TunnelId(raw.to_be_bytes())
+    }
+
+    /// The numeric form, for logs and for the client's own bookkeeping.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+}
+
+#[cfg(feature = "multiplex")]
+impl std::fmt::Display for TunnelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
 /// One service registration inside a v4 session: the service's own credential
 /// (`digest(service_token ‖ nonce)`) plus the registration it authorizes.
 ///
@@ -165,6 +281,22 @@ pub struct SessionRegistration {
 pub enum SessionCmd {
     Register(SessionRegistration),
     Deregister(ServiceId),
+    /// Ask the server to stop placing **new** flows in one of a claim's lanes,
+    /// so the lane can be retired once both ends agree it is empty.
+    ///
+    /// A lane's flows are placed by each end for its own direction, and the
+    /// end that dialed the lane cannot see the flows the peer placed on it. So
+    /// a lane may only end when both ends have stopped placing new flows in it
+    /// *and* have none left: the alternative — ending it on this end's word
+    /// alone — is the retired-lane black hole (HANDOFF.md), where the peer kept
+    /// writing into a connection nothing read. The lane id is the one the dialer
+    /// named in the channel's prologue, so both ends are talking about the same
+    /// connection rather than about an index either of them reuses.
+    DrainLane(ServiceId, [u8; 4]),
+    /// Put a lane back in service: the drain could not be completed (a flow
+    /// outlived the budget, or the replacement never came up), and a claim with
+    /// a lane nobody may use is worse than the carrier it was trying to leave.
+    CancelDrain(ServiceId, [u8; 4]),
 }
 
 /// Upper bound for the encoded size of a [`SessionCmd`] frame: a registration
@@ -278,7 +410,7 @@ pub enum ControlChannelCmd {
     /// order, and the session reader tells an ack frame from a command by the
     /// first byte — an ack's is its length's high byte, which is `0` as long
     /// as the frame stays under 256 bytes. Keeping a variant at tag 0 is what
-    /// makes every command this build does speak sit at 1..=4, where that
+    /// makes every command this build does speak sit at 1..=5, where that
     /// disambiguation holds.
     CreateDataChannel,
     HeartBeat,
@@ -298,7 +430,7 @@ pub enum ControlChannelCmd {
     ///
     /// The point of the command is that the client learns *which opens belong
     /// together* before it places them, so it can reserve one tunnel per stripe
-    /// instead of letting a cold pool put the whole group on one tunnel (D24).
+    /// instead of stacking the whole group on one tunnel (D24).
     /// A plain visitor's request keeps the 4-byte form: only a stripe group
     /// carries the group and its index.
     ///
@@ -307,7 +439,102 @@ pub enum ControlChannelCmd {
     /// index and count are `u8`s, so the tag alone still decides that exactly
     /// 10 bytes follow.
     CreateDataChannelForStripe(ServiceId, [u8; 4], u8, u8),
+    /// What the **server** offered one of a claim's lanes, and what that lane's
+    /// queue refused — the half of the evidence the client cannot see.
+    ///
+    /// The client decides which carrier a lane should ride, and on a
+    /// transparent claim the loss that matters happens where the packets are
+    /// *offered*: the server reads the visitor's traffic off its own device and
+    /// hands it to the lanes, so a lane whose queue refuses 44 % of what it is
+    /// offered is a carrier that is not delivering — and the client's own
+    /// counters (which only ever see what arrived) read zero for exactly that
+    /// lane. Without this report the deciding end has no evidence of the only
+    /// place the loss happens.
+    ///
+    /// Fixed width on purpose, like every other session command: four raw
+    /// byte-array fields rather than `u32`s (postcard varints integers), so the
+    /// tag alone decides that exactly 17 bytes follow — service, lane, offered,
+    /// refused, and the sample's sequence.
+    ///
+    /// The counters are cumulative for the lane's life and saturate at
+    /// `u32::MAX`; the sequence is what lets the receiver tell a fresh report
+    /// from one that overtook it, and a *delta* is what a policy compares.
+    CarrierReport(ServiceId, [u8; 4], [u8; 4], [u8; 4], u8),
+    /// What became of a [`SessionCmd::DrainLane`] for one lane.
+    ///
+    /// The client asked the server to stop placing new flows in a lane; this is
+    /// the server's answer, and it is the *other half* of the agreement a
+    /// retirement needs. `state` is one of the `LANE_DRAIN_*` values: still
+    /// draining (flows the server placed are still talking), ready (the server
+    /// holds no flow in it), or unknown (the lane is not one this server holds —
+    /// already gone, or never its business).
+    ///
+    /// Fixed width: four raw bytes of service id, four of lane id, one of state.
+    LaneDrainAck(ServiceId, [u8; 4], u8),
+    /// What the **server's** session for one tunnel has emitted and re-sent.
+    ///
+    /// The L4 half of [`Self::CarrierReport`], and for the same reason: the
+    /// client dials the tunnels and decides their carrier, while on a path that
+    /// polices UDP the loss happens where the traffic is *offered* — the
+    /// server's sends into a policed carrier never arrive, so its ARQ re-sends
+    /// them, and the client's own counters (which only see what arrived) read
+    /// nothing. Measured on the policed condition: the server's sessions
+    /// re-sent **22.9 %** of what they emitted while the client's own read
+    /// 0.04 % — a separation the deciding end cannot see without this frame.
+    ///
+    /// Fixed width, like every other session command: four raw byte-array fields
+    /// rather than `u32`s (postcard varints integers), so the tag alone decides
+    /// that exactly 21 bytes follow — service, tunnel id, datagrams out,
+    /// retransmits, **bytes handed to the tunnel** and the sample's sequence. The service is what the client
+    /// routes by (a session's pools are per service, and a shared pool serves
+    /// several), exactly as [`Self::CarrierReport`]'s is; the tunnel id is the
+    /// same number that tunnel's stream prologue carries. The counters are
+    /// cumulative for the tunnel connection's life and saturate; the sequence
+    /// tells a fresh report from one that overtook it.
+    ///
+    /// The byte count is the field that makes a **delivery ratio** possible, and
+    /// it is what the ARQ counters failed to be: a share of re-sent datagrams
+    /// cannot tell a policed path from a merely lossy one — measured, the two
+    /// classes overlap (healthy median 3.5 %, policed 28.7 %) and a rule on that
+    /// signal fires on both (HANDOFF.md, round 6). What the deciding end can
+    /// compare is what the peer *handed* this tunnel against what it *received*
+    /// from it: policed ~10-20 %, healthy ~95-100 %.
+    TunnelHealth(ServiceId, [u8; 4], [u8; 4], [u8; 4], [u8; 4], u8),
 }
+
+/// [`ControlChannelCmd::LaneDrainAck`] states: the server is draining the lane
+/// and its own flows are still talking.
+#[cfg_attr(
+    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_PENDING: u8 = 0;
+/// The server holds no flow in the lane: its half of the agreement is met.
+#[cfg_attr(
+    not(all(feature = "transparent", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_READY: u8 = 1;
+/// The lane is not one this server holds (already ended, or never registered).
+///
+/// Every build answers with this one: a build that cannot drain anything says
+/// so, which is what keeps the client's handling one shape.
+pub const LANE_DRAIN_UNKNOWN: u8 = 2;
+/// The drain was called off: the lane takes new flows again.
+#[cfg_attr(
+    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "only a build that can drain a lane has a use for the state"
+    )
+)]
+pub const LANE_DRAIN_CANCELLED: u8 = 3;
 
 /// Variant names mirror the wire contract and stay stable across versions.
 #[expect(clippy::enum_variant_names, reason = "wire-contract variant names")]
@@ -334,6 +561,15 @@ pub enum DataChannelCmd {
     /// them unchanged. A peer that does not know this variant fails loudly
     /// on the unknown tag instead of silently reframing payload bytes.
     StartForwardStripedTcp([u8; 4], u8, u8),
+    /// Transparent forwarding: this data channel carries whole IP packets for
+    /// the service the stream's prologue named, framed `[u16 length][packet]`
+    /// by [`IpTraffic`]. The client's host owns the claimed address, so the
+    /// packets are injected on its side and its kernel answers the visitor;
+    /// the server never pairs a visitor with this channel.
+    ///
+    /// A unit variant like the other fixed-size data commands: the tag alone
+    /// decides the length the reader must consume.
+    StartForwardTransparent,
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -517,6 +753,167 @@ pub fn digest(data: &[u8]) -> Digest {
     d.into()
 }
 
+/// The framing of a transparent data channel: `[u32 length][vnet frame]`, in
+/// both directions.
+///
+/// A namespace type rather than a painted buffer — the packet's destination
+/// lives *inside* it, so unlike [`UdpTraffic`] there is no address tag to
+/// carry, and callers read straight into their own scratch buffer.
+///
+/// The "vnet frame" is the whole unit off the TUN device: the 10-byte
+/// virtio-net header followed by the packet (or GSO super-frame) it
+/// describes. The frame is relayed **whole** — the reader hands it over
+/// including the header, and the injection side writes it back with the
+/// header — because a `NEEDS_CSUM` frame only checksums correctly when the
+/// header travels with it, and a GSO super-frame only re-segments at the far
+/// end when its `gso_size` arrives intact.
+///
+/// The length prefix is `u32` (the old `u16` would have capped a frame below
+/// what the device can hand over: a GSO super-frame reaches ~65 560 bytes,
+/// past any 16-bit ceiling).
+// Present where it is carried (the transparent data path) or exercised (this
+// module's own framing tests): a build with neither would only know it as dead
+// code, and the tests would not compile without it.
+/// The 10-byte virtio-net header the transparent path relays in front of
+/// every frame (`include/uapi/linux/virtio_net.h`).
+///
+/// Declared here, not on the TUN side, because the transparent framing
+/// (`IpTraffic`) counts it — its length prefix is the frame's whole size,
+/// header included — and the framing compiles in builds whose `transparent`
+/// feature is off. The TUN side re-exports it as its own. Same gate as
+/// [`IpTraffic`]: without the framing there is nothing to count it into, and
+/// an unused constant is a dead one.
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub const VNET_HDR_LEN: usize = 10;
+
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub struct IpTraffic;
+
+/// How much room a read makes for frames it has not parsed yet. One read of
+/// this size carries a whole batch from the far side, so the per-frame cost is
+/// a slice, not a syscall. Sized for the largest unit the transparent path
+/// moves: a GSO super-frame (up to ~64 KiB) plus its virtio-net header.
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+const IP_READ_CHUNK: usize = 68 * 1024;
+
+/// Frames read from a transparent channel, with the reads batched.
+///
+/// The far side writes a run of frames per write, so one read can carry many
+/// packets: parsing them out of a buffer costs one syscall per *run* instead of
+/// two per frame, and the caller then walks a whole burst without awaiting
+/// between packets. Both halves of the data path are batched for the same
+/// reason — the measurement is in
+/// [benchmarks.md](../docs/benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model).
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+pub struct IpFrames<R> {
+    reader: R,
+    /// Bytes read ahead and not yet turned into frames.
+    buf: BytesMut,
+    /// Where the unconsumed part starts.
+    start: usize,
+}
+
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+impl<R: AsyncRead + Unpin> IpFrames<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: BytesMut::new(),
+            start: 0,
+        }
+    }
+
+    /// The next frame — the whole `[vnet header][packet]` unit.
+    ///
+    /// The returned slice starts at the virtio-net header and stays valid
+    /// until the next call. The end of the stream is an error, not an empty
+    /// frame: this channel exists only while its service does, and the caller
+    /// answers a channel that ended by asking for another one.
+    pub async fn next(&mut self) -> Result<&[u8]> {
+        loop {
+            if let Some(len) = IpTraffic::frame_at(&self.buf[self.start..])? {
+                let start = self.start + 4;
+                self.start = start + len;
+                return Ok(&self.buf[start..start + len]);
+            }
+            self.read_more().await?;
+        }
+    }
+
+    /// Read more from the tunnel, compacting what is left first so a part-read
+    /// frame stays at the front.
+    async fn read_more(&mut self) -> Result<()> {
+        if self.start > 0 {
+            // Inherent on `BytesMut`, and it drops exactly the consumed prefix.
+            let _consumed = self.buf.split_to(self.start);
+            self.start = 0;
+        }
+        self.buf.reserve(IP_READ_CHUNK);
+        let read = self
+            .reader
+            .read_buf(&mut self.buf)
+            .await
+            .with_context(|| "Failed to read IP frames")?;
+        if read == 0 {
+            let leftover = self.buf.len();
+            if leftover > 0 {
+                bail!("Transparent channel ended mid-frame ({leftover} bytes left)");
+            }
+            bail!("Transparent channel ended");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+impl IpTraffic {
+    /// Append one **whole device frame** (virtio-net header already in front)
+    /// to a batch as a `[u32 length][frame]` entry.
+    ///
+    /// Synchronous on purpose: a frame is framed where it is read, so a whole
+    /// batch of frames can be handed over and written as one unit. Nothing is
+    /// prepended here — the caller's frame is exactly the unit the device
+    /// produced, and it is relayed byte for byte; the length prefix is the
+    /// frame's own size, which is what [`Self::frame_at`] on the far side
+    /// expects.
+    pub fn encode_into(batch: &mut BytesMut, frame: &[u8]) -> Result<()> {
+        let len = u32::try_from(frame.len()).with_context(|| {
+            format!(
+                "device frame of {} bytes exceeds the wire format limit",
+                frame.len()
+            )
+        })?;
+        batch.reserve(4 + frame.len());
+        batch.put_u32(len);
+        batch.extend_from_slice(frame);
+        Ok(())
+    }
+
+    /// The length of the frame at the front of `available`, when all of it is
+    /// there — the frame format's only reader, so the writer and the reader
+    /// cannot drift apart.
+    ///
+    /// A frame shorter than the virtio-net header cannot name a packet; a
+    /// zero-length frame is a protocol error rather than an empty packet.
+    pub fn frame_at(available: &[u8]) -> Result<Option<usize>> {
+        let Some(header) = available.first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(*header);
+        if len == 0 {
+            bail!("Empty IP frame: the stream is corrupt");
+        }
+        let len = len as usize;
+        if len < VNET_HDR_LEN {
+            bail!("IP frame shorter than its virtio-net header ({len} bytes)");
+        }
+        if available.len() < 4 + len {
+            return Ok(None);
+        }
+        Ok(Some(len))
+    }
+}
+
 struct PacketLength {
     hello: usize,
     #[cfg(feature = "client")]
@@ -587,6 +984,45 @@ pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(
     Ok((version, hello))
 }
 
+/// The prologue a stream of a **multiplexed tunnel** opens with: the service it
+/// serves, and the tunnel carrying it.
+///
+/// Eight raw bytes, the same shape [`write_lane_prologue`] uses for a claim's
+/// lane, and for the same reason: the receiving end has to be able to talk about
+/// the *connection* a stream arrived on, and a service id alone cannot say which
+/// one it was.
+#[cfg(all(feature = "client", feature = "multiplex"))]
+pub async fn write_tunnel_prologue<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    service_id: ServiceId,
+    tunnel: TunnelId,
+) -> Result<()> {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&service_id.0);
+    buf[4..].copy_from_slice(&tunnel.0);
+    conn.write_all(&buf)
+        .await
+        .with_context(|| "Failed to write the v5 tunnel prologue")?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Read the prologue written by [`write_tunnel_prologue`].
+#[cfg(all(feature = "server", feature = "multiplex"))]
+pub async fn read_tunnel_prologue<T: AsyncRead + Unpin>(
+    conn: &mut T,
+) -> Result<(ServiceId, TunnelId)> {
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read the v5 tunnel prologue")?;
+    let mut service = [0u8; 4];
+    let mut tunnel = [0u8; 4];
+    service.copy_from_slice(&buf[..4]);
+    tunnel.copy_from_slice(&buf[4..]);
+    Ok((ServiceId(service), TunnelId(tunnel)))
+}
+
 /// Write the 4-byte service prologue that opens every stream of a v4 data
 /// plane: a direct data channel (right after its hello) and every stream
 /// inside a multiplexed tunnel alike.
@@ -615,6 +1051,86 @@ pub async fn read_stream_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<
         .await
         .with_context(|| "Failed to read the v4 service prologue")?;
     Ok(ServiceId(buf))
+}
+
+/// The prologue a **lane** opens with: the service it serves, and the identity
+/// of the physical connection carrying it.
+///
+/// The lane id rides here rather than in a later frame because the two facts
+/// are one opening act: a reader that knows the service but not the lane cannot
+/// tell this connection from the one that replaced it, and the retired-lane
+/// black hole (HANDOFF.md) is exactly a peer that kept writing into a
+/// connection the other end had already let go. Naming the lane up front is
+/// what lets the *other* end report what it received from a lane this end no
+/// longer holds.
+///
+/// Eight raw bytes, never varints: the tag-dispatched reader of a data channel
+/// consumes a fixed prologue, so its length must not depend on either value.
+#[cfg(all(feature = "client", feature = "transparent", feature = "multiplex"))]
+pub async fn write_lane_prologue<T: AsyncWrite + Unpin>(
+    conn: &mut T,
+    service_id: ServiceId,
+    lane: LaneId,
+) -> Result<()> {
+    let mut buf = [0u8; 8];
+    buf[..4].copy_from_slice(&service_id.0);
+    buf[4..].copy_from_slice(&lane.0);
+    conn.write_all(&buf)
+        .await
+        .with_context(|| "Failed to write the v4 lane prologue")?;
+    conn.flush().await?;
+    Ok(())
+}
+
+/// Read the whole lane prologue in one 8-byte read: the round-trip form, and
+/// the only place the two halves' order is pinned.
+///
+/// The server's own path cannot use it: a direct channel's prologue is the
+/// first bytes on the channel, so the server has to learn the *width* from the
+/// registered service before it reads (`read_channel_prologue` reads the
+/// service id, then the lane half). Both go through the same constants here,
+/// so the two cannot drift apart.
+/// Read the **lane half** of a prologue: the four bytes that follow the
+/// service id, and only they.
+///
+/// Split so the server can use it on the path it actually has: a direct data
+/// channel's prologue is the first thing on the channel, so its *width* has to
+/// be known before anything is read, and the width is a property of the
+/// registered service (`read_channel_prologue` looks the service up, reads its
+/// id, then calls this for the lane that follows). The whole-prologue form is
+/// what the round-trip test pins.
+#[cfg(all(
+    feature = "server",
+    feature = "transparent",
+    feature = "multiplex",
+    target_os = "linux"
+))]
+pub async fn read_lane_half<T: AsyncRead + Unpin>(conn: &mut T) -> Result<LaneId> {
+    let mut lane = [0u8; 4];
+    conn.read_exact(&mut lane)
+        .await
+        .with_context(|| "Failed to read the v4 lane prologue")?;
+    Ok(LaneId(lane))
+}
+
+#[cfg(all(
+    test,
+    feature = "server",
+    feature = "client",
+    feature = "transparent",
+    feature = "multiplex",
+    target_os = "linux"
+))]
+pub async fn read_lane_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ServiceId, LaneId)> {
+    let mut buf = [0u8; 8];
+    conn.read_exact(&mut buf)
+        .await
+        .with_context(|| "Failed to read the v4 lane prologue")?;
+    let mut service = [0u8; 4];
+    let mut lane = [0u8; 4];
+    service.copy_from_slice(&buf[..4]);
+    lane.copy_from_slice(&buf[4..]);
+    Ok((ServiceId(service), LaneId(lane)))
 }
 
 #[cfg(feature = "server")]
@@ -701,9 +1217,9 @@ pub async fn write_register_result<T: AsyncWrite + Unpin>(conn: &mut T, ack: &Ac
 /// same reason as [`read_register_result`].
 #[cfg(feature = "client")]
 pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<ControlChannelCmd> {
-    // 1 tag byte + the largest suffix below (a service id, a group id, an
-    // index and a count: the stripe request's 10 bytes).
-    let mut buf = [0u8; 11];
+    // 1 tag byte + the largest suffix below (the tunnel health report's 21
+    // bytes: service, tunnel, emitted, re-sent, handed over, sequence).
+    let mut buf = [0u8; 22];
     conn.read_exact(&mut buf[..1])
         .await
         .with_context(|| "Failed to read cmd")?;
@@ -712,6 +1228,11 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
         1 => return Ok(ControlChannelCmd::HeartBeat),
         2 | 3 => 4,
         4 => 10,
+        // The lane report is 17 bytes (service + four fields + sequence); the
+        // tunnel report is 21 (the same, plus the bytes handed over).
+        5 => 17,
+        7 => 21,
+        6 => 9,
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -727,12 +1248,57 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
                 ControlChannelCmd::ServiceDropped(service_id)
             }
         }
+        // The carrier report: raw fixed-width fields, decoded by hand because
+        // postcard would varint the integers and move the frame's length with
+        // their values (see the variant's own note).
+        5 => {
+            let mut service = [0u8; 4];
+            let mut lane = [0u8; 4];
+            let mut offered = [0u8; 4];
+            let mut refused = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            lane.copy_from_slice(&buf[5..9]);
+            offered.copy_from_slice(&buf[9..13]);
+            refused.copy_from_slice(&buf[13..17]);
+            ControlChannelCmd::CarrierReport(ServiceId(service), lane, offered, refused, buf[17])
+        }
+        // The drain answer: service, lane, state — the same hand-decoded
+        // fixed-width form as the report, and for the same reason.
+        6 => {
+            let mut service = [0u8; 4];
+            let mut lane = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            lane.copy_from_slice(&buf[5..9]);
+            ControlChannelCmd::LaneDrainAck(ServiceId(service), lane, buf[9])
+        }
+        // The tunnel health report: tunnel, emitted, re-sent, sequence — the
+        // same hand-decoded fixed-width form the lane report uses.
+        7 => {
+            let mut service = [0u8; 4];
+            let mut tunnel = [0u8; 4];
+            let mut out = [0u8; 4];
+            let mut resent = [0u8; 4];
+            let mut handed = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            tunnel.copy_from_slice(&buf[5..9]);
+            out.copy_from_slice(&buf[9..13]);
+            resent.copy_from_slice(&buf[13..17]);
+            handed.copy_from_slice(&buf[17..21]);
+            ControlChannelCmd::TunnelHealth(
+                ServiceId(service),
+                tunnel,
+                out,
+                resent,
+                handed,
+                buf[21],
+            )
+        }
         // The only tag left is 4, the stripe request: the dispatch above
-        // returned on 0 and 1 and bailed on everything but 2, 3 and 4. Parsed
-        // with postcard as one tuple rather than field by field, so the reader
-        // and the writer agree on the layout by construction: a reordered or
-        // resized field fails here instead of silently reading the next
-        // frame's bytes as an index.
+        // returned on 0 and 1 and bailed on everything but 2, 3, 4, 5, 6 and 7.
+        // Parsed with postcard as one tuple rather than field by field, so the
+        // reader and the writer agree on the layout by construction: a
+        // reordered or resized field fails here instead of silently reading the
+        // next frame's bytes as an index.
         _ => {
             let (service_id, group, index, count): (ServiceId, [u8; 4], u8, u8) =
                 postcard::from_bytes(&buf[1..11]).with_context(|| "Failed to deserialize cmd")?;
@@ -807,6 +1373,12 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
             return Ok(DataChannelCmd::StartForwardUdp);
         }
         2 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
+        3 => {
+            // StartForwardTransparent is a unit variant, so the tag alone is
+            // the whole command and the channel's IP framing starts right
+            // after it.
+            return Ok(DataChannelCmd::StartForwardTransparent);
+        }
         tag => bail!("Unknown data channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -1313,6 +1885,55 @@ mod tests {
         }
     }
 
+    /// A tunnel's prologue is eight fixed bytes — the service, then the tunnel
+    /// — and it round-trips as the pair the server attributes a stream by.
+    ///
+    /// The width is the contract: the server reads exactly this many bytes, and
+    /// a field added here without a matching reader would reframe every
+    /// following byte of the stream.
+    #[cfg(all(feature = "client", feature = "server", feature = "multiplex"))]
+    #[tokio::test]
+    async fn a_tunnel_prologue_carries_the_service_and_the_tunnel() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        let service = ServiceId::new(0x0BAD_F00D);
+        let tunnel = TunnelId::new(0x0000_1234);
+        write_tunnel_prologue(&mut tx, service, tunnel)
+            .await
+            .unwrap();
+        let (read_service, read_tunnel) = read_tunnel_prologue(&mut rx).await.unwrap();
+        assert_eq!(read_service, service);
+        assert_eq!(read_tunnel, tunnel);
+        assert_eq!(read_tunnel.get(), 0x1234);
+    }
+
+    /// A lane's prologue is eight fixed bytes — the service, then the lane —
+    /// and it round-trips as the pair the reader needs. The lane half is what
+    /// lets two ends talk about one physical connection without agreeing on an
+    /// index: a slot is one end's routing bookkeeping and is reused, a lane is
+    /// the connection that actually rode a carrier.
+    #[cfg(all(
+        feature = "client",
+        feature = "server",
+        feature = "transparent",
+        feature = "multiplex",
+        target_os = "linux"
+    ))]
+    #[tokio::test]
+    async fn a_lane_prologue_carries_the_service_and_the_lane() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        let service = ServiceId::new(0xDEAD_BEEF);
+        let lane = LaneId::new(0x00C0_FFEE);
+        write_lane_prologue(&mut tx, service, lane).await.unwrap();
+        let (read_service, read_lane) = read_lane_prologue(&mut rx).await.unwrap();
+        assert_eq!(read_service, service);
+        assert_eq!(read_lane, lane);
+        assert_eq!(read_lane.get(), 0x00C0_FFEE);
+    }
+
     /// The prologue is exactly four raw bytes, written in big-endian order,
     /// and nothing else precedes a v4 stream's first byte.
     #[cfg(all(feature = "client", feature = "server"))]
@@ -1354,25 +1975,27 @@ mod tests {
         }
     }
 
-    /// The v4 data-channel handshake: the hello stays 34 bytes, and the four
+    /// The data-channel handshake: the hello stays 34 bytes, and the four
     /// service bytes follow it — which is where the server reads them.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
-    async fn v4_data_channel_carries_the_service_after_the_hello() {
+    async fn data_channel_carries_the_service_after_the_hello() {
         use tokio::io::duplex;
 
         let (mut tx, mut rx) = duplex(128);
         let nonce = sample_digest(9);
         let id = ServiceId::new(0x0102_0304);
-        let hello = postcard::to_stdvec(&Hello::DataChannelHello(PROTO_V4_VERSION, nonce)).unwrap();
+        let hello =
+            postcard::to_stdvec(&Hello::DataChannelHello(CURRENT_PROTO_VERSION, nonce)).unwrap();
         assert_eq!(hello.len(), PacketLength::new().hello);
         tx.write_all(&hello).await.unwrap();
         write_stream_prologue(&mut tx, id).await.unwrap();
 
         let (version, back) = read_hello(&mut rx).await.unwrap();
-        assert_eq!(version, PROTO_V4_VERSION);
+        assert_eq!(version, CURRENT_PROTO_VERSION);
         assert!(matches!(back, Hello::DataChannelHello(_, n) if n == nonce));
-        // Only now, and only for v4, does the server read the prologue.
+        // Only now, and only after the hello, does the server read the
+        // prologue: it is what names the service the channel carries.
         assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), id);
     }
 
@@ -1643,5 +2266,183 @@ mod tests {
         tx.write_u16(over_cap).await.unwrap();
         let err = read_session_cmd(&mut rx).await.unwrap_err();
         assert!(format!("{err:#}").contains("too large"));
+    }
+
+    /// A lane-drain ask and its answer round-trip, and the answer is exactly
+    /// the width the reader assumes.
+    ///
+    /// The width matters more than usual here: the client's reader decides how
+    /// many bytes to consume from the tag alone, so a drain answer that grew a
+    /// field would silently reframe the *next* command on the session.
+    #[tokio::test]
+    async fn a_lane_drain_ask_and_its_answer_roundtrip() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(4096);
+        write_session_cmd(
+            &mut tx,
+            &SessionCmd::DrainLane(ServiceId::new(7), [1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let back = read_session_cmd(&mut rx).await.unwrap();
+        assert!(matches!(
+            back,
+            SessionCmd::DrainLane(id, lane) if id == ServiceId::new(7) && lane == [1, 2, 3, 4]
+        ));
+        write_session_cmd(
+            &mut tx,
+            &SessionCmd::CancelDrain(ServiceId::new(7), [1, 2, 3, 4]),
+        )
+        .await
+        .unwrap();
+        let back = read_session_cmd(&mut rx).await.unwrap();
+        assert!(matches!(back, SessionCmd::CancelDrain(..)));
+
+        // The answer: tag 6, then service, lane and state — 9 bytes, whatever
+        // the values are (the state is one byte, not a varint).
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_all(&[
+            6, 0, 0, 0, 7, // service 7
+            1, 2, 3, 4, // lane
+            1, // ready
+        ])
+        .await
+        .unwrap();
+        let back = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(
+            back,
+            ControlChannelCmd::LaneDrainAck(id, lane, state)
+                if id == ServiceId::new(7) && lane == [1, 2, 3, 4] && state == 1
+        ));
+
+        // And a following command still lands on its own tag: the answer's
+        // length is what makes that true.
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_all(&[6, 0, 0, 0, 7, 1, 2, 3, 4, 0, 1])
+            .await
+            .unwrap();
+        let first = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(first, ControlChannelCmd::LaneDrainAck(..)));
+        let second = read_control_cmd(&mut rx).await.unwrap();
+        assert!(matches!(second, ControlChannelCmd::HeartBeat));
+    }
+
+    /// The transparent data channel's framing: `[u16 length][vnet frame]`, and
+    /// the frame comes back byte for byte -- header included, which is the
+    /// whole point of this service type.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_roundtrip_preserves_the_packet() {
+        use tokio::io::duplex;
+
+        // A minimal but well-formed IPv4 header (20 bytes) plus payload.
+        let mut packet = vec![
+            0x45, 0x00, 0x00, 0x28, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 2,
+        ];
+        packet.extend_from_slice(&[10, 0, 0, 1]);
+        packet.extend_from_slice(b"payload");
+        // The frame is the whole device unit: virtio-net header first.
+        let mut frame = vec![0u8; VNET_HDR_LEN];
+        frame.extend_from_slice(&packet);
+
+        let (mut tx, mut rx) = duplex(4096);
+        // A batch of one here; the writer hands over whole batches.
+        let mut batch = BytesMut::new();
+        IpTraffic::encode_into(&mut batch, &frame).unwrap();
+        tx.write_all(&batch).await.unwrap();
+
+        let mut frames = IpFrames::new(&mut rx);
+        let got = frames.next().await.unwrap();
+        assert_eq!(got, &frame[..], "the frame must survive verbatim");
+        // And the packet is still readable past the header.
+        assert_eq!(&got[VNET_HDR_LEN..], &packet[..]);
+    }
+
+    /// A zero-length prefix is a corrupt stream, not an empty packet, and the
+    /// reader names it; an over-limit frame is refused by the writer before
+    /// anything reaches the channel. (The length ceiling itself is `u32` now —
+    /// the device's ~66 KiB super-frames have to fit — so the oversized case
+    /// is the writer's refusal, not the reader's.)
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_rejects_empty_and_oversized() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        tx.write_u32(0).await.unwrap();
+        let mut frames = IpFrames::new(&mut rx);
+        let err = frames.next().await.unwrap_err();
+        assert!(format!("{err:#}").contains("Empty IP frame"));
+
+        // A frame the writer cannot name (past the u32 prefix) is refused
+        // while the batch is built, before anything reaches the channel. The
+        // 5 GiB frame only exists on a 64-bit target; the assertion that
+        // matters is the refusal, not the size.
+        let mut batch = BytesMut::new();
+        #[cfg(target_pointer_width = "64")]
+        {
+            let oversized: Box<[u8]> = vec![0u8; 5 * 1024 * 1024 * 1024].into_boxed_slice();
+            let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
+            assert!(format!("{err:#}").contains("exceeds the wire format limit"));
+            assert!(
+                batch.is_empty(),
+                "a refused frame must not leave a partial frame in the batch"
+            );
+        }
+    }
+
+    /// A truncated frame (the writer died mid-packet) surfaces as an error, so
+    /// the channel is torn down instead of injecting half a packet.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn ip_frame_rejects_a_truncated_packet() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(4096);
+        tx.write_u16(20).await.unwrap();
+        tx.write_all(&[0x45; 8]).await.unwrap();
+        drop(tx);
+
+        let mut frames = IpFrames::new(&mut rx);
+        let err = frames.next().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("ended mid-frame"),
+            "a half frame must be named as one, got: {err:#}"
+        );
+    }
+
+    /// A run of frames written together is read back as those frames, one at a
+    /// time: batching changes how many syscalls move them, not the format.
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn a_run_of_frames_reads_back_frame_by_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        // Frames as the device hands them over: vnet header first.
+        let frames_in: Vec<Vec<u8>> = (0..3)
+            .map(|i| {
+                let mut f = vec![0u8; VNET_HDR_LEN];
+                f.extend_from_slice(&vec![0x45; 20 + i * 100]);
+                f
+            })
+            .collect();
+        let mut batch = BytesMut::new();
+        for frame in &frames_in {
+            IpTraffic::encode_into(&mut batch, frame).unwrap();
+        }
+
+        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        tx.write_all(&batch).await.unwrap();
+        drop(tx);
+
+        let mut frames = IpFrames::new(&mut rx);
+        for expected in &frames_in {
+            assert_eq!(frames.next().await.unwrap(), &expected[..]);
+        }
+        assert!(
+            frames.next().await.is_err(),
+            "the run ended, so the next read is the end of the stream"
+        );
     }
 }

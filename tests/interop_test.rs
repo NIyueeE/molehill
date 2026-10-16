@@ -103,6 +103,16 @@ const UNKNOWN_VERSION: u8 = 99;
 /// because this build can no longer produce such a hello.
 const PROTO_V3_BYTE: u8 = 3;
 
+/// The control channel's Noise key pair, for both ends' generated configs.
+///
+/// The control channel must use Noise in this build, and the matrix's whole
+/// point is that the *same* config drives the released binary and this one, so
+/// the pair is written for both. It is a test pair, published here on purpose:
+/// it guards nothing, and a reader must be able to reproduce the matrix. A
+/// deployment generates its own with `molehill --genkey`.
+const NOISE_SERVER_PRIVATE: &str = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=";
+const NOISE_CLIENT_REMOTE_PUBLIC: &str = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=";
+
 /// The old release binary, or `None` when the environment did not provide one.
 fn old_bin() -> Option<PathBuf> {
     let raw = std::env::var("MOLEHILL_OLD_BIN").ok()?;
@@ -178,7 +188,10 @@ fn server_config(control: u16, exposed: u16) -> String {
          allow_ports = [\"{exposed}\"]\n\
          \n\
          [server.control]\n\
-         bind_addr = \"127.0.0.1:{control}\"\n"
+         bind_addr = \"127.0.0.1:{control}\"\n\
+         \n\
+         [server.transport.noise]\n\
+         local_private_key = \"{NOISE_SERVER_PRIVATE}\"\n"
     )
 }
 
@@ -191,7 +204,10 @@ fn client_config(control: u16, exposed: u16, backend: u16) -> String {
          default_remote_addr = \"127.0.0.1:{control}\"\n\
          \n\
          [client.transport]\n\
-         type = \"plain\"\n\
+         type = \"noise\"\n\
+         \n\
+         [client.transport.noise]\n\
+         remote_public_key = \"{NOISE_CLIENT_REMOTE_PUBLIC}\"\n\
          \n\
          [client.services.echo]\n\
          local_addr = \"127.0.0.1:{backend}\"\n\
@@ -420,7 +436,10 @@ fn old_server_refuses_new_client_and_says_so() {
 
     // The client is process 1. It must not need the exposed port to exist: the
     // registration never happens, so this waits on the message alone.
-    if let Err(e) = wait_for_log(&mut case, 1, "protocol v4") {
+    // The client names *its own* dialect, which moves with the wire version;
+    // pinning a number here would fail on every bump for no reason.
+    let speaks = format!("protocol v{}", molehill_rathole::CURRENT_PROTO_VERSION);
+    if let Err(e) = wait_for_log(&mut case, 1, &speaks) {
         let msg = format!(
             "the new client never reported the protocol mismatch: {e}\n\
              --- server log (tail) ---\n{}",

@@ -189,7 +189,10 @@ impl Scenario {
                  allow_ports = [\"{exposed}\"]\n\
                  {server_extra}\n\
                  [server.control]\n\
-                 bind_addr = \"127.0.0.1:{control}\"\n"
+                 bind_addr = \"127.0.0.1:{control}\"\n\
+                 \n\
+                 [server.transport.noise]\n\
+                 local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
             ),
         )
         .unwrap();
@@ -204,7 +207,10 @@ impl Scenario {
                  \n\
                  {data_block}\
                  [client.transport]\n\
-                 type = \"plain\"\n\
+                 type = \"noise\"\n\
+                 \n\
+                 [client.transport.noise]\n\
+                 remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
                  \n\
                  [client.services.echo]\n\
                  local_addr = \"127.0.0.1:{backend}\"\n\
@@ -446,7 +452,7 @@ fn a_healthy_run_stays_within_the_log_budget() {
 }
 
 /// The migration wart, measured the same way: a config that still carries a
-/// key v0.10.0 removed does **not start**, and the refusal names the key and
+/// key a release removed does **not start**, and the refusal names the key and
 /// what to write instead — the operator runs the binary once and gets the
 /// whole list.
 ///
@@ -464,9 +470,24 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
     // backticked — so `count` cannot be satisfied by the `default_count`
     // line's text. Each end gets the keys that lived in *its* file: a server
     // config has no `[client]` tables to carry the client's keys.
-    const CLIENT_KEYS: [(&str, &str); 5] = [
-        ("client.data.default_count", "max_tunnels"),
-        ("client.services.*.count", "max_tunnels"),
+    //
+    // The pool keys are the pinned rewrite's: the elastic pool's `max_tunnels`
+    // (both carriers) and its `[client.data].idle_timeout` shrink clock are
+    // gone, and what the operator has to write instead is the count the pool
+    // establishes at service start.
+    // The two carrier tables are gone as *tables*, so a config that writes
+    // `[client.data.tcp] max_tunnels = 4` is refused at the table — which is why
+    // the deeper `…tcp.max_tunnels` path has no entry of its own any more: the
+    // message a reader gets names the table they wrote and the key that replaces
+    // it.
+    const CLIENT_KEYS: [(&str, &str); 10] = [
+        ("client.data.default_count", "[client.data].tunnels"),
+        ("client.services.*.count", "[client.data].tunnels"),
+        ("client.data.tcp", "[client.data].tunnels"),
+        ("client.data.kcp", "[client.data].tunnels"),
+        ("client.data.default_carrier", "chosen at runtime"),
+        ("client.services.*.carrier", "chosen at runtime"),
+        ("client.data.idle_timeout", "no shrink clock"),
         ("client.services.*.pool_size", "udp_workers"),
         (
             "client.services.*.heartbeat_timeout",
@@ -475,11 +496,20 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
         ("client.services.*.health_check", "registered"),
     ];
     const SERVER_KEYS: [(&str, &str); 1] = [("server.max_pool_size", "max_tunnels_per_client")];
-    // `[client.data]` (and so the removed `default_count`) exists only with the
+    // `[client.data]` (and so the removed pool keys) exists only with the
     // `multiplex` feature; the other client keys live in tables every build
     // has, so they are asserted everywhere.
     let client_data_extra = if cfg!(feature = "multiplex") {
-        "[client.data]\ndefault_count = 4\n"
+        "[client.data]\n\
+         default_count = 4\n\
+         idle_timeout = 2\n\
+         default_carrier = \"tcp\"\n\
+         \n\
+         [client.data.tcp]\n\
+         max_tunnels = 4\n\
+         \n\
+         [client.data.kcp]\n\
+         max_tunnels = 4\n"
     } else {
         ""
     };
@@ -501,10 +531,15 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              default_token = \"{TOKEN}\"\n\
              [client.control]\n\
              default_remote_addr = \"127.0.0.1:{control}\"\n\
+             [client.transport]\n\
+             type = \"noise\"\n\
+             [client.transport.noise]\n\
+             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              [client.services.echo]\n\
              local_addr = \"127.0.0.1:{backend}\"\n\
              remote_bind_addr = \"0.0.0.0:{exposed}\"\n\
              count = 2\n\
+             carrier = \"tcp\"\n\
              pool_size = 8\n\
              heartbeat_timeout = 90\n\
              health_check = {{ type = \"tcp\", interval = 10 }}\n\
@@ -521,7 +556,10 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              max_pool_size = 16\n\
              allow_ports = [\"{exposed}\"]\n\
              [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n"
+             bind_addr = \"127.0.0.1:{control}\"\n\
+             \n\
+             [server.transport.noise]\n\
+             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();
@@ -567,7 +605,9 @@ fn assert_refused(who: &str, cfg: &Path, keys: &[(&str, &str)]) {
         "a refused config must not warn — the refusal is the message ({who}):\n{stderr}"
     );
     for (pattern, replacement) in keys {
-        if *pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
+        // The `[client.data]` table and its carrier tables exist only with the
+        // `multiplex` feature.
+        if pattern.starts_with("client.data.") && !cfg!(feature = "multiplex") {
             continue;
         }
         assert!(

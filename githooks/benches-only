@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Classify a change set: is every changed path a benchmark or test entry?
+#
+# Reads paths (one per line) on stdin; exits 0 when all of them are entries
+# under benches/scripts/ (the python PEP 723 entries and the shell helpers),
+# and 1 otherwise.
+#
+# What this buys: the fast gate (githooks/pre-commit) compiles nothing for
+# such a change. The scripts are runtime tooling — run via `uv run` or as
+# plain shell — they are not compiled, linked, or depended on by any Rust
+# target, so `cargo fmt`, `cargo machete` and both clippy passes cannot move;
+# the quality gates that CAN move (the two ruff gates, the bench-model
+# selfcheck, the docs gate that keeps model.py's registry and
+# docs/benchmarks.md in lock) all still run. CI keeps the full chain
+# regardless (see the note in githooks/pre-commit), so this is a latency
+# split, never a coverage split.
+#
+# Like githooks/docs-only: an empty input is NOT benches-only, a manual run
+# from a terminal classifies nothing, and deleting this file makes the hook
+# run the full chain again — the safe direction.
+set -euo pipefail
+
+if [ -t 0 ]; then
+  # A manual run from a terminal has no change set to classify.
+  exit 1
+fi
+
+benches_only=1
+saw_path=0
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  saw_path=1
+  case "$path" in
+    benches/scripts/*) ;;
+    *) benches_only=0 ;;
+  esac
+done
+
+[ "$saw_path" -eq 1 ] || exit 1
+[ "$benches_only" -eq 1 ]

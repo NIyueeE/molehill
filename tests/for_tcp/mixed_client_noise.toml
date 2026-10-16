@@ -1,6 +1,6 @@
-# Mixed-transport fixture, Noise client side: a client that decides to
-# encrypt (v3 transport selector 0x01) against the same server that also
-# serves the plain client in mixed_server.toml.
+# Mixed-data-transport fixture, Noise client side: a client whose control
+# channel and data planes are all Noise, against the same server that also
+# serves the plain-data client in mixed_server.toml.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures

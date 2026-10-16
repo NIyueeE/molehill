@@ -78,6 +78,15 @@ pub trait Transport: Debug + Send + Sync {
 mod tcp;
 pub use tcp::TcpTransport;
 
+/// The data plane's carrier and the fallback that chooses it (KCP, else TCP).
+///
+/// Multiplex-gated because the carrier is: KCP rides on the multiplexed data
+/// plane's runtime, and a build without it has exactly one carrier, TCP.
+pub mod health;
+
+#[cfg(feature = "multiplex")]
+pub mod carrier;
+
 #[cfg(feature = "noise")]
 mod noise;
 #[cfg(feature = "noise")]
@@ -118,8 +127,8 @@ pub(crate) mod udp_batch;
 pub(crate) mod multiplex;
 #[cfg(feature = "multiplex")]
 pub(crate) use multiplex::MuxStream;
-// The elastic pool's *policy*: internal constants, placement arithmetic and
-// the shrink predicate. Pure, so the rules are unit-tested without a socket.
+// The pinned pool's *policy*: internal constants, placement arithmetic and
+// the stream ceiling. Pure, so the rules are unit-tested without a socket.
 #[cfg(feature = "multiplex")]
 pub(crate) mod pool;
 // The client's tunnel pool and its per-session/per-service keys are re-exported

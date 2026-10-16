@@ -7,3 +7,7 @@ bind_addr = "127.0.0.1:2360"
 # Declared to the client in `Ack::SessionOk`; the session test asserts the
 # declared cadence is what the server actually sends.
 heartbeat_interval = 5
+
+
+[server.transport.noise]
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml

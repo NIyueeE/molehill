@@ -18,6 +18,7 @@
 - [选择配置(决策树)](#选择配置决策树)
 - [动态服务注册](#动态服务注册)
 - [多路复用(`multiplex` 特性)](#多路复用multiplex-特性)
+- [透明(L3)服务](#透明l3服务)
 - [日志](#日志)
 - [调优](#调优)
 - [示例与部署](#示例与部署)
@@ -33,6 +34,12 @@
 - 服务端**没有**任何按服务的配置。客户端连接时在运行时注册服务;服务端
   在暴露任何端口前,都会用 `allow_ports` 白名单校验每次注册。
 - 两端用一个共享密钥(`default_token`)鉴权。
+
+一个进程只运行在**三种模式之一**,由配置文件表明是哪一种:`[server]`、
+`[client]`(转发)或 `[transparent]`(L3——见[透明(L3)服务](#透明l3服务))。
+模式是**进程**的属性——它的能力、它的 socket、它的 TUN 设备——所以同时写了
+两张表的文件会被拒绝,而一台想扮演两种角色的机器就跑两个进程。
+`--server` / `--client` / `--transparent` 覆盖文件里的声明。
 
 典型配置步骤:
 
@@ -58,7 +65,9 @@
 > `[client].heartbeat_timeout` / `retry_interval` →
 > `[client.control].default_*`;
 > `[client].mux = false` → `[client.data].default_mode = "direct"`;
-> `[client].mux = true` → `[client.data].default_mode = "multiplex"`(
+> `[client].mux = true` → `[client.data].default_mode = "multiplex"`——而
+> `default_mode` 随后也被移除了,因为形态现在由服务类型推导(见下文
+> 「迁移:数据面的形态不再是键」)(
 > `mux_receive_window` / `mux_max_streams` 两个键已移除——改用内部固定
 > 的 yamux 默认值);
 > `[client.transport].type = "tcp"` → `"plain"`;
@@ -75,9 +84,9 @@
 > 0.8 客户端侧的默认块统一用 `default_` 前缀命名——`[client.control]`
 > (`default_remote_addr`、`default_heartbeat_timeout`、
 > `default_retry_interval`)与 `[client.data]`(`default_data_addr`、
-> `default_mode`、`default_carrier`)——以便与
+> `tunnels`)——以便与
 > `[client.services.<name>]` 上的按服务覆盖键(`protocol`、`remote_addr`、
-> `token`、`retry_interval`、`mode`、`carrier`、`transport`、
+> `token`、`retry_interval`、`transport`、
 > `udp_workers`、`udp_forwarder_ipv6`、`udp_send_queue_size` 等;
 > 0.8 新增)清晰区分。`[client.transport]` 的 `type`/`noise` 保持无前缀:
 > 它的按服务覆盖在嵌套的 `transport` 表里,服务层不存在同名冲突
@@ -93,48 +102,89 @@
 > 第一个**只服务 v4** 的版本:v3 客户端的连接会在它发生的那条连接上被拒绝,且
 > 不会有任何回包。因此请两端一起升级;先后顺序无所谓,因为每一端都会拒绝对方的
 > 方言而不是继续通信,而被拒绝的连接会写明它期待的版本。
+>
+> **升级到 0.11(协议 v5)**:线上要承载透明(L3)服务,所以是 v5,而 0.11.0
+> **只服务 v5**——0.10 对端的连接会在它发生的那条连接上被拒绝、不会有任何回包,
+> 反方向也是一样。请两端一起升级;先后顺序无所谓,每一端都会说出它期待的版本。
+> **控制通道现在必须使用 Noise**:服务端加 `[server.transport.noise]` 表,客户端
+> 加 `[client.transport].type = "noise"` 与 `[client.transport.noise]` 表,L3
+> 客户端加 `[transparent.transport.noise]` 表——每端一对密钥,用
+> `molehill --genkey` 生成。明文控制通道会在启动时被拒绝,因为它携带的是每个数据
+> 通道用来鉴权的凭证。对于已经跑 Noise 的部署,这就是全部的迁移动作;单个*服务*
+> 或一条 L3 *车道*仍可以是明文,也就是你已经有的按服务 `transport` 覆盖。
 
 ### 迁移到 0.10:已移除的键
 
-隧道池现在是每个会话、每个 carrier 一个弹性池,并且**冷启动**——因此那些描述
-「池的初始大小」「按服务的池」或 0.8 后期健康检查的键都已移除。仍带着这些键的
+隧道池现在是每个会话、每个 carrier 一个池,并**固定**在配置写明的条数上——因此
+那些描述「池的初始大小」「按服务的池」或 0.8 后期健康检查的键都已移除。仍带着这些键的
 配置不会启动:拒绝信息会列出它找到的每一个键以及该改写成什么(只写「未知字段」
 能告诉你有东西不对,却不能告诉你该写什么)。请改写为:
 
 | 已移除的键 | 改写成 |
 |---|---|
-| `[client.data].default_count` | 无需填写:池冷启动、按需增长。`[client.data.tcp].max_tunnels`(或 `[client.data.kcp].max_tunnels`)是它可增长到的上限,默认 4 |
-| `[client.services.<name>].count` | 无需填写:同样是冷启动,而且池属于会话与 carrier,不再属于单个服务。`[client.data.tcp\|kcp].max_tunnels` 是上限 |
+| `[client.data].default_count` | 无需填写:池的宽度是 `[client.data].tunnels`,默认 4 |
+| `[client.services.<name>].count` | 无需填写:池属于会话,不再属于单个服务。`[client.data].tunnels`(或服务自己的 `tunnels`)是它的宽度 |
 | `[client.services.<name>].pool_size` | UDP 服务写 `[client.services.<name>].udp_workers`(默认 2)。TCP 服务按访客即时打开数据通道 |
 | `[client.services.<name>].heartbeat_timeout` | 无需填写:服务端在会话确认里声明自己的心跳节奏,客户端据此推导超时。`[client.control].default_heartbeat_timeout` 仍作为可选下限保留 |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的隧道数;0 = 不限) |
+| `[server].max_pool_size` | `[server.data].max_tunnels_per_client`(一个客户端可持有的承载连接数;0 = 不限) |
 | `[client.services.<name>].health_check` | 无需填写:只要客户端在运行,服务就保持注册;无法转发的请求只对那个访客失败 |
 
 下一节说明每个替代键做什么、代价是什么;[CHANGELOG.md](../CHANGELOG.md) 记录
 这些移除的原因。
 
+### 迁移:数据面的形态不再是键
+
+`mode` 已移除。仍带着 `[client.data].default_mode` 或按服务的
+`[client.services.<name>].mode` 的配置不会启动:拒绝信息会点名该键并说明该怎么做。
+它当初表达的东西,现在是服务类型的一个属性:
+
+| 已移除的键 | 改写成 |
+|---|---|
+| `[client.data].default_mode` | 无需填写:转发服务永远走多路复用。`[client.data].tunnels` 是它池的宽度 |
+| `[client.services.<name>].mode` | 无需填写:形态跟随协议——转发服务多路复用,透明认领永远不 |
+
+认领的通道**就是**它的载体连接——认领的吞吐是**连接**之和,而不是流之和——所以对它
+做多路复用等于白付成帧成本:同一台主机、同一份负载下,同一条认领走自己的连接时线上
+字节少 6%、每包 CPU 少 33%、每秒往返次数多 65%
+([基准测试](./benchmarks.zh.md#the-transparent-l3-wire-question-the-acceptance-harness))。
+
+### 迁移到 0.11:carrier 与池的时钟
+
+哪一种 carrier 能用是网络的性质,不是部署的性质,所以数据面在运行时选择它
+(先 KCP,回退 TCP),而那些用来声明它的键已经移除。池也**固定**了——它在服务启动时
+建立、之后只做修复,既不按负载增长、也不因空闲回收——于是没有收缩时钟可配:
+
+| 已移除的键 | 改写成 |
+|---|---|
+| `[client.data].default_carrier` | 什么都不写:数据面先拨 KCP,会话建立不起来时回退 TCP。需要把两条路径分开做测量或测试时用 `MOLEHILL_DATA_CARRIER=tcp\|kcp` 强制其一 |
+| `[client.services.<name>].carrier` | 什么都不写 —— 理由同上。服务自己的 `tunnels` 是它仍能写的数据面键 |
+| `[client.data.tcp]` | `[client.data].tunnels`:无论跑在哪个 carrier 上,都是一个池、一个宽度 |
+| `[client.data.kcp]` | `[client.data].tunnels` —— 同上 |
+| `[client.data].idle_timeout` | 什么都不写:固定池不会因空闲被回收,没有超时可设 |
+
 ## 选择配置(决策树)
 
-默认配置——`mode = "multiplex"`、`max_tunnels = 4`、`carrier = "tcp"`、
-明文传输——对绝大多数人是正确的起点。只有树上有明确分支时才偏离;每次只改一项,
+第一个选择是模式:`[client]` 转发到本地应用,`[transparent]` 则自己拥有公网地址
+(见[透明(L3)服务](#透明l3服务))——这是关于**进程**的选择,不是关于某个服务的,
+所以它排在下面所有内容之前。
+
+默认配置——`tunnels = 4` 的固定多路复用连接池、Noise 控制通道(必需),以及先试
+KCP、建立不起来再回退 TCP 的数据面——对绝大多数人是正确的起点。只有树上有明确分支时才偏离;每次只改一项,
 并在**你自己的路径上**测量结果:已发布的运行、它们的数字以及如何复现,见
 [基准测试](benchmarks.zh.md)。本页负责的是**每个设置做了什么**:
 
 ```mermaid
 flowchart TD
-    A["起点:默认配置<br/>multiplex、max_tunnels=4、<br/>carrier=tcp、明文"] --> B{"流量经过不可信网络?"}
-    B -- 是 --> C["transport type = noise<br/>+ 密钥(见传输层文档)"]
-    B -- 否 --> D{"单个服务或少数<br/>长连接?"}
+    A["起点:默认配置<br/>tunnels=4、<br/>控制通道 Noise(必需)"] --> B{"该服务的载荷自带加密吗?<br/>(TLS、SSH、WireGuard)"}
+    B -- 是 --> C["该服务:transport = { type = \"plain\" }<br/>- 更省,且防护不减"]
+    B -- 否 --> D{"并发访客连接很多?"}
     C --> D
-    D -- "是,且原始吞吐优先" --> E["mode = direct"]
-    D -- "否:多服务、多用户、<br/>高连接频率" --> F{"并发连接很多?"}
-    E --> Z["完成——按需用<br/>[client.services.*] 覆盖"]
-    F -- "> ~256 并发" --> G["max_tunnels = 8 或更高"]
-    F -- 一般 --> H["保持 max_tunnels = 4"]
+    D -- "> ~256 并发" --> G["tunnels = 8 或更高"]
+    D -- 一般 --> H["保持 tunnels = 4"]
     G --> I{"路径质量?"}
     H --> I
-    I -- "高纯延迟 + UDP 游戏<br/>(100ms+ RTT)" --> J["A/B 测试 carrier = kcp"]
-    I -- 其他 --> Z
+    I -- "高纯延迟 + UDP 游戏<br/>(100ms+ RTT)" --> J["用 MOLEHILL_DATA_CARRIER<br/>分别测 KCP 与 TCP"]
+    I -- 其他 --> Z["完成——按需用<br/>[client.services.*] 覆盖"]
     J --> Z
 ```
 
@@ -142,17 +192,14 @@ flowchart TD
 
 | 决策 | 选项 | 你放弃 / 得到什么 |
 |---|---|---|
-| `mode` | `"multiplex"`(默认) | 每个 FD、每个 NAT 映射承载最多连接;一条慢流会和同隧道其它流共享隧道 |
-| `mode` | `"direct"` | 每条流一条物理连接:原始单流吞吐,代价是每条流一个 FD / 端口 / NAT 映射 |
-| `max_tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住 |
-| `max_tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
-| `max_tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限 |
-| `carrier` | `"tcp"`(默认) | 有损与限速路径上表现良好的默认值;前提是网络不封锁 TCP 隧道 |
-| `carrier` | `"kcp"` | TCP 隧道被封锁/限速时的延迟优先 UDP 传输;它不做多路复用,因此需要配合 `noise` + 调高 `max_tunnels` 来拿连接上限 |
-| transport | `"plain"` | 不加密;每字节开销最低 |
+| `tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住。实测为所有路径上最差的配置 |
+| `tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
+| `tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限;在干净快速路径上实测从一条隧道到八条吞吐 +77% |
+| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价按决策的测量)) |
+| transport | `"plain"` | 不加密,每字节开销最低 —— 只适用于载荷自带加密的**单个服务**;控制通道始终加密 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
-| 冷启动池 | (没有对应的键) | 池冷启动:空闲期后的第一个访客要先付一次隧道建连才开始过字节,之后池就热了,并可按需长到 `max_tunnels` |
-| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型) |
+| 池的建立 | (没有对应的键) | 池的 `tunnels` 条连接在服务启动时拨出,而不是在第一个访客到来时:请求时不需要付任何代价,成本是 `tunnels` 条空闲连接(实测每条 0.5–0.8 MiB RSS 与 2.6 个 FD,不占线程) |
+| `udp_workers` | 2(默认) | 仅 UDP:该服务的 worker 集合使用多少条数据通道。不同访客分片到这些通道上;单个访客绝不被拆到多条通道(会话亲和)。它是扇出,不是容量旋钮:不会提高服务的报文上限,该上限的实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断) |
 
 各选项的**实测代价**——这些取舍所依据的数字及其来源——见
 [基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
@@ -172,46 +219,40 @@ default_remote_addr = "example.com:2333" # 必填。服务端地址
 # default_heartbeat_timeout = 65 # 可选。应用层心跳超时。不设置(默认)时由服务端在会话确认里声明的节奏推导:`max(10 秒, 2 × server.control.heartbeat_interval + 5 秒)`。低于该下限的取值会在启动时被拒绝(否则会把健康的服务端判死);设为 0 禁用检测
 default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:延迟从 1 秒开始、按 3 倍增长并带抖动,最高不超过该值(抖动会让单次睡眠最长达到该上限的两倍),共 3 次重试;退避耗尽后客户端回落到固定 1 秒的重试循环。默认:1 秒
 
-[client.data] # 可选。所有服务的数据面默认值(特性 `multiplex`,默认构建的一部分)。每个服务都可以单独覆盖 default_mode/default_carrier——见下方 `[client.services.*]` 里的按服务键
-# default_data_addr = "example.com:2343" # 可选。数据面端点;默认为服务的控制端点(设置了 `client.services.<name>.remote_addr` 时用该地址,否则用 `client.control.default_remote_addr`)。`default_carrier = "kcp"` 时 KCP 会话用 UDP 拨控制地址——TCP 控制与 UDP KCP 可以共用一个端口(协议不同互不冲突)
-default_mode = "multiplex" # 可选。默认数据面模式:"multiplex"(默认)或 "direct"(每条数据通道一条连接;`carrier` 不适用)
-default_carrier = "tcp" # 可选。默认数据载体:"tcp"(默认)复用控制通道的传输栈;"kcp" 使用 KCP-over-UDP 会话(特性 `kcp`;服务端在第一条 `kcp` 注册到达时才打开 KCP 监听,无需服务端配置)。两种传输都可与 KCP 组合:transport 为 `noise` 时同样的 Noise 握手包裹每个 KCP 会话,`plain` 时会话保持明文
-# shared_pool = false # 可选。把一条控制会话的所有服务放进每个 carrier 一个共享隧道池(true),而不是每个服务一个池(false,默认)。两者是同一套代码路径,只有池的 key 不同
-# idle_timeout = 60 # 可选。池在没有 stream、没有待打开、也没有被钉住的 UDP peer 的情况下要空闲多少秒才移除一条隧道。默认:60。池永远不会缩到少于一条隧道,也不会低于 UDP 推导出的下限
-[client.data.tcp] # 可选。TCP carrier 的弹性池上限
-# max_tunnels = 4 # 可选。该 carrier 的池可增长到的上限;池冷启动、按需增长到它为止。校验 `>= 1`,收敛到 1..=64。默认:4
-[client.data.kcp] # 可选。KCP carrier 的上限,键与规则相同
-# max_tunnels = 4
+[client.data] # 可选。所有服务的数据面默认值(特性 `multiplex`,默认构建的一部分)。每个服务都可以单独覆盖 `tunnels`——见下方 `[client.services.*]` 里的按服务键
+# default_data_addr = "example.com:2343" # 可选。数据面端点;默认为服务的控制端点(设置了 `client.services.<name>.remote_addr` 时用该地址,否则用 `client.control.default_remote_addr`)。KCP 会话用 UDP 拨该地址,所以 TCP 控制通道与 KCP 数据面可以共用一个端口(协议不同互不冲突)
+# tunnels = 4 # 可选。池的宽度:这个客户端为一个服务(启用 `shared_pool` 时为一条会话)持有多少条载体连接。默认:4,并会被共享该池的服务推导出的 UDP 下限抬高。校验 `>= 1` 且 `>=` 该下限;收敛到 1..=64
+# shared_pool = false # 可选。把一条控制会话的所有服务放进一个共享隧道池(true),而不是每个服务一个池(false,默认)。两者是同一套代码路径,只有池的 key 不同
+# 这里刻意**没有** carrier 键:数据面先试 KCP(特性 `kcp`),会话建立不起来时回退到 TCP,因为哪一种能用是网络的性质而不是部署的性质。透明声明还会在**运行中**搬动车道:每条车道都有独立度量(服务端向它投递了多少、该车道队列拒收了多少、客户端从它注入了多少),当所用 carrier 拒收的比例达到材料性门槛时,该车道会被换到另一条 carrier——对端停止往它放新流,两端都确认其中已无流后才退役,因此正在进行的流在原有车道上跑完、不会被重排。`MOLEHILL_DATA_CARRIER=tcp|kcp` 可以强制其一,用于需要把两条路径分开的测量或测试——它同时会关闭回退与自动搬移
 
-[client.transport] # 可选。指定传输层如何封装;对控制面与数据面都生效
-type = "plain" # 可选。可选值:["plain", "noise"]。默认:"plain"
+[client.transport] # 必需。指定传输层如何封装;对控制面与数据面都生效
+type = "noise" # 必需,且 `"noise"` 是守护进程唯一接受的值:控制通道携带的是每个数据通道用来鉴权的凭证,明文控制腿在启动时即被拒绝。单个*服务*仍可在下面覆盖为 `"plain"
 proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。仅客户端。通过 `http`/`socks5` 代理连接服务端
 
-[client.transport.noise] # Noise 协议。进一步说明见 `docs/transport.md`
+[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.md`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如所示
-local_private_key = "key_encoded_in_base64" # 可选
-remote_public_key = "key_encoded_in_base64" # 可选
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
+local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # 可选。本客户端自己的密钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # 必需:服务端的公钥 # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
 
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
-protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"
+protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"。必须自己拥有公网 ip:port 的服务根本不是转发服务:它属于 `[transparent]` 表,那是一种独立的运行模式——见下文「透明(L3)服务」
 local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址
 remote_bind_addr = "0.0.0.0:8081" # 必填。该服务在服务端暴露的公网地址。必须被服务端的 `allow_ports` 覆盖
 nodelay = true # 可选。该服务数据通道的 TCP_NODELAY。默认:即使不设置也为 true;设为 `false` 关闭
 retry_interval = 1 # 可选。按服务的重连退避上限,语义与 `client.control.default_retry_interval` 相同。默认:继承 `client.control.default_retry_interval`
 token = "service-specific-token" # 可选。仅对本服务覆盖 `client.default_token`——例如对使用独立 token 的服务端做鉴权 # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # 可选。仅对本服务覆盖 `client.control.default_remote_addr`——它的控制通道(默认还包括数据面)拨向这个服务端。让同一个客户端可以把服务分散到多个 molehill 服务端
-mode = "multiplex" # 可选。仅对本服务覆盖 `client.data.default_mode`:"multiplex"(默认)或 "direct"
-carrier = "tcp" # 可选。仅对本服务覆盖 `client.data.default_carrier`;仅在 `mode = "multiplex"` 时有效。不设则继承默认值
+# tunnels = 2 # 可选。本服务自己的池宽度;不设则继承 `[client.data].tunnels`
 transport = { type = "plain" } # 可选。按服务传输覆盖:`type`("noise" = 加密,"plain" = 明文;不设 = 跟随 `client.transport.type`)与 `noise` 密钥(本服务加密时使用;不设 = 用 `client.transport.noise`)。让同一个客户端明文与加密服务并存——例如拨向不同服务端、带自己公钥的服务
 
 [client.services.service2] # 可以定义多个服务
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:报文上限是服务自身的属性,不随该值变化(多访客下 1400 字节数据报约 1 Gbit/s 即饱和),超过上限的数据报会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)。实测见[基准测试](benchmarks.zh.md#udp-队列问题不属于-soak-模型)
+udp_workers = 2 # 可选。仅 UDP 服务:该服务的 worker 集合使用多少条数据通道;不同访客分片到这些通道上,单个访客绝不被拆到多条通道。隧道池至少保留这些通道所需的隧道数。默认:2。它是扇出,不是容量旋钮:报文上限是服务自身的属性,不随该值变化(多访客下 1400 字节数据报约 1 Gbit/s 即饱和),超过上限的数据报会被丢弃——这是设计接受的取舍,以免队头阻塞其他访客,`MOLEHILL_UDP_STATS` 会把它计入(`queue_full`)。实测见[基准测试](benchmarks.zh.md#udp-队列问题仅-molehill-的诊断)
 udp_forwarder_ipv6 = false # 可选。仅 UDP 服务:UDP 转发器连接本地服务时优先使用 IPv6。默认:false
 udp_buffer_size = 2048 # 可选。UDP 接收缓冲区,单位字节。默认:2048,最大 65535
 udp_idle_timeout = 60 # 可选。客户端上空闲 UDP 对端映射被丢弃的秒数(其本地 socket——即本地服务看到的源端口——随之回收)。默认:60
@@ -227,16 +268,19 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔;客户�
 
 [server.data] # 可选。数据面监听器(特性 `multiplex`)
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
-# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
-# max_tunnels_per_client = 0 # 可选。运维方对弹性池的阀门:一个客户端在其会话的所有服务上一共可持有多少条多路复用数据隧道。0(默认)为不限。超过上限的隧道会被带类型地拒绝,并在应答里写明上限;会话本身继续运行
+# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
+# max_tunnels_per_client = 0 # 可选。运维方对「一个客户端在其会话的所有服务上一共可持有多少条承载连接」的阀门:既包括多路复用的数据隧道,也包括透明认领的车道(一条车道就是一条自己的连接——认领永不multiplex)。配置的 `tunnels`/车道预算超过它时,多出的建连会在启动时被拒绝(并由修复 tick 重试),于是它用拿到的那些服务。0(默认)为不限。超过上限的隧道会被带类型地拒绝并在应答里写明上限;车道则被丢弃,并输出一行写明上限的 INFO;会话本身继续运行
 
-[server.transport] # 可选。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头);放置密钥后服务端可以接受 Noise 连接(除此之外也接受明文)
-[server.transport.noise] # 密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
+[server.transport] # 必需。只有密钥,没有 `type`。连接是否加密由客户端决定(每条连接以 1 字节传输选择器开头),但服务端没有密钥就拒绝启动:控制通道必须能说 Noise
+[server.transport.noise] # 必需。密钥。存在 = 服务端可以接受 Noise(选择器 0x01)
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # 必需:本服务端自己的密钥 # security-scan:allow documentation example key
+remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # 可选。客户端的公钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
+psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
 resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+
+[server.transparent] # 可选,而这张表本身就是开关:它存在,服务端才会提供透明(L3)客户端。没有它,认领会在看任何设备之前被策略拒绝——提供 L3 意味着向本进程索要 CAP_NET_ADMIN 与 TUN 设备,所以这是运维方的决定,永远不是远端客户端的
+tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
 ```
 
 ## 动态服务注册
@@ -248,7 +292,8 @@ resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一�
    `protocol`(tcp/udp)、`remote_bind_addr`、将要使用的数据面
    `carrier`(tcp/kcp——`kcp` carrier 会触发服务端懒绑定 UDP 监听)与
    UDP 缓冲大小。通道数不在消息里:客户端打开自己配置的通道(TCP 每个访客
-   一条,UDP 为 `udp_workers` 条),服务端在访客到达时再要一条。
+   一条,UDP 为 `udp_workers` 条,透明认领为该 carrier 分给它的车道数——
+   长生命周期连接),服务端在访客到达或某条通道结束时再要一条。
 3. 服务端校验:
    - **白名单**:请求的端口必须被 `allow_ports` 覆盖;为空/缺失的
      `allow_ports` 会拒绝*每一次*注册(这也是完全禁用该特性的方式);
@@ -266,57 +311,66 @@ resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一�
 
 ## 多路复用(`multiplex` 特性)
 
-`multiplex` 特性是默认特性集的一部分。`mode = "multiplex"`(默认)时,
-注册的服务跑在一个**弹性隧道池**上(上限
-`[client.data.tcp|kcp].max_tunnels`,默认 4),之后每条数据通道都变成其中
+`multiplex` 特性是默认特性集的一部分。注册的转发服务跑在一个**固定的隧道池**上
+(`[client.data].tunnels`,默认 4),它承载的每条数据通道都变成其中
 一条隧道内的 yamux 流。这消除了每条连接的握手延迟
 (TCP 连接,以及 `noise` 下的 Noise 握手),并在大量并发访客下大幅减少
-FD 占用。
+FD 占用。形态不是键:转发服务永远走多路复用(没有 `mode` 可写),
+而[透明认领](#透明l3服务)永远不走。
 
-- 决定权只在客户端(`[client.data].default_mode`);服务端按连接自动适配。
-- `mode = "direct"` 恢复每通道一条连接的行为。
+- 决定权只在客户端;服务端按连接自动适配。
 - 每条隧道的缓冲由内部固定默认值约束(32 MiB yamux 接收窗口、64 条流):
   丢包积压有界且吞吐无损;这两个值固定是因为 yamux 将两者耦合(见
   internals.md)。
-- **池是冷启动的。** 在真的需要隧道之前什么都不会拨:某个服务的第一个访客
-  会同步把池撑起来,因此这位访客要先付一次隧道建连才开始过字节(回环上
-  2.0-3.2 ms,M2a);之后的访客都能用上热隧道,池也会按需继续长到
-  `max_tunnels`。空闲的池在 `[client.data].idle_timeout`(默认 60 秒)之后
-  归还隧道,但不会少于一条,也不会低于某 UDP 服务的 worker 所需的下限。
-- `max_tunnels = N` 是该 carrier 的池可增长到的上限。独立 TCP 流
+- **池在服务启动时建立并固定。** 全部 `tunnels` 条连接在服务激活时就拨出,
+  因此第一个访客不需要付任何代价(建连成本在它到来之前就已支付),而一个部署
+  提供的容量不取决于它一分钟前恰好在做什么。池永远不会为负载调整大小,空闲
+  隧道也永远不会被回收。
+- **修复是唯一的例外**,而且它不是增长:死亡的隧道会被替换,直到重新满足条数,
+  因此单次故障不会永久缩小一个部署。*不*被修复的是条数本身——池需要更宽就得
+  提高 `tunnels` 并重启客户端,这正是重点:容量是配置决策,不是运行时决策。
+- `tunnels = N` 是该 carrier 的池持有多少条 carrier 连接。独立 TCP 流
   隔离队头阻塞(丢段只停滞自己的隧道),并可超越单条流的拥塞窗口聚合吞吐。
-  某条隧道死亡时,开启请求会透明地落到存活隧道,直到常规心跳重连重建整个
-  池。默认:4;`1` 恢复单隧道行为。
-- **实验性(传输层对比选项):** `carrier = "kcp"` 把数据面换成 KCP-over-UDP
-  会话而不是 TCP 连接(特性 `kcp`,属于默认特性集)。KCP 是用户态 ARQ 协议,
-  用吞吐换 UDP 会话质量,所以它是 A/B 对比选项而不是默认:与 TCP carrier 的实测
-  对比见[基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
+  某条隧道死亡时,开启请求会透明地落到存活隧道,修复 tick 会拨一条替代。
+  默认:4(当某个 UDP 服务的 worker 数更大时提高到该数);`1` 恢复单隧道行为,
+  但要付实测代价——在模型的各格子里,一条隧道是所有路径上最差的配置,因为
+  此时每条流共享同一个拥塞窗口。
+- **负载超过池时**发生的是分担,不是增长:流会摊到现有的隧道上,每条隧道最多
+  56 条,而当所有隧道都到该上限时到来的访客会短暂等待某条流退出,若没有流
+  退出就被拒绝。按你预期的并发量为 `tunnels` 定容;定容所依据的实测见
+  [基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
+- **carrier 不是你要写的选项。** 数据面先拨 KCP(特性 `kcp`,属于默认特性集),
+  会话建立不起来时回退到 TCP——因为哪一种能用取决于两端之间的网络:UDP 可能被封、
+  被整形,也可能今天通明天不通。回退会以 `INFO` 播报一次、每 60 秒重新探测一次,
+  而池或车道一旦建立,承载方式就不再改变。想把两条路径**分开测量**,或复现一个
+  必须走 TCP 的测试,用 `MOLEHILL_DATA_CARRIER=tcp|kcp` 强制其一——它同时关闭
+  回退。两条路径的实测对比见[基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)。
   加密栈不变——transport 为 `noise` 时同样的
-  Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`max_tunnels` 照常生效。
+  Noise 握手包裹每个 KCP 会话——数据通道仍由 yamux 承载,`tunnels` 照常生效。
   服务端在第一条声明 `kcp` carrier 的注册到达时才打开 UDP 监听——绑定失败
   会变成精确的注册拒绝;没有 KCP 客户端的服务端永远不会打开 UDP socket。
   监听绑定在数据地址上(`[server.data].bind_addr`,默认 = 控制地址),每个
   会话像 TCP 隧道一样用控制会话的 nonce 认证。如果两端都不设置数据地址,**TCP 控制
   与 UDP KCP 就共用一个端口号**:TCP 和 UDP 是不同协议,两个 socket 绑定同一端口
   不会冲突(记得在防火墙/NAT 里同时放行两种协议)。固定的 KCP 参数(为可比性记录):
-  流模式、nodelay 10 ms 间隔、fast-resend 2、关闭拥塞控制、发送窗口 2048 /
-  接收窗口 4096 段、MTU 1400、32 MiB socket 缓冲。保活:适配器层每 2 秒的
+  流模式、nodelay 10 ms 间隔、fast-resend 2、关闭拥塞控制、发送窗口 8192 /
+  接收窗口 4096 段(发送窗口就是有损路径上的吞吐天花板:2048 段在约 44 ms 往返下
+  只能承载 533 Mbit/s;改成 8192 后由对端 4096 段的窗口成为上限,既拆掉这个天花板,
+  又不改变干净路径上的数字)、**数据报大小跟随路径**(1400 字节——任何路径都能承载——在路径
+  自身 MTU 允许时最高 8 KiB;内核给出的路径 MTU 每秒重读一次,因此在 1500 字节路径
+  上的会话永远不会发出需要分片的数据报)、32 MiB socket 缓冲。保活:适配器层每 2 秒的
   PING/PONG 让空闲隧道保持活跃(NAT 映射)并探测路径 RTT;对端消失仍只在
-  下一次写入时确认(约 20 次 RTO 后判死)。
+  下一次写入时确认:当某个分片被重传约 20 次**且**发送窗口已连续五秒没有推进时才
+  判定会话结束,因此只是"慢"的对端(例如确认排在整形器队列之后)不会被误判为消失。
 - 编译时去掉该特性则完全移除这个选项,而且这样的构建根本不能看到相应的表:
   配置里出现 `[client.data]` 或 `[server.data]` 就会被拒绝(未知键——
-  `deny_unknown_fields`)。删掉这两个表之后,数据面始终走每通道一条连接。
+  `deny_unknown_fields`)。删掉这两个表之后,每条数据通道都是自己的一条连接。
 
 **按服务覆盖。** `[client.data]` 存放默认值;每个服务可以在自己的
-`[client.services.<name>]` 块里单独覆盖 `mode` 与 `carrier`。
-合并后的视图遵循与全局块相同的规则:`carrier` 只在
-`mode = "multiplex"` 时有效,`carrier = "kcp"` 还额外需要 `kcp` 特性。
-服务的 carrier 决定它的池长到哪个上限
-(`[client.data.tcp|kcp].max_tunnels`);开启 `[client.data].shared_pool` 时,
-同一会话的所有服务共用每个 carrier 一个池。于是同一个客户端可以混合:
-交互式服务走 mux(握手少、对 NAT 友好),大流量传输服务走 `direct`
-(原始吞吐优先),服务端无需任何配置改动:服务端按连接自动适配,并在第一条
-`kcp` 注册时打开自己的 KCP 监听(没有按 carrier 的服务端配置)。同样的覆盖
+`[client.services.<name>]` 块里单独覆盖 `tunnels`,数据面的其它部分不可覆盖:
+carrier 随路径而定,形态随协议而定。于是同一个客户端可以给繁忙的服务更宽的池,
+或让两个服务共用一个池,服务端无需任何配置改动:服务端按连接自动适配,并在第一条
+声明该 carrier 的注册到达时打开自己的 KCP 监听(没有按 carrier 的服务端配置)。同样的覆盖
 模式也适用于控制默认值:`token`、`remote_addr` 分别覆盖
 `[client].default_token`、`[client.control].default_remote_addr`,
 `retry_interval` 覆盖 `default_retry_interval`。心跳不是按服务的旋钮:一条
@@ -341,6 +395,172 @@ FD 占用。
 
 线级设计——隧道升级、每流分帧与窗口,以及池化流为何需要 SYN 启动——
 见[内部原理](./internals.md)。
+
+## 透明(L3)服务
+
+透明(L3)客户端把公网 `ip:port` 交给**客户端**拥有,而不是让服务端绑定它。
+客户端的宿主机在自己的 TUN 设备上承载所声明的地址,服务端把整个 IP 包路由进隧道,
+由客户端自己的内核应答访客——因此后端看到访客的真实源地址,TCP 保持端到端语义,
+服务端也不为该连接持有任何 socket 或按流的状态。
+
+它是**独立的运行模式,有独立的配置模型**:一张 `[transparent]` 表,用
+`molehill <配置> --transparent` 启动(也可以不带参数,因为这张表本身就说明了这个
+进程是什么)。它的每个服务都是对一个公网地址的**认领**,所以没有 `protocol` 键去
+切换条目的性质,转发服务会用到的键在 schema 里根本没有位置:`local_addr`、`nodelay`
+与仅限 UDP 的那些键是**写不出来**,而不是写出来再被拒绝。`[client.services.<name>]`
+里的 `protocol = "transparent"` 会被拒绝并指向这里;同时写了 `[client]` 与
+`[transparent]` 的文件也会被拒绝——既转发又认领的机器跑**两个进程**,这也正是让
+`CAP_NET_ADMIN` 不落到不需要它的那个进程上的办法。
+
+它**仅支持 Linux**,两端都需要 `CAP_NET_ADMIN`(各自要连接一个 TUN 设备);
+`transparent` 特性属于默认特性集。其他平台上的配置、或在不含该特性的构建里,
+都会在解析配置时被拒绝:信息形如 `... carries whole IP packets through a TUN
+device, and this platform is not Linux`,或指明缺少 `transparent` 特性。目前只
+承载 IPv4——非 IPv4 的包会被丢弃并计数。
+
+**服务不服务 L3,由服务端运维决定。** 在服务端,`[server.transparent]` 这张表
+就是开关:没有它,认领会在看任何设备之前被策略拒绝,所以客户端永远不可能成为
+"让服务端去碰 `/dev/net/tun`、向内核索要 `CAP_NET_ADMIN`"的原因。只转发
+`tcp`/`udp` 的服务端因此完全不需要这项能力。启用 L3 有一个后果要直说:这类客户端
+永不加密,所以服务它的服务端会接受来自该客户端的明文连接,无论
+`[server.transport.noise]` 写了什么——Noise 键仍然作用于真正协商了它的客户端。
+
+**守护进程从不配置网络。** 它没有 netlink 代码,也从不调用 `ip`:TUN 设备与
+地址、路由都由运维方创建和安装,守护进程只校验自己依赖的东西,缺什么就用要执行
+的确切命令拒绝。两套配方——地址被路由到服务端,以及单 IP 服务端——见
+[部署文档](./deployment.zh.md#透明l3服务)。
+
+| 键 | 含义 |
+|---|---|
+| `[transparent]` | **模式本身**:这张表让进程成为 L3 客户端,客户端级的那一半也在这里(`default_token`、`tun`、`control`、`data`、`transport`) |
+| `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
+| `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
+| `[transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
+| `[transparent.data.tcp\|kcp].tunnels` | 该 carrier 的**车道预算**:这个客户端在该 carrier 上为它所有认领一共持有多少条载体连接,在共用该 carrier 的认领之间平分。一条车道**就是**一条连接(认领永远不做多路复用),且每条认领至少保留一条。默认:每条认领一条车道——认领一直以来的形态——低于认领数的预算会被拒绝并给出该写入的条数。上限 1024。平分只是车道的**起点**:承载的流比车道更多的认领,会从还有空闲车道的认领那里借走一条(但绝不借走最后一条),也就是说预算是「存在多少条连接」的决定者,而谁持有它们由流量决定。平分与出借带来三个后果:**默认**情况(不写 `tunnels`,即每条认领一条车道)下没有任何认领有多余车道,于是什么也不会被出借——预算是这个机制的空间,想要它就用「每条认领至少两条」的量来写;低于认领数的预算会被拒绝(每条认领至少保留一条);而认领数的非整数倍预算会剩下除不尽的部分不被分配——分配器重新分配的是各认领的份额,不会去花除法剩下的余数;想让每条车道都用上,就把预算写成认领数的整数倍 |
+| `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次认领都会在看任何设备之前被策略拒绝 |
+| `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
+
+按认领的键与转发服务一一对应:`token`、`remote_addr`、`retry_interval`、
+`tunnels`。`[transparent.transport]` 决定 L3 客户端两条线栈怎么建:
+
+- **控制通道永远是 Noise。** 它发布的会话 nonce 是每条 lane 认证所用的
+  凭证,明文控制段等于把该凭证交给路径上的所有人。其密钥对写在
+  `[transparent.transport.noise]`——必填,lane 默认继承的也是这一对。
+  这一项不可配置:它就是"数据面凭证不上线"的保障。
+- **lane 默认明文。** lane 承载的是访客自己的 IP 包——访客的 TLS 是
+  端到端的保护,逐包加密花费的是被承载流量没有要求的 CPU。`type = "noise"`
+  打开 lane 加密,使用控制通道的密钥对与模式(每主机一对,继承);
+  在 `type` 旁边另写一个 `[transparent.transport.noise]` 块即可覆盖密钥,
+  供 lane 不与控制通道共享密钥对的部署使用。
+- `proxy` 作用于该客户端拨出的每一条连接(控制与 lane)。
+
+设备名写在 `[transparent].tun`。
+
+认领没有 carrier 键,因此少了一件会写错的事:每条车道跑在数据面拨到的任何载体上
+(KCP,回退 TCP),载体的会话**就是**数据通道,其上没有多路复用器。认领真正要选的是它
+拿到几条车道(`[transparent.data].tunnels`)。认领永远不做多路复用:它的车道就是它的载体连接,其吞吐是这些连接之和。在同一主机、
+同一负载下实测:同一条认领走自己的连接时线上字节少 6%、每包 CPU 少 33%、
+每秒往返次数多 65%
+(见[基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
+
+`[transparent.data]` 接受与 `[client.data]` 相同的键(`default_data_addr` 与
+`tunnels`),另外还多一个 `lend`(默认 `true`):某条认领的空闲车道是否可以借给「流比车道多」的同级认领。`lend = false` 即把平分
+结果固定下来;这个机制值不值取决于路径的瓶颈在哪(见[基准页](./benchmarks.zh.md))。条数
+在这里的含义也不同:转发服务的 `tunnels` 是池的宽度,而认领的是一份连接预算,因为这里
+没有池;每条认领分到的份额是 `tunnels / 认领数`,且永不低于一条。
+
+**这份预算的缺省值是每条认领两条车道,而这是一笔交易,不是偏好。** 认领的数据路径
+是按车道串行的(一个设备读取者、一个注入者),所以繁忙认领的吞吐跟着车道数走,而它给
+「所有认领共享的那个读取者」施加的压力也一样。两条轴都测过(同一主机、同一二进制、
+五条认领、八条内部流):
+
+| 每条认领车道数 | 只看 bulk | 身边另有一条交互流时 |
+|---|---|---|
+| 1 | 2.351 Gbit/s | 撑住 8 条流,平台 2.35 Gbit/s |
+| **2** | **3.283(+40%)** | **8 条流——斜坡的上限——3.32 Gbit/s,p99 2 ms** |
+| 4 | 5.191(+121%) | **3 条流**,四条流起 p99 271 ms,五条流 560 ms |
+| 8 | 5.255 | — |
+
+四条车道多买到 58% 的 **bulk** 吞吐,代价是交互流的余量,所以缺省值是两条:bulk 的
+天花板可以靠写出 `tunnels` 去拿,而 SLO 不是缺省值可以悄悄弄坏的东西。(量于
+v0.11.0 之前的二进制;该版本起吃的分段 offload 抬高了 bulk 一列的绝对值,但
+**形状**——两条处的拐点、越过它的 SLO 代价——才是这张表标的价,而且 SLO 一列
+受探针约束而非吞吐约束,不会随之移动。)代价按连接数
+计:`车道数 x 认领数` 条连接,每条一个 socket、**两端各约 2.6 个文件描述符与
+0.5–0.8 MiB RSS**,再占服务端 `[server.data].max_tunnels_per_client` 阀门一个名额
+(默认不限)。只承载**单条**流的认领从多出的车道里得不到任何东西(一条到八条:
+1.966 / 1.962 / 2.050 / 2.087 Gbit/s),所以服务很多认领、或每条认领只有一条连接的
+客户端应当写出 `tunnels` 以少付一些。**升级提示:** 这个缺省值原本是每条认领一条车道,
+想保留那种行为的部署把 `tunnels` 写成等于认领数即可。
+
+`tunnels = 4` 配两条认领时每条分到两条连接;`tunnels = 1` 配两条认领会被拒绝,并在
+信息里给出应当写入 `2`。认领的内部流会摊在它的车道上(每条流按五元组哈希落在一条
+车道上),所以承载大量并发连接的认领想要超过一条连接的吞吐,靠的就是更多车道。
+
+### 运维方需要准备什么
+
+两端都连接到自己 `tun` 键指定的**已存在**设备;守护进程刻意不创建设备,因为
+运维方的地址和路由就落在它上面。
+
+- **设备存在**(两端)。设备缺失时,拒绝信息会给出创建它的两条命令——
+  `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`。
+- **客户端承载它声明的每个地址。** 所声明的 IP 就是 `remote_bind_addr` 里的
+  那个,客户端必须拥有它:拒绝信息会打印 `ip addr add <ip>/32 dev <tun>`、
+  `ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table
+  100`。地址必须是本地的,因为应用要绑定它;源地址规则则把该应用发出的回包送回
+  隧道。
+- **关闭反向路径过滤。** `net.ipv4.conf.<tun>.rp_filter` **和**
+  `net.ipv4.conf.all.rp_filter` 都必须读到 `0`——注入的包携带访客的源地址,
+  严格的检查会丢掉它们——拒绝信息会打印确切的 `sysctl -w` 行。这项检查在
+  客户端执行;服务端只校验自己的设备是否存在。
+- **路由要把所声明的地址带到服务端**,并让客户端的回包出得去。两套配方见
+  [部署文档](./deployment.zh.md#透明l3服务)。
+- 两个进程都需要 `CAP_NET_ADMIN`;[部署文档](./deployment.zh.md#systemd)的
+  systemd 单元展示了 `AmbientCapabilities=` 行。
+
+### 一个完整示例
+
+```toml
+# server.toml - 服务端不为该服务绑定任何东西:它把 10.99.0.1/32 路由进自己的
+# TUN 设备。最后一张表就是允许它这么做的开关:去掉它,下面的注册会被策略拒绝。
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+# 控制通道始终使用 Noise —— 必需
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```toml
+# client.toml - 客户端拥有 10.99.0.1:8443,并在自己的 TUN 设备上承载该地址,
+# 应用就绑定在那里。一张表一种模式:这个进程只做认领,不做别的。
+[transparent]
+default_token = "change-me"
+tun = "molehill0"
+
+[transparent.control]
+default_remote_addr = "203.0.113.5:2333"
+
+# 控制通道的密钥对 —— 必需
+[transparent.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+```
+
+多个认领只有在端口不同时才能声明同一个地址;而没有端口可路由的包——ICMP,以及
+首个分片之后的分片——只有在恰好一个认领声明该地址时才会投递,否则宁可丢弃也不
+猜测。`MOLEHILL_L3_STATS=1` 每秒打印一次数据面的累计计数(见
+[诊断开关](#诊断开关按需开启));两端各自如何判断一个包属于哪个服务,见
+[内部原理](./internals.md#transparent-l3-services)。
 
 ## 日志
 
@@ -385,20 +605,28 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 
 ### 诊断开关(按需开启)
 
-五个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`。它们默认关闭,从不
-改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
+六个环境变量用于打开聚合诊断,每个对象每秒一行 `INFO`;另有一个用于强制数据面的
+carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧道一个)。前六个默认关闭,
+从不改变转发路径;打开开关本身就是许可——需要把 `RUST_LOG` 提上去才看得见的行,
 永远不会落到任何地方:
 
 | 开关 | 输出 | 内容 |
 |---|---|---|
 | `MOLEHILL_MUX_STATS=1` | 每个 tunnel 每秒一行 | yamux 组帧累计计数(`written`、`read`、`bytes`)——即每秒帧数,配上一次 CPU 采样就是每帧 CPU |
-| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 | KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain 与 ARQ update 的粗粒度分相计时 |
-| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、上限、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned`,以及每次尺寸变化的理由时间线(`+load:1->2`、`-idle:2->1`) |
+| `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 |
+| `MOLEHILL_TUNNEL_STATS=1` | 每进程每秒一行 | 每条多路复用隧道承载的字节数,格式 `序号:已交付/已写入`,按 pool 的 tunnel 顺序编号(旁边的 pool-stats 行才有 tunnel 名)——车道计数在 L4 的对应物,用来判断不同 carrier 上的隧道速率是否有材料性差异。计数本身是每条隧道上每轮 IO 两次 relaxed 原子加;该开关只启动报告线程 |
+ KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned/carrier/phase`、进行中的切换(`id/target:phase`)、carrier 规则所判定的每条隧道累计 KCP `datagrams_out/retransmits`(非 KCP 隧道为 `-`),以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`、`-handover:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
+| `MOLEHILL_DATA_CARRIER=tcp\|kcp` | 不打印(它改变行为) | 强制数据面拨号使用的 carrier,供需要把两条路径分开的测试或测量使用:`kcp` 让 KCP 失败即终结而不再回退,`tcp` 直接跳过那次尝试。它不是部署选项——carrier 在运行时决定,因为哪一种能用是网络的性质——取值不是这两个时会报告并忽略。要**测量回退**而不是强制它,应该在路径上封掉 UDP:基准模型里的 `udp_blocked` 条件做的就是这件事,量的正是产品自己的决策 |
+| `MOLEHILL_CARRIER_SWITCH_AT=<秒>` | 触发时每个认领一行 | 在该客户端的数据池启动这么多秒之后,把每条透明认领切到另一条 carrier,并请求对端排空它最忙的一条车道,于是补位的那条车道会用新 carrier 拨号。排空与自动策略用的是同一个双端约定:两端的该车道都不再接受新流、保留已在它上面的流(所以不会重排序),并且只有两端都确认其中已无流时才退役——因此仍承载长流的车道不会被夺走,切换的效果体现在随后的新流上。它的用途是**测量**一次 carrier 切换能换来什么、代价是什么——生产行为是客户端内部的、由实测驱动的决策,不是旋钮——取值不是整数秒时会报告并忽略 |
+| `MOLEHILL_TUNNEL_SWITCH_AT=<秒>` | 触发时每个 pool 一行 | 上一个开关在 L4 的对应物:多路复用 pool 启动这么多秒之后,把该 pool 当前 carrier 的一条隧道移出新的放置,保留已在它上面的流(所以不会重排序),并只有当它既无 stream 也无 pinned UDP peer 时才退役——随后修复会按另一条 carrier 拨补位。一直不安静(承载长流)的隧道在排空预算到期后回到服务,补位无法建立时切换被放弃、交给普通修复——pool 永远不会一直缺一条隧道。它的用途是**测量**逐隧道切换的代价与其补位能接住什么,与 L3 的诊断开关对认领做的事一样;它不是部署旋钮,取值不是整数秒时会报告并忽略 |
+| `MOLEHILL_TUNNEL_CARRIER_RULE=1` | 每次探测事件或迁移每个 pool 一行 | 为本进程**开启**多路复用 pool 的载体规则(默认关闭,原因见下)。该规则读取每条 KCP 隧道在一秒窗口内的重传份额,凡在窗口内携带过真实流量、且份额越过 4% 的隧道即**怀疑**当前载体:它通过 hatch 驱动的同一种无扰动 handover 把一条隧道交给另一载体,在探测运行期间把新流路由到探测隧道,并在携带字节上比较两个载体——显著更多则切换端点的 carrier 决策(受同样的切换冷却约束),显著更少则归还隧道并退避十分钟,而窗口内没有携带任何流量的探测按"未测量"处理而不是下判。真正**停止交付**的隧道(交付率 < 对端移交量的 60%)无需探测,直接迁移。阈值与单侧形状(KCP → TCP;TCP 隧道的重传状态留在内核里)见 [internals.md](internals.md#the-tunnel-pool)。**为何默认关闭**:规则在它为之设计的路径上能够诚实地触发并比较,但其 Move 路径尚未在 bench 工作负载上端到端演示——UDP 工作负载的通道在服务激活时一次性打开,运行中启动的探测拿不到被路由的新流量,而现有场景没有一个既能武装怀疑、又会在探测启动之后重新拨号的(HANDOFF.md,"the sighting protocol")。在补上这一缺口的工作负载出现之前,是否启用由操作者自行决定,并了解探测能看见什么、看不见什么。
+| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个车道槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`flows`、`forwarded` 与 `no_channel`——即哪个车道承载了多少、有多少条流落在它上面,以及替换窗口让哪个车道丢了多少。这是区分「车道集合」与「全部堆在一个车道上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该车道死亡期间被丢弃的流量 |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
-就能算出每秒速率与单位成本。pool 与 placement 两行就是共享弹性 pool 的 S1
+就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
 观测(它做什么,以及为什么这些数字是聚合而不是逐个事件:
 [internals.md](internals.md#the-tunnel-pool))。`MOLEHILL_STRIPE_COUNT` 是唯一
 一个改变行为而不是观测行为的开关,它记录在 `stripe_count` 旁边——也就是它所
@@ -406,7 +634,7 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 
 ## 调优
 
-按负载选择 `mode`/`max_tunnels`/`carrier`/transport 的方法就是上面的
+按负载选择 `tunnels` 与 transport 的方法就是上面的
 [决策树](#选择配置决策树)(含实测花费与验证方式)。本节讲逐连接层面的
 旋钮。
 
@@ -416,7 +644,8 @@ TRACE)和当前 span 上下文,例如 `handle{service=ssh}:`——繁忙服务�
 降低带宽。
 
 `nodelay` 只有客户端会采纳,而且只作用于客户端为某个服务自己建立的两类
-socket:每通道一条连接路径上的数据通道连接,以及它连向本地服务的 TCP
+socket:数据通道连接(认领的车道,以及不带 `multiplex` 特性的构建里的每条
+通道),以及它连向本地服务的 TCP
 连接。其余 socket 一律保持 nodelay:控制通道两端始终设置 TCP_NODELAY,
 客户端的多路复用隧道沿用同一套控制通道选项,服务端对每条数据通道自己这
 一端以及面向访客的 socket 也始终使用固定的低延迟默认值(nodelay +
@@ -427,6 +656,68 @@ keepalive)。因此 `nodelay = false` 无法让这些 socket 重新启用 Nagle�
 
 如果带宽更重要,可以在每个服务上用 `nodelay = false` 关闭 TCP_NODELAY
 ——只作用于上面那些客户端侧 socket。
+
+## 状态 API
+
+一个可选的只读视图,回答"这个正在运行的**客户端**正在承载什么":它的服务、
+各隧道池(含每隧道字节数与 KCP ARQ 健康),以及透明客户端的 claim 与 lane。
+单个 HTTP 端点上的 JSON——前端刻意交给别人的程序(mihomo external-controller
+确立的那种分离):把面板或脚本指向这个应答即可,本守护进程不带 UI。
+
+```toml
+[client]
+default_token = "服务端的-token" # security-scan:allow 文档占位
+
+[client.control]
+default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+
+[client.status]
+bind_addr = "127.0.0.1:9090"   # 建议默认:回环地址
+token = "一串足够长的随机字符串" # 必填;每个请求都需要 # security-scan:allow 文档占位
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+```
+
+没有这个块,功能整体关闭:无监听、无端口、无可探测面。写了它:
+
+- `GET /status`(唯一路径、唯一方法)在请求携带
+  `Authorization: Bearer <token>` 时返回 `application/json`,否则返回
+  `401` 与 `WWW-Authenticate: Bearer` 质询。比对走摘要,时序不泄漏
+  token 的任何信息。
+- 应答陈述**整个**客户端:服务及其注册状态、每个活跃隧道池与每隧道
+  计数器,构建与配置带透明服务时还有 claim 与 lane。处于重连间隙的
+  会话是应答里的一段空白,而不是一个错误:还知道的就照实显示。
+- 每个响应都带 `Access-Control-Allow-Origin: *`,因此另一 origin 上的
+  浏览器面板可以读取(带 token,这就是 bearer)。
+- 为什么在客户端而不是服务端:隧道池与 lane 分配器是客户端的,而服务端
+  自身的每隧道健康也以隧道报告的形式到达客户端——一个进程已经握有
+  全部图景。控制端口承载的是客户端的协议与其认证,不是 HTTP;教它嗅探
+  请求等于把一个解析器放到数据面唯一信任的连接上,所以这是一个
+  独立的监听器。
+
+把它绑定到回环之外,等于发布这台机器自身的拓扑——请带着 token、放在
+主机已有的防护之后,刻意地做这个决定。
+
+裸 `curl` 就是全部客户端:一个头、一个路径、JSON 出来。
+
+```sh
+# 每隧道健康:各隧道承载了多少,载体让它重发了多少
+curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
+
+# 轮询观察重发计数:载体在丢流量时重发数以千计,健康时几乎为零
+# (这正是载体规则所依据的信号)
+watch -n 1 "curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
+  | jq '.pools[].tunnels[].kcp_retransmits'"
+```
 
 ## 示例与部署
 
@@ -510,8 +801,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v4 的 molehill。0.10 只服务 v4,因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
-| 客户端在服务端的 hello 始终不到达后以 `protocol v4` 停止 | 服务端早于 0.10:它读到版本 4、自己的版本检查失败并关闭该连接。请升级服务端。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5 的 molehill(0.10 系列服务 v4,0.11 系列服务 v5),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| 客户端在服务端的 hello 始终不到达后以 `protocol v5` 停止 | 服务端早于本构建:它读到版本 5、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
 | 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |
@@ -521,3 +812,12 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | UDP 流量不通 | 检查 `protocol = "udp"`;大于 `udp_buffer_size` 的数据报会被截断到该大小;空闲映射在 `udp_idle_timeout` 秒后超时。 |
 | 有状态 UDP 会话(游戏、QUIC、WireGuard)中途断开 | 确保两端运行带 UDP 会话亲和的版本(≥ 本修复);空闲超过 `udp_idle_timeout` 的对端会在下一个数据报时重新绑定到新本地 socket(源端口变化)——调大超时或发送周期流量。 |
 | `Failed to read cmd: early eof` 警告 | 对端关闭了通道(重启或关停);客户端会自动重连。 |
+| 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | 透明服务连接的是运维方创建的设备,守护进程绝不自己创建。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务))。 |
+| 注册被拒:`This server does not serve transparent (L3) services: [server.transparent] is not configured` | 服务端自己的开关没打开,所以注册在看设备之前就被策略拒绝了。如果这台主机确实要路由所声明的地址,就**在服务端的**配置里加上这张表;否则从客户端去掉该服务。 |
+| `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印的 `ip addr add <ip>/32 dev <tun>`、`ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table 100`。 |
+| `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | 注入的包携带访客的源地址,严格的检查会丢掉它们。执行信息里打印的 `sysctl -w` 行;`net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都必须读到 `0`。 |
+| `Address <ip:port> is already claimed by another transparent service on this server` | 两个客户端声明了同一个端点;先到的声明在其注册存续期间一直持有。给其中一个换地址或端口。 |
+| 在 `[client.services.<name>]` 里写 `protocol = "transparent"` 会被拒绝,信息指向 `[transparent.claims.<name>]` | 自己拥有公网地址的客户端不是转发客户端:把该条目搬到 `[transparent]` 表,并用 `--transparent` 启动那个进程。见[透明(L3)服务](#透明l3服务)。 |
+| `[client.transparent]` 被作为"配置在本版本中已迁移"拒绝 | 设备现在属于模式:`[client.transparent].tun` → `[transparent].tun`,而每个透明服务变成一个 `[transparent.claims.<name>]` 条目。 |
+| `[transparent]` 表在启动时被拒,信息为 `... and this platform is not Linux`,或指明缺少 `transparent` 特性 | 承载整个 IP 包需要 Linux 构建并启用 `transparent` 特性(默认特性集的一部分)。在其他平台上请继续用转发型 `[client]`。 |
+| 透明服务的访客拿不到任何响应,`MOLEHILL_L3_STATS=1` 计入 `unclaimed` 丢弃 | 路由不完整:服务端需要一条把所声明地址送进自己设备的路由,客户端需要 `from <ip>` 规则及其表内路由(见[部署文档](./deployment.zh.md#透明l3服务))。`unclaimed` 也会出现在没有任何成员持有该端点时的重连窗口;`no_channel` 表示某个成员的队列已满,或该流所落的成员已经消失——具体是哪一个,看按槽位的那几行。 |

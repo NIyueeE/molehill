@@ -7,6 +7,243 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-14
+
+### Changed
+
+- **BREAKING: the control channel must use Noise.** The session hello that
+  publishes the nonce every data channel of that session authenticates with was
+  itself unencrypted on a plain control channel — an on-path reader got the data
+  plane's credential for free, and the registration frames were rewritable in
+  flight. Both ends now refuse to start without a Noise key pair (`molehill
+  --genkey` prints one): the server without `[server.transport.noise]`, the
+  client without `[client.transport].type = "noise"` and its keys, the
+  transparent client without `[transparent.transport.noise]`. The
+  per-connection selector stays for the *data* plane, so a service or a lane may
+  still run plain where the payload carries its own crypto. Existing plain
+  deployments add one key-pair block per end; forwarding clients that already
+  ran Noise change nothing.
+
+- **The data plane's shape is derived from the service type: `mode` is gone.**
+  A forwarding service always multiplexes over its pinned pool; a transparent
+  claim never does, because its channels *are* its carrier connections.
+  `[client.data].default_mode` is refused with what the service type already
+  decides.
+
+- **The tunnel pool is pinned: `max_tunnels` becomes `tunnels`.** The pool used
+  to be elastic — it started cold, grew on load and gave tunnels back when idle,
+  so its width was a *result* rather than a setting. It is now dialed at the
+  configured width (`[client.data].tunnels`, default 4) and never resized for
+  load; a dead tunnel is repaired back to the count. `[client.data].max_tunnels`
+  and `[client.data].idle_timeout` are refused with the replacement / the
+  reason. Measured: one tunnel is the worst configuration on every path, two
+  captures most of the lossy-path gain, and more keeps paying on a clean fast
+  path ([benchmarks](docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)).
+
+- **The data plane's carrier is not a key: it is KCP, with TCP as its built-in
+  fallback.** `[client.data].default_carrier` and the per-service `carrier` are
+  gone — which carrier works is a property of the network, not of the
+  deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement or a
+  test.
+
+- **The KCP send window is 8192 segments, not 2048**, and **the KCP carrier's
+  datagram size follows the path** (it was pinned at 1400 and could only
+  shrink). Both were throughput ceilings on exactly the paths where they
+  mattered.
+
+- **A transparent claim's lanes move to the other carrier when the one in use is
+  measured to be losing its traffic.** Each lane carries its own identity; the
+  server reports what it offered each lane and what that lane's queue refused
+  there, and the client decides on that pair — the end that chooses the carrier
+  can finally see the loss, which happens where the packets are *offered* and
+  reads as zero in its own counters. A lane is retired only once both ends agree
+  it holds nothing, so a running flow finishes where it is.
+
+- **`[server.data].max_tunnels_per_client` now counts a transparent claim's
+  lanes too**, so the operator's valve bounds every carrier connection a client
+  holds, not just the multiplexed ones.
+
+- **The feature names are intent names only.** `hot-reload` no longer exists as
+  two spellings (its 22 code gates read the feature, not the dependency's
+  name), and the feature table is a registry: every `[features]` row except
+  `default` must be documented in the build guide.
+
+- **The benchmark model is one runner again.** `benches/scripts/bench/` owns
+  everything a performance number is produced by, and the soak sweep is a
+  profile of it. Records measured with the model it replaced stay in
+  `benches/records/` as published history.
+
+- **A shaped stage states its queue depth, and the model records what the
+  shaper dropped.** netem's implicit 1 000-packet default is a capacity as much
+  as a depth — a qdisc holds `rate x delay` packets — so at `rtt100` it capped
+  the shaped leg at 10 000 packets/s against a return stream of 37 600 and shed
+  73 % of it, while every device counter in the evidence read zero, because
+  `/proc/net/dev` cannot see a qdisc's drops. The classes that shape a delay
+  now carry 10 000 packets (the value `loss1_buf` already used for "tail drops
+  out of the way"), `loss1` states the 1 000 it means, each stage's qdisc drops
+  and standing backlog travel in its evidence, and `dropped_packets` counts
+  them. Numbers published for the shaped stages under the old default measured
+  the shaper.
+
+- **The wedge axis measures silence, and it used to measure something else.**
+  `wedge_count` and `wedge_max_s` read gaps between interactive samples, and
+  the probe is serial — so the gap was the *next attempt's own duration* — while
+  the threshold sat at exactly the probe's attempt budget, making a single
+  unanswered attempt a "silence" by construction. A 5 %-loss stage therefore
+  reported two 5.1–5.5 s **successful** answers as a tool "going silent". A
+  silence is now a run of consecutive unanswered attempts measured end to end,
+  the threshold is two attempt budgets, and `ATTEMPT_TIMEOUT_S` bounds the whole
+  attempt rather than each socket operation. Published `wedge_count` numbers
+  mean something different now; the benchmarks page says what.
+
+### Added
+
+- **Transparent (L3) clients: the client owns the public `ip:port`.** A
+  `[transparent]` block is a run mode of its own, and every entry it has is a
+  claim: the client owns a public `ip:port` on a TUN device, the server routes
+  whole IP packets into the tunnel, and the **client's own kernel answers the
+  visitor** — so the backend sees the visitor's real source address and the
+  server holds no socket and no per-flow state for the connection. It lowers
+  into the same client engine the forwarding path runs on, so the wire and the
+  data path are shared. Linux only, `CAP_NET_ADMIN` on the client and on any
+  server that serves it; the daemon never creates, addresses or routes the TUN
+  device, and a missing prerequisite is refused with the exact command to run
+  instead of failing as silent packet loss. Serving L3 is the server
+  operator's decision: `[server.transparent]` is that switch, and without it a
+  registration is refused **by policy, before any device is looked at**. The
+  wire moves to **protocol v5**, so both ends upgrade together. IPv6 is not
+  carried (dropped and counted). Keys, the two operator recipes and the
+  privileges each mode needs: [Configuration](docs/configuration.md#transparent-l3-services)
+  and [Deployment](docs/deployment.md#transparent-services).
+
+- **A transparent claim's lanes are lent to the claim that needs them.** The
+  lane budget used to be split equally and left that way, so a claim carrying
+  sixteen flows and a claim carrying nothing held the same number. The client
+  now moves an idle lane to the claim furthest from a lane per talking flow —
+  never below one lane, and only after the donor's lane has actually ended, so
+  the connection count the operator pays for moves rather than grows. A single
+  flow cannot be spread over two lanes (its packets have to stay in order), so
+  the gain is per flow. Measured on a path whose carrier connections are the
+  limit: **+27 % throughput** for one claim, at +8 % CPU per byte; on a clean
+  fast loopback the difference is inside the noise.
+  `[transparent.data].lend = false` holds the equal split static.
+
+- **A transparent client holds two lanes per claim by default, not one.** A
+  claim's data path is serialized per lane — one device reader and one injector —
+  so a busy claim's throughput follows its lanes, and so does the pressure it
+  puts on the reader every claim shares. Two is the largest value that keeps
+  both axes, and both were measured (one host, five claims, eight inner flows):
+  bulk alone reads 2.351 Gbit/s at one lane, **3.283 at two** and 5.191 at four;
+  with an interactive stream beside the load — the capacity ramp, and the SLO's
+  50 ms p99 — **two sustains all eight streams at a 2 ms p99 and 3.32 Gbit/s**,
+  while **four sustains three** and reads 271 ms from four streams onward. Four
+  lanes buys another 58 % of bulk throughput and spends the interactive stream's
+  headroom doing it, so four is a configuration to ask for, not one to inherit.
+  The trade is connections — `lanes x claims`, each a socket, ≈2.6 file
+  descriptors and 0.5–0.8 MiB RSS on both ends, plus a slot in the server's
+  `max_tunnels_per_client` valve — and a claim carrying a *single* flow gains
+  nothing from any of them. **`tunnels` equal to the claim count restores the old
+  behaviour**; the configuration page prices both the default and the ceiling.
+
+- **A claim's flow placement is remembered, so a lane change cannot reorder a
+  flow.** The hub used to route every packet by `hash % width`, which meant a
+  lane *joining* re-placed every established flow.
+
+- **The client can answer "what am I carrying" over an optional status API.** A
+  `[client.status]` block with a `bind_addr` and a required `token` starts one
+  read-only HTTP endpoint — `GET /status`, the only path and the only method —
+  answering JSON: every service with its registration state, every live tunnel
+  pool with per-tunnel bytes and KCP ARQ health, and a transparent client's
+  claims and lanes. It carries `Access-Control-Allow-Origin: *` so a panel on
+  another origin can read it (the split mihomo's external-controller made
+  standard). It lives on the **client** and on its **own** listener: the pool
+  and the lane allocator are the client's, and the control port carries the
+  client's protocol — teaching it to sniff HTTP would put a parser on the one
+  connection the data plane trusts. Absent, the block is off.
+
+- **The server reports each multiplexed tunnel's ARQ health back to the
+  client**, and **the tunnel pool's carrier rule can probe the other carrier
+  instead of trusting its own counters**: a suspicion hands one tunnel to the
+  carrier the pool is not riding, and compares carried bytes before deciding.
+  Still opt-in (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), because the wiring run
+  measured its trigger as rate-dependent; a probe whose window carried nothing
+  is held rather than judged.
+
+- **The bench model's verdicts are statistics, not a silent heuristic.** An
+  exact sign test with its p-value beside the level the run's own length can
+  test at, a bootstrap confidence interval over the paired difference, and
+  **pre-registered** primary endpoints (`--primary`) so choosing the winner
+  after seeing the numbers changes the file's identity. A cell that lost more
+  than half its rounds is refused outright; a verdict that flips when one round
+  is dropped is marked FRAGILE.
+
+- **A path condition that polices UDP instead of refusing it**
+  (`--condition udp_throttled`), **a `loss1_deep` condition** that separates a
+  carrier's loss recovery from the shaper's own drops, and **a peer arm's tool
+  version recorded beside its numbers** (`peer_versions`).
+
+- **The gate chain classifies bench-only changes** (`benches/scripts/**`): the
+  scripts are runtime tooling, never compiled, so the fast gate skips the cargo
+  gates for them and pre-push skips the heavy ones. CI keeps the full chain —
+  it is a latency split, never a coverage split.
+
+### Fixed
+
+- **Transparent (L3) bulk throughput: the device's own segmentation offload is
+  now taken.** The TUN device is attached with `IFF_VNET_HDR` and declares
+  `TUNSETOFFLOAD` (TCP and UDP, IPv4 and IPv6), so the kernel hands the reader
+  GSO super-frames — one up-to-64 KiB read per ~44 MTU-sized packets instead
+  of one read per packet. Measured on this host (kernel 6.12, a routed
+  forward path): without the declaration a bulk TCP flow arrived as 576 071
+  reads of 1 500 bytes; with it, as 59 160 reads averaging 65 212 bytes
+  (`gso_type = TCPV4`) for the same 3.85 GB. Every read, routing lookup,
+  batch hand-over, carrier write and ACK now covers a super-frame instead of
+  a single packet, which is the packing the multiplexed path gets for free
+  from the kernel's TCP stack. The frame travels the lane whole (10-byte
+  virtio-net header included — a `NEEDS_CSUM` frame only checksums with its
+  header present), so the transparent wire framing's length prefix moves from
+  `u16` to `u32`; no two releases share a wire, and v5 is still untagged, so
+  both ends upgrade together as always.
+
+- **The `embedded`, `noise` and `transparent` feature combinations compile
+  again** (the `NoiseConfig` re-export was gated on two stacked cfg
+  attributes), and **the tunnel byte counters no longer take a process-wide
+  lock on the IO path**.
+
+- **KCP: a refused datagram is held, not dropped** (the pacer's denial, a
+  partial `sendmmsg` and `EAGAIN` no longer wait a round trip for the ARQ), **a
+  retransmission timeout clears the round trip it is timing**, **a session is
+  no longer declared dead for being slow** (the reference's twenty-retransmit
+  rule cannot tell a gone peer from a slow one), **a session no longer
+  throttles itself for being busy** (its pacer read a queued keepalive PONG as
+  congestion), and **a control frame sharing a datagram batch with payload is
+  no longer fed to the ARQ and dropped**.
+
+- **A tunnel pool's repair follows the endpoint's carrier preference**, and **a
+  deliberate carrier switch is no longer undone by a reachability re-probe**.
+
+- **Transparent lanes: a handover completes** (a peer's drain waited for the
+  placement table to forget a flow — a minute — rather than for the lane to go
+  quiet), **a retired or lost lane no longer leaves the peer writing into a
+  channel that carries nothing** (a KCP session has no close handshake), **a
+  forced carrier now stops the lane policy** instead of draining a lane for a
+  switch that cannot happen, and **carrier reports are matched to their claim**
+  before the lane id is consulted.
+
+- **The transparent (L3) code compiles for musl**, so the static release
+  binaries — and the container image built from them — carry L3 services: the
+  TUN attach passed `TUNSETIFF` typed for glibc's `ioctl` signature, which
+  musl's `c_int` request parameter refuses. The CI musl job and `just container`
+  now name the whole default feature set, so the image a reader builds locally
+  is the image the release publishes.
+
+- **Dependencies refreshed ahead of the release**: `chacha20` moves off its
+  yanked 0.10.1 to 0.10.2 (cargo audit's last allowed warning), and `libc`,
+  `sha2`, `tokio`, `toml` take their patch releases. The `tokio` patch
+  deprecates `AsyncFd::new` (an I/O-safety hole), so the TUN fd registers
+  through `AsyncFd::register` instead — same semantics, with the ownership
+  argument the safe path could not state.
+
 ## [0.10.0] - 2026-10-01
 
 ### Changed

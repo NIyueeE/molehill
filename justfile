@@ -76,9 +76,10 @@ bench-deps:
     sudo apt-get install -y iperf3 iproute2
 
 # Fetch the latest GitHub release binaries of the peer tools (frp, rathole,
-# nps) into ~/tmp/bench-peers — nothing is built from source.
-soak-peers:
-    uv run benches/scripts/soak/fetch_peers.py
+# nps) into ~/tmp/bench-peers — nothing is built from source. A peer arm needs
+# them; `just bench-doctor` says whether they are there.
+bench-peers:
+    uv run benches/scripts/bench/peers.py fetch
 
 # Interop matrix: this build against the previous release's binary, both
 # directions (needs network on the first run; the fetched binary is cached
@@ -96,22 +97,63 @@ interop:
     # (libtest captures a passing test's output); this is the run that does them.
     cargo test --test interop_test -- --test-threads=1 --include-ignored
 
-# Run the soak benchmark: a tool (or a batch of them) through the scripted
-# workload under the stage schedule. Test types: capacity / rrul / soak /
-# cost / screen — see docs/release.md, "Benchmarks".
-# Example (fast development A/B between two builds):
-#   just soak --test=screen --path=clean --streams-max=8 --ab bin-a,bin-b
-soak *ARGS:
-    uv run benches/scripts/soak/soak.py {{ARGS}}
+# Transparent-L3 acceptance: the real binaries in a three-namespace topology,
+# proving the client (never the server) owns the public ip:port. Needs root
+# for the veth pairs, TUN devices and routes, so it is outside the check
+# chain; without root it skips loudly (exit 77) instead of passing silently.
+# See docs/checks.md, "Outside the chain".
+l3-accept:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "$(git rev-parse --show-toplevel)"
+    bash benches/scripts/l3/run.sh
 
-# Render the charts + markdown tables from the latest results file.
-soak-plot:
-    uv run benches/scripts/soak/soak_plot.py
+# The performance model: one topology, a declared metric registry, a control
+# arm in every scenario and a noise floor the run measures itself. Root-only
+# (three network namespaces) and outside the check chain; results land outside
+# the tree. Method: docs/benchmarks.md, "The bench model".
+# Examples:
+#   sudo -n just bench                      # the smoke profile, about a minute
+#   sudo -n just bench --profile dev --aa   # the default for an optimization
+#   sudo -n just bench --arm id=l3,txqueuelen=10000
+#   sudo -n just bench --ab-arm l3 --binary-b /path/to/other/build
+bench *ARGS:
+    uv run benches/scripts/bench/bench.py run {{ARGS}}
 
-# The gate: latest results vs the previous release's file (pre-tag ritual).
-# With --screen <file>: the verdict of a development A/B run.
-soak-check *ARGS:
-    uv run benches/scripts/soak/soak_check.py {{ARGS}}
+# What this host can and cannot measure, before a run finds out.
+bench-doctor *ARGS:
+    uv run benches/scripts/bench/bench.py doctor {{ARGS}}
+
+# The registry: every metric, scenario, arm and profile the model declares.
+bench-list:
+    uv run benches/scripts/bench/bench.py list
+
+# Render a stored results file (tables, floors, verdicts) as markdown.
+bench-report FILE:
+    uv run benches/scripts/bench/bench.py report {{FILE}} --markdown
+
+# A/B two results files, or refuse: comparability first, then the verdicts.
+bench-compare A B:
+    uv run benches/scripts/bench/bench.py compare {{A}} {{B}}
+
+# The model's own checks (metric registry, verdict rules, comparability rules,
+# probe syntax): no root, no topology, seconds. Also in the pre-commit gate.
+bench-selfcheck:
+    uv run benches/scripts/bench/bench.py selfcheck
+
+# Render a results file's charts and markdown tables (matplotlib comes from the
+# script's own PEP 723 header).
+# Example: just bench-plot ~/tmp/bench-*.json
+bench-plot *ARGS:
+    uv run benches/scripts/bench/plot.py {{ARGS}}
+
+# The gate: coverage, the endpoint invariant, the SLO on the clean stages, the
+# drift and wedge axes, the capacity ramp — plus the regression half when a
+# comparable baseline is given. This is what the pre-tag ritual runs.
+# Example: just bench-gate benches/records/results-bench-v0.11.0.json \
+#            --baseline benches/records/results-bench-v0.10.0.json
+bench-gate *ARGS:
+    uv run benches/scripts/bench/bench.py gate {{ARGS}}
 
 # Fast dev loop: lib tests + the core integration subset (~1 min; the full
 # suite is ~72 s and runs on every push/CI — see docs/checks.md).
@@ -133,7 +175,7 @@ container:
     #!/usr/bin/env bash
     set -euo pipefail
     cd "$(git rev-parse --show-toplevel)"
-    cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features server,client,noise,hot-reload,multiplex,kcp
+    cargo build --release --target x86_64-unknown-linux-musl --no-default-features --features server,client,noise,hot-reload,multiplex,kcp,transparent
     mkdir -p img/bin/amd64
     cp target/x86_64-unknown-linux-musl/release/molehill img/bin/amd64/
     docker build -f Containerfile -t molehill img/

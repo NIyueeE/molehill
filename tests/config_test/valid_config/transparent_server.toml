@@ -1,0 +1,14 @@
+[server]
+default_token = "t"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+
+# The control channel is always Noise
+[server.transport.noise]
+local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture key
+
+[server.transparent]
+tun = "molehill-srv0"

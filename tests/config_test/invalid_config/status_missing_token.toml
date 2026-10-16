@@ -1,0 +1,18 @@
+# expect: missing field `token`
+
+[client]
+default_token = "t"
+[client.control]
+default_remote_addr = "127.0.0.1:2333"
+[client.status]
+bind_addr = "127.0.0.1:9090"
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:2334"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture key
+

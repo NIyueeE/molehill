@@ -1,8 +1,9 @@
 # 传输层
 
-默认情况下,`molehill` 按原样转发流量(明文 TCP)。客户端的
+控制通道永远使用 Noise(它发布的会话 nonce 是数据通道认证所用的凭证,
+明文控制段等于把数据面凭证交给路径上的所有人)。客户端的
 `[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
-决定**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
+决定数据面**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
 语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
 `type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见
 [benchmarks.md](benchmarks.md)的「每个配置选择的代价」。本文只讲
@@ -58,6 +59,13 @@ local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
 
 ### 按服务加密
 
+有一种客户端模式没有加密可配:透明(L3)客户端永远是明文,因为它承载的是整个
+IP 包,内容由访问者自己的端到端保护负责,这一跳按设计就是明文链路。这是结构性的,
+不是一条规则——它的 `[transparent.transport]` 表只有 `proxy` 键,没有任何放密码
+的地方,想要求加密也无处可写——见[配置文档](./configuration.zh.md#透明l3服务)。
+服务端接受什么不受影响:它的 Noise 键仍然作用于每一个协商了 Noise 的客户端,
+而 L3 客户端从不会协商。
+
 客户端全局的 `[client.transport].type` 是每个服务的默认值,每个服务都可以
 单独覆盖——包括自己的密钥,这正是多服务端场景需要的(每个服务端持有自己的
 密钥对):
@@ -82,7 +90,7 @@ transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" }
 强制明文。有效传输为 Noise 的服务必须要有密钥——优先用自己
 `transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
 Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
-(`carrier = "kcp"` 时的)Noise-over-KCP 包裹都用该服务的有效密钥。服务端
+以及其 KCP 会话的 Noise-over-KCP 包裹,都用该服务的有效密钥。服务端
 只需要放置自己的密钥(传输选择器:它接受每条连接所说的语言)。
 
 ### 指定 pattern

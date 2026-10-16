@@ -96,11 +96,17 @@ jobs:
       # release.yml builds the release binaries (and the GHCR image) with
       # exactly this target and feature set; nothing else in CI does, so a
       # glibc-only assumption in Linux-only code reaches the release build.
+      # The list is the whole default set, and it has to stay that way: this
+      # check is the only thing that builds it for musl, and it silently
+      # stopped covering the release when `transparent` was added to
+      # release.yml alone (a TUN `ioctl` request that only glibc's signature
+      # accepts reached the tag). `githooks/check-docs` now fails the three
+      # copies of this list if they disagree with Cargo.toml.
       - name: Check the release feature set against musl
         run: >
           cargo check --all-targets --target x86_64-unknown-linux-musl
           --no-default-features
-          --features server,client,noise,hot-reload,multiplex,kcp
+          --features server,client,noise,hot-reload,multiplex,kcp,transparent
 
   test:
     name: test ${{ matrix.name }}

@@ -81,8 +81,8 @@ jobs:
           # notes, so the release stops here instead of publishing a claim
           # nobody can check.
           missing=0
-          for f in "benches/scripts/soak/results-soak-v$VERSION.json" \
-                   "assets/soak-v$VERSION.png"; do
+          for f in "benches/records/results-bench-v$VERSION.json" \
+                   "assets/bench-v$VERSION.png"; do
             if [ -f "$f" ]; then
               echo "ok: $f"
             else
@@ -117,14 +117,14 @@ jobs:
             cross: false
             # Full default feature set: static musl binary.
             # Used as the linux/amd64 container image artifact.
-            features: server,client,noise,hot-reload,multiplex,kcp
+            features: server,client,noise,hot-reload,multiplex,kcp,transparent
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             exe: molehill
             cross: true
             # Same feature set as x86_64 musl so the linux/arm64 container
             # image artifact is feature-consistent with linux/amd64.
-            features: server,client,noise,hot-reload,multiplex,kcp
+            features: server,client,noise,hot-reload,multiplex,kcp,transparent
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
             exe: molehill
