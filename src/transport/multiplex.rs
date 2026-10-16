@@ -5120,6 +5120,11 @@ mod tests {
         assert_eq!(dials.load(Ordering::Relaxed), 0);
 
         // The peer goes away: the driver observes the closed duplex and ends.
+        // This loop is an observation, not the property under test — the
+        // corpse-marking races the driver task, and the repair loop below
+        // owns the deadline (a loaded CI runner, measured: the windows runner
+        // under the full suite, can stall a timer far past any local
+        // expectation, which is where that deadline failed at 5 s).
         server0.abort();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -5138,7 +5143,7 @@ mod tests {
 
         // The tick reaps the corpse and dials exactly one replacement, whoever
         // gets there first (the pool's own task or this call).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while pool.size() < 1 && std::time::Instant::now() < deadline {
             pool.maintain().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
