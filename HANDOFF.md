@@ -212,22 +212,24 @@
   UDP_SEGMENT sender and only rules out a UDP-shaped win)).
 
 - **RESOLVED: the release sweep is measured.** The run that matters landed on
-  2026-10-16 at `e4afa24` (the release commit, tree clean, binary
-  `a6169db1841a19cf`): 85 samples over the five arms (molehill, l3, frp,
+  2026-10-17 at `6222e3c` (the release commit, tree clean, binary
+  `490335fb9c5cdadc`): 84 samples over the five arms (molehill, l3, frp,
   rathole, nps), timeline + capacity, 103 minutes, zero failed samples.
   `just bench-gate` PASSES — the endpoint invariant, the clean-stage SLOs,
   zero wedges on every arm, every arm sustaining the ramp to its own ceiling
-  (nps two this run; its path-limited ceiling has read 2/5/8 across runs, its
-  own recorded behavior). Two earlier attempts taught the same lesson from
-  both ends: the first (at `26ebb13`) was green but its tag's release build
-  failed on aarch64-musl — `c_char`'s signedness is a target property the
-  x86_64-only CI musl job never sees, fixed in `e4afa24`; the second re-run
-  lost one cell to a probe timeout while this host was busy with the cross
-  builds for that very fix — a self-inflicted measurement contamination that
-  the gate's coverage rule correctly refused. The headline shift from the
-  pre-offload record (`1c2dcd9`): L3 clean bulk 2.811 → **6.014 Gbit/s**
-  (+114 %, the offload fix through a staged run), clean interactive p99
-  2.3 → **1.3 ms**; L4 essentially unchanged (9.10 → 9.30). The charts and
+  (nps one this run; its path-limited ceiling has read 1/2/5/8 across runs,
+  its own recorded behavior). Three earlier attempts each paid for a lesson
+  now recorded here: the first (at `26ebb13`) was green but its tag's release
+  build failed on aarch64-musl — `c_char`'s signedness is a target property
+  the x86_64-only CI musl job never sees, fixed in `e4afa24`; the second lost
+  one cell to a probe timeout while this host was busy with the cross builds
+  for that very fix — a self-inflicted measurement contamination the gate's
+  coverage rule correctly refused; the third was clean but its tag's release
+  run tripped the windows flake in the multiplex pool test, fixed in
+  `6222e3c` (the repair loop owns the CI deadline). The headline shift from
+  the pre-offload record (`1c2dcd9`): L3 clean bulk 2.811 → **5.950 Gbit/s**
+  (+112 %, the offload fix through a staged run), clean interactive p99
+  2.3 → **1.5 ms**; L4 essentially unchanged (9.10 → 8.86). The charts and
   both READMEs carry these numbers, and the L3-vs-L4 reading on them is
   "the two architectures split the workloads" rather than "one trades
   throughput for latency".

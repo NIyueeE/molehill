@@ -105,21 +105,21 @@ winner is marked in those columns. Sample counts and the full reading rules:
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
 | molehill (L4) | 4.2 | 402.2 | 1071.6 | 2451.4 | 199.0 | 434.2 | 281.6 | 3.9 |
-| molehill (L3) | 1.3 | 401.3 | 1064.2 | 2067.3 | 197.4 | 432.5 | 280.6 | 1.3 |
-| frp | 1.2 | 401.4 | 1069.9 | 1452.9 | 196.0 | 424.6 | 277.2 | 1.4 |
-| rathole | 1.5 | 401.1 | 1070.5 | 3137.8 | 196.9 | 430.3 | 281.3 | 1.4 |
-| nps | 16.8 | 421.6 | 1076.1 | 1449.8 | 197.6 | 434.5 | 267.3 | 66.7 |
-
+| molehill (L4) | 4.6 | 402.3 | 1074.3 | 2051.4 | 196.5 | 435.2 | 263.1 | 4.3 |
+| molehill (L3) | 1.5 | 401.4 | 1057.0 | 2084.7 | 196.5 | 428.8 | 284.1 | 1.5 |
+| frp | 1.4 | 401.3 | 1083.7 | 2684.0 | 195.9 | 431.5 | 290.1 | 11.0 |
+| rathole | 1.6 | 400.9 | 1078.3 | 2464.9 | 197.1 | 426.5 | 263.1 | 1.8 |
+| nps | 82.6 | 441.6 | 1072.3 | 2036.4 | 198.3 | 430.5 | 272.7 | 59.9 |
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 9.302 | 3.397 | 9.111 | 0.814 | 0.094 | 0.019 | 0.019 | 9.382 |
-| molehill (L3) | 6.014 | 3.159 | 4.774 | 0.944 | 0.093 | 0.019 | 0.019 | 5.981 |
-| frp | 5.987 | 3.382 | 6.086 | 1.141 | 0.094 | 0.019 | 0.019 | 5.968 |
-| rathole | 28.587 | 3.389 | 14.778 | 1.176 | 0.094 | 0.019 | 0.019 | 28.338 |
-| nps | 0.134 | 0.136 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 8.864 | 3.414 | 8.557 | 1.096 | 0.094 | 0.019 | 0.019 | 8.892 |
+| molehill (L3) | 5.950 | 2.878 | 5.041 | 1.034 | 0.093 | 0.019 | 0.019 | 5.976 |
+| frp | 6.023 | 3.384 | 6.122 | 1.179 | 0.094 | 0.019 | 0.019 | 5.995 |
+| rathole | 28.794 | 3.406 | 14.838 | 1.141 | 0.094 | 0.019 | 0.019 | 29.129 |
+| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **The run's own replicate.** `clean` is measured at both ends of every
 timeline, so each tool's two readings are two samples of one condition about an
@@ -127,11 +127,11 @@ hour apart — the scale every other cell is read against:
 
 | tool | clean bulk reading | clean interactive p99 |
 |---|---|---|
-| molehill (L4) | 9.302 – 9.382 Gbit/s (**0.9 %** apart) | 4.2 – 3.9 ms |
-| molehill (L3) | 6.014 – 5.981 Gbit/s (**0.6 %** apart) | 1.3 – 1.3 ms |
-| frp | 5.987 – 5.968 Gbit/s (**0.3 %** apart) | 1.2 – 1.4 ms |
-| rathole | 28.587 – 28.338 Gbit/s (**0.9 %** apart) | 1.5 – 1.4 ms |
-| nps | 0.134 – 0.134 Gbit/s (**0.0 %** apart) | 16.8 – 66.7 ms |
+| molehill (L4) | 8.864 – 8.892 Gbit/s (**0.3 %** apart) | 4.6 – 4.3 ms |
+| molehill (L3) | 5.950 – 5.976 Gbit/s (**0.4 %** apart) | 1.5 – 1.5 ms |
+| frp | 6.023 – 5.995 Gbit/s (**0.5 %** apart) | 1.4 – 11.0 ms |
+| rathole | 28.794 – 29.129 Gbit/s (**1.1 %** apart) | 1.6 – 1.8 ms |
+| nps | 0.134 – 0.134 Gbit/s (**0.1 %** apart) | 82.6 – 59.9 ms |
 
 **How much it carries.** The same artifact carries the load ramp — the first
 bulk load level at which a fresh interactive connection breaks the SLO — a
@@ -144,8 +144,8 @@ architecture, not a fifth tool: frp, rathole and nps are forwarding proxies with
 no TUN path, so the L3 row's comparison is `molehill (L4)` and the tool-free
 control arm — same workload, same topology, one architecture apart. The honest
 reading is that **the two architectures now split the workloads**: on the clean
-stage L3 reads 6.01 against L4's 9.30 Gbit/s bulk, with a clearly lower
-interactive p99 (1.3 against 4.2 ms) and a steadier one under load — it holds
+stage L3 reads 5.95 against L4's 8.86 Gbit/s bulk, with a clearly lower
+interactive p99 (1.5 against 4.6 ms) and a steadier one under load — it holds
 every level of the capacity ramp. Bulk and latency move opposite ways because
 v0.11.0 narrowed the bulk gap at its root: the device now takes its
 segmentation offload (GSO super-frames instead of one packet per read), which
@@ -170,7 +170,7 @@ is what a shaped stage's interactive number is a reading *of*
 
 **Read the L4 row against the v0.10.0 one and the difference is the data plane,
 not the tool.** v0.10.0 published 16.83 Gbit/s on the clean stage with a plain
-data plane; this run reads 9.30 with the control channel's Noise keys inherited
+data plane; this run reads 8.86 with the control channel's Noise keys inherited
 by every service — and the price list for that choice is measured at
 [Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)
 (10.0 → 5.8 Gbit/s at one stream, 19.5 → 14.9 at eight: ~42 %, against the ~46 %
