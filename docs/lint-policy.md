@@ -74,7 +74,9 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
   relaxed by an expectation, which is the point.
 
 The TUN waivers are sanctioned because the ioctls and the tokio registration
-have no safe equivalent. The batching site is no longer unsafe: `udp_batch`
+have no safe equivalent. A `tun-rs` replacement was tried and measured about
+0.6 % slower while adding 29 dependencies, so the audited three-ioctl version
+stays. The batching site is no longer unsafe: `udp_batch`
 uses `nix`'s safe `recvmmsg`/`sendmmsg`, at a measured 1.4-1.9 % CPU per Gbit
 cost (inside the 15 % materiality floor; the A/B is in
 [HANDOFF.md](../HANDOFF.md)). The `sysconf(_SC_CLK_TCK)` read is also gone, in

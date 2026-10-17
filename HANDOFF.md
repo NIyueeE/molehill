@@ -121,8 +121,21 @@
   raw-FFI baseline measured 1.566-1.578 s/Gbit against 1.590-1.602 for the nix
   variants: ~1.5-1.9 % higher CPU, consistently in the same direction. That is
   inside `cpu_s_per_gbit`'s 15 % materiality floor (no claim), so the safety
-  win was accepted. `quinn-udp` is no longer needed to remove this waiver; it
-  remains only a GSO/GRO transport experiment.
+  win was accepted.
+- **`quinn-udp` is not a drop-in replacement for this batching.** Its
+  `poll_send` takes one `Transmit`, and GSO requires contiguous, equal-sized
+  segments; KCP's batch is a mix of `Staged` and `Split` spans, so using it
+  would mean copying every datagram or paying one syscall per datagram. Its
+  `poll_recv` enables GRO, which returns coalesced datagrams that KCP would
+  have to split by `stride` before its per-datagram accounting. That is a
+  transport redesign with its own A/B, not a wrapper swap, and the `nix`
+  wrapper already removed the local unsafe.
+- **A `tun-rs` replacement for the TUN attach was tried and declined.** It
+  compiled and ran the real L3 path (the binary attached, read and wrote
+  frames through `tun-rs`), but the `screen` A/B measured 1.1969 s/Gbit for the
+  current attach against 1.2045 for `tun-rs` (~0.6 % slower, inside the 15 %
+  floor), and it adds 29 crates (netlink/route_manager, encoding_rs, winreg,
+  zerocopy, ...) and ~300 lockfile lines. The three audited ioctls stay.
 - **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
   trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
   `set_var`/`remove_var` scoped and safe at the call site; a worktree
