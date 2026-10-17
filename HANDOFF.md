@@ -74,10 +74,10 @@
   (`l3-budget10-lending` against `l3-budget10-nolend`).
 - **The repository state**: `version = "0.11.1"` and `CHANGELOG.md` carries a
   dated `## [0.11.1] - 2026-10-17` section (no tag yet; `[Unreleased]` is
-  empty). `main` is at the v0.11.0 release commit and `v0.11.0` names
-  `f3295e8`. The branch `feat/v0.11.1-builds` also carries the native ARM64
-  build/test legs and the every-musl-target check (`5e585b7`). No v0.11.1 tag
-  or push is implied by this state; the release ritual is separate.
+  empty). `main` is at `664ab22` (the post-release HANDOFF update) and
+  `v0.11.0` names `f3295e8`. The branch `feat/v0.11.1-builds` also carries the
+  native ARM64 build/test legs and the every-musl-target check (`5e585b7`).
+  No v0.11.1 tag is implied by this state; the release ritual is separate.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
