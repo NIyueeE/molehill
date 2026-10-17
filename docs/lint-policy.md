@@ -22,11 +22,10 @@ pre-commit). Changing a lint level or a waiver requires updating this page
 | `todo` | warn | stubs get removed, not accumulated (AGENTS.md §9) |
 | `pedantic` | deny | the whole pedantic clippy group (rust-agents-template parity); members that genuinely do not fit are relaxed per-item in code with a reason, never here |
 
-Deviations from the rust-agents-template lint set: none. The template's
-`clippy::pedantic` (deny) and `missing_docs` (warn) are declared above since the
-lint migration; individual pedantic members that do not fit this codebase are
-relaxed per-item in code — prefer `#[expect(..., reason = "...")]` — under the
-same waiver discipline as every other lint.
+The lint set matches the rust-agents-template: no declared deviations.
+Individual pedantic members that do not fit are relaxed per item in code —
+prefer `#[expect(..., reason = "...")]` — under the same waiver discipline as
+every other lint.
 
 ## Waiver discipline
 

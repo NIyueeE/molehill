@@ -1,6 +1,7 @@
 # Build Guide
 
-This is for those who want to build `molehill` themselves, possibly because the need of latest features or the minimal binary size.
+This page is for contributors building `molehill` from source — for the latest
+features, another platform, or a smaller binary.
 
 ## Build
 
@@ -12,7 +13,8 @@ cargo build --release
 
 ## Customize the Build
 
-`molehill` comes with lots of *crate features* that determine whether a certain feature will be compiled or not. Supported features can be checked out in `[features]` of [Cargo.toml](../Cargo.toml).
+The crate is feature-gated: `[features]` in [Cargo.toml](../Cargo.toml) is the
+list of what can be compiled in or out.
 
 For example, to build `molehill` with the `client` and `noise` feature:
 

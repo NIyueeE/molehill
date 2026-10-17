@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for contributing! This repository runs a layered check pipeline; please
-make sure it stays green.
+This page is for contributors: how to set up, run the gates, and land a change.
+Users start at [README.md](README.md).
 
 ## Setup
 
@@ -18,11 +18,11 @@ with `curl -LsSf https://astral.sh/uv/install.sh | sh` (AGENTS.md §1).
 ## Check gates
 
 The authoritative gate tables — every command, what it does, and what to do
-when a gate blocks you — live in [docs/checks.md](docs/checks.md). In short:
-fast gates run on every commit, heavy gates on every push, and CI runs the
-same chain via `just check` plus the extra jobs `just check` cannot cover
-(feature powerset, the per-feature test matrix, the minimal-size check, the
-musl static build, the platform builds).
+when a gate blocks you — are in [docs/checks.md](docs/checks.md). Fast gates run
+on every commit, heavy gates on every push. CI runs the same chain via
+`just check` plus the jobs it cannot cover: the feature powerset, the
+per-feature test matrix, the minimal-size build, the musl checks and the
+platform builds.
 
 The full discipline — including when a lint waiver is acceptable — lives in
 [AGENTS.md](AGENTS.md) §2 and [docs/lint-policy.md](docs/lint-policy.md). In
