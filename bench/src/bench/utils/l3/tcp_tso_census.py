@@ -39,8 +39,10 @@ import collections
 import contextlib
 import fcntl
 import os
+import shutil
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -275,6 +277,14 @@ s.close()
 """
 
 
+def _ip() -> str:
+    """The iproute2 binary, or a refusal naming the missing tool."""
+    found = shutil.which("ip")
+    if found is None:
+        sys.exit("ip: not on PATH (install iproute2)")
+    return found
+
+
 def main() -> int:
     setup()
     fd_tun = attach("census_tun", vnet=True)
@@ -283,7 +293,7 @@ def main() -> int:
     shuttle = Shuttle(fd_tun, fd_in)
     shuttle.start()
     server = subprocess.Popen(
-        ["ip", "netns", "exec", "census_b", "python3", "-c", SERVER_CODE],
+        [_ip(), "netns", "exec", "census_b", sys.executable, "-c", SERVER_CODE],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -291,7 +301,7 @@ def main() -> int:
     time.sleep(0.4)
     try:
         client = subprocess.run(
-            ["ip", "netns", "exec", "census_a", "python3", "-c", CLIENT_CODE],
+            [_ip(), "netns", "exec", "census_a", sys.executable, "-c", CLIENT_CODE],
             check=False,
             capture_output=True,
             text=True,

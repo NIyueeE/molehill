@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shutil
 import socket
 import statistics
 import subprocess
@@ -34,6 +35,14 @@ import time
 from pathlib import Path
 
 from bench import paths
+
+
+def _git() -> str:
+    """The git executable, or an OSError the callers already suppress."""
+    found = shutil.which("git")
+    if found is None:
+        raise FileNotFoundError("git")
+    return found
 
 
 def binary_fingerprint(path) -> dict:
@@ -469,7 +478,7 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
             # No `--broken`: in git 2.47 it appends `-dirty` to the *name*,
             # which is the conflation this function exists to undo (the verdict
             # is the second return value, and it excludes the run's own output).
-            ["git", "describe", "--always"],
+            [_git(), "describe", "--always"],
             capture_output=True,
             text=True,
             check=False,
@@ -483,7 +492,7 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         root = Path(
             subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"],
+                [_git(), "rev-parse", "--show-toplevel"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -492,7 +501,7 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
             ).stdout.strip()
             or here
         )
-        args = ["git", "status", "--porcelain", "--", "."]
+        args = [_git(), "status", "--porcelain", "--", "."]
         # `:(exclude)` pathspec: everything except the run's own output, stated
         # relative to the repository root the status is run from. A path
         # *outside* the repository cannot be excluded — git exits 128 with

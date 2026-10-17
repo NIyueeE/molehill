@@ -266,11 +266,12 @@ def iperf_version() -> str:
     so the version is as much a part of what a UDP number means as the
     workload's parameters are.
     """
-    if shutil.which("iperf3") is None:
+    iperf3 = shutil.which("iperf3")
+    if iperf3 is None:
         return ""
     try:
         r = subprocess.run(
-            ["iperf3", "--version"],
+            [iperf3, "--version"],
             check=False,
             capture_output=True,
             text=True,

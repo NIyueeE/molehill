@@ -57,7 +57,8 @@ follow the same discipline.
 `unsafe_code` is **deny**, so an unexpected `unsafe` fails a plain
 `cargo build` and not only the `-D warnings` gate. The modules that need it ask
 per item, with `#[expect(unsafe_code, reason = "...")]` plus a
-`// SAFETY:` comment directly above the item:
+`// SAFETY:` comment directly above the item — 11 in production modules and
+5 test-only:
 
 - `src/transport/udp_batch.rs` — the `recvmmsg`/`sendmmsg` batching FFI
   (8 expectations: the zeroed `msghdr`/`sockaddr_storage` templates, the
@@ -67,8 +68,6 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
   `ifreq` and name copy bounded by `IFNAMSIZ` for `TUNSETIFF`, the
   `TUNSETOFFLOAD` declaration, and tokio's `AsyncFd::register`, which requires
   the caller to prove the registered fd stays open and unchanged);
-- `src/transport/kcp.rs` — 1 expectation: `sysconf(_SC_CLK_TCK)`, a
-  pointer-free read of one system constant;
 - test-only: 5 expectations for edition-2024 environment mutation (3 in
   `src/transport/multiplex.rs`'s tests, 2 in `tests/pool_test.rs`). These are
   serial-suite tests; `std::env::set_var`/`remove_var` are `unsafe` since
@@ -79,10 +78,9 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 The `mmsg` and TUN waivers are sanctioned because the raw syscalls have no
 `std` equivalent; the analysis that rejected `nix`'s `MultiHeaders` wrapper and
 evaluated `quinn-udp` is recorded in [HANDOFF.md](../HANDOFF.md), "Open threads
-for the next cycle" (the `quinn-udp` A/B entry). The `sysconf` waiver is the
-one with a known safe wrapper (`nix::unistd::sysconf`): replacing it needs the
-`nix` `feature` flag and an integer-math rewrite, so it is a small follow-up
-rather than a permanent FFI requirement.
+for the next cycle" (the `quinn-udp` A/B entry). The `sysconf(_SC_CLK_TCK)`
+read is no longer a waiver: it uses `nix::unistd::sysconf` and integer
+arithmetic.
 
 ## Test modules (the one sanctioned module-level waiver)
 
@@ -103,11 +101,12 @@ production modules get neither.
 
 The bench project under `bench/src/` is held to the same rule: fix the code
 first. The `ignore` list in `bench/pyproject.toml` is reserved for a property
-that is true of every tool in scope — today one property, covering S603/S607,
-because these tools measure *external* binaries reached through `PATH`
-(iperf3, tc, ss, the peers), where resolving a different program would measure
-something other than the documented tool. Every other waiver is written inline
-at its own site (`# noqa: <rule>`) with a one-line reason, the python
+that is true of every tool in scope — today S603, because these tools measure
+*external* binaries (iperf3, tc, ss, the peers), where resolving a different
+program would measure something other than the documented tool. Every
+executable is now resolved to an absolute path
+(`shutil.which`/`sys.executable`) before it is launched, so S607 is not
+waived. Every other waiver is written inline at its own site (`# noqa: <rule>`) with a one-line reason, the python
 equivalent of `#[expect(clippy::...)]` plus its reason comment.
 `just py-lint` runs `ruff check` and `ruff format --check`; `just py-fmt`
 applies the formatter's fixes.

@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -28,6 +29,14 @@ from bench import paths
 
 REPO = "NIyueeE/molehill"
 UA = {"User-Agent": "molehill-interop-fetch", "Accept": "application/vnd.github+json"}
+
+
+def _gh() -> str:
+    """The gh CLI, or an OSError the callers already turn into a fallback."""
+    found = shutil.which("gh")
+    if found is None:
+        raise FileNotFoundError("gh")
+    return found
 
 
 def http_get(url: str) -> bytes:
@@ -47,7 +56,7 @@ def releases() -> list:
     """
     try:
         out = subprocess.run(
-            ["gh", "api", f"repos/{REPO}/releases?per_page=20"],
+            [_gh(), "api", f"repos/{REPO}/releases?per_page=20"],
             capture_output=True,
             text=True,
             check=True,
@@ -76,7 +85,7 @@ def assets_for(tag: str) -> list:
     """
     try:
         out = subprocess.run(
-            ["gh", "release", "view", tag, "--json", "assets"],
+            [_gh(), "release", "view", tag, "--json", "assets"],
             capture_output=True,
             text=True,
             check=True,

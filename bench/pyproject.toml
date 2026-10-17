@@ -69,7 +69,7 @@ extend-select = [
 # every tool here. Everything else is waived inline at its own site with a
 # reason (AGENTS.md §2: fix the code first, waive in code, minimal scope).
 #
-# - S603/S607: these tools measure processes that ARE external binaries
+# - S603: these tools measure processes that ARE external binaries
 #   reached through PATH (iperf3, tc, ss, the peers). Resolving them
 #   differently would measure a different program than the one documented.
 #
@@ -87,7 +87,7 @@ extend-select = [
 #   files `ruff format` owns, so the lint gate and the format gate fight over
 #   the tree. The formatter already inserts a trailing comma where its own
 #   style wants one (magic trailing comma), so nothing is lost.
-ignore = ["S603", "S607"]
+ignore = ["S603"]
 
 [tool.pyright]
 include = ["src"]

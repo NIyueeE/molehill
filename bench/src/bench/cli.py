@@ -193,8 +193,11 @@ def cmd_udp_stress(rest: list[str]) -> int:
 
 
 def cmd_l3(rest: list[str]) -> int:
+    bash = shutil.which("bash")
+    if bash is None:
+        raise SystemExit("bash: not on PATH")
     return subprocess.run(
-        ["bash", str(paths.UTILS_DIR / "l3" / "run.sh"), *rest], check=False
+        [bash, str(paths.UTILS_DIR / "l3" / "run.sh"), *rest], check=False
     ).returncode
 
 
@@ -210,8 +213,11 @@ def cmd_l3_census(rest: list[str]) -> int:
 
 
 def cmd_mux(rest: list[str]) -> int:
+    bash = shutil.which("bash")
+    if bash is None:
+        raise SystemExit("bash: not on PATH")
     return subprocess.run(
-        ["bash", str(paths.UTILS_DIR / "mux" / "gap_profile.sh"), *rest],
+        [bash, str(paths.UTILS_DIR / "mux" / "gap_profile.sh"), *rest],
         check=False,
     ).returncode
 
@@ -1484,9 +1490,10 @@ def _check_socket_query(c: Checker) -> None:
     unpacked character by character, `ss` failed on stderr, and the watcher
     read the empty stdout as "no sockets" for a whole campaign.
     """
-    if not shutil.which("ss"):
+    ss = shutil.which("ss")
+    if ss is None:
         return
-    query = ["ss", "-Htn", "state", "established", "sport = :1"]
+    query = [ss, "-Htn", "state", "established", "sport = :1"]
     r = subprocess.run(query, capture_output=True, text=True, check=False)
     c.check(
         "the socket filter is a valid ss invocation",
@@ -1494,7 +1501,7 @@ def _check_socket_query(c: Checker) -> None:
         f"exit {r.returncode}: {r.stderr.strip()[:200]}",
     )
     udp = subprocess.run(
-        ["ss", "-Hun", "sport = :1"], capture_output=True, text=True, check=False
+        [ss, "-Hun", "sport = :1"], capture_output=True, text=True, check=False
     )
     c.check(
         "the datagram socket filter is a valid ss invocation",
