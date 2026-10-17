@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Pre-push hook (heavyweight gates + tag review dispatch): audit + dependency
-# policy + freshness + tests guard every push. A push carrying a `v*` tag is a
-# release act (AGENTS.md §5): the light release review (githooks/pre-tag) runs
-# first so a violation fails fast — git has no native tag hook, so pre-push is
-# where the review fires automatically on a tag push. Fast gates live in
-# githooks/pre-commit.
+# policy + freshness + tests guard every branch push. A push carrying a `v*`
+# tag is a release act (AGENTS.md §5): the light release review
+# (githooks/pre-tag) runs for it, and a tag-only push stops there — the tagged
+# commit's heavy gates ran when its branch was pushed, and re-running them
+# would make the release depend on the local machine and its flakes. git has
+# no native tag hook, so pre-push is where the review fires automatically.
+# Fast gates live in githooks/pre-commit.
 # Activate via: git config core.hooksPath githooks   (or: just setup)
 set -euo pipefail
 
@@ -15,6 +17,7 @@ cd "$(git rev-parse --show-toplevel)"
 # (A manual run from a terminal reads nothing, like the hook always did.)
 pushed_any=0
 tag_pushed=0
+branch_pushed=0
 docs_only=1
 benches_only=1
 if [ ! -t 0 ]; then
@@ -26,6 +29,11 @@ if [ ! -t 0 ]; then
           tag_pushed=1
           echo "==> release tag pushed: $local_ref"
           githooks/pre-tag --tag "${local_ref#refs/tags/}" --commit "$(git rev-parse --verify "$local_sha^{commit}")"
+        fi
+        ;;
+      *)
+        if [ "$local_sha" != "$zeros" ]; then
+          branch_pushed=1
         fi
         ;;
     esac
@@ -48,6 +56,16 @@ if [ ! -t 0 ]; then
       benches_only=0
     fi
   done
+fi
+
+# A tag-only push is the release act: the review above is its gate, and the
+# tagged commit's heavy gates ran when its branch was pushed. Re-running them
+# here would make the release depend on the local machine and its flakes. If
+# the tag's commit never went through a branch push, run `just check` on it
+# first.
+if [ "$tag_pushed" -eq 1 ] && [ "$branch_pushed" -eq 0 ]; then
+  echo "==> tag-only push: release review passed; heavy gates already ran on the commit"
+  exit 0
 fi
 
 if [ "$pushed_any" -eq 1 ] && [ "$tag_pushed" -eq 0 ] && { [ "$docs_only" -eq 1 ] || [ "$benches_only" -eq 1 ]; }; then

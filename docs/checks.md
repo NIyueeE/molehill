@@ -5,13 +5,14 @@ Three layered gates guard the repository, split by moment and weight:
 | Moment | Gate | Weight | What it guards |
 |--------|------|--------|----------------|
 | every commit | `githooks/pre-commit` | fast (~1 min) | code quality: fmt, secrets, machete, docs sync, ruff lint + format, bench-model self-check, clippy ×2 |
-| every push | `githooks/pre-push` | heavy (minutes) | security & dependency policy & freshness & tests (audit, deny, outdated, test) |
+| every branch push | `githooks/pre-push` | heavy (minutes) | security & dependency policy & freshness & tests (audit, deny, outdated, test) |
 | every release tag | `githooks/pre-tag` | light (seconds) | release state: tag↔version, changelog section, bench assets, container-job greps + advisory checklist |
 
 The split is deliberate: pre-commit is the fast per-commit quality loop,
-pre-push is the heavyweight loop every push pays (tag pushes included —
-releasing is a deliberate act), and pre-tag is a light release-readiness
-review. git has no native tag hook, so pre-tag fires at the two tag moments:
+pre-push is the heavyweight loop every branch push pays, and pre-tag is a
+light release-readiness review. A tag-only push runs that review and stops
+there — the tagged commit's heavy gates ran when its branch was pushed, and
+re-running them on the tag would make the release depend on the local machine. git has no native tag hook, so pre-tag fires at the two tag moments:
 `just tag` runs it before creating the tag, and pre-push runs it for every
 `v*` tag in a push (before the heavy gates, so a violation fails fast). It is
 not part of `just check` — it needs a release state (dated changelog section,
@@ -25,8 +26,8 @@ docs-alignment check, which is precisely what a docs edit can break. A commit
 mixing docs and code paths runs both workflows.
 
 Beyond that chain, CI runs jobs this page does not cover — the feature powerset,
-the alternative feature-set test matrix, the cross-platform builds and the musl
-checks of what `release.yml` ships. Their roster, and what each one guards, is
+the alternative feature-set test matrix, the native musl test jobs, the
+cross-platform builds and the musl checks of what `release.yml` ships. Their roster, and what each one guards, is
 owned by the "Automation" table in [structure.md](structure.md).
 
 ## Tools
@@ -72,8 +73,10 @@ Three properties make this safe rather than a bypass:
   scan (a leaked key in a README is still a leaked key) and the docs-alignment
   check (which is what such a change moves);
 - anything ambiguous falls back to the full chain: an empty change set, a new
-  branch with no remote to diff against, a **tag push** (never docs-only, the
-  release review runs first), and a commit that mixes docs with code paths.
+  branch with no remote to diff against, a **tag push that also carries a
+  branch** (never docs-only; the release review runs first, then the branch's
+  heavy gates), and a commit that mixes docs with code paths. A tag-only push
+  is not ambiguous: it runs the release review and stops there.
 
 `githooks/docs-only` is the classifier itself: paths on stdin, exit 0 when all
 of them are docs. Deleting it makes both hooks run the full chain again, which
@@ -101,7 +104,7 @@ Note the template difference: clippy runs twice (default features, then
 second pass covers the minimal no-default-features build that the
 default-feature pass never compiles. `just check` runs the identical chain.
 
-## On every push — `githooks/pre-push`
+## On every branch push — `githooks/pre-push`
 
 | # | Gate | Command | Purpose |
 |---|------|---------|---------|
@@ -113,9 +116,10 @@ default-feature pass never compiles. `just check` runs the identical chain.
 Tests run **serially** (`--test-threads=1`): the integration suite spawns real
 server/client pairs on fixed ports; parallel execution races on them.
 
-A push that carries `v*` tags additionally runs the release review
-(`githooks/pre-tag`, below) before these heavy gates — releasing is a
-deliberate act, and a tag review violation fails the whole push.
+A push that carries a `v*` tag runs the release review (`githooks/pre-tag`,
+below). A tag-only push stops after the review; a push that also carries a
+branch runs these heavy gates for the branch. The tagged commit's heavy gates
+ran when its branch was pushed.
 
 ## On every tag — `githooks/pre-tag`
 
@@ -123,7 +127,8 @@ A light release review for the next `v*` tag (AGENTS.md §5). Fires at tag
 creation (`just tag`) and again on tag push (inside pre-push, evaluated
 against the tag's commit — so re-pushing an old tag reviews that tag's state,
 not the working tree). All checks are seconds-fast greps against the reviewed
-commit; nothing here is a heavy gate.
+commit; nothing here is a heavy gate. A tag-only push stops after this review;
+the heavy gates are not re-run on the tag.
 
 | # | Check | Purpose |
 |---|-------|---------|

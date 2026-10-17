@@ -58,6 +58,13 @@
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
   changelog date and the README numbers may, code may not (AGENTS.md §10,
   "prove provenance").
+- **The release path builds and smoke-tests; it no longer re-runs the suite.**
+  `release.yml` builds every artifact and runs `--help` on the native ones
+  the runner can execute; CI owns the test suite (it now also tests
+  x86_64-musl natively), and a tag-only push runs the release review without
+  the local heavy chain. The
+  v0.11.0 release blockers were platform flakes in the release matrix, not
+  product failures.
 
 ## Open threads for the next cycle
 

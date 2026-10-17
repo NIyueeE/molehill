@@ -216,7 +216,8 @@ is the voice contract for writing it.
      only section for that version, contains prose, and `[Unreleased]` is
      empty (every extractor takes the first match, so a stray duplicate in
      front of the real section would be published as the notes);
-  4. `just check` is green on the tagged commit;
+  4. `just check` is green on the tagged commit (the branch push that carried
+     it ran the same chain);
   5. the benchmark ritual is done (docs/release.md):
      `benches/records/results-bench-vX.Y.Z.json`, the chart set, and the README
      benchmark table are refreshed in the release commit, and `just bench-gate`
@@ -258,8 +259,10 @@ Details: [docs/release.md](docs/release.md).
 ## 8. Day-to-day operations
 
 - commit → fast gates; push to a branch → heavy gates; **push of a `v*` tag →
-  release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
-  runs the identical chain when the change touches code. A docs-only change
+  release (§5, deliberate)** — a tag-only push runs the release review and
+  stops there, because the tagged commit's heavy gates ran on its branch; PR
+  (any branch) or push to `main`/`dev` → CI runs the identical chain when the
+  change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
   docs-alignment check instead — the one gate such a change can break. A
   benches-only change (`benches/scripts/**`) skips the cargo gates of the
@@ -271,9 +274,10 @@ Details: [docs/release.md](docs/release.md).
   pre-commit keeps the secret scan and the docs check, plus the two ruff
   gates and the bench-model self-check for a benches-only change; pre-push
   keeps only the docs check; and anything ambiguous — an empty change set, a
-  new branch, a tag push, a commit mixing docs or benches with code — falls
-  back to the full chain. Deleting a classifier restores the full chain,
-  which is the safe direction. `main`
+  new branch, a commit mixing docs or benches with code — falls back to the
+  full chain. A tag-only push is not ambiguous: it runs the release review and
+  stops there. Deleting a classifier restores the full chain, which is the safe
+  direction. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by
   convention (CI red on main is the top priority; the one sanctioned

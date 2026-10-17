@@ -55,8 +55,10 @@ the two tag moments (responsibilities of the three hooks are split in
   annotated tag for `Cargo.toml`'s version. `just tag-check` runs only the
   review.
 - **On tag push**: git has no native tag hook, so `githooks/pre-push` re-runs
-  the review (against the tag's commit) for every `v*` tag in the push,
-  before the heavy gates — a violation fails the push.
+  the review (against the tag's commit) for every `v*` tag in the push. A
+  tag-only push stops after the review; a push that also carries a branch runs
+  the heavy gates for the branch — the tagged commit's heavy gates ran when its
+  branch was pushed.
 
 The review mechanically verifies tag↔version match (including `Cargo.lock`),
 exactly one dated non-empty changelog section with an empty `[Unreleased]`,
@@ -189,13 +191,16 @@ inside the instrument's own scatter.
 1. **pre-release checks**: Cargo.toml version ↔ tag version, CHANGELOG
    section present, `cargo audit`.
 2. **build matrix** (10 targets): linux gnu + musl, aarch64 gnu + musl (native
-   arm64 runners, so the aarch64-musl tests run without qemu), arm/armv7 musl
-   (`embedded` feature, via cross), macOS x86_64 + aarch64, Windows msvc. The
-   full default feature set
+   arm64 runners), arm/armv7 musl (`embedded` feature, via cross), macOS
+   x86_64 + aarch64, Windows msvc. The full default feature set
    (`server,client,noise,hot-reload,multiplex,kcp,transparent`) is built by
    the x86_64/aarch64 legs, including the two GHCR image architectures; linux
-   artifacts are UPX-compressed. Tests run inside the matrix for native and
-   cross targets, serial in both cases.
+   artifacts are UPX-compressed. The matrix builds every artifact and
+   smoke-tests the native ones the runner can execute with `--help`; the test
+   suite is CI's job (it runs on the PR and on `main`), not the release's —
+   re-running it here duplicated CI and turned platform flakes into release
+   blockers. The 32-bit `embedded` artifacts have no native runner and are
+   cross-checked in CI.
 3. **GitHub Release**: published **directly** (no draft stage; the tag push
    itself is the human checkpoint), with notes extracted from `CHANGELOG.md`,
    all archives, and a `SHA256SUMS` — never edit the notes by hand.

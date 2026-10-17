@@ -41,7 +41,7 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `githooks/benches-only` | change-set classifier: all paths under `benches/scripts/` → pre-commit skips the cargo gates, pre-push skips the heavy gates (runtime tooling, never compiled) |
 | `githooks/check-secrets` | staged-changes secret scan (`security-scan:allow` marker to waive a line) |
 | `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, feature-name registry, edition, channel, README index, CI entry) |
-| `.github/workflows/ci.yml` | `just check` chain + feature powerset + per-feature test matrix + minimal-size check + musl checks (full set on x86_64 and native aarch64; `embedded` via cross) + native aarch64-musl test job + 5-platform builds (skipped for docs-only changes) |
+| `.github/workflows/ci.yml` | `just check` chain + feature powerset + per-feature test matrix + minimal-size check + musl checks (full set on x86_64 and native aarch64; `embedded` via cross) + native musl test jobs (x86_64 and aarch64) + 5-platform builds (skipped for docs-only changes) |
 | `.github/workflows/docs.yml` | the docs-only half: `githooks/check-docs` for changes limited to markdown, `docs/`, `assets/` |
 | `.github/workflows/release.yml` | tag-driven release: version/changelog gates, 10-target matrix (native arm64), direct release, GHCR, crates.io |
 | `.github/workflows/test-build.yml` | manual per-commit CD test builds (never publishes) |
