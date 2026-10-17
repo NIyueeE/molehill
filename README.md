@@ -121,51 +121,12 @@ not its best second).
 | rathole | 28.180 | 3.412 | 14.852 | 1.123 | 0.094 | 0.019 | 0.019 | 28.281 |
 | nps | 0.135 | 0.135 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
 
-**The run's own replicate.** `clean` is measured at both ends of every
-timeline, so each tool's two readings are two samples of one condition about an
-hour apart — the scale every other cell is read against. The percentages use
-the unrounded readings (the tables round to three decimals):
-
-| tool | clean bulk reading | clean interactive p99 |
-|---|---|---|
-| molehill (L4) | 8.901 – 8.883 Gbit/s (**0.2 %** apart) | 4.3 – 4.6 ms |
-| molehill (L3) | 3.881 – 3.906 Gbit/s (**0.7 %** apart) | 0.9 – 0.9 ms |
-| frp | 6.026 – 6.019 Gbit/s (**0.1 %** apart) | 3.0 – 1.5 ms |
-| rathole | 28.180 – 28.281 Gbit/s (**0.4 %** apart) | 1.6 – 1.4 ms |
-| nps | 0.135 – 0.134 Gbit/s (**0.2 %** apart) | 96.7 – 69.1 ms |
-
-**How much it carries.** The same artifact carries the load ramp — the first
-bulk load level at which a fresh interactive connection breaks the SLO — a
-different instrument from the staged schedule
-([Benchmarks](./docs/benchmarks.md#the-scenarios)); every arm carried its full 8
-streams, so 8 reads as a **floor** ("at least 8"), not a maximum.
-
-**Two rows are one tool.** `molehill (L3)` is this project's second
-architecture, not a fifth tool: frp, rathole and nps are forwarding proxies with
-no TUN path, so the L3 row's comparison is `molehill (L4)` and the tool-free
-control arm — same workload, same topology, one architecture apart. The two
-architectures split the workloads: on the clean stage L3 reads 3.88 against
-L4's 8.90 Gbit/s bulk, with a lower interactive p99 (0.9 against 4.3 ms) and a
-steadier one under load — it holds every level of the capacity ramp. A claim's
-lanes are carrier connections of its own rather than streams of a multiplexed
-pool, and it holds **two by default**
-([Configuration](./docs/configuration.md#transparent-l3-services) prices the
-trade in connections).
-
-**Every arm reads zero wedges on this run.** The shaped `rtt100` column above
-is the shaper's number more than either architecture's: this run reads 401.2 ms
-for L3 against 402.2 for L4, and the shaper's queue counters are zero for both
-([Benchmarks](./docs/benchmarks.md#how-to-read-a-cell)).
-
-**rathole reads above this host's loopback calibration** (28.2 against a
-~21.1 Gbit/s loopback probe), so its row is a reading of the host's state, not
-a standing ranking; `frp` and `nps`, an order of magnitude below the ceiling,
-repeat their bulk reading within 1 %.
-
-These are v0.11.0 numbers from one host; only same-schema, same-method,
-same-host runs compare directly. v0.11.0 is the first release measured by the
-bench model, so it has no comparable baseline
-([Benchmarks](./docs/benchmarks.md#comparability)).
+**How to read it.** `molehill (L3)` is this project's second architecture, not
+a fifth tool: its comparison is `molehill (L4)` and the tool-free control arm.
+These are one host's v0.11.0 readings; only same-schema, same-method, same-host
+runs compare directly. The stage schedule, the run's own noise floor, the
+capacity ramp, the drift and cost panels, and how to reproduce a run are in
+[Benchmarks](./docs/benchmarks.md).
 
 A deployment that wants the data plane unencrypted sets
 `transport = { type = "plain" }` per service and keeps the encrypted control

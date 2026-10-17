@@ -142,6 +142,11 @@ is the voice contract for writing it.
   "very"), adjectives without a measured basis, and a caveat already stated on
   the page that owns it. A number travels with its method link, not with a
   retelling of the method.
+- **One home for a number.** A measured number lives in `benchmarks.md`, the
+  landing page's published tables, or the results file they cite. Another page
+  may quote the one figure its decision needs, marked as a quotation and linked
+  to the method; it does not copy a table. Two copies of a number are two
+  numbers that will disagree.
 - **Terms once.** Define a term at first use on the page, then keep the same
   word: user/operator, visitor, service, claim, lane, pool, tunnel, carrier.
 - **No dead ends.** Every command, recipe and link works; a removed key names
