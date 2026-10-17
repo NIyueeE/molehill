@@ -1,16 +1,15 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-17.** **v0.11.0 is being released from `main`; the
-> human authorized the agent to merge and tag it.** The transparent (L3)
+> **State as of 2026-10-17.** **v0.11.0 is released.** The transparent (L3)
 > client, the mandatory-Noise control channel, the bench model as the one
 > measurement standard, and the two-lane default for an L3 claim are on `main`
-> (PR #5, merged as `a9d66b4`). `version = "0.11.0"` is committed, the
-> CHANGELOG section is dated `2026-10-17`, and the release sweep is measured at
-> `d0f22b9` (`just bench-gate` PASS — see "RESOLVED: the release sweep is
-> measured" below); the record, the chart set and both READMEs' numbers are
-> the release's own. The release matrix failed three times — a musl compile
-> error and two timing flakes (windows, aarch64-musl) — each fix invalidated
-> the sweep, and the tag was deleted and is re-pushed on the release commit.
+> (PR #5, merged as `a9d66b4`) and in the tag: `v0.11.0` names `f3295e8`, and
+> the release run published the GitHub release, the nine platform archives,
+> the crates.io package and the GHCR image. `version = "0.11.0"` is committed,
+> the CHANGELOG section is dated `2026-10-17`, and the release sweep is
+> measured at `d0f22b9` (`just bench-gate` PASS — see "RESOLVED: the release
+> sweep is measured" below); the record, the chart set and both READMEs'
+> numbers are the release's own.
 >
 > What is left is the repository-settings items and the open threads below.
 >
@@ -28,16 +27,15 @@
 
 ## Where this stands
 
-- **v0.11.0 is on `main` and the release is in its tag step.** PR #5 merged as
-  `a9d66b4`, and the human authorized the agent to tag. The release matrix has
-  failed three times (a musl compile error and two timing flakes, on windows
-  and aarch64-musl), none in the product code (the list is in "RESOLVED: the
-  release sweep is measured" below); every src fix invalidated the previous
-  sweep, because `githooks/pre-tag` compares the record's revision against
-  `src/`. The published record is the sweep at
-  `d0f22b9` — 90 samples, `just bench-gate` PASS — and the tag is re-pushed on
-  the release commit that carries it (docs and assets after `d0f22b9` are
-  allowed by that check).
+- **v0.11.0 is released.** PR #5 merged as `a9d66b4`; the human authorized the
+  agent to tag; `v0.11.0` names `f3295e8`, and the release run passed all
+  thirteen jobs (nine platform builds, the GitHub Release, crates.io, GHCR).
+  The release matrix failed three times on the way there (a musl compile error
+  and two timing flakes, on windows and aarch64-musl), none in the product
+  code (the list is in "RESOLVED: the release sweep is measured" below); every
+  src fix invalidated the previous sweep, because `githooks/pre-tag` compares
+  the record's revision against `src/`. The published record is the sweep at
+  `d0f22b9` — 90 samples, `just bench-gate` PASS.
 
 - **The cycle being released**: transparent (L3) services, wire **v5**, based on
   `main` at `cf01091`. Nothing of it is in `v0.10.0` (verified: the tag's tree
@@ -224,8 +222,9 @@
 
 - **The repository state**: `version = "0.11.0"`, `CHANGELOG.md` carries
   `## [0.11.0] - 2026-10-17` with `[Unreleased]` empty; `main` is at the
-  release commit and the tag is re-pushed there. The previous tag pointed at
-  `9ad3362`, whose release run failed; it was deleted, not moved.
+  release commit and `v0.11.0` names `f3295e8`. The tag was deleted once
+  (its first push pointed at `9ad3362`, whose release run failed); the
+  released tag is the re-push.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
@@ -235,15 +234,15 @@
   for `main` and the release secrets. They are tracked as an open thread below;
   nothing in this repository can enable them.
 
-## The transparent-L3 cycle (unreleased, branch `feat/transparent-l3`)
+## The transparent-L3 cycle (shipped in v0.11.0)
 
 **State as of 2026-10-09.** The feature is committed and green
 (`45adb6e` the feature, `edffa53` never-encrypted, `b1ce03b` the striping
 note): the transparent (L3) client makes itself the owner of a public
 `ip:port`, carried as whole IP packets over a TUN device on both ends, with the
 wire at **v5** and `just l3-accept` (root-only, outside the check chain)
-proving the transparency end to end. Because none of it is released, the
-configuration surface is free to change — and this cycle changes it.
+proving the transparency end to end. Because none of it was released yet, the
+configuration surface was free to change — and this cycle changed it.
 
 ### Decisions
 
@@ -269,6 +268,14 @@ configuration surface is free to change — and this cycle changes it.
 | L18 | The mux×1-versus-direct gap is attributed with the model before it is optimised, and each optimisation lands only if it clears that run's own noise floor. No reorder buffer, no mid-stream framing switch, no compact single-stream mode |
 
 ## Open threads for the next cycle
+
+- **CI still does not test the non-x86 targets the release ships.** The CI
+  musl job builds `x86_64-unknown-linux-musl` only; the aarch64/arm/armv7 musl
+  legs exist only in `release.yml`, so both aarch64-only failures this release
+  hit — `c_char`'s signedness and a timing flake — were first seen by the
+  release build. A compile-only `cross build` for aarch64-musl in CI closes
+  that class cheaply; a qemu test run would also cover the flakes but is slow
+  and itself timing-sensitive, so the compile half is the first step.
 
 - **A config the product refuses was a config every check accepted
   (2026-10-13, found while preparing v0.11.0).** The mandatory-Noise control
