@@ -188,12 +188,14 @@ inside the instrument's own scatter.
 
 1. **pre-release checks**: Cargo.toml version ↔ tag version, CHANGELOG
    section present, `cargo audit`.
-2. **build matrix** (9 targets): linux gnu + musl, aarch64 musl (via cross),
-   arm/armv7 musl (`embedded` feature), macOS x86_64 + aarch64, Windows
-   msvc. musl artifacts build with the full default feature set
-   (`server,client,noise,hot-reload,multiplex,kcp,transparent`); linux
+2. **build matrix** (10 targets): linux gnu + musl, aarch64 gnu + musl (native
+   arm64 runners, so the aarch64-musl tests run without qemu), arm/armv7 musl
+   (`embedded` feature, via cross), macOS x86_64 + aarch64, Windows msvc. The
+   full default feature set
+   (`server,client,noise,hot-reload,multiplex,kcp,transparent`) is built by
+   the x86_64/aarch64 legs, including the two GHCR image architectures; linux
    artifacts are UPX-compressed. Tests run inside the matrix for native and
-   cross targets.
+   cross targets, serial in both cases.
 3. **GitHub Release**: published **directly** (no draft stage; the tag push
    itself is the human checkpoint), with notes extracted from `CHANGELOG.md`,
    all archives, and a `SHA256SUMS` — never edit the notes by hand.
@@ -207,6 +209,6 @@ inside the instrument's own scatter.
 
 `.github/workflows/test-build.yml` builds **test artifacts** from any commit
 without creating a release: dispatch it manually from the Actions tab, choose
-a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
-`windows`). Artifacts are ephemeral (7-day retention) and are never a Release;
+a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `linux-arm64`,
+`macos`, `windows`). Artifacts are ephemeral (7-day retention) and are never a Release;
 the usage rules and typical uses are in [AGENTS.md §6](../AGENTS.md).

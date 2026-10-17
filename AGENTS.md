@@ -193,8 +193,8 @@ code-level.**
 
 `.github/workflows/test-build.yml` builds **test artifacts** from any commit
 without ever creating a release — dispatch it manually from the Actions tab
-with a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
-`windows`). Artifacts are ephemeral (7-day retention): never hand out
+with a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `linux-arm64`,
+`macos`, `windows`). Artifacts are ephemeral (7-day retention): never hand out
 release links for them, and never reference them in the changelog. Typical
 uses: verifying that a specific commit compiles on all platforms before
 tagging (§5), and reproducing platform-specific issues on an exact commit.

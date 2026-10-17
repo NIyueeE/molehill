@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Prebuilt `aarch64-unknown-linux-gnu` archives.** The release now ships ten
+  archives; the new one serves arm64 Linux hosts that want the system glibc
+  (NSS/DNS) rather than the static musl binary.
+
 ## [0.11.0] - 2026-10-17
 
 ### Changed
