@@ -2052,6 +2052,7 @@ max_tunnels_per_client = 6
     /// a default device it would then be willing to attach. Inside the table
     /// the device name keeps its default, because writing the table already is
     /// the operator's decision.
+    #[cfg(feature = "transparent")]
     #[test]
     fn test_server_transparent_is_opt_in() {
         let without = r#"
