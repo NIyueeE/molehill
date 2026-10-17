@@ -1916,7 +1916,9 @@ mod tests {
                 // client is supported. Elsewhere the refusal is the contract,
                 // so the block is skipped rather than read as drift — every
                 // other block on the page is still checked.
-                if !transparent_client_supported() && b.contains("[transparent]") {
+                if (!transparent_client_supported() && b.contains("[transparent]"))
+                    || (!transparent_server_supported() && b.contains("[server.transparent]"))
+                {
                     continue;
                 }
                 Config::from_str(b).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
