@@ -295,7 +295,7 @@ fingerprint, a shortened run can never be mistaken for a published one.
 | `stage` | 2 (+1 warm-up) | ~150 s | one condition, the whole workload: a shape question, minutes |
 | `soak` | 1 (+0 warm-up) | ~1200 s | the drift axis: a rotating path held for a long time |
 | `screen` | 3 (+1 warm-up) | ~240 s | a development A/B: one condition, the two builds interleaved |
-| `sweep` | 1 (+0 warm-up) | ~2400 s | the release sweep: the staged schedule and the load ramp |
+| `sweep` | 1 (+0 warm-up) | ~3000 s | the release sweep: the staged schedule and the load ramp |
 | `nobulk` | 2 (+1 warm-up) | ~300 s | the same staged timeline with the bulk spine removed: a diagnostic, not a gate |
 | `carrier` | 3 (+0 warm-up) | ~240 s | one condition held long, bulk spine off: is the L3 wedge the carrier alone? |
 
@@ -710,14 +710,17 @@ bytes on the visitor's leg were tunnel overhead (`wire_per_visitor_byte` 1.0755)
 at 8000 it is 1.5 % (1.0152), because the carrier's own header and
 acknowledgements are paid once per 8000-byte packet instead of once per 1400.
 
-**Postscript (2026-10-16, the offload fix): the two readings above are dated.
-** This section's binary segmented every packet at the TUN boundary; the
-shipped one declares its segmentation offloads and receives GSO super-frames —
-see the retraction-turned-correction below. In the v0.11.0 release sweep the
-staged L3 clean cell read 5.687 Gbit/s against this section's 4.335 (same
-1400-byte TUN MTU, same host), and a single-flow smoke A/B measured the fix at
-2.0 → 3.4 Gbit/s. "Does not scale with flows" and "packet size is the lever"
-both survive — but the packet size inside the device is no longer the
+**Postscript (2026-10-16, the offload fix; re-swept 2026-10-17): the two
+readings above are dated.** This section's binary segmented every packet at the
+TUN boundary; the shipped one declares its segmentation offloads and receives
+GSO super-frames — see the retraction-turned-correction below. The paired
+evidence for the fix is a single-flow smoke A/B: 2.0 → 3.4 Gbit/s. The staged
+L3 clean cell cannot carry an absolute comparison against this section's 4.335:
+it has moved by more than a third between this release's sweeps on this host
+(the published one reads 3.881 Gbit/s) while one run's own two clean readings
+agree to under 1 % — the cell is the row's least stable, and the pair inside a
+run is what it supports. "Does not scale with flows" and "packet size is the
+lever" both survive — but the packet size inside the device is no longer the
 operator's alone to set, and the serialized per-packet reader is no longer the
 whole of the ceiling.
 
@@ -782,8 +785,8 @@ reader and one injector per claim), so a claim's throughput follows its *lanes*
 and the budget decides how many it may hold. One host, one binary, five claims,
 eight inner flows: a claim at one lane carries 2.351 Gbit/s, at two 3.283, at
 four 5.191. (Pre-v0.11.0 binary — the offload it takes raises the absolute
-values, as the v0.11.0 sweep's L3 clean cell of 5.687 Gbit/s at two lanes
-shows; the lane trade itself is unchanged.) It is not free — the lanes that spread a busy claim's flows are also
+values; the paired smoke A/B in the postscript above measures it, and the lane
+trade itself is unchanged.) It is not free — the lanes that spread a busy claim's flows are also
 pressure on the one reader every claim shares, so four lanes spends the
 interactive stream's SLO headroom (three streams sustained on the capacity ramp,
 against two lanes' eight) — which is why the shipping default is two and four is

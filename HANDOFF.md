@@ -1,16 +1,18 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-16.** **v0.11.0 is prepared and waiting for a human to
-> merge and tag.** `feat/transparent-l3` carries the release: the transparent
-> (L3) client, the mandatory-Noise control channel, the bench model as the one
-> measurement standard, and a new default for an L3 claim's lane budget.
-> `version = "0.11.0"` is committed and the CHANGELOG section is written.
-> **The release sweep is measured** (2026-10-16 at `26ebb13`, `just bench-gate`
-> PASS — see "RESOLVED: the release sweep is measured" below); the record, the
-> chart set and both READMEs' numbers are the release's own.
+> **State as of 2026-10-17.** **v0.11.0 is being released from `main`; the
+> human authorized the agent to merge and tag it.** The transparent (L3)
+> client, the mandatory-Noise control channel, the bench model as the one
+> measurement standard, and the two-lane default for an L3 claim are on `main`
+> (PR #5, merged as `a9d66b4`). `version = "0.11.0"` is committed, the
+> CHANGELOG section is dated `2026-10-17`, and the release sweep is measured at
+> `d0f22b9` (`just bench-gate` PASS — see "RESOLVED: the release sweep is
+> measured" below); the record, the chart set and both READMEs' numbers are
+> the release's own. The release matrix failed three times — a musl compile
+> error and two timing flakes (windows, aarch64-musl) — each fix invalidated
+> the sweep, and the tag was deleted and is re-pushed on the release commit.
 >
-> What is left is not code: the human's merge and tag, the repository-settings
-> items, and the open threads below.
+> What is left is the repository-settings items and the open threads below.
 >
 > **This file owns the working state**: what is open, what was decided and why,
 > and the release checklist. Per AGENTS.md §3 it is a contributor page —
@@ -26,38 +28,16 @@
 
 ## Where this stands
 
-- **v0.11.0 is prepared and waiting for a human to merge and tag.** The work is
-  on `feat/transparent-l3` as a PR; `version = "0.11.0"` is committed, the
-  CHANGELOG section is written, and `just bench-gate` **passes** on the sweep
-  that ran before the last product change (90 cells, the endpoint invariant, the
-  SLO on the clean stages, drift, wedges, and the ramp). Both axes that blocked
-  this release are resolved: the L3 wedge was the harness's own shaper queue
-  (stated and recorded now), and the wedge axis was measuring the probe's own
-  patience (it measures unanswered attempts now). What remains is the human's:
-  review the PR, merge to `main`, then `just tag` and push `v0.11.0`
-  (AGENTS.md §5 — an agent must never create a release tag on its own
-  initiative). Three things for that review:
-  - **the CHANGELOG's date is `2026-10-14` and the tag will not be.** The
-    section is `## [0.11.0] - 2026-10-14`; `githooks/pre-tag` only checks that
-    exactly one dated section exists, so a tag cut later should carry the date
-    it is cut on. That is a human's edit to make in the release commit.
-  - **the final sweep is the one running as this is written**, on the commit
-    that changes an L3 claim's default to two lanes; it replaces
-    `benches/records/results-bench-v0.11.0.json`, the `assets/bench-v0.11.0*.png`
-    chart set and the README's benchmark tables. The sweeps before it measured
-    either the harness's shaper or the previous default, and are not the
-    artifact.
-  - **the L3 row will jump for two stacked reasons — the default and the code.**
-    The default: a claim now holds two carrier connections where it held one,
-    measured at +40 % on a multi-flow claim ([`DEFAULT_CLAIM_LANES`] carries both
-    tables) and costing `lanes x claims` connections — a breaking change with a
-    one-line upgrade path, both stated in the changelog and the configuration
-    page. The code: the TUN device now takes its segmentation offload (the
-    "The fourth fix is the one that worked" bullet below), measured at +70 % on
-    a single-flow bulk claim — so a sweep read against the v0.10.0 record is
-    neither a like-for-like default comparison nor a like-for-like code one, and
-    the two effects are separated by the smoke A/B in HANDOFF-archive's
-    2026-10-16 section, not by the sweep.
+- **v0.11.0 is on `main` and the release is in its tag step.** PR #5 merged as
+  `a9d66b4`, and the human authorized the agent to tag. The release matrix has
+  failed three times (a musl compile error and two timing flakes, on windows
+  and aarch64-musl), none in the product code (the list is in "RESOLVED: the
+  release sweep is measured" below); every src fix invalidated the previous
+  sweep, because `githooks/pre-tag` compares the record's revision against
+  `src/`. The published record is the sweep at
+  `d0f22b9` — 90 samples, `just bench-gate` PASS — and the tag is re-pushed on
+  the release commit that carries it (docs and assets after `d0f22b9` are
+  allowed by that check).
 
 - **The cycle being released**: transparent (L3) services, wire **v5**, based on
   `main` at `cf01091`. Nothing of it is in `v0.10.0` (verified: the tag's tree
@@ -211,33 +191,41 @@
   whole; the UDP control (`gso_probe5.py`, kept out of the repo — it needs a
   UDP_SEGMENT sender and only rules out a UDP-shaped win)).
 
-- **RESOLVED: the release sweep is measured.** The run that matters landed on
-  2026-10-17 at `6222e3c` (the release commit, tree clean, binary
-  `490335fb9c5cdadc`): 84 samples over the five arms (molehill, l3, frp,
-  rathole, nps), timeline + capacity, 103 minutes, zero failed samples.
+- **RESOLVED: the release sweep is measured.** The published run landed on
+  2026-10-17 at `d0f22b9` (the release commit, tree clean, binary
+  `871521c51fc4da88`): 90 samples over the five arms (molehill, l3, frp,
+  rathole, nps), timeline + capacity, 102 minutes, zero failed samples.
   `just bench-gate` PASSES — the endpoint invariant, the clean-stage SLOs,
   zero wedges on every arm, every arm sustaining the ramp to its own ceiling
-  (nps one this run; its path-limited ceiling has read 1/2/5/8 across runs,
-  its own recorded behavior). Three earlier attempts each paid for a lesson
-  now recorded here: the first (at `26ebb13`) was green but its tag's release
-  build failed on aarch64-musl — `c_char`'s signedness is a target property
-  the x86_64-only CI musl job never sees, fixed in `e4afa24`; the second lost
-  one cell to a probe timeout while this host was busy with the cross builds
-  for that very fix — a self-inflicted measurement contamination the gate's
-  coverage rule correctly refused; the third was clean but its tag's release
-  run tripped the windows flake in the multiplex pool test, fixed in
-  `6222e3c` (the repair loop owns the CI deadline). The headline shift from
-  the pre-offload record (`1c2dcd9`): L3 clean bulk 2.811 → **5.950 Gbit/s**
-  (+112 %, the offload fix through a staged run), clean interactive p99
-  2.3 → **1.5 ms**; L4 essentially unchanged (9.10 → 8.86). The charts and
-  both READMEs carry these numbers, and the L3-vs-L4 reading on them is
-  "the two architectures split the workloads" rather than "one trades
-  throughput for latency".
+  (nps reached 8 this run; its path-limited ceiling has read 1/2/5/8 across
+  runs, its own recorded behavior). Four earlier attempts each paid for a
+  lesson now recorded here: the first (at `26ebb13`) was green but its tag's
+  release build failed on aarch64-musl — `c_char`'s signedness is a target
+  property the x86_64-only CI musl job never sees, fixed in `e4afa24`; the
+  second lost one cell to a probe timeout while this host was busy with the
+  cross builds for that very fix — a self-inflicted measurement contamination
+  the gate's coverage rule correctly refused; the third was clean but its
+  tag's release run tripped the windows flake in the multiplex pool test,
+  fixed in `6222e3c` (the repair loop owns the CI deadline); the fourth tag
+  (`9ad3362`) tripped a second aarch64-musl timing flake — the handover lease
+  test raced the pool's own 50 ms maintenance tick and had only been winning
+  that race on a fast runner, fixed in `7059440` (both tunnels carry a lease,
+  and the wait covers the pool size and the handover state). The pre-offload
+  record (`1c2dcd9`) reads L3 clean bulk 2.811 → **3.881 Gbit/s** and clean
+  interactive p99 2.3 → **0.9 ms**; L4 9.10 → 8.90. **The L3 clean cell is the
+  release's least stable number**: the two same-path sweeps before this one
+  read 5.950 and 6.014 Gbit/s, the run's own replicate agrees to 0.7 %, and
+  the arm's `offered_gbps` tracks the carried number — the staged cell is
+  sender/path-state sensitive, not a tool ceiling. Both READMEs and the
+  benchmarks postscript state the spread and lean on the paired smoke A/B
+  (2.0 → 3.4) for the offload's size. The charts and both READMEs carry these
+  numbers, and the L3-vs-L4 reading on them is "the two architectures split
+  the workloads" rather than "one trades throughput for latency".
 
 - **The repository state**: `version = "0.11.0"`, `CHANGELOG.md` carries
-  `## [0.11.0] - 2026-10-14` with `[Unreleased]` empty, and no tag names this
-  branch yet — `v0.11.0` is the human's to create. The changelog's date is the
-  one thing to change in the release commit if the tag is cut on another day.
+  `## [0.11.0] - 2026-10-17` with `[Unreleased]` empty; `main` is at the
+  release commit and the tag is re-pushed there. The previous tag pointed at
+  `9ad3362`, whose release run failed; it was deleted, not moved.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
