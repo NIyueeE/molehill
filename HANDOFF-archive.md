@@ -18,6 +18,19 @@ Two rules apply to everything below, and they are the reason it was split out:
   reasoning can be audited. Where a record was retracted in place, the
   retraction is marked in that record.
 
+## Contents
+
+- [The v0.11.0 release preparation](#the-v0110-release-preparation-as-it-was-recorded-archived-2026-10-17)
+- [The L3 cycle's decisions](#the-l3-cycles-decisions-l1-l18-as-shipped-archived-2026-10-17)
+- [Closed: the non-x86 CI gap](#closed-the-non-x86-ci-gap-archived-2026-10-17)
+- [The transparent-L3 cycle: closed records](#the-transparent-l3-cycle-closed-records-archived-2026-10-13)
+- [The L3 cycle's investigation records](#the-l3-cycles-investigation-records-2026-10-10--2026-10-13-moved-2026-10-16)
+- [The v0.10.0 theme](#the-v0100-theme)
+- [The v0.10.0 release, as it was recorded](#the-v0100-release-as-it-was-recorded-archived-2026-10-16)
+- [Index of earlier records](#index)
+- [Records archived before this file existed](#records-archived-before-this-file-existed)
+- [Historical records (pre-v0.10.0)](#historical-records-pre-v0100)
+
 ## The transparent-L3 cycle: closed records (archived 2026-10-13)
 
 Moved from [HANDOFF.md](HANDOFF.md) when the cycle's release was prepared: each of these
@@ -859,9 +872,6 @@ anything**. They live in git history; this table is the index.
 | The Soak model's introduction and the four harness defects it fixed | `docs/benchmarks.md` (the model) and git history (the defects) |
 | The v0.9.0 provenance record and the KCP Linux-only release blocker | HANDOFF at v0.9.0 in git history; the platform lesson survives in `build.rs` |
 | The v0.8.x transport comparison and the archived QUIC arm | `CHANGELOG.md` of those releases; the `archive/transport-test` tag |
-
-The rules that came out of those incidents bind this cycle too, and they live in
-[AGENTS.md](AGENTS.md) §10 (measurement discipline) rather than here.
 
 The rules that came out of those incidents bind this cycle too, and they live in
 [AGENTS.md](AGENTS.md) §10 (measurement discipline) rather than here.
@@ -4612,3 +4622,231 @@ page. The rules at the top of this page apply.
 both hold; a difference inside the variance counts as *no difference*, and
 either failure removes the feature. The small-packet arm failed on the ceiling
 alone, so the other arms were not run for the verdict.
+
+## The v0.11.0 release preparation, as it was recorded (archived 2026-10-17)
+
+Moved from [HANDOFF.md](HANDOFF.md) when v0.11.0 was released; the rules at
+the top of this page apply. These records say what the branch's authors
+believed at the time; no number here is a measurement of the current code.
+
+### The branch squashes
+
+- **The branch was squashed four times: 187 commits to 13 (2026-10-14), 36 to
+  29 (2026-10-15, after the wedge cycle), then 39 to 35 (2026-10-16, before the
+  release sweep), then 44 to 42 (2026-10-16, before the re-run sweep — the
+  offload cycle grew nine commits; two pairs folded: the musl fix with the
+  deployment doc that stated its consequence, and the offload fix with its own
+  refactor).** Each commit is one topic, and each was a state that passed
+  the gate chain when first committed; every time the tree came out
+  byte-identical to the tip it replaced (`git diff` against the backup, empty).
+  Backups: `backup/l3-pre-squash-2026-10-14`, `backup/l3-pre-squash2-2026-10-15`,
+  `backup/pre-squash3-2026-10-15`, `backup/pre-squash4-2026-10-16` and
+  `backup/pre-squash5-2026-10-16`.
+  - **The third squash is the smallest, and that is the honest shape of the
+    history rather than a failure to compress.** It folded three commits that
+    were one investigation's instruments into one, the shaper's instrument and
+    its queue statement into one, and one docs half-commit into the code commit
+    it belonged to. What it did *not* fold is the eight `docs(handoff)` record
+    entries: they are interleaved with code commits and each edits the same
+    file, so folding them means either reordering (which breaks the later
+    patches and resolves as conflicts) or dropping the chain's diffs — and the
+    records themselves are append-only history by this repository's own rule
+    (HANDOFF-archive.md). Their *content* is in the archive now regardless. A squash changes every SHA, which is why the
+  sweep is re-measured rather than carried over: `githooks/pre-tag` checks the
+  results file's recorded revision against the commit being tagged, and an
+  artifact citing a revision nobody can check out is not provenance.
+  - The second squash folded only what was genuinely one topic or genuinely
+    superseded: the three fixups that followed on the shaper's instrument, the
+    tail-dropping limits, the re-measured release artifacts, and the four
+    wrong-turn HANDOFF records — which became one commit whose subject does not
+    assert the conclusion they had reached. `433a60e`'s subject claimed the
+    wedge *was* bufferbloat; it is reworded to claim only what survived, which
+    is that the loss is a queue and the product's own is clear. The bufferbloat
+    reading turned out to be right; the attribution is what it could not make.
+  - The first squash's re-run was not merely a re-stamp, and the reason is
+    worth recording: the first sweep's method record carried
+    `engine_hash a08ba5c5cfd439dc`, and the `analysis.py` coverage fix landed
+    *after* it, so the new run's was `1771ce182f09d566`. Same numbers' worth of
+    code, different engine — which is exactly what the engine hash exists to
+    make visible, and exactly why a file measured under the old one could not
+    have gated that commit.
+  - That re-run's agreement with the one before it is the reading the README
+    published: molehill's clean bulk 9.209 → 8.495, frp 6.106 → 6.040, rathole
+    28.986 → 25.026, nps 0.135 → 0.134.
+
+### The wedge gate result
+
+- **RESOLVED: the release gate failed on one axis, and the failure was the
+  harness, not the tool.** `l3` used to go silent 6 times on the stage schedule
+  where L4 never did. The cycle that chased it proposed seven mechanisms and
+  refuted every one of them by measurement before the eighth reading held — the
+  whole sequence, wrong turns included, is in
+  [HANDOFF-archive.md](HANDOFF-archive.md), "The L3 cycle's investigation
+  records". Two harness defects were behind it, both fixed:
+  - **The shaped leg's netem queue was left on its implicit 1 000-packet
+    default**, which caps a 100 ms leg at 10 000 packets/s against this arm's
+    37 600, so the shaper shed 73 % of the return stream while every device
+    counter read zero (`/proc/net/dev` cannot see a qdisc's drops). Every shaped
+    class states its queue now, and each stage's qdisc drops and standing
+    backlog travel in its evidence beside the devices'.
+  - **The wedge axis measured gaps between samples**, and on a serial probe a
+    gap is the next attempt's own duration; with the threshold at exactly the
+    probe's attempt budget, one unanswered attempt was a "silence" by
+    construction — two 5.1–5.5 s *successful* answers read as L4 going silent.
+    It measures runs of unanswered attempts now, and the attempt budget bounds
+    the whole attempt (per-socket-operation it could be spent three times).
+  **The gate passes on the sweep that ran at `bfb1ef4`**: 90 measured cells, the
+  endpoint invariant, the SLO on the clean stages, drift, the wedge axis with
+  **every arm at zero**, and the ramp. The one L3-specific penalty that survives
+  is `rtt100`'s p99 (1 426 against 402 ms), and its cost is in the record rather
+  than argued: the same stage shows the shaped leg shedding **259 149 packets for
+  L3 and none for L4**, because L3 offers ~5× the return packets per second for
+  less than half the data (12 KB per acknowledgement against L4's 65, since the
+  client's kernel receives the bulk through its TUN in 1 400-byte units where
+  L4's server GRO-coalesces it). The lever for that is GSO/TSO on the TUN — a
+  feature, and a wire question rather than a flag.
+
+### The pre-release checks outside the chain
+
+- **The v0.11.0 pre-release checks that are not in the chain, all green**: the
+  interop matrix (`just interop`, 3 cases — both directions refuse the other's
+  dialect and keep serving a peer of their own version, against the released
+  v0.10.0 binary) and the L3 acceptance harness (`just l3-accept`, 15
+  assertions including the negative policy half). Both were broken by the
+  mandatory-Noise change and both were repaired with it; neither would have
+  been caught by `just check`.
+
+### The release audit blocker
+
+- **The release audit found a blocker that would have failed the tag, and it is
+  fixed** (`2d4cc0f`). The transparent code did not compile for musl: the TUN
+  attach passed `TUNSETIFF` typed for glibc's `ioctl` signature, and
+  `release.yml` builds `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
+  with `transparent` — the two artifacts the GHCR image is built from — so the
+  tag would have failed at the build step. The CI job whose comment claims it
+  builds "exactly this target and feature set" had drifted to five sixths of it
+  when `transparent` joined `release.yml` alone, so **no musl build had ever
+  compiled the L3 code the release ships**; `just container` had the same gap.
+  The cast is an identity cast on glibc — the release binary's `.text` is
+  byte-identical with and without it — and `githooks/check-docs` now fails any of
+  the three copies of that list that is not `Cargo.toml`'s default set.
+
+### The L3-vs-L4 gap and the offload fix
+
+- **The L3-versus-L4 throughput gap is the architecture, not a defect — and
+  then it was fixed.** Four TUN syscalls per data packet — the visitor's data
+  read and written, plus its acknowledgement read and written, because the
+  *client's* kernel terminates the connection — put ~4.6 of the daemons' 7.7
+  cores in system time. It is neither a lock nor one saturated stage: over 22
+  threads, run ≈ 600 % against wait ≈ 1 %. Three candidate fixes were built or
+  measured and refused (a serialized reader, the routing-table mutex, and
+  multi-queue TUN readers, which the A/B showed buy nothing and which would
+  have stranded every pre-v0.11.0 binary, since a `multi_queue` device refuses
+  a non-multi-queue attach).
+  **The fourth fix is the one that worked** (this session): the kernel was
+  segmenting every packet at the TUN boundary because the device never
+  declared the offloads its reader can take. `IFF_VNET_HDR` +
+  `TUNSETOFFLOAD(CSUM|TSO4|TSO6|ECN|USO4|USO6)` changes the unit of the whole
+  data path from one 1 400-byte packet to one ~64 KiB super-frame — measured
+  on a routed forward path, 3.85 GB of bulk TCP: 576 071 reads of 1 500 bytes
+  became 59 160 reads averaging 65 212 bytes. The frame travels the lane
+  whole (vnet header included, `NEEDS_CSUM` intact), the routing decision is
+  one lookup per super-frame, and the wire framing's length prefix moved from
+  `u16` to `u32` to carry a whole super-frame. Attach-time compatibility was
+  verified on this host: a VNET_HDR attach to a pre-created plain device
+  succeeds (unlike the `multi_queue` trap), so no operator recipe changes.
+  What did **not** work: `IFF_VNET_HDR` alone (the kernel still segments —
+  the declaration is the lever), and the UDP-GSO read side segments even with
+  the declaration on this kernel (UDP offload is TX-only here); TCP TSO is
+  the win. The probe is in-repo:
+  [`benches/scripts/l3/tcp_tso_census.py`](benches/scripts/l3/tcp_tso_census.py)
+  (method:
+  two netns, one routed TUN hop, a userspace shuttle that relays frames
+  whole; the UDP control (`gso_probe5.py`, kept out of the repo — it needs a
+  UDP_SEGMENT sender and only rules out a UDP-shaped win)).
+
+### The release sweep, as it was recorded
+
+- **RESOLVED: the release sweep is measured.** The published run landed on
+  2026-10-17 at `d0f22b9` (the release commit, tree clean, binary
+  `871521c51fc4da88`): 90 samples over the five arms (molehill, l3, frp,
+  rathole, nps), timeline + capacity, 102 minutes, zero failed samples.
+  `just bench-gate` PASSES — the endpoint invariant, the clean-stage SLOs,
+  zero wedges on every arm, every arm sustaining the ramp to its own ceiling
+  (nps reached 8 this run; its path-limited ceiling has read 1/2/5/8 across
+  runs, its own recorded behavior). Four earlier attempts each paid for a
+  lesson now recorded here: the first (at `26ebb13`) was green but its tag's
+  release build failed on aarch64-musl — `c_char`'s signedness is a target
+  property the x86_64-only CI musl job never sees, fixed in `e4afa24`; the
+  second lost one cell to a probe timeout while this host was busy with the
+  cross builds for that very fix — a self-inflicted measurement contamination
+  the gate's coverage rule correctly refused; the third was clean but its
+  tag's release run tripped the windows flake in the multiplex pool test,
+  fixed in `6222e3c` (the repair loop owns the CI deadline); the fourth tag
+  (`9ad3362`) tripped a second aarch64-musl timing flake — the handover lease
+  test raced the pool's own 50 ms maintenance tick and had only been winning
+  that race on a fast runner, fixed in `7059440` (both tunnels carry a lease,
+  and the wait covers the pool size and the handover state). The pre-offload
+  record (`1c2dcd9`) reads L3 clean bulk 2.811 → **3.881 Gbit/s** and clean
+  interactive p99 2.3 → **0.9 ms**; L4 9.10 → 8.90. **The L3 clean cell is the
+  release's least stable number**: the two same-path sweeps before this one
+  read 5.950 and 6.014 Gbit/s, the run's own replicate agrees to 0.7 %, and
+  the arm's `offered_gbps` tracks the carried number — the staged cell is
+  sender/path-state sensitive, not a tool ceiling. Both READMEs and the
+  benchmarks postscript state the spread and lean on the paired smoke A/B
+  (2.0 → 3.4) for the offload's size. The charts and both READMEs carry these
+  numbers, and the L3-vs-L4 reading on them is "the two architectures split
+  the workloads" rather than "one trades throughput for latency".
+
+## The L3 cycle's decisions (L1-L18), as shipped (archived 2026-10-17)
+
+Moved from [HANDOFF.md](HANDOFF.md) when v0.11.0 was released; the cycle is
+closed, and the configuration and internals pages own the design as shipped.
+
+**State as of 2026-10-09.** The feature is committed and green
+(`45adb6e` the feature, `edffa53` never-encrypted, `b1ce03b` the striping
+note): the transparent (L3) client makes itself the owner of a public
+`ip:port`, carried as whole IP packets over a TUN device on both ends, with the
+wire at **v5** and `just l3-accept` (root-only, outside the check chain)
+proving the transparency end to end. Because none of it was released yet, the
+configuration surface was free to change — and this cycle changed it.
+
+### Decisions
+
+| # | Decision |
+|---|---|
+| L1 | L3 is a **run mode**, not a service type: touching a NIC is a process-level capability, so an entry-level key must not be what opens it |
+| L2 | The mode is chosen by its own top-level table (`[transparent]`), exactly as `[server]`/`[client]` are; a CLI flag only overrides |
+| L3 | `[client]` and `[transparent]` in one file is `Undetermine`: two roles are two processes (capability and restart isolation) |
+| L4 | The server gets **no** mode. It is a policy host: one config serves encrypted L4 clients and plaintext L3 ones |
+| L5 | `[server.transparent]` **is** the server's switch: absent, a registration is refused by policy *before* any device is looked at, so a client can never be what makes the server reach for `/dev/net/tun` (shipped first in this cycle) |
+| L6 | **No** `allow_addresses`: one shared `default_token` is one trust domain, so a global address list cannot discriminate between clients; the address universe is already expressed by the operator's own routing |
+| L7 | Noise and L3 are **not** mutually exclusive — the Noise keys simply have no effect on an L3 client. The documented consequence: enabling L3 means that server accepts plaintext connections from it |
+| L8 | `allow_ports` keeps gating L3 too: it is documented as the master switch for dynamic registration, and an L3 claim is a registration |
+| L9 | A claim's address key stays `remote_bind_addr`, and `proxy` stays in `[transparent.transport]` (the only key there — no encryption key has a home in that table) |
+| L10 | Header compression is an **intermediate state**: keep it when the measurement shows benefit, remove it when it does not, against criteria written down *before* the run |
+| L11 | No startup INFO for the switch; the plaintext consequence lives in the docs instead |
+| L12 | `tunnels` is one quantity in both models — **how many carrier connections this client holds for that carrier**: L4 spends them on a pool that carries unbounded per-visitor streams, L3 hands them to claims as lanes |
+| L13 | The data plane's shape is **derived from the service type**, not configured: a forwarding service always multiplexes, a transparent claim never does. `mode` is deleted, and a config that still carries it is refused by name |
+| L14 | A claim's lane count is `max(1, floor(tunnels / claims on that carrier))`, and `tunnels` unset means **`DEFAULT_CLAIM_LANES` per claim** (two — the largest value that keeps both the bulk ceiling and the interactive SLO, measured); a budget below the claim count is refused with the number to write |
+| L15 | A lane **is** a connection, so reclamation moves **idle lanes only** — at most one per tick, never below one per claim: taking a busy lane would drop that claim's packets while its replacement was dialled anyway |
+| L16 | Flow placement is a **per-flow table**, not a hash modulus: assignment happens once, into a *live* slot; established flows never move; entries expire after silence in either direction, so a lane change cannot reorder a flow |
+| L17 | `[server.data].max_tunnels_per_client` counts a client's **carrier connections**: a transparent claim's direct lane registers against it, a per-visitor channel (the no-`multiplex` build's shape) does not |
+| L18 | The mux×1-versus-direct gap is attributed with the model before it is optimised, and each optimisation lands only if it clears that run's own noise floor. No reorder buffer, no mid-stream framing switch, no compact single-stream mode |
+
+## Closed: the non-x86 CI gap (archived 2026-10-17)
+
+`5e585b7` closed the compile half of the old thread: the two full-set musl
+targets are built in CI (x86_64 on `ubuntu-latest`, aarch64 natively on
+`ubuntu-24.04-arm`), the three 32-bit `embedded` targets are cross-checked,
+and a native aarch64-musl test job runs the release's test command on every
+PR. The 32-bit targets are compile-checked only; a qemu test run remains the
+optional next step. The old thread text, as it was written:
+
+- **CI still does not test the non-x86 targets the release ships.** The CI
+  musl job builds `x86_64-unknown-linux-musl` only; the aarch64/arm/armv7 musl
+  legs exist only in `release.yml`, so both aarch64-only failures this release
+  hit — `c_char`'s signedness and a timing flake — were first seen by the
+  release build. A compile-only `cross build` for aarch64-musl in CI closes
+  that class cheaply; a qemu test run would also cover the flakes but is slow
+  and itself timing-sensitive, so the compile half is the first step.
