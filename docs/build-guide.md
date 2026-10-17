@@ -41,7 +41,7 @@ undiscoverable feature, and both fail `githooks/check-docs`.
 
 1. Build with the `minimal` profile
 
-The `release` build profile optimize for the program running time, not the binary size.
+The `release` build profile optimizes for the program's running time, not the binary size.
 
 However, the `minimal` profile enables lots of optimization for the binary size to produce a much smaller binary.
 
@@ -51,15 +51,19 @@ For example, to build `molehill` with `client` feature with the `minimal` profil
 cargo build --profile minimal --no-default-features --features client
 ```
 
-2. `strip` and `upx`
+2. `strip` and `upx` (optional)
 
-The binary that step 1 produces can be even smaller, by using `strip` and `upx` to remove the symbols and compress the binary.
-
-Like:
+`[profile.minimal]` inherits `[profile.release]`, which sets `strip = true`,
+so step 1 already produces a stripped binary — `strip` has nothing left to
+remove. `upx` can still compress it:
 
 ```sh
-strip molehill
 upx --best --lzma molehill
 ```
 
-At the time of writting the build guide, the produced binary for `x86_64-unknown-linux-glibc` has the size of **574 KiB**.
+Measured on `x86_64-unknown-linux-gnu` with this tree (2026-10-17): the
+`--features client` build is **1 927 808 bytes** (1.84 MiB) and the
+`--features embedded` build is **2 675 176 bytes** (2.55 MiB), both already
+stripped. The Linux release archives are UPX-compressed, so their published
+size is the packed figure; `just container` builds the musl image binary
+locally.
