@@ -368,18 +368,40 @@ FD 占用。形态不是键:转发服务永远走多路复用(没有 `mode` 可�
 
 ```toml
 # server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["5202"]
+
 [server.control]
 bind_addr = "0.0.0.0:2333"
+
 [server.data]
 bind_addr = "0.0.0.0:2343"
+
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
 ```
 
 ```toml
 # client.toml
+[client]
+default_token = "change-me"
+
 [client.control]
 default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+
 [client.data]
 default_data_addr = "server.example.com:2343"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:5202"
 ```
 
 服务端会在 `[server.data].bind_addr` 上再绑一个 TCP 监听,并在第一条 KCP 注册
