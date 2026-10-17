@@ -21,7 +21,10 @@ mod protocol;
 #[cfg(feature = "client")]
 mod status;
 mod stripe;
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 mod transparent;
 mod transport;
 

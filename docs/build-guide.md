@@ -23,8 +23,10 @@ cargo build --release --no-default-features --features client,noise
 ```
 
 (Note that the default feature set is `server`, `client`, `noise`,
-`hot-reload`, `multiplex`, `kcp` and `transparent`; `transparent` needs Linux
-and a TUN device.)
+`hot-reload`, `multiplex`, `kcp` and `transparent`; `transparent` needs a TUN
+device — Linux and macOS run both ends, Windows can serve but not claim — and
+pulls the `tun-rs` dependency. A Windows server also needs `wintun.dll` at
+runtime.)
 
 Two names exist outside the default set:
 

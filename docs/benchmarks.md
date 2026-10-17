@@ -1100,7 +1100,9 @@ dials the server on (the tunnel's wire, both directions, including the carrier's
 own TCP/IP headers) and the two TUN devices (the packets the L3 path actually
 carries). The denominator is always stated: **wire** is the veth's bytes, which
 is the link's real cost; **carried** is those packets plus this protocol's
-2-byte length prefix.
+2-byte length prefix. The harness drives IPv4; IPv6 shares the framing and GSO
+path but has a 40-byte base header, so these ceilings are IPv4 numbers.
+`just l3-accept-ipv6` is the IPv6 functionality gate, not a measurement.
 
 | Arm (one connection each) | Carried | Mean carried packet | Wire | Wire per carried packet | Header-compression ceiling |
 |---|---|---|---|---|---|
@@ -1169,8 +1171,12 @@ userspace hotspot exists to fix — a synchronous data path would chase the
 10 %, not the 84 % — and the levers that move it are **the packet size**:
 - **The device's own offload (a code change, in v0.11.0):** the TUN device is
   attached with `IFF_VNET_HDR` and declares `TUNSETOFFLOAD`, so the kernel
-  hands the reader TCP super-frames instead of segmenting first. Measured on
-  a routed forward path (two netns, one TUN hop, frames relayed whole):
+  hands the reader TCP super-frames instead of segmenting first. Since protocol
+  v5.1 that is the `Vnet` wire, negotiated only when both ends are Linux with
+  offload; a pair with a plain-IP device negotiates `Ip` and the Linux side
+  splits/checksums at its boundary, which is not measured by these Linux-pair
+  numbers. Measured on a routed forward path (two netns, one TUN hop, frames
+  relayed whole):
   3.85 GB of bulk TCP arrived as 576 071 reads of 1 500 bytes without the
   declaration and as 59 160 reads averaging 65 212 bytes with it — the same
   ratio of reads to bytes the 8000-byte-MTU operator lever buys below, taken

@@ -13,10 +13,13 @@ v0.5.0 — and has been numbered independently since.
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) applies within
 that line.
 
-The **wire protocol** has its own number, and it moves with the release line:
-it changes with the tag that introduces it, and no two tags are compatible. The
-rule, the current dialect and the release line are in AGENTS.md §5; the wire
-consequences are in [internals.md](internals.md), "Protocol versions".
+The **wire protocol** has its own `major.minor` number, and it moves with the
+release line: it changes with the tag that introduces it, and no two tags are
+compatible. A change to either half is a new dialect, not a compatible
+extension: 0.11.1 speaks v5.1, which deliberately breaks 0.11.0's v5.0 in a
+patch release. The rule, the current dialect and the release line are in
+AGENTS.md §5; the wire consequences are in
+[internals.md](internals.md), "Protocol versions".
 
 ## Release notes: CHANGELOG.md is the single source
 

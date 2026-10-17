@@ -1,12 +1,16 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-17.** **v0.11.0 is released**: the tag names
-> `f3295e8`, and the release sweep at `d0f22b9` passed `just bench gate`
-> (90 samples over five arms; the record is
-> `benches/records/results-bench-v0.11.0.json`). The branch
-> `feat/v0.11.1-builds` carries the CI build-matrix change (`5e585b7`) that
-> the release exposed, and the bench-harness refactor that makes v0.11.1 a
-> method re-baseline.
+> **State as of 2026-10-17.** **v0.11.1 is in development on
+> `feat/v0.11.1-builds`.** It moves the wire to **protocol v5.1** (a deliberate
+> v5.0 break), makes transparent (L3) services cross-platform through
+> `tun-rs` — Linux/macOS clients and servers, Windows servers, a Windows client
+> refused with the WSL2 path — and removes the crate's three production
+> `unsafe` blocks. The earlier branch content (CI build-matrix change
+> `5e585b7`, the bench-harness refactor) is still part of this release.
+> **v0.11.0 is released**: the tag names `f3295e8`, and the release sweep at
+> `d0f22b9` passed `just bench gate` (90 samples over five arms; the record is
+> `benches/records/results-bench-v0.11.0.json`). The v0.11.1 sweep is still a
+> method re-baseline and has not been run.
 >
 > **This file owns the working state**: what is open, what was decided and why,
 > and the release checklist. Per AGENTS.md §3 it is an agent page — user-facing
@@ -68,11 +72,12 @@
   run that did show it converging was voided by the shaper bug recorded in the
   archive. A long-hold scenario is what would settle it; the arms already exist
   (`l3-budget10-lending` against `l3-budget10-nolend`).
-- **The repository state**: `version = "0.11.0"`, `CHANGELOG.md` carries
-  `## [0.11.0] - 2026-10-17` with `[Unreleased]` empty; `main` is at the
-  release commit and `v0.11.0` names `f3295e8`. The branch
-  `feat/v0.11.1-builds` adds the native ARM64 build/test legs and the
-  every-musl-target check (`5e585b7`).
+- **The repository state**: `version = "0.11.1"` and `CHANGELOG.md` carries a
+  dated `## [0.11.1] - 2026-10-17` section (no tag yet; `[Unreleased]` is
+  empty). `main` is at the v0.11.0 release commit and `v0.11.0` names
+  `f3295e8`. The branch `feat/v0.11.1-builds` also carries the native ARM64
+  build/test legs and the every-musl-target check (`5e585b7`). No v0.11.1 tag
+  or push is implied by this state; the release ritual is separate.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
@@ -130,18 +135,48 @@
   have to split by `stride` before its per-datagram accounting. That is a
   transport redesign with its own A/B, not a wrapper swap, and the `nix`
   wrapper already removed the local unsafe.
-- **A `tun-rs` replacement for the TUN attach was tried and declined.** It
-  compiled and ran the real L3 path (the binary attached, read and wrote
-  frames through `tun-rs`), but the `screen` A/B measured 1.1969 s/Gbit for the
-  current attach against 1.2045 for `tun-rs` (~0.6 % slower, inside the 15 %
-  floor), and it adds 29 crates (netlink/route_manager, encoding_rs, winreg,
-  zerocopy, ...) and ~300 lockfile lines. The three audited ioctls stay.
-  Cherry-picking only the code paths used was also considered and rejected:
-  the Linux device/offload/async path is 4,588 lines with 41 `unsafe` blocks,
-  while the needed attach/offload/read/write subset is already this crate's
-  299-line `tun.rs` with 3 audited blocks. Vendoring would multiply the audit
-  surface, not shrink it; KCP is safe state-machine code, whereas TUN is a
-  syscall boundary by nature.
+- **`tun-rs` is accepted for the cross-platform L3 cycle.** The earlier trial
+  measured 1.1969 s/Gbit for the audited ioctl attach against 1.2045 for
+  `tun-rs` (~0.6 % slower, inside the 15 % floor), and adds 29 crates and ~300
+  lockfile lines; the cross-platform requirement is what changed the decision,
+  not the cost. The three audited ioctls are gone, so production `unsafe` is
+  now zero; `tun-rs`'s syscalls sit behind the dependency audit/deny gates.
+  Vendoring only the used Linux subset was still rejected: 4,588 lines and 41
+  `unsafe` blocks against the 299-line wrapper.
+- **Protocol v5.1, and why it is a patch-release wire break.** The version is
+  now `major.minor` (two bytes) and `StartForwardTransparent` carries the frame
+  format (`Ip` or `Vnet`). A Linux pair negotiates `Vnet` and keeps the GSO
+  fast path; any pair with a plain-IP device negotiates `Ip`, and the Linux
+  side converts in `src/transparent/frame.rs`. v5.0 is refused on the
+  connection it happens on. AGENTS.md §5 was updated: `5.1` is a dialect
+  label, not a SemVer-compatible minor.
+- **Both Linux L3 acceptance modes pass (2026-10-17).** `just l3-accept`
+  (Vnet) and the same harness with `MOLEHILL_L3_WIRE=ip` (plain-IP wire) both
+  returned PASS on every verdict, including transparency, no server-side
+  flow state, bulk/MTU, 2,000 small round trips and 16 flows. The plain-IP
+  run's bulk arm carried 314 packets at a mean 2,237 B/packet instead of 52
+  super-frames at 7,614 B, which is the expected shape of the conversion
+  path. The screen A/B for `tun-rs` on Linux has not been re-run since the
+  cross-platform changes; run it before the release sweep.
+- **IPv6 is in v0.11.1, not deferred.** The v5.1 frame carries opaque IP
+  packets, so this needed no wire bump: the work is the IPv6 parser (base
+  header, common extension-chain walk with a header-count ceiling, fragment
+  header, TCP/UDP ports, ICMPv6/ESP address-only, jumbograms rejected), the
+  `gso_split` family argument, macOS `/128` assignment, Linux `ip -6`
+  rules/routes and forwarding check, the Windows `/128` recipe, and tests.
+  `just l3-accept-ipv6` passes on the `Vnet` wire and with
+  `MOLEHILL_L3_WIRE=ip`: a visitor on an IPv6 path reaches a client-owned
+  `/128`, the backend sees the visitor's IPv6 address, the server holds no
+  socket, and a 60 KiB stream round-trips byte-exactly. The macOS/Windows
+  IPv6 recipes still need real-host validation, like their IPv4 counterparts.
+- **Windows L3 client is out of scope for v0.11.1.** Windows has no built-in
+  source-address policy routing; a native client would need a WFP callout or
+  WinDivert-class redirector, with a driver and its own security review. The
+  config refuses it at parse time and names WSL2. macOS uses a pf
+  `route-to` rule; the recipe still needs validation on a real Mac, and the
+  exact syntax may depend on the utun's point-to-point peer. Windows **server**
+  support is implemented (Wintun + `wintun.dll` + route/forwarding recipe) but
+  also needs a real-host acceptance run.
 - **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
   trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
   `set_var`/`remove_var` scoped and safe at the call site; a worktree

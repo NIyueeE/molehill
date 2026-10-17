@@ -1,4 +1,4 @@
-# requires: transparent
+# requires: transparent-client
 
 # An L3 client is its own run mode: one block, and every service it has is a
 # claim on a public address. There is no `protocol` key here, and the keys a

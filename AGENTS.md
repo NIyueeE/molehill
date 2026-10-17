@@ -184,18 +184,20 @@ is the voice contract for writing it.
   [rathole](https://github.com/rapiz1/rathole) (upstream's last release was
   v0.5.0), and has been numbered independently since. Never renumber.
 - **The wire protocol version moves with the release line, and no two tags are
-  compatible.** A dialect is defined by a release: the number changes when the
-  wire changes, it changes *with* the tag that introduces it, and
-  `SUPPORTED_PROTO_VERSIONS` is the current dialect alone — a peer from another
-  tag is refused on the connection it happens on, in both directions, and
-  upgrading means upgrading both ends. Two releases share a number when their
-  wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
-  still in development it is still being defined, so commands may be extended
-  **in place** under that number; once the tag exists, the next change to the
-  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4,
-  0.11 v5 — each read off its tag's `CURRENT_PROTO_VERSION`. v5 is tagged, so
-  its commands are fixed; the next wire change is v6, and a 0.11.x patch that
-  does not change the wire stays v5.
+  compatible.** A dialect is `major.minor`; a change to either half is a new
+  dialect, never a compatible extension. It changes *with* the tag that
+  introduces it, and `SUPPORTED_PROTO_VERSIONS` is the current dialect alone —
+  a peer from another tag is refused on the connection it happens on, in both
+  directions, and upgrading means upgrading both ends. Two releases share a
+  number when their wire is the same (0.8.x and 0.9.x are both v3). While a
+  dialect's release is still in development its commands may be extended **in
+  place** under that number; once the tag exists, the next change is the next
+  number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4, 0.11.0 v5.0,
+  0.11.1 v5.1 — each read off its tag's `CURRENT_PROTO_VERSION`. v5.0 is
+  tagged, so its commands are fixed. v5.1 deliberately breaks the v5.0 wire in
+  a patch release (the two-byte version and the transparent frame-format
+  negotiation); `5.1` is a dialect label, not a SemVer-compatible minor. The
+  next wire change is 5.2; a redesign would be 6.0.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -446,15 +448,16 @@ pointers, not copies:
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
   `hot-reload`; `multiplex` (yamux, in the default set); `kcp`
   (KCP-over-UDP data tunnels, in the default set); `transparent` (a
-  client-owned public `ip:port` carried as whole IP packets over a TUN device,
-  Linux only, in the default set); `embedded` (minimal).
+  client-owned public `ip:port` carried as whole IP packets over a TUN device:
+  Linux and macOS run both ends, Windows can serve but not claim, in the
+  default set); `embedded` (minimal).
   Clippy runs twice in the pre-commit gate: the second pass covers the
   minimal no-default-features `server,client` build that the default-feature
   pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v5, one control session per endpoint; the rule and the
+- **Protocol**: v5.1, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at

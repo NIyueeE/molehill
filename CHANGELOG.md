@@ -7,14 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-17
+
 ### Added
 
+- **Transparent (L3) services are cross-platform.** Linux and macOS run both
+  ends; a Windows server can serve transparent claims (Wintun, Administrator,
+  `wintun.dll`). A Windows client is refused at config parse: Windows has no
+  source-address policy routing, so its replies would not return to the tunnel;
+  the refusal names the WSL2 path. macOS uses a daemon-created utun and assigns
+  the claimed `/32`s, while the operator owns the pf `route-to` rule and routes;
+  Windows uses a daemon-created Wintun adapter plus operator routes and
+  forwarding. Linux keeps its persistent operator-created TUN and the same
+  `ip rule`/`ip route` recipes.
+- **Transparent (L3) carries IPv6 as well as IPv4.** The packet reader walks
+  the IPv6 base header and the common extension-header chain (including
+  fragments), reads TCP/UDP ports when they are reachable, and routes ICMPv6
+  and non-first fragments by address; jumbograms are rejected. The same
+  `Ip`/`Vnet` frame negotiation carries both families, the Linux GSO split
+  handles IPv6, and Linux/macOS/Windows recipes use `/128` addresses and the
+  family's forwarding/routing commands. A focused Linux IPv6 acceptance
+  harness (`just l3-accept-ipv6`) covers the visitor path, transparency and a
+  60 KiB stream on both wire formats.
 - **Prebuilt `aarch64-unknown-linux-gnu` archives.** The release now ships ten
   archives; the new one serves arm64 Linux hosts that want the system glibc
   (NSS/DNS) rather than the static musl binary.
 
 ### Changed
 
+- **BREAKING: protocol v5.1, incompatible with v5.0.** The hello carries a
+  two-byte `major.minor` version, and a transparent data channel negotiates its
+  frame format (`Ip` for bare IPv4 packets, `Vnet` for Linux virtio-net/GSO
+  frames) in `StartForwardTransparent`. A Linux pair keeps the `Vnet` fast path;
+  any pair with a plain-IP device uses `Ip`, with the Linux side splitting and
+  checksumming at its boundary. A 0.11.0 (v5.0) peer is refused on the
+  connection it happens on; upgrade both ends together. `5.1` is a dialect
+  label, not a SemVer-compatible minor.
+- **The L3 stats counter `not_ipv4` is now `not_ip`.** It counts packets whose
+  version is neither IPv4 nor IPv6; IPv6 is no longer dropped there.
+- **The TUN device layer is `tun-rs`.** One cross-platform API replaces the
+  three audited Linux ioctls, so the crate has no production `unsafe` blocks
+  left. The measured Linux cost was about 0.6 % on the L3 screen arm, inside the
+  15 % materiality floor; the dependency remains covered by the audit/deny
+  gates.
 - **The benchmark harness is the top-level `bench/` uv project.** Its Python
   lives under `bench/src/bench/`, dependencies are pinned by `bench/uv.lock`,
   and one console script dispatches every command (`just bench <verb>`:

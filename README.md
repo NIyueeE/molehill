@@ -32,7 +32,8 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
   and the server holds no connection state for the flow at all. This is the
   mode you want when the real source address matters — a mail server, a game
   server, anything that logs or rate-limits by peer — and it is the reason a
-  reverse proxy in front of it is not a compromise. Linux only.
+  reverse proxy in front of it is not a compromise. Linux and macOS clients and
+  servers; Windows servers; a Windows client runs under WSL2.
 
 <!-- TOC -->
 
@@ -50,20 +51,24 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 
 ## Features
 
-- **Transparent (L3) clients: the device behind NAT owns its public IP (Linux).**
-  A `[transparent]` block is a run mode of its own: the server binds nothing,
-  routes whole IP packets into the tunnel, and the **client's kernel answers the
-  visitor** — so the backend sees the visitor's real source address, TCP keeps
-  its end-to-end semantics, and the server holds no socket and no per-flow state
-  for the connection. Nothing is translated. It lowers into the same engine the
-  forwarding path uses, so the wire and the data path are shared. The daemon
-  configures no network itself: it attaches to a TUN device you created and
-  refuses a missing prerequisite with the exact command to run, instead of
-  failing as silent packet loss. Serving L3 is the *server operator's* decision
+- **Transparent (L3) clients: the device behind NAT owns its public IP.**
+  Linux and macOS run both ends; a Windows server can serve a transparency
+  claim, while a Windows client runs under WSL2. A `[transparent]` block is a
+  run mode of its own: the server binds nothing, routes whole IP packets into
+  the tunnel, and the **client's kernel answers the visitor** — so the backend
+  sees the visitor's real source address, TCP keeps its end-to-end semantics,
+  and the server holds no socket and no per-flow state for the connection.
+  Nothing is translated; both IPv4 and IPv6 are carried. It lowers into the same
+  engine the forwarding path uses, so the wire and the data path are shared. The daemon installs no route
+  itself: on Linux it attaches to a TUN device you created; on macOS and
+  Windows it creates the ephemeral device because those platforms have no
+  persistent equivalent, and the operator still owns the routes, forwarding
+  and firewall rules. Serving L3 is the *server operator's* decision
   (`[server.transparent]`), and without it a claim is refused by policy before
-  any device is looked at. See [Configuration](./docs/configuration.md#transparent-l3-services)
-  and [Deployment](./docs/deployment.md#transparent-services) for the two
-  recipes and the privileges each mode needs.
+  any device is looked at. See
+  [Configuration](./docs/configuration.md#transparent-l3-services) and
+  [Deployment](./docs/deployment.md#transparent-services) for the recipes and
+  the privileges each platform needs.
 - **High throughput** — measured against frp, rathole and nps on one host with the same method; the published numbers are [below](#benchmarks).
 - **Small binary** — the `minimal` profile builds a **1.84 MiB** client binary and a **2.55 MiB** embedded one (measured 2026-10-17; see the [build guide](docs/build-guide.md)).
 - **Client-authoritative services** — the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.

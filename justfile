@@ -101,6 +101,11 @@ interop:
 l3-accept *ARGS:
     just bench l3 {{ARGS}}
 
+# Transparent L3 IPv6 acceptance: root-only Linux, a focused companion to
+# `l3-accept` (see docs/checks.md).
+l3-accept-ipv6 *ARGS:
+    bash bench/src/bench/utils/l3/run_ipv6.sh {{ARGS}}
+
 # The performance model: one topology, a declared metric registry, a control
 # arm in every scenario and a noise floor the run measures itself. Root-only
 # (three network namespaces) and outside the check chain; results land outside

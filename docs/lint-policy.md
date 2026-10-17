@@ -57,13 +57,14 @@ follow the same discipline.
 `unsafe_code` is **deny**, so an unexpected `unsafe` fails a plain
 `cargo build` and not only the `-D warnings` gate. The modules that need it ask
 per item, with `#[expect(unsafe_code, reason = "...")]` plus a
-`// SAFETY:` comment directly above the item — 3 in production modules and
+`// SAFETY:` comment directly above the item — **none in production** and
 5 test-only:
 
-- `src/transparent/tun.rs` — the TUN attach (3 expectations: the zeroed
-  `ifreq` and name copy bounded by `IFNAMSIZ` for `TUNSETIFF`, the
-  `TUNSETOFFLOAD` declaration, and tokio's `AsyncFd::register`, which requires
-  the caller to prove the registered fd stays open and unchanged);
+- production: none. The TUN device layer is `tun-rs`; its platform syscalls
+  live in the dependency, outside this crate's `unsafe_code` lint. That is a
+  dependency-audit boundary, not a licence to ignore it: `cargo deny`, the
+  advisory audit and the dependency review cover the crate, and
+  `src/transparent/tun.rs` contains no `unsafe`.
 - test-only: 5 expectations for edition-2024 environment mutation (3 in
   `src/transport/multiplex.rs`'s tests, 2 in `tests/pool_test.rs`). These are
   serial-suite tests; `std::env::set_var`/`remove_var` are `unsafe` since
@@ -73,13 +74,14 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 
-The TUN waivers are sanctioned because the ioctls and the tokio registration
-have no safe equivalent. A `tun-rs` replacement was tried and measured about
-0.6 % slower while adding 29 dependencies, so the audited three-ioctl version
-stays. The batching site is no longer unsafe: `udp_batch`
+`tun-rs` is in because the transparent data path is cross-platform now: one
+device API covers Linux, macOS and the Windows server, and the three audited
+Linux ioctls (attach, offload declaration, tokio fd registration) left this
+crate with it. Its local A/B cost was about 0.6 % on the Linux `screen` L3 arm,
+inside the 15 % materiality floor; the record is in
+[HANDOFF.md](../HANDOFF.md). The batching site is also safe: `udp_batch`
 uses `nix`'s safe `recvmmsg`/`sendmmsg`, at a measured 1.4-1.9 % CPU per Gbit
-cost (inside the 15 % materiality floor; the A/B is in
-[HANDOFF.md](../HANDOFF.md)). The `sysconf(_SC_CLK_TCK)` read is also gone, in
+cost (inside the same floor). The `sysconf(_SC_CLK_TCK)` read is gone, in
 favour of `nix::unistd::sysconf` and integer arithmetic.
 
 ## Test modules (the one sanctioned module-level waiver)

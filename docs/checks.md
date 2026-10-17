@@ -220,6 +220,26 @@ or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
 command and exits 77, never a silent pass. The daemon configures no network
 itself; the harness is the operator.
 
+`sudo -n env MOLEHILL_L3_WIRE=ip just l3-accept` runs the same acceptance on the
+plain-IP wire, forcing the Linux devices through the same frame conversion a
+macOS/Windows peer uses. That is the gate for the mixed-format path; the
+default run covers the Linux↔Linux `Vnet` path.
+
+`sudo -n just l3-accept-ipv6` runs the focused IPv6 acceptance
+(`bench/src/bench/utils/l3/run_ipv6.sh`): a visitor on an IPv6 path reaches a
+client-owned `/128` through the tunnel, the backend sees the visitor's IPv6
+address, the server holds no socket for the flow, and a 60 KiB stream
+round-trips byte-exactly. Add `MOLEHILL_L3_WIRE=ip` for the same run on the
+plain-IP wire, which exercises IPv6 GSO splitting and checksums. It is
+root-only and outside the check chain for the same reasons as `l3-accept`.
+
+macOS and Windows cannot reuse this topology (no Linux network namespaces), so
+their runtime checks are **manual**: create the utun/Wintun, assign or route
+the claim, apply the pf/forwarding rule, and prove a visitor reaches the
+backend with its real source address. CI compiles both targets and runs the
+unit/config tests; it does not run a privileged L3 pair on them. The recipes
+are in [deployment.md](deployment.md#transparent-services).
+
 ### The performance model (`just bench`)
 
 `bench/src/bench/` is the repository's measurement standard and its only

@@ -241,8 +241,9 @@ local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-sc
 服务端不绑定任何东西,只把整个 IP 包路由进隧道,由客户端内核应答访客。各个键、
 前置条件与确切的拒绝信息归
 [配置文档](./configuration.zh.md#透明l3服务)负责;本节讲的是运维方要搭建的
-网络。它仅支持 Linux,两端都需要 `CAP_NET_ADMIN`(各自要打开 TUN 设备),而且
-自己不配置任何网络。
+网络。Linux 与 macOS 两端都支持;Windows 可做服务端,但不能做客户端(它的
+协议栈没有源地址策略路由)。守护进程自己不安装路由;哪一半属于运维方由平台决定,
+见下表。
 
 在进入配方之前先给一条容量建议:认领的内部流会摊在它的车道上,而同一客户端各认领的车道会
 随流量起落互相出借——但前提是预算给某条认领留下了余量(`[transparent.data].tunnels`,
@@ -254,6 +255,18 @@ local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-sc
 `[server.transparent]` 就是那个开关,没有它,注册会在碰到任何设备之前被拒绝。
 把提供 L3 的服务端放在带该能力的 unit 下,只做 L4 的服务端放在不带该能力的
 unit 下(见 [systemd](#systemd))。
+
+支持的组合如下:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| 透明客户端 | 是 | 是 | 否 —— 请跑在 WSL2 里 |
+| 透明服务端 | 是 | 是 | 是(Wintun + 管理员) |
+| 设备 | 运维方创建持久 TUN | 守护进程创建 `utunN`,并配置所声明的 `/32`/`/128` | 守护进程创建 Wintun 适配器 |
+| 路由 | `ip route` / `ip rule` | `route` + pf `route-to` | `New-NetRoute` + 转发 |
+| 权限 | `CAP_NET_ADMIN` | root | 管理员 + `wintun.dll` |
+
+下面 Linux 的两套配方是基准形态;macOS 与 Windows 服务端的配方紧随其后。
 
 两套配方都基于同样两个事实:
 
@@ -377,25 +390,161 @@ sudo ip route add default dev molehill0 table 100
 应用绑定该地址。事后 `ip route get <public-ip> mark 0x1` 必须指向 TUN 设备,
 `ip rule show` 里 mark 规则必须排在 local 查询之前。
 
+### IPv6 认领
+
+同一套配方,把地址换成 `/128`,命令加 `-6`。认领写成方括号形式:
+
+```text
+[transparent.claims.web]
+remote_bind_addr = "[2001:db8:99::1]:8443"
+```
+
+```bash
+# Linux 服务端
+sudo sysctl -w net.ipv6.conf.all.forwarding=1
+sudo ip -6 route add 2001:db8:99::1/128 dev molehill0
+
+# Linux 客户端
+sudo ip -6 addr add 2001:db8:99::1/128 dev molehill0
+sudo ip -6 rule add from 2001:db8:99::1 lookup 100
+sudo ip -6 route add default dev molehill0 table 100
+```
+
+macOS 用 `ifconfig utunN inet6 <address> prefixlen 128`、`inet6` 的 pf
+`route-to` 规则、`net.inet6.ip6.forwarding=1` 与 `route add -inet6
+<address>/128 -interface utunN`。Windows 服务端用 `/128` 的
+`New-NetRoute` 与 `Set-NetIPInterface -AddressFamily IPv6 -Forwarding
+Enabled`。
+
+上游网络必须把所声明的 `/128` 路由到服务端,与 IPv4 相同;守护进程不做 NDP
+代理,也不安装路由。IPv6 jumbogram 不承载。数据面与地址族无关:一条认领可以
+是 IPv4 或 IPv6,两端对两种地址族协商同一套 `Ip`/`Vnet` 帧格式。
+
+### macOS:utun、pf 与转发
+
+macOS 没有可由运维方创建并交给守护进程的持久 TUN 设备:守护进程打开
+`/dev/utun`,内核创建 `utunN`,它只在进程持有期间存在。因此守护进程创建设备并
+把每个所声明的 `/32`/`/128` 配置到它上面;pf 规则、路由与转发仍归运维方。pf 规则是
+静态的时,请写固定的 `tun = "utunN"`。
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transport.noise]
+local_private_key = "<服务端私钥>" # molehill --genkey
+
+[server.transparent]
+tun = "utun7"
+```
+
+```toml
+# client.toml
+[transparent]
+default_token = "change-me"
+tun = "utun7"
+
+[transparent.control]
+default_remote_addr = "<server-address>:2333"
+
+[transparent.transport.noise]
+remote_public_key = "<服务端公钥>"
+
+[transparent.claims.web]
+remote_bind_addr = "<public-ip>:8443"
+```
+
+```bash
+# ---------- 服务端(macOS)----------
+# 守护进程会在第一次透明注册时创建 utun7。
+sudo sysctl -w net.inet.ip.forwarding=1
+# <public-ip> 由上游路由到本机;把它送进 utun。
+sudo route add -host <public-ip> -interface utun7
+
+# ---------- 客户端(macOS)----------
+# 守护进程创建 utun7 并配置 <public-ip>/32。本地应用从该地址发出的回包
+# 必须回到 utun:
+sudo tee /etc/pf.anchors/molehill >/dev/null <<'EOF'
+pass out quick route-to (utun7) from <public-ip> to any
+EOF
+# 在 /etc/pf.conf 里加两行,然后重新加载:
+#   anchor "molehill"
+#   load anchor "molehill" from "/etc/pf.anchors/molehill"
+sudo pfctl -f /etc/pf.conf
+sudo pfctl -E
+```
+
+事后核对:服务端 `route -n get <public-ip>` 必须指向 utun;客户端
+`pfctl -sr` 必须显示 `route-to` 规则,访客的回包从 utun 出去。具体的 pf 语法
+可能取决于 utun 的点对点对端:`route-to (utunN)` 是只写接口的形式,上线前请在
+该主机上验证。
+
+### Windows 服务端:Wintun、路由与转发
+
+Windows 服务端可以为 Linux/macOS 透明客户端提供服务。它需要管理员权限,以及
+放在 `molehill.exe` 旁边(或 `PATH` 上)的 `wintun.dll`;守护进程创建 `tun`
+指定的适配器。Windows 没有源地址策略路由,所以 Windows **客户端**会被拒绝——
+请把客户端跑在 WSL2 里。
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transport.noise]
+local_private_key = "<服务端私钥>" # molehill --genkey
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```powershell
+# 以管理员运行。<uplink> 是面向访客的接口。
+New-NetRoute -DestinationPrefix "<public-ip>/32" -InterfaceAlias "molehill0" `
+  -NextHop "0.0.0.0" -PolicyStore ActiveStore
+Set-NetIPInterface -InterfaceAlias "molehill0" -Forwarding Enabled
+Set-NetIPInterface -InterfaceAlias "<uplink>" -Forwarding Enabled
+# 接口之间的 IPv4 转发:
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
+  -Name IPEnableRouter -Value 1
+```
+
+Windows 防火墙必须放行被转发的流量;具体规则取决于部署。发送访客流量之前用
+`Find-NetRoute -RemoteIPAddress <public-ip>` 核对路由(必须指向 Wintun 适配器)。
+
+WSL2 里的 Windows **客户端**在 WSL2 发行版内部运行 Linux 客户端与后端:所声明
+的地址落在 WSL2 的 TUN 上,服务端把访客的包隧道送到它,本地后端绑定该地址。
+WSL2 实例需要与上面 Linux 配方相同的前置条件。
+
 ### 每种运行模式需要什么
 
 三种模式向主机索取的东西不同,只有一种需要额外的东西:
 
 | 需要什么 | `molehill --server`(转发) | `molehill --client`(转发) | L3 两端(`--server` + `--transparent`) |
 |---|---|---|---|
-| `CAP_NET_ADMIN` | 否 | 否 | **是,两端都要** —— 各自要连接一个 TUN 设备 |
-| TUN 设备 | 否 | 否 | **是,两端都要** —— 由运维方创建,不是守护进程 |
-| `net.ipv4.ip_forward = 1` | 否 | 否 | **是,服务端上** —— 它路由进 TUN 的包属于转发 |
-| TUN 与 `all` 上的 `rp_filter = 0` | 否 | 否 | **是** —— 注入的包携带的是访客的源地址 |
+| `CAP_NET_ADMIN` / root / 管理员 | 否 | 否 | **是,两端都要** —— Linux/macOS 上透明进程要打开 TUN 设备;Windows 上需要管理员 + `wintun.dll` |
+| TUN 设备 | 否 | 否 | Linux:**是,两端都要**,由运维方创建。macOS/Windows:守护进程创建(utun/Wintun) |
+| `net.ipv4.ip_forward = 1` | 否 | 否 | **Linux 服务端上是**;macOS 上是 `net.inet.ip.forwarding`;Windows 上是接口转发 + `IPEnableRouter` |
+| TUN 与 `all` 上的 `rp_filter = 0` | 否 | 否 | **仅 Linux 上是** —— 注入的包携带的是访客的源地址 |
+| 源地址策略路由 | 否 | 否 | Linux `ip rule`;macOS pf `route-to`;**Windows 不支持**(用 WSL2) |
 | 1024 以下的端口 | 只有服务要求时才需要 | 否 | 只有认领要求时才需要 |
 
 其中两条值得说清楚,因为它们是部署真正会栽在上面的地方:
 
-- **只有提供 L3 的服务端才需要 `CAP_NET_ADMIN`。** 这项能力是由
+- **在 Linux 上,只有提供 L3 的服务端才需要 `CAP_NET_ADMIN`。** macOS 用 root,Windows 用管理员 + `wintun.dll`;这项 Linux 能力是由
   `[server.transparent]` 表索取的,所以配置里没有它的 `molehill --server`
   就没有这项能力,并按策略拒绝 L3 注册。只做转发的服务端什么都不需要,这正是
   能力应该跟着需要它的那个单元走的原因(见 [systemd](#systemd))。
-- **`ip_forward` 是被检查的,不是被假设的。** 它关着的时候,内核会在守护进程
+- **在 Linux 上,`ip_forward` 是被检查的,不是被假设的。** 它关着的时候,内核会在守护进程
   读到一个字节之前就丢弃所有发往认领地址的包:进程看到的是一个健康的 TUN 和
   一个沉默的设备——这是唯一一个看起来什么都不像的失败形态。守护进程会在第一次
   透明注册时拒绝,并给出要执行的 `sysctl` 命令行。
@@ -418,7 +567,7 @@ sudo ip route add default dev molehill0 table 100
 单元名中 `molehills` 代表 `molehill --server`,`molehillc` 代表
 `molehill --client`,`molehill` 是自动判断模式。单元名里的 `@` 表示按
 配置文件实例化。配置文件建议权限 `600`(内含共享 token)。提供透明服务的服务端
-需要 `CAP_NET_ADMIN` 才能打开自己的 TUN 设备——也只有这种服务端需要:这项能力是
+需要 `CAP_NET_ADMIN` 才能打开自己的 TUN 设备——也只有这种 Linux 服务端需要:这项能力是
 由 `[server.transparent]` 这张表索取的,所以配置里没有它的 `molehill --server`
 不需要该能力运行,并按策略拒绝 L3 注册。root 隐含具备;以其他用户运行的
 单元请使用下面单元里那行(默认注释掉的)`AmbientCapabilities=`。

@@ -1,3 +1,5 @@
+# requires: transparent-server
+
 [server]
 default_token = "t"
 allow_ports = ["8443"]

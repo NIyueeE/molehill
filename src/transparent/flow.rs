@@ -221,8 +221,8 @@ mod tests {
         );
     }
 
-    /// IPv6 is not carried yet, but the key is defined over the parsed packet,
-    /// so a v6 flow hashes as stably as a v4 one — including the sorted order
+    /// IPv6 is carried too, and the key is defined over the parsed packet, so
+    /// a v6 flow hashes as stably as a v4 one — including the sorted order
     /// across the two families' byte widths.
     #[test]
     fn an_ipv6_flow_hashes_like_any_other() {

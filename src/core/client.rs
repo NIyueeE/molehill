@@ -22,15 +22,35 @@ use crate::protocol::write_tunnel_prologue;
 // The lane *prologue* is what only a transparent+multiplex build writes; the
 // `LaneId` type itself is imported above for every build, because a data
 // channel's signature carries `Option<LaneId>` wherever it is compiled.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
 use crate::protocol::write_lane_prologue;
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
 use crate::transparent::Direction;
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
 use crate::transparent::Endpoint;
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
 use crate::transparent::hub::TunHub;
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 use crate::transparent::lanes::{self, ClaimLoad, LaneLoad};
 #[cfg(feature = "multiplex")]
 use crate::transport::carrier::{CarrierChoice, KCP_ATTEMPT_BUDGET, first_carrier};
@@ -372,6 +392,9 @@ struct ServiceSlot {
     /// registration is accepted — the server shards distinct visitors across
     /// them. A TCP service opens none: one channel per visitor, on demand.
     channels: usize,
+    /// What this client's transparent device can take. `None` for every
+    /// forwarding service.
+    transparent_capabilities: Option<crate::protocol::TransparentCapabilities>,
 }
 
 impl ServiceSlot {
@@ -419,6 +442,7 @@ impl ServiceSlot {
                     .service
                     .udp_buffer_size
                     .unwrap_or_else(|| u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX)),
+                transparent_capabilities: self.transparent_capabilities,
             },
         })
     }
@@ -436,7 +460,11 @@ enum SessionRequest {
     /// The allocator decides (it is the only thing that reads the evidence) but
     /// does not own the writer, so the ask travels through the same channel a
     /// registration does.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     DrainLane {
         service: ServiceId,
         lane: [u8; 4],
@@ -511,7 +539,11 @@ fn spawn_tunnel_stats() {
 /// `(peer offered, peer refused, this end injected)`: the peer's two are what its
 /// report carries, and the third is this end's own view of the same lane. A
 /// window is the difference between two of these.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 type LaneSample = (u64, u64, u64);
 
 /// What the server said about the drains this client asked for, by lane.
@@ -519,13 +551,21 @@ type LaneSample = (u64, u64, u64);
 /// The dialer cannot see the flows the peer placed on a lane, so its own
 /// emptiness is only half the question; this is the other half, and a lane is
 /// only retired once it says [`crate::protocol::LANE_DRAIN_READY`].
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Debug, Default)]
 struct LaneDrainState {
     states: std::sync::Mutex<HashMap<(ServiceId, LaneId), u8>>,
 }
 
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl LaneDrainState {
     fn set(&self, service: ServiceId, lane: LaneId, state: u8) {
         if let Ok(mut states) = self.states.lock() {
@@ -710,11 +750,16 @@ impl Client {
         let retry_interval = cfg.retry_interval.unwrap_or(1);
 
         // A transparent service's prerequisites are the operator's to satisfy
-        // and this process's to verify: it must already own the address it
-        // claims, and the kernel must be willing to accept injected packets.
-        if cfg.service_type == ServiceType::Transparent {
-            check_transparent_client(&cfg)?;
-        }
+        // and this process's to verify: on Linux it must already own the
+        // address it claims and the kernel must accept injected packets; on
+        // macOS the daemon creates the utun and assigns the claimed address. The
+        // same call reports what the device can take, which is what the
+        // registration declares to the server.
+        let transparent_capabilities = if cfg.service_type == ServiceType::Transparent {
+            Some(check_transparent_client(&cfg)?)
+        } else {
+            None
+        };
 
         let previous = self.services.remove(&name);
         if let Some(loc) = &previous
@@ -745,6 +790,7 @@ impl Client {
             transport,
             data,
             channels,
+            transparent_capabilities,
         }));
         self.services
             .insert(name, ServiceLocation { session: key, id });
@@ -805,11 +851,23 @@ impl Client {
             shared_pool: self.config.shared_pool(),
             #[cfg(feature = "multiplex")]
             pins: Arc::new(crate::transport::multiplex::PinRegistry::new()),
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             lane_pool: None,
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             req_tx: req_tx.clone(),
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             lane_drains: Arc::new(LaneDrainState::default()),
             #[cfg(feature = "multiplex")]
             carriers: HashMap::new(),
@@ -910,11 +968,19 @@ struct RunDataChannelArgs {
     /// prologue so the server knows which connection it is reading, which is
     /// what will let it report what it received from a lane the client has
     /// already retired.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     lane_ids: std::sync::atomic::AtomicU32,
 }
 
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl RunDataChannelArgs {
     /// The next lane id: unique per service session, and never reused inside
     /// one (a retired lane's id must not be read as its replacement's).
@@ -1204,7 +1270,11 @@ async fn do_data_channel_handshake(
     // the server reports what it offered *this* lane, and a report the dialer
     // cannot match to a lane is a number about nothing. Everything else keeps
     // the 4-byte prologue it has always written.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+    ))]
     if args.service.service_type == ServiceType::Transparent {
         let lane = LaneId::new(args.next_lane_id());
         write_lane_prologue(&mut conn, args.service_id, lane).await?;
@@ -1555,7 +1625,11 @@ async fn forward_data_channel(
     )]
     stripes: &StripeRegistry,
     #[cfg_attr(
-        not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+        not(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        )),
         expect(
             unused_variables,
             reason = "only a transparent claim's lane names itself in its prologue"
@@ -1605,18 +1679,26 @@ async fn forward_data_channel(
                 "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
             );
         }
-        DataChannelCmd::StartForwardTransparent => {
+        DataChannelCmd::StartForwardTransparent(wire) => {
             if service.service_type != ServiceType::Transparent {
                 bail!("Expect transparent traffic. Please check the configuration.")
             }
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
-            run_transparent_channel(conn, service, lane).await?;
-            #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+            ))]
+            run_transparent_channel(conn, service, lane, wire).await?;
+            #[cfg(not(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+            )))]
             {
-                let _ = (conn, service);
+                let _ = (conn, service, wire);
                 bail!(
-                    "This build cannot carry a transparent service: it needs Linux and the \
-                     `transparent` feature"
+                    "This build cannot carry a transparent service: it needs Linux or macOS \
+                     and the `transparent` feature"
                 );
             }
         }
@@ -1626,12 +1708,16 @@ async fn forward_data_channel(
 
 /// Inject what the tunnel sends for this service's claimed endpoint, and hand
 /// the kernel's return traffic back.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
 async fn run_transparent_channel(
     conn: ClientDataChannel,
     service: &ClientServiceConfig,
     lane: Option<LaneId>,
+    wire: crate::protocol::FrameFormat,
 ) -> Result<()> {
     use crate::transparent::hub::{TunHub, forward_transparent};
     use crate::transparent::{Direction, Endpoint};
@@ -1647,6 +1733,15 @@ async fn run_transparent_channel(
     // member of that set for as long as it runs; the set's width is what the
     // hub actually sees join, so a replacement inherits its predecessor's slot.
     let hub = TunHub::get_or_spawn(&service.transparent_tun, Direction::Source)?;
+    let endpoint = Endpoint::new(addr.ip(), addr.port());
+    if wire == crate::protocol::FrameFormat::Vnet && hub.format() != wire {
+        bail!(
+            "The server selected vnet frames for {}, but this device produces {:?} frames",
+            endpoint,
+            hub.format()
+        );
+    }
+    hub.set_wire_format(endpoint, wire)?;
     // This end dialed the lane, so it knows which carrier it rides — the fact
     // the allocator's carrier policy compares instead of trusting the choice it
     // made earlier (a lane dialed before a switch rides the old carrier). The
@@ -1657,38 +1752,62 @@ async fn run_transparent_channel(
     let carrier = conn.carrier();
     #[cfg(not(feature = "multiplex"))]
     let carrier = None;
-    forward_transparent(
-        conn,
-        hub,
-        Endpoint::new(addr.ip(), addr.port()),
-        lane,
-        carrier,
-    )
-    .await
+    forward_transparent(conn, hub, endpoint, lane, carrier, wire).await
 }
 
 /// The client's side of a transparent service's contract, checked before the
 /// service registers rather than after its first packet disappears.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
-fn check_transparent_client(cfg: &ClientServiceConfig) -> Result<()> {
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+))]
+fn check_transparent_client(
+    cfg: &ClientServiceConfig,
+) -> Result<crate::protocol::TransparentCapabilities> {
+    use crate::transparent::{Direction, hub::TunHub};
+
     let addr: SocketAddr = cfg.remote_bind_addr.parse().with_context(|| {
         format!(
             "service {}: invalid `remote_bind_addr`: {:?}",
             cfg.name, cfg.remote_bind_addr
         )
     })?;
-    crate::transparent::check::check_client(&cfg.transparent_tun, &[addr.ip()]).with_context(|| {
+    let hub = TunHub::get_or_spawn(&cfg.transparent_tun, Direction::Source).with_context(|| {
         format!(
             "service {}: transparent prerequisites are not met",
             cfg.name
         )
+    })?;
+    #[cfg(target_os = "linux")]
+    crate::transparent::check::check_client(&cfg.transparent_tun, &[addr.ip()]).with_context(
+        || {
+            format!(
+                "service {}: transparent prerequisites are not met",
+                cfg.name
+            )
+        },
+    )?;
+    #[cfg(target_os = "macos")]
+    hub.ensure_claimed(addr.ip())
+        .with_context(|| format!("service {}: failed to assign the claimed address", cfg.name))?;
+    Ok(crate::protocol::TransparentCapabilities {
+        vnet_frames: hub.format() == crate::protocol::FrameFormat::Vnet
+            && !crate::transparent::force_ip_wire(),
     })
 }
 
-#[cfg(not(all(feature = "transparent", target_os = "linux")))]
-fn check_transparent_client(_cfg: &ClientServiceConfig) -> Result<()> {
+#[cfg(not(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(any(target_os = "linux", target_os = "macos"), target_os = "macos")
+)))]
+fn check_transparent_client(
+    _cfg: &ClientServiceConfig,
+) -> Result<crate::protocol::TransparentCapabilities> {
     bail!(
-        "This build cannot carry a transparent service: it needs Linux and the `transparent` feature"
+        "This build cannot carry a transparent service: it needs Linux or macOS and the \
+         `transparent` feature"
     );
 }
 
@@ -2771,7 +2890,11 @@ enum ServiceState {
 /// not invent lanes the configuration never allocated. That keeps the operator's
 /// `tunnels` the number that decides how many connections exist, with the
 /// *division* of them left to what the traffic turns out to be.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 struct LanePool {
     /// Whether lending is on for this client (`[transparent.data].lend`).
     ///
@@ -2804,7 +2927,11 @@ struct LanePool {
 /// off. The peer answers as soon as its own flows in the lane are gone, and a
 /// flow that outlives this budget is one the drain must not wait for: a lane
 /// nobody may use is worse than the carrier the drain was trying to leave.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How many consecutive ticks a claim must be judged to be losing traffic on
@@ -2815,11 +2942,19 @@ const DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// ticks is the order the lending allocator's own tick works at, and the move
 /// itself is rate-limited again by
 /// [`crate::transport::carrier::SWITCH_COOLDOWN`].
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 const CARRIER_CONFIRM_TICKS: u32 = 3;
 
 /// One claim, as the allocator knows it.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 struct ClaimEntry {
     /// The device the claim's hub reads (`[transparent].tun`).
     tun: String,
@@ -2838,7 +2973,11 @@ struct ClaimEntry {
     target: usize,
 }
 
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 impl LanePool {
     fn new(
         lend: bool,
@@ -3476,7 +3615,11 @@ struct ActiveService {
     /// and nothing reads this. (Without the gate the type is simply missing on
     /// a `transparent`-without-`multiplex` build, which no feature powerset
     /// leg compiles today.)
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     lane: Option<Endpoint>,
 }
 
@@ -3564,14 +3707,26 @@ struct ClientSession {
     /// One per session, not one per claim: the lane budget is the client's, so
     /// the claims that share it are the claims the allocator can move a lane
     /// between — and they are exactly the claims that dial this session.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     lane_pool: Option<Arc<LanePool>>,
     /// A second handle on this session's own request channel, so the lane
     /// allocator can ask for a drain without owning the writer.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     req_tx: mpsc::UnboundedSender<SessionRequest>,
     /// What the server said about those drains, shared with the allocator.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     lane_drains: Arc<LaneDrainState>,
     /// One carrier decision per data endpoint this session's services dial.
     ///
@@ -3774,7 +3929,7 @@ impl ClientSession {
                     Some(SessionRequest::Deregister(id)) => {
                         self.deregister(id, &mut wr).await?;
                     }
-                    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                    #[cfg(all(feature = "transparent", feature = "multiplex", any(target_os = "linux", target_os = "macos")))]
                     Some(SessionRequest::DrainLane { service, lane, cancel }) => {
                         let cmd = if cancel {
                             SessionCmd::CancelDrain(service, lane)
@@ -3939,7 +4094,11 @@ impl ClientSession {
             })
             .collect();
 
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         let claims = self
             .lane_pool
             .as_ref()
@@ -3963,14 +4122,26 @@ impl ClientSession {
             })
             .unwrap_or_default();
 
-        #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+        #[cfg(not(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        )))]
         let claims = ();
 
         crate::status::SessionView {
             services,
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             claims,
-            #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+            #[cfg(not(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            )))]
             claims,
         }
     }
@@ -3997,7 +4168,7 @@ impl ClientSession {
                     #[cfg(all(
                         feature = "transparent",
                         feature = "multiplex",
-                        target_os = "linux"
+                        any(target_os = "linux", target_os = "macos")
                     ))]
                     self.forget_claim(id);
                     self.services.remove(&id);
@@ -4006,7 +4177,11 @@ impl ClientSession {
                 // is about lanes of the *previous* connection: they are gone
                 // with it, and the allocator re-asks on its next tick if it
                 // still wants one.
-                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                #[cfg(all(
+                    feature = "transparent",
+                    feature = "multiplex",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
                 SessionRequest::DrainLane { .. } => {}
             }
         }
@@ -4205,7 +4380,11 @@ impl ClientSession {
     /// transparent claim of this session is dropped: it is not this end's
     /// business, and inventing a place for it would make stale evidence
     /// readable.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn note_lane_report(
         &self,
         id: ServiceId,
@@ -4250,7 +4429,11 @@ impl ClientSession {
     }
 
     /// A build without the transparent data path has no lane to report on.
-    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    )))]
     #[expect(
         clippy::unused_self,
         reason = "the two shapes of this method are one call site: the build that has lanes \
@@ -4268,13 +4451,21 @@ impl ClientSession {
 
     /// Record the peer's half of a lane retirement, for the allocator to act on
     /// (see [`LanePool::drain_step`]).
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn note_lane_drain(&self, id: ServiceId, lane: [u8; 4], state: u8) {
         self.lane_drains.set(id, LaneId(lane), state);
     }
 
     /// A build without the transparent data path has no lane to retire.
-    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    )))]
     #[expect(
         clippy::unused_self,
         reason = "the two shapes of this method are one call site: the build that has lanes \
@@ -4373,7 +4564,11 @@ impl ClientSession {
     /// One allocator per session (the lane budget is the client's, so the claims
     /// that share it are the claims a lane can move between), and it is what
     /// lets an idle lane of one claim become a lane of a congested sibling.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn join_lane_pool(&mut self, endpoint: Endpoint, slot: &ServiceSlot, active: &ActiveService) {
         let share = slot.channels.max(1);
         let lend = slot.service.transparent_lend;
@@ -4397,6 +4592,11 @@ impl ClientSession {
     /// Turn a registered service into a live one: resolve its data endpoint,
     /// open (or join) its tunnel pool when it multiplexes, pre-open its
     /// configured channels (D5), and refresh the pools' UDP-derived floors.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one service's activation is one sequence: register, open its configured \
+                  channels, and keep the per-service state in step"
+    )]
     async fn activate(&mut self, id: ServiceId, nonce: &Nonce) -> Result<()> {
         let Some(entry) = self.services.remove(&id) else {
             return Ok(());
@@ -4436,7 +4636,11 @@ impl ClientSession {
         // registration already validated this address (`check_transparent_client`),
         // so a parse that fails here means the config changed under us: the
         // service still runs, it just has no claim to lend lanes to or from.
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         let lane = if slot.service.service_type == ServiceType::Transparent {
             slot.service
                 .remote_bind_addr
@@ -4470,20 +4674,32 @@ impl ClientSession {
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
                 #[cfg(feature = "multiplex")]
                 stripe_placements: StripePlacements::default(),
-                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                #[cfg(all(
+                    feature = "transparent",
+                    feature = "multiplex",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
                 lane_ids: std::sync::atomic::AtomicU32::new(1),
             }),
             #[cfg(feature = "multiplex")]
             tunnel,
             #[cfg(feature = "multiplex")]
             pool_key,
-            #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+            #[cfg(all(
+                feature = "transparent",
+                feature = "multiplex",
+                any(target_os = "linux", target_os = "macos")
+            ))]
             lane,
         };
         open_channels(&active, slot.channels);
         // The claim joins the session's allocator, which is what lets an idle
         // lane of one claim become a lane of a congested sibling.
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         if let Some(endpoint) = lane {
             self.join_lane_pool(endpoint, &slot, &active);
         }
@@ -4582,7 +4798,11 @@ impl ClientSession {
                 // get back (the allocator lowered its target first). A lane that
                 // *failed* leaves the claim short, and this dials its
                 // replacement.
-                #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+                #[cfg(all(
+                    feature = "transparent",
+                    feature = "multiplex",
+                    any(target_os = "linux", target_os = "macos")
+                ))]
                 if let Some(endpoint) = active.lane
                     && let Some(pool) = self.lane_pool.as_ref()
                     && !pool.wants_another_lane(&endpoint)
@@ -4641,7 +4861,11 @@ impl ClientSession {
 
     /// Tell the lane allocator a service is gone, so its claim stops counting
     /// against its carrier's budget.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn forget_claim(&self, id: ServiceId) {
         let Some(entry) = self.services.get(&id) else {
             return;
@@ -4660,7 +4884,11 @@ impl ClientSession {
     /// Drop one service: the server releases its public endpoint and the
     /// session keeps serving its siblings.
     async fn deregister<W: AsyncWrite + Unpin>(&mut self, id: ServiceId, wr: &mut W) -> Result<()> {
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         self.forget_claim(id);
         if self.services.remove(&id).is_some() {
             debug!("Deregistering service {id}");
