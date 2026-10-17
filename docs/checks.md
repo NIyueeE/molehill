@@ -33,9 +33,12 @@ owned by the "Automation" table in [structure.md](structure.md).
 ## Tools
 
 The cargo gates need `cargo-machete`, `cargo-audit`, `cargo-outdated` and
-`cargo-deny`, and the python gates need `uv`/`uvx`; `just setup` installs what is
-missing and activates the git hooks. The setup routine — which tools must be on
-PATH, and `cargo-hack` for `just powerset` — is in [AGENTS.md §1](../AGENTS.md).
+`cargo-deny`, and the python gates need `uv`; `just setup` installs what is
+missing and activates the git hooks. The python toolchain (ruff, pyright and
+the plot extra) is the `bench/` project's: it is pinned in `bench/uv.lock`, and
+`uv run --project bench --locked` installs it on first use. The setup routine —
+which tools must be on PATH, and `cargo-hack` for `just powerset` — is in
+[AGENTS.md §1](../AGENTS.md).
 
 ## The docs-only path (both fast and heavy gates)
 
@@ -45,23 +48,22 @@ running anything and take a two-gate path instead:
 
 | Where | Runs | Skips |
 |---|---|---|
-| `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, both ruff gates, the bench-model self-check, both clippy passes |
+| `githooks/pre-commit` | `githooks/check-secrets`, `githooks/check-docs` | fmt, machete, `just py-lint`, `just py-typecheck`, the bench-model self-check, both clippy passes |
 | `githooks/pre-push` | `githooks/check-docs` | audit, deny, outdated, tests |
 
-A change limited to `benches/scripts/**` takes the same shortcut, in both
-hooks (classified by `githooks/benches-only`): the scripts are runtime
-tooling — `uv run` entries and shell helpers — never compiled, linked or
-depended on by any Rust target, so fmt, machete, both clippy passes and the
-whole heavy chain cannot move. The gates that can move all still run: the
-secret scan, the docs check, both ruff gates and the bench-model self-check
-in pre-commit; the docs check in pre-push. A push mixing docs with benches —
-or either with code — fails both classifiers and takes the full chain. CI
-does **not** take
-this shortcut (`ci.yml`'s only ignore-list is the docs one), so a benches-only
-change still runs the full Rust chain there — the hook path is a latency
-split, never a coverage split, and the classification is deliberately wider
-than "python": the shell helpers under `benches/scripts/` are equally
-compile-free.
+A change limited to the `bench/` project or its published records takes the
+same shortcut, in both hooks (classified by `githooks/benches-only`: every path
+under `bench/`, or under `benches/records/`): the project is runtime tooling —
+`uv run` entries and shell helpers — never compiled, linked or depended on by
+any Rust target, so fmt, machete, both clippy passes and the whole heavy chain
+cannot move. The gates that can move all still run: the secret scan, the docs
+check, `just py-lint`, `just py-typecheck` and `just bench-selfcheck` in
+pre-commit; the docs check in pre-push. A push mixing docs with benches — or
+either with code — fails both classifiers and takes the full chain. CI does
+**not** take this shortcut (`ci.yml`'s only ignore-list is the docs one), so a
+benches-only change still runs the full Rust chain there — the hook path is a
+latency split, never a coverage split, and the classification is deliberately
+wider than "python": the shell helpers under `bench/` are equally compile-free.
 
 Three properties make this safe rather than a bypass:
 
@@ -93,9 +95,9 @@ take a `security-scan:allow` marker with a reason; `check-secrets` skips them.
 | 2 | secrets | `githooks/check-secrets` | secret scan on staged changes |
 | 3 | machete | `cargo machete` | unused dependencies |
 | 4 | docs | `githooks/check-docs` | docs ↔ code alignment (includes the feature-name registry: every `[features]` row must be documented in docs/build-guide.md; and the explicit feature lists that build the release artifacts — `release.yml`'s full-set musl entries, the CI musl check's full-set list, `just container` — must equal Cargo.toml's default set) |
-| 5 | python lint | `uvx ruff check benches/scripts/` | python bench/test entries (ruff.toml) |
-| 6 | python format | `uvx ruff format --check benches/scripts/` | python formatting (auto-fix: `just py-fmt`) |
-| 7 | bench model | `uv run benches/scripts/bench/bench.py selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |
+| 5 | python lint | `just py-lint` | ruff check + format over the `bench/` project (config in `bench/pyproject.toml`; auto-fix: `just py-fmt`) |
+| 6 | python types | `just py-typecheck` | pyright standard over `bench/src`; the adapter files opt into strict |
+| 7 | bench model | `just bench-selfcheck` | the performance model's own rules: metric registry, verdicts, comparability (see "The performance model", below) |
 | 8 | clippy | `cargo clippy --all-targets -- -D warnings` | strict lints, default features |
 | 9 | clippy (gates) | `cargo clippy --all-targets --no-default-features --features server,client -- -D warnings` | feature-gated code paths |
 
@@ -156,15 +158,13 @@ just tag-check   # run only the release review, without tagging
 Other recipes: `just fmt` / `just py-fmt` (auto-fix), `just test` (the full
 serial suite), `just test-fast` (lib tests + the core integration subset,
 ~1 min), `just powerset` (feature powerset via cargo-hack, CI's `features`
-job), `just py-lint` (both ruff gates, also in the pre-commit gate),
-`just bench-selfcheck` (the performance model's own checks, also in the
-pre-commit gate), `just bench-deps` (iperf3 + iproute2 on the benchmark host),
-`just bench-peers` (fetch the peer tools' latest release binaries),
-`just bench-plot` (charts + markdown tables from a results file),
-`just bench-gate` (the release gate: coverage, the endpoint invariant, the SLO,
-drift, wedges, the ramp, and the regression half against a baseline),
-`just container` (scratch image), `just interop` (the interop matrix, below).
-The performance model's own commands are in the section below.
+job), `just py-lint` (ruff check + format, also in the pre-commit gate),
+`just py-typecheck` (pyright, also in the pre-commit gate),
+`just py-fmt` (ruff's auto-fix), `just bench-selfcheck` (the performance model's
+own checks, also in the pre-commit gate), `just bench-deps` (iperf3 + iproute2
+on the benchmark host), `just container` (scratch image), and `just interop`
+(the interop matrix, below). The performance model's own commands are
+`just bench <verb>`, in the section below.
 
 ## Outside the chain: the interop matrix (`just interop`)
 
@@ -175,9 +175,10 @@ hole by running a real server and a real client as subprocesses with one of
 them the *released asset* — a binary built from today's tree cannot test
 yesterday's protocol.
 
-`benches/scripts/interop/fetch_old.py` downloads the newest release (asset for
-this host, cached under `~/tmp/interop`; `MOLEHILL_OLD_TAG=vX.Y.Z` skips the
-release listing), prints `MOLEHILL_OLD_BIN=…`, and the recipe hands that to
+`bench/src/bench/utils/interop.py` (run as `just bench interop`) downloads the
+newest release (asset for this host, cached under `~/tmp/interop`;
+`MOLEHILL_OLD_TAG=vX.Y.Z` skips the release listing), prints
+`MOLEHILL_OLD_BIN=…`, and the recipe hands that to
 `cargo test --test interop_test`. Three cases, all of them about a refusal
 being *local*: an old server refuses the new client's dialect, a new server
 refuses the old client's dialect (a release serves one dialect), and an old server
@@ -193,14 +194,15 @@ what it did not check.
 
 ### Transparent-L3 acceptance (`just l3-accept`)
 
-`just l3-accept` runs `benches/scripts/l3/run.sh`: three network namespaces, a
-real `molehill` server and client, and a visitor whose connection is owned by
-the **client** namespace — the server routes the packets into its TUN while
-holding no socket and no conntrack entry for the flow, and the backend sees the
-visitor's real address.
+`just l3-accept` runs `just bench l3`, which runs
+`bench/src/bench/utils/l3/run.sh`: three network namespaces, a real `molehill`
+server and client, and a visitor whose connection is owned by the **client**
+namespace — the server routes the packets into its TUN while holding no socket
+and no conntrack entry for the flow, and the backend sees the visitor's real
+address.
 
 It also measures: each arm is bracketed by `/proc/net/dev` samples inside the
-namespaces, and `benches/scripts/l3/wire_report.py` turns them into carried
+namespaces, and `bench/src/bench/utils/l3/wire_report.py` turns them into carried
 packet sizes and the ceiling a header compressor could reach. The method and the
 numbers it produced belong to [benchmarks.md](benchmarks.md#the-transparent-l3-wire-question-the-acceptance-harness);
 its verdict was that compression is not worth building.
@@ -220,7 +222,7 @@ itself; the harness is the operator.
 
 ### The performance model (`just bench`)
 
-`benches/scripts/bench/` is the repository's measurement standard and its only
+`bench/src/bench/` is the repository's measurement standard and its only
 runner: a declared metric registry, one topology for every arm (the product's
 configurations, the reference tools and a control with no tool in the path),
 scenarios that each state the claim they support, conditions and timelines that
@@ -228,17 +230,18 @@ change the path in place, and verdicts that clear the run's own measured noise
 floor before they claim anything. Its method is owned by
 [benchmarks.md](benchmarks.md#the-bench-model-the-measurement-standard).
 
-Two of its commands are in the check chain, and the rest are measurements:
+One of its commands is in the check chain, and the rest are measurements:
 
 | Command | In the chain? | What it is |
 |---|---|---|
-| `just bench-selfcheck` | **yes** — a fast gate in `githooks/pre-commit` | the model's own checks: the metric registry is consistent, the verdict rules do what they say, comparability refuses what it must, the probes compile. No root, no topology, about a second. |
+| `just bench-selfcheck` | **yes** — a fast gate in `githooks/pre-commit` | the model's own checks: the metric registry is consistent, the verdict rules do what they say, comparability refuses what it must, the probes compile, and — when a release binary is present — every arm's config is built, parsed and loaded by that binary. No root, no topology, about a second. |
 | `just bench` | no | a campaign (`--profile smoke\|dev\|full\|stage\|soak\|screen\|sweep`): root-only (three network namespaces), minutes to hours, results outside the tree unless `--out` says otherwise |
-| `just bench-doctor` | no | what this host can measure, and what it cannot (root, TUN, iperf3, the peer binaries) |
-| `just bench-list` | no | the registry: every metric, condition, timeline, arm and profile |
-| `just bench-report` / `just bench-compare` / `just bench-gate` | no | render a stored run; A/B two of them (or refuse); gate a release run |
-| `just bench-plot` | no | the charts and markdown tables of a results file |
-| `just bench-peers` | no | fetch the peer tools' release binaries into `~/tmp/bench-peers` |
+| `just bench doctor` | no | what this host can measure, and what it cannot (root, TUN, iperf3, the peer binaries) |
+| `just bench list` | no | the registry: every metric, condition, timeline, arm and profile |
+| `just bench report` / `just bench compare` / `just bench gate` | no | render a stored run; A/B two of them (or refuse); gate a release run |
+| `just bench plot` | no | the charts and markdown tables of a results file |
+| `just bench peers fetch` | no | fetch the peer tools' release binaries into `~/tmp/bench-peers` (override with `--peer-dir`) |
+| `just bench interop`, `just bench udp-stress`, `just bench l3`, `just bench l3-census`, `just bench mux` | no | the supporting instruments in `bench/src/bench/utils/` |
 
 The model asserts nothing about the tool and gates nothing in CI: it produces
 numbers and verdicts, the gate decides whether a *release* run may be published,

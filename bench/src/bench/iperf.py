@@ -25,9 +25,10 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
-def iperf_active_seconds(doc: dict, secs: int) -> float:
+def iperf_active_seconds(doc: dict[str, Any], secs: float) -> float:
     """Length of the MEASURED window = the sender's non-omitted intervals.
 
     This is the honest denominator for the sender-side rate: total bytes sent
@@ -85,14 +86,14 @@ class IperfDial:
     #: ratios from this run's payload counters — around the `-O` boundary
     #: iperf3's interval list can lose a whole measured interval, so those
     #: ratios come from interface counters instead
-    #: (`benches/scripts/bench/workloads.py`).
+    #: (`bench/src/bench/workloads.py`).
     omit: int = 2
 
 
 def iperf_result(
     target: int | IperfDial,
     streams: int,
-    secs: int,
+    secs: float,
     timeout: float,
     artifact: Path | None,
 ) -> dict:
@@ -124,6 +125,9 @@ def iperf_result(
     ]
     t0 = time.perf_counter()
     timed_out = False
+    out: str
+    err: str
+    rc: int | None
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False
@@ -173,7 +177,7 @@ def iperf_result(
         "exit": rc,
         "artifact": str(artifact / "stdout.json") if artifact else None,
     }
-    doc = None
+    doc: dict[str, Any] | None = None
     with contextlib.suppress(ValueError):
         doc = json.loads(out) if out else None
     if doc and doc.get("error"):
@@ -186,16 +190,16 @@ def iperf_result(
             "transferring)",
         }
     if rc != 0:
-        detail = (err or out or "").strip().replace("\n", " ")[:200]
+        detail = f"{err or out}".strip().replace("\n", " ")[:200]
         return base | {
             "ok": False,
             "reason": f"iperf3 exit {rc}: {detail or 'no output'}",
         }
     if doc is None or "end" not in doc:
         return base | {"ok": False, "reason": "unparseable iperf3 output"}
-    end = doc["end"]
-    sent = end.get("sum_sent") or {}
-    recv = end.get("sum_received") or {}
+    end: dict[str, Any] = doc["end"]
+    sent: dict[str, Any] = end.get("sum_sent") or {}
+    recv: dict[str, Any] = end.get("sum_received") or {}
     # The whole test's bytes, warm-up included (the omitted intervals carry
     # their own byte counts). Recorded for provenance: around the `-O` boundary
     # iperf3 can also mangle the list itself — a measured 1 ms interval carrying
@@ -203,9 +207,8 @@ def iperf_result(
     # under-reported one run's total by 12 %, so this is not a safe denominator
     # for a byte ratio. `sum_sent`/`sum_received` cover only the post-omit
     # window, which is the right numerator for the rate.
-    total_b = sum(
-        (iv.get("sum") or {}).get("bytes", 0) for iv in doc.get("intervals") or []
-    )
+    intervals: list[dict[str, Any]] = doc.get("intervals") or []
+    total_b = sum((iv.get("sum") or {}).get("bytes", 0) for iv in intervals)
     active_s = iperf_active_seconds(doc, secs)
     sent_b = sent.get("bytes", 0)
     recv_b = recv.get("bytes", 0)
@@ -214,7 +217,9 @@ def iperf_result(
     # sender-side run): reading the top level yields all-zero per-stream byte
     # counts, which is how a perfectly healthy run can still be summarised as
     # "8 zero streams"
-    streams = [(s.get("sender") or {}) for s in end.get("streams", [])]
+    stream_rows: list[dict[str, Any]] = [
+        (stream.get("sender") or {}) for stream in end.get("streams", [])
+    ]
     # `sum_sent` covers only the post-omit window, so its byte count is the
     # right numerator for the measured window — EXCEPT when the sender's
     # writes all completed inside the `-O` warm-up and backpressure then
@@ -266,11 +271,11 @@ def iperf_result(
         "gbps_received_own_window": round(recv.get("bits_per_second", 0.0) / 1e9, 4),
         "receiver_window_s": round(recv.get("seconds", 0.0), 3),
         "retransmits": sent.get("retransmits", 0),
-        "per_stream_bytes": [s.get("bytes", 0) for s in streams],
+        "per_stream_bytes": [s.get("bytes", 0) for s in stream_rows],
         "per_stream_gbps": [
-            round(s.get("bits_per_second", 0.0) / 1e9, 4) for s in streams
+            round(s.get("bits_per_second", 0.0) / 1e9, 4) for s in stream_rows
         ],
-        "mean_rtt_us": streams[0].get("mean_rtt") if streams else None,
+        "mean_rtt_us": stream_rows[0].get("mean_rtt") if stream_rows else None,
     }
 
 

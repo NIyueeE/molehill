@@ -13,6 +13,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archives; the new one serves arm64 Linux hosts that want the system glibc
   (NSS/DNS) rather than the static musl binary.
 
+### Changed
+
+- **The benchmark harness is the top-level `bench/` uv project.** Its Python
+  lives under `bench/src/bench/`, dependencies are pinned by `bench/uv.lock`,
+  and one console script dispatches every command (`just bench <verb>`:
+  `run`, `list`, `doctor`, `report`, `gate`, `compare`, `selfcheck`, `plot`,
+  `peers`, `interop`, `udp-stress`, `l3`, `l3-census`, `mux`). The retired
+  historical stall reproduction (`mux/repro_e2e.py`) is gone; the useful
+  instruments remain under `bench/src/bench/utils/`.
+- **A tool adapter now starts every arm.** The subject (`molehill`), the
+  tool-free control and each peer (`frp`, `rathole`, `nps`) implement one
+  `ToolAdapter` contract (`bench/src/bench/targets/`), so a new reference tool
+  is an adapter plus a registry row rather than a branch in the runner. Peer
+  caching is configurable with `--peer-dir` (`~/tmp/bench-peers` by default).
+  The method fingerprint covers the method modules, the adapters and the
+  probes; it deliberately excludes the CLI, the plotter and the diagnostic
+  utilities.
+- **The bench project is gated by ruff (lint + format) and pyright.** The
+  configuration lives in `bench/pyproject.toml`; pyright runs in `standard`
+  mode at zero errors, and the adapter layer opts into per-file `strict`.
+  `just py-lint` and `just py-typecheck` are pre-commit gates, and Dependabot
+  tracks `/bench`'s uv dependencies.
+
+  The v0.11.1 sweep is a **method re-baseline**: it is gated on the absolute
+  checks and becomes the next baseline, and its fingerprints are not
+  comparable with v0.11.0's.
+
 ## [0.11.0] - 2026-10-17
 
 ### Changed

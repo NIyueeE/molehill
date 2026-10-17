@@ -33,6 +33,8 @@ import threading
 import time
 from pathlib import Path
 
+from bench import paths
+
 
 def binary_fingerprint(path) -> dict:
     """Identify the binary a run measured, and whether it is stale.
@@ -55,7 +57,7 @@ def binary_fingerprint(path) -> dict:
     except OSError:
         return {}
     newest_src = 0.0
-    root = Path(__file__).resolve().parents[3]
+    root = paths.REPO_ROOT
     for rel in ("src", "build.rs"):
         target = root / rel
         if target.is_file():
@@ -303,8 +305,9 @@ def _loopback_child(cpu: int | None, total: int, reps: int) -> dict:
 #: Spawned with `sys.executable`, so a fresh interpreter does the pinning and
 #: the interpreter's own threads are none of its business.
 _LOOPBACK_CHILD = (
-    "import json, sys; sys.path.insert(0, {libdir!r}); import hostinfo; "
-    "print(json.dumps(hostinfo._loopback_child({cpu!r}, {total!r}, {reps!r})))"
+    "import json, sys; sys.path.insert(0, {libdir!r}); import bench.hostinfo; "
+    "print(json.dumps(bench.hostinfo._loopback_child("
+    "{cpu!r}, {total!r}, {reps!r})))"
 )
 
 
@@ -339,7 +342,10 @@ def host_loopback(reps: int = LOOPBACK_REPS) -> dict:
     before = _affinity()
     try:
         script = _LOOPBACK_CHILD.format(
-            libdir=str(Path(__file__).parent), cpu=_one_cpu(), total=total, reps=reps
+            libdir=str(paths.PACKAGE_DIR.parent),
+            cpu=_one_cpu(),
+            total=total,
+            reps=reps,
         )
         proc = subprocess.run(
             [sys.executable, "-c", script],
@@ -441,7 +447,7 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
       output dirty, so a naive `--dirty` marks every release artifact dirty and
       the mark stops carrying information;
     * **the verdict is about the repository, not about this file's directory.**
-      It used to run `git status -- .` from `benches/scripts/bench/`, which
+      It used to run `git status -- .` from the harness's own subdirectory, which
       cannot see an uncommitted change under `src/` — the case the rule exists
       for — and it read clean for a release sweep that had uncommitted files
       (measured 2026-10-15; those two happened to be documentation, so the
@@ -454,7 +460,7 @@ def git_revision(exclude: Path | None = None, here: Path | None = None) -> tuple
 
     `here` is where the source lives, and it is a parameter so the scope rule
     above can be tested against a throwaway repository rather than argued about
-    (see `bench.py selfcheck`, "the clean verdict covers the repository").
+    (see `just bench selfcheck`, "the clean verdict covers the repository").
     """
     here = Path(__file__).parent if here is None else Path(here)
     rev = "unknown"

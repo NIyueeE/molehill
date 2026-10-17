@@ -2,8 +2,9 @@
 
 
 All Rust lints live in `Cargo.toml` `[lints]`; the table below is the single
-source of truth. The python bench scripts have their own lint *and* format
-gate (`ruff.toml`, run as `uvx ruff check` + `uvx ruff format --check` in
+source of truth. The python bench project has its own lint, format and type
+gates, configured in `bench/pyproject.toml` (`[tool.ruff]`, `[tool.pyright]`)
+and run through its locked environment (`just py-lint`, `just py-typecheck` in
 pre-commit). Changing a lint level or a waiver requires updating this page
 **in the same commit** — `githooks/check-docs` enforces the mechanical part.
 
@@ -47,7 +48,7 @@ Only two legitimate scenarios:
    audit noise from dependencies themselves.
 
 Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
-`ruff.toml`, `githooks/pre-commit`, or any check command. All extra checks
+`bench/pyproject.toml`, `githooks/pre-commit`, or any check command. All extra checks
 (machete, audit, deny, outdated, docs-sync, secret scan, the python gates)
 follow the same discipline.
 
@@ -86,35 +87,54 @@ modules get no such exception.
 
 ## Python (ruff)
 
-The bench/test scripts under `benches/scripts/` are held to the same rule:
-fix the code first. `ruff.toml`'s `ignore` list is reserved for a property
-that is true of every script in scope — today exactly one, S602/S603/S607,
-because these scripts measure *external* binaries reached through `PATH`
-(iperf3, tc, ss, vegeta, the peers), where resolving a different program
-would measure something other than the documented tool. Every other waiver
-is written inline at its own site (`# noqa: <rule>`) with a one-line reason,
-the python equivalent of `#[expect(clippy::...)]` plus its reason comment.
-`uvx ruff check` and `uvx ruff format --check` are the two gates; `just
-py-fmt` applies the formatter's fixes.
+The bench project under `bench/src/` is held to the same rule: fix the code
+first. The `ignore` list in `bench/pyproject.toml` is reserved for a property
+that is true of every tool in scope — today exactly one, S602/S603/S607,
+because these tools measure *external* binaries reached through `PATH`
+(iperf3, tc, ss, the peers), where resolving a different program would measure
+something other than the documented tool. Every other waiver is written inline
+at its own site (`# noqa: <rule>`) with a one-line reason, the python
+equivalent of `#[expect(clippy::...)]` plus its reason comment.
+`just py-lint` runs `ruff check` and `ruff format --check`; `just py-fmt`
+applies the formatter's fixes.
 
 The selected set is deliberately wider than "the code already passes":
 `B` (bugbear, e.g. `zip(strict=)`), `E7` (ambiguous `l`/`O`/`I` names, which
 the base rules cannot see), `ARG` (an unused argument is a dead parameter or
-a stale signature), `PTH` (these scripts build and read paths constantly),
+a stale signature), `PTH` (these tools build and read paths constantly),
 `E501` (the formatter wraps code but not a docstring or a URL, and one had
 drifted to 94 characters), `DTZ` (a naive datetime in a run record cannot be
-compared to another run's), `TID` (a relative import would break the
-`uv run <script>` entry shape), `C901` (cyclomatic complexity, default limit
-10 — the two functions over it were split rather than waived, and both splits
-were checked to leave stdout and exit codes byte-identical on recorded
-fixtures), and the already-clean
+compared to another run's), `TID` (package-internal imports are absolute: the
+probes and the `l3` helpers are still executed as scripts and must not depend
+on a relative package context), `C901` (cyclomatic complexity, default limit
+10 — functions over it were split rather than waived), and the already-clean
 `RET`/`C4`/`N`/`FA`/`FLY`/`PERF`/`PIE`/`PGH`/`LOG` families as guards for
 future edits. `TRY`/`EM`, `ANN`, `T20` and `COM812` are deliberately **not**
-selected, with the reasoning recorded in `ruff.toml` itself: the first two
-fight the house style of actionable error messages and
-annotated-where-it-matters signatures, every `print` in these scripts is
+selected, with the reasoning recorded in `bench/pyproject.toml` itself: the
+first two fight the house style of actionable error messages and
+annotated-where-it-matters signatures, every `print` in these tools is
 deliberate output, and `COM812` (trailing commas) is [the one rule ruff's own
 formatter warns against][com812] — it rewrites exactly the files `ruff format`
 owns, so the two gates would fight over the tree.
 
 [com812]: https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+
+## Python (pyright)
+
+`bench/pyproject.toml` sets `typeCheckingMode = "standard"` with `include =
+["src"]`, and the project must stay at **0 errors**. Standard (not strict) is
+deliberate: strict over the whole model was measured at 4,811 errors, almost
+all `reportUnknown*`, and that is an annotation project, not a lint fix.
+
+The **new adapter layer** opts into strict per file with `# pyright: strict`:
+`targets/base.py`, `targets/__init__.py`, `targets/molehill.py`,
+`targets/control.py`, `targets/peers/base.py` and `paths.py`. New code there
+is written to the strict rules; the older model modules keep their inferred
+boundaries.
+
+A type error is fixed, not silenced. Where a dynamic boundary genuinely cannot
+be typed (a parsed JSON document, a subprocess pipe), narrow it at the boundary
+with a local annotation or a runtime check. A `# pyright: ignore[rule]` is the
+last resort, at the narrowest line, with a one-line reason, and it is recorded
+in this section; `reportUnnecessaryTypeIgnoreComment = true` fails a stale one.
+Never disable a file or the whole project to make a gate green.

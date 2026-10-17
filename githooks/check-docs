@@ -21,7 +21,7 @@ expect() {
 }
 
 # 1) every command a hook runs must be documented in the checks docs. The
-#    filter keeps real commands (cargo/uvx/git/just and the repo's own gates)
+#    filter keeps real commands (cargo/uv/git/just and the repo's own gates)
 #    and drops shell builtins, assignments and comments, so a gate that is
 #    renamed in a hook immediately shows up as a docs failure here.
 for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
@@ -39,7 +39,7 @@ for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
   done < <(sed -e 's/[[:space:]]*#.*$//' "$hook" \
-             | grep -oE '(cargo [a-z-]+|uvx [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
+             | grep -oE '(cargo [a-z-]+|uv [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
              | sort -u)
 done
 
@@ -62,7 +62,7 @@ done < <(awk '
            /^## / { in_gate = ($0 ~ /pre-commit|pre-push|pre-tag/) }
            in_gate { print }
          ' docs/checks.md \
-           | grep -oE '`(cargo [a-z-]+|uvx [a-z]+|githooks/[a-z-]+)[^`]*`' \
+           | grep -oE '`(cargo [a-z-]+|uv [a-z]+|githooks/[a-z-]+)[^`]*`' \
            | tr -d '`' | sort -u)
 
 # 2) every lint declared in Cargo.toml [lints] must be documented in the lint-policy docs
@@ -115,9 +115,9 @@ expect "just check documented" README.zh.md 'just check'
 # the READMEs link to it instead of repeating the recipe.
 expect "just bench documented" docs/benchmarks.md 'just bench'
 expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
-expect "just bench-gate documented" docs/benchmarks.md 'just bench-gate'
-expect "just bench-gate documented (zh)" docs/benchmarks.zh.md 'just bench-gate'
-expect "just bench-peers documented" docs/benchmarks.md 'just bench-peers'
+expect "just bench gate documented" docs/benchmarks.md 'just bench gate'
+expect "just bench gate documented (zh)" docs/benchmarks.zh.md 'just bench gate'
+expect "just bench peers fetch documented" docs/benchmarks.md 'just bench peers fetch'
 
 # 5b) every backticked `just <recipe>` a live page cites must name a recipe the
 #     justfile defines. Backticks keep prose ("just the", "just a") out of the
@@ -298,17 +298,18 @@ while IFS= read -r metric; do
   [ -n "$metric" ] || continue
   expect "bench metric documented: $metric" docs/benchmarks.md "\`$metric\`"
   expect "bench metric documented (zh): $metric" docs/benchmarks.zh.md "\`$metric\`"
-done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' benches/scripts/bench/model.py | sort -u)
+done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' bench/src/bench/model.py | sort -u)
 while IFS= read -r scenario; do
   [ -n "$scenario" ] || continue
   expect "bench scenario documented: $scenario" docs/benchmarks.md "\`$scenario\`"
   expect "bench scenario documented (zh): $scenario" docs/benchmarks.zh.md "\`$scenario\`"
-done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' benches/scripts/bench/model.py | sort -u)
+done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' bench/src/bench/model.py | sort -u)
 expect "just bench-selfcheck documented" docs/checks.md 'just bench-selfcheck'
 expect "just bench documented" docs/benchmarks.md 'just bench'
 expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
-expect "just bench-doctor documented" docs/benchmarks.md 'just bench-doctor'
-expect "just bench-compare documented" docs/benchmarks.md 'just bench-compare'
+expect "just bench doctor documented" docs/benchmarks.md 'just bench doctor'
+expect "just bench compare documented" docs/benchmarks.md 'just bench compare'
+expect "just py-typecheck documented" docs/checks.md 'just py-typecheck'
 
 # 16) a key the parser refuses must be in the configuration page's removed-keys
 #     tables. The parser carries the registry (REMOVED_KEYS: the keys it refuses,

@@ -1,11 +1,12 @@
 # HANDOFF: Working State & Future Work
 
 > **State as of 2026-10-17.** **v0.11.0 is released**: the tag names
-> `f3295e8`, and the release sweep at `d0f22b9` passed `just bench-gate`
+> `f3295e8`, and the release sweep at `d0f22b9` passed `just bench gate`
 > (90 samples over five arms; the record is
 > `benches/records/results-bench-v0.11.0.json`). The branch
 > `feat/v0.11.1-builds` carries the CI build-matrix change (`5e585b7`) that
-> the release exposed.
+> the release exposed, and the bench-harness refactor that makes v0.11.1 a
+> method re-baseline.
 >
 > **This file owns the working state**: what is open, what was decided and why,
 > and the release checklist. Per AGENTS.md §3 it is an agent page — user-facing
@@ -21,6 +22,25 @@
 
 ## Where this stands
 
+- **The v0.11.1 harness change is in, and the sweep that follows is a
+  re-baseline.** The bench model moved from `benches/scripts/bench/` to the
+  top-level `bench/` uv project (one console script, `ruff` + `pyright`
+  configured in `bench/pyproject.toml`, adapters in
+  `bench/src/bench/targets/`). The engine hash now covers the method modules,
+  the adapters and the probes — not the CLI, the plotter or the utilities — so
+  v0.11.1's fingerprints differ from v0.11.0's by construction. Run the
+  release gate **without** a baseline, record the new file as the next
+  baseline, and do not present a cross-version method comparison
+  ([docs/release.md](docs/release.md), "Benchmarks: per-tag ritual").
+  The refactor's decisions: one `ToolAdapter` contract starts the subject,
+  the control and every peer (`bench/src/bench/targets/`), so a new peer is an
+  adapter plus a `PEERS` row and the runner has no tool branches; the engine
+  hash names the method modules, `targets/**` and `probes/**` explicitly and
+  excludes `cli.py`, `plot.py`, `paths.py` and `utils/**`; pyright runs in
+  `standard` mode at zero errors with the adapter files opted into `strict`
+  (whole-model strict was measured at 4,811 errors, a separate annotation
+  project). `--peer-dir` makes the peer cache configurable on `run` and
+  `doctor`, and `provenance.binaries` still records only the subject binary.
 - **v0.11.0 is released, and the release record is closed.** The tag was
   deleted and re-pushed once (the first push pointed at `9ad3362`, whose
   release run failed); the released tag is the re-push. The preparation
@@ -80,7 +100,7 @@
   parser-based check was blind: 24 documented examples, every bench arm's
   configs, both L3-acceptance ends and all three interop cases refused to start
   while `just check` stayed green. Two guards now exist (the doc-example test
-  and `from_str`; `bench.py selfcheck` loads each arm's config). **The general
+  and `from_str`; `just bench selfcheck` loads each arm's config). **The general
   hole is open**: a rule enforced at runtime rather than parse time has no
   check that names it; start the next one in `from_str`.
 - **Build times were decomposed (2026-10-13, 20 cores, rustc 1.99); the
@@ -104,7 +124,7 @@
   any port it contains; the OS decides whether the bind succeeds). Enforcing
   `<1024` would be a behaviour decision for the human.
 - **Carried over**: an HTTP API for configuration (hot reload is files-only),
-  replacing the python bench/test entries with `cargo-script` once it is stable,
+  replacing the python bench project with `cargo-script` once it is stable,
   and QUIC (implemented and measured, parked in the `archive/transport-test`
   tag; revisit only for a UDP-only path or multi-stream loss isolation).
 - **Repository settings are a human's to make**: branch protection for `main`
@@ -121,15 +141,15 @@
   'iperf3'` and the gate refuses the file — but it looks like a finished
   artifact until someone reads it.
 - **`/tmp` is periodically wiped.** Keep `--out` and logs under `~/tmp` or the
-  repo. The bench model's own work directories (`/tmp/molehill-bench.*`) are
-  normal residue and are never deleted by the harness.
+  repo. The bench model's own work directories (`~/tmp/bench-*`) are normal
+  residue and are never deleted by the harness.
 - **`timeout N` orphans the run.** The wrapper signals `uv run`, not the python
   child, which keeps executing and holds the bench lock.
 - **Peers are cached** in `~/tmp/bench-peers` and the interop binary in
   `~/tmp/interop`, so `just bench` and `just interop` normally need no network.
-  `just bench-peers` re-resolves each peer to the **latest GitHub release** and
-  re-downloads when the cached version is behind; the resolved versions are
-  recorded in the results meta beside the numbers.
+  `just bench peers fetch` re-resolves each peer to the **latest GitHub
+  release** and re-downloads when the cached version is behind; the resolved
+  versions are recorded in the results meta beside the numbers.
 - **`sudo` works without a password** and `tc`/`ip` are present, so the shaped
   stages and the MTU classes run here.
 - **This host is `3f8b4508ab91`**: 20 cores, 23 GB RAM, kernel

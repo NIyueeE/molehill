@@ -25,8 +25,8 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import instruments as inst
-import model
+from bench import instruments as inst
+from bench import model
 
 #: Tolerances for the two host probes, carried over from the soak model's
 #: incidents: a CPU probe that repeats to ~2 % and is blind to the loopback
@@ -368,7 +368,9 @@ def _floor_entry(spot: FloorSpot, metric: str) -> dict:
         readings |= _paired_readings(base_values, twin_values)
         readings |= _scatter_readings(twin_values, "aa_scatter")
     readings |= _scatter_readings(control_values, "control")
-    entry = dict(readings) | {"metric": metric}
+    entry: dict[str, object] = {}
+    entry.update(readings)
+    entry["metric"] = metric
     entry["floor_pct"] = _floor_of(readings, "pct")
     entry["floor_abs"] = _floor_of(readings, "abs")
     return entry
@@ -709,7 +711,9 @@ def verdict(cmp: Comparison) -> dict:
     return base
 
 
-def _verdict_base(pairs: list, metric: model.Metric, noise: dict, seed: int) -> dict:
+def _verdict_base(
+    pairs: list, metric: model.Metric, noise: dict | None, seed: int
+) -> dict:
     """The verdict's measured legs, from one set of paired rounds.
 
     A pure function of the pairs: leave-one-out fragility calls it again on
@@ -805,7 +809,7 @@ def _verdict_state(base: dict) -> str:
     return _decide(base["material"], base["p"], base["alpha_eff"], base["ci"])
 
 
-def _fragile(pairs, metric, noise, seed, base) -> bool:
+def _fragile(pairs, metric, noise: dict | None, seed, base) -> bool:
     """Whether the verdict survives dropping any single paired round.
 
     A leave-one-out check, reported and never applied: a reading that flips
@@ -1105,7 +1109,7 @@ def _method_blockers(meta_a: dict, meta_b: dict) -> list:
     ):
         blockers.append(
             "only the analysis version differs: re-analyse both files with the "
-            "current code (`bench.py report`) before comparing them"
+            "current code (`just bench report`) before comparing them"
         )
     return blockers or ["method fingerprints differ"]
 

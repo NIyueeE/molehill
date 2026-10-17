@@ -31,9 +31,9 @@ Before touching anything, verify three things:
    cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
    ```
 
-   `uv`/`uvx` must also be on PATH (the python bench gates — ruff lint *and*
-   format check — run in the pre-commit chain; install:
-   `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+   `uv` must also be on PATH (the python bench gates — ruff lint *and* format
+   check, plus pyright — run in the pre-commit chain from the `bench/` project;
+   install: `curl -LsSf https://astral.sh/uv/install.sh | sh`).
 
    Note: `cargo fmt` and `cargo clippy` are guaranteed by the components
    declared in `rust-toolchain.toml`; rustup installs them with the toolchain.
@@ -52,11 +52,11 @@ Principle: **fix the code first; a waiver is the last resort, and only
 code-level.**
 
 - Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
-  `ruff.toml`, `githooks/pre-commit`, or any check command. Never delete,
-  comment out, or bypass a check.
-- Every check follows the **same discipline** — the Rust lints, the two ruff
-  gates, and all the audits and extra checks (machete, audit, deny, outdated,
-  docs alignment, secret scan, and anything added later): fix if fixable, waive
+  `bench/pyproject.toml`, `githooks/pre-commit`, or any check command. Never
+  delete, comment out, or bypass a check.
+- Every check follows the **same discipline** — the Rust lints, the ruff and
+  pyright gates, and all the audits and extra checks (machete, audit, deny,
+  outdated, docs alignment, secret scan, and anything added later): fix if fixable, waive
   only when genuinely unfixable, in code, at the narrowest scope, with a
   reason.
 - The waiver *forms* — which attribute, what scope counts as minimal, the one
@@ -220,9 +220,10 @@ is the voice contract for writing it.
      it ran the same chain);
   5. the benchmark ritual is done (docs/release.md):
      `benches/records/results-bench-vX.Y.Z.json`, the chart set, and the README
-     benchmark table are refreshed in the release commit, and `just bench-gate`
+     benchmark table are refreshed in the release commit, and `just bench gate`
      is green against the previous release — coverage, the SLO, drift and the
-     capacity ramp must not regress.
+     capacity ramp must not regress. A method-changing release runs the gate
+     **without** a baseline and becomes the next baseline (docs/release.md).
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 - **Mechanics live in [docs/release.md](docs/release.md)**: the exact changelog
@@ -265,14 +266,14 @@ Details: [docs/release.md](docs/release.md).
   change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
   docs-alignment check instead — the one gate such a change can break. A
-  benches-only change (`benches/scripts/**`) skips the cargo gates of the
-  fast gate for the same reason — the scripts are runtime tooling, never
+  benches-only change (`bench/**`, `benches/records/**`) skips the cargo gates
+  of the fast gate for the same reason — the project is runtime tooling, never
   compiled — and pre-push skips the heavy gates for it too (audit, deny,
   outdated and tests cannot move), while CI keeps the full chain.
   **The hooks mirror that split** (`githooks/docs-only` and
   `githooks/benches-only` classify the staged paths or the pushed range):
-  pre-commit keeps the secret scan and the docs check, plus the two ruff
-  gates and the bench-model self-check for a benches-only change; pre-push
+  pre-commit keeps the secret scan and the docs check, plus ruff, pyright and
+  the bench-model self-check for a benches-only change; pre-push
   keeps only the docs check; and anything ambiguous — an empty change set, a
   new branch, a commit mixing docs or benches with code — falls back to the
   full chain. A tag-only push is not ambiguous: it runs the release review and
@@ -284,7 +285,7 @@ Details: [docs/release.md](docs/release.md).
   exception to history rules: a coordinated history rebuild, explicitly
   requested and backed up first). Enabling branch protection is a repo
   settings change for a human to make.
-- Formatting: `just fmt` (Rust) and `just py-fmt` (python bench scripts)
+- Formatting: `just fmt` (Rust) and `just py-fmt` (python bench project)
   auto-fix; `just check` rehearses the whole chain before committing.
 - Dependencies: add or remove them only through cargo — `cargo add` (add
   `--dev` for dev-dependencies) and `cargo remove`. Never hand-edit the
@@ -361,7 +362,7 @@ revision) and are as binding as the lint discipline in §2.
   loopback iperf3 ceiling (~46 Gbit/s) for every tool; the same error
   reappeared when a sampler was refactored to reuse the backend port. Record
   the endpoint in the data (the port the probe dials vs the backend's) and
-  assert the invariant: `just bench-gate` fails a throughput sample that dials
+  assert the invariant: `just bench gate` fails a throughput sample that dials
   the backend instead of the tool's exposed port.
 - **Instrument parameters are part of the method.** Queue depth, pacing
   rate, client timeout and the window convention change the result, so they
@@ -398,14 +399,14 @@ revision) and are as binding as the lint discipline in §2.
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
   every reader of a key you touch, and keep a completeness gate in the
-  ritual (`bench.py gate`: the coverage of every declared cell, the endpoint
+  ritual (`just bench gate`: the coverage of every declared cell, the endpoint
   invariant, the SLO verdicts, the drift and wedge axes).
 - **Prove provenance.** A run must correspond to a committed revision and a
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that
   way, and its numbers would have described code that no longer existed).
 - **A performance claim about a change is made with the bench model.**
-  `benches/scripts/bench/` is the standard: a metric exists only as a
+  `bench/src/bench/` is the standard: a metric exists only as a
   declaration in `model.METRICS` (unit, direction, denominator, the workloads
   that can produce it, the smallest difference worth calling a claim), every
   scenario runs against a control arm with no tool in the path, a run records
@@ -462,9 +463,16 @@ pointers, not copies:
 - **Unsafe** is denied crate-wide; the modules that opt in per item, the
   `src/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
-- **Bench/test entries are PEP 723 python scripts run via `uv run`**; their
-  lint and format gates and the waiver rule are
-  [docs/lint-policy.md](docs/lint-policy.md) ("Python (ruff)").
+- **The bench model is the `bench/` uv project**: one console script
+  (`just bench <verb>`), ruff and pyright configured in
+  `bench/pyproject.toml`, and the tool adapters that start the subject and every
+  peer in `bench/src/bench/targets/` (a new peer is an adapter + a `PEERS` row,
+  never a runner branch). The supporting instruments are
+  `bench/src/bench/utils/`; the engine hash covers the method modules, the
+  adapters and the probes, not the CLI, the plotter or the utilities. Their
+  lint, format and type gates and the waiver rules are
+  [docs/lint-policy.md](docs/lint-policy.md) ("Python (ruff)", "Python
+  (pyright)").
 - **Where everything lives**: [docs/structure.md](docs/structure.md) — the
   file map and the topic-ownership contract (§3).
 

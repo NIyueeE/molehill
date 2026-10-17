@@ -3,7 +3,7 @@
 # three-namespace topology, plus the evidence that the CLIENT owns the public
 # ip:port and the server holds no connection state for the visitor's flow.
 #
-#   sudo -n bash benches/scripts/l3/run.sh
+#   sudo -n bash bench/src/bench/utils/l3/run.sh
 #
 # Root-only and Linux-only: it creates veth pairs, two TUN devices, routes and
 # an ip rule. It is deliberately outside the check chain -- see docs/checks.md,
@@ -18,7 +18,7 @@
 #      small request/response round trips;
 #   6. 16 concurrent flows stay byte-exact too, and the run reports what each
 #      arm costs on the wire, on the CPU and what share of it a header
-#      compressor could reach (benches/scripts/l3/wire_report.py);
+#      compressor could reach (bench/src/bench/utils/l3/wire_report.py);
 #   7. a server whose config has no `[server.transparent]` refuses the
 #      registration BY POLICY, before it looks at a device (its device is
 #      deleted for that run, so the order is proven rather than asserted);
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../../../../.." && pwd)"
 LOG="${LOG:-/tmp/l3-accept}"
 # Which build the run measures. `debug` is the default because it builds
 # fastest; `release` is what an operator runs, and the two do not cost the same

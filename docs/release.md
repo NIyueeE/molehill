@@ -80,7 +80,7 @@ timelines, the SLO, the scenarios, and how to reproduce a run — is owned by
 [benchmarks.md](benchmarks.md); this section owns the ritual a tag depends on.
 The ritual produces three artifacts and one verdict: the results file
 (`benches/records/results-bench-vX.Y.Z.json`), the chart set in `assets/`, the
-refreshed README benchmark numbers, and `just bench-gate`'s verdict on the run
+refreshed README benchmark numbers, and `just bench gate`'s verdict on the run
 (plus its comparison against the previous tag when a baseline is given).
 
 The sweep is one profile of the one model, so the staged schedule and the load
@@ -93,8 +93,9 @@ came from, so the gate compares like with like.
 
 Peers are frp, rathole (upstream) and nps, each fetched as the **latest GitHub
 release** binary, never built from source, with the resolved versions recorded
-in the results meta. Every entry is a PEP 723 python script run via `uv run`,
-and the whole package is self-contained (`benches/scripts/bench/`).
+in the results meta. The model is the `bench/` uv project, pinned by
+`bench/uv.lock` and run through its console script (`just bench <verb>`); its
+only third-party runtime dependency is the optional `plot` extra.
 
 1. `just interop` — the interop matrix
    ([checks.md](checks.md#outside-the-chain-the-interop-matrix-just-interop)):
@@ -103,7 +104,8 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    — it is seconds. What it asserts is that both cross-version directions
    **refuse** each other on the connection it happens on, and that the refusing
    process keeps serving a peer of its own version.
-2. `just bench-peers` — fetch/refresh the peer binaries (cached per release).
+2. `just bench peers fetch` — fetch/refresh the peer binaries (cached per
+   release; `--peer-dir` overrides `~/tmp/bench-peers`).
 3. `just bench --profile sweep --binary target/release/molehill \
    --out benches/records/results-bench-vX.Y.Z.json`
    — run the sweep. **The profile's arm list is the requirement**: a run whose
@@ -125,7 +127,7 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    so five arms are a little over two hours on this host. `--scale 0.2` shortens the
    holds without changing the schedule's *shape*, and the fingerprint records
    the scale, so a shortened run can never be mistaken for the published one.
-4. `just bench-plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
+4. `just bench plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
    — renders the chart set and prints the markdown tables: the master (per
    arm, the interactive stream over the stage schedule with its per-stage
    p50/p99 and the bulk throughput, wedges marked), the small multiples, the
@@ -135,12 +137,12 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    Benchmarks section with them and their numbers.
    The release review enforces the provenance half of this step: the results
    file records the revision it was measured at, and `githooks/pre-tag` fails
-   the tag if `src/`, `tests/`, `Cargo.*`, `build.rs` or the model changed
+   the tag if `src/`, `tests/`, `Cargo.*`, `build.rs` or `bench/src/bench/` changed
    between that revision and the reviewed commit — a chart whose numbers
    describe code that is no longer here is the one thing a reader cannot see.
    Doc and asset commits after the sweep are fine; that is how the ritual lands
    it.
-5. `just bench-gate benches/records/results-bench-vX.Y.Z.json \
+5. `just bench gate benches/records/results-bench-vX.Y.Z.json \
    --baseline benches/records/results-bench-v<previous>.json`
    — the gate: coverage (every cell the scenarios declared), the endpoint
    invariant, the SLO on the clean stages, the drift and wedge axes, the
@@ -152,10 +154,20 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    thresholds and the comparability rules are in
    [benchmarks.md](benchmarks.md#the-gate).
 
+   **A method-changing release is a re-baseline release.** When the change
+   touches the method's code (`bench/src/bench/`'s engine modules, the
+   adapters or the probes), the published record is not comparable with the
+   previous tag by construction: run this gate **without `--baseline`**, then
+   record in `CHANGELOG.md` and `HANDOFF.md` that the new record is the next
+   baseline. The gate's absolute half (coverage, endpoint invariant, SLO,
+   drift, wedge, ramp) still applies; only the regression half has nothing to
+   compare against, and the release notes say so instead of implying a
+   comparison that the fingerprints would refuse.
+
 The soak model's records (`results-soak-vX.Y.Z.json`, also in
 `benches/records/`) were measured with the model this one replaced. They stay
 as published history and are never a regression baseline for a `bench` run:
-the two schemas are different instruments, and `bench-gate` refuses a baseline
+the two schemas are different instruments, and `just bench gate` refuses a baseline
 whose method record does not match.
 
 The same refusal now operates inside `bench` itself, on two keys: the
@@ -178,7 +190,7 @@ run's own noise floor:
 # build both, then one interleaved A/B
 just bench --profile screen --ab-arm molehill --binary-b /path/to/other/build \
      --out ~/tmp/bench-ab.json
-just bench-compare ~/tmp/bench-ab.json ~/tmp/bench-ab-first.json
+just bench compare ~/tmp/bench-ab.json ~/tmp/bench-ab-first.json
 ```
 
 It is the fast, development-time form of

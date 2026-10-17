@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """Fetch the **previous molehill release** binary, for interop testing.
 
 Policy: the interop matrix compares this build's client and server against the
@@ -10,15 +6,15 @@ a new dialect cleanly". Nothing is compiled from source: the asset is the same
 one users download, which is the point (a binary built from today's tree cannot
 test yesterday's protocol).
 
-Usage:
-    uv run fetch_old.py [tag] [cache_dir]
-
-`tag` defaults to the newest release that is not this build's own version, so a
+`bench interop [tag] [cache_dir]`; `tag` defaults to the newest release, so a
 run for v0.9.1 fetches v0.9.0 without being told. The resolved tag and the
 binary's own `--version` output are printed; the interop test reads the path
 from `MOLEHILL_OLD_BIN` (see `tests/interop_test.rs`).
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import platform
@@ -28,14 +24,8 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-#: argv is [script, tag?, cache_dir?]; ruff's magic-value rule applies to the
-#: index, which reads better named than inlined.
-CACHE_ARG = 2
-CACHE_DIR = Path(
-    sys.argv[CACHE_ARG]
-    if len(sys.argv) > CACHE_ARG
-    else Path.home() / "tmp" / "interop"
-)
+from bench import paths
+
 REPO = "NIyueeE/molehill"
 UA = {"User-Agent": "molehill-interop-fetch", "Accept": "application/vnd.github+json"}
 
@@ -73,7 +63,7 @@ def releases() -> list:
         except OSError as api_err:
             sys.exit(
                 f"cannot list releases ({api_err}). Pass an explicit tag "
-                f"(uv run fetch_old.py v0.9.0) or set MOLEHILL_OLD_BIN yourself."
+                f"(bench interop v0.9.0) or set MOLEHILL_OLD_BIN yourself."
             )
     return [(d["tag_name"], [a["name"] for a in d["assets"]]) for d in data]
 
@@ -82,7 +72,7 @@ def assets_for(tag: str) -> list:
     """Asset names of one release, without listing every release.
 
     An explicit tag skips the listing entirely — which is also the way around a
-    rate-limited API (`--tag` on the command line, or `MOLEHILL_OLD_TAG`).
+    rate-limited API (`tag` on the command line, or `MOLEHILL_OLD_TAG`).
     """
     try:
         out = subprocess.run(
@@ -103,9 +93,7 @@ def assets_for(tag: str) -> list:
 
 def own_version() -> str:
     """The version in this checkout's Cargo.toml (`0.9.1` → `v0.9.1`)."""
-    for line in (
-        (Path(__file__).resolve().parents[3] / "Cargo.toml").read_text().split("\n")
-    ):
+    for line in (paths.REPO_ROOT / "Cargo.toml").read_text().split("\n"):
         if line.startswith("version = "):
             return "v" + line.split('"')[1]
     sys.exit("cannot read the version from Cargo.toml")
@@ -134,12 +122,23 @@ def host_asset(version: str, assets: list) -> str:
     return want
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bench interop",
+        description="fetch the previous molehill release binary for the interop test",
+    )
+    parser.add_argument(
+        "tag", nargs="?", default="", help="a release tag, e.g. v0.10.0"
+    )
+    parser.add_argument(
+        "cache_dir", nargs="?", type=Path, default=None, help="where to keep it"
+    )
+    parsed = parser.parse_args(argv)
+    cache_dir = parsed.cache_dir or (paths.user_home() / "tmp" / "interop")
+
     # `MOLEHILL_OLD_TAG` or an explicit tag skips release listing entirely —
     # cheaper, and the way around a rate-limited API.
-    want_tag = os.environ.get("MOLEHILL_OLD_TAG") or (
-        sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].startswith("v") else None
-    )
+    want_tag = os.environ.get("MOLEHILL_OLD_TAG") or (parsed.tag or None)
     if want_tag is not None:
         tag, assets = want_tag, assets_for(want_tag)
     else:
@@ -156,7 +155,7 @@ def main() -> None:
             f"is same-release; it is a smoke check, not an old-peer test"
         )
 
-    target = CACHE_DIR / tag
+    target = cache_dir / tag
     binary = target / "molehill"
     if binary.exists():
         print(f"cached {tag} -> {binary}")
@@ -184,7 +183,4 @@ def main() -> None:
     )
     print(f"MOLEHILL_OLD_BIN={binary}")
     print(f"reports: {(ver.stdout or ver.stderr).strip()}")
-
-
-if __name__ == "__main__":
-    main()
+    return 0

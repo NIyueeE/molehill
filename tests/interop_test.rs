@@ -13,7 +13,7 @@
 //! than a CI gate. `just interop` does both halves:
 //!
 //! ```text
-//! uv run benches/scripts/interop/fetch_old.py   # prints MOLEHILL_OLD_BIN=...
+//! just bench interop                            # prints MOLEHILL_OLD_BIN=...
 //! MOLEHILL_OLD_BIN=... cargo test --test interop_test -- --include-ignored
 //! ```
 //!

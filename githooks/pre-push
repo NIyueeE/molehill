@@ -40,9 +40,9 @@ if [ ! -t 0 ]; then
     # Classify the commits this push carries: a branch push whose commits only
     # touch markdown/docs/assets cannot move audit/deny/outdated/test, so it
     # runs the doc gate instead (the same split CI makes). The same holds for
-    # benches/scripts/** (githooks/benches-only): the scripts are runtime
+    # bench/** (githooks/benches-only): the project is runtime
     # tooling, never compiled, so no Rust gate can move and the doc gate — the
-    # one gate a bench-script change CAN move (the metric registry) — runs
+    # one gate a bench-project change CAN move (the metric registry) — runs
     # alone. A push mixing docs with benches (or either with code) fails both
     # classifiers and takes the full chain: the safe direction. A tag push
     # never takes the shortcut.

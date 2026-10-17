@@ -4,6 +4,7 @@
 /target/
 /docs/
 /benches/
+/bench/
 
 # Files
 .gitignore

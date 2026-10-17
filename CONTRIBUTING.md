@@ -11,9 +11,11 @@ just check        # run the full chain (same as CI)
 ```
 
 `just setup` installs the four cargo check tools (machete, audit, outdated,
-deny) and reports `uvx` / `cargo-hack` when they are missing. The python
-gates (ruff lint + format) additionally need `uv`/`uvx` on PATH, installed
-with `curl -LsSf https://astral.sh/uv/install.sh | sh` (AGENTS.md §1).
+deny) and reports `uv` / `cargo-hack` when they are missing. The python gates
+(ruff lint + format, pyright) additionally need `uv` on PATH, installed with
+`curl -LsSf https://astral.sh/uv/install.sh | sh` (AGENTS.md §1); the tools
+themselves come from the `bench/` project's locked environment, so there is no
+separate global install.
 
 ## Check gates
 

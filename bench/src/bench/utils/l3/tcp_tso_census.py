@@ -18,7 +18,7 @@ this kernel even with it, so the win is TCP-shaped.
 
 Run as root; builds its own namespaces and tears them down:
 
-    sudo -n python3 benches/scripts/l3/tcp_tso_census.py
+    sudo -n python3 bench/src/bench/utils/l3/tcp_tso_census.py
 
 Topology (root namespace = pure router, ip_forward=1):
 
