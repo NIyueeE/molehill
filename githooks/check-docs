@@ -186,20 +186,53 @@ for doc in configuration deployment transport benchmarks; do
   fi
 done
 
-# 8c) the ownership contract lists every docs/ page, so a new page without a
-#     stated owner (and audience) fails here instead of drifting
+# 8c) the ownership contract lists every docs/ page with a valid audience.
+#     The Audience column is the voice contract (AGENTS.md §3, "Audience and
+#     voice"), so a page added without a row — or a row whose audience is not
+#     one of the four tiers — fails here instead of drifting.
+ownership=$(mktemp)
+awk -F'|' '
+  /^### Documentation responsibilities/ { section = 1 }
+  section && /^\| Doc \| Audience \|/ { in_table = 1; next }
+  in_table && /^\|/ {
+    doc = $2; aud = $3;
+    gsub(/^[ \t]+|[ \t]+$/, "", doc);
+    gsub(/^[ \t]+|[ \t]+$/, "", aud);
+    if (doc ~ /^-+$/) next;
+    print doc "\t" aud
+  }
+  in_table && !/^\|/ { exit }
+' docs/structure.md > "$ownership"
+
+while IFS=$'\t' read -r row_doc row_aud; do
+  case "$row_aud" in
+    users|contributors|agents|"vulnerability reporters") ;;
+    *)
+      echo "  FAIL  ownership row '$row_doc' has audience '$row_aud' (expected users, contributors, agents or vulnerability reporters)" >&2
+      errors=$((errors + 1))
+      ;;
+  esac
+done < "$ownership"
+
 while IFS= read -r page; do
   name="$(basename "$page")"
   case "$name" in
     *.zh.md) continue ;;
   esac
-  if grep -qF "\`$name\`" docs/structure.md; then
-    echo "  ok    docs/$name has an owner in docs/structure.md"
+  if grep -qF -- "\`$name\`" "$ownership"; then
+    audience=$(grep -F -- "\`$name\`" "$ownership" | head -1 | cut -f2)
+    case "$audience" in
+      users|contributors|agents|"vulnerability reporters")
+        echo "  ok    docs/$name has an owner (audience: $audience)" ;;
+      *)
+        echo "  ok    docs/$name has an owner (invalid audience — see the row failure above)" ;;
+    esac
   else
-    echo "  FAIL  docs/$name is not listed in docs/structure.md's ownership table" >&2
+    echo "  FAIL  docs/$name is not a row in docs/structure.md's ownership table" >&2
     errors=$((errors + 1))
   fi
 done < <(git ls-files 'docs/*.md')
+rm -f "$ownership"
 
 # 9) CI must run the same chain
 if [ -f .github/workflows/ci.yml ]; then
