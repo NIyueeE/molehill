@@ -173,7 +173,7 @@ KCP、建立不起来再回退 TCP 的数据面——对绝大多数人是正确
 ```mermaid
 flowchart TD
     A["起点:默认配置<br/>tunnels=4、<br/>控制通道 Noise(必需)"] --> B{"该服务的载荷自带加密吗?<br/>(TLS、SSH、WireGuard)"}
-    B -- 是 --> C["该服务:transport = { type = \"plain\" }<br/>- 更省,且防护不减"]
+    B -- 是 --> C["该服务:transport = { type = 'plain' }<br/>- 更省,且防护不减"]
     B -- 否 --> D{"并发访客连接很多?"}
     C --> D
     D -- "> ~256 并发" --> G["tunnels = 8 或更高"]
@@ -362,6 +362,30 @@ FD 占用。形态不是键:转发服务永远走多路复用(没有 `mode` 可�
 - 编译时去掉该特性则完全移除这个选项,而且这样的构建根本不能看到相应的表:
   配置里出现 `[client.data]` 或 `[server.data]` 就会被拒绝(未知键——
   `deny_unknown_fields`)。删掉这两个表之后,每条数据通道都是自己的一条连接。
+
+**分开绑定数据面。** 默认情况下两个平面共用控制地址。要把数据面放到独立端口,
+两端都要设置:
+
+```toml
+# server.toml
+[server.control]
+bind_addr = "0.0.0.0:2333"
+[server.data]
+bind_addr = "0.0.0.0:2343"
+```
+
+```toml
+# client.toml
+[client.control]
+default_remote_addr = "server.example.com:2333"
+[client.data]
+default_data_addr = "server.example.com:2343"
+```
+
+服务端会在 `[server.data].bind_addr` 上再绑一个 TCP 监听,并在第一条 KCP 注册
+到达时打开该地址的 KCP UDP socket;这个端口要同时放行 **TCP 与 UDP**。带自己
+`remote_addr` 的服务会同时跟随该服务端的两个平面,客户端级的
+`default_data_addr` 不作用于它。
 
 **按服务覆盖。** `[client.data]` 存放默认值;每个服务可以在自己的
 `[client.services.<name>]` 块里单独覆盖 `tunnels`,数据面的其它部分不可覆盖:

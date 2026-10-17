@@ -194,7 +194,7 @@ in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 ```mermaid
 flowchart TD
     A["Start: defaults<br/>tunnels=4,<br/>control Noise (required)"] --> B{"Does a service's payload<br/>carry its own crypto<br/>(TLS, SSH, WireGuard)?"}
-    B -- Yes --> C["that service: transport = { type = \"plain\" }<br/>- cheaper, and no less protected"]
+    B -- Yes --> C["that service: transport = { type = 'plain' }<br/>- cheaper, and no less protected"]
     B -- No --> D{"Many concurrent<br/>visitor connections?"}
     C --> D
     D -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
@@ -420,6 +420,30 @@ service always multiplexes (there is no `mode` to write), and a
   contains `[client.data]` or `[server.data]` is rejected there (unknown
   keys — `deny_unknown_fields`). Delete those tables and every data channel is
   a connection of its own.
+
+**Binding the data plane separately.** By default both planes share the
+control address. To put the data plane on its own port, set both sides:
+
+```toml
+# server.toml
+[server.control]
+bind_addr = "0.0.0.0:2333"
+[server.data]
+bind_addr = "0.0.0.0:2343"
+```
+
+```toml
+# client.toml
+[client.control]
+default_remote_addr = "server.example.com:2333"
+[client.data]
+default_data_addr = "server.example.com:2343"
+```
+
+The server binds a second TCP listener on `[server.data].bind_addr` and opens
+the KCP UDP socket there on the first KCP registration; open **both** TCP and
+UDP on that port. A service with its own `remote_addr` follows that server for
+both planes, so the client-wide `default_data_addr` does not apply to it.
 
 **Per-service overrides.** `[client.data]` holds the defaults; each service can
 override `tunnels` individually on its own `[client.services.<name>]` block, and
