@@ -101,7 +101,7 @@ molehill，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://
 
 | 工具 | clean 批量读数 | clean 交互 p99 |
 |---|---|---|
-| molehill (L4) | 8.864 – 8.892 Gbit/s(**相差 0.9 %**) | 4.6 – 4.3 ms |
+| molehill (L4) | 8.864 – 8.892 Gbit/s(**相差 0.3 %**) | 4.6 – 4.3 ms |
 | molehill (L3) | 5.950 – 5.976 Gbit/s(**相差 0.4 %**) | 1.5 – 1.5 ms |
 | frp | 6.023 – 5.995 Gbit/s(**相差 0.5 %**) | 1.4 – 11.0 ms |
 | rathole | 28.794 – 29.129 Gbit/s(**相差 1.1 %**) | 1.6 – 1.8 ms |

@@ -104,12 +104,12 @@ winner is marked in those columns. Sample counts and the full reading rules:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 4.2 | 402.2 | 1071.6 | 2451.4 | 199.0 | 434.2 | 281.6 | 3.9 |
 | molehill (L4) | 4.6 | 402.3 | 1074.3 | 2051.4 | 196.5 | 435.2 | 263.1 | 4.3 |
 | molehill (L3) | 1.5 | 401.4 | 1057.0 | 2084.7 | 196.5 | 428.8 | 284.1 | 1.5 |
 | frp | 1.4 | 401.3 | 1083.7 | 2684.0 | 195.9 | 431.5 | 290.1 | 11.0 |
 | rathole | 1.6 | 400.9 | 1078.3 | 2464.9 | 197.1 | 426.5 | 263.1 | 1.8 |
 | nps | 82.6 | 441.6 | 1072.3 | 2036.4 | 198.3 | 430.5 | 272.7 | 59.9 |
+
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
