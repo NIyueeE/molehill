@@ -71,7 +71,9 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 - test-only: 5 expectations for edition-2024 environment mutation (3 in
   `src/transport/multiplex.rs`'s tests, 2 in `tests/pool_test.rs`). These are
   serial-suite tests; `std::env::set_var`/`remove_var` are `unsafe` since
-  edition 2024 and have no safe replacement.
+  edition 2024 and have no safe replacement. A `temp-env` wrapper works, but
+  it adds a dev-dependency and re-resolves the lockfile for five sanctioned
+  test-only calls; the trade was tried and declined.
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 

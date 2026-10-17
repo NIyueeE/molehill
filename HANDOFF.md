@@ -123,6 +123,13 @@
   claim), but repeatable, so the raw FFI stays until a wrapper is neutral.
   `quinn-udp` would remove all eight expectations too, but changes the
   GSO/GRO send shape and needs the same measured A/B — not a lint cleanup.
+- **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
+  trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
+  `set_var`/`remove_var` scoped and safe at the call site; a worktree
+  conversion of the three multiplex tests and the pool handover test passed
+  the full suites. It needs a dev-dependency (`futures` via `async_closure`)
+  and re-resolves unrelated `windows-sys` entries in `Cargo.lock`, so it is
+  not worth changing a sanctioned test-only waiver for it.
 - **Privileged ports** are documented as *not* implemented (the whitelist admits
   any port it contains; the OS decides whether the bind succeeds). Enforcing
   `<1024` would be a behaviour decision for the human.
