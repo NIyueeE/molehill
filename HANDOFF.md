@@ -56,9 +56,9 @@
   refactor).** Each commit is one topic, and each was a state that passed
   the gate chain when first committed; every time the tree came out
   byte-identical to the tip it replaced (`git diff` against the backup, empty).
-  Backups: `backup/l3-pre-squash-2026-10-14`, `backup/l3-pre-squash2-2026-10-15`,
-  `backup/pre-squash3-2026-10-15`, `backup/pre-squash4-2026-10-16` and
-  `backup/pre-squash5-2026-10-16`.
+  The pre-squash backup refs and the merged `feat/transparent-l3` branch were
+  retired after the v0.11.0 tag (2026-10-17): `main` and the tag are the
+  history now.
   - **The third squash is the smallest, and that is the honest shape of the
     history rather than a failure to compress.** It folded three commits that
     were one investigation's instruments into one, the shaper's instrument and
