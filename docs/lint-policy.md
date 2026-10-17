@@ -57,13 +57,9 @@ follow the same discipline.
 `unsafe_code` is **deny**, so an unexpected `unsafe` fails a plain
 `cargo build` and not only the `-D warnings` gate. The modules that need it ask
 per item, with `#[expect(unsafe_code, reason = "...")]` plus a
-`// SAFETY:` comment directly above the item — 11 in production modules and
+`// SAFETY:` comment directly above the item — 3 in production modules and
 5 test-only:
 
-- `src/transport/udp_batch.rs` — the `recvmmsg`/`sendmmsg` batching FFI
-  (8 expectations: the zeroed `msghdr`/`sockaddr_storage` templates, the
-  kernel-ABI `sockaddr` reinterpretation, the two `mmsg` calls, and three
-  `Send`/`Sync` proofs for the reusable descriptor arrays);
 - `src/transparent/tun.rs` — the TUN attach (3 expectations: the zeroed
   `ifreq` and name copy bounded by `IFNAMSIZ` for `TUNSETIFF`, the
   `TUNSETOFFLOAD` declaration, and tokio's `AsyncFd::register`, which requires
@@ -77,12 +73,12 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 
-The `mmsg` and TUN waivers are sanctioned because the raw syscalls have no
-`std` equivalent; the analysis that rejected `nix`'s `MultiHeaders` wrapper and
-evaluated `quinn-udp` is recorded in [HANDOFF.md](../HANDOFF.md), "Open threads
-for the next cycle" (the `quinn-udp` A/B entry). The `sysconf(_SC_CLK_TCK)`
-read is no longer a waiver: it uses `nix::unistd::sysconf` and integer
-arithmetic.
+The TUN waivers are sanctioned because the ioctls and the tokio registration
+have no safe equivalent. The batching site is no longer unsafe: `udp_batch`
+uses `nix`'s safe `recvmmsg`/`sendmmsg`, at a measured 1.4-1.9 % CPU per Gbit
+cost (inside the 15 % materiality floor; the A/B is in
+[HANDOFF.md](../HANDOFF.md)). The `sysconf(_SC_CLK_TCK)` read is also gone, in
+favour of `nix::unistd::sysconf` and integer arithmetic.
 
 ## Test modules (the one sanctioned module-level waiver)
 

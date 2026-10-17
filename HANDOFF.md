@@ -113,16 +113,16 @@
   already clean (`mux` ← `transport` ← `core` ← `main`, `mux` a
   zero-reverse-dep leaf). The benches-only classification now covers both hooks
   (`f9c0187`).
-- **The safe-`nix` replacement for `udp_batch` was A/B'd and declined for
-  now.** Two variants were built: per-call `MultiHeaders` (0 local unsafe) and
-  stored headers plus inline `SmallVec` descriptors (3 `Send`/`Sync` proofs).
-  On the KCP `l4` path (`just bench --profile screen --arms l4 --ab-arm l4`,
-  four runs) the raw-FFI baseline measured 1.566-1.578 s/Gbit against
-  1.590-1.602 for the nix variants: ~1.5-1.9 % higher CPU, consistently in the
-  same direction. That is inside `cpu_s_per_gbit`'s 15 % materiality floor (no
-  claim), but repeatable, so the raw FFI stays until a wrapper is neutral.
-  `quinn-udp` would remove all eight expectations too, but changes the
-  GSO/GRO send shape and needs the same measured A/B — not a lint cleanup.
+- **The safe-`nix` replacement for `udp_batch` is in.** The shipped variant
+  rebuilds `MultiHeaders` per call (it is `!Send`), so the module has no
+  `unsafe` left; a stored-header + `SmallVec` variant kept three `Send`/`Sync`
+  proofs and measured the same. On the KCP `l4` path
+  (`just bench --profile screen --arms l4 --ab-arm l4`, four runs) the
+  raw-FFI baseline measured 1.566-1.578 s/Gbit against 1.590-1.602 for the nix
+  variants: ~1.5-1.9 % higher CPU, consistently in the same direction. That is
+  inside `cpu_s_per_gbit`'s 15 % materiality floor (no claim), so the safety
+  win was accepted. `quinn-udp` is no longer needed to remove this waiver; it
+  remains only a GSO/GRO transport experiment.
 - **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
   trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
   `set_var`/`remove_var` scoped and safe at the call site; a worktree

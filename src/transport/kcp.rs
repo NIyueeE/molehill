@@ -1535,9 +1535,14 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
     // very first batch. After an EAGAIN, `try_io` clears the cached flag, so
     // this await parks until the kernel send buffer drains — no spinning.
     net.socket.writable().await?;
-    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
+    // The send half is stateless: `nix` builds its descriptors per call.
     net.socket.try_io(Interest::WRITABLE, || {
-        send_batch.send_spans(net.socket.as_raw_fd(), net.peer, buf, spans)
+        crate::transport::udp_batch::SendBatch::send_spans(
+            net.socket.as_raw_fd(),
+            net.peer,
+            buf,
+            spans,
+        )
     })
 }
 
@@ -2199,9 +2204,8 @@ const IPV6_UDP_HEADERS: usize = 40 + 8;
 /// type for it (its `sockopt::IpMtu` is the IPv4 `IP_MTU`).
 ///
 /// `nix`'s two exported macros supply the whole implementation without a
-/// single `unsafe` line here (the crate denies `unsafe_code`; the audited FFI
-/// sites are `transport::udp_batch` and the TUN attach in
-/// `transparent::tun`):
+/// single `unsafe` line here (the crate denies `unsafe_code`; the remaining
+/// audited FFI site is the TUN attach in `transparent::tun`):
 ///
 /// * [`sockopt_impl!`](nix::sockopt_impl) declares this marker type (derive,
 ///   docs and all) and implements [`GetSockOpt`](nix::sys::socket::GetSockOpt)
