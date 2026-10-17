@@ -63,33 +63,47 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
   (8 expectations: the zeroed `msghdr`/`sockaddr_storage` templates, the
   kernel-ABI `sockaddr` reinterpretation, the two `mmsg` calls, and three
   `Send`/`Sync` proofs for the reusable descriptor arrays);
-- `src/transparent/tun.rs` — the `TUNSETIFF` ioctl that binds an fd to a TUN
-  interface (1 expectation: the zeroed `ifreq`, the name copy bounded by
-  `IFNAMSIZ` into that zeroed buffer, and the `ioctl` call with the request the
-  kernel defines for exactly this struct);
+- `src/transparent/tun.rs` — the TUN attach (3 expectations: the zeroed
+  `ifreq` and name copy bounded by `IFNAMSIZ` for `TUNSETIFF`, the
+  `TUNSETOFFLOAD` declaration, and tokio's `AsyncFd::register`, which requires
+  the caller to prove the registered fd stays open and unchanged);
+- `src/transport/kcp.rs` — 1 expectation: `sysconf(_SC_CLK_TCK)`, a
+  pointer-free read of one system constant;
+- test-only: 5 expectations for edition-2024 environment mutation (3 in
+  `src/transport/multiplex.rs`'s tests, 2 in `tests/pool_test.rs`). These are
+  serial-suite tests; `std::env::set_var`/`remove_var` are `unsafe` since
+  edition 2024 and have no safe replacement.
 - `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 
-The waivers are sanctioned because no equally reasonable alternative exists: the
-raw syscalls have no `std` equivalent. The analysis that rejected `nix` and
+The `mmsg` and TUN waivers are sanctioned because the raw syscalls have no
+`std` equivalent; the analysis that rejected `nix`'s `MultiHeaders` wrapper and
 evaluated `quinn-udp` is recorded in [HANDOFF.md](../HANDOFF.md), "Open threads
-for the next cycle" (the `quinn-udp` A/B entry).
+for the next cycle" (the `quinn-udp` A/B entry). The `sysconf` waiver is the
+one with a known safe wrapper (`nix::unistd::sysconf`): replacing it needs the
+`nix` `feature` flag and an integer-math rewrite, so it is a small follow-up
+rather than a permanent FFI requirement.
 
 ## Test modules (the one sanctioned module-level waiver)
 
 A `#[cfg(test)] mod tests` may carry a module-level
 `#![expect(clippy::unwrap_used, reason = "tests unwrap values they just
 constructed")]`, extended with `expect_used`, `panic` or
-`assertions_on_constants` only when that test needs it. This is the one
-sanctioned module-level waiver: a test's failure path *is* a panic, so
-waiving per call would bury the assertion under `.expect()` noise. Production
-modules get no such exception.
+`assertions_on_constants` only when that test needs it. A test's failure path
+*is* a panic, so waiving per call would bury the assertion under `.expect()`
+noise.
+
+A shared test-support module may carry a module-level `#![allow(dead_code)]`
+(today `tests/common/mod.rs`): each integration binary compiles the module but
+calls a subset of the helpers, so `expect` would be unfulfilled in a binary
+that uses every helper. This is the second and last module-level exception;
+production modules get neither.
 
 ## Python (ruff)
 
 The bench project under `bench/src/` is held to the same rule: fix the code
 first. The `ignore` list in `bench/pyproject.toml` is reserved for a property
-that is true of every tool in scope — today exactly one, S602/S603/S607,
+that is true of every tool in scope — today one property, covering S603/S607,
 because these tools measure *external* binaries reached through `PATH`
 (iperf3, tc, ss, the peers), where resolving a different program would measure
 something other than the documented tool. Every other waiver is written inline

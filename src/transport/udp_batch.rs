@@ -18,9 +18,10 @@
 //! well, because its reader borrow lives across an await). Non-Linux
 //! platforms keep the single-datagram tokio paths.
 //!
-//! This is one of the codebase's two audited FFI sites (`unsafe_code =
-//! "deny"` crate-wide, per-item expectations here; the other is the TUN
-//! attach in `src/transparent/tun.rs`). It has no `std` equivalent, and the wrapper
+//! This is one of the codebase's audited FFI sites (`unsafe_code = "deny"`
+//! crate-wide, per-item expectations here; the others are the TUN attach in
+//! `src/transparent/tun.rs` and the `sysconf` read in
+//! `src/transport/kcp.rs`). It has no `std` equivalent, and the wrapper
 //! crates were evaluated rather than assumed: `nix`'s `MultiHeaders` is
 //! itself `!Send`, so it cannot remove the `Send`/`Sync` proofs, and
 //! `quinn-udp` could remove all eight at the price of GSO/GRO semantics on
