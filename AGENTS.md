@@ -42,8 +42,8 @@ Before touching anything, verify three things:
    resolves the latest stable automatically. Never hardcode a version number
    and never bypass this file.
 
-When in doubt about environment health, run `githooks/pre-commit` end to end
-as a smoke test (the first run of `cargo audit` fetches the RustSec database;
+When in doubt about environment health, run `just check` end to end as a
+smoke test (its first `cargo audit` run fetches the RustSec database;
 slowness is normal).
 
 ## 2. Lint errors: waiver discipline
@@ -56,7 +56,7 @@ code-level.**
   comment out, or bypass a check.
 - Every check follows the **same discipline** — the Rust lints, the two ruff
   gates, and all the audits and extra checks (machete, audit, deny, outdated,
-  docs-sync, secret scan, and anything added later): fix if fixable, waive
+  docs alignment, secret scan, and anything added later): fix if fixable, waive
   only when genuinely unfixable, in code, at the narrowest scope, with a
   reason.
 - The waiver *forms* — which attribute, what scope counts as minimal, the one
@@ -82,10 +82,10 @@ code-level.**
   - source doc comments (`//!` / `///`) ↔ actual behavior.
 - User-facing docs (README, configuration, transport, benchmarks, deployment)
   keep Chinese mirrors (`*.zh.md`) and must change together; never update one
-  language only. Governance and contributor docs (checks, lint-policy,
-  release, structure, internals, build-guide, AGENTS.md, HANDOFF.md) are
-  English-only by decision — do not create `*.zh.md` for them. When touching
-  any page, at minimum keep it truthful.
+  language only. Contributor and agent docs (checks, lint-policy, release,
+  structure, internals, build-guide, AGENTS.md, HANDOFF.md) are English-only
+  by decision — do not create `*.zh.md` for them. When touching any page, at
+  minimum keep it truthful.
 - **One topic, one home.** Every fact is written once, in the page that owns
   it; every other page links to it. Putting a fact in two places guarantees
   that one of them goes stale. **The routing table is
@@ -105,13 +105,48 @@ code-level.**
     configuration page keeps its old→new migration callouts. The instruction
     stays; the story does not.
   - **Guidance about *using* the tool never sends a reader to a contributor
-    page.** `HANDOFF.md`, `AGENTS.md` and `docs/checks.md` are for people
-    changing the repository; a user who wants to configure, measure or deploy
-    is sent to `configuration`, `transport`, `benchmarks` or `release`. The one
+    or agent page.** `HANDOFF.md`, `AGENTS.md` and `docs/checks.md` are not
+    user pages; a user who wants to configure, measure or deploy
+    is sent to `configuration`, `transport`, `benchmarks` or `deployment`. The one
     exception is the landing page's own "for people changing it" index group,
     which is how a contributor finds those pages in the first place — keep that
     group clearly labelled and keep it out of the usage sections. Contributor
     pages link each other freely.
+
+### Audience and voice (one tier per page)
+
+Every page belongs to exactly one audience, and its voice follows from it.
+The roster is the Audience column of
+[docs/structure.md](docs/structure.md), "Documentation responsibilities"; this
+is the voice contract for writing it.
+
+| Tier | Pages | Write as | Carries | Never carries |
+|---|---|---|---|---|
+| **User / operator** (the person running it) | `README*.md`, `configuration*.md`, `deployment*.md`, `transport*.md`, `benchmarks*.md`, `CHANGELOG.md` | second person, task first ("run X", "set Y"); `CHANGELOG.md` is the past-tense exception ("changed X") | what is true now, how to do it, what it costs (with the method link), upgrade instructions | repository history, gate/hook names, design rationale that changes no decision |
+| **Contributor / developer** | `CONTRIBUTING.md`, `build-guide.md`, `internals.md`, `checks.md`, `lint-policy.md`, `release.md`, `structure.md` | instructional or descriptive ("the hook runs X", "to add Y, do Z") | how to build/test/release, the design and its trade-offs, the file map | sales copy, user hand-holding, a second copy of a user-page fact |
+| **Agent** | `AGENTS.md`, `HANDOFF.md` (+ archive) | imperative for rules ("do X", "never Y"); state for HANDOFF | binding rules with their reason, current state, open threads, decisions and costs | options without a decision, marketing, tutorial prose |
+| **Vulnerability reporter** | `SECURITY.md` | direct, second person | supported versions, how to report, scope, what to expect | internals, contributor workflow |
+
+- **Open with the reader.** The first paragraph says what the page is for and
+  who it assumes. A page that has to explain its audience later has the wrong
+  opening.
+- **One tier per page.** A section for another tier moves to that tier's page
+  and is linked, not restated. The landing page's labelled "for people
+  changing it" index is the one sanctioned exception (above).
+- **Current truth on user pages.** No "since v0.7", "used to", "the old
+  model", or "this release fixed": release history is `CHANGELOG.md`, design
+  history is `HANDOFF.md`, and the method's own history (why a measurement
+  changed) is `benchmarks.md`. An **upgrade instruction** — "this key was
+  removed; write that instead" — is the only history a user page keeps.
+- **Concision.** One claim per sentence; delete hedging ("simply", "quite",
+  "very"), adjectives without a measured basis, and a caveat already stated on
+  the page that owns it. A number travels with its method link, not with a
+  retelling of the method.
+- **Terms once.** Define a term at first use on the page, then keep the same
+  word: user/operator, visitor, service, claim, lane, pool, tunnel, carrier.
+- **No dead ends.** Every command, recipe and link works; a removed key names
+  its replacement; a page that sends a user onward sends them to a user page.
+
 - Changing lint config or the check chain requires syncing the affected docs
   pages, both READMEs, and this file **in the same commit**.
 - The mechanical part is automated in `githooks/check-docs`, wired into the
@@ -152,10 +187,10 @@ code-level.**
   wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
   still in development it is still being defined, so commands may be extended
   **in place** under that number; once the tag exists, the next change to the
-  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
-  — each read off its tag's `CURRENT_PROTO_VERSION`. The unreleased line on top
-  of v0.10.0 is v5; it has no tag yet, so its commands may still be extended in
-  place.
+  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4,
+  0.11 v5 — each read off its tag's `CURRENT_PROTO_VERSION`. v5 is tagged, so
+  its commands are fixed; the next wire change is v6, and a 0.11.x patch that
+  does not change the wire stays v5.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -317,15 +352,14 @@ revision) and are as binding as the lint discipline in §2.
   loopback iperf3 ceiling (~46 Gbit/s) for every tool; the same error
   reappeared when a sampler was refactored to reuse the backend port. Record
   the endpoint in the data (the port the probe dials vs the backend's) and
-  assert the invariant: the Soak runner raises when a throughput sample
-  dials the backend instead of the tool's exposed port.
+  assert the invariant: `just bench-gate` fails a throughput sample that dials
+  the backend instead of the tool's exposed port.
 - **Instrument parameters are part of the method.** Queue depth, pacing
   rate, client timeout and the window convention change the result, so they
   are recorded in the results meta (the stage order, the settle window, the
-  sample rates) and stated in the README. A constant buried in a function
-  is a method nobody can audit: a
-  hardcoded shallow queue shaped rate cells at ~30% of the nominal rate for
-  a whole baseline.
+  sample rates) and stated on the benchmarks page. A constant buried in a
+  function is a method nobody can audit: a hardcoded shallow queue shaped rate
+  cells at ~30% of the nominal rate for a whole baseline.
 - **One failure must not poison the next sample.** A wedged iperf3 server
   (single-test by design) turned every later repetition into a `null` and
   made the 8-stream slots at the rate cells look unmeasurable. Restart the
@@ -349,8 +383,8 @@ revision) and are as binding as the lint discipline in §2.
   host.
 - **A metric without contrast is not a measurement.** If every arm returns
   the same value, or the probe only ever reaches its own ceiling, remove the
-  chart panel and the claim — and say why in the README and HANDOFF — rather
-  than drawing a degenerate panel.
+  chart panel and the claim — and say why on the benchmarks page and in
+  HANDOFF — rather than drawing a degenerate panel.
 - **Re-check every consumer after reshaping data.** Renaming one field
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
@@ -400,8 +434,8 @@ pointers, not copies:
   carry forwarded traffic.
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
-  `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels, in the default set); `transparent` (a
+  `hot-reload`; `multiplex` (yamux, in the default set); `kcp`
+  (KCP-over-UDP data tunnels, in the default set); `transparent` (a
   client-owned public `ip:port` carried as whole IP packets over a TUN device,
   Linux only, in the default set); `embedded` (minimal).
   Clippy runs twice in the pre-commit gate: the second pass covers the
@@ -428,9 +462,8 @@ pointers, not copies:
 ## 12. One-line summary
 
 > Self-check the environment on entry; when a check blocks you, fix the code —
-> waive only as a last resort, locally, with a named reason; keep docs and
-> code in the same commit; write commit messages in english; commits are free,
+> waive only as a last resort, locally, with a named reason; keep docs and code
+> in the same commit; write commit messages in English; commits are free,
 > release tags are deliberate; let releases speak through CHANGELOG.md; count
-> versions from the fork point; prove every claim with real output and
-> measure the path you claim (§10); end
-> sessions clean; secrets never enter the repo.
+> versions from the fork point; prove every claim with real output and measure
+> the path you claim (§10); end sessions clean; secrets never enter the repo.

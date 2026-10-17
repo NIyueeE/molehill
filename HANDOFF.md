@@ -14,7 +14,7 @@
 > What is left is the repository-settings items and the open threads below.
 >
 > **This file owns the working state**: what is open, what was decided and why,
-> and the release checklist. Per AGENTS.md §3 it is a contributor page —
+> and the release checklist. Per AGENTS.md §3 it is an agent page —
 > user-facing facts belong in the docs pages, and anything released belongs in
 > CHANGELOG.md. The closed records — incidents, superseded sweeps, measurement
 > records, retracted diagnoses, and this cycle's whole investigation — live in
@@ -343,7 +343,7 @@ configuration surface was free to change — and this cycle changed it.
   'iperf3'` and the gate refuses the file — but it looks like a finished
   artifact until someone reads it.
 - **`/tmp` is periodically wiped.** Keep `--out` and logs under `~/tmp` or the
-  repo. The Soak harness's own work directories (`/tmp/molehill-bench.*`) are
+  repo. The bench model's own work directories (`/tmp/molehill-bench.*`) are
   normal residue and are never deleted by the harness.
 - **`timeout N` orphans the run.** The wrapper signals `uv run`, not the python
   child, which keeps executing and holds the bench lock.
@@ -355,8 +355,8 @@ configuration surface was free to change — and this cycle changed it.
 - **`sudo` works without a password** and `tc`/`ip` are present, so the shaped
   stages and the MTU classes run here.
 - **This host is `3f8b4508ab91`**: 20 cores, 23 GB RAM, kernel
-  `6.12.0-160000.38-default`. `/etc/machine-id` is **absent**, so the Soak
-  harness's `host_id` hashes `cpu model + core count` only
+  `6.12.0-160000.38-default`. `/etc/machine-id` is **absent**, so the bench
+  model's `host_id` hashes `cpu model + core count` only
   (`host_id_basis.machine_id: false`) — *not* the hostname. The container's
   hostname changes between sessions without moving `host_id`, which is the
   point: the comparable runs in this cycle's files share `host_id

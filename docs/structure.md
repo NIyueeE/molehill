@@ -101,9 +101,15 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 
 **One topic, one home.** Every fact is written once, in the page that owns it,
 and every other page links to it. A fact written twice is a fact that will go
-stale in one of the two places — this table is the contract. AGENTS.md §3
-routes by it, and carries the two rules that follow from it (what a user page
-must never explain, and who a user page may link to).
+stale in one of the two places — this table is the contract.
+
+**One audience, one voice.** The Audience column is the voice contract:
+**users** read task-oriented pages that state what is true now, **contributors**
+read instructional pages that may explain design, **agents** read binding rules
+and working state, and a **vulnerability reporter** reads `SECURITY.md`.
+AGENTS.md §3, "Audience and voice", carries the rules; this table is the
+roster. Route by it before you write, and add a row in the same commit as a new
+page.
 
 | Doc | Audience | Owns | Does **not** own |
 |-----|----------|------|------------------|
@@ -112,14 +118,16 @@ must never explain, and who a user page may link to).
 | `deployment.md` + `.zh.md` | users | how to stand it up: worked examples, systemd units, container/compose/Quadlet recipes, network requirements, deployment security | what a setting means (→ configuration), measured costs (→ benchmarks) |
 | `transport.md` + `.zh.md` | users | Noise transport setup: keys, patterns, resume | configuration reference, measured costs |
 | `benchmarks.md` + `.zh.md` | users | the benchmark method: what is measured, how to read the charts, the stage schedule, the SLO, the test types, per-decision measurements, comparability, how to reproduce a run (including the two-build screen) — and the bench model's standard: its metric registry, scenarios, profiles, verdict rules and how to run, report and compare a campaign | the release ritual and its gate (→ release), configuration reference, what each gate runs (→ checks) |
+| `CHANGELOG.md` | users | what changed, per release (past tense, one change per entry) | design rationale |
+| `CONTRIBUTING.md` | contributors | setup, the gate summary, the commit convention, test and release pointers | the full gate tables (→ checks), the waiver forms (→ lint-policy) |
 | `build-guide.md` | contributors | building from source, feature flags, minimal binaries | gate tables, release mechanics |
 | `internals.md` | contributors | wire protocol and forwarding design (registration, muxing, UDP affinity, striping) | measured comparisons (→ benchmarks) |
 | `checks.md` | contributors | gate tables: every command a hook runs and how to handle a block | lint levels, release mechanics |
 | `lint-policy.md` | contributors | declared lints, waiver discipline (Rust and python) | what the gates run |
 | `release.md` | contributors | release mechanics, versioning, CD test builds, the per-tag benchmark *ritual* and its gate | the measurement method (→ benchmarks) |
 | `structure.md` | contributors | this map — what every file is for, and which page owns which topic (the routing table AGENTS.md §3 points to) | any topic's content |
-| `HANDOFF.md` | contributors | working state: decisions, open threads, the release checklist | anything a user needs, and the closed records (→ HANDOFF-archive.md) |
-| `HANDOFF-archive.md` | contributors | the closed records: incidents, superseded sweeps, measurement records, retracted diagnoses, and each cycle's investigation | the current state (→ HANDOFF.md) |
-| `AGENTS.md` | contributors | the rules that bind future changes (§2 lint, §5 release, §10 measurement) | topic content |
-| `CHANGELOG.md` | users | what changed, per release | design rationale |
+| `HANDOFF.md` | agents | working state: decisions, open threads, the release checklist | anything a user needs, and the closed records (→ HANDOFF-archive.md) |
+| `HANDOFF-archive.md` | agents | the closed records: incidents, superseded sweeps, measurement records, retracted diagnoses, and each cycle's investigation | the current state (→ HANDOFF.md) |
+| `AGENTS.md` | agents | the rules that bind future changes (§2 lint, §5 release, §10 measurement) | topic content |
+| `SECURITY.md` | vulnerability reporters | supported versions, private reporting, scope notes | release mechanics, contributor workflow |
 | `*.zh.md` | users | Chinese mirrors of the user-facing docs (`README`, `configuration`, `deployment`, `transport`, `benchmarks`) — governance and contributor docs are English-only by decision | — |
