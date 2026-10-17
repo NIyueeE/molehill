@@ -119,6 +119,22 @@ expect "just bench-gate documented" docs/benchmarks.md 'just bench-gate'
 expect "just bench-gate documented (zh)" docs/benchmarks.zh.md 'just bench-gate'
 expect "just bench-peers documented" docs/benchmarks.md 'just bench-peers'
 
+# 5b) every backticked `just <recipe>` a live page cites must name a recipe the
+#     justfile defines. Backticks keep prose ("just the", "just a") out of the
+#     check, and the list comes from the justfile itself, so a rename that
+#     leaves a page behind fails here instead of dead-ending a reader.
+recipes=$(sed -n 's/^\([a-z][a-z0-9-]*\)\( .*\)\{0,1\}:.*/\1/p' justfile | sort -u)
+while IFS= read -r recipe; do
+  [ -n "$recipe" ] || continue
+  if printf '%s\n' "$recipes" | grep -qx -- "$recipe"; then
+    echo "  ok    just recipe exists: $recipe"
+  else
+    echo "  FAIL  a live page cites 'just $recipe', which the justfile does not define" >&2
+    errors=$((errors + 1))
+  fi
+done < <(grep -rhoE '`just [a-z][a-z0-9-]*' README.md README.zh.md docs/*.md \
+           | sed 's/^`just //' | sort -u)
+
 # 6) hooks activation instruction
 expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'
 expect "hooksPath instruction documented" README.zh.md 'core.hooksPath githooks'
@@ -134,7 +150,19 @@ done
 
 # 8b) user-facing docs keep a Chinese mirror and both READMEs link the page
 #     in their own language (AGENTS.md §3)
-for doc in configuration transport benchmarks; do
+#
+# Heading levels outside fenced code blocks. A `# comment` inside a TOML or
+# shell example is not a heading: a raw `^#` count reads 72 for deployment.md
+# against 17 for its mirror, while the structure is identical. Translated text
+# differs, so the comparison is the level sequence, not the words.
+heading_levels() {
+  awk '
+    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    !fence && /^#+[[:space:]]/ { match($0, /^#+/); print RLENGTH }
+  ' "$1"
+}
+
+for doc in configuration deployment transport benchmarks; do
   expect "docs/$doc.md linked from README" README.md "docs/$doc.md"
   expect "docs/$doc.zh.md linked from README.zh" README.zh.md "docs/$doc.zh.md"
   if [ ! -f "docs/$doc.zh.md" ]; then
@@ -142,14 +170,18 @@ for doc in configuration transport benchmarks; do
     errors=$((errors + 1))
     continue
   fi
-  # A section added to one language only is the usual way a mirror drifts:
-  # the heading count is a cheap, greppable proxy for "same structure".
-  en_headings=$(grep -c '^#' "docs/$doc.md")
-  zh_headings=$(grep -c '^#' "docs/$doc.zh.md")
-  if [ "$en_headings" -eq "$zh_headings" ]; then
-    echo "  ok    docs/$doc.md and its mirror have the same structure ($en_headings headings)"
+  # A section added to one language only is the usual way a mirror drifts.
+  # Compare the level sequence (not the words, which are translated): a
+  # reordered section or a changed depth fails here even when the count matches.
+  en_levels=$(heading_levels "docs/$doc.md")
+  zh_levels=$(heading_levels "docs/$doc.zh.md")
+  if [ "$en_levels" = "$zh_levels" ]; then
+    count=$(printf '%s\n' "$en_levels" | awk 'NF { n++ } END { print n }')
+    echo "  ok    docs/$doc.md and its mirror have the same structure ($count headings)"
   else
-    echo "  FAIL  docs/$doc.md has $en_headings headings, docs/$doc.zh.md has $zh_headings — the mirror drifted" >&2
+    echo "  FAIL  docs/$doc.md and docs/$doc.zh.md have different heading structure — the mirror drifted" >&2
+    echo "        en: $(printf '%s' "$en_levels" | tr '\n' ' ')" >&2
+    echo "        zh: $(printf '%s' "$zh_levels" | tr '\n' ' ')" >&2
     errors=$((errors + 1))
   fi
 done
