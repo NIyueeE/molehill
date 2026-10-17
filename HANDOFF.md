@@ -323,7 +323,7 @@ configuration surface was free to change — and this cycle changed it.
     `Send + Sync` struct whose `recv`/`send` take caller-owned slice buffers),
     but it also brings GSO/GRO segmentation, i.e. it changes the send path's
     syscall shape. That is a measurable change to the KCP data path, so it
-    belongs in its own `just soak --test=screen` run against the current
+    belongs in its own `just bench --profile screen` run against the current
     batching rather than in a lint cleanup.
 - **Privileged ports** are documented as *not* implemented (the whitelist admits
   any port it contains; the OS decides whether the bind succeeds). Enforcing
@@ -348,8 +348,8 @@ configuration surface was free to change — and this cycle changed it.
 - **`timeout N` orphans the run.** The wrapper signals `uv run`, not the python
   child, which keeps executing and holds the bench lock.
 - **Peers are cached** in `~/tmp/bench-peers` and the interop binary in
-  `~/tmp/interop`, so `just soak` and `just interop` normally need no network.
-  `just soak-peers` re-resolves each peer to the **latest GitHub release** and
+  `~/tmp/interop`, so `just bench` and `just interop` normally need no network.
+  `just bench-peers` re-resolves each peer to the **latest GitHub release** and
   re-downloads when the cached version is behind; the resolved versions are
   recorded in the results meta beside the numbers.
 - **`sudo` works without a password** and `tc`/`ip` are present, so the shaped
