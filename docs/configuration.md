@@ -1,8 +1,11 @@
 # Configuration
 
-`molehill` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in the [Quickstart](../README.md#quickstart).
-
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `molehill --server config.toml` and on the client side, run `molehill --client config.toml` to explicitly tell `molehill` the running mode.
+`molehill` picks its run mode from the configuration file: at least one of
+`[server]`, `[client]` or `[transparent]` must be present, as in the
+[Quickstart](../README.md#quickstart). A file may carry more than one block,
+but then the mode must be chosen with `--server` / `--client` /
+`--transparent`; without a flag the process refuses to guess. A host that wants
+two roles runs two processes.
 
 Ready-to-run configurations, systemd units and container deployments live
 in [Deployment & examples](./deployment.md).
@@ -11,7 +14,7 @@ See [Transport](./transport.md) for more details about encryption and the `trans
 
 Page index:
 
-- [How to configure (v0.7+ model)](#how-to-configure-v07-model)
+- [How to configure](#how-to-configure)
 - [Choosing your configuration (decision tree)](#choosing-your-configuration-decision-tree)
 - [Dynamic service registration](#dynamic-service-registration)
 - [Multiplexing (`multiplex` feature)](#multiplexing-multiplex-feature)
@@ -22,10 +25,10 @@ Page index:
 - [Usage notes](#usage-notes)
 - [Troubleshooting](#troubleshooting)
 
-## How to configure (v0.7+ model)
+## How to configure
 
-Since v0.7 the **client owns the service definitions** and the server owns
-only the policy:
+The **client owns the service definitions** and the server owns only the
+policy:
 
 - The client declares each forwarded service in its own config — including
   the public address it should be exposed at (`remote_bind_addr`).
@@ -38,9 +41,9 @@ A process runs in exactly **one** of three modes, and the file says which:
 `[server]`, `[client]` (forwarding) or `[transparent]` (L3 — see
 [Transparent (L3) services](#transparent-l3-services)). A mode is a property of
 the *process* — its capabilities, its sockets, its TUN device — so a file
-carrying two blocks is refused, and a host that wants two roles runs two
-processes. `--server` / `--client` / `--transparent` override what the file
-says.
+carrying two blocks needs a flag to pick one, and a host that wants two roles
+runs two processes. `--server` / `--client` / `--transparent` override what the
+file says.
 
 A typical setup:
 
@@ -579,7 +582,7 @@ round trips per second than the same claim as one stream of a pool
 (default `true`), which is whether an idle lane of one claim may be lent to a
 sibling carrying more flows than lanes. `lend = false` holds the equal split
 static; the mechanism's worth depends on what limits the path
-([Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when)), and this is the
+([Benchmarks](./benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)), and this is the
 key that turns it off. The count itself has a different meaning here. A
 forwarding `tunnels` is a pool's width; a claim's is a budget of connections,
 because there is no pool: each claim's share is `tunnels / claims`, never below

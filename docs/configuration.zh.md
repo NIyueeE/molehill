@@ -1,20 +1,17 @@
 # 配置
 
-`molehill` 可以根据配置文件的内容自动判断以服务端还是客户端模式运行:如果
-`[server]` 与 `[client]` 块只出现一个,就自动选择对应模式,如
-[快速开始](../README.zh.md#快速开始)中的示例。
-
-`[client]` 与 `[server]` 块也可以放在同一个文件里:此时在服务端运行
-`molehill --server config.toml`,在客户端运行 `molehill --client config.toml`,
-显式指定运行模式。
+`molehill` 从配置文件判断运行模式:`[server]`、`[client]`、`[transparent]`
+三者中至少要出现一个,如[快速开始](../README.zh.md#快速开始)中的示例。文件
+可以包含多个块,但此时必须用 `--server` / `--client` / `--transparent` 选定
+模式;不带标志时进程拒绝猜测。一台机器要扮演两种角色,就跑两个进程。
 
 开箱即用的配置、systemd 单元与容器部署见[部署与示例](./deployment.zh.md)。
 
-加密与 `transport` 块的更多细节见[传输层文档](./transport.md)。
+加密与 `transport` 块的更多细节见[传输层文档](./transport.zh.md)。
 
 页面索引:
 
-- [如何配置(v0.7+ 模型)](#如何配置v07-模型)
+- [如何配置](#如何配置)
 - [选择配置(决策树)](#选择配置决策树)
 - [动态服务注册](#动态服务注册)
 - [多路复用(`multiplex` 特性)](#多路复用multiplex-特性)
@@ -25,9 +22,9 @@
 - [使用说明](#使用说明)
 - [故障排查](#故障排查)
 
-## 如何配置(v0.7+ 模型)
+## 如何配置
 
-自 v0.7 起,**服务定义归客户端所有**,服务端只拥有策略:
+**服务定义归客户端所有**,服务端只拥有策略:
 
 - 客户端在自己的配置里声明每个要转发的服务——包括它应该暴露的公网地址
   (`remote_bind_addr`)。
@@ -38,13 +35,13 @@
 一个进程只运行在**三种模式之一**,由配置文件表明是哪一种:`[server]`、
 `[client]`(转发)或 `[transparent]`(L3——见[透明(L3)服务](#透明l3服务))。
 模式是**进程**的属性——它的能力、它的 socket、它的 TUN 设备——所以同时写了
-两张表的文件会被拒绝,而一台想扮演两种角色的机器就跑两个进程。
+两张表的文件需要用一个标志选定模式,而一台想扮演两种角色的机器就跑两个进程。
 `--server` / `--client` / `--transparent` 覆盖文件里的声明。
 
 典型配置步骤:
 
 1. 选择传输层——`plain` 或 `noise`——`noise` 需要生成一对密钥(见
-   [传输层文档](./transport.md))。
+   [传输层文档](./transport.zh.md))。
 2. 编写 `server.toml`:`[server]` 只需 `default_token` 和 `allow_ports`
    白名单,监听地址是 `[server.control].bind_addr`,仅此而已。
 3. 编写 `client.toml`:`[client]` 配置相同的 `default_token`,服务端地址是
@@ -146,7 +143,7 @@
 认领的通道**就是**它的载体连接——认领的吞吐是**连接**之和,而不是流之和——所以对它
 做多路复用等于白付成帧成本:同一台主机、同一份负载下,同一条认领走自己的连接时线上
 字节少 6%、每包 CPU 少 33%、每秒往返次数多 65%
-([基准测试](./benchmarks.zh.md#the-transparent-l3-wire-question-the-acceptance-harness))。
+([基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
 
 ### 迁移到 0.11:carrier 与池的时钟
 
@@ -195,7 +192,7 @@ flowchart TD
 | `tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住。实测为所有路径上最差的配置 |
 | `tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
 | `tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限;在干净快速路径上实测从一条隧道到八条吞吐 +77% |
-| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价按决策的测量)) |
+| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)) |
 | transport | `"plain"` | 不加密,每字节开销最低 —— 只适用于载荷自带加密的**单个服务**;控制通道始终加密 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
 | 池的建立 | (没有对应的键) | 池的 `tunnels` 条连接在服务启动时拨出,而不是在第一个访客到来时:请求时不需要付任何代价,成本是 `tunnels` 条空闲连接(实测每条 0.5–0.8 MiB RSS 与 2.6 个 FD,不占线程) |
@@ -229,13 +226,13 @@ default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:�
 type = "noise" # 必需,且 `"noise"` 是守护进程唯一接受的值:控制通道携带的是每个数据通道用来鉴权的凭证,明文控制腿在启动时即被拒绝。单个*服务*仍可在下面覆盖为 `"plain"
 proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。仅客户端。通过 `http`/`socks5` 代理连接服务端
 
-[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.md`
+[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.zh.md`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如所示
 local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # 可选。本客户端自己的密钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
 remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # 必需:服务端的公钥 # security-scan:allow documentation example key
 psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.zh.md`「Noise session resume」
 
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
 protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"。必须自己拥有公网 ip:port 的服务根本不是转发服务:它属于 `[transparent]` 表,那是一种独立的运行模式——见下文「透明(L3)服务」
@@ -277,7 +274,7 @@ local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # 必需:本�
 remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # 可选。客户端的公钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
 psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.zh.md`「Noise session resume」
 
 [server.transparent] # 可选,而这张表本身就是开关:它存在,服务端才会提供透明(L3)客户端。没有它,认领会在看任何设备之前被策略拒绝——提供 L3 意味着向本进程索要 CAP_NET_ADMIN 与 TUN 设备,所以这是运维方的决定,永远不是远端客户端的
 tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
@@ -772,7 +769,7 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 
 ### 传输层
 
-传输层配置——Noise 密钥对、pattern 与 PSK——在[传输层文档](./transport.md)
+传输层配置——Noise 密钥对、pattern 与 PSK——在[传输层文档](./transport.zh.md)
 中逐步说明:在上面的规范中选好 `type`,再跟着那篇指南做。
 
 - **代理**:`[client.transport].proxy` 只作用于客户端到服务端的出站连接

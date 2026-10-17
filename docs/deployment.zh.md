@@ -15,9 +15,10 @@
 ## 完整示例
 
 以下每个代码块都能被当前二进制解析,配置测试套件会持续校验。数据面表
-(`[client.data]`、`[server.data]`)需要 `multiplex` 特性,它属于默认构建;
-同一个客户端可以混用模式,因为每个服务都可以在自己的
-`[client.services.<name>]` 块里覆盖 `mode`/`carrier`。
+(`[client.data]`、`[server.data]`)需要 `multiplex` 特性,它属于默认构建。
+一个进程只运行一种模式(`[client]`、`[server]` 或 `[transparent]`);数据面的
+形态由服务类型决定,carrier 在运行时选择,两者都不是逐服务的键
+(见[配置文档](./configuration.zh.md#迁移数据面的形态不再是键))。
 
 ### 最小配置
 

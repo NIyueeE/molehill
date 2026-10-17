@@ -17,9 +17,11 @@ default and its allowed values.
 
 Every block below parses with the current binary, enforced by the config
 test suite. The data-plane tables (`[client.data]`, `[server.data]`) require
-the `multiplex` feature, which is part of the default build, and a client
-can mix modes because every service may override `mode`/`carrier` on its own
-`[client.services.<name>]` block.
+the `multiplex` feature, which is part of the default build. A process runs
+one mode (`[client]`, `[server]` or `[transparent]`); the data plane's shape
+follows the service type and its carrier is chosen at runtime, so neither is a
+per-service key
+([Configuration](./configuration.md#migrating-the-data-planes-shape-is-no-longer-a-key)).
 
 ### Minimal
 
@@ -255,7 +257,7 @@ worth a great deal when the *carrier connections* are the limit (a long-haul or
 lossy path) and nothing on a fast, short one, at the cost of more connections
 and more CPU; the numbers and the `lend = false` switch are
 [Configuration](./configuration.md#transparent-l3-services) and
-[Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when).
+[Benchmarks](./benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
 The server serves L3 only if **its own** config asks for it: the
 `[server.transparent]` table in `server.toml` below is that switch, and without

@@ -17,7 +17,7 @@ choice costs". This page covers `noise`;
 The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight,
 easy-to-configure way to encrypt the connection: one X25519 keypair, no PKI.
 
-`molehill` comes with a reasonable default configuration; see the minimal [noise example](./deployment.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so MITM is no longer a problem.
+`molehill` comes with a reasonable default configuration; see the minimal [noise example](./deployment.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so a MITM cannot impersonate it.
 
 > **What ring-accelerated buys.** The default build links `snow`'s
 > **ring-accelerated** resolver, so the ChaCha20-Poly1305 data path — the
@@ -44,7 +44,7 @@ Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
 ```
 
-(WARNING: Don't use the keypair from the Internet, including this one)
+(Do not use a keypair from the Internet, including this one.)
 
 The server keeps the private key to identify itself, and the client keeps the public key to verify the server:
 
@@ -69,7 +69,7 @@ design. That is structural rather than a rule — its `[transparent.transport]`
 table holds the `proxy` key and no key for a cipher, so there is nowhere to ask
 — see [Configuration](./configuration.md#transparent-l3-services). What a
 *server* accepts is unaffected: its Noise keys still apply to every client that
-negotiates them, and an L3 client simply never does.
+negotiates them, and an L3 client never does.
 
 The client-wide `[client.transport].type` is the default for every service,
 and each service can override it individually — including its own keys, which
