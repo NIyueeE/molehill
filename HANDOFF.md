@@ -136,6 +136,12 @@
   current attach against 1.2045 for `tun-rs` (~0.6 % slower, inside the 15 %
   floor), and it adds 29 crates (netlink/route_manager, encoding_rs, winreg,
   zerocopy, ...) and ~300 lockfile lines. The three audited ioctls stay.
+  Cherry-picking only the code paths used was also considered and rejected:
+  the Linux device/offload/async path is 4,588 lines with 41 `unsafe` blocks,
+  while the needed attach/offload/read/write subset is already this crate's
+  299-line `tun.rs` with 3 audited blocks. Vendoring would multiply the audit
+  surface, not shrink it; KCP is safe state-machine code, whereas TUN is a
+  syscall boundary by nature.
 - **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
   trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
   `set_var`/`remove_var` scoped and safe at the call site; a worktree
