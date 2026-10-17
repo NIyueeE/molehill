@@ -32,13 +32,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import instruments as inst
-import iperf
-import model
-import topology
+from bench import instruments as inst
+from bench import iperf, model, topology
 
 HERE = Path(__file__).resolve().parent
 RR_PROBE = HERE / "probes" / "rr.py"
@@ -126,27 +125,35 @@ class Spot:
     cell: str
 
 
+#: The running arm's pid map, supplied by the runner.
+PidsOf = Callable[[], dict[str, int]]
+#: The backend's peers announced since the previous cell, or no reader.
+PeersOf = Callable[[], list[str]] | None
+#: Stop and restart the arm, returning (seconds to answer, failure reason).
+RestartArm = Callable[[], tuple[float | None, str]] | None
+
+
 @dataclass
 class Ctx:
     """Everything a workload needs, so no workload takes a long argument list."""
 
     topo: topology.Topology
-    pids_of: object
+    pids_of: PidsOf
     work: Path
     arm: model.Arm
     probe_startup_s: float = 0.0
     #: The backend's announced peers, read after each cell: on an L3 arm the
     #: backend must see the *visitor*, and on L4 the client. It is the
     #: transparency evidence, recorded beside the numbers rather than assumed.
-    peers_of: object = None
+    peers_of: PeersOf = None
     #: The campaign's condition and the leg it is imposed on: a staged scenario
     #: changes conditions *within* a run and must put this one back.
     leg: str = "visitor"
-    condition: object = None
+    condition: model.Condition | None = None
     #: Restart the arm's daemons and return the seconds until the service
     #: answers — the reconnect scenario's instrument (the runner owns the
     #: processes, the workload owns the measurement).
-    restart_arm: object = None
+    restart_arm: RestartArm = None
 
 
 class Backend:
@@ -321,8 +328,9 @@ def _evidence(ctx: Ctx, window: dict, extra: dict | None = None) -> dict:
     }
     if extra:
         out |= extra
-    if ctx.peers_of is not None:
-        out["backend_peers"] = sorted(set(ctx.peers_of()))
+    peers_of = ctx.peers_of
+    if peers_of is not None:
+        out["backend_peers"] = sorted(set(peers_of()))
     return out
 
 
@@ -1124,12 +1132,13 @@ def run_reconnect(ctx: Ctx, params: dict) -> list:
     the workload asks it to: five restarts, each timed from spawn to the first
     answered connection, which is what a visitor actually waits for.
     """
-    if ctx.restart_arm is None:
+    restart_arm = ctx.restart_arm
+    if restart_arm is None:
         return [Cell("", False, reason="this arm cannot be restarted")]
     starts: list = []
     failures: list = []
     for _ in range(max(1, params["reps"])):
-        seconds, why = ctx.restart_arm()
+        seconds, why = restart_arm()
         if seconds is None:
             failures.append(why)
         else:

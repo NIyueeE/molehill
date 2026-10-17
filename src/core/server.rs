@@ -10,7 +10,7 @@ use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
 #[cfg(feature = "multiplex")]
 use crate::protocol::read_tunnel_prologue;
 use crate::protocol::{
-    self, Ack, CURRENT_PROTO_VERSION, Carrier, ControlChannelCmd, DataChannelCmd,
+    self, Ack, CURRENT_PROTO_VERSION, Carrier, ControlChannelCmd, DataChannelCmd, FrameFormat,
     HASH_WIDTH_IN_BYTES, Hello, MAX_UDP_HEADER_LEN, NOISE_SELECTOR, PLAIN_SELECTOR, ServiceId,
     ServiceRegistration, SessionCmd, SessionRegistration, UdpTraffic, read_auth, read_hello,
     read_session_cmd, read_stream_prologue, write_register_result,
@@ -119,10 +119,18 @@ struct RegisteredService {
     /// The TUN device a transparent service's data path attaches to
     /// (`[server.transparent].tun`); `None` for every other service type.
     #[cfg_attr(
-        not(all(feature = "transparent", target_os = "linux")),
+        not(all(
+            feature = "transparent",
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        )),
         expect(dead_code, reason = "read only by the transparent data path")
     )]
     transparent_tun: Option<String>,
+    /// The frame shape this service's transparent channels carry. `Ip` for
+    /// every forwarding service, and for a transparent one that did not
+    /// negotiate the Linux vnet fast path.
+    #[cfg(feature = "transparent")]
+    wire_format: FrameFormat,
 }
 
 // The entrypoint of running a server
@@ -243,7 +251,10 @@ type LaneCounter = ();
 
 /// What a transparent service charges its lanes to: the session's counter and
 /// the operator's cap.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 #[derive(Clone, Default)]
 struct LaneValve {
     counter: LaneCounter,
@@ -254,18 +265,27 @@ struct LaneValve {
 /// A build without the transparent data path has no lane to charge. The type
 /// stays, so the plumbing that carries it reads the same everywhere, and it is
 /// zero-sized.
-#[cfg(not(all(feature = "transparent", target_os = "linux")))]
+#[cfg(not(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+)))]
 #[derive(Clone, Default)]
 struct LaneValve;
 
 impl LaneValve {
     /// The valve one session's services charge their lanes to.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     fn new(counter: LaneCounter, cap: usize) -> Self {
         Self { counter, cap }
     }
 
-    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     fn new(_counter: LaneCounter, _cap: usize) -> Self {
         Self
     }
@@ -274,7 +294,11 @@ impl LaneValve {
     ///
     /// `Err(held)` is the number of connections the client already holds, for
     /// the refusal line — the same contract as the tunnel valve's.
-    #[cfg(all(feature = "transparent", target_os = "linux", feature = "multiplex"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        feature = "multiplex"
+    ))]
     fn reserve(&self) -> std::result::Result<Option<TunnelGuard>, usize> {
         match &self.counter {
             Some(count) => count.try_reserve(self.cap).map(Some),
@@ -287,7 +311,7 @@ impl LaneValve {
     /// nothing counts them.
     #[cfg(all(
         feature = "transparent",
-        target_os = "linux",
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
         not(feature = "multiplex")
     ))]
     fn reserve(&self) -> std::result::Result<Option<()>, usize> {
@@ -304,10 +328,16 @@ impl LaneValve {
 struct TransparentContext {
     /// Held for the service's lifetime: the address stays claimed until this
     /// task ends. Read only by the transparent data path.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     claim: Option<Claim>,
     /// The session's lane valve.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     lane_valve: LaneValve,
     /// Where the claim's per-lane counters are reported to its client.
     ///
@@ -315,13 +345,19 @@ struct TransparentContext {
     /// transparent claim happens here (this end reads the visitor's traffic off
     /// its own device and offers it to the lanes), so the client cannot see it
     /// without being told.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     sink: ControlSink,
 }
 
 impl TransparentContext {
     /// What a registration hands the service it just accepted.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     fn new(claim: Option<Claim>, lane_valve: LaneValve, sink: ControlSink) -> Self {
         Self {
             claim,
@@ -332,7 +368,10 @@ impl TransparentContext {
 
     /// A build without the transparent data path has no lane to charge and no
     /// claim to hold, so there is nothing to carry.
-    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     fn new(_claim: Option<Claim>, _lane_valve: LaneValve, _sink: ControlSink) -> Self {
         Self {}
     }
@@ -876,7 +915,10 @@ enum Registration {
 /// client's, whose registration arrives at runtime and could otherwise be what
 /// makes this host reach for `/dev/net/tun`. A server without the table
 /// therefore refuses by policy, before any device is looked at.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
     match server_config.transparent.as_ref() {
         Some(transparent) => Ok(&transparent.tun),
@@ -896,6 +938,11 @@ fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
 /// that turns a port conflict into a precise rejection. The caller takes over
 /// any previous registration for the service *before* calling this, so
 /// `bind_with_retry` absorbs that asynchronous teardown.
+#[expect(
+    clippy::too_many_lines,
+    reason = "registration is one policy sequence: allow_ports, carrier, transparent \
+              prerequisites and the claim, then bind"
+)]
 async fn register_service(
     reg: &ServiceRegistration,
     server_config: &Arc<ServerConfig>,
@@ -911,6 +958,15 @@ async fn register_service(
     registry: &Arc<Registry>,
 ) -> Result<Registration> {
     info!(service = %reg.name, "Registering service at {}", reg.bind_addr);
+
+    if reg.service_type != ServiceType::Transparent && reg.transparent_capabilities.is_some() {
+        let reason = format!(
+            "Service {} declared transparent capabilities but is not a transparent service",
+            reg.name
+        );
+        warn!(service = %reg.name, "{reason}");
+        return Ok(Registration::Rejected(reason));
+    }
 
     // Policy check: `allow_ports` is the master switch for dynamic
     // registration. An empty whitelist rejects everything.
@@ -951,11 +1007,14 @@ async fn register_service(
     // four things have to hold before it is accepted: this server serves L3 at
     // all (the operator's own `[server.transparent]`, checked first so that a
     // client's registration is never what makes this process reach for a
-    // device), the build and platform can carry it, the routing contract is
-    // satisfiable (the operator's TUN device exists), and no other service
-    // already owns that address.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
-    let (claim, transparent_tun) = {
+    // device), the build and platform can carry it, the device can be opened
+    // (Linux requires the operator's TUN to exist; macOS/Windows create theirs),
+    // and no other service already owns that address.
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    let (claim, transparent_tun, wire_format) = {
         if reg.service_type == ServiceType::Transparent {
             let tun = match transparent_tun_for(server_config) {
                 Ok(tun) => tun,
@@ -974,7 +1033,7 @@ async fn register_service(
             // sees silence. Checked here (the first transparent registration)
             // rather than at startup: serving L3 is this table's switch, and
             // a server that never serves it never needs the sysctl.
-            if let Err(e) = crate::transparent::check::check_server() {
+            if let Err(e) = crate::transparent::check::check_server(reg.bind_addr.ip()) {
                 let reason = format!("{e:#}");
                 warn!(service = %reg.name, "Registration failed: {reason}");
                 return Ok(Registration::Rejected(reason));
@@ -987,23 +1046,50 @@ async fn register_service(
                 warn!(service = %reg.name, "{reason}");
                 return Ok(Registration::Rejected(reason));
             };
-            (Some(held), Some(tun.to_string()))
+            let hub = match crate::transparent::hub::TunHub::get_or_spawn(
+                tun,
+                crate::transparent::Direction::Destination,
+            ) {
+                Ok(hub) => hub,
+                Err(e) => {
+                    let reason = format!("{e:#}");
+                    warn!(service = %reg.name, "Registration failed: {reason}");
+                    return Ok(Registration::Rejected(reason));
+                }
+            };
+            let client_vnet = reg
+                .transparent_capabilities
+                .is_some_and(|capabilities| capabilities.vnet_frames);
+            let wire = if client_vnet
+                && hub.format() == FrameFormat::Vnet
+                && !crate::transparent::force_ip_wire()
+            {
+                FrameFormat::Vnet
+            } else {
+                FrameFormat::Ip
+            };
+            (Some(held), Some(tun.to_string()), wire)
         } else {
-            (None, None)
+            (None, None, FrameFormat::Ip)
         }
     };
-    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
-    let (claim, transparent_tun): (Option<Claim>, Option<String>) = {
+    #[cfg(not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
+    let (claim, transparent_tun, wire_format): (Option<Claim>, Option<String>, FrameFormat) = {
         if reg.service_type == ServiceType::Transparent {
             let reason = "This server cannot serve `protocol = \"transparent\"`: it carries \
-                          whole IP packets through a TUN device, which needs a Linux build with \
-                          the `transparent` feature. This build does not have it."
+                          whole IP packets through a TUN device, which needs a `transparent` \
+                          build on Linux, macOS or Windows. This build does not have it."
                 .to_string();
             warn!(service = %reg.name, "{reason}");
             return Ok(Registration::Rejected(reason));
         }
-        (None, None)
+        (None, None, FrameFormat::Ip)
     };
+    #[cfg(not(feature = "transparent"))]
+    let _ = wire_format;
 
     let service = RegisteredService {
         name: reg.name.clone(),
@@ -1011,6 +1097,8 @@ async fn register_service(
         bind_addr: reg.bind_addr,
         udp_buffer_size: reg.udp_buffer_size as usize,
         transparent_tun,
+        #[cfg(feature = "transparent")]
+        wire_format,
     };
 
     // Bind the public endpoint eagerly so that conflicts are reported
@@ -1265,7 +1353,11 @@ impl SessionCtx {
     /// answers `LANE_DRAIN_UNKNOWN` rather than pretending to have drained
     /// something: the client then keeps the lane instead of retiring a
     /// connection on an answer about nothing.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     async fn lane_drain(
         &self,
         service_id: ServiceId,
@@ -1316,7 +1408,11 @@ impl SessionCtx {
     /// A build without the transparent data path has no lane to drain; the
     /// answer is the same one an unknown lane gets, so the client's handling is
     /// one shape.
-    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     #[expect(
         clippy::unused_async,
         clippy::unused_async_trait_impl,
@@ -1729,7 +1825,10 @@ fn report_tunnel_violation(service_id: ServiceId, why: &str) {
 
 /// Report a transparent lane the valve refused: once per process at `info` —
 /// the operator wrote the cap, so this is it biting — then at `debug`.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn report_lane_refusal(held: usize, cap: usize) {
     static LANE_REFUSALS: RepeatNotice = RepeatNotice::new();
     LANE_REFUSALS.report(
@@ -2317,7 +2416,10 @@ static CLAIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<So
 struct Claim(SocketAddr);
 
 #[cfg_attr(
-    not(all(feature = "transparent", target_os = "linux")),
+    not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )),
     expect(dead_code, reason = "transparent registrations are refused here")
 )]
 impl Claim {
@@ -2620,7 +2722,10 @@ impl ControlChannelHandle {
 /// A replacement is requested when a member of the claim ends; without a pause,
 /// a peer that refuses the start command instantly would be asked again just as
 /// instantly.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How often a transparent claim reports its per-lane counters to its client.
@@ -2630,7 +2735,10 @@ const TRANSPARENT_REPLACE_BACKOFF: std::time::Duration = std::time::Duration::fr
 /// report would make every window a guess, and a faster one would spend the
 /// session's single writer on telemetry. Only lanes whose counters *moved* are
 /// sent, so a quiet claim costs nothing.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 const LANE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Aborts a claim's lane reporter when the claim's task ends.
@@ -2639,10 +2747,16 @@ const LANE_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// returns from several arms (shutdown, a dead control task, the channel queue
 /// closing), and a reporter that outlived its claim would keep a session writer
 /// alive and report lanes nobody holds.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 struct LaneReporter(tokio::task::JoinHandle<()>);
 
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 impl Drop for LaneReporter {
     fn drop(&mut self) {
         self.0.abort();
@@ -2668,7 +2782,10 @@ impl Drop for LaneReporter {
 /// is quiet (or whose lanes are carrying everything) costs no control traffic,
 /// and the client's own staleness rule is what bounds a lane that stops
 /// reporting.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 fn spawn_lane_reporter(
     hub: std::sync::Arc<crate::transparent::hub::TunHub>,
     endpoint: crate::transparent::Endpoint,
@@ -2759,13 +2876,19 @@ fn spawn_lane_reporter(
 /// rather than part of the set the client opened in one go. Both halves of that
 /// rule live here so they can be read (and tested) without a TUN device: the
 /// loop below is plumbing, this is the policy.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 #[derive(Default)]
 struct MemberSupervisor {
     ended: usize,
 }
 
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 impl MemberSupervisor {
     /// Whether a channel arriving now is a replacement, and therefore paced.
     ///
@@ -2800,12 +2923,22 @@ impl MemberSupervisor {
 /// members that actually join. A member's end does not narrow it — the slot is
 /// kept, so the surviving flows stay where they are — and the replacement
 /// inherits the slot its predecessor held.
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the supervisor owns the receiver, requester, device, endpoint, wire format, \
+              shutdown, control task and claim context; grouping them would only move the \
+              same fields into one struct"
+)]
 async fn run_transparent_service<C>(
     mut data_ch_rx: mpsc::Receiver<C>,
     data_ch_req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     tun: String,
     endpoint: SocketAddr,
+    wire: FrameFormat,
     mut shutdown_rx: broadcast::Receiver<bool>,
     mut control_task: tokio::task::JoinHandle<()>,
     transparent: TransparentContext,
@@ -2820,6 +2953,7 @@ where
     // into the same line.
     let hub = TunHub::get_or_spawn(&tun, Direction::Destination)?;
     let endpoint = Endpoint::new(endpoint.ip(), endpoint.port());
+    hub.set_wire_format(endpoint, wire)?;
     let TransparentContext {
         claim: _claim,
         lane_valve,
@@ -2833,7 +2967,7 @@ where
     let _reporter = spawn_lane_reporter(Arc::clone(&hub), endpoint, sink);
 
     let start_cmd = Arc::new(postcard::to_stdvec(
-        &DataChannelCmd::StartForwardTransparent,
+        &DataChannelCmd::StartForwardTransparent(wire),
     )?);
     // What the claim has lost, and what that makes of the channels arriving.
     let mut lost_members = MemberSupervisor::default();
@@ -2860,7 +2994,7 @@ where
                 // is dropped — reading nothing would leave its bytes to be
                 // parsed as frames, and a lane nobody can attribute is exactly
                 // what this is here to end.
-                #[cfg(all(feature = "multiplex", target_os = "linux"))]
+                #[cfg(all(feature = "multiplex", any(target_os = "linux", target_os = "macos", target_os = "windows")))]
                 let named_lane = match crate::protocol::read_lane_half(&mut channel).await {
                     Ok(lane) => Some(lane),
                     Err(e) => {
@@ -2868,7 +3002,7 @@ where
                         continue;
                     }
                 };
-                #[cfg(not(all(feature = "multiplex", target_os = "linux")))]
+                #[cfg(not(all(feature = "multiplex", any(target_os = "linux", target_os = "macos", target_os = "windows"))))]
                 let named_lane = None;
                 // The operator's valve counts these lanes too: a claim's channel
                 // is a carrier connection of its own, and before this it was the
@@ -2909,7 +3043,7 @@ where
                     // the prologue — so this end's counters can be attributed
                     // to the connection that carried the traffic.
                     if let Err(e) =
-                        forward_transparent(channel, hub, endpoint, named_lane, None).await
+                        forward_transparent(channel, hub, endpoint, named_lane, None, wire).await
                     {
                         debug!("Transparent channel for {endpoint} ended: {e:#}");
                     }
@@ -2939,7 +3073,10 @@ where
 /// operator's TUN device and whoever holds a slot, and asking for a replacement
 /// whenever one ends.
 #[cfg_attr(
-    not(all(feature = "transparent", target_os = "linux")),
+    not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )),
     expect(
         unused_variables,
         clippy::needless_pass_by_value,
@@ -2957,10 +3094,14 @@ fn spawn_transparent_service(
     transparent: TransparentContext,
     pool_died_tx: mpsc::UnboundedSender<()>,
 ) {
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     {
         let tun = service.transparent_tun.clone().unwrap_or_default();
         let endpoint = service.bind_addr;
+        let wire = service.wire_format;
         tokio::spawn(
             async move {
                 if let Err(e) = run_transparent_service(
@@ -2968,6 +3109,7 @@ fn spawn_transparent_service(
                     data_ch_req_tx,
                     tun,
                     endpoint,
+                    wire,
                     shutdown_rx,
                     control_task,
                     transparent,
@@ -2981,7 +3123,10 @@ fn spawn_transparent_service(
             .instrument(Span::current()),
         );
     }
-    #[cfg(not(all(feature = "transparent", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )))]
     {
         // A registration is refused long before this on such a build; the
         // parameters are consumed so the signature stays one shape.
@@ -4220,7 +4365,11 @@ mod tests {
     /// A lane and a tunnel draw on the **same** session counter, which is what
     /// makes `[server.data].max_tunnels_per_client` a bound on the carrier
     /// connections one client holds rather than on one kind of them.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     // The module-level waiver cannot carry `expect_used`: this test is gated on
     // three cfgs, so most builds would leave the module's expectation
     // unfulfilled.
@@ -4267,7 +4416,10 @@ mod tests {
     /// there is what the data path gets. `[server.transparent]` is an `Option`
     /// for exactly this reason: a defaulted table would leave this process
     /// armed to attach a device the operator never asked for.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     #[test]
     fn the_server_switch_governs_transparent_registrations() {
         let mut server = ServerConfig::default();
@@ -4662,7 +4814,10 @@ mod tests {
     /// channel is a replacement and is paced. Each end asks for exactly one
     /// channel — one death, one request — because a claim short two members
     /// must be repaired twice, not once.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     #[test]
     fn a_member_end_makes_the_next_channel_a_paced_replacement() {
         let mut supervisor = MemberSupervisor::default();

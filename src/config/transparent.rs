@@ -39,8 +39,10 @@ use crate::config::parsing::{ClientDataConfig, DataCarrierLimits};
 pub struct TransparentClientConfig {
     /// Shared secret, must match `[server].default_token`. Required.
     pub default_token: MaskedString,
-    /// The TUN device this client attaches to; the device, its addresses and
-    /// its routes are the operator's, as on the forwarding side.
+    /// The TUN device this client attaches to. On Linux the operator creates
+    /// it and owns its addresses and routes. On macOS the daemon creates the
+    /// utun and assigns the claimed addresses, while the operator owns the pf
+    /// rule and routes. `auto` (the macOS default) picks a free `utunN`.
     #[serde(default = "default_tun_name")]
     pub tun: String,
     #[serde(default)]
@@ -67,7 +69,8 @@ pub struct TransparentClientConfig {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentClaimConfig {
-    /// The public address this client **claims**, e.g. `"10.99.0.1:8443"`.
+    /// The public address this client **claims**, e.g. `"10.99.0.1:8443"` or
+    /// `"[2001:db8::1]:8443"`.
     /// Required. The server binds nothing for it; its port must still be
     /// covered by the server's `allow_ports`, because a claim is a
     /// registration like any other.
@@ -339,7 +342,11 @@ impl TransparentClientConfig {
     }
 }
 
-#[cfg(all(test, feature = "transparent", target_os = "linux"))]
+#[cfg(all(
+    test,
+    feature = "transparent",
+    any(target_os = "linux", target_os = "macos")
+))]
 mod tests {
     #![expect(
         clippy::unwrap_used,
@@ -348,9 +355,9 @@ mod tests {
     #[cfg(feature = "multiplex")]
     use crate::common::constants::DEFAULT_CLAIM_LANES;
     use crate::config::parsing::Config;
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     use crate::config::parsing::{ServiceType, TransportType};
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     use url::Url;
 
     /// The lowering is the whole of the model difference, so it is pinned key
@@ -360,7 +367,7 @@ mod tests {
     /// (its keys are this table's), the lanes are plain by default — the
     /// visitor's TLS is the end-to-end protection — and the resolved pair
     /// travels per service so the engine's overlay dials each with its own.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_lowers_to_a_transparent_service() {
         let config = Config::from_str(
@@ -425,12 +432,16 @@ token = "claim-token"
     /// A claim's lanes are an equal share of its lane budget: one each
     /// when the key is unwritten (the shape a claim had before the budget), and
     /// the written budget divided among the claims that draw on that carrier.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     /// `type = "noise"` on the lanes: the table's keys are the control
     /// channel's and the lanes' at once (one pair per host), and the per-service
     /// overlay carries the resolved pair so a lane dials Noise without the
     /// engine knowing this model exists.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn noise_lanes_inherit_the_table_keys() {
         let config = Config::from_str(
@@ -466,7 +477,11 @@ remote_bind_addr = "10.99.0.1:8443"
         assert_eq!(lanes.noise.clone(), client.transport.noise.clone());
     }
 
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn a_claims_lanes_are_an_equal_share_of_the_carriers_budget() {
         let lanes = |budget: &str, claims: &str| {
@@ -543,7 +558,11 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
     /// Lending is on unless the client says otherwise, and the switch reaches
     /// the claim the runtime reads it from.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
         let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
@@ -570,7 +589,11 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
     /// A budget below the claim count is refused with the number to write: a
     /// claim's lane is a connection of its own, so some claim would otherwise
     /// have no carrier at all.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn a_lane_budget_below_the_claim_count_is_refused() {
         let err = format!(
@@ -610,7 +633,7 @@ remote_bind_addr = "10.99.0.1:2222"
     /// The `[transparent.control]` block is where the server is named, so a
     /// block without one is refused — and the message names the block the
     /// reader actually wrote, not `[client.control]`.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_needs_a_server_to_dial() {
         let err = Config::from_str(
@@ -636,7 +659,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// An L3 client has claims and nothing else: a forwarding key has no home
     /// in the model, and the parse says so rather than ignoring it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_has_no_home_for_forwarding_keys() {
         let err = Config::from_str(
@@ -669,7 +692,7 @@ local_addr = "127.0.0.1:8080"
     test,
     feature = "multiplex",
     feature = "transparent",
-    target_os = "linux"
+    any(target_os = "linux", target_os = "macos")
 ))]
 mod data_tests {
     #![expect(
@@ -681,7 +704,7 @@ mod data_tests {
     /// A claim never multiplexes: its data channels are carrier connections of
     /// its own, which is what `ClientServiceConfig::uses_pool` derives from the
     /// service type — the shape is a property of the model, not a key.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_never_multiplexes() {
         let config = Config::from_str(
@@ -708,7 +731,7 @@ remote_bind_addr = "10.99.0.1:8443"
     /// connections of its own and `tunnels` is a budget rather than a width.
     /// The carrier is not a key anywhere, which is what this pins: a claim over
     /// KCP is what the runtime chooses when the path carries it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_kcp_carrier_is_not_a_key_a_claim_can_write() {
         let config = r#"
@@ -755,7 +778,11 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// Lending is on unless the client says otherwise, and the switch reaches
     /// the claim the runtime reads it from.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
         let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
@@ -782,7 +809,11 @@ remote_bind_addr = "10.99.0.1:8443"
     /// A budget below the claim count is refused with the number to write: a
     /// claim's lane is a connection of its own, so some claim would otherwise
     /// have no carrier at all.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     fn a_lane_budget_below_the_claim_count_is_refused() {
         let err = format!(
@@ -822,7 +853,7 @@ remote_bind_addr = "10.99.0.1:2222"
     /// The `[transparent.control]` block is where the server is named, so a
     /// block without one is refused — and the message names the block the
     /// reader actually wrote, not `[client.control]`.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_needs_a_server_to_dial() {
         let err = Config::from_str(
@@ -848,7 +879,7 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// An L3 client has claims and nothing else: a forwarding key has no home
     /// in the model, and the parse says so rather than ignoring it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    #[cfg(all(feature = "transparent", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn a_claim_has_no_home_for_forwarding_keys() {
         let err = Config::from_str(

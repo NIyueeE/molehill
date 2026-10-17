@@ -225,8 +225,10 @@ pub enum ServiceType {
     /// The client *owns* the public `ip:port` instead of the server binding it:
     /// the client's host carries the address on its own TUN device and its
     /// kernel answers the visitor, so the backend sees the visitor's real
-    /// address and the server holds no connection state. Linux only, and it
-    /// needs `CAP_NET_ADMIN` on both ends; see `docs/configuration.md`.
+    /// address and the server holds no connection state. Linux and macOS run
+    /// both ends; Windows can serve but not claim. The privilege is
+    /// `CAP_NET_ADMIN` (Linux), root (macOS), or Administrator + `wintun.dll`
+    /// (Windows server); see `docs/configuration.md`.
     #[serde(rename = "transparent")]
     Transparent,
 }
@@ -486,28 +488,73 @@ impl DataCarrierLimits {
 }
 /// The TUN device a transparent (L3) service attaches to.
 ///
-/// Only the *name* is configuration: the device itself, its addresses and its
-/// routes belong to the operator, and this daemon deliberately never installs
-/// one ([deployment.md](../../docs/deployment.md) owns the recipes). Both ends
-/// may need a device — the server routes the claimed address into its own, the
-/// client carries the address on its own.
+/// Only the *name* is configuration: this daemon installs no route, rule or
+/// firewall rule ([deployment.md](../../docs/deployment.md) owns the recipes).
+/// Linux attaches to an operator-created persistent device; macOS and Windows
+/// create the ephemeral utun/Wintun adapter, and macOS also assigns the claimed
+/// `/32`s. Both ends need a device — the server routes the claimed address into
+/// its own, the client carries the address on its own.
 ///
 /// On the **server** the table carries a second meaning: it is the operator's
 /// own switch for the feature, because serving L3 is what asks this process for
-/// `CAP_NET_ADMIN` and a device. `[server]` therefore holds this as an
+/// a device and the platform privilege. `[server]` therefore holds this as an
 /// `Option`, and a server without the table refuses every transparent
 /// registration by policy instead of being steered into a device by a client.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentConfig {
-    /// Interface name, created and configured by the operator before the
-    /// daemon starts. Default: `molehill0`.
+    /// Interface name. On Linux it is created and configured by the operator
+    /// before the daemon starts; on macOS `auto` chooses a free `utunN`; on
+    /// Windows it names the Wintun adapter. Default: `molehill0` (Linux and
+    /// Windows), `auto` (macOS).
     #[serde(default = "default_tun_name")]
     pub tun: String,
 }
 
 pub(crate) fn default_tun_name() -> String {
-    "molehill0".to_owned()
+    if cfg!(target_os = "macos") {
+        // macOS utun devices are created on demand and their unit number is
+        // only known after creation; `auto` lets the daemon choose a free one.
+        "auto".to_owned()
+    } else {
+        "molehill0".to_owned()
+    }
+}
+
+/// Whether this build and platform can run a transparent **client**.
+///
+/// Windows is deliberately absent: it has no source-address policy routing,
+/// so the client's replies would not return to the TUN. It can still serve as
+/// a transparent server.
+pub(crate) const fn transparent_client_supported() -> bool {
+    cfg!(all(
+        feature = "transparent",
+        any(target_os = "linux", target_os = "macos")
+    ))
+}
+
+/// Whether this build and platform can run a transparent **server**.
+pub(crate) const fn transparent_server_supported() -> bool {
+    cfg!(all(
+        feature = "transparent",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )
+    ))
+}
+
+/// The platform-specific half of a transparent refusal message.
+fn transparent_platform_reason(client: bool) -> &'static str {
+    if !cfg!(feature = "transparent") {
+        "this build was compiled without the `transparent` feature"
+    } else if client && cfg!(target_os = "windows") {
+        "Windows has no source-address policy routing; run the transparent client under WSL2 \
+         (Linux), or on Linux/macOS"
+    } else {
+        "this platform is not supported"
+    }
 }
 
 impl Default for TransparentConfig {
@@ -1093,6 +1140,22 @@ impl Config {
         // reader that parses a config to describe it.
         Config::validate_control_transport(&config)?;
 
+        if config.transparent.is_some() && !transparent_client_supported() {
+            bail!(
+                "`[transparent]` carries whole IP packets through a TUN device, and {}",
+                transparent_platform_reason(true)
+            );
+        }
+        if let Some(server) = config.server.as_ref()
+            && server.transparent.is_some()
+            && !transparent_server_supported()
+        {
+            bail!(
+                "`[server.transparent]` carries whole IP packets through a TUN device, and {}",
+                transparent_platform_reason(false)
+            );
+        }
+
         if let Some(server) = config.server.as_mut() {
             Config::validate_server_config(server)?;
         }
@@ -1370,15 +1433,11 @@ impl Config {
                  own, started as a client"
             ),
             (ClientModel::Claiming, ServiceType::Transparent) => {
-                if !cfg!(all(feature = "transparent", target_os = "linux")) {
-                    let why = if cfg!(feature = "transparent") {
-                        "this platform is not Linux"
-                    } else {
-                        "this build was compiled without the `transparent` feature"
-                    };
+                if !transparent_client_supported() {
                     bail!(
                         "{entry} {name}: `[transparent]` carries whole IP packets through a \
-                         TUN device, and {why}"
+                         TUN device, and {}",
+                        transparent_platform_reason(true)
                     );
                 }
             }
@@ -1739,9 +1798,27 @@ mod tests {
                 available
             }
             "transparent" => {
-                let available = cfg!(all(feature = "transparent", target_os = "linux"));
+                let available = cfg!(feature = "transparent");
                 if !available {
-                    println!("  skip {name}: needs a Linux build with the `transparent` feature");
+                    println!("  skip {name}: needs the `transparent` feature");
+                }
+                available
+            }
+            "transparent-client" => {
+                let available = transparent_client_supported();
+                if !available {
+                    println!(
+                        "  skip {name}: needs a Linux/macOS build with the `transparent` feature"
+                    );
+                }
+                available
+            }
+            "transparent-server" => {
+                let available = transparent_server_supported();
+                if !available {
+                    println!(
+                        "  skip {name}: needs a Linux/macOS/Windows build with the `transparent` feature"
+                    );
                 }
                 available
             }
@@ -1835,12 +1912,12 @@ mod tests {
             let blocks = doc_toml_blocks(path)?;
             assert!(!blocks.is_empty(), "no toml code blocks found in {path}");
             for b in &blocks {
-                // An L3 example can only be validated where the feature is
-                // compiled and the platform is Linux. Elsewhere the refusal is
-                // the contract, so the block is skipped rather than read as
-                // drift — every other block on the page is still checked.
-                if !cfg!(all(feature = "transparent", target_os = "linux"))
-                    && b.contains("[transparent]")
+                // An L3 client example can only be validated where the
+                // client is supported. Elsewhere the refusal is the contract,
+                // so the block is skipped rather than read as drift — every
+                // other block on the page is still checked.
+                if (!transparent_client_supported() && b.contains("[transparent]"))
+                    || (!transparent_server_supported() && b.contains("[server.transparent]"))
                 {
                     continue;
                 }
@@ -1977,6 +2054,7 @@ max_tunnels_per_client = 6
     /// a default device it would then be willing to attach. Inside the table
     /// the device name keeps its default, because writing the table already is
     /// the operator's decision.
+    #[cfg(feature = "transparent")]
     #[test]
     fn test_server_transparent_is_opt_in() {
         let without = r#"
@@ -2004,8 +2082,52 @@ bind_addr = "0.0.0.0:2333"
         let cfg = Config::from_str(&with_noise(with)).unwrap();
         assert_eq!(
             cfg.server.unwrap().transparent.map(|t| t.tun).as_deref(),
-            Some("molehill0"),
+            Some(default_tun_name().as_str()),
             "writing the table is the decision; the device name still defaults"
+        );
+    }
+
+    /// Windows can serve transparent clients but cannot be one: the client's
+    /// replies need source-address policy routing, which Windows does not
+    /// expose. The refusal names the supported alternative rather than saying
+    /// "unsupported platform".
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_transparent_client_is_refused_with_the_wsl2_path() {
+        let config = r#"
+[transparent]
+default_token = "t"
+tun = "utun0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#;
+        let err = Config::from_str(&with_noise(config)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("WSL2"), "{msg}");
+        assert!(msg.contains("source-address policy routing"), "{msg}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_server_can_serve_transparent_clients() {
+        let config = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = "molehill0"
+"#;
+        let cfg = Config::from_str(&with_noise(config)).unwrap();
+        assert_eq!(
+            cfg.server.unwrap().transparent.map(|t| t.tun).as_deref(),
+            Some("molehill0")
         );
     }
 
@@ -2789,7 +2911,11 @@ udp_workers = 4
     /// ceiling's behaviour, and a claim's lanes are connections rather than
     /// streams, so the two are deliberately different keys with different
     /// bounds.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    #[cfg(all(
+        feature = "multiplex",
+        feature = "transparent",
+        not(target_os = "windows")
+    ))]
     #[test]
     fn test_a_lane_budget_above_the_guard_is_refused() {
         let config = |tunnels: u16| {

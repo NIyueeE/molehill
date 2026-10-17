@@ -2,7 +2,7 @@
 """The bench model's vocabulary: metrics, arms, scenarios, profiles.
 
 This module is the standard, written down once. Everything else in
-`benches/scripts/bench/` executes it, and nothing may add a metric, an arm or a
+`bench/src/bench/` executes it, and nothing may add a metric, an arm or a
 scenario anywhere else — a number that is not defined here has no definition,
 and a metric without a definition is not comparable with anything.
 
@@ -19,7 +19,7 @@ The rules the model enforces, in code:
   default that a previous arm could have changed; two arms differ only in the
   keys the arm itself sets (one variable per pair).
 * **Every profile is time-budgeted.** A profile names the scenarios it runs and
-  the seconds it expects to spend; `bench.py doctor` and the run report print
+  the seconds it expects to spend; `just bench doctor` and the run report print
   the budget beside the actual cost, so "fast" is a measurement too.
 """
 
@@ -1037,7 +1037,7 @@ ARM_CATALOG: dict = {
     # against `--condition udp_blocked` is the fallback, a clean run is KCP —
     # while forcing one carrier for isolation is an experiment-wide environment
     # switch rather than an arm.
-    # The reference tools. Their adapters live in `peers.py`; the arm is the
+    # The reference tools. Their adapters live in `targets/peers/`; the arm is the
     # same shape as any other, which is what makes the comparison one run.
     "frp": Arm("frp", "peer", tool="frp", label="frp"),
     "rathole": Arm("rathole", "peer", tool="rathole", label="rathole"),
@@ -1646,7 +1646,7 @@ def profile_of(name: str, args) -> dict:
     if name not in PROFILES:
         raise SystemExit(
             f"unknown profile {name!r}; known: {', '.join(PROFILES)} "
-            "(see `bench.py list`)"
+            "(see `just bench list`)"
         )
     profile = dict(PROFILES[name])
     profile = {**profile, "params": {k: dict(v) for k, v in profile["params"].items()}}
@@ -1716,6 +1716,6 @@ def validate_scenarios(names: list) -> list:
     if unknown:
         raise SystemExit(
             f"unknown scenario(s): {unknown}; known: {list(SCENARIOS)} "
-            "(see `bench.py list`)"
+            "(see `just bench list`)"
         )
     return names

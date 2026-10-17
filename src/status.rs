@@ -104,7 +104,11 @@ struct PoolStatus {
 }
 
 /// One L3 lane of one claim, as the status answer states it.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Serialize)]
 pub(crate) struct LaneStatus {
     pub(crate) slot: usize,
@@ -114,7 +118,11 @@ pub(crate) struct LaneStatus {
 }
 
 /// One L3 claim, as the status answer states it.
-#[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+#[cfg(all(
+    feature = "transparent",
+    feature = "multiplex",
+    any(target_os = "linux", target_os = "macos")
+))]
 #[derive(Serialize)]
 pub(crate) struct ClaimStatus {
     /// The claimed endpoint, the claim's identity.
@@ -131,7 +139,11 @@ struct StatusReport {
     pools: Vec<PoolStatus>,
     /// The transparent claims and their lanes, when this build and config
     /// carry any; absent (not empty) when the feature is not compiled.
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[serde(skip_serializing_if = "Option::is_none")]
     claims: Option<Vec<ClaimStatus>>,
 }
@@ -155,9 +167,17 @@ pub(crate) struct SessionView {
     /// The session's L3 claims; empty without the transparent feature (the
     /// type itself does not exist on such a build, so the field is a unit —
     /// the report layer gates on the same cfg and never reads it).
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) claims: Vec<ClaimStatus>,
-    #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+    #[cfg(not(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    )))]
     pub(crate) claims: (),
 }
 
@@ -341,7 +361,11 @@ async fn report(asks: &HashMap<String, mpsc::UnboundedSender<SessionAsk>>) -> Re
     #[cfg(not(feature = "multiplex"))]
     let pools: Vec<PoolStatus> = Vec::new();
     let mut services: Vec<ServiceStatus> = Vec::new();
-    #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+    #[cfg(all(
+        feature = "transparent",
+        feature = "multiplex",
+        any(target_os = "linux", target_os = "macos")
+    ))]
     let mut claims: Vec<ClaimStatus> = Vec::new();
     for ask in asks.values() {
         let (tx, rx) = oneshot::channel();
@@ -352,9 +376,17 @@ async fn report(asks: &HashMap<String, mpsc::UnboundedSender<SessionAsk>>) -> Re
             continue; // reconnecting: answered next time
         };
         services.extend(view.services);
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         claims.extend(view.claims);
-        #[cfg(not(all(feature = "transparent", feature = "multiplex", target_os = "linux")))]
+        #[cfg(not(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        )))]
         let () = view.claims;
     }
     services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -362,7 +394,11 @@ async fn report(asks: &HashMap<String, mpsc::UnboundedSender<SessionAsk>>) -> Re
     let answer = StatusReport {
         services,
         pools,
-        #[cfg(all(feature = "transparent", feature = "multiplex", target_os = "linux"))]
+        #[cfg(all(
+            feature = "transparent",
+            feature = "multiplex",
+            any(target_os = "linux", target_os = "macos")
+        ))]
         claims: (!claims.is_empty()).then_some(claims),
     };
     serde_json::to_string(&answer).context("status API: serializing the report")

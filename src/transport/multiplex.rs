@@ -3040,27 +3040,12 @@ fn probe_carried_bytes(last: &HealthSample, now: &HealthSample, probe_tunnel: us
     let chosen_avg = if chosen.is_empty() {
         0
     } else {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a window's byte counts are far below 2^53, the point where an f64 stops \
-                      counting integers exactly"
-        )]
-        let sum = chosen.iter().sum::<u64>() as f64;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "tunnel counts are single digits"
-        )]
-        let n = chosen.len() as f64;
-        // An average of byte counts rounds down to the byte; the verdict
-        // compares ratios, where one byte cannot matter.
-        let avg = sum / n;
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "see above: the fractional byte is noise next to a 1.5x edge"
-        )]
-        let rounded = avg as u64;
-        rounded
+        // The average of byte counts rounds down to the byte, which is the
+        // convention the verdict has always used; integer division keeps it
+        // exact instead of routing the counts through an f64.
+        let sum: u64 = chosen.iter().sum();
+        let n = u64::try_from(chosen.len()).unwrap_or(1).max(1);
+        sum / n
     };
     (chosen_avg, probe)
 }

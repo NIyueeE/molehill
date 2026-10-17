@@ -25,11 +25,11 @@ not a measurement:
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import hashlib
 import json
 import os
-import pwd
 import shutil
 import signal
 import statistics
@@ -41,19 +41,33 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-import analysis
-import hostinfo
-import instruments as inst
-import model
-import peers
-import topology
-import workloads
+from bench import analysis, hostinfo, model, paths, topology, workloads
+from bench import instruments as inst
+from bench.targets import adapter_for, peer_version
+from bench.targets.base import DeploymentContext, Ports
 
 #: The results file's schema version. It changes when the *shape* of a file
 #: changes — the analysis version (`method.analysis_version`) covers the
 #: statistics instead, and the fingerprint covers the meaning.
 SCHEMA = 3
 HERE = Path(__file__).resolve().parent
+
+#: The modules that decide what a number means. `engine_hash` covers exactly
+#: these: a change to the launch/configuration path (`targets/`) or a probe's
+#: measurement (`probes/`) is a method change; a change to the CLI, the
+#: plotter, the path helpers or a diagnostic utility is not. `githooks/pre-tag`
+#: stays conservative and watches the whole package.
+_METHOD_MODULES = (
+    "model.py",
+    "analysis.py",
+    "runner.py",
+    "topology.py",
+    "workloads.py",
+    "instruments.py",
+    "iperf.py",
+    "hostinfo.py",
+)
+_METHOD_DIRS = ("targets", "probes")
 
 
 class PreflightError(RuntimeError):
@@ -101,12 +115,20 @@ def preflight(binary: str, need_iperf: bool = True) -> dict:
     }
 
 
+def engine_paths() -> list[Path]:
+    """The files whose change is a method change, relative to the package."""
+    paths = [HERE / name for name in _METHOD_MODULES]
+    for directory in _METHOD_DIRS:
+        paths.extend((HERE / directory).rglob("*.py"))
+    return sorted(path.relative_to(HERE) for path in paths)
+
+
 def engine_hash() -> str:
     """A hash over the engine's own code: the method is the code that ran it."""
     digest = hashlib.sha256()
-    for path in sorted(HERE.rglob("*.py")):
-        digest.update(path.name.encode())
-        digest.update(path.read_bytes())
+    for relative in engine_paths():
+        digest.update(relative.as_posix().encode())
+        digest.update((HERE / relative).read_bytes())
     return digest.hexdigest()[:16]
 
 
@@ -173,7 +195,9 @@ def method_record(
         # than a guess). Molehill's own version is the binary's provenance
         # line, not the method's, so it is not repeated here.
         "peer_versions": {
-            arm.tool: _peer_version(arm.tool)
+            arm.tool: peer_version(
+                arm.tool, Path(getattr(args, "peer_dir", paths.DEFAULT_PEER_DIR))
+            )
             for arm in arms
             if getattr(arm, "tool", None)
         },
@@ -242,11 +266,12 @@ def iperf_version() -> str:
     so the version is as much a part of what a UDP number means as the
     workload's parameters are.
     """
-    if shutil.which("iperf3") is None:
+    iperf3 = shutil.which("iperf3")
+    if iperf3 is None:
         return ""
     try:
         r = subprocess.run(
-            ["iperf3", "--version"],
+            [iperf3, "--version"],
             check=False,
             capture_output=True,
             text=True,
@@ -256,25 +281,6 @@ def iperf_version() -> str:
         return first[0][:60] if first else ""
     except (OSError, subprocess.SubprocessError):
         return ""
-
-
-def _peer_version(tool: str) -> str:
-    """One peer tool's resolved version, through its own adapter.
-
-    The adapter reads the tool's own `--version` output and falls back to the
-    fetcher's release marker, so the version beside a peer's numbers is the
-    one that actually ran — not the one the run assumed.
-    """
-    try:
-        adapter = _peer_adapter(tool)
-    except SystemExit:
-        return ""
-    binaries = adapter.binaries(adapter.peer_dir)
-    if not binaries:
-        return ""
-    # One binary names the tool's version for all of them (rathole's server
-    # and client are the same file; nps's two halves print the same line).
-    return adapter.describe_version(next(iter(binaries.values())))
 
 
 def fingerprint(method: dict) -> str:
@@ -358,7 +364,7 @@ def with_aa(arms: list, enabled: bool) -> list:
 
 @dataclass
 class Campaign:
-    args: object
+    args: argparse.Namespace
     profile: dict
     profile_name: str
     arms: list
@@ -373,20 +379,6 @@ class Campaign:
     def save(self) -> None:
         self.results["meta"]["updated"] = _now()
         _write_json(self.out, self.results)
-
-
-def user_home() -> Path:
-    """Where a run's artifacts go: the *invoking* user's home.
-
-    `sudo` sets `HOME=/root`, so a `sudo just bench` would drop its results in
-    a directory the person who ran it cannot read. The results are theirs, so
-    they land in their home.
-    """
-    user = os.environ.get("SUDO_USER")
-    if user:
-        with contextlib.suppress(KeyError, OSError):
-            return Path(pwd.getpwnam(user).pw_dir)
-    return Path.home()
 
 
 def _now() -> str:
@@ -437,51 +429,31 @@ class ArmTurn:
         up: a client can run perfectly while failing to register, and a control
         arm has no daemons at all.
         """
-        self.camp.topo.set_txqueuelen(self.arm.txqueuelen)
-        if self.arm.kind == "peer":
-            self._start_peer()
-        elif self.arm.is_tool:
-            cfg = topology.service_config(self.arm, self.camp.work)
-            self.config = {
-                "server": cfg["server"].read_text(),
-                "client": cfg["client"].read_text(),
-            }
-            self._spawn(
-                "server",
-                self.camp.topo.ns_argv(
-                    topology.SRV_NS, [self.arm.binary, "--server", str(cfg["server"])]
-                ),
-            )
-            self._spawn(
-                "client",
-                self.camp.topo.ns_argv(
-                    topology.CLI_NS,
-                    [self.arm.binary, self.arm.mode_flag, str(cfg["client"])],
-                ),
-            )
-        ready = self.camp.topo.wait_target(
-            self.arm.dial_host, topology.ECHO_PORT, timeout=30.0
+        topo = self._topology()
+        topo.set_txqueuelen(self.arm.txqueuelen)
+        deployment = adapter_for(self.arm).deploy(self.arm, self._context())
+        self.config = dict(deployment.configs)
+        for launch in deployment.launches:
+            self._spawn(launch.role, list(launch.argv))
+        ready = topo.wait_target(
+            deployment.endpoint.host, deployment.endpoint.port, timeout=30.0
         )
         return self.pids(), ready
 
-    def _start_peer(self) -> None:
-        """Start a reference tool from its own adapter (`peers.py`).
+    def _topology(self) -> topology.Topology:
+        """The campaign's topology, which exists before any turn starts."""
+        topo = self.camp.topo
+        if topo is None:
+            raise RuntimeError("a turn starts after the topology is up")
+        return topo
 
-        The adapter owns the tool's configuration language; the model owns the
-        topology, the ports and the measurement. That split is what lets a peer
-        be an arm like any other.
-        """
-        adapter = _peer_adapter(self.arm.tool)
-        ports = {
-            "control": topology.CONTROL_PORT,
-            "echo": topology.ECHO_PORT,
-            "iperf": topology.IPERF_PORT,
-            "iperf2": topology.IPERF2_PORT,
-            "udp": topology.UDP_PORT,
-            "udp_sink": topology.IPERF_UDP_PORT,
-        }
-        for role, argv in adapter.write(self.dir, ports).items():
-            self._spawn(role, argv)
+    def _context(self) -> DeploymentContext:
+        return DeploymentContext(
+            topology=self._topology(),
+            work=self.camp.work,
+            ports=Ports.from_topology(),
+            peer_dir=Path(self.camp.args.peer_dir),
+        )
 
     def restart(self) -> tuple:
         """Stop the arm and start it again, timing the visitor's first success.
@@ -539,6 +511,9 @@ class ArmTurn:
 
 def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
     """One arm's turn: every scenario, once, with its counters around it."""
+    topo = camp.topo
+    if topo is None:
+        raise RuntimeError("a scenario runs after the topology is up")
     turn = ArmTurn(camp, arm, rnd)
     samples: list = []
     _, ready = turn.start()
@@ -566,7 +541,7 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
             params = scenario.params_for(camp.profile)
             who = _who(arm, rnd, warmup, scenario)
             ctx = workloads.Ctx(
-                topo=camp.topo,
+                topo=topo,
                 pids_of=turn.pids,
                 work=turn.dir,
                 arm=arm,
@@ -606,15 +581,6 @@ def _headline(cells: list, scenario: model.Scenario) -> str:
         label = f"{cell.cell}: " if cell.cell else ""
         parts.append(f"{label}{shown}{suffix}")
     return "; ".join(parts)
-
-
-def _peer_adapter(tool: str):
-    """The reference tool's adapter, or a refusal naming the tools that exist."""
-    if tool not in peers.PEERS:
-        raise PreflightError(
-            f"no adapter for peer tool {tool!r}; known: {', '.join(peers.PEERS)}"
-        )
-    return peers.PEERS[tool]
 
 
 def _cell_peers(backend):
@@ -691,7 +657,7 @@ def build_results(camp: Campaign, pre: dict, provenance: dict, started: str) -> 
         "meta": {
             "model": "bench",
             "schema": SCHEMA,
-            "runner": "benches/scripts/bench/bench.py",
+            "runner": "bench/src/bench/cli.py",
             "fingerprint": fingerprint(camp.method),
             "method": camp.method,
             "profile": camp.profile_name,
@@ -763,7 +729,7 @@ def _prepare(args) -> Campaign:
             "(delete it, pick another --out, or pass --force)"
         )
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    home = user_home()
+    home = paths.user_home()
     work = Path(args.work or (home / "tmp" / f"bench-{stamp}"))
     out = Path(args.out or (home / "tmp" / f"bench-{stamp}.json"))
     work.mkdir(parents=True, exist_ok=True)

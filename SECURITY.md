@@ -2,12 +2,12 @@
 
 ## Supported versions
 
-Only the latest `main` branch receives security fixes.
+Only the latest release is supported. Fixes land on `main` and ship in the
+next release.
 
 ## Reporting a vulnerability
 
-Please do **not** open a public issue for security reports. Use GitHub's
-private vulnerability reporting instead:
+Do **not** open a public issue. Use GitHub's private vulnerability reporting:
 
 **Security → Report a vulnerability** on this repository.
 

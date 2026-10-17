@@ -1,6 +1,6 @@
 [package]
 name = "molehill-rathole"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 authors = ["niyue <n1yu3@proton.me>"]
 description = "A lightweight and high-performance reverse proxy for NAT traversal, written in Rust. An alternative to frp and ngrok, with transparent (L3) clients that own their own public IP."
@@ -59,10 +59,11 @@ kcp = [ "multiplex"]
 # Transparent (L3) services: the client owns the public `ip:port` instead of
 # the server binding it, so the visitor's packets reach the client's TUN device
 # and its kernel answers them -- the backend sees the visitor's real address
-# and the server holds no connection state. Linux only (it needs a TUN device
-# and CAP_NET_ADMIN on both ends); a config that asks for one on another
-# platform is refused with a precise reason.
-transparent = []
+# and the server holds no connection state. Linux and macOS run both ends;
+# Windows can serve a transparent client but cannot be one (it has no
+# source-address policy routing), and a config that asks for a client there is
+# refused with a precise reason. The device layer is `tun-rs`.
+transparent = ["dep:tun-rs"]
 
 [profile.release]
 panic = "abort"
@@ -116,9 +117,10 @@ thiserror = "2.0.20"
 libc = "0.2.189"
 parking_lot = { version = "0.12.5", optional = true }
 nohash-hasher = { version = "0.2.0", optional = true }
-nix = { version = "0.31.3", features = ["socket", "net"] }
+nix = { version = "0.31.3", features = ["socket", "net", "feature", "uio"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 serde_json = "1.0.154"
+tun-rs = { version = "2.8.12", default-features = false, features = ["async_tokio"], optional = true }
 
 [build-dependencies]
 vergen = { version = "10.0.2", default-features = false, features = ["build", "cargo"] }

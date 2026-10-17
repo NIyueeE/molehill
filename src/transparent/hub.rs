@@ -37,13 +37,14 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
 
-use crate::protocol::{IpFrames, IpTraffic, LaneId};
+use crate::protocol::{FrameFormat, IpFrames, IpTraffic, LaneId};
 use crate::transparent::flow;
+use crate::transparent::frame::{self, SegmentScratch};
 use crate::transparent::ip::{self, PacketInfo};
 use crate::transparent::tun::{MAX_PACKET, Tun};
 use crate::transparent::{Direction, DropReason, Endpoint, EndpointTable, Stats};
@@ -89,15 +90,21 @@ const BATCH_PACKETS: usize = 32;
 /// of super-frames is bounded by bytes, not by the packet count.
 const BATCH_BYTES: usize = 64 * 1024;
 
+/// The virtio-net header the `Vnet` shape carries in front of a frame.
+const VNET: usize = crate::protocol::VNET_HDR_LEN;
+
 /// Read the routing identity out of one device frame.
 ///
 /// The virtio-net header is skipped, not interpreted: segmentation state
 /// (`gso_type`, `gso_size`, `NEEDS_CSUM`) is the far end's business, and the
 /// header travels with the frame whichever way the frame goes. Only the
 /// packet's own routing fields matter here.
-fn frame_info(frame: &[u8]) -> Result<PacketInfo, ip::ParseError> {
-    let Some(packet) = frame.get(crate::transparent::tun::VNET_HDR_LEN..) else {
-        return Err(ip::ParseError::Malformed);
+fn frame_info(frame: &[u8], format: FrameFormat) -> Result<PacketInfo, ip::ParseError> {
+    let packet = match format {
+        FrameFormat::Vnet => frame
+            .get(crate::protocol::VNET_HDR_LEN..)
+            .ok_or(ip::ParseError::Malformed)?,
+        FrameFormat::Ip => frame,
     };
     ip::parse(packet)
 }
@@ -107,8 +114,10 @@ fn frame_info(frame: &[u8]) -> Result<PacketInfo, ip::ParseError> {
 /// A super-frame names its `gso_size`; a plain packet is one packet. The count
 /// is an estimate for the counters and the batch's packet budget — the bytes
 /// are counted exactly, so a coarse packets number only moves a report.
-fn packet_estimate(frame: &[u8]) -> usize {
-    const VNET: usize = crate::transparent::tun::VNET_HDR_LEN;
+fn packet_estimate(frame: &[u8], format: FrameFormat) -> usize {
+    let FrameFormat::Vnet = format else {
+        return 1;
+    };
     if frame.len() <= VNET + ip::IPV4_MIN_HEADER {
         return 1;
     }
@@ -160,6 +169,7 @@ const MAX_TRACKED_FLOWS: usize = 4096;
 pub struct TunHub {
     name: String,
     tun: Arc<Tun>,
+    format: FrameFormat,
     direction: Direction,
     routes: Arc<Routes>,
 }
@@ -189,9 +199,11 @@ impl TunHub {
         }
 
         let tun = Arc::new(Tun::attach(name)?);
+        let format = tun.format();
         let hub = Arc::new(TunHub {
-            name: name.to_owned(),
+            name: tun.name().to_owned(),
             tun: Arc::clone(&tun),
+            format,
             direction,
             routes: Arc::new(Routes::new()),
         });
@@ -207,6 +219,24 @@ impl TunHub {
         self.direction
     }
 
+    /// The local device's frame shape.
+    pub fn format(&self) -> FrameFormat {
+        self.format
+    }
+
+    /// Fix the wire format for one claim. Every lane of the claim carries the
+    /// same format for its whole life; a conflicting later call is an error.
+    pub fn set_wire_format(&self, endpoint: Endpoint, format: FrameFormat) -> Result<()> {
+        self.routes.set_wire_format(endpoint, format)
+    }
+
+    /// Assign a claimed address to a daemon-created device (macOS); the
+    /// operator owns device addresses on the other platforms.
+    #[cfg(target_os = "macos")]
+    pub fn ensure_claimed(&self, ip: std::net::IpAddr) -> Result<()> {
+        self.tun.ensure_claimed(ip)
+    }
+
     /// The counters of this device's data path. One set per hub, so every claim
     /// the device carries is counted in the same place.
     pub fn stats(&self) -> Arc<Stats> {
@@ -219,9 +249,27 @@ impl TunHub {
         self.routes.member_stats()
     }
 
-    /// Hand one frame to the kernel, as it arrived: header included.
-    pub async fn inject(&self, frame: &[u8]) -> io::Result<()> {
-        self.tun.write_packet(frame).await
+    /// Hand one **wire** frame to the kernel in this device's shape.
+    ///
+    /// A plain-IP wire frame into a vnet device needs the zero virtio-net
+    /// header; every other combination is either byte-identical or impossible
+    /// under the negotiation invariant.
+    pub async fn inject_wire(&self, frame: &[u8], wire: FrameFormat) -> io::Result<()> {
+        match (wire, self.format) {
+            (FrameFormat::Ip, FrameFormat::Vnet) => {
+                let mut framed = Vec::with_capacity(crate::protocol::VNET_HDR_LEN + frame.len());
+                framed.extend_from_slice(&[0u8; crate::protocol::VNET_HDR_LEN]);
+                framed.extend_from_slice(frame);
+                self.tun.write_packet(&framed).await
+            }
+            (FrameFormat::Ip, FrameFormat::Ip) | (FrameFormat::Vnet, FrameFormat::Vnet) => {
+                self.tun.write_packet(frame).await
+            }
+            (FrameFormat::Vnet, FrameFormat::Ip) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a vnet wire frame cannot be injected into an IP device",
+            )),
+        }
     }
 
     /// Count packets a lane delivered into this end's device (see
@@ -239,6 +287,7 @@ impl TunHub {
     /// only by id landed on the first claim holding a lane with that number
     /// (measured: a report for the ladder's claim read as another claim's
     /// `peer_offered`), which is evidence about nothing.
+    #[cfg_attr(not(test), cfg(any(target_os = "linux", target_os = "macos")))]
     pub fn note_remote(
         &self,
         endpoint: Endpoint,
@@ -305,6 +354,7 @@ impl TunHub {
     /// allocator's policy ([`crate::transparent::lanes`]). A caller reaches for
     /// this only for a slot the policy has already found idle; the return value
     /// is the same answer as seen under the lock.
+    #[cfg_attr(not(test), cfg(any(target_os = "linux", target_os = "macos")))]
     pub fn retire_lane(&self, endpoint: &Endpoint, slot: usize) -> bool {
         self.routes.retire_lane(endpoint, slot)
     }
@@ -342,13 +392,14 @@ impl TunHub {
             // the queue being replaced mid-drain: the flush looks the current
             // queue up.
             let mut batches: HashMap<(Endpoint, usize), Batch> = HashMap::new();
+            let mut scratch = SegmentScratch::default();
             loop {
                 let mut read_here = 0u64;
                 let outcome = self
                     .tun
                     .drain(&mut buf, &mut |frame| {
                         read_here += 1;
-                        self.route_frame(frame, &mut batches);
+                        self.route_frame(frame, &mut batches, &mut scratch);
                     })
                     .await;
                 if read_here > 0 {
@@ -380,8 +431,13 @@ impl TunHub {
     /// if its header arrives with it. What is parsed here is the packet's
     /// routing identity, one lookup per frame however many packets the frame
     /// carries.
-    fn route_frame(&self, frame: &[u8], batches: &mut HashMap<(Endpoint, usize), Batch>) {
-        let info = match frame_info(frame) {
+    fn route_frame(
+        &self,
+        frame: &[u8],
+        batches: &mut HashMap<(Endpoint, usize), Batch>,
+        scratch: &mut SegmentScratch,
+    ) {
+        let info = match frame_info(frame, self.format) {
             Ok(info) => info,
             Err(e) => {
                 self.routes.stats.count_drop(DropReason::from(e));
@@ -392,17 +448,25 @@ impl TunHub {
             self.routes.stats.count_drop(DropReason::Unclaimed);
             return;
         };
-        let batch = batches.entry((endpoint, slot)).or_default();
-        if batch.push(frame).is_err() {
-            // A frame that cannot be framed (past the wire's u16) cannot be
-            // carried; dropping it keeps the rest.
-            self.routes.stats.count_drop(DropReason::Malformed);
+        let Some(wire) = self.routes.wire_format(&endpoint) else {
+            // A claim whose lane has not fixed its format yet has nowhere to
+            // put the packet: this is the registration/join window, and the
+            // visitor's transport retries.
+            self.routes.stats.count_no_channel_by(1);
             return;
+        };
+        let mut batch = batches.remove(&(endpoint, slot)).unwrap_or_default();
+        let converted = frame::device_to_wire(frame, self.format, wire, scratch, &mut |out| {
+            batch.push(out, wire)
+        });
+        if let Err(e) = converted {
+            self.routes.stats.count_drop(DropReason::Malformed);
+            tracing::debug!(tun = %self.name, "frame conversion failed: {e:#}");
         }
-        if batch.is_full()
-            && let Some(batch) = batches.remove(&(endpoint, slot))
-        {
+        if batch.is_full() {
             self.routes.flush(&endpoint, slot, batch);
+        } else if batch.packets > 0 {
+            batches.insert((endpoint, slot), batch);
         }
     }
 }
@@ -727,6 +791,7 @@ impl Routes {
     }
 
     /// Ask one of a claim's lanes to end, and say whether it is idle right now.
+    #[cfg_attr(not(test), cfg(any(target_os = "linux", target_os = "macos")))]
     fn retire_lane(&self, endpoint: &Endpoint, slot: usize) -> bool {
         let Ok(mut table) = self.table.lock() else {
             return false;
@@ -777,6 +842,40 @@ impl Routes {
                     .map(|claim| claim.should_retire(slot))
             })
             .unwrap_or(false)
+    }
+
+    /// Fix the wire format of one claim. The first lane to start owns the
+    /// decision for the claim's whole life; a replacement that arrives with a
+    /// different format is a protocol error, not a reason to reframe traffic
+    /// already in flight.
+    fn set_wire_format(&self, endpoint: Endpoint, format: FrameFormat) -> Result<()> {
+        let mut table = self
+            .table
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the TUN routing table is poisoned"))?;
+        if let Some(claim) = table.lookup_endpoint_mut(&endpoint) {
+            match claim.wire {
+                Some(existing) if existing != format => {
+                    bail!("claim {endpoint} already carries {existing:?} frames, not {format:?}");
+                }
+                Some(_) => {}
+                None => claim.wire = Some(format),
+            }
+            return Ok(());
+        }
+        let mut claim = ClaimSlots::new();
+        claim.wire = Some(format);
+        table.insert(endpoint, claim);
+        Ok(())
+    }
+
+    /// The wire format of one claim, if any of its lanes has fixed it.
+    fn wire_format(&self, endpoint: &Endpoint) -> Option<FrameFormat> {
+        self.table.lock().ok().and_then(|mut table| {
+            table
+                .lookup_endpoint_mut(endpoint)
+                .and_then(|claim| claim.wire)
+        })
     }
 
     /// Which claim and which of its lanes one packet belongs to.
@@ -845,6 +944,7 @@ impl Routes {
     /// one that retired between the peer's sample and its arrival — is dropped,
     /// which is the safe direction: stale evidence must never be read as the
     /// current lane's.
+    #[cfg_attr(not(test), cfg(any(target_os = "linux", target_os = "macos")))]
     fn note_remote(&self, endpoint: Endpoint, lane: LaneId, offered: u32, refused: u32, seq: u8) {
         let Ok(mut table) = self.table.lock() else {
             return;
@@ -1062,6 +1162,10 @@ impl Routes {
 /// another claim, cannot move a flow that is already talking, and a reordering
 /// is not something a lane change has to be careful about.
 struct ClaimSlots {
+    /// The format this claim's channels carry. Fixed by the first lane to
+    /// start; a later lane that disagrees is rejected rather than reframing
+    /// the claim mid-flight.
+    wire: Option<FrameFormat>,
     slots: Vec<MemberSlot>,
     /// One entry per flow that is talking, keyed by its identity
     /// ([`flow::key`]).
@@ -1171,6 +1275,7 @@ impl ClaimSlots {
     /// A set with the one slot every claim starts with.
     fn new() -> Self {
         Self {
+            wire: None,
             slots: vec![MemberSlot::default()],
             flows: HashMap::new(),
             retired: Vec::new(),
@@ -1472,10 +1577,10 @@ struct Batch {
 }
 
 impl Batch {
-    fn push(&mut self, frame: &[u8]) -> Result<()> {
+    fn push(&mut self, frame: &[u8], format: FrameFormat) -> Result<()> {
         IpTraffic::encode_into(&mut self.frames, frame)?;
         self.packets += 1;
-        self.packet_total += packet_estimate(frame);
+        self.packet_total += packet_estimate(frame, format);
         Ok(())
     }
 
@@ -1506,6 +1611,7 @@ pub async fn forward_transparent<T>(
     endpoint: Endpoint,
     lane: Option<LaneId>,
     carrier: Option<Carrier>,
+    wire: FrameFormat,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1532,7 +1638,7 @@ where
     // The receive half is batched the same way the send half is: one socket
     // read carries a run of frames, so the inject loop walks a burst of frames
     // without awaiting between them (and the far side writes them that way).
-    let mut frames = IpFrames::new(reader);
+    let mut frames = IpFrames::new(reader, wire);
     // The wait is built **once**, outside the loop: `tokio::select!` evaluates
     // its futures on every iteration, so constructing it inside would rebuild
     // the wait — and re-take the hub's lock — once per relayed packet.
@@ -1556,12 +1662,12 @@ where
                     // client is the destination, the server is the source of the
                     // traffic it hands back. The frame arrives whole — the
                     // virtio-net header first — so the parse starts past it.
-                    let Some(info) = claimed_frame_info(&endpoint, frame, hub.direction()) else {
+                    let Some(info) = claimed_frame_info(&endpoint, frame, hub.direction(), wire) else {
                         stats.count_drop(DropReason::Unclaimed);
                         continue;
                     };
                     hub.touch(&endpoint, &info);
-                    if let Err(e) = hub.inject(frame).await {
+                    if let Err(e) = hub.inject_wire(frame, wire).await {
                         break Err(anyhow::Error::from(e))
                             .with_context(|| format!("Failed to inject a packet for {endpoint}"));
                     }
@@ -1574,7 +1680,7 @@ where
                     hub.count_injected(
                         &endpoint,
                         slot,
-                        packet_estimate(frame) as u64,
+                        packet_estimate(frame, wire) as u64,
                         frame.len() as u64,
                     );
                 }
@@ -1608,8 +1714,9 @@ fn claimed_frame_info(
     endpoint: &Endpoint,
     frame: &[u8],
     direction: Direction,
+    format: FrameFormat,
 ) -> Option<PacketInfo> {
-    let info = frame_info(frame).ok()?;
+    let info = frame_info(frame, format).ok()?;
     let (addr, port) = match direction {
         Direction::Source => (info.dst, info.dst_port),
         Direction::Destination => (info.src, info.src_port),
@@ -1640,12 +1747,12 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
             stats.sample_rates();
             tracing::info!(
                 target: "molehill::transparent",
-                "l3-stats: role={role} forwarded={} dropped(not_ipv4={} malformed={} \
+                "l3-stats: role={role} forwarded={} dropped(not_ip={} malformed={} \
                  unclaimed={} no_channel={}) channel_errors={} read_gap_max_ms={} \
                  read_gap_at_ms={} write_gap_max_ms={} write_gap_at_ms={} \
                  offered_per_s={} forwarded_per_s={}",
                 stats.forwarded.load(std::sync::atomic::Ordering::Relaxed),
-                stats.dropped_not_ipv4.load(std::sync::atomic::Ordering::Relaxed),
+                stats.dropped_not_ip.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dropped_unclaimed.load(std::sync::atomic::Ordering::Relaxed),
                 stats
@@ -1787,7 +1894,7 @@ mod tests {
     /// packet — the shape [`Tun::drain`] hands the reader and what every
     /// batch/flush test below pushes.
     fn frame_of(packet: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0u8; crate::transparent::tun::VNET_HDR_LEN];
+        let mut frame = vec![0u8; crate::protocol::VNET_HDR_LEN];
         frame.extend_from_slice(packet);
         frame
     }
@@ -2131,7 +2238,7 @@ mod tests {
             let (endpoint, placed) = routes.pick(&info, Direction::Destination).unwrap();
             assert_eq!(placed, *slot, "a flow keeps the member it was placed on");
             let mut batch = Batch::default();
-            batch.push(&frame_of(packet)).unwrap();
+            batch.push(&frame_of(packet), FrameFormat::Vnet).unwrap();
             assert!(routes.flush(&endpoint, placed, batch));
         }
         for (slot, queue) in [(0usize, &mut rx_first), (1usize, &mut rx_second)] {
@@ -2139,7 +2246,7 @@ mod tests {
                 Some((_, packet)) => {
                     let frames = queue.try_recv().unwrap();
                     assert_eq!(
-                        &frames[4 + crate::transparent::tun::VNET_HDR_LEN..],
+                        &frames[4 + crate::protocol::VNET_HDR_LEN..],
                         &packet[..],
                         "member {slot} carried the flow placed in it, and only that"
                     );
@@ -2393,15 +2500,15 @@ mod tests {
         let first = frame_of(&tcp_packet(4));
         let second = frame_of(&tcp_packet(8));
         let mut batch = Batch::default();
-        batch.push(&first).unwrap();
-        batch.push(&second).unwrap();
+        batch.push(&first, FrameFormat::Vnet).unwrap();
+        batch.push(&second, FrameFormat::Vnet).unwrap();
         assert_eq!(batch.packets, 2);
 
         let (mut tx, mut rx) = tokio::io::duplex(4096);
         tx.write_all(&batch.frames).await.unwrap();
         drop(tx);
 
-        let mut frames = IpFrames::new(&mut rx);
+        let mut frames = IpFrames::new(&mut rx, FrameFormat::Vnet);
         assert_eq!(frames.next().await.unwrap(), &first[..]);
         assert_eq!(
             frames.next().await.unwrap(),
@@ -2419,7 +2526,9 @@ mod tests {
         let mut by_packets = Batch::default();
         for _ in 0..BATCH_PACKETS {
             assert!(!by_packets.is_full(), "not full before the cap is reached");
-            by_packets.push(&frame_of(&tcp_packet(4))).unwrap();
+            by_packets
+                .push(&frame_of(&tcp_packet(4)), FrameFormat::Vnet)
+                .unwrap();
         }
         assert!(by_packets.is_full(), "the packet cap bounds it");
 
@@ -2427,12 +2536,12 @@ mod tests {
         // A whole super-frame (~65 KiB) per push: two of them pass the byte
         // cap, one does not — the shape a bulk flow actually arrives in now.
         let big = frame_of(&tcp_packet(64_000));
-        by_bytes.push(&big).unwrap();
+        by_bytes.push(&big, FrameFormat::Vnet).unwrap();
         assert!(
             !by_bytes.is_full(),
             "one super-frame is inside the batch budget"
         );
-        by_bytes.push(&big).unwrap();
+        by_bytes.push(&big, FrameFormat::Vnet).unwrap();
         assert!(by_bytes.is_full(), "the byte cap bounds it");
         assert!(
             by_bytes.packets < BATCH_PACKETS,
@@ -2442,7 +2551,8 @@ mod tests {
         // And one super-frame alone is a meaningful slice of a batch, which is
         // the whole point of the device's offload declaration.
         let mut one = Batch::default();
-        one.push(&frame_of(&tcp_packet(60_000))).unwrap();
+        one.push(&frame_of(&tcp_packet(60_000)), FrameFormat::Vnet)
+            .unwrap();
         assert!(
             one.frames.len() > BATCH_BYTES / 3,
             "a super-frame should dominate a batch: {} bytes",
@@ -2458,11 +2568,11 @@ mod tests {
     #[test]
     fn an_unframable_frame_is_named_at_the_length_check() {
         // A zero-length prefix is a corrupt stream, not an empty frame.
-        let err = IpTraffic::frame_at(&0u32.to_be_bytes()).unwrap_err();
+        let err = IpTraffic::frame_at(&0u32.to_be_bytes(), FrameFormat::Vnet).unwrap_err();
         assert!(format!("{err:#}").contains("Empty IP frame"));
 
         // And a prefix shorter than the virtio-net header cannot name a packet.
-        let err = IpTraffic::frame_at(&8u32.to_be_bytes()).unwrap_err();
+        let err = IpTraffic::frame_at(&8u32.to_be_bytes(), FrameFormat::Vnet).unwrap_err();
         assert!(format!("{err:#}").contains("shorter than its virtio-net header"));
     }
 
@@ -2570,7 +2680,7 @@ mod tests {
         };
 
         let mut batch = Batch::default();
-        batch.push(&packet).unwrap();
+        batch.push(&packet, FrameFormat::Vnet).unwrap();
         assert!(
             routes.flush(&endpoint, placed, batch),
             "the live member took it"
@@ -2595,7 +2705,7 @@ mod tests {
         // so on its own counters.
         routes.vacate(&web, placed);
         let mut batch = Batch::default();
-        batch.push(&packet).unwrap();
+        batch.push(&packet, FrameFormat::Vnet).unwrap();
         assert!(
             !routes.flush(&endpoint, placed, batch),
             "the empty slot dropped it"
@@ -2611,7 +2721,7 @@ mod tests {
 
         // And the survivor still carries traffic of its own.
         let mut batch = Batch::default();
-        batch.push(&packet).unwrap();
+        batch.push(&packet, FrameFormat::Vnet).unwrap();
         assert!(routes.flush(&endpoint, survivor, batch));
         assert_eq!(routes.member_stats()[survivor].forwarded, 1);
     }
@@ -2639,7 +2749,7 @@ mod tests {
         // counters move.
         routes.vacate(&web, placed);
         let mut batch = Batch::default();
-        batch.push(&packet).unwrap();
+        batch.push(&packet, FrameFormat::Vnet).unwrap();
         assert!(
             !routes.flush(&endpoint, placed, batch),
             "dropped while the slot is empty"
@@ -2661,7 +2771,7 @@ mod tests {
             "and the flow that was placed in it stays there"
         );
         let mut batch = Batch::default();
-        batch.push(&packet).unwrap();
+        batch.push(&packet, FrameFormat::Vnet).unwrap();
         assert!(routes.flush(&endpoint, placed, batch));
         assert!(
             rx_replacement.try_recv().is_ok(),

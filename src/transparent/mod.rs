@@ -1,11 +1,13 @@
 //! Transparent (L3) services: the client owns the public `ip:port`.
 //!
 //! A transparent service is never bound by the server. The claimed address is
-//! carried by the **client's** TUN device — the operator's own routing moves
-//! traffic in and out, this module never installs a route or a netfilter rule
-//! — so the visitor's packets reach the client's kernel *as packets*: the
-//! backend sees the visitor's real address, TCP keeps its end-to-end
-//! semantics, and the server holds no connection state for the flow.
+//! carried by the **client's** TUN device, and the visitor's packets reach the
+//! client's kernel *as packets*: the backend sees the visitor's real address,
+//! TCP keeps its end-to-end semantics, and the server holds no connection
+//! state for the flow. This module installs no route, rule or firewall rule on
+//! any platform: Linux attaches to the operator's persistent device, while
+//! macOS and Windows create the ephemeral device and leave the routes to the
+//! operator.
 //!
 //! Both ends share the same two primitives:
 //!
@@ -14,21 +16,46 @@
 //! - [`EndpointTable`] decides which packet belongs to which service — a
 //!   router on the server, an allow-list on the client.
 //!
-//! Linux only, because the data path is a TUN device.
+//! Linux and macOS run both ends; Windows can serve a transparent client but
+//! cannot be one (its stack has no source-address policy routing). The local
+//! frame shape is `Vnet` on a Linux device with segmentation offload and `Ip`
+//! everywhere else; the server negotiates one shape for the claim, and
+//! [`frame`] converts at a Linux boundary when the pair is mixed.
 
 pub mod check;
 pub mod flow;
+pub mod frame;
 pub mod hub;
 pub mod ip;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod lanes;
 pub mod tun;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::transparent::ip::{PacketInfo, ParseError, TCP, UDP};
+
+/// `MOLEHILL_L3_WIRE=ip` forces the plain-IP wire on either end, which is how
+/// the Linux acceptance harness exercises the mixed-format conversion without a
+/// macOS or Windows host. Any other value leaves the negotiated format alone.
+pub fn force_ip_wire() -> bool {
+    static FORCE: LazyLock<bool> = LazyLock::new(|| match std::env::var("MOLEHILL_L3_WIRE") {
+        Ok(value) if value.eq_ignore_ascii_case("ip") => true,
+        Ok(value) if value.eq_ignore_ascii_case("vnet") || value.eq_ignore_ascii_case("auto") => {
+            false
+        }
+        Ok(value) => {
+            tracing::debug!("Ignoring MOLEHILL_L3_WIRE={value:?}: use `ip`, `vnet` or `auto`");
+            false
+        }
+        Err(_) => false,
+    });
+    *FORCE
+}
 
 /// Which end of a packet a routing table keys on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -56,7 +83,10 @@ impl Endpoint {
 
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.ip, self.port)
+        match self.ip {
+            IpAddr::V4(ip) => write!(f, "{ip}:{}", self.port),
+            IpAddr::V6(ip) => write!(f, "[{ip}]:{}", self.port),
+        }
     }
 }
 
@@ -219,8 +249,8 @@ impl<V> EndpointTable<V> {
 /// misdirected packet is not an operator's problem, a stream of them is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropReason {
-    /// The header is not IPv4 (IPv6 is not carried yet).
-    NotIpv4,
+    /// The version nibble is neither IPv4 nor IPv6.
+    NotIp,
     /// Too short, or a header length that runs past the packet.
     Malformed,
     /// Well formed, but no registered endpoint claims its destination.
@@ -230,7 +260,7 @@ pub enum DropReason {
 impl From<ParseError> for DropReason {
     fn from(e: ParseError) -> Self {
         match e {
-            ParseError::NotIpv4 => Self::NotIpv4,
+            ParseError::NotIp => Self::NotIp,
             ParseError::Malformed => Self::Malformed,
         }
     }
@@ -240,7 +270,8 @@ impl From<ParseError> for DropReason {
 #[derive(Default)]
 pub struct Stats {
     pub forwarded: AtomicU64,
-    pub dropped_not_ipv4: AtomicU64,
+    /// Packets whose version is neither 4 nor 6.
+    pub dropped_not_ip: AtomicU64,
     pub dropped_malformed: AtomicU64,
     pub dropped_unclaimed: AtomicU64,
     /// Packets whose channel was gone (reconnect window): UDP semantics, the
@@ -318,7 +349,7 @@ fn unix_ms() -> u64 {
 impl Stats {
     pub fn count_drop(&self, reason: DropReason) {
         let counter = match reason {
-            DropReason::NotIpv4 => &self.dropped_not_ipv4,
+            DropReason::NotIp => &self.dropped_not_ip,
             DropReason::Malformed => &self.dropped_malformed,
             DropReason::Unclaimed => &self.dropped_unclaimed,
         };
@@ -463,6 +494,12 @@ mod tests {
             dst_port: Some(41000),
         };
         assert_eq!(table.lookup_in(&other, Direction::Source), None);
+    }
+
+    #[test]
+    fn an_ipv6_endpoint_is_bracketed_in_logs() {
+        let endpoint = Endpoint::new("2001:db8::1".parse().unwrap(), 8443);
+        assert_eq!(endpoint.to_string(), "[2001:db8::1]:8443");
     }
 
     #[test]

@@ -542,10 +542,10 @@ pub(crate) fn kcp_stats() -> KcpStats {
 
 /// The process's own CPU time (user + system), in milliseconds.
 ///
-/// Read from `/proc/self/stat` on Linux — the fields are clock ticks (the
-/// kernel's `_SC_CLK_TCK`, 100/s on every supported target), so the
-/// conversion is exact via the constant libc exports. `None` off Linux or on
-/// a read failure: the stats line reports 0 rather than guessing.
+/// Read from `/proc/self/stat` on Linux — the fields are clock ticks, and the
+/// kernel's `_SC_CLK_TCK` (100/s on every supported target) converts them with
+/// integer arithmetic, so no float rounding enters the field. `None` off
+/// Linux or on a read failure: the stats line reports 0 rather than guessing.
 #[cfg(target_os = "linux")]
 fn proc_cpu_ms() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
@@ -565,31 +565,19 @@ fn proc_cpu_ms() -> u64 {
     let Some(stime) = ticks.get(12).and_then(|v| v.parse::<u64>().ok()) else {
         return 0;
     };
-    #[expect(
-        unsafe_code,
-        reason = "audited FFI: `sysconf(_SC_CLK_TCK)` reads a constant the kernel \
-                  defines; it takes no pointers and cannot fault — the same \
-                  one-value read the socket-buffer sizing already makes"
-    )]
-    // SAFETY: no pointers, no buffers: the call queries one system constant.
-    let ticks_per_s = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    // The clock's tick rate is 100/s on every supported target, so the f64
-    // conversion loses nothing that matters; the ms result stays integral in
-    // practice, and a rounding drop of under one tick is the read's noise.
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "tick rate and tick counts are small integers; the conversions \
-                  cannot lose a value the field's ms resolution cares about"
-    )]
-    let ms_per_tick = 1000.0 / (ticks_per_s.max(1) as f64);
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "ticks × ms_per_tick is integral in practice; a sub-tick drop \
-                  is below the field's resolution"
-    )]
-    let cpu_ms = (f64::from(u32::try_from(utime + stime).unwrap_or(u32::MAX)) * ms_per_tick) as u64;
-    cpu_ms
+    // `nix` wraps the raw `sysconf` call; `_SC_CLK_TCK` is one pointer-free
+    // read of a system constant. 100 is the value every supported target
+    // reports, so an unavailable query still leaves the diagnostic usable.
+    let ticks_per_s = {
+        use nix::unistd::{SysconfVar, sysconf};
+        sysconf(SysconfVar::CLK_TCK)
+            .ok()
+            .flatten()
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(100)
+    };
+    utime.saturating_add(stime).saturating_mul(1000) / ticks_per_s
 }
 
 /// Off Linux there is no `/proc` to read: the field is a fixed 0 (see its
@@ -1547,9 +1535,14 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
     // very first batch. After an EAGAIN, `try_io` clears the cached flag, so
     // this await parks until the kernel send buffer drains — no spinning.
     net.socket.writable().await?;
-    let mut send_batch = crate::transport::udp_batch::SendBatch::new();
+    // The send half is stateless: `nix` builds its descriptors per call.
     net.socket.try_io(Interest::WRITABLE, || {
-        send_batch.send_spans(net.socket.as_raw_fd(), net.peer, buf, spans)
+        crate::transport::udp_batch::SendBatch::send_spans(
+            net.socket.as_raw_fd(),
+            net.peer,
+            buf,
+            spans,
+        )
     })
 }
 
@@ -2211,9 +2204,8 @@ const IPV6_UDP_HEADERS: usize = 40 + 8;
 /// type for it (its `sockopt::IpMtu` is the IPv4 `IP_MTU`).
 ///
 /// `nix`'s two exported macros supply the whole implementation without a
-/// single `unsafe` line here (the crate denies `unsafe_code`; the audited FFI
-/// sites are `transport::udp_batch` and the TUN attach in
-/// `transparent::tun`):
+/// single `unsafe` line here (the crate denies `unsafe_code`; the remaining
+/// audited FFI site is the TUN attach in `transparent::tun`):
 ///
 /// * [`sockopt_impl!`](nix::sockopt_impl) declares this marker type (derive,
 ///   docs and all) and implements [`GetSockOpt`](nix::sys::socket::GetSockOpt)

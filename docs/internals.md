@@ -6,7 +6,7 @@
 - **Server**: the publicly accessible host running molehill in server mode
 - **Client**: the host behind NAT running molehill in client mode; it holds the services to be exposed
 - **Visitor**: someone who connects to a service through the server
-- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5). Two services share it when they declare the same endpoint and the same transport — a connection speaks one transport, so a service that overrides `transport` gets a session of its own
+- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5.1). Two services share it when they declare the same endpoint and the same transport — a connection speaks one transport, so a service that overrides `transport` gets a session of its own
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel. It names the service it carries with a four-byte prologue (see "Forwarding")
 - **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that belongs to a control session and carries many data channels as streams
 - **Tunnel pool**: the set of tunnels one client keeps for one key — the whole session, or one service, depending on `[client.data].shared_pool` (see "The tunnel pool")
@@ -31,22 +31,27 @@ A session uses two credentials, which is what lets one connection carry services
 ### Protocol versions
 
 The protocol version rides in every hello, and this build speaks and serves one
-dialect: **v5**. v5 adds one service type (`ServiceType::Transparent`), one
-data-channel command (`DataChannelCmd::StartForwardTransparent`), and the
-transparent lane's own framing — a transparent channel's `[u16 length][packet]`
-becomes `[u32 length][vnet frame]`, wide enough for a GSO super-frame and
-carrying the virtio-net header the device attaches. Everything else — the
-selector byte, the session handshake, the service prologue, the striping
-frames, the UDP framing — is v4's. (0.8–0.9 spoke v3 and 0.10 v4; each
-dialect was dropped by the release that followed it.) The rule — a
-dialect is defined by a release, its number moves with the tag that introduces
-it, and no two tags are compatible — lives in AGENTS.md §5; what it means on the
-wire is here: a server that does not serve the client's version closes the
-connection instead of answering, and the client turns that into a terminal error
-naming the likely cause (a server older than the client) rather than a retry
-loop. A *client* older than the server is refused the same way, so upgrading
-means upgrading both ends, in either order, with one refused connection telling
-you which side is behind.
+dialect: **v5.1**. The version is two bytes (`major.minor`), so every hello is
+one byte wider than v5.0's and the two dialects cannot be read as each other.
+v5.1 keeps v5's service type (`ServiceType::Transparent`) and adds the
+transparent frame-format negotiation: a registration may declare whether its
+device produces vnet frames, and `DataChannelCmd::StartForwardTransparent`
+carries the format the channel will actually use — `Ip` for one bare IPv4 or IPv6
+packet per frame, or `Vnet` for a Linux device frame (the 10-byte virtio-net
+header plus packet or GSO super-frame). Everything else — the selector byte,
+the session handshake, the service prologue, the striping frames, the UDP
+framing — is v5.0's. (0.8–0.9 spoke v3, 0.10 v4, 0.11.0 v5.0; each dialect was
+dropped by the release that followed it.) The rule — a dialect is defined by a
+release, its number moves with the tag that introduces it, and no two tags are
+compatible — lives in AGENTS.md §5; what it means on the wire is here: the
+reader checks a three-byte prefix (variant tag plus the two version bytes)
+before it waits for the digest, so a peer from another dialect is refused
+instead of hanging on a hello of a different width. A server that does not
+serve the client's version closes the connection instead of answering, and the
+client turns that into a terminal error naming the likely cause (a server older
+than the client) rather than a retry loop. A *client* older than the server is
+refused the same way, so upgrading means upgrading both ends, in either order,
+with one refused connection telling you which side is behind.
 
 ## Forwarding
 
@@ -64,7 +69,7 @@ For UDP, the server maintains a per-service **session-affinity table**: a single
 
 ### Data-channel striping
 
-With `[server.data]stripe_count = K` (default `1`), the server pairs every visitor connection with `K` data channels instead of one and labels each with a `StartForwardStripedTcp(group, index, K)` command. The pair then forwards the connection over the group (`src/stripe.rs`):
+With `[server.data].stripe_count = K` (default `1`), the server pairs every visitor connection with `K` data channels instead of one and labels each with a `StartForwardStripedTcp(group, index, K)` command. The pair then forwards the connection over the group (`src/stripe.rs`):
 
 - Each direction numbers its chunks (`[u64 seq][u16 len][payload]` frames, 32 KiB payloads) and spreads them round-robin over the group's channels.
 - The receiving side reassembles by sequence number: out-of-order chunks wait in a bounded reorder map, contiguous ones are written to the destination. A frame always travels whole on one channel (a half-written frame cannot move — it would corrupt that channel's framing); a channel that refuses a frame *before* any byte of it is committed is skipped for that frame, so one backpressured channel does not stall the group.
@@ -210,17 +215,22 @@ How a claim's lane set is opened, held and repaired:
   which service — and therefore which endpoint — it carries before the first
   packet.
 - The server answers each channel with
-  `DataChannelCmd::StartForwardTransparent` (tag 3, a unit variant like the other
-  fixed-size data commands), and from then on it carries whole IP frames, framed
-  `[u32 length][vnet frame]` in both directions by `IpTraffic`
-  (`src/protocol.rs`). The "vnet frame" is the unit the TUN device produces:
-  the 10-byte virtio-net header followed by the packet — or the GSO
-  super-frame — it describes. The frame travels **whole**: a `NEEDS_CSUM`
-  frame only checksums with its header present, and a super-frame only
-  re-segments at the far end when its `gso_size` arrives intact. There is no
-  address tag, because the addresses are inside the packet; a zero-length
-  frame, or one shorter than the header it must carry, is a protocol error
-  rather than an empty packet.
+  `DataChannelCmd::StartForwardTransparent(format)` (tag 3 plus one format
+  byte), and from then on it carries IP traffic framed `[u32 length][frame]` in
+  both directions by `IpTraffic` (`src/protocol.rs`). The format is fixed for
+  the claim: `Ip` is one bare IPv4 or IPv6 packet per frame; `Vnet` is the Linux
+  device's whole frame — the 10-byte virtio-net header followed by the packet
+  or GSO super-frame. A pair of Linux devices negotiates `Vnet`, preserving the
+  GSO fast path; any pair with a plain-IP device negotiates `Ip`, and the Linux
+  side converts at its boundary (`src/transparent/frame.rs`): it splits a GSO
+  super-frame into checksummed IPv4 or IPv6 segments on the way out, completes a
+  `NEEDS_CSUM` packet, and prepends the zero virtio-net header on the way back
+  in. The frame travels **whole** in `Vnet` mode: a `NEEDS_CSUM` frame only
+  checksums with its header present, and a super-frame only re-segments at the
+  far end when its `gso_size` arrives intact. There is no address tag, because
+  the addresses are inside the packet; a zero-length frame, or one shorter than
+  the header its format requires, is a protocol error rather than an empty
+  packet.
 - The server supervises the set, and it is not told the set's width: the
   channels the client opens *are* the set, and the hub discovers the width from
   the lanes that actually join, widening by one whenever a join finds every
@@ -306,26 +316,35 @@ it is injected into the local kernel, so a compromised or buggy peer cannot
 steer traffic into an arbitrary local address. On the client that check doubles
 as an allow-list, because the client is the end that owns local addresses.
 
-**What the daemon does not do.** It never creates, addresses or routes the
-device — `src/transparent/check.rs` is the whole of its network knowledge —
-which is what keeps the crate free of netlink and of shelling out to `ip`. What
-it does instead is verify the parts it depends on and refuse with the exact
-command to run: the device must exist on both ends; on the client, every claimed
-address must be one the host carries and `rp_filter` (the device's and `all`)
-must read 0; on the server, a registration is rejected if its device is missing.
-The recipes are in [Deployment](deployment.md#transparent-services).
+**What the daemon does not do.** It installs no route, rule or firewall rule,
+and it has no netlink code or shell-out to `ip` on any platform. On Linux it
+attaches to the operator's persistent TUN device and verifies what it depends
+on: the device must exist on both ends; on the client, every claimed address
+must be one the host carries and `rp_filter` (the device's and `all`) must read
+0; on the server, a registration is rejected if its device is missing or
+`ip_forward` is off. On macOS and Windows there is no persistent
+operator-created device to attach to: the daemon creates the utun or Wintun
+adapter (and on macOS assigns the claimed `/32`/`/128` addresses), while the operator owns the
+pf rule, routes and forwarding. The recipes are in
+[Deployment](deployment.md#transparent-services).
 
-**Limits worth stating.** IPv4 only: a packet whose version is not 4 is dropped
-and counted (`not_ipv4`), and there is no IPv6 path. A claim's lane set is
-spread **per flow**, so the claim's throughput is the sum of its lanes while
-one flow still cannot exceed one lane; a lane that dies takes its flows'
-packets with it until its replacement joins the slot, and a portless packet
-(ICMP, a later fragment) hashes on its addresses alone, so the fragments of one
-datagram can take different lanes — IP reassembly is order-insensitive, which
-is what makes that safe. And the
+**Limits worth stating.** IPv4 and IPv6 are both carried. The IPv6 parser
+walks the common extension-header chain (Hop-by-Hop, Routing, Fragment,
+Destination Options, Authentication Header, Mobility, HIP and Shim6) under both
+a packet-length bound and a header-count ceiling; TCP/UDP ports are read when
+the transport header is reachable, while ICMPv6, ESP, and the non-first
+fragments are routed by address alone. IPv6 jumbograms are rejected, as is an
+extension chain that runs past the packet. A packet whose version is neither 4
+nor 6 is dropped and counted (`not_ip`). A claim's lane set is spread **per
+flow**, so the claim's throughput is the sum of its lanes while one flow still
+cannot exceed one lane; a lane that dies takes its flows' packets with it until
+its replacement joins the slot, and a portless packet (ICMP/ICMPv6, a later
+fragment) hashes on its addresses alone, so the fragments of one datagram can
+take different lanes — IP reassembly is order-insensitive, which is what makes
+that safe. And the
 network stays the operator's: nothing here installs a route, a rule or a
 netfilter rule. `MOLEHILL_L3_STATS=1` prints the data path's cumulative
-counters (`forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)`,
+counters (`forwarded`, `dropped(not_ip, malformed, unclaimed, no_channel)`,
 `channel_errors`) once a second per data path, and one line per lane slot of
 every claim on that device (`live`, `forwarded`, `no_channel`), which is how a
 run is observed without logging per packet and how a lane set is told from a

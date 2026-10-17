@@ -27,8 +27,7 @@ import threading
 import time
 from pathlib import Path
 
-import hostinfo
-import topology
+from bench import hostinfo, topology
 
 #: The `/proc/<pid>/io` fields this model reads. `rchar`/`wchar` count bytes at
 #: the syscall boundary, so their ratio to `syscr`/`syscw` is the I/O *shape* —

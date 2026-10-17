@@ -427,9 +427,12 @@ mod tests {
 
         // The re-probe is not allowed before the switch has been held: the
         // reachability wait alone (60 s) is shorter than the promise (120 s).
-        let hold_ms = u64::try_from(SWITCH_COOLDOWN.as_millis()).unwrap_or(u64::MAX);
+        // Compare the two deadlines the same `prefer` stored, not a fresh
+        // wall-clock reading — sampling `now_ms()` here made the assertion
+        // depend on the test reaching it inside the same millisecond.
+        let switch_allowed = choice.switch_allowed_at_ms.load(Ordering::Relaxed);
         assert!(
-            choice.retry_at_ms.load(Ordering::Relaxed) >= now_ms() + hold_ms,
+            choice.retry_at_ms.load(Ordering::Relaxed) >= switch_allowed,
             "the re-probe must wait at least as long as the switch is held"
         );
 

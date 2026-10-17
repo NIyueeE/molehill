@@ -1,7 +1,3 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """When does a UDP worker queue actually overflow — D27's missing evidence.
 
 `MOLEHILL_UDP_STATS` reports two drop counters, and the milestone table's M2c
@@ -63,6 +59,8 @@ import threading
 import time
 from pathlib import Path
 
+from bench import paths
+
 #: Run as a child: one thread receives datagrams and counts them, the main thread
 #: answers a request on stdin with the total. Answering on request rather than
 #: printing on a timer is what keeps the parent from blocking on a readline that
@@ -96,7 +94,7 @@ for _ in sys.stdin:
         print(count, flush=True)
 """
 
-BIN = Path("/home/dsh/repo/molehill/target/release/molehill")
+BIN = paths.DEFAULT_BINARY
 PACKET = 1400
 #: The server's per-worker channel capacity (`DEFAULT_UDP_SENDQ_SIZE`), quoted so
 #: a reader can hold the offered load against what one queue absorbs.
@@ -108,8 +106,10 @@ STATS = re.compile(
 )
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="bench udp-stress", description=(__doc__ or "").splitlines()[0]
+    )
     p.add_argument(
         "--rates",
         default="10000,25000,50000,100000",
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--secs", type=float, default=8.0, help="seconds per step")
     p.add_argument("--workers", type=int, default=2, help="the service's udp_workers")
     p.add_argument("--out", type=Path, help="write the numbers here as JSON")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def write_configs(dirpath: Path, workers: int) -> tuple[Path, Path, int, int]:
@@ -392,8 +392,8 @@ def report(record: dict) -> None:
     print(f"\nVERDICT: {record['verdict']}")
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     if not BIN.exists():
         sys.exit(f"build the release binary first: {BIN} does not exist")
     record = measure(args)
@@ -402,7 +402,3 @@ def main() -> int:
         args.out.write_text(json.dumps(record, indent=2) + "\n")
         print(f"-> {args.out}")
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

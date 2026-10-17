@@ -104,7 +104,17 @@ jobs:
     name: build ${{ matrix.target }}
     needs: check
     runs-on: ${{ matrix.os }}
+    # CI owns the test suite: the tagged commit's PR/main run executes it on
+    # Linux, the feature matrix, the native musl targets and the desktop
+    # platforms. This job builds every artifact and smoke-tests the native
+    # ones; re-running the suite here duplicated CI and turned platform flakes
+    # into release blockers (v0.11.0: a Windows timing flake and a qemu cross
+    # flake).
     strategy:
+      # A failing platform must not cancel the others: the release question is
+      # whether every artifact builds, and the other legs' logs are the
+      # evidence.
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -118,12 +128,18 @@ jobs:
             # Full default feature set: static musl binary.
             # Used as the linux/amd64 container image artifact.
             features: server,client,noise,hot-reload,multiplex,kcp,transparent
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            exe: molehill
+            cross: false
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             exe: molehill
-            cross: true
+            cross: false
             # Same feature set as x86_64 musl so the linux/arm64 container
-            # image artifact is feature-consistent with linux/amd64.
+            # image artifact is feature-consistent with linux/amd64. Built on
+            # an arm64 runner, so its tests run natively instead of under
+            # qemu.
             features: server,client,noise,hot-reload,multiplex,kcp,transparent
           - os: ubuntu-latest
             target: arm-unknown-linux-musleabi
@@ -184,12 +200,15 @@ jobs:
       - name: Install target
         if: matrix.cross == false
         run: rustup target add ${{ matrix.target }}
-      - name: Run tests
-        if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }} -- --test-threads=1
       - name: Build release
         if: matrix.cross == false
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
+      - name: Smoke test
+        # aarch64-apple-darwin builds on macos-latest but does not run there
+        # (the runner is x86_64); its build is the evidence, as before.
+        if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/${{ matrix.exe }} --help
 
       # Cross build
       - name: Install cross
@@ -197,16 +216,15 @@ jobs:
         uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
         with:
           tool: cross
-      - name: Run tests
-        if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
+      # The 32-bit `embedded` artifacts have no native runner; CI cross-checks
+      # them (`musl-embedded`) and the build is the release evidence.
       - name: Build release
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} ${{ matrix.features && format('--no-default-features --features {0}', matrix.features) || '' }}
 
       - name: Run UPX
         continue-on-error: true
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         uses: crazy-max/ghaction-upx@c83f378efc804f828e988debb88ed6116feb2368 # v4
         with:
           version: v4.0.2
@@ -349,4 +367,4 @@ jobs:
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: cargo publish

@@ -1,8 +1,11 @@
 # Configuration
 
-`molehill` can automatically determine to run in the server mode or the client mode, according to the content of the configuration file, if only one of `[server]` and `[client]` block is present, like the example in the [Quickstart](../README.md#quickstart).
-
-But the `[client]` and `[server]` block can also be put in one file. Then on the server side, run `molehill --server config.toml` and on the client side, run `molehill --client config.toml` to explicitly tell `molehill` the running mode.
+`molehill` picks its run mode from the configuration file: at least one of
+`[server]`, `[client]` or `[transparent]` must be present, as in the
+[Quickstart](../README.md#quickstart). A file may carry more than one block,
+but then the mode must be chosen with `--server` / `--client` /
+`--transparent`; without a flag the process refuses to guess. A host that wants
+two roles runs two processes.
 
 Ready-to-run configurations, systemd units and container deployments live
 in [Deployment & examples](./deployment.md).
@@ -11,7 +14,7 @@ See [Transport](./transport.md) for more details about encryption and the `trans
 
 Page index:
 
-- [How to configure (v0.7+ model)](#how-to-configure-v07-model)
+- [How to configure](#how-to-configure)
 - [Choosing your configuration (decision tree)](#choosing-your-configuration-decision-tree)
 - [Dynamic service registration](#dynamic-service-registration)
 - [Multiplexing (`multiplex` feature)](#multiplexing-multiplex-feature)
@@ -22,10 +25,10 @@ Page index:
 - [Usage notes](#usage-notes)
 - [Troubleshooting](#troubleshooting)
 
-## How to configure (v0.7+ model)
+## How to configure
 
-Since v0.7 the **client owns the service definitions** and the server owns
-only the policy:
+The **client owns the service definitions** and the server owns only the
+policy:
 
 - The client declares each forwarded service in its own config — including
   the public address it should be exposed at (`remote_bind_addr`).
@@ -38,9 +41,9 @@ A process runs in exactly **one** of three modes, and the file says which:
 `[server]`, `[client]` (forwarding) or `[transparent]` (L3 — see
 [Transparent (L3) services](#transparent-l3-services)). A mode is a property of
 the *process* — its capabilities, its sockets, its TUN device — so a file
-carrying two blocks is refused, and a host that wants two roles runs two
-processes. `--server` / `--client` / `--transparent` override what the file
-says.
+carrying two blocks needs a flag to pick one, and a host that wants two roles
+runs two processes. `--server` / `--client` / `--transparent` override what the
+file says.
 
 A typical setup:
 
@@ -103,11 +106,17 @@ A typical setup:
 > other's dialect instead of continuing, and the refused connection names the
 > version that was expected.
 >
-> **Upgrading to 0.11 (protocol v5)**: the wire carries transparent (L3)
-> services, so it is v5, and 0.11.0 serves **v5 only** — a 0.10 peer's
+> **Upgrading to 0.11.0 (protocol v5.0)**: the wire carries transparent (L3)
+> services, so it is v5.0, and 0.11.0 serves **v5.0 only** — a 0.10 peer's
 > connection is refused on that connection alone, with nothing sent back, and
 > the same is true in the other direction. Upgrade both ends together; either
 > order works, and each side says which version it expects.
+>
+> **Upgrading to 0.11.1 (protocol v5.1)**: v5.1 is a wire break, not a
+> compatible patch: the hello carries a two-byte version and a transparent data
+> channel negotiates its frame format. A 0.11.0 peer (v5.0) is refused on the
+> connection it happens on, in both directions. Upgrade both ends together;
+> there is no mixed-version deployment.
 > **The control channel must now use Noise**: add a `[server.transport.noise]`
 > block on the server, `[client.transport].type = "noise"` with a
 > `[client.transport.noise]` block on the client, or
@@ -191,7 +200,7 @@ in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 ```mermaid
 flowchart TD
     A["Start: defaults<br/>tunnels=4,<br/>control Noise (required)"] --> B{"Does a service's payload<br/>carry its own crypto<br/>(TLS, SSH, WireGuard)?"}
-    B -- Yes --> C["that service: transport = { type = \"plain\" }<br/>- cheaper, and no less protected"]
+    B -- Yes --> C["that service: transport = { type = 'plain' }<br/>- cheaper, and no less protected"]
     B -- No --> D{"Many concurrent<br/>visitor connections?"}
     C --> D
     D -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
@@ -296,8 +305,8 @@ psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key,
 psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
 resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
 
-[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) clients at all. Without it a claim is refused by policy, before any device is looked at — serving L3 is what asks this process for CAP_NET_ADMIN and a TUN device, so the decision belongs to the operator, never to a remote client
-tun = "molehill0" # Optional. The TUN device the server attaches to. It must already exist and have a route for every claimed address — that is the operator's job, not the daemon's. Default: molehill0
+[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) clients at all. Without it a claim is refused by policy, before any device is looked at — serving L3 is what asks this process for a TUN device and the platform privilege, so the decision belongs to the operator, never to a remote client
+tun = "molehill0" # Optional. The server's TUN device. Default: molehill0 on Linux and Windows, auto (a free utunN) on macOS. Linux: the operator creates it and routes every claim into it. macOS/Windows: the daemon creates it; the operator routes/forwards
 ```
 
 ## Dynamic service registration
@@ -418,6 +427,52 @@ service always multiplexes (there is no `mode` to write), and a
   keys — `deny_unknown_fields`). Delete those tables and every data channel is
   a connection of its own.
 
+**Binding the data plane separately.** By default both planes share the
+control address. To put the data plane on its own port, set both sides:
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["5202"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.data]
+bind_addr = "0.0.0.0:2343"
+
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+```
+
+```toml
+# client.toml
+[client]
+default_token = "change-me"
+
+[client.control]
+default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+
+[client.data]
+default_data_addr = "server.example.com:2343"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:5202"
+```
+
+The server binds a second TCP listener on `[server.data].bind_addr` and opens
+the KCP UDP socket there on the first KCP registration; open **both** TCP and
+UDP on that port. A service with its own `remote_addr` follows that server for
+both planes, so the client-wide `default_data_addr` does not apply to it.
+
 **Per-service overrides.** `[client.data]` holds the defaults; each service can
 override `tunnels` individually on its own `[client.services.<name>]` block, and
 nothing else about the data plane: the carrier follows the path and the shape
@@ -478,41 +533,56 @@ a `[transparent]` block is refused too — a host that both forwards and claims
 runs **two processes**, which is also what keeps `CAP_NET_ADMIN` off the one
 that does not need it.
 
-It is **Linux only** and needs `CAP_NET_ADMIN` on both ends (each side attaches
-to a TUN device); the `transparent` feature is part of the default set. A config
-that asks for it on another platform, or in a build without the feature, is
-refused at parse time with `... carries whole IP packets through a TUN device,
-and this platform is not Linux`, or with a message naming the missing
-`transparent` feature. Only IPv4 is carried today — a packet that is not IPv4 is
-dropped and counted.
+It runs on **Linux and macOS**, and a **Linux, macOS or Windows server** can
+serve it. Windows **cannot be a client**: its stack has no source-address
+policy routing, so an application's replies would not return to the tunnel; a
+Windows client config is refused at parse time with the WSL2 guidance. The
+`transparent` feature is part of the default set. A config that asks for a
+client on an unsupported platform, or in a build without the feature, is
+refused at parse time with the reason and the supported alternative.
+
+The device lifecycle follows the platform. On Linux the operator creates a
+persistent TUN device and the daemon attaches to it; the process needs
+`CAP_NET_ADMIN`. On macOS the daemon creates an ephemeral `utunN`, assigns each
+claimed address (`/32` or `/128`) to it, and the operator owns the pf rule and
+routes; the process needs root. On Windows the daemon creates a Wintun adapter,
+and the operator owns the route, forwarding and firewall rules; the process
+needs Administrator and `wintun.dll` beside the binary. Both IPv4 and IPv6 are
+carried: the parser understands the IPv6 base header, the common
+extension-header chain (including fragments), and TCP/UDP ports; ICMPv6 and ESP
+are routed by address alone. IPv6 jumbograms are rejected as malformed, and a
+transport header behind an extension this parser does not understand is routed
+address-only. A packet whose version is neither 4 nor 6 is dropped and counted.
 
 **Serving L3 is the server operator's decision.** On the server the
 `[server.transparent]` table is the switch: without it a transparent
 registration is refused by policy, before any device is looked at, so a client
-can never be what makes the server reach for `/dev/net/tun` or ask the kernel
-for `CAP_NET_ADMIN`. A server that only forwards `tcp`/`udp` services therefore
+can never be what makes the server open a device or ask the kernel for the
+capability. A server that only forwards `tcp`/`udp` services therefore
 needs no capability for this feature at all. Enabling L3 does have a
 consequence worth stating plainly: such a client is never encrypted, so a
 server that serves one accepts plaintext connections from it, whatever
 `[server.transport.noise]` says — the Noise keys keep applying to the clients
 that do negotiate them.
 
-**The daemon never configures the network.** It has no netlink code and never
-shells out to `ip`: the operator creates the TUN device and installs the
-addresses and routes, and the daemon verifies what it depends on and refuses
-with the exact command to run when something is missing. The two recipes — an
-address routed to the server, and a single-IP server — are in
+**The daemon never installs a route, a rule or a firewall rule.** It has no
+netlink code and never shells out to `ip`. On Linux it attaches to the
+operator's persistent TUN device and verifies the addresses and `rp_filter` the
+operator configured. On macOS and Windows it creates the ephemeral device
+because those platforms have no operator-created equivalent; it assigns the
+claimed addresses on macOS, while the operator installs the pf rule, routes and
+forwarding. The recipes are in
 [Deployment](./deployment.md#transparent-services).
 
 | Key | Meaning |
 |---|---|
 | `[transparent]` | **the mode**: this block is what makes the process an L3 client, and it is where the client-wide half lives (`default_token`, `tun`, `control`, `data`, `transport`) |
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
-| `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device) |
-| `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` |
+| `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device). IPv4 is written as `10.99.0.1:8443`, IPv6 as `[2001:db8::1]:8443` |
+| `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` on Linux and Windows, `auto` (a free `utunN`) on macOS |
 | `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: **two lanes per claim** — a measured knee, and the trade it makes is priced in the note below this table. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget decides how many connections exist and the traffic decides who holds them. A budget below the claim count is refused with the number to write; the ceiling is 1024 lanes per client; a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
-| `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` |
+| `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` on Linux and Windows, `auto` (a free `utunN`) on macOS |
 
 **The lane budget's default is two lanes per claim, and that is a trade, not
 a preference.** A claim's data path is serialized per lane — one device reader
@@ -579,7 +649,7 @@ round trips per second than the same claim as one stream of a pool
 (default `true`), which is whether an idle lane of one claim may be lent to a
 sibling carrying more flows than lanes. `lend = false` holds the equal split
 static; the mechanism's worth depends on what limits the path
-([Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when)), and this is the
+([Benchmarks](./benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)), and this is the
 key that turns it off. The count itself has a different meaning here. A
 forwarding `tunnels` is a pool's width; a claim's is a budget of connections,
 because there is no pool: each claim's share is `tunnels / claims`, never below
@@ -591,29 +661,31 @@ connections gets more than one connection's worth of throughput.
 
 ### What the operator must prepare
 
-Both ends attach to an **existing** device named by their `tun` key; the daemon
-deliberately does not create one, because the operator's addresses and routes
-live on it.
+The platform decides which half is the operator's:
 
-- **The device exists** (both ends). A missing device is refused with the two
-  commands that create it — `ip tuntap add dev <tun> mode tun` and
-  `ip link set <tun> up mtu 1400`.
-- **The client carries every address it claims.** The claimed IP is the one in
-  `remote_bind_addr`, and the client must own it: the refusal prints
-  `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and
-  `ip route add default dev <tun> table 100`. The address must be local because
-  the application binds it; the source rule is what sends the replies that
-  application emits back into the tunnel.
-- **Reverse-path filtering is off.** `net.ipv4.conf.<tun>.rp_filter` **and**
-  `net.ipv4.conf.all.rp_filter` must both read `0` — injected packets carry the
-  visitor's source address, which a strict check drops — and the refusal prints
-  the exact `sysctl -w` line. This check runs on the client; on the server the
-  daemon only verifies that its device exists.
-- **The routing brings the claimed address to the server** and lets the
-  client's replies out. Both recipes are in
-  [Deployment](./deployment.md#transparent-services).
-- `CAP_NET_ADMIN` for both processes; the systemd units in
-  [Deployment](./deployment.md#systemd) show the `AmbientCapabilities=` line.
+| | Linux | macOS | Windows (server only) |
+|---|---|---|---|
+| Device | operator creates the persistent TUN | daemon creates a `utunN` | daemon creates the Wintun adapter |
+| Claimed address | operator assigns `/32` or `/128` | daemon assigns each claimed `/32`/`/128` | not assigned; the claim is routed |
+| Routing | operator (`ip route`/`ip rule`) | operator (`route` + pf) | operator (`New-NetRoute`) |
+| Privilege | `CAP_NET_ADMIN` | root | Administrator + `wintun.dll` |
+| Checks | device, address, `rp_filter`, `ip_forward` | daemon creates/assigns; operator owns pf/routes | daemon creates; operator owns route/forwarding/firewall |
+
+- **Linux:** the device must exist; the client must own every claimed address
+  and have `net.ipv4.conf.<tun>.rp_filter` and
+  `net.ipv4.conf.all.rp_filter` at `0`; the server needs `ip_forward = 1`. A
+  missing prerequisite is refused with the exact command to run.
+- **macOS:** the client's claimed `/32` or `/128` addresses are assigned by the daemon. The
+  operator installs the pf `route-to` rule that sends replies from those
+  addresses back into the utun; the server enables `net.inet.ip.forwarding` and
+  routes each claim to its utun. Use a fixed `tun = "utunN"` when the pf rule
+  is static; `auto` logs the actual name. Assigned addresses live for the
+  process's lifetime: a removed claim's address stays until restart.
+- **Windows:** the server's Wintun adapter is created by the daemon. The
+  operator adds a route for each claim and enables forwarding/firewall rules;
+  the client is not supported (use WSL2).
+
+The worked recipes are in [Deployment](./deployment.md#transparent-services).
 
 ### A worked example
 
@@ -719,7 +791,8 @@ anything:
 | `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` | one line when it fires, per claim | at that many seconds after the pool starts, moves every transparent claim of the client to the other carrier and asks the peer to drain its busiest lane, so the replacement is dialed on the new carrier. The drain is the same two-sided one the automatic policy uses: the lane stops taking new flows on **both** ends, keeps the flows already on it (so nothing is reordered), and is retired only once both agree it holds none — which means a lane still carrying a long-lived flow is not taken, and the switch's effect is the new flows that follow. It exists to **measure** what a carrier switch buys and what it costs — the production behaviour is a measured decision inside the client, not a knob — and a value that is not a whole number of seconds is reported and ignored |
 | `MOLEHILL_TUNNEL_SWITCH_AT=<seconds>` | one line when it fires, per pool | at that many seconds after a multiplexed pool starts, the L4 analogue of the switch above: the pool excludes one tunnel of the carrier its tunnels currently ride from new placements, keeps the flows already on it (so nothing is reordered), and retires it only once it holds no stream and no pinned UDP peer — the repair then dials the replacement on the other carrier. A tunnel that never quiets (a long-lived flow) returns to service after the drain budget, and a replacement that cannot be established releases the handover so ordinary repair takes over — a pool is never left one tunnel short for ever. It exists to **measure** what a per-tunnel handover costs and what its replacement captures, the same way the L3 hatch does for claims; it is not a deployment knob, and a value that is not a whole number of seconds is reported and ignored |
 | `MOLEHILL_TUNNEL_CARRIER_RULE=1` | one line per probe event or move, per pool | turns the multiplexed pool's carrier rule **on** for this process (off by default — see why below). The rule reads each KCP tunnel's retransmit share over a one-second window, and a tunnel carrying real traffic whose share clears 4 % **suspects** the carrier: it hands one tunnel to the other carrier through the same no-disruption handover the hatch drives, routes new streams to the probe while it runs, and compares the two carriers on carried bytes — materially more moves the endpoint's carrier decision (under the same switch cooldown), materially less gives the tunnel back and backs off ten minutes, and a probe that carried nothing in its window is held rather than judged. A tunnel that actually *stops* delivering (< 60 % of what the peer handed it) moves immediately, without a probe. The floors and the one-sided shape (KCP → TCP only; a TCP tunnel's retransmit state stays in the kernel) are in [internals.md](internals.md#the-tunnel-pool). **Why it is off by default**: the rule fires and compares honestly on the paths it was built for, but its Move path has not yet been demonstrated end to end on a bench workload — a UDP workload's channels open once at service activation, so a probe that starts mid-run cannot receive routed traffic, and no scenario both arms the suspicion and re-dials after it does (HANDOFF.md, "the sighting protocol"). Until a workload exists that closes that gap, arming the rule is an operator's decision, made knowing what the probe can and cannot see.
-| `MOLEHILL_L3_STATS=1` | one line per second per transparent data path, plus one line per lane slot of every claim on its device | the transparent data path's cumulative counters: `forwarded`, `dropped(not_ipv4, malformed, unclaimed, no_channel)` and `channel_errors`; then, per claim, each slot's `live`, `flows`, `forwarded` and `no_channel` — which lane carried how much, how many flows are placed in it, and which one a replacement window cost. This is how a lane set is told from a stack (all the traffic on `member=0` is a claim that is not spreading), and `no_channel` on a slot is the traffic a dead lane dropped |
+| `MOLEHILL_L3_WIRE=ip` | selects the plain-IP wire on that end, if the negotiated format has not already chosen it | a diagnostic override for the mixed-format path: it forces `StartForwardTransparent` to `Ip`, so a Linux↔Linux pair exercises the same conversion a macOS/Windows peer uses. Values `ip`/`vnet`/`auto`; anything else is reported at debug and ignored. Do not deploy it as a tuning knob — the server negotiates the format from both devices |
+| `MOLEHILL_L3_STATS=1` | one line per second per transparent data path, plus one line per lane slot of every claim on its device | the transparent data path's cumulative counters: `forwarded`, `dropped(not_ip, malformed, unclaimed, no_channel)` and `channel_errors`; then, per claim, each slot's `live`, `flows`, `forwarded` and `no_channel` — which lane carried how much, how many flows are placed in it, and which one a replacement window cost. This is how a lane set is told from a stack (all the traffic on `member=0` is a claim that is not spreading), and `no_channel` on a slot is the traffic a dead lane dropped |
 
 The counters are cumulative, so a reader that knows the window — or takes the
 first and the last line of a run — gets per-second rates and cost per unit. The
@@ -869,8 +942,8 @@ above and follow that guide.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5 (the 0.10 line serves v4, the 0.11 line v5), so an older client *or* an older server gets this; upgrade both ends together. |
-| The client stops with `protocol v5` after a server's hello never arrives | The server is older than this build: it reads version 5, fails its own check and closes that connection. Upgrade the server. |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5.1 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1), so an older client *or* an older server gets this; upgrade both ends together. |
+| The client stops with `protocol v5.1` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |
@@ -880,12 +953,13 @@ above and follow that guide.
 | UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; idle mappings time out after `udp_idle_timeout` seconds. |
 | Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |
-| `Interface <tun> does not exist. Prepare it first` (client, or a registration rejection on the server) | A transparent service attaches to a device the operator creates; the daemon never creates one. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). |
+| An IPv6 claim's visitors get nothing | On Linux, assign the `/128`, add the `ip -6 rule from <addr>` and the `ip -6 route` in table 100, and enable `net.ipv6.conf.all.forwarding=1` on the server. The refusal prints the exact commands when the local address is missing. macOS needs an `inet6` pf rule; Windows needs a `/128` route and IPv6 forwarding. |
+| `Interface <tun> does not exist. Prepare it first` (Linux; client, or a registration rejection on the server) | On Linux a transparent service attaches to a device the operator creates. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). macOS/Windows create their own device. |
 | `This server does not serve transparent (L3) services: [server.transparent] is not configured` (registration rejection) | The server's own switch is off, so the registration was refused by policy before the device was looked at. Add the table to the **server's** config if this host is meant to route the claimed address, or drop the service from the client. |
-| `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims: run the `ip addr add <ip>/32 dev <tun>`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines the message prints. |
+| `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims. For IPv4 run the `ip addr add <ip>/32`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines; for IPv6 the same commands with `ip -6` and `/128`. The refusal prints the exact family's commands. |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | Injected packets carry the visitor's source address, which a strict check drops. Run the `sysctl -w` line the message prints; both `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` must read `0`. |
 | `Address <ip:port> is already claimed by another transparent service on this server` | Two clients claim the same endpoint; the first claim is held for the lifetime of its registration. Give one of them another address or port. |
 | `protocol = "transparent"` is refused inside a `[client.services.<name>]` entry, with a message naming `[transparent.claims.<name>]` | A client that owns its public address is not a forwarding client: move the entry to a `[transparent]` block and start that process with `--transparent`. See [Transparent (L3) services](#transparent-l3-services). |
 | `[client.transparent]` is refused as "configuration this version moved" | The device belongs to the mode now: `[client.transparent].tun` → `[transparent].tun`, and each transparent service becomes a `[transparent.claims.<name>]` entry. |
-| A `[transparent]` block refused at startup with `... and this platform is not Linux`, or with a message naming the missing `transparent` feature | Carrying whole IP packets needs a Linux build with the `transparent` feature (part of the default set). On another platform, keep to a forwarding `[client]`. |
+| A `[transparent]` block refused at startup with the platform reason, or with a message naming the missing `transparent` feature | A transparent client runs on Linux and macOS with the `transparent` feature (part of the default set). Windows can serve transparent clients but cannot be one; run the client under WSL2 (Linux) or on Linux/macOS. |
 | A claimed address's visitors get nothing, and `MOLEHILL_L3_STATS=1` counts `unclaimed` drops | The routing is incomplete: the server needs a route for the claimed address into its device and the client the `from <ip>` rule plus its table route (see [Deployment](./deployment.md#transparent-services)). `unclaimed` is also the reconnect window, while no member holds the endpoint; `no_channel` means a member's queue was full, or that the member a flow is placed on is gone — the per-slot lines say which. |

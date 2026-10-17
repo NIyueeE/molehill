@@ -66,7 +66,7 @@ not a failure.
 
 ## The bench model (the measurement standard)
 
-`benches/scripts/bench/` is the standard and the only runner. The sweep the
+`bench/src/bench/` is the standard and the only runner. The sweep the
 release publishes is not a second instrument: it is this model's `sweep`
 profile — the `timeline` and `capacity` scenarios over the product and the
 reference tools — which is why the staged schedule and the load ramp travel in
@@ -75,11 +75,11 @@ one results file, under one schema, behind one gate.
 ```bash
 sudo -n just bench                     # the smoke profile, about a minute
 sudo -n just bench --profile dev --aa  # the default loop for an optimization
-sudo -n just bench-doctor              # what this host can and cannot measure
-just bench-list                        # every metric, condition and profile
-just bench-report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
-just bench-plot ~/tmp/bench-*.json     # its charts and markdown tables
-just bench-gate RESULTS.json           # may this run be published?
+sudo -n just bench doctor              # what this host can and cannot measure
+just bench list                        # every metric, condition and profile
+just bench report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
+just bench plot ~/tmp/bench-*.json     # its charts and markdown tables
+just bench gate RESULTS.json           # may this run be published?
 just bench-selfcheck                   # the model's own checks (a fast gate)
 ```
 
@@ -125,7 +125,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 - **A metric is defined once, in code.** Unit, direction, the denominator it is
   a ratio over, the workload kinds that can produce it and the smallest
   difference worth calling a claim all live in `model.METRICS`; the table below
-  is generated from that registry and `just bench-list` prints it. A metric
+  is generated from that registry and `just bench list` prints it. A metric
   described one way and computed another fails `just bench-selfcheck`.
 - **A control arm is mandatory.** Every scenario also runs on the same
   topology, ports and backend with no tool in the path. Without it a slow probe
@@ -135,7 +135,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   carries a fingerprint over the topology, the conditions and timelines, the
   scenarios and their *resolved* parameters, the instrument cadences and the
   model's own code. Two files may only be compared when it matches, and
-  `just bench-compare` names every key that differs instead of printing a
+  `just bench compare` names every key that differs instead of printing a
   difference between two methods.
 - **The run measures its own resolution.** One arm is measured twice under two
   names (`--aa`; on by default in `dev`, `full` and `stage`), and the paired
@@ -201,7 +201,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 ### The metrics
 
-Generated from `model.METRICS`; `just bench-list` prints the same registry, and
+Generated from `model.METRICS`; `just bench list` prints the same registry, and
 the definitions are what the report and the verdict render.
 | metric | unit | direction | what it is | divided by |
 |---|---|---|---|---|
@@ -517,7 +517,7 @@ sudo -n just bench
 sudo -n just bench --profile dev --aa
 
 # the release sweep: the staged schedule and the load ramp, four arms
-just bench-peers
+just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
 # one condition, the whole workload (a shape question in minutes)
@@ -531,10 +531,11 @@ sudo -n just bench --profile screen --ab-arm molehill --binary-b /path/to/build
 sudo -n just bench --arm id=l3-deep,txqueuelen=20000
 ```
 
-`just bench-doctor` states what this host can and cannot measure before a run
+`just bench doctor` states what this host can and cannot measure before a run
 has to find out (root, `/dev/net/tun`, iperf3, the peer binaries). The peer
-binaries come from `just bench-peers`: the latest GitHub release assets, never
-built from source, with the resolved versions recorded in the results meta.
+binaries come from `just bench peers fetch`: the latest GitHub release assets,
+never built from source, with the resolved versions recorded in the results
+meta.
 
 ## Reading a result
 
@@ -561,15 +562,15 @@ built from source, with the resolved versions recorded in the results meta.
   probes) and the arm list; `samples` is one record per arm, round, scenario
   and cell, each with its metrics, its typed absences and its evidence;
   `summary` is what the analysis derived from those samples — and
-  `just bench-report` recomputes it, because the samples are the evidence and
+  `just bench report` recomputes it, because the samples are the evidence and
   the summary is a rendering of it.
-- **`just bench-plot` renders exactly the figures this page describes** from
+- **`just bench plot` renders exactly the figures this page describes** from
   any results file: the timeline master, the small multiples, the capacity
   curve, the UDP ladder, the drift panels and the cost bars.
 
 ## The gate
 
-`just bench-gate` is what a run must satisfy before its numbers may be
+`just bench gate` is what a run must satisfy before its numbers may be
 published. It reports what it saw for every question and fails the ones a human
 must act on:
 
@@ -593,7 +594,7 @@ must act on:
   a silence by construction, and the axis becomes a coin flip;
 - **the capacity ramp** — a ramp that sustained nothing is not a reading;
 - and, with `--baseline`, the **regression half**: the same comparison
-  `just bench-compare` makes, refused unless the two files' method records
+  `just bench compare` makes, refused unless the two files' method records
   match.
 
 ## What the model cannot answer
@@ -808,7 +809,7 @@ virtio-net header, relayed whole, `NEEDS_CSUM` intact). What the path lacked
 was the declaration: `IFF_VNET_HDR` plus `TUNSETOFFLOAD`. Measured: 3.85 GB of
 bulk TCP arrived as 576 071 reads of 1 500 bytes without it and 59 160 reads
 averaging 65 212 bytes with it. That fix is in the shipping binary; the probe
-is [`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+is [`bench/src/bench/utils/l3/tcp_tso_census.py`](../bench/src/bench/utils/l3/tcp_tso_census.py),
 and "What is left is per-packet syscall cost" below now reads differently.
 
 ### The carrier axis: TCP versus KCP (2026-10-10, this model)
@@ -1092,14 +1093,16 @@ misattributed, and their handovers did not complete inside a round.
 
 An L3 client carries whole IP packets, so the question "how much of the wire is
 header, and how much of *that* could a compressor take?" has its own instrument:
-`benches/scripts/l3/run.sh` samples `/proc/net/dev` inside its namespaces around
-each arm, and `benches/scripts/l3/wire_report.py` turns the difference into
+`bench/src/bench/utils/l3/run.sh` samples `/proc/net/dev` inside its namespaces around
+each arm, and `bench/src/bench/utils/l3/wire_report.py` turns the difference into
 carried packet sizes and a ceiling. Two interfaces matter — the veth the client
 dials the server on (the tunnel's wire, both directions, including the carrier's
 own TCP/IP headers) and the two TUN devices (the packets the L3 path actually
 carries). The denominator is always stated: **wire** is the veth's bytes, which
 is the link's real cost; **carried** is those packets plus this protocol's
-2-byte length prefix.
+2-byte length prefix. The harness drives IPv4; IPv6 shares the framing and GSO
+path but has a 40-byte base header, so these ceilings are IPv4 numbers.
+`just l3-accept-ipv6` is the IPv6 functionality gate, not a measurement.
 
 | Arm (one connection each) | Carried | Mean carried packet | Wire | Wire per carried packet | Header-compression ceiling |
 |---|---|---|---|---|---|
@@ -1168,15 +1171,19 @@ userspace hotspot exists to fix — a synchronous data path would chase the
 10 %, not the 84 % — and the levers that move it are **the packet size**:
 - **The device's own offload (a code change, in v0.11.0):** the TUN device is
   attached with `IFF_VNET_HDR` and declares `TUNSETOFFLOAD`, so the kernel
-  hands the reader TCP super-frames instead of segmenting first. Measured on
-  a routed forward path (two netns, one TUN hop, frames relayed whole):
+  hands the reader TCP super-frames instead of segmenting first. Since protocol
+  v5.1 that is the `Vnet` wire, negotiated only when both ends are Linux with
+  offload; a pair with a plain-IP device negotiates `Ip` and the Linux side
+  splits/checksums at its boundary, which is not measured by these Linux-pair
+  numbers. Measured on a routed forward path (two netns, one TUN hop, frames
+  relayed whole):
   3.85 GB of bulk TCP arrived as 576 071 reads of 1 500 bytes without the
   declaration and as 59 160 reads averaging 65 212 bytes with it — the same
   ratio of reads to bytes the 8000-byte-MTU operator lever buys below, taken
   by the binary instead of the deployment. UDP GSO segments before the reader
   on this kernel even with the declaration (UDP offload is TX-only here), so
   the win is TCP-shaped; the probe is
-  [`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+  [`bench/src/bench/utils/l3/tcp_tso_census.py`](../bench/src/bench/utils/l3/tcp_tso_census.py),
   and the
   wire's length prefix moved to `u32` the same release so a whole super-frame
   fits one frame.
@@ -1203,13 +1210,13 @@ loopback where the L3 path is limited per packet, the difference is inside the
 noise. Reproduce it as an arm rather than a build: the catalog carries
 `l3-budget10` (lending on) and `l3-budget10-nolend` (the same topology and the
 same binary with `[transparent.data].lend = false`), so
-`bench.py run --arms l3-budget10,l3-budget10-nolend --condition rtt100
+`just bench run --arms l3-budget10,l3-budget10-nolend --condition rtt100
 --condition-leg tunnel` is the whole experiment; the record is in `HANDOFF.md`.
 
 **Attributing the multiplexing overhead.** The L4 rows above say what
 multiplexing costs (a single flow on a pinned pool carries about half what a
 connection of its own does, at roughly twice the CPU per byte); where that CPU
-goes is `benches/scripts/mux/gap_profile.sh`, which samples both daemons with
+goes is `bench/src/bench/utils/mux/gap_profile.sh`, which samples both daemons with
 `perf` while one iperf3 flow crosses one tunnel and prints the top symbols per
 daemon. The shape it reports on this host: **~35 % kernel, ~15 % libc's memory
 routines, and the mux's own Rust code a few percent per symbol** — every leaf is
@@ -1246,7 +1253,7 @@ while the claim keeps serving on the rest).
 ## The UDP queue question (a molehill-only diagnostic)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the
-stage schedule, so it has its own instrument: `benches/scripts/udp_stress.py`
+stage schedule, so it has its own instrument: `bench/src/bench/utils/udp_stress.py`
 starts a real pair with a configurable `udp_workers`, blasts paced or flat-out
 visitors at it, reads the server's `MOLEHILL_UDP_STATS` line around each step,
 and ends with a control step that blasts the same visitors **straight at the
@@ -1257,14 +1264,14 @@ saturate the pool at ~1 Gbit/s regardless of `udp_workers` (1.14 / 1.00 / 0.98 a
 1 / 2 / 4) or visitor count, the spread stays even, and the drops equal the
 excess over that ceiling to within 0.07 %. The number a user needs is on the
 configuration page beside `udp_workers`. The probe behind it is
-`benches/scripts/udp_stress.py`; run it the same way to reproduce the ceiling on
+`bench/src/bench/utils/udp_stress.py`; run it the same way to reproduce the ceiling on
 your own host.
 
 ## Comparability
 - **Same model, same method, same host.** Every results file records the
   fingerprint, the host identity and both calibration probes; a number from
   another host or another method is context, not a baseline.
-- **The comparison is refused, not approximated.** `just bench-compare` names
+- **The comparison is refused, not approximated.** `just bench compare` names
   every blocker — a differing method key, a missing probe, a host that
   disagrees beyond its tolerance (25 % for the CPU probe, 15 % for the loopback
   one; the same two probes the gate uses) — and a run with no A/A pair reports
@@ -1297,22 +1304,22 @@ your own host.
 On a Linux host with `iperf3`, `tc` and root (see `just bench-deps`):
 
 ```bash
-just bench-doctor                      # is this host ready?
-just bench-peers                       # the reference tools' release binaries
+just bench doctor                      # is this host ready?
+just bench peers fetch                 # the reference tools' release binaries
 sudo -n just bench --profile dev --aa  # a change, measured
-just bench-plot ~/tmp/bench-*.json     # its charts and tables
+just bench plot ~/tmp/bench-*.json     # its charts and tables
 ```
 
 The release sweep is one command, and the gate is the other:
 
 ```bash
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
-just bench-gate benches/records/results-bench-vX.Y.Z.json \
+just bench gate benches/records/results-bench-vX.Y.Z.json \
      --baseline benches/records/results-bench-v<previous>.json
 ```
 
-`just bench --help` lists the profiles, the arms, the conditions and the knobs;
-`just bench-list` prints the registry; and every parameter that changes what a
+`just bench run --help` lists the profiles, the arms, the conditions and the knobs;
+`just bench list` prints the registry; and every parameter that changes what a
 number means is recorded in the results file (the resolved scenario parameters,
 the condition, the timeline, the instrument cadences, the SLO), so a chart can
 always be traced back to the method that produced it.

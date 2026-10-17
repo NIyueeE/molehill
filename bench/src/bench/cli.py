@@ -1,19 +1,16 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """bench: the model that measures molehill's performance, one way.
 
-This is the entry point. The model it runs is declared in `model.py` (metrics,
-arms, scenarios, profiles) and executed by `runner.py`; the rules it enforces
-are in `analysis.py`. Read `docs/benchmarks.md`, "The bench model", first.
+This is the project's single entry point. The model it runs is declared in
+`model.py` (metrics, arms, scenarios, profiles) and executed by `runner.py`;
+the rules it enforces are in `analysis.py`; the tool adapters that start a
+subject or a peer live in `targets/`. Read `docs/benchmarks.md`, "The bench
+model", first.
 
-    sudo -n just bench                  # the smoke profile: every headline
-                                        # metric, about a minute
+    sudo -n just bench                  # the smoke profile, about a minute
     sudo -n just bench --profile dev    # the default for an optimization
     sudo -n just bench --arm id=l3,txqueuelen=10000
     sudo -n just bench --profile smoke --ab-arm l3 --binary-b /path/to/other
+    just bench list
     just bench report ~/tmp/bench-*.json
     just bench compare a.json b.json
     just bench selfcheck                # the model's own checks, no root
@@ -23,34 +20,31 @@ Every run writes its results and its raw artifacts outside the tree (under
 evidence does not belong in the repository.
 """
 
-# E402 is waived file-wide: the sys.path insert below is the bench-lib import
-# pattern and must precede the sibling imports.
+from __future__ import annotations
+
+import argparse
+import contextlib
+import importlib.util
+import json
 import os
+import py_compile
+import select
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import tomllib
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+from bench import analysis, hostinfo, model, paths, runner, topology, workloads
+from bench import instruments as inst
+from bench.targets import adapter_for, peer_version
+from bench.targets.peers import PEERS
+from bench.targets.peers import main as peers_main
+from bench.utils import interop, udp_stress
 
-import argparse  # noqa: E402
-import contextlib  # noqa: E402
-import importlib.util  # noqa: E402
-import json  # noqa: E402
-import py_compile  # noqa: E402
-import select  # noqa: E402
-import shutil  # noqa: E402
-import subprocess  # noqa: E402
-
-import analysis  # noqa: E402
-import hostinfo  # noqa: E402
-import instruments as inst  # noqa: E402
-import model  # noqa: E402
-import runner  # noqa: E402
-import topology  # noqa: E402
-import workloads  # noqa: E402
+HERE = paths.PACKAGE_DIR
 
 
 def cmd_list(args) -> int:
@@ -98,6 +92,10 @@ def cmd_doctor(args) -> int:
     for tool, path in pre["tools"].items():
         print(f"tool: {tool:<8} {path or 'MISSING'}")
     print(f"tun:  {pre['tun']}")
+    print(f"peer dir: {args.peer_dir}")
+    for tool in sorted(PEERS):
+        version = peer_version(tool, Path(args.peer_dir))
+        print(f"peer: {tool:<8} {version or 'NOT INSTALLED'}")
     if pre["stale_namespaces"]:
         print(
             f"stale namespaces: {', '.join(pre['stale_namespaces'])} "
@@ -170,6 +168,73 @@ def cmd_compare(args) -> int:
     return 2 if refused else 0
 
 
+def cmd_plot(rest: list[str]) -> int:
+    """Render charts/tables, importing matplotlib only when asked for."""
+    try:
+        # Lazy on purpose: the model runs without the plot extra installed.
+        from bench import plot  # noqa: PLC0415
+    except ImportError as exc:
+        print(f"bench plot: matplotlib is unavailable ({exc})", file=sys.stderr)
+        print("run it through the project extra: just bench plot ...", file=sys.stderr)
+        return 1
+    return plot.main(rest)
+
+
+def cmd_peers(rest: list[str]) -> int:
+    return peers_main(rest)
+
+
+def cmd_interop(rest: list[str]) -> int:
+    return interop.main(rest)
+
+
+def cmd_udp_stress(rest: list[str]) -> int:
+    return udp_stress.main(rest)
+
+
+def cmd_l3(rest: list[str]) -> int:
+    bash = shutil.which("bash")
+    if bash is None:
+        raise SystemExit("bash: not on PATH")
+    return subprocess.run(
+        [bash, str(paths.UTILS_DIR / "l3" / "run.sh"), *rest], check=False
+    ).returncode
+
+
+def cmd_l3_census(rest: list[str]) -> int:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(paths.UTILS_DIR / "l3" / "tcp_tso_census.py"),
+            *rest,
+        ],
+        check=False,
+    ).returncode
+
+
+def cmd_mux(rest: list[str]) -> int:
+    bash = shutil.which("bash")
+    if bash is None:
+        raise SystemExit("bash: not on PATH")
+    return subprocess.run(
+        [bash, str(paths.UTILS_DIR / "mux" / "gap_profile.sh"), *rest],
+        check=False,
+    ).returncode
+
+
+#: Tools that keep their own command line. Dispatch happens before the model's
+#: parser, so their `--help` is the tool's, not the dispatcher's.
+UTILITY_COMMANDS = {
+    "plot": cmd_plot,
+    "peers": cmd_peers,
+    "interop": cmd_interop,
+    "udp-stress": cmd_udp_stress,
+    "l3": cmd_l3,
+    "l3-census": cmd_l3_census,
+    "mux": cmd_mux,
+}
+
+
 # --- selfcheck --------------------------------------------------------------
 #: A leg is shaped on both of its ends, because netem is egress-only. The
 #: selfcheck asserts it so a future leg cannot silently shape one direction.
@@ -181,7 +246,7 @@ SHAPED_ENDS_PER_LEG = 2
 CONFIG_LOAD_TIMEOUT_S = 15
 
 
-def _check_config_loads(c: "Checker", arm: model.Arm, cfg: dict) -> None:
+def _check_config_loads(c: Checker, arm: model.Arm, cfg: dict[str, Path]) -> None:
     """Whether the product loads this arm's config, per end.
 
     A peer arm's config belongs to another tool (frp's `frps.toml`, nps's
@@ -213,7 +278,7 @@ def _selfcheck_binary() -> str:
     the selfcheck runs in the pre-commit gate, where a missing build is not a
     defect.
     """
-    binary = Path(HERE).parents[2] / "target/release/molehill"
+    binary = paths.DEFAULT_BINARY
     return str(binary) if binary.is_file() and os.access(binary, os.X_OK) else ""
 
 
@@ -244,6 +309,12 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
         )
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"{type(e).__name__}: {e}"
+    stdout = proc.stdout
+    if stdout is None:
+        proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        return False, "the child has no stdout pipe"
     deadline = time.monotonic() + CONFIG_LOAD_TIMEOUT_S
     out: list = []
     loaded = False
@@ -260,14 +331,16 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            ready, _, _ = select.select([stdout], [], [], remaining)
             if not ready:
                 break
-            line = proc.stdout.readline()
+            line = stdout.readline()
             if not line:
                 break  # the child closed its stdout
             out.append(line)
-            if line.startswith("Running as"):
+            # The daemon's own log line carries a timestamp prefix, so the
+            # marker is contained in the line rather than at its start.
+            if "Running as " in line:
                 loaded = True
                 break
             # `Failed to load <path>` is the daemon's own marker for a config
@@ -276,7 +349,7 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
             # (a bind address that needs the topology, a transparent
             # prerequisite that needs the operator's routes), which belongs to
             # the run and not to this check.
-            if line.startswith("Error: Failed to load"):
+            if "Error: Failed to load" in line:
                 refused = line.strip()
                 break
     finally:
@@ -284,7 +357,7 @@ def _config_loads(binary: str, path: Path, flag: str) -> tuple:
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
         with contextlib.suppress(Exception):
-            proc.stdout.close()
+            stdout.close()
 
     if loaded or not refused:
         return True, ""
@@ -508,6 +581,54 @@ def _check_arms(c: Checker) -> None:
         _refused(model.parse_arm_spec, "id=l3,typo=1"),
         "typo=1 was accepted",
     )
+
+
+def _check_adapters(c: Checker) -> None:
+    """Every arm resolves one adapter, and the dispatch is the registry's.
+
+    The adapter layer exists so a new tool is a registry row rather than a
+    branch in the runner; this check pins the dispatch and the refusals, so a
+    catalog row that names no adapter fails the commit gate instead of a run
+    that has already built its namespaces.
+    """
+    control = adapter_for(model.ARM_CATALOG["control"])
+    c.equal("the control arm uses the control adapter", control.name, "control")
+    l4 = model.arms_from_names(["l4"], "/bin/true")[0]
+    c.equal(
+        "a forwarding arm uses the molehill adapter",
+        adapter_for(l4).name,
+        "molehill",
+    )
+    for name, arm in model.ARM_CATALOG.items():
+        adapter = adapter_for(arm)
+        expected = (
+            "control"
+            if arm.kind == "control"
+            else "molehill"
+            if arm.kind != "peer"
+            else arm.tool
+        )
+        c.equal(f"arm {name} resolves {expected}", adapter.name, expected)
+    c.check(
+        "the control adapter has no binaries",
+        control.binaries(model.ARM_CATALOG["control"], Path()).primary is None,
+        "a control arm with a binary is not a control",
+    )
+    unknown = model.parse_arm_spec("id=unknown-peer,kind=peer,tool=nope")
+    c.check(
+        "an unknown peer tool is refused",
+        _exits(adapter_for, unknown),
+        "adapter_for accepted a peer tool that is not registered",
+    )
+
+
+def _exits(fn, *args) -> bool:
+    """True when the call ends the program: the shape of every refusal here."""
+    try:
+        fn(*args)
+    except SystemExit:
+        return True
+    return False
 
 
 def _check_device_io(c: Checker) -> None:
@@ -897,7 +1018,7 @@ def _check_run_rules(c: Checker) -> None:
     ]
     c.check(
         "the headline stays primary when nothing was declared",
-        headline and all(v["primary"] for v in headline),
+        bool(headline) and all(v["primary"] for v in headline),
         str(headline),
     )
     for entry in exploratory:
@@ -1172,6 +1293,29 @@ def _check_fingerprint(c: Checker) -> None:
         method["metrics_hash"] == runner.metrics_hash(),
         "metrics_hash is not the registry's hash",
     )
+    engine = {path.as_posix() for path in runner.engine_paths()}
+    c.check(
+        "the engine hash covers the adapters",
+        any(path.startswith("targets/") for path in engine),
+        "no targets/ file is hashed",
+    )
+    c.check(
+        "the engine hash covers the probes",
+        any(path.startswith("probes/") for path in engine),
+        "no probes/ file is hashed",
+    )
+    hashed_utils = sorted(path for path in engine if path.startswith("utils/"))
+    c.check(
+        "the engine hash excludes the utilities",
+        not hashed_utils,
+        f"utilities hashed: {hashed_utils}",
+    )
+    excluded = engine & {"cli.py", "plot.py", "paths.py"}
+    c.check(
+        "the engine hash excludes the CLI, the plotter and the path helpers",
+        not excluded,
+        f"non-method files hashed: {sorted(excluded)}",
+    )
 
 
 def _load_probe_module(name: str):
@@ -1282,7 +1426,7 @@ def _check_provenance(c: Checker) -> None:
     """The clean verdict covers the repository, not the harness's own folder.
 
     The defect this pins: the verdict ran `git status -- .` from
-    `benches/scripts/bench/`, so an uncommitted change under `src/` — the case
+    the harness's own directory, so an uncommitted change under `src/` — the case
     §10's provenance rule exists for — could not be seen, and a release sweep
     with uncommitted files read `clean: True`. The check builds a throwaway
     repository shaped like this one (`src/` beside a nested harness directory),
@@ -1300,7 +1444,7 @@ def _check_provenance(c: Checker) -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        here = root / "benches" / "scripts" / "bench"
+        here = root / "bench" / "src" / "bench"
         (root / "src").mkdir()
         (here).mkdir(parents=True)
         (root / "src" / "code.rs").write_text("fn main() {}\n")
@@ -1346,9 +1490,10 @@ def _check_socket_query(c: Checker) -> None:
     unpacked character by character, `ss` failed on stderr, and the watcher
     read the empty stdout as "no sockets" for a whole campaign.
     """
-    if not shutil.which("ss"):
+    ss = shutil.which("ss")
+    if ss is None:
         return
-    query = ["ss", "-Htn", "state", "established", "sport = :1"]
+    query = [ss, "-Htn", "state", "established", "sport = :1"]
     r = subprocess.run(query, capture_output=True, text=True, check=False)
     c.check(
         "the socket filter is a valid ss invocation",
@@ -1356,7 +1501,7 @@ def _check_socket_query(c: Checker) -> None:
         f"exit {r.returncode}: {r.stderr.strip()[:200]}",
     )
     udp = subprocess.run(
-        ["ss", "-Hun", "sport = :1"], capture_output=True, text=True, check=False
+        [ss, "-Hun", "sport = :1"], capture_output=True, text=True, check=False
     )
     c.check(
         "the datagram socket filter is a valid ss invocation",
@@ -1458,6 +1603,7 @@ def cmd_selfcheck(args) -> int:
     c = Checker()
     _check_registry(c)
     _check_arms(c)
+    _check_adapters(c)
     _check_device_io(c)
     _check_analysis(c)
     _check_summary(c)
@@ -1476,19 +1622,13 @@ def cmd_selfcheck(args) -> int:
 
 
 # --- command line -----------------------------------------------------------
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(
-        prog="bench.py", description="the molehill performance model"
-    )
-    sub = ap.add_subparsers(dest="command", required=True)
-
+def _add_model_parsers(sub: argparse._SubParsersAction) -> None:
     listing = sub.add_parser("list", help="metrics, scenarios, arms and profiles")
     listing.set_defaults(func=cmd_list)
 
     doctor = sub.add_parser("doctor", help="what this host can and cannot measure")
-    doctor.add_argument(
-        "--binary", default=str(HERE.parents[2] / "target/release/molehill")
-    )
+    doctor.add_argument("--binary", default=str(paths.DEFAULT_BINARY))
+    doctor.add_argument("--peer-dir", default=str(paths.DEFAULT_PEER_DIR))
     doctor.add_argument("--no-host-probes", action="store_true")
     doctor.set_defaults(func=cmd_doctor)
 
@@ -1514,9 +1654,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="scale every staged timeline's holds (a full sweep in minutes)",
     )
     run.add_argument("--warmup-rounds", type=int, default=None)
-    run.add_argument(
-        "--binary", default=str(HERE.parents[2] / "target/release/molehill")
-    )
+    run.add_argument("--binary", default=str(paths.DEFAULT_BINARY))
+    run.add_argument("--peer-dir", default=str(paths.DEFAULT_PEER_DIR))
     run.add_argument("--binary-b", default="", help="the second build of an A/B")
     run.add_argument("--ab-arm", default="", help="the arm id to duplicate for the A/B")
     run.add_argument(
@@ -1565,6 +1704,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-host-probes", action="store_true")
     run.set_defaults(func=cmd_run)
 
+
+def _add_result_parsers(sub: argparse._SubParsersAction) -> None:
     report = sub.add_parser("report", help="render a stored results file")
     report.add_argument("file")
     report.add_argument("--markdown", action="store_true")
@@ -1584,11 +1725,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     selfcheck = sub.add_parser("selfcheck", help="the model's own checks")
     selfcheck.set_defaults(func=cmd_selfcheck)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="bench",
+        description="the molehill performance model",
+        epilog="utilities (each takes its own --help): " + ", ".join(UTILITY_COMMANDS),
+    )
+    sub = ap.add_subparsers(dest="command", required=True)
+    _add_model_parsers(sub)
+    _add_result_parsers(sub)
     return ap
 
 
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch one command; no command (or a leading flag) means `run`."""
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] in UTILITY_COMMANDS:
+        return UTILITY_COMMANDS[args_list[0]](args_list[1:])
+    if not args_list or args_list[0].startswith("-"):
+        args_list.insert(0, "run")
+    args = build_parser().parse_args(args_list)
     return args.func(args)
 
 
