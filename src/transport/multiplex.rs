@@ -1281,13 +1281,40 @@ impl TunnelPool {
             );
             return;
         }
-        if self.begin_handover(Carrier::Kcp, Carrier::Tcp) {
-            info!(
+        self.move_convicted_tunnel(tunnel_id, share_pct);
+    }
+
+    /// The move a confirmed delivery verdict earns: hand the convicted tunnel
+    /// to TCP through the handover, preferring it over the emptiest member.
+    ///
+    /// The verdict names a tunnel, but the handover's own selection is
+    /// least-loaded-first; asking for the convicted id is what makes the log's
+    /// "handing it over" describe the tunnel that actually left.
+    fn move_convicted_tunnel(&self, convicted: usize, share_pct: f64) {
+        if let Some(moved) = self.begin_handover_on(Carrier::Kcp, Carrier::Tcp, Some(convicted)) {
+            if moved == convicted {
+                info!(
+                    pool = %self.inner.shared.key,
+                    tunnel = moved,
+                    share = format!("{share_pct:.1}%"),
+                    "carrier rule: tunnel re-sent its share of the window; \
+                     handing it over to tcp"
+                );
+            } else {
+                info!(
+                    pool = %self.inner.shared.key,
+                    tunnel = moved,
+                    convicted,
+                    share = format!("{share_pct:.1}%"),
+                    "carrier rule: the convicted tunnel cannot drain right now; \
+                     handing over the least-loaded one"
+                );
+            }
+        } else {
+            debug!(
                 pool = %self.inner.shared.key,
-                tunnel = tunnel_id,
-                share = format!("{share_pct:.1}%"),
-                "carrier rule: tunnel re-sent its share of the window; \
-                 handing it over to tcp"
+                tunnel = convicted,
+                "carrier rule: no eligible tunnel to hand over"
             );
         }
     }
@@ -1590,8 +1617,28 @@ impl TunnelPool {
     /// `from` from future placement. Its live streams stay on it; the repair
     /// dials its replacement on `target` once the entry drains to zero.
     fn begin_handover(&self, from: Carrier, target: Carrier) -> bool {
+        self.begin_handover_on(from, target, None).is_some()
+    }
+
+    /// The same, preferring `preferred` when it is an eligible serving tunnel of
+    /// `from`; returns the id of the tunnel now draining.
+    ///
+    /// A move that names the tunnel its evidence convicted must drain *that*
+    /// tunnel: draining the least-loaded one instead would leave the degrading
+    /// tunnel in service and make the rule's "handing it over" log a lie. A
+    /// caller with no conviction (the diagnostic hatch, a probe returning a
+    /// tunnel) passes `None`, and a conviction that cannot drain right now — the
+    /// tunnel is pinned to a UDP peer, or it died between the sample and the
+    /// move — falls back to the least-loaded eligible tunnel rather than
+    /// stalling the move.
+    fn begin_handover_on(
+        &self,
+        from: Carrier,
+        target: Carrier,
+        preferred: Option<usize>,
+    ) -> Option<usize> {
         if from == target {
-            return false;
+            return None;
         }
         let mut state = self.inner.state.lock();
         if state.handover.is_some()
@@ -1602,18 +1649,21 @@ impl TunnelPool {
                 .count()
                 <= 1
         {
-            return false;
+            return None;
         }
         let pin_counts = self.inner.pins.counts();
-        let Some(entry) = state
+        let index = state
             .entries
-            .iter_mut()
-            .filter(|entry| entry.phase == TunnelPhase::Serving && entry.carrier == from)
-            .filter(|entry| pin_counts.get(&entry.tunnel.id()).copied().unwrap_or(0) == 0)
-            .min_by_key(|entry| entry.load().total())
-        else {
-            return false;
-        };
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.phase == TunnelPhase::Serving
+                    && entry.carrier == from
+                    && pin_counts.get(&entry.tunnel.id()).copied().unwrap_or(0) == 0
+            })
+            .min_by_key(|(_, entry)| (Some(entry.tunnel.id()) != preferred, entry.load().total()))
+            .map(|(index, _)| index)?;
+        let entry = &mut state.entries[index];
         let tunnel_id = entry.tunnel.id();
         entry.phase = TunnelPhase::Draining;
         let now = std::time::Instant::now();
@@ -1623,7 +1673,7 @@ impl TunnelPool {
             phase: HandoverPhase::Draining,
             phase_since: now,
         });
-        true
+        Some(tunnel_id)
     }
 
     fn handover_step(&self) {
@@ -4929,20 +4979,9 @@ mod tests {
         tx.send(true).unwrap();
     }
 
-    /// A tunnel whose connection dies leaves the pool even while it still
-    /// "holds" a stream, and the pool dials its replacement.
-    ///
-    /// **A repair asks for the carrier the endpoint prefers now, not the one the
-    /// pool was born on.**
-    ///
-    /// The pool's carrier is part of its identity, and its dialer used to be
-    /// built for that one carrier at pool creation — so a pool that came up on
-    /// KCP kept repairing into KCP after UDP stopped working, which is the
-    /// defect this seam exists for. The fixture makes the two answers differ on
-    /// purpose: born on TCP, preferring KCP, and the *first* repair must ask for
-    /// KCP.
-    #[tokio::test]
-    async fn a_handover_excludes_new_streams_until_existing_lease_ends() {
+    /// A two-tunnel KCP pool whose repairs record their dials and must ask for
+    /// TCP: the fixture both handover tests start from.
+    fn handover_pool(key: &str) -> (TunnelPool, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let dials = std::sync::Arc::new(AtomicUsize::new(0));
@@ -4961,14 +5000,37 @@ mod tests {
         ];
         let pool = TunnelPool::with_preference(
             Carrier::Kcp,
-            "handover".to_owned(),
+            key.to_owned(),
             initial,
             2,
             Some(dial),
             std::sync::Arc::new(|| Carrier::Tcp),
             std::sync::Arc::new(PinRegistry::new()),
         );
+        (pool, dials)
+    }
+
+    /// A handover drains a tunnel with a live lease before replacing it, and
+    /// places new streams on the tunnel that stays.
+    ///
+    /// The drain target is the least-loaded tunnel of the carrier, so the
+    /// fixture puts a lease on *both* tunnels: with one open, the pool would
+    /// (correctly) pick the idle tunnel and the maintenance tick would replace
+    /// it before the test could see a lease holding anything. Two leases also
+    /// make the assertion robust on a slow runner, where the 50 ms maintenance
+    /// tick has long fired before the body finishes.
+    #[tokio::test]
+    async fn a_handover_excludes_new_streams_until_existing_lease_ends() {
+        use std::sync::atomic::Ordering;
+
+        let (pool, dials) = handover_pool("handover");
         let held = pool.open_stream().await.unwrap();
+        let anchor = pool.open_stream().await.unwrap();
+        assert_ne!(
+            held.tunnel_id(),
+            anchor.tunnel_id(),
+            "back-to-back leases land on distinct tunnels"
+        );
         assert!(pool.begin_handover(Carrier::Kcp, Carrier::Tcp));
         let snapshot = pool.snapshot();
         assert!(
@@ -4985,24 +5047,52 @@ mod tests {
             }),
             "target carrier and phase are visible: {snapshot:?}"
         );
-        assert!(snapshot.draining.iter().any(|is_draining| *is_draining));
+        let (draining_id, serving_id) = {
+            let state = pool.inner.state.lock();
+            let draining = state
+                .entries
+                .iter()
+                .find(|entry| entry.phase == TunnelPhase::Draining)
+                .expect("the handover drains one tunnel")
+                .tunnel
+                .id();
+            let serving = state
+                .entries
+                .iter()
+                .find(|entry| entry.phase == TunnelPhase::Serving)
+                .expect("one tunnel keeps serving")
+                .tunnel
+                .id();
+            (draining, serving)
+        };
+        // The drain must have landed on a tunnel that already carries a lease:
+        // that lease is what keeps the tunnel alive across a maintenance tick,
+        // and it is the state the assertions below are about.
+        let (lease_on_draining, lease_elsewhere) = if held.tunnel_id() == draining_id {
+            (held, anchor)
+        } else {
+            assert_eq!(
+                anchor.tunnel_id(),
+                draining_id,
+                "the draining tunnel carries one of the two leases"
+            );
+            (anchor, held)
+        };
         let replacement_stream = pool.open_stream().await.unwrap();
-        assert!(
-            snapshot.draining.iter().any(|draining| *draining),
-            "pool must mark old carrier entry unavailable"
-        );
-        let serving_index = snapshot
-            .draining
-            .iter()
-            .position(|draining| !draining)
-            .unwrap();
-        let serving_id = pool.inner.state.lock().entries[serving_index].tunnel.id();
         assert_eq!(replacement_stream.tunnel_id(), serving_id);
-        assert_eq!(dials.load(Ordering::SeqCst), 0, "busy tunnel stays intact");
-        drop(held);
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            0,
+            "a lease on the draining tunnel keeps it intact"
+        );
+        drop(lease_on_draining);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while dials.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while (dials.load(Ordering::SeqCst) == 0
+            || pool.size() < 2
+            || pool.snapshot().handover.is_some())
+            && std::time::Instant::now() < deadline
+        {
             pool.maintain().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -5022,10 +5112,100 @@ mod tests {
                 .iter()
                 .any(|tunnel| tunnel.3 == Carrier::Tcp)
         );
+        drop(lease_elsewhere);
         drop(replacement_stream);
         drop(pool);
     }
 
+    /// A rule move drains the tunnel its evidence convicted, even when another
+    /// tunnel of the carrier is emptier.
+    ///
+    /// The generic selection is least-loaded-first, which is right for the
+    /// diagnostic hatch and for a probe returning its tunnel — neither has
+    /// evidence naming a member. The rule does: draining the empty tunnel
+    /// instead would leave the degrading carrier in service and log a tunnel
+    /// that was not the one moved.
+    #[tokio::test]
+    async fn a_rule_move_drains_the_tunnel_its_evidence_convicted() {
+        use std::sync::atomic::Ordering;
+
+        let (pool, dials) = handover_pool("convicted");
+        let mut leases = Vec::new();
+        for _ in 0..3 {
+            leases.push(pool.open_stream().await.unwrap());
+        }
+        // The busier tunnel is the one the evidence names: the generic
+        // least-loaded selection would drain the other one, so this is what
+        // makes the preference observable.
+        let convicted = {
+            let state = pool.inner.state.lock();
+            let mut loads: Vec<(usize, usize)> = state
+                .entries
+                .iter()
+                .map(|entry| (entry.tunnel.id(), entry.load().total()))
+                .collect();
+            loads.sort_unstable_by_key(|(_, load)| *load);
+            assert_eq!(loads.len(), 2, "the fixture starts with two tunnels");
+            assert!(
+                loads[0].1 < loads[1].1,
+                "one tunnel carries more streams: {loads:?}"
+            );
+            loads[1].0
+        };
+        assert_eq!(
+            pool.begin_handover_on(Carrier::Kcp, Carrier::Tcp, Some(convicted)),
+            Some(convicted),
+            "the named tunnel is the one that drains"
+        );
+        {
+            let state = pool.inner.state.lock();
+            let drained = state
+                .entries
+                .iter()
+                .find(|entry| entry.tunnel.id() == convicted)
+                .expect("the convicted tunnel is still a pool member");
+            assert_eq!(drained.phase, TunnelPhase::Draining);
+            let serving = state
+                .entries
+                .iter()
+                .filter(|entry| entry.phase == TunnelPhase::Serving)
+                .count();
+            assert_eq!(serving, 1, "the other tunnel stays serving");
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            0,
+            "a busy tunnel is not replaced before its leases end"
+        );
+        // The move waits for the convicted tunnel's streams; releasing them is
+        // what lets the repair dial the replacement.
+        leases.retain(|lease| lease.tunnel_id() != convicted);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while (dials.load(Ordering::SeqCst) == 0
+            || pool.size() < 2
+            || pool.snapshot().handover.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            pool.maintain().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "one replacement dial");
+        assert_eq!(pool.size(), 2, "pool count is preserved");
+        assert!(
+            pool.snapshot().handover.is_none(),
+            "the move completed through repair"
+        );
+    }
+
+    /// **A repair asks for the carrier the endpoint prefers now, not the one the
+    /// pool was born on.**
+    ///
+    /// The pool's carrier is part of its identity, and its dialer used to be
+    /// built for that one carrier at pool creation — so a pool that came up on
+    /// KCP kept repairing into KCP after UDP stopped working, which is the
+    /// defect this seam exists for. The fixture makes the two answers differ on
+    /// purpose: born on TCP, preferring KCP, and the *first* repair must ask for
+    /// KCP.
     #[tokio::test]
     async fn a_repair_establishes_the_preferred_carrier() {
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5063,6 +5243,9 @@ mod tests {
         );
     }
 
+    /// A tunnel whose connection dies leaves the pool even while it still
+    /// "holds" a stream, and the pool dials its replacement.
+    ///
     /// The old pool asked for a replacement only when the dead tunnel had
     /// carried something, and its idle shrink needed the *whole* pool quiet —
     /// so a stream that outlived its connection kept a corpse placeable for

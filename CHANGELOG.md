@@ -165,9 +165,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client**, and **the tunnel pool's carrier rule can probe the other carrier
   instead of trusting its own counters**: a suspicion hands one tunnel to the
   carrier the pool is not riding, and compares carried bytes before deciding.
-  Still opt-in (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), because the wiring run
-  measured its trigger as rate-dependent; a probe whose window carried nothing
-  is held rather than judged.
+  A confirmed move drains the tunnel its evidence convicted — the least-loaded
+  one only when that tunnel cannot drain — so the degrading carrier is the one
+  that leaves, not whichever member happened to be idle. Still opt-in
+  (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), because the wiring run measured its
+  trigger as rate-dependent; a probe whose window carried nothing is held
+  rather than judged.
 
 - **The bench model's verdicts are statistics, not a silent heuristic.** An
   exact sign test with its p-value beside the level the run's own length can
