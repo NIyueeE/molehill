@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + python lint/format (ruff) + strict clippy.
+# Pre-commit hook (fast gates): format + secret scan + unused deps + docs-sync + python lint/format (ruff) + pyright + strict clippy.
 # A change limited to markdown, docs/ or assets/ cannot move the code gates, so
 # it runs only the two gates it CAN break (the secret scan and the
 # docs-alignment check) — the same split CI makes with ci.yml / docs.yml.
-# A change limited to benches/scripts/ moves no Rust gate either: the scripts
-# are runtime tooling (`uv run` / plain shell), never compiled or linked, so
+# A change limited to bench/ moves no Rust gate either: the project is
+# runtime tooling (`uv run` / plain shell), never compiled or linked, so
 # the python gates, the bench-model selfcheck and the docs check run and cargo
 # skips — CI still runs the full chain on such a change, so this is a latency
 # split, never a coverage split.
@@ -30,12 +30,12 @@ if git diff --cached --name-only --diff-filter=ACMRD | githooks/benches-only; th
   githooks/check-secrets
   echo "==> docs alignment (githooks/check-docs)"
   githooks/check-docs
-  echo "==> ruff check (python bench/test entries, see ruff.toml)"
-  uvx ruff check benches/scripts/
-  echo "==> ruff format --check (same scope; auto-fix with: just py-fmt)"
-  uvx ruff format --check benches/scripts/
+  echo "==> python lint + format (bench project, see bench/pyproject.toml)"
+  just py-lint
+  echo "==> python typecheck (pyright standard; adapters are strict)"
+  just py-typecheck
   echo "==> bench model self-check (metrics, verdict rules, comparability rules)"
-  uv run benches/scripts/bench/bench.py selfcheck
+  just bench-selfcheck
   echo "pre-commit checks passed (benches-only)"
   exit 0
 fi
@@ -52,14 +52,14 @@ cargo machete
 echo "==> docs alignment (githooks/check-docs)"
 githooks/check-docs
 
-echo "==> ruff check (python bench/test entries, see ruff.toml)"
-uvx ruff check benches/scripts/
+echo "==> python lint + format (bench project, see bench/pyproject.toml)"
+just py-lint
 
-echo "==> ruff format --check (same scope; auto-fix with: just py-fmt)"
-uvx ruff format --check benches/scripts/
+echo "==> python typecheck (pyright standard; adapters are strict)"
+just py-typecheck
 
 echo "==> bench model self-check (metrics, verdict rules, comparability rules)"
-uv run benches/scripts/bench/bench.py selfcheck
+just bench-selfcheck
 
 echo "==> cargo clippy (strict lints from Cargo.toml, default features)"
 cargo clippy --all-targets -- -D warnings
