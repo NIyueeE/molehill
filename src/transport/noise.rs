@@ -300,3 +300,116 @@ impl Transport for NoiseTransport {
         }
     }
 }
+
+#[cfg(all(test, feature = "client", feature = "server"))]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
+    use super::*;
+    use crate::config::{MaskedString, NoiseConfig, TransportConfig};
+    use crate::transport::Transport;
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+
+    const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+
+    /// A server static keypair, base64-encoded the way the config carries it.
+    fn server_keypair() -> (String, String) {
+        let params = PATTERN.parse().unwrap();
+        let keypair = snow::Builder::new(params).generate_keypair().unwrap();
+        let engine = base64::engine::general_purpose::STANDARD;
+        (
+            engine.encode(keypair.private),
+            engine.encode(keypair.public),
+        )
+    }
+
+    /// A full handshake first caches a ticket; a second server with the same
+    /// static key but a fresh ticket store declines it. The client must then
+    /// re-dial and complete a *third* full handshake instead of surfacing the
+    /// decline as a connection failure.
+    #[tokio::test]
+    async fn a_declined_resume_redials_and_falls_back_to_a_full_handshake() {
+        let (server_private, server_public) = server_keypair();
+        let server_cfg = NoiseConfig {
+            pattern: PATTERN.to_owned(),
+            local_private_key: Some(MaskedString::from(server_private.as_str())),
+            remote_public_key: None,
+            psk: None,
+            psk_location: None,
+            resume: Some(true),
+        };
+        let client_cfg = NoiseConfig {
+            pattern: PATTERN.to_owned(),
+            local_private_key: None,
+            remote_public_key: Some(server_public),
+            psk: None,
+            psk_location: None,
+            resume: Some(true),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_a = NoiseKeys::from_config(&server_cfg).unwrap();
+        let server_b = NoiseKeys::from_config(&server_cfg).unwrap();
+        let server = tokio::spawn(async move {
+            // 1. Full handshake; this issues the ticket the client caches.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut selector = [0u8; 1];
+            stream.read_exact(&mut selector).await.unwrap();
+            assert_eq!(selector[0], crate::protocol::NOISE_SELECTOR);
+            let _first = server_a.wrap_responder(stream).await.unwrap();
+
+            // 2. The resume reaches a server that has a different store, so the
+            //    ticket cannot open: `run_resume` sends the decline verdict.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_exact(&mut selector).await.unwrap();
+            assert_eq!(selector[0], NOISE_RESUME_SELECTOR);
+            assert!(
+                server_b.run_resume(stream).await.unwrap().is_none(),
+                "the fresh store must decline the old ticket"
+            );
+
+            // 3. The client's fallback re-dial: a fresh full handshake, then
+            //    the data path.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.read_exact(&mut selector).await.unwrap();
+            assert_eq!(selector[0], crate::protocol::NOISE_SELECTOR);
+            let mut third = server_b.wrap_responder(stream).await.unwrap();
+            let mut ping = [0u8; 4];
+            third.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            third.write_all(b"pong").await.unwrap();
+        });
+
+        let client_transport: NoiseTransport = Transport::new(&TransportConfig {
+            noise: Some(client_cfg),
+            ..Default::default()
+        })
+        .unwrap();
+        let target = AddrMaybeCached::new(&addr.to_string());
+        let result = timeout(Duration::from_secs(10), async move {
+            // First connection: full handshake, which caches the ticket.
+            let first = client_transport.connect(&target).await.unwrap();
+            drop(first);
+            // Second connection: resume is declined, and `connect` must
+            // transparently re-dial for the third (full) handshake.
+            let mut stream = client_transport.connect(&target).await.unwrap();
+            stream.write_all(b"ping").await.unwrap();
+            let mut pong = [0u8; 4];
+            stream.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, b"pong");
+        })
+        .await;
+        result.expect("the resume fallback timed out");
+        timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the server task timed out")
+            .unwrap();
+    }
+}

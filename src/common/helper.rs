@@ -1,6 +1,9 @@
 #[cfg(feature = "server")]
 use anyhow::Context;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+#[cfg(feature = "client")]
+use anyhow::anyhow;
+#[cfg(feature = "client")]
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use socket2::{SockRef, TcpKeepalive};
 #[cfg(any(feature = "client", feature = "server"))]
@@ -14,8 +17,10 @@ use tokio::net::TcpStream;
 #[cfg(feature = "client")]
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
 use tracing::trace;
+#[cfg(feature = "client")]
 use url::Url;
 
+#[cfg(feature = "client")]
 use crate::transport::AddrMaybeCached;
 
 // Tokio hesitates to expose this option...So we have to do it on our own :(
@@ -62,6 +67,7 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("Failed to lookup the host"))
 }
 
+#[cfg(feature = "client")]
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
     let semi = s
         .rfind(':')
@@ -135,6 +141,7 @@ pub fn datagram_len(result: io::Result<usize>, buf_len: usize) -> io::Result<usi
 
 /// Create a `TcpStream` using a proxy
 /// e.g. `<socks5://user:pass@127.0.0.1:1080>` `<http://127.0.0.1:8080>`
+#[cfg(feature = "client")]
 pub async fn tcp_connect_with_proxy(
     addr: &AddrMaybeCached,
     proxy: Option<&Url>,
@@ -211,6 +218,17 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "client")]
+    use crate::transport::AddrMaybeCached;
+    #[cfg(feature = "client")]
+    use std::time::Duration;
+    #[cfg(feature = "client")]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(feature = "client")]
+    use tokio::net::{TcpListener, TcpStream};
+    #[cfg(feature = "client")]
+    use url::Url;
+
     /// The Windows spelling of "the datagram did not fit": the buffer holds the
     /// prefix, and the read reports the length it filled rather than the
     /// failure it looks like. A synthetic errno, because the platform that
@@ -238,5 +256,179 @@ mod tests {
     fn a_short_read_keeps_its_length() {
         assert_eq!(datagram_len(Ok(37), 1024).unwrap(), 37);
         assert_eq!(datagram_len(Ok(1024), 1024).unwrap(), 1024);
+    }
+
+    /// Read an HTTP request head without assuming where the proxy's reader
+    /// stopped: the test is the server, so it owns the byte stream.
+    #[cfg(feature = "client")]
+    async fn read_http_head(stream: &mut TcpStream) -> Vec<u8> {
+        let mut head = Vec::new();
+        loop {
+            let byte = stream.read_u8().await.unwrap();
+            head.push(byte);
+            if head.ends_with(b"\r\n\r\n") {
+                return head;
+            }
+            assert!(
+                head.len() < 8 * 1024,
+                "HTTP proxy head never ended: {head:?}"
+            );
+        }
+    }
+
+    /// A SOCKS5 proxy is dialed, its username/password sub-negotiation runs,
+    /// and the CONNECT target is the service endpoint rather than the proxy.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn a_socks5_proxy_carries_the_service_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting[0], 5, "SOCKS version");
+            let mut methods = vec![0u8; usize::from(greeting[1])];
+            stream.read_exact(&mut methods).await.unwrap();
+            assert!(
+                methods.contains(&2),
+                "the client must offer username/password auth: {methods:?}"
+            );
+            stream.write_all(&[5, 2]).await.unwrap();
+
+            let mut auth = [0u8; 2];
+            stream.read_exact(&mut auth).await.unwrap();
+            assert_eq!(auth, [1, 5], "username/password sub-negotiation version");
+            let mut username = vec![0u8; 5];
+            stream.read_exact(&mut username).await.unwrap();
+            assert_eq!(username, b"proxy");
+            let mut password_len = [0u8; 1];
+            stream.read_exact(&mut password_len).await.unwrap();
+            let mut password = vec![0u8; usize::from(password_len[0])];
+            stream.read_exact(&mut password).await.unwrap();
+            assert_eq!(password, b"secret");
+            stream.write_all(&[1, 0]).await.unwrap();
+
+            let mut request = [0u8; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[..3], [5, 1, 0], "CONNECT request");
+            assert_eq!(request[3], 3, "the target must travel as a domain name");
+            let mut host_len = [0u8; 1];
+            stream.read_exact(&mut host_len).await.unwrap();
+            let mut host = vec![0u8; usize::from(host_len[0])];
+            stream.read_exact(&mut host).await.unwrap();
+            assert_eq!(host, b"example.com");
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(port), 443);
+
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let proxy = Url::parse(&format!("socks5://proxy:secret@{proxy_addr}")).unwrap();
+        let target = AddrMaybeCached::new("example.com:443");
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(5),
+            tcp_connect_with_proxy(&target, Some(&proxy)),
+        )
+        .await
+        .expect("SOCKS5 handshake timed out")
+        .expect("SOCKS5 proxy dial failed");
+        let mut pong = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut pong))
+            .await
+            .expect("reading through the proxy timed out")
+            .unwrap();
+        assert_eq!(&pong, b"pong");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("proxy task timed out")
+            .unwrap();
+    }
+
+    /// An HTTP CONNECT proxy receives the target and the Basic credential, and
+    /// a 200 response is what hands the tunnel back to the caller.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn an_http_connect_proxy_carries_the_service_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let head = read_http_head(&mut stream).await;
+            let text = String::from_utf8_lossy(&head);
+            assert!(
+                text.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+                "wrong CONNECT target: {text:?}"
+            );
+            assert!(
+                text.contains("Proxy-Authorization: Basic dXNlcjpwYXNz"),
+                "the Basic credential was not sent: {text:?}"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let proxy = Url::parse(&format!("http://user:pass@{proxy_addr}")).unwrap();
+        let target = AddrMaybeCached::new("example.com:443");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tcp_connect_with_proxy(&target, Some(&proxy)),
+        )
+        .await
+        .expect("HTTP CONNECT timed out")
+        .expect("HTTP CONNECT proxy dial failed");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("proxy task timed out")
+            .unwrap();
+    }
+
+    /// The IPv6-preferring UDP lookup falls back to IPv4 when the host has
+    /// only an A record; the connected socket then carries a datagram.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn udp_connect_prefers_ipv6_but_falls_back_to_ipv4() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = udp_connect(("127.0.0.1", receiver_addr.port()), true)
+            .await
+            .expect("the IPv4 fallback must connect");
+        sender.send(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), receiver.recv_from(&mut buf))
+            .await
+            .expect("the datagram timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"x");
+    }
+
+    /// With no proxy configured the helper is a plain direct dial; this pins
+    /// that the proxy branch did not become mandatory.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn without_a_proxy_the_helper_dials_directly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let target = AddrMaybeCached::new(&addr.to_string());
+        let mut client = tcp_connect_with_proxy(&target, None)
+            .await
+            .expect("direct dial failed");
+        let mut pong = [0u8; 4];
+        client.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        server.await.unwrap();
     }
 }
