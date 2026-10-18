@@ -55,7 +55,7 @@ SLO 行为。这条拓扑存在的意义,是让一个 L4 臂(终结 TCP)、一�
 
 ## bench 模型(测量标准)
 
-`benches/scripts/bench/` 是标准,也是唯一的 runner。发布所公布的 sweep 不是第
+`bench/src/bench/` 是标准,也是唯一的 runner。发布所公布的 sweep 不是第
 二套仪器:它就是本模型的 `sweep` profile——产品与各参照工具上的 `timeline` 与
 `capacity` 场景——这正是阶段日程与负载斜坡装在同一份结果文件里、同一份 schema
 之下、同一道门禁之后的原因。
@@ -63,11 +63,11 @@ SLO 行为。这条拓扑存在的意义,是让一个 L4 臂(终结 TCP)、一�
 ```bash
 sudo -n just bench                     # the smoke profile, about a minute
 sudo -n just bench --profile dev --aa  # the default loop for an optimization
-sudo -n just bench-doctor              # what this host can and cannot measure
-just bench-list                        # every metric, condition and profile
-just bench-report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
-just bench-plot ~/tmp/bench-*.json     # its charts and markdown tables
-just bench-gate RESULTS.json           # may this run be published?
+sudo -n just bench doctor              # what this host can and cannot measure
+just bench list                        # every metric, condition and profile
+just bench report ~/tmp/bench-*.json   # a stored run: tables, floors, verdicts
+just bench plot ~/tmp/bench-*.json     # its charts and markdown tables
+just bench gate RESULTS.json           # may this run be published?
 just bench-selfcheck                   # the model's own checks (a fast gate)
 ```
 
@@ -104,7 +104,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 - **一个指标只在代码里定义一次。** 单位、方向、它作为比值时所用的分母、能够
   产出它的工作负载种类,以及值得称为一个 claim 的最小差异,全都写在
-  `model.METRICS` 里;下面那张表就是从这个注册表生成的,`just bench-list` 会
+  `model.METRICS` 里;下面那张表就是从这个注册表生成的,`just bench list` 会
   把它打印出来。一个指标若描述成一种算法、计算的却是另一种,
   `just bench-selfcheck` 会失败。
 - **对照臂是强制的。** 每个场景还会在同一条拓扑、同一组端口与同一个后端上再
@@ -112,7 +112,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   是把一个工具臂*对着它自己的对照*上报,而不是单独上报。
 - **一轮运行在取第一个样本之前,就陈述它的整套方法。** 结果文件带一个指纹,覆
   盖拓扑、各条件与时间线、各个场景及其*解析后*的参数、各仪器的节奏与本模型自
-  身的代码。只有指纹一致时,两份文件才可以比较,而 `just bench-compare` 会逐
+  身的代码。只有指纹一致时,两份文件才可以比较,而 `just bench compare` 会逐
   一列出每一个有差异的键,而不是印出两种方法之间的一个差值。
 - **本轮运行测量它自己的分辨率。** 有一个臂会在两个名字下各测一次(`--aa`;
   在 `dev`、`full` 与 `stage` 里默认开启),这两半之间逐轮配对的差异就是本轮
@@ -160,7 +160,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 
 ### 指标
 
-由 `model.METRICS` 生成;`just bench-list` 打印的是同一份注册表,而报告和判定
+由 `model.METRICS` 生成;`just bench list` 打印的是同一份注册表,而报告和判定
 渲染出来的就是这些定义。
 | 指标 | 单位 | 方向 | 是什么 | 除以 |
 |---|---|---|---|---|
@@ -427,7 +427,7 @@ sudo -n just bench
 sudo -n just bench --profile dev --aa
 
 # the release sweep: the staged schedule and the load ramp, four arms
-just bench-peers
+just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
 # one condition, the whole workload (a shape question in minutes)
@@ -441,9 +441,9 @@ sudo -n just bench --profile screen --ab-arm molehill --binary-b /path/to/build
 sudo -n just bench --arm id=l3-deep,txqueuelen=20000
 ```
 
-`just bench-doctor` 会在一轮运行不得不自己去发现之前,就把这台主机能测什么、不
+`just bench doctor` 会在一轮运行不得不自己去发现之前,就把这台主机能测什么、不
 能测什么说清楚(root、`/dev/net/tun`、iperf3、各对端二进制)。对端二进制来自
-`just bench-peers`:取自 GitHub 最新 release 产物,绝不从源码构建,解析出的版
+`just bench peers fetch`:取自 GitHub 最新 release 产物,绝不从源码构建,解析出的版
 本记录在结果 meta 里。
 
 ## 怎么读一次结果
@@ -466,14 +466,14 @@ sudo -n just bench --arm id=l3-deep,txqueuelen=20000
   sha256 与它自己那一行 `--version`、主机身份、两个校准探针)以及臂列表;
   `samples` 是每个臂、每一轮、每个场景、每个格子一条记录,各自带着它的指标、
   它类型化的缺失与它的证据;`summary` 是分析从这些样本里推导出来的东西——而
-  `just bench-report` 会重算它,因为样本才是证据,`summary` 只是对证据的一次渲
+  `just bench report` 会重算它,因为样本才是证据,`summary` 只是对证据的一次渲
   染。
-- **`just bench-plot` 从任意结果文件渲染出的正是本页描述的这些图**:时间线主图、
+- **`just bench plot` 从任意结果文件渲染出的正是本页描述的这些图**:时间线主图、
   小倍数图、容量曲线、UDP 阶梯、漂移面板与成本柱。
 
 ## 门禁
 
-`just bench-gate` 是一轮运行的数字在可以发布之前必须满足的东西。它会为每一个
+`just bench gate` 是一轮运行的数字在可以发布之前必须满足的东西。它会为每一个
 问题报告它看到的结果,并让其中必须由人来处理的问题失败:
 
 - **覆盖**——各场景声明过的每一个格子,每个臂都要有;
@@ -492,7 +492,7 @@ sudo -n just bench --arm id=l3-deep,txqueuelen=20000
   理由:只等于一个预算时,一次未获应答的尝试按定义就是一次静默,这条轴就成了
   抛硬币;
 - **容量斜坡**——什么都没撑住的斜坡不是一个读数;
-- 以及带上 `--baseline` 时的**回归那一半**:与 `just bench-compare` 所做的同一
+- 以及带上 `--baseline` 时的**回归那一半**:与 `just bench compare` 所做的同一
   个比较,除非两份文件的方法记录一致,否则拒绝。
 
 ## 模型回答不了什么
@@ -584,12 +584,12 @@ sudo -n just bench --arm id=l3-deep,txqueuelen=20000
 (`wire_per_visitor_byte` 1.0755);8000 字节时是 1.5 %(1.0152),因为载体自己的
 头部与确认从"每 1400 字节付一次"变成"每 8000 字节付一次"。
 
-**后记(2026-10-16,offload 修复;2026-10-17 重测):上面两条读法都已经过时。**
+**后记(2026-10-16,offload 修复;2026-10-17、2026-10-18 重测):上面两条读法都已经过时。**
 本节的二进制在 TUN 边界逐包分段;出厂的二进制声明了自己的分段 offload,接收的是
 GSO 超级帧——见下文那条"撤回变更正"。这个修复的配对证据是单流的 smoke A/B:
 2.0 → 3.4 Gbit/s。staged 运行的 L3 clean 格子承担不了与本节 4.335 的绝对值对比:
 在本版本的几轮 sweep 之间,它在这台主机上变过三分之一以上(发布的一轮读
-3.881 Gbit/s),而同一轮自己的两次 clean 读数相差不到 1%——这一格是这一行里
+5.859 Gbit/s),而同一轮自己的两次 clean 读数相差不到 1%——这一格是这一行里
 最不稳定的,它只支持"同一轮内的一对"。「不随流数扩展」与「包大小是杠杆」
 两条都仍然成立——但设备内的包大小不再只由运维单方面设定,逐包串行的读取者也不
 再是上限的全部。
@@ -611,8 +611,9 @@ GSO 超级帧——见下文那条"撤回变更正"。这个修复的配对证�
 上限"上,这也解释了为什么它的 `bulk-n` 反而**低于** `bulk-1`:八条流穿过一条通道,
 用的仍是同一条连接。
 
-**认领现在可以持有一组成员**,而正是这一点终于抬动了上限(`members` /
-`[transparent.data].default_members`,默认 1——所以上面每一格的臂都保持原意)。四个成员、
+**正是首次引入认领成员集的那轮测量**终于抬动了上限。当时的模型把这两个键叫作
+`members` / `[transparent.data].default_members`(默认 1——所以上面每一格的臂都保持原意);
+当前模型把连接预算称为 `[transparent.data].tunnels`,把成员称为车道。四个成员、
 内层流按规范化的五元组哈希分摊、巨型帧路径、每臂四轮实测并在同轮带 A/A 孪生臂:
 
 | `bulk-n`(8 条流) | `l3`(直连,1) | `l3-mux`(多路,1) | `l3-mux4`(4 成员) | 孪生臂(同配置) | `l4`(转发池) |
@@ -658,7 +659,7 @@ GSO 超级帧——见下文那条"撤回变更正"。这个修复的配对证�
 路径缺的只是声明:`IFF_VNET_HDR` 加 `TUNSETOFFLOAD`。实测:同样 3.85 GB 的 bulk TCP,
 无声明时以 576 071 次 1500 字节读抵达,有声明时以 59 160 次平均 65 212 字节的读抵达。
 该修复已进入出厂二进制;探针在
-[`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+[`bench/src/bench/utils/l3/tcp_tso_census.py`](../bench/src/bench/utils/l3/tcp_tso_census.py),
 下文「剩下的是逐包系统调用成本」一段已按此改写。
 
 ### carrier 这一维:TCP 对 KCP(2026-10-10,本模型)
@@ -888,12 +889,13 @@ churn 持平。更早的三次 "no claim" campaign 被本次取代:它们的运�
 ## 透明 L3 的线上开销问题(验收 harness)
 
 L3 客户端承载的是整个 IP 包,所以"线上有多少是首部、其中又有多少能被压缩拿掉"
-这个问题有它自己的仪器:`benches/scripts/l3/run.sh` 在每个臂前后,于各自命名空间内
-采样 `/proc/net/dev`;`benches/scripts/l3/wire_report.py` 把差值换算成承载包的大小
+这个问题有它自己的仪器:`bench/src/bench/utils/l3/run.sh` 在每个臂前后,于各自命名空间内
+采样 `/proc/net/dev`;`bench/src/bench/utils/l3/wire_report.py` 把差值换算成承载包的大小
 与一个上限。两个接口是关键——客户端拨向服务端的那对 veth(隧道的线上流量,双向,
 包含载体自己的 TCP/IP 首部)与两个 TUN 设备(L3 路径真正承载的包)。分母每次都写明:
 **wire** 是 veth 的字节数,即链路真实成本;**carried** 是这些包加上本协议 2 字节的
-长度前缀。
+长度前缀。该 harness 跑的是 IPv4;IPv6 共用帧与 GSO 路径,但基础头是 40 字节,所以
+这些上限数字是 IPv4 的。`just l3-accept-ipv6` 是 IPv6 的功能验收,不是测量。
 
 | 臂(各自一条连接) | 承载 | 平均承载包 | 线上 | 每个承载包的线上字节 | 首部压缩上限 |
 |---|---|---|---|---|---|
@@ -946,13 +948,16 @@ bulk 臂期间做 `perf` 采样:**84% 的 CPU 在内核**,molehill 占 10%,libc 
 很薄。没有可修的用户态热点——同步数据面只会去抓那 10%,而不是那 84%——真正能推动它的
 杠杆是**包大小**:
 - **设备自身的 offload(代码改动,v0.11.0 起):** TUN 设备以 `IFF_VNET_HDR` 附加并声明
-  `TUNSETOFFLOAD`,内核随即将 TCP 超级帧整块交给读端,而不是先分段。在一条路由转发路径上
+  `TUNSETOFFLOAD`,内核随即将 TCP 超级帧整块交给读端,而不是先分段。自协议 v5.1
+  起,这条 `Vnet` 线格式只在两端都是开启 offload 的 Linux 时协商;只要有一端是纯
+  IP 设备就协商 `Ip`,由 Linux 侧在边界处分段/校验——这些 Linux 对 Linux 的数字
+  不覆盖那条路径。在一条路由转发路径上
   实测(两个 netns、一跳 TUN、帧整体中继):同样 3.85 GB 的 bulk TCP,无声明时以 576 071 次
   1500 字节读抵达;有声明时以 59 160 次平均 65 212 字节的读抵达——读次数与字节数之比,等于
   下文 8000 字节 MTU 这个运维杠杆买到的东西,只是这次由二进制自己拿到,而不依赖部署。本内核
   上 UDP GSO 即便有声明也在读端之前分段(UDP offload 在这里只有发送侧),所以收益是 TCP 形状
   的;探针在
-  [`benches/scripts/l3/tcp_tso_census.py`](../benches/scripts/l3/tcp_tso_census.py),
+  [`bench/src/bench/utils/l3/tcp_tso_census.py`](../bench/src/bench/utils/l3/tcp_tso_census.py),
   同一版本的线格式长度前缀改为 `u32`,让整个超级帧装进
   一帧。
 - **TUN MTU(运维设置):** 同样的字节用 8000 字节的包而不是 1400,实测吞吐 1.8 倍、每字节
@@ -970,10 +975,10 @@ materiality 10%、符号一致 1.0,并且越过本轮 A/A 地板)。同样比较
 ——用更多连接承载更多流量。条件加在访客腿、或干净 loopback(此时 L3 路径是按包受限)时,差异落在噪声
 里。复现用的是**臂**而不是另外构建的二进制:目录里就有 `l3-budget10`(开着出借)与
 `l3-budget10-nolend`(同一拓扑、同一个二进制,只是 `[transparent.data].lend = false`),
-所以 `bench.py run --arms l3-budget10,l3-budget10-nolend --condition rtt100
+所以 `just bench run --arms l3-budget10,l3-budget10-nolend --condition rtt100
 --condition-leg tunnel` 就是全部实验;完整记录在 `HANDOFF.md`。
 
-**给多路复用开销做归因。** 上面 L4 各行说明多路复用要花多少(池上单条流大约只有独占连接的一半吞吐,而每字节 CPU 约为两倍);这些 CPU 去了哪里,由 `benches/scripts/mux/gap_profile.sh` 回答:它用 `perf` 在一条 iperf3 流穿过一条隧道时同时采样两端守护进程,并按守护进程打印最热的符号。本机上的形态是:**约 35% 在内核、约 15% 在 libc 的内存例程、mux 自己的 Rust 代码每个符号只有几个百分点**——每个叶子都很小,总量落在「每字节要拷贝几次、要几次系统调用」上,而不是某个热点函数。这与下文 TUN 路径得到的结论一致,也正是候选方案都是结构性的原因(一个包被拷贝几次、一次成帧写入多大),而不是去优化某个函数。
+**给多路复用开销做归因。** 上面 L4 各行说明多路复用要花多少(池上单条流大约只有独占连接的一半吞吐,而每字节 CPU 约为两倍);这些 CPU 去了哪里,由 `bench/src/bench/utils/mux/gap_profile.sh` 回答:它用 `perf` 在一条 iperf3 流穿过一条隧道时同时采样两端守护进程,并按守护进程打印最热的符号。本机上的形态是:**约 35% 在内核、约 15% 在 libc 的内存例程、mux 自己的 Rust 代码每个符号只有几个百分点**——每个叶子都很小,总量落在「每字节要拷贝几次、要几次系统调用」上,而不是某个热点函数。这与下文 TUN 路径得到的结论一致,也正是候选方案都是结构性的原因(一个包被拷贝几次、一次成帧写入多大),而不是去优化某个函数。
 
 **方法说明:bulk 臂曾经测的是一次死锁。** 它先发一整块再读回显,超过缓冲就必然卡死
 ——访客等回显,回显等访客读——其中 20 MB 与 100 MB 的两次运行被当成吞吐报了出去,而
@@ -996,19 +1001,19 @@ materiality 10%、符号一致 1.0,并且越过本轮 A/A 地板)。同样比较
 ## UDP 队列问题(仅 molehill 的诊断)
 
 UDP 服务的数据报上限是**服务**的属性,不是阶段日程的属性,所以它有专门的仪器:
-`benches/scripts/udp_stress.py` 启动真实的一对进程(`udp_workers` 可配),用**限速或
+`bench/src/bench/utils/udp_stress.py` 启动真实的一对进程(`udp_workers` 可配),用**限速或
 全速**的访客打它,并在每一步前后读取服务端的 `MOLEHILL_UDP_STATS` 行;最后一步是
 对照——同样的访客**直接打 sink**。没有这个对照,慢 sink 和慢隧道从计数器上看是
 一样的。同一主机、1400 字节数据报实测:单个访客从不丢包(它自己的 socket 缓冲把它
 限在约 29.8k 数据报/秒),多访客把池打到约 1 Gbit/s 饱和,与 `udp_workers`(1/2/4 分别
 1.14/1.00/0.98)和访客数都无关,扩散保持均匀,而丢弃量与该上限之上的超出部分相差
 0.07% 以内。用户需要的数字在配置页 `udp_workers` 旁边。背后的探针是
-`benches/scripts/udp_stress.py`;用同样的方式运行,就能在自己的主机上复现这个上限。
+`bench/src/bench/utils/udp_stress.py`;用同样的方式运行,就能在自己的主机上复现这个上限。
 
 ## 可比性
 - **同模型、同方法、同主机。** 每份结果文件都记录指纹、主机身份与两个校准探针;
   来自另一台主机或另一个方法的数字只是背景,不是基线。
-- **比较是被拒绝,而不是被近似。** `just bench-compare` 会点名每一条阻断理由
+- **比较是被拒绝,而不是被近似。** `just bench compare` 会点名每一条阻断理由
   ——某个方法键有差异、某个探针缺失、某台主机的分歧超出它的容差(CPU 探针
   25%,loopback 探针 15%;与 gate 用的是同样这两个探针)——而一轮没有 A/A 对的
   运行,会把文件之间的每一处差异都报成 `directional`,绝不报成 claim。
@@ -1036,21 +1041,21 @@ UDP 服务的数据报上限是**服务**的属性,不是阶段日程的属性,�
 在一台装有 `iperf3`、`tc` 并且有 root 的 Linux 主机上(见 `just bench-deps`):
 
 ```bash
-just bench-doctor                      # is this host ready?
-just bench-peers                       # the reference tools' release binaries
+just bench doctor                      # is this host ready?
+just bench peers fetch                 # the reference tools' release binaries
 sudo -n just bench --profile dev --aa  # a change, measured
-just bench-plot ~/tmp/bench-*.json     # its charts and tables
+just bench plot ~/tmp/bench-*.json     # its charts and tables
 ```
 
 发布 sweep 是一条命令,门禁是另一条:
 
 ```bash
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
-just bench-gate benches/records/results-bench-vX.Y.Z.json \
+just bench gate benches/records/results-bench-vX.Y.Z.json \
      --baseline benches/records/results-bench-v<previous>.json
 ```
 
-`just bench --help` 会列出各 profile、各臂、各条件与各旋钮;`just bench-list` 打印
+`just bench run --help` 会列出各 profile、各臂、各条件与各旋钮;`just bench list` 打印
 注册表;而每一个会改变数字含义的参数都记录在结果文件里(解析后的场景参数、条件、
 时间线、各仪器的节奏、SLO),因此任何一张图总能追溯回产出它的方法。
 
