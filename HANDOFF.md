@@ -1,7 +1,7 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-18.** **v0.11.1 is merged to `main` at `b38a337`
-> and is the release being tagged; `main` carries `version = "0.11.1"`.** v0.11.1 moves the wire to
+> **State as of 2026-10-18.** **v0.11.1 is released: the tag names `4874f05`,
+> the `main` tip at tag time; `main` carries `version = "0.11.1"`.** v0.11.1 moves the wire to
 > **protocol v5.1** (a deliberate v5.0 break), makes transparent (L3)
 > services cross-platform through `tun-rs` — Linux/macOS clients and servers,
 > Windows servers, a Windows client refused with the WSL2 path — and removes
@@ -88,13 +88,19 @@
   run that did show it converging was voided by the shaper bug recorded in the
   archive. A long-hold scenario is what would settle it; the arms already exist
   (`l3-budget10-lending` against `l3-budget10-nolend`).
-- **The repository state**: v0.11.1 is merged at `b38a337` and `main`
-  carries `version = "0.11.1"` for the release; `CHANGELOG.md` keeps the dated
-  `## [0.11.1] - 2026-10-17` section and an empty `[Unreleased]`. `v0.11.0`
-  names `f3295e8`; the v0.11.1 tag is being created from the release commit.
-  The measured v0.11.1 revision is `0b56438`, preserved as
-  `bench/v0.11.1-measured`. The tag review checks that no measured code changed
-  between that revision and the tagged commit.
+- **The repository state**: v0.11.1 is released and the tag names `4874f05`,
+  the `main` tip at tag time; `main` carries `version = "0.11.1"`;
+  `CHANGELOG.md` keeps the dated `## [0.11.1] - 2026-10-17` section and an empty
+  `[Unreleased]`. `v0.11.0` names `f3295e8`. The measured v0.11.1 revision is
+  `0b56438`, preserved as `bench/v0.11.1-measured`. The tag review checks that
+  no measured code changed between that revision and the tagged commit.
+  The v0.11.1 tag was re-created on `4874f05` after a transient 0.11.2 bump was
+  reset off `main`; that commit's tree is identical to the first tagged commit,
+  so the rebuilt archives and image describe the same code. A re-tag re-runs
+  the whole workflow, whose `crates.io` job then fails: `molehill-rathole
+  0.11.1` is already published and cannot be uploaded twice. The workflow has
+  no skip guard for that case, so a re-tag leaves the run red after the
+  release, artifacts and GHCR image are updated.
 - **Only docs and assets may follow a sweep.** `githooks/pre-tag` reads the
   results file's recorded revision and fails the tag if `src/`, `tests/`,
   `Cargo.*`, `build.rs` or the bench model's own code changed since — the
