@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Classify a change set: is every changed path a benchmark or test entry?
+# Classify a change set: is every changed path part of the bench project?
 #
-# Reads paths (one per line) on stdin; exits 0 when all of them are entries
-# under benches/scripts/ (the python PEP 723 entries and the shell helpers),
+# Reads paths (one per line) on stdin; exits 0 when all of them are part of
+# the bench project (`bench/`) or its published records (`benches/records/`),
 # and 1 otherwise.
 #
 # What this buys: the fast gate (githooks/pre-commit) compiles nothing for
-# such a change. The scripts are runtime tooling — run via `uv run` or as
+# such a change. The project is runtime tooling — run via `uv run` or as
 # plain shell — they are not compiled, linked, or depended on by any Rust
 # target, so `cargo fmt`, `cargo machete` and both clippy passes cannot move;
-# the quality gates that CAN move (the two ruff gates, the bench-model
+# the quality gates that CAN move (ruff, pyright, the bench-model
 # selfcheck, the docs gate that keeps model.py's registry and
 # docs/benchmarks.md in lock) all still run. CI keeps the full chain
 # regardless (see the note in githooks/pre-commit), so this is a latency
@@ -31,7 +31,7 @@ while IFS= read -r path; do
   [ -n "$path" ] || continue
   saw_path=1
   case "$path" in
-    benches/scripts/*) ;;
+    bench/*|benches/records/*) ;;
     *) benches_only=0 ;;
   esac
 done

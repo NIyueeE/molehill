@@ -13,10 +13,13 @@ v0.5.0 — and has been numbered independently since.
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) applies within
 that line.
 
-The **wire protocol** has its own number, and it moves with the release line:
-it changes with the tag that introduces it, and no two tags are compatible. The
-rule, the current dialect and the release line are in AGENTS.md §5; the wire
-consequences are in [internals.md](internals.md), "Protocol versions".
+The **wire protocol** has its own `major.minor` number, and it moves with the
+release line: it changes with the tag that introduces it, and no two tags are
+compatible. A change to either half is a new dialect, not a compatible
+extension: 0.11.1 speaks v5.1, which deliberately breaks 0.11.0's v5.0 in a
+patch release. The rule, the current dialect and the release line are in
+AGENTS.md §5; the wire consequences are in
+[internals.md](internals.md), "Protocol versions".
 
 ## Release notes: CHANGELOG.md is the single source
 
@@ -55,8 +58,10 @@ the two tag moments (responsibilities of the three hooks are split in
   annotated tag for `Cargo.toml`'s version. `just tag-check` runs only the
   review.
 - **On tag push**: git has no native tag hook, so `githooks/pre-push` re-runs
-  the review (against the tag's commit) for every `v*` tag in the push,
-  before the heavy gates — a violation fails the push.
+  the review (against the tag's commit) for every `v*` tag in the push. A
+  tag-only push stops after the review; a push that also carries a branch runs
+  the heavy gates for the branch — the tagged commit's heavy gates ran when its
+  branch was pushed.
 
 The review mechanically verifies tag↔version match (including `Cargo.lock`),
 exactly one dated non-empty changelog section with an empty `[Unreleased]`,
@@ -78,7 +83,7 @@ timelines, the SLO, the scenarios, and how to reproduce a run — is owned by
 [benchmarks.md](benchmarks.md); this section owns the ritual a tag depends on.
 The ritual produces three artifacts and one verdict: the results file
 (`benches/records/results-bench-vX.Y.Z.json`), the chart set in `assets/`, the
-refreshed README benchmark numbers, and `just bench-gate`'s verdict on the run
+refreshed README benchmark numbers, and `just bench gate`'s verdict on the run
 (plus its comparison against the previous tag when a baseline is given).
 
 The sweep is one profile of the one model, so the staged schedule and the load
@@ -91,8 +96,9 @@ came from, so the gate compares like with like.
 
 Peers are frp, rathole (upstream) and nps, each fetched as the **latest GitHub
 release** binary, never built from source, with the resolved versions recorded
-in the results meta. Every entry is a PEP 723 python script run via `uv run`,
-and the whole package is self-contained (`benches/scripts/bench/`).
+in the results meta. The model is the `bench/` uv project, pinned by
+`bench/uv.lock` and run through its console script (`just bench <verb>`); its
+only third-party runtime dependency is the optional `plot` extra.
 
 1. `just interop` — the interop matrix
    ([checks.md](checks.md#outside-the-chain-the-interop-matrix-just-interop)):
@@ -101,7 +107,8 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    — it is seconds. What it asserts is that both cross-version directions
    **refuse** each other on the connection it happens on, and that the refusing
    process keeps serving a peer of its own version.
-2. `just bench-peers` — fetch/refresh the peer binaries (cached per release).
+2. `just bench peers fetch` — fetch/refresh the peer binaries (cached per
+   release; `--peer-dir` overrides `~/tmp/bench-peers`).
 3. `just bench --profile sweep --binary target/release/molehill \
    --out benches/records/results-bench-vX.Y.Z.json`
    — run the sweep. **The profile's arm list is the requirement**: a run whose
@@ -123,7 +130,7 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    so five arms are a little over two hours on this host. `--scale 0.2` shortens the
    holds without changing the schedule's *shape*, and the fingerprint records
    the scale, so a shortened run can never be mistaken for the published one.
-4. `just bench-plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
+4. `just bench plot benches/records/results-bench-vX.Y.Z.json --out-dir assets/`
    — renders the chart set and prints the markdown tables: the master (per
    arm, the interactive stream over the stage schedule with its per-stage
    p50/p99 and the bulk throughput, wedges marked), the small multiples, the
@@ -133,12 +140,12 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    Benchmarks section with them and their numbers.
    The release review enforces the provenance half of this step: the results
    file records the revision it was measured at, and `githooks/pre-tag` fails
-   the tag if `src/`, `tests/`, `Cargo.*`, `build.rs` or the model changed
+   the tag if `src/`, `tests/`, `Cargo.*`, `build.rs` or `bench/src/bench/` changed
    between that revision and the reviewed commit — a chart whose numbers
    describe code that is no longer here is the one thing a reader cannot see.
    Doc and asset commits after the sweep are fine; that is how the ritual lands
    it.
-5. `just bench-gate benches/records/results-bench-vX.Y.Z.json \
+5. `just bench gate benches/records/results-bench-vX.Y.Z.json \
    --baseline benches/records/results-bench-v<previous>.json`
    — the gate: coverage (every cell the scenarios declared), the endpoint
    invariant, the SLO on the clean stages, the drift and wedge axes, the
@@ -150,10 +157,20 @@ and the whole package is self-contained (`benches/scripts/bench/`).
    thresholds and the comparability rules are in
    [benchmarks.md](benchmarks.md#the-gate).
 
+   **A method-changing release is a re-baseline release.** When the change
+   touches the method's code (`bench/src/bench/`'s engine modules, the
+   adapters or the probes), the published record is not comparable with the
+   previous tag by construction: run this gate **without `--baseline`**, then
+   record in `CHANGELOG.md` and `HANDOFF.md` that the new record is the next
+   baseline. The gate's absolute half (coverage, endpoint invariant, SLO,
+   drift, wedge, ramp) still applies; only the regression half has nothing to
+   compare against, and the release notes say so instead of implying a
+   comparison that the fingerprints would refuse.
+
 The soak model's records (`results-soak-vX.Y.Z.json`, also in
 `benches/records/`) were measured with the model this one replaced. They stay
 as published history and are never a regression baseline for a `bench` run:
-the two schemas are different instruments, and `bench-gate` refuses a baseline
+the two schemas are different instruments, and `just bench gate` refuses a baseline
 whose method record does not match.
 
 The same refusal now operates inside `bench` itself, on two keys: the
@@ -176,7 +193,7 @@ run's own noise floor:
 # build both, then one interleaved A/B
 just bench --profile screen --ab-arm molehill --binary-b /path/to/other/build \
      --out ~/tmp/bench-ab.json
-just bench-compare ~/tmp/bench-ab.json ~/tmp/bench-ab-first.json
+just bench compare ~/tmp/bench-ab.json ~/tmp/bench-ab-first.json
 ```
 
 It is the fast, development-time form of
@@ -188,12 +205,18 @@ inside the instrument's own scatter.
 
 1. **pre-release checks**: Cargo.toml version ↔ tag version, CHANGELOG
    section present, `cargo audit`.
-2. **build matrix** (9 targets): linux gnu + musl, aarch64 musl (via cross),
-   arm/armv7 musl (`embedded` feature), macOS x86_64 + aarch64, Windows
-   msvc. musl artifacts build with the full default feature set
-   (`server,client,noise,hot-reload,multiplex,kcp,transparent`); linux
-   artifacts are UPX-compressed. Tests run inside the matrix for native and
-   cross targets.
+2. **build matrix** (10 targets): linux gnu + musl, aarch64 gnu + musl (native
+   arm64 runners), arm/armv7 musl (`embedded` feature, via cross), macOS
+   x86_64 + aarch64 on native x64/arm64 runners, Windows msvc. The full default
+   feature set (`server,client,noise,hot-reload,multiplex,kcp,transparent`) is
+   built by the x86_64/aarch64 legs, including the two GHCR image architectures;
+   linux artifacts are UPX-compressed. The matrix builds every artifact and
+   smoke-tests each native one with `--help`; the test suite is CI's job (it
+   runs on the PR and on `main`, including both macOS architectures), not the
+   release's —
+   re-running it here duplicated CI and turned platform flakes into release
+   blockers. The 32-bit `embedded` artifacts have no native runner and are
+   cross-checked in CI.
 3. **GitHub Release**: published **directly** (no draft stage; the tag push
    itself is the human checkpoint), with notes extracted from `CHANGELOG.md`,
    all archives, and a `SHA256SUMS` — never edit the notes by hand.
@@ -207,6 +230,7 @@ inside the instrument's own scatter.
 
 `.github/workflows/test-build.yml` builds **test artifacts** from any commit
 without creating a release: dispatch it manually from the Actions tab, choose
-a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
-`windows`). Artifacts are ephemeral (7-day retention) and are never a Release;
+a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `linux-arm64`,
+`macos`, `macos-x64`, `windows`). Artifacts are ephemeral (7-day retention) and
+are never a Release;
 the usage rules and typical uses are in [AGENTS.md §6](../AGENTS.md).

@@ -12,9 +12,9 @@ on:
         required: false
         default: "main"
       targets:
-        description: "Platforms, comma-separated (linux, macos, windows)"
+        description: "Platforms, comma-separated (linux, linux-arm64, macos, macos-x64, windows)"
         required: false
-        default: "linux,macos,windows"
+        default: "linux,macos,macos-x64,windows"
 
 run-name: Test build ${{ inputs.ref }} [${{ inputs.targets }}]
 
@@ -42,14 +42,16 @@ jobs:
           MATRIX=$(printf '%s' "$REQUESTED" | tr ', ' '\n\n' | sed '/^$/d' | jq -Rsc '
             def platform:
               {
-                "linux":   {os: "ubuntu-latest",  target: "x86_64-unknown-linux-gnu"},
-                "macos":   {os: "macos-latest",   target: "aarch64-apple-darwin"},
-                "windows": {os: "windows-latest", target: "x86_64-pc-windows-msvc"}
+                "linux":       {os: "ubuntu-latest",   target: "x86_64-unknown-linux-gnu"},
+                "linux-arm64": {os: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu"},
+                "macos":       {os: "macos-26",        target: "aarch64-apple-darwin"},
+                "macos-x64":   {os: "macos-26-intel",  target: "x86_64-apple-darwin"},
+                "windows":     {os: "windows-latest",  target: "x86_64-pc-windows-msvc"}
               }[.];
             split("\n")
             | map(select(length > 0)
                 | platform
-                | if . == null then error("unknown platform; use linux, macos, windows") else . end)
+                | if . == null then error("unknown platform; use linux, linux-arm64, macos, macos-x64, windows") else . end)
             | unique
             | {include: .}
           ')

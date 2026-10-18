@@ -10,13 +10,32 @@ use tracing::{trace, warn};
 
 use crate::config::ServiceType;
 
-type ProtocolVersion = u8;
-const _PROTO_V0: u8 = 0u8;
-const _PROTO_V1: u8 = 1u8;
-const _PROTO_V2: u8 = 2u8;
-const _PROTO_V3: u8 = 3u8;
-const _PROTO_V4: u8 = 4u8;
-const PROTO_V5: u8 = 5u8;
+/// One wire dialect. The pair is the whole identity: there is no
+/// compatibility across a change of either half, so `5.1` is as incompatible
+/// with `5.0` as it is with `4.0`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProtocolVersion {
+    pub major: u8,
+    pub minor: u8,
+}
+
+impl ProtocolVersion {
+    pub const fn new(major: u8, minor: u8) -> Self {
+        Self { major, minor }
+    }
+}
+
+impl std::fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl std::fmt::Debug for ProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "v{self}")
+    }
+}
 
 /// v4: every connection starts with a one-byte transport selector (`0x00`
 /// plain / `0x01` noise) so the server can accept both transports on one
@@ -40,37 +59,42 @@ const PROTO_V5: u8 = 5u8;
 /// was gone.
 /// The data plane (hellos, prologue, the striping frames) is unchanged.
 ///
-/// v4's number, kept for the refusal tests: this build speaks v5 and a v4
-/// hello must be turned away with the version the peer actually sent.
-#[cfg(test)]
-pub const PROTO_V4_VERSION: ProtocolVersion = _PROTO_V4;
-
-/// v5 adds one service type and one data-channel command, nothing else: a
-/// registration may declare `ServiceType::Transparent`, whose `bind_addr` is a
-/// public `ip:port` the client *claims* rather than a listener the server
-/// binds, and whose data channel carries whole IP packets — framed
-/// `[u16 length][packet]` by [`IpTraffic`] — once the server has announced it
-/// with [`DataChannelCmd::StartForwardTransparent`]. The server keeps no
-/// per-visitor state for such a service: it routes packets it was given by the
-/// host's own routing, and the client's kernel owns the connections.
+/// v5.1 is the transparent cross-platform revision.
 ///
-/// The selector byte, the session handshake, the service prologue, the
-/// striping frames and the UDP framing are unchanged from v4.
-pub const PROTO_V5_VERSION: ProtocolVersion = PROTO_V5;
+/// It keeps v5.0's service type and data-channel command, and changes two
+/// things:
+///
+/// - the protocol version is two bytes (`major.minor`), so the hello is one
+///   byte wider and a v5.0 hello has a different shape. This is deliberate:
+///   the two lines do not interoperate.
+/// - a transparent registration may declare the frame format its device can
+///   take, and the server answers `StartForwardTransparent` with the format
+///   the channel will actually carry (`Ip` or `Vnet`). A Linux pair negotiates
+///   `Vnet` and keeps the virtio-net header/GSO path; any pair with a plain-IP
+///   device negotiates `Ip`, and the Linux side converts.
+///
+/// v5.0's number, kept for the refusal tests: a v5.0 peer must be turned away
+/// with the version it actually sent.
+#[cfg(test)]
+pub const PROTO_V5_0_VERSION: ProtocolVersion = ProtocolVersion::new(5, 0);
 
 /// The dialect this build *speaks*: the version it puts in the hellos it
 /// originates. It is deliberately separate from [`SUPPORTED_PROTO_VERSIONS`],
 /// because a server has to keep serving the dialects it no longer speaks.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V5_VERSION;
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = ProtocolVersion::new(5, 1);
 
 /// The dialect a *server* accepts, and the only one it speaks.
 ///
-/// v4 (one control session per endpoint, service-id-carrying commands) stopped
-/// being served when v5 landed: this project is self-hosted, both ends are the
-/// same binary, and a wire break is announced on the connection it happens on
-/// (see [`read_hello`]). Anything else is refused there, loudly, with the
-/// version the peer actually sent.
-pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [PROTO_V5_VERSION];
+/// v5.0 stopped being served when v5.1 landed: this project is self-hosted,
+/// both ends are the same binary, and a wire break is announced on the
+/// connection it happens on (see [`read_hello`]). Anything else is refused
+/// there, loudly, with the version the peer actually sent.
+pub const SUPPORTED_PROTO_VERSIONS: [ProtocolVersion; 1] = [CURRENT_PROTO_VERSION];
+
+/// The bytes before a hello's digest: one postcard variant tag and the
+/// `major.minor` version. Read separately so a peer from another dialect is
+/// refused before the reader waits for a digest that will never arrive.
+const HELLO_PREFIX_LEN: usize = 3;
 
 /// First byte of every byte stream between client and server (TCP
 /// connections and KCP sessions alike): `PLAIN_SELECTOR` is followed by
@@ -94,19 +118,47 @@ pub enum Carrier {
 }
 
 impl Carrier {
-    /// The wire value of the carrier the client will try first. Only exists with
-    /// the `multiplex` feature (the runtime carrier type is feature-gated);
+    /// The wire value of the carrier the client will try first. Only exists
+    /// with the `carrier` feature (the runtime carrier type is feature-gated);
     /// without it the data plane is always TCP.
-    #[cfg(feature = "multiplex")]
-    pub fn from_data_carrier(c: crate::transport::multiplex::Carrier) -> Carrier {
+    #[cfg(all(feature = "carrier", feature = "multiplex"))]
+    pub fn from_data_carrier(c: crate::transport::carrier::Carrier) -> Carrier {
         match c {
-            crate::transport::multiplex::Carrier::Tcp => Carrier::Tcp,
-            crate::transport::multiplex::Carrier::Kcp => Carrier::Kcp,
+            crate::transport::carrier::Carrier::Tcp => Carrier::Tcp,
+            crate::transport::carrier::Carrier::Kcp => Carrier::Kcp,
         }
     }
 }
 
-/// The client-driven service registration sent inside a v4 session, after
+/// The frame shape one transparent data channel carries.
+///
+/// `Ip` is one bare IP packet per frame, with no virtio-net header. `Vnet`
+/// is the Linux device's whole frame: the 10-byte virtio-net header followed
+/// by the packet or GSO super-frame it describes.
+///
+/// The server chooses one format for the whole claim and sends it in
+/// [`DataChannelCmd::StartForwardTransparent`]. `Vnet` is chosen only when both
+/// ends' devices are vnet-capable; otherwise the channel is `Ip`, and a Linux
+/// endpoint converts at its device boundary.
+///
+/// The variant order is the wire contract: `Ip` is tag 0, `Vnet` tag 1.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFormat {
+    Ip,
+    Vnet,
+}
+
+/// What a transparent client's device can do, declared in its registration so
+/// the server can pick a [`FrameFormat`] the pair actually shares.
+///
+/// It is a capability, not a demand: a server whose own device is plain-IP
+/// answers `Ip` even when the client offers `Vnet`.
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransparentCapabilities {
+    pub vnet_frames: bool,
+}
+
+/// The client-driven service registration sent inside a v5.1 session, after
 /// its authentication succeeded.
 ///
 /// The server owns no per-service configuration: everything needed to expose
@@ -129,6 +181,9 @@ pub struct ServiceRegistration {
     /// Receive buffer size for UDP datagrams of this service. Ignored for
     /// TCP services. Wire-compatible up to `u16::MAX`.
     pub udp_buffer_size: u16,
+    /// What the client's transparent device can do. `None` for every
+    /// forwarding service; the server rejects a capability on one of those.
+    pub transparent_capabilities: Option<TransparentCapabilities>,
 }
 
 /// Hard upper bound for the encoded size of a [`ServiceRegistration`] frame.
@@ -178,10 +233,7 @@ impl std::fmt::Display for ServiceId {
 /// Unique per control session, and meaningless across sessions: it is a
 /// correlation key for the lifetime of one session, not a global name.
 #[cfg_attr(
-    not(any(
-        feature = "client",
-        all(feature = "transparent", feature = "multiplex")
-    )),
+    not(any(feature = "client", mh_l3_server)),
     expect(
         dead_code,
         reason = "a lane id is named by a client and read by the transparent server path; \
@@ -197,7 +249,7 @@ pub struct LaneId(pub [u8; 4]);
 impl LaneId {
     /// Wrap a numeric id as its big-endian wire form.
     #[cfg_attr(
-        not(all(feature = "transparent", feature = "multiplex")),
+        not(any(mh_l3_client, mh_l3_server)),
         expect(
             dead_code,
             reason = "only a transparent build mints a lane id; the others carry the type"
@@ -340,9 +392,10 @@ pub fn fit_rejection_reason(reason: &str) -> String {
 pub enum Hello {
     /// The opening hello of a control channel. The digest is
     /// `sha256(service name)` in v3, where a control channel serves exactly one
-    /// service, and 32 random bytes — the *session tag* — in v4, where the
-    /// session's identity must not be derivable from a service name.
-    /// Accepting both versions, it is 34 bytes either way.
+    /// service, and 32 random bytes — the *session tag* — in v4 and later,
+    /// where the session's identity must not be derivable from a service name.
+    /// v5.1's two-byte version makes the hello 35 bytes; older dialects were
+    /// 34.
     ControlChannelHello(ProtocolVersion, Digest),
     DataChannelHello(ProtocolVersion, Digest), // token provided by the session
     /// The opening half of a *multiplexed data tunnel*: after this hello the
@@ -505,7 +558,7 @@ pub enum ControlChannelCmd {
 /// [`ControlChannelCmd::LaneDrainAck`] states: the server is draining the lane
 /// and its own flows are still talking.
 #[cfg_attr(
-    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    not(mh_l3),
     expect(
         dead_code,
         reason = "only a build that can drain a lane has a use for the state"
@@ -514,7 +567,7 @@ pub enum ControlChannelCmd {
 pub const LANE_DRAIN_PENDING: u8 = 0;
 /// The server holds no flow in the lane: its half of the agreement is met.
 #[cfg_attr(
-    not(all(feature = "transparent", target_os = "linux")),
+    not(mh_l3),
     expect(
         dead_code,
         reason = "only a build that can drain a lane has a use for the state"
@@ -528,7 +581,7 @@ pub const LANE_DRAIN_READY: u8 = 1;
 pub const LANE_DRAIN_UNKNOWN: u8 = 2;
 /// The drain was called off: the lane takes new flows again.
 #[cfg_attr(
-    not(all(feature = "transparent", feature = "multiplex", target_os = "linux")),
+    not(mh_l3),
     expect(
         dead_code,
         reason = "only a build that can drain a lane has a use for the state"
@@ -561,15 +614,17 @@ pub enum DataChannelCmd {
     /// them unchanged. A peer that does not know this variant fails loudly
     /// on the unknown tag instead of silently reframing payload bytes.
     StartForwardStripedTcp([u8; 4], u8, u8),
-    /// Transparent forwarding: this data channel carries whole IP packets for
-    /// the service the stream's prologue named, framed `[u16 length][packet]`
-    /// by [`IpTraffic`]. The client's host owns the claimed address, so the
+    /// Transparent forwarding: this data channel carries IPv4 traffic for the
+    /// service the stream's prologue named, framed `[u32 length][frame]` by
+    /// [`IpTraffic`]. The client's host owns the claimed address, so the
     /// packets are injected on its side and its kernel answers the visitor;
     /// the server never pairs a visitor with this channel.
     ///
-    /// A unit variant like the other fixed-size data commands: the tag alone
-    /// decides the length the reader must consume.
-    StartForwardTransparent,
+    /// The payload is the format the channel will carry for its whole life:
+    /// `Ip` is one bare IPv4 packet per frame, `Vnet` is a Linux device frame
+    /// (virtio-net header plus packet or GSO super-frame). The tag plus one
+    /// byte is the whole command; the reader knows the width from the tag.
+    StartForwardTransparent(FrameFormat),
 }
 
 type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
@@ -753,20 +808,21 @@ pub fn digest(data: &[u8]) -> Digest {
     d.into()
 }
 
-/// The framing of a transparent data channel: `[u32 length][vnet frame]`, in
-/// both directions.
+/// The framing of a transparent data channel: `[u32 length][frame]`, in both
+/// directions. `frame` is one bare IPv4 or IPv6 packet in `FrameFormat::Ip` mode, or
+/// the whole device unit (10-byte virtio-net header plus packet or GSO
+/// super-frame) in `FrameFormat::Vnet` mode.
 ///
 /// A namespace type rather than a painted buffer — the packet's destination
 /// lives *inside* it, so unlike [`UdpTraffic`] there is no address tag to
 /// carry, and callers read straight into their own scratch buffer.
 ///
-/// The "vnet frame" is the whole unit off the TUN device: the 10-byte
-/// virtio-net header followed by the packet (or GSO super-frame) it
-/// describes. The frame is relayed **whole** — the reader hands it over
+/// In `Vnet` mode the frame is relayed **whole** — the reader hands it over
 /// including the header, and the injection side writes it back with the
 /// header — because a `NEEDS_CSUM` frame only checksums correctly when the
 /// header travels with it, and a GSO super-frame only re-segments at the far
-/// end when its `gso_size` arrives intact.
+/// end when its `gso_size` arrives intact. In `Ip` mode the frame is the bare
+/// packet; the Linux side converts at its device boundary.
 ///
 /// The length prefix is `u32` (the old `u16` would have capped a frame below
 /// what the device can hand over: a GSO super-frame reaches ~65 560 bytes,
@@ -783,17 +839,22 @@ pub fn digest(data: &[u8]) -> Digest {
 /// feature is off. The TUN side re-exports it as its own. Same gate as
 /// [`IpTraffic`]: without the framing there is nothing to count it into, and
 /// an unused constant is a dead one.
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+#[cfg(any(test, feature = "transparent"))]
 pub const VNET_HDR_LEN: usize = 10;
 
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+/// The smallest IPv4 header, and the floor for an `Ip` frame's payload.
+/// The parser names an IPv6 frame shorter than 40 bytes as malformed.
+#[cfg(any(test, feature = "transparent"))]
+const IPV4_MIN_HEADER: usize = 20;
+
+#[cfg(any(test, feature = "transparent"))]
 pub struct IpTraffic;
 
 /// How much room a read makes for frames it has not parsed yet. One read of
 /// this size carries a whole batch from the far side, so the per-frame cost is
 /// a slice, not a syscall. Sized for the largest unit the transparent path
 /// moves: a GSO super-frame (up to ~64 KiB) plus its virtio-net header.
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+#[cfg(any(test, feature = "transparent"))]
 const IP_READ_CHUNK: usize = 68 * 1024;
 
 /// Frames read from a transparent channel, with the reads batched.
@@ -804,34 +865,38 @@ const IP_READ_CHUNK: usize = 68 * 1024;
 /// between packets. Both halves of the data path are batched for the same
 /// reason — the measurement is in
 /// [benchmarks.md](../docs/benchmarks.md#the-transparent-l3-wire-question-not-part-of-the-soak-model).
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+#[cfg(any(test, feature = "transparent"))]
 pub struct IpFrames<R> {
     reader: R,
+    /// The format this channel carries; fixed for the channel's life.
+    format: FrameFormat,
     /// Bytes read ahead and not yet turned into frames.
     buf: BytesMut,
     /// Where the unconsumed part starts.
     start: usize,
 }
 
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+#[cfg(any(test, feature = "transparent"))]
 impl<R: AsyncRead + Unpin> IpFrames<R> {
-    pub fn new(reader: R) -> Self {
+    pub fn new(reader: R, format: FrameFormat) -> Self {
         Self {
             reader,
+            format,
             buf: BytesMut::new(),
             start: 0,
         }
     }
 
-    /// The next frame — the whole `[vnet header][packet]` unit.
+    /// The next frame — one device unit in `Vnet` mode, or one bare IPv4/IPv6
+    /// packet in `Ip` mode.
     ///
-    /// The returned slice starts at the virtio-net header and stays valid
-    /// until the next call. The end of the stream is an error, not an empty
-    /// frame: this channel exists only while its service does, and the caller
-    /// answers a channel that ended by asking for another one.
+    /// The returned slice stays valid until the next call. The end of the
+    /// stream is an error, not an empty frame: this channel exists only while
+    /// its service does, and the caller answers a channel that ended by asking
+    /// for another one.
     pub async fn next(&mut self) -> Result<&[u8]> {
         loop {
-            if let Some(len) = IpTraffic::frame_at(&self.buf[self.start..])? {
+            if let Some(len) = IpTraffic::frame_at(&self.buf[self.start..], self.format)? {
                 let start = self.start + 4;
                 self.start = start + len;
                 return Ok(&self.buf[start..start + len]);
@@ -865,7 +930,7 @@ impl<R: AsyncRead + Unpin> IpFrames<R> {
     }
 }
 
-#[cfg(any(test, all(feature = "transparent", target_os = "linux")))]
+#[cfg(any(test, feature = "transparent"))]
 impl IpTraffic {
     /// Append one **whole device frame** (virtio-net header already in front)
     /// to a batch as a `[u32 length][frame]` entry.
@@ -877,25 +942,30 @@ impl IpTraffic {
     /// frame's own size, which is what [`Self::frame_at`] on the far side
     /// expects.
     pub fn encode_into(batch: &mut BytesMut, frame: &[u8]) -> Result<()> {
-        let len = u32::try_from(frame.len()).with_context(|| {
-            format!(
-                "device frame of {} bytes exceeds the wire format limit",
-                frame.len()
-            )
-        })?;
+        let len = Self::frame_len(frame.len())?;
         batch.reserve(4 + frame.len());
         batch.put_u32(len);
         batch.extend_from_slice(frame);
         Ok(())
     }
 
+    /// The `u32` length prefix a frame of `len` bytes would need.
+    ///
+    /// Kept separate from the allocation so the over-limit branch is testable
+    /// without materialising a 4 GiB frame.
+    fn frame_len(len: usize) -> Result<u32> {
+        u32::try_from(len)
+            .with_context(|| format!("device frame of {len} bytes exceeds the wire format limit"))
+    }
+
     /// The length of the frame at the front of `available`, when all of it is
     /// there — the frame format's only reader, so the writer and the reader
     /// cannot drift apart.
     ///
-    /// A frame shorter than the virtio-net header cannot name a packet; a
-    /// zero-length frame is a protocol error rather than an empty packet.
-    pub fn frame_at(available: &[u8]) -> Result<Option<usize>> {
+    /// A frame shorter than the header its format requires cannot name a
+    /// packet; a zero-length frame is a protocol error rather than an empty
+    /// packet.
+    pub fn frame_at(available: &[u8], format: FrameFormat) -> Result<Option<usize>> {
         let Some(header) = available.first_chunk::<4>() else {
             return Ok(None);
         };
@@ -904,8 +974,18 @@ impl IpTraffic {
             bail!("Empty IP frame: the stream is corrupt");
         }
         let len = len as usize;
-        if len < VNET_HDR_LEN {
-            bail!("IP frame shorter than its virtio-net header ({len} bytes)");
+        match format {
+            FrameFormat::Vnet if len < VNET_HDR_LEN => {
+                bail!("IP frame shorter than its virtio-net header ({len} bytes)");
+            }
+            FrameFormat::Ip => {
+                let version = available.get(4).map_or(4, |byte| byte >> 4);
+                let floor = if version == 6 { 40 } else { IPV4_MIN_HEADER };
+                if len < floor {
+                    bail!("IP frame shorter than its IP header ({len} bytes)");
+                }
+            }
+            FrameFormat::Vnet => {}
         }
         if available.len() < 4 + len {
             return Ok(None);
@@ -954,32 +1034,38 @@ static PACKET_LEN: LazyLock<PacketLength> = LazyLock::new(PacketLength::new);
 
 /// Read one hello, returning the protocol version it declared beside it.
 ///
-/// The version is *returned* rather than only checked because a server has to
-/// serve more than one dialect: it branches on what it read, while the client
-/// checks that the answer came back in a dialect it accepts. The accepted
-/// set is [`SUPPORTED_PROTO_VERSIONS`]; a peer outside it is refused loudly, and
-/// — this is what an old server does to a newer client — by closing without a
-/// reply, which that client turns into a typed "server is too old" error
-/// instead of a retry loop.
+/// The version is *returned* so both ends can report the dialect they actually
+/// saw. The accepted set is [`SUPPORTED_PROTO_VERSIONS`]; a peer outside it is
+/// refused loudly, and — this is what an old server does to a newer client — by
+/// closing without a reply, which that client turns into a typed "server is too
+/// old" error instead of a retry loop.
 pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<(ProtocolVersion, Hello)> {
+    // The version is read before the digest on purpose. A peer from another
+    // dialect may send a hello of a *different* width (v5.0 is one byte
+    // narrower), and a fixed-width read of the current hello would sit waiting
+    // for a byte that peer will never send. The three-byte prefix is enough to
+    // refuse it without consuming anything else.
+    let mut prefix = [0u8; HELLO_PREFIX_LEN];
+    conn.read_exact(&mut prefix)
+        .await
+        .with_context(|| "Failed to read hello")?;
+    // `Hello` is an enum whose tag is one postcard byte and whose first field
+    // is the version, in every variant. That is what makes this prefix stable.
+    let version = ProtocolVersion::new(prefix[1], prefix[2]);
+    if !SUPPORTED_PROTO_VERSIONS.contains(&version) {
+        bail!(
+            "Protocol version mismatched. Supported versions: {SUPPORTED_PROTO_VERSIONS:?}, got v{version}. Please update `molehill`."
+        );
+    }
+
     let mut buf = vec![0u8; PACKET_LEN.hello];
-    conn.read_exact(&mut buf)
+    buf[..HELLO_PREFIX_LEN].copy_from_slice(&prefix);
+    conn.read_exact(&mut buf[HELLO_PREFIX_LEN..])
         .await
         .with_context(|| "Failed to read hello")?;
     let hello: Hello = postcard::from_bytes(&buf).with_context(|| "Failed to deserialize hello")?;
-
-    let version = match hello {
-        Hello::ControlChannelHello(v, _)
-        | Hello::DataChannelHello(v, _)
-        | Hello::DataChannelTunnelHello(v, _) => v,
-    };
-    if !SUPPORTED_PROTO_VERSIONS.contains(&version) {
-        bail!(
-            "Protocol version mismatched. Supported versions: {SUPPORTED_PROTO_VERSIONS:?}, got {version}. Please update `molehill`."
-        );
-    }
 
     Ok((version, hello))
 }
@@ -1066,7 +1152,7 @@ pub async fn read_stream_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<
 ///
 /// Eight raw bytes, never varints: the tag-dispatched reader of a data channel
 /// consumes a fixed prologue, so its length must not depend on either value.
-#[cfg(all(feature = "client", feature = "transparent", feature = "multiplex"))]
+#[cfg(mh_l3_client)]
 pub async fn write_lane_prologue<T: AsyncWrite + Unpin>(
     conn: &mut T,
     service_id: ServiceId,
@@ -1099,12 +1185,7 @@ pub async fn write_lane_prologue<T: AsyncWrite + Unpin>(
 /// registered service (`read_channel_prologue` looks the service up, reads its
 /// id, then calls this for the lane that follows). The whole-prologue form is
 /// what the round-trip test pins.
-#[cfg(all(
-    feature = "server",
-    feature = "transparent",
-    feature = "multiplex",
-    target_os = "linux"
-))]
+#[cfg(mh_l3_server)]
 pub async fn read_lane_half<T: AsyncRead + Unpin>(conn: &mut T) -> Result<LaneId> {
     let mut lane = [0u8; 4];
     conn.read_exact(&mut lane)
@@ -1113,14 +1194,7 @@ pub async fn read_lane_half<T: AsyncRead + Unpin>(conn: &mut T) -> Result<LaneId
     Ok(LaneId(lane))
 }
 
-#[cfg(all(
-    test,
-    feature = "server",
-    feature = "client",
-    feature = "transparent",
-    feature = "multiplex",
-    target_os = "linux"
-))]
+#[cfg(all(test, mh_l3_client, mh_l3_server))]
 pub async fn read_lane_prologue<T: AsyncRead + Unpin>(conn: &mut T) -> Result<(ServiceId, LaneId)> {
     let mut buf = [0u8; 8];
     conn.read_exact(&mut buf)
@@ -1373,12 +1447,8 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
             return Ok(DataChannelCmd::StartForwardUdp);
         }
         2 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
-        3 => {
-            // StartForwardTransparent is a unit variant, so the tag alone is
-            // the whole command and the channel's IP framing starts right
-            // after it.
-            return Ok(DataChannelCmd::StartForwardTransparent);
-        }
+        3 => 1, // StartForwardTransparent(FrameFormat): one format byte
+
         tag => bail!("Unknown data channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -1396,7 +1466,7 @@ async fn read_cmd_tag<T: AsyncRead + Unpin>(conn: &mut T, buf: &mut [u8; 7]) -> 
     Ok(buf[0])
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client", feature = "server"))]
 mod tests {
     #![expect(
         clippy::unwrap_used,
@@ -1626,6 +1696,7 @@ mod tests {
             bind_addr: sample_addr(),
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            transparent_capabilities: Some(TransparentCapabilities { vnet_frames: true }),
         };
         let bytes = postcard::to_stdvec(&reg).unwrap();
         assert!(bytes.len() <= MAX_REGISTRATION_LEN);
@@ -1633,6 +1704,10 @@ mod tests {
         assert_eq!(back.name, "ssh");
         assert_eq!(back.bind_addr, sample_addr());
         assert_eq!(back.udp_buffer_size, 2048);
+        assert_eq!(
+            back.transparent_capabilities.map(|c| c.vnet_frames),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1758,6 +1833,7 @@ mod tests {
                 bind_addr: sample_addr(),
                 carrier: Carrier::Tcp,
                 udp_buffer_size: 2048,
+                transparent_capabilities: None,
             },
         });
         let bytes = postcard::to_stdvec(&cmd).unwrap();
@@ -1870,7 +1946,12 @@ mod tests {
     async fn read_hello_rejects_an_unsupported_version() {
         use tokio::io::duplex;
 
-        for version in [0u8, 2, 6, 99] {
+        for version in [
+            ProtocolVersion::new(0, 0),
+            PROTO_V5_0_VERSION,
+            ProtocolVersion::new(6, 0),
+            ProtocolVersion::new(99, 0),
+        ] {
             let (mut tx, mut rx) = duplex(64);
             let hello = Hello::ControlChannelHello(version, sample_digest(1));
             tx.write_all(&postcard::to_stdvec(&hello).unwrap())
@@ -1913,13 +1994,7 @@ mod tests {
     /// lets two ends talk about one physical connection without agreeing on an
     /// index: a slot is one end's routing bookkeeping and is reused, a lane is
     /// the connection that actually rode a carrier.
-    #[cfg(all(
-        feature = "client",
-        feature = "server",
-        feature = "transparent",
-        feature = "multiplex",
-        target_os = "linux"
-    ))]
+    #[cfg(all(mh_l3_client, mh_l3_server))]
     #[tokio::test]
     async fn a_lane_prologue_carries_the_service_and_the_lane() {
         use tokio::io::duplex;
@@ -1975,7 +2050,7 @@ mod tests {
         }
     }
 
-    /// The data-channel handshake: the hello stays 34 bytes, and the four
+    /// The data-channel handshake: the hello is 35 bytes, and the four
     /// service bytes follow it — which is where the server reads them.
     #[cfg(all(feature = "client", feature = "server"))]
     #[tokio::test]
@@ -1999,21 +2074,38 @@ mod tests {
         assert_eq!(read_stream_prologue(&mut rx).await.unwrap(), id);
     }
 
-    /// The hello frame is 34 bytes in every dialect: v3 puts a service digest in
-    /// the second slot, v4 a random session tag, and neither changes the length
-    /// — which is what lets an old server read a v4 hello far enough to refuse
-    /// it by version instead of by a framing error.
+    /// The current hello is 35 bytes (tag, two-byte version, digest). The
+    /// older dialects' one-byte version made theirs 34; the reader's three-byte
+    /// prefix is what lets it refuse one without waiting for the missing byte.
     #[test]
-    fn hello_width_is_version_independent() {
-        let v3 = postcard::to_stdvec(&Hello::ControlChannelHello(3, sample_digest(1))).unwrap();
-        let v4 = postcard::to_stdvec(&Hello::ControlChannelHello(
-            PROTO_V4_VERSION,
+    fn hello_width_is_fixed_for_the_current_dialect() {
+        // The pre-5.1 dialects put a one-byte version in the hello. They are
+        // raw bytes here because this build can no longer construct one.
+        let old = [0u8, 4];
+        assert_eq!(old.len() + 32, 34);
+        let current = postcard::to_stdvec(&Hello::ControlChannelHello(
+            CURRENT_PROTO_VERSION,
             sample_digest(2),
         ))
         .unwrap();
-        assert_eq!(v3.len(), 34);
-        assert_eq!(v4.len(), 34);
-        assert_eq!(PacketLength::new().hello, 34);
+        assert_eq!(current.len(), 35);
+        assert_eq!(PacketLength::new().hello, 35);
+    }
+
+    /// A v5.0 peer sends a 34-byte hello. The reader must refuse it after the
+    /// three-byte prefix, not block waiting for the 35th byte.
+    #[tokio::test]
+    async fn read_hello_refuses_a_v5_0_hello_without_waiting_for_its_digest() {
+        use tokio::io::duplex;
+
+        let (mut tx, mut rx) = duplex(64);
+        let mut hello = vec![0u8, 5]; // variant tag + v5.0's one-byte version
+        hello.extend([0x42u8; 32]);
+        tx.write_all(&hello).await.unwrap();
+        let err = read_hello(&mut rx).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Supported versions: [v5.1]"), "{msg}");
+        assert!(msg.contains("got v5."), "{msg}");
     }
 
     #[test]
@@ -2029,6 +2121,15 @@ mod tests {
         let bytes = postcard::to_stdvec(&cmd).unwrap();
         let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
         assert!(matches!(back, DataChannelCmd::StartForwardUdp));
+
+        // StartForwardTransparent carries the frame format in one byte.
+        for format in [FrameFormat::Ip, FrameFormat::Vnet] {
+            let cmd = DataChannelCmd::StartForwardTransparent(format);
+            let bytes = postcard::to_stdvec(&cmd).unwrap();
+            assert_eq!(bytes, [3, u8::from(format == FrameFormat::Vnet)]);
+            let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
+            assert!(matches!(back, DataChannelCmd::StartForwardTransparent(f) if f == format));
+        }
     }
 
     #[test]
@@ -2220,6 +2321,44 @@ mod tests {
     }
 
     #[test]
+    fn ip_frames_carry_a_bare_ipv4_packet() {
+        let packet = [0x45u8; 20];
+        let mut framed = 20u32.to_be_bytes().to_vec();
+        framed.extend_from_slice(&packet);
+        assert_eq!(
+            IpTraffic::frame_at(&framed, FrameFormat::Ip).unwrap(),
+            Some(20)
+        );
+        let mut short = 19u32.to_be_bytes().to_vec();
+        short.extend_from_slice(&[0u8; 19]);
+        assert!(IpTraffic::frame_at(&short, FrameFormat::Ip).is_err());
+        // The vnet reader refuses a payload shorter than its header.
+        let mut short_vnet = 9u32.to_be_bytes().to_vec();
+        short_vnet.extend_from_slice(&[0u8; 9]);
+        assert!(IpTraffic::frame_at(&short_vnet, FrameFormat::Vnet).is_err());
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn read_data_cmd_reads_the_transparent_format() {
+        use tokio::io::duplex;
+
+        for format in [FrameFormat::Ip, FrameFormat::Vnet] {
+            let (mut tx, mut rx) = duplex(16);
+            tx.write_all(
+                &postcard::to_stdvec(&DataChannelCmd::StartForwardTransparent(format)).unwrap(),
+            )
+            .await
+            .unwrap();
+            let back = read_data_cmd(&mut rx).await.unwrap();
+            assert!(matches!(
+                back,
+                DataChannelCmd::StartForwardTransparent(f) if f == format
+            ));
+        }
+    }
+
+    #[test]
     fn digest_is_32_bytes() {
         let d = digest(b"hello");
         assert_eq!(d.len(), HASH_WIDTH_IN_BYTES);
@@ -2231,7 +2370,7 @@ mod tests {
         // The fixed-width frames, pinned to their real widths so a protocol
         // change cannot slip through as "still greater than zero". Anything
         // variable-length is tag-dispatched and must NOT appear here.
-        assert_eq!(len.hello, 34);
+        assert_eq!(len.hello, 35);
         assert_eq!(len.ack, 1);
         assert_eq!(len.auth, 32);
     }
@@ -2253,6 +2392,7 @@ mod tests {
                 bind_addr: sample_addr(),
                 carrier: Carrier::Tcp,
                 udp_buffer_size: 2048,
+                transparent_capabilities: None,
             },
         });
         let (mut tx, mut rx) = duplex(4096);
@@ -2352,7 +2492,7 @@ mod tests {
         IpTraffic::encode_into(&mut batch, &frame).unwrap();
         tx.write_all(&batch).await.unwrap();
 
-        let mut frames = IpFrames::new(&mut rx);
+        let mut frames = IpFrames::new(&mut rx, FrameFormat::Vnet);
         let got = frames.next().await.unwrap();
         assert_eq!(got, &frame[..], "the frame must survive verbatim");
         // And the packet is still readable past the header.
@@ -2371,24 +2511,18 @@ mod tests {
 
         let (mut tx, mut rx) = duplex(64);
         tx.write_u32(0).await.unwrap();
-        let mut frames = IpFrames::new(&mut rx);
+        let mut frames = IpFrames::new(&mut rx, FrameFormat::Vnet);
         let err = frames.next().await.unwrap_err();
         assert!(format!("{err:#}").contains("Empty IP frame"));
 
-        // A frame the writer cannot name (past the u32 prefix) is refused
-        // while the batch is built, before anything reaches the channel. The
-        // 5 GiB frame only exists on a 64-bit target; the assertion that
-        // matters is the refusal, not the size.
-        let mut batch = BytesMut::new();
+        // A frame the writer cannot name (past the u32 prefix) is refused by
+        // the length guard before anything is allocated or reaches the
+        // channel. The guard is exercised directly: constructing a 4 GiB
+        // frame just to prove the comparison would make the test OOM-prone.
         #[cfg(target_pointer_width = "64")]
         {
-            let oversized: Box<[u8]> = vec![0u8; 5 * 1024 * 1024 * 1024].into_boxed_slice();
-            let err = IpTraffic::encode_into(&mut batch, &oversized).unwrap_err();
+            let err = IpTraffic::frame_len(u32::MAX as usize + 1).unwrap_err();
             assert!(format!("{err:#}").contains("exceeds the wire format limit"));
-            assert!(
-                batch.is_empty(),
-                "a refused frame must not leave a partial frame in the batch"
-            );
         }
     }
 
@@ -2404,7 +2538,7 @@ mod tests {
         tx.write_all(&[0x45; 8]).await.unwrap();
         drop(tx);
 
-        let mut frames = IpFrames::new(&mut rx);
+        let mut frames = IpFrames::new(&mut rx, FrameFormat::Vnet);
         let err = frames.next().await.unwrap_err();
         assert!(
             format!("{err:#}").contains("ended mid-frame"),
@@ -2436,7 +2570,7 @@ mod tests {
         tx.write_all(&batch).await.unwrap();
         drop(tx);
 
-        let mut frames = IpFrames::new(&mut rx);
+        let mut frames = IpFrames::new(&mut rx, FrameFormat::Vnet);
         for expected in &frames_in {
             assert_eq!(frames.next().await.unwrap(), &expected[..]);
         }

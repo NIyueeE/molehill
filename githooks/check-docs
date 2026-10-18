@@ -21,7 +21,7 @@ expect() {
 }
 
 # 1) every command a hook runs must be documented in the checks docs. The
-#    filter keeps real commands (cargo/uvx/git/just and the repo's own gates)
+#    filter keeps real commands (cargo/uv/git/just and the repo's own gates)
 #    and drops shell builtins, assignments and comments, so a gate that is
 #    renamed in a hook immediately shows up as a docs failure here.
 for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
@@ -39,7 +39,7 @@ for hook in githooks/pre-commit githooks/pre-push githooks/pre-tag; do
     [ -n "$cmd" ] || continue
     expect "[$hook] command documented: $cmd" docs/checks.md "$cmd"
   done < <(sed -e 's/[[:space:]]*#.*$//' "$hook" \
-             | grep -oE '(cargo [a-z-]+|uvx [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
+             | grep -oE '(cargo [a-z-]+|uv [a-z]+|just [a-z-]+|githooks/[a-z-]+)' \
              | sort -u)
 done
 
@@ -62,7 +62,7 @@ done < <(awk '
            /^## / { in_gate = ($0 ~ /pre-commit|pre-push|pre-tag/) }
            in_gate { print }
          ' docs/checks.md \
-           | grep -oE '`(cargo [a-z-]+|uvx [a-z]+|githooks/[a-z-]+)[^`]*`' \
+           | grep -oE '`(cargo [a-z-]+|uv [a-z]+|githooks/[a-z-]+)[^`]*`' \
            | tr -d '`' | sort -u)
 
 # 2) every lint declared in Cargo.toml [lints] must be documented in the lint-policy docs
@@ -115,9 +115,25 @@ expect "just check documented" README.zh.md 'just check'
 # the READMEs link to it instead of repeating the recipe.
 expect "just bench documented" docs/benchmarks.md 'just bench'
 expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
-expect "just bench-gate documented" docs/benchmarks.md 'just bench-gate'
-expect "just bench-gate documented (zh)" docs/benchmarks.zh.md 'just bench-gate'
-expect "just bench-peers documented" docs/benchmarks.md 'just bench-peers'
+expect "just bench gate documented" docs/benchmarks.md 'just bench gate'
+expect "just bench gate documented (zh)" docs/benchmarks.zh.md 'just bench gate'
+expect "just bench peers fetch documented" docs/benchmarks.md 'just bench peers fetch'
+
+# 5b) every backticked `just <recipe>` a live page cites must name a recipe the
+#     justfile defines. Backticks keep prose ("just the", "just a") out of the
+#     check, and the list comes from the justfile itself, so a rename that
+#     leaves a page behind fails here instead of dead-ending a reader.
+recipes=$(sed -n 's/^\([a-z][a-z0-9-]*\)\( .*\)\{0,1\}:.*/\1/p' justfile | sort -u)
+while IFS= read -r recipe; do
+  [ -n "$recipe" ] || continue
+  if printf '%s\n' "$recipes" | grep -qx -- "$recipe"; then
+    echo "  ok    just recipe exists: $recipe"
+  else
+    echo "  FAIL  a live page cites 'just $recipe', which the justfile does not define" >&2
+    errors=$((errors + 1))
+  fi
+done < <(grep -rhoE '`just [a-z][a-z0-9-]*' README.md README.zh.md docs/*.md \
+           | sed 's/^`just //' | sort -u)
 
 # 6) hooks activation instruction
 expect "hooksPath instruction documented" README.md 'core.hooksPath githooks'
@@ -134,7 +150,19 @@ done
 
 # 8b) user-facing docs keep a Chinese mirror and both READMEs link the page
 #     in their own language (AGENTS.md §3)
-for doc in configuration transport benchmarks; do
+#
+# Heading levels outside fenced code blocks. A `# comment` inside a TOML or
+# shell example is not a heading: a raw `^#` count reads 72 for deployment.md
+# against 17 for its mirror, while the structure is identical. Translated text
+# differs, so the comparison is the level sequence, not the words.
+heading_levels() {
+  awk '
+    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    !fence && /^#+[[:space:]]/ { match($0, /^#+/); print RLENGTH }
+  ' "$1"
+}
+
+for doc in configuration deployment transport benchmarks; do
   expect "docs/$doc.md linked from README" README.md "docs/$doc.md"
   expect "docs/$doc.zh.md linked from README.zh" README.zh.md "docs/$doc.zh.md"
   if [ ! -f "docs/$doc.zh.md" ]; then
@@ -142,32 +170,69 @@ for doc in configuration transport benchmarks; do
     errors=$((errors + 1))
     continue
   fi
-  # A section added to one language only is the usual way a mirror drifts:
-  # the heading count is a cheap, greppable proxy for "same structure".
-  en_headings=$(grep -c '^#' "docs/$doc.md")
-  zh_headings=$(grep -c '^#' "docs/$doc.zh.md")
-  if [ "$en_headings" -eq "$zh_headings" ]; then
-    echo "  ok    docs/$doc.md and its mirror have the same structure ($en_headings headings)"
+  # A section added to one language only is the usual way a mirror drifts.
+  # Compare the level sequence (not the words, which are translated): a
+  # reordered section or a changed depth fails here even when the count matches.
+  en_levels=$(heading_levels "docs/$doc.md")
+  zh_levels=$(heading_levels "docs/$doc.zh.md")
+  if [ "$en_levels" = "$zh_levels" ]; then
+    count=$(printf '%s\n' "$en_levels" | awk 'NF { n++ } END { print n }')
+    echo "  ok    docs/$doc.md and its mirror have the same structure ($count headings)"
   else
-    echo "  FAIL  docs/$doc.md has $en_headings headings, docs/$doc.zh.md has $zh_headings — the mirror drifted" >&2
+    echo "  FAIL  docs/$doc.md and docs/$doc.zh.md have different heading structure — the mirror drifted" >&2
+    echo "        en: $(printf '%s' "$en_levels" | tr '\n' ' ')" >&2
+    echo "        zh: $(printf '%s' "$zh_levels" | tr '\n' ' ')" >&2
     errors=$((errors + 1))
   fi
 done
 
-# 8c) the ownership contract lists every docs/ page, so a new page without a
-#     stated owner (and audience) fails here instead of drifting
+# 8c) the ownership contract lists every docs/ page with a valid audience.
+#     The Audience column is the voice contract (AGENTS.md §3, "Audience and
+#     voice"), so a page added without a row — or a row whose audience is not
+#     one of the four tiers — fails here instead of drifting.
+ownership=$(mktemp)
+awk -F'|' '
+  /^### Documentation responsibilities/ { section = 1 }
+  section && /^\| Doc \| Audience \|/ { in_table = 1; next }
+  in_table && /^\|/ {
+    doc = $2; aud = $3;
+    gsub(/^[ \t]+|[ \t]+$/, "", doc);
+    gsub(/^[ \t]+|[ \t]+$/, "", aud);
+    if (doc ~ /^-+$/) next;
+    print doc "\t" aud
+  }
+  in_table && !/^\|/ { exit }
+' docs/structure.md > "$ownership"
+
+while IFS=$'\t' read -r row_doc row_aud; do
+  case "$row_aud" in
+    users|contributors|agents|"vulnerability reporters") ;;
+    *)
+      echo "  FAIL  ownership row '$row_doc' has audience '$row_aud' (expected users, contributors, agents or vulnerability reporters)" >&2
+      errors=$((errors + 1))
+      ;;
+  esac
+done < "$ownership"
+
 while IFS= read -r page; do
   name="$(basename "$page")"
   case "$name" in
     *.zh.md) continue ;;
   esac
-  if grep -qF "\`$name\`" docs/structure.md; then
-    echo "  ok    docs/$name has an owner in docs/structure.md"
+  if grep -qF -- "\`$name\`" "$ownership"; then
+    audience=$(grep -F -- "\`$name\`" "$ownership" | head -1 | cut -f2)
+    case "$audience" in
+      users|contributors|agents|"vulnerability reporters")
+        echo "  ok    docs/$name has an owner (audience: $audience)" ;;
+      *)
+        echo "  ok    docs/$name has an owner (invalid audience — see the row failure above)" ;;
+    esac
   else
-    echo "  FAIL  docs/$name is not listed in docs/structure.md's ownership table" >&2
+    echo "  FAIL  docs/$name is not a row in docs/structure.md's ownership table" >&2
     errors=$((errors + 1))
   fi
 done < <(git ls-files 'docs/*.md')
+rm -f "$ownership"
 
 # 9) CI must run the same chain
 if [ -f .github/workflows/ci.yml ]; then
@@ -233,17 +298,18 @@ while IFS= read -r metric; do
   [ -n "$metric" ] || continue
   expect "bench metric documented: $metric" docs/benchmarks.md "\`$metric\`"
   expect "bench metric documented (zh): $metric" docs/benchmarks.zh.md "\`$metric\`"
-done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' benches/scripts/bench/model.py | sort -u)
+done < <(sed -n 's/.*"id": "\([a-z_0-9]*\)".*/\1/p' bench/src/bench/model.py | sort -u)
 while IFS= read -r scenario; do
   [ -n "$scenario" ] || continue
   expect "bench scenario documented: $scenario" docs/benchmarks.md "\`$scenario\`"
   expect "bench scenario documented (zh): $scenario" docs/benchmarks.zh.md "\`$scenario\`"
-done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' benches/scripts/bench/model.py | sort -u)
+done < <(sed -n 's/^ *id="\([a-z0-9-]*\)",$/\1/p' bench/src/bench/model.py | sort -u)
 expect "just bench-selfcheck documented" docs/checks.md 'just bench-selfcheck'
 expect "just bench documented" docs/benchmarks.md 'just bench'
 expect "just bench documented (zh)" docs/benchmarks.zh.md 'just bench'
-expect "just bench-doctor documented" docs/benchmarks.md 'just bench-doctor'
-expect "just bench-compare documented" docs/benchmarks.md 'just bench-compare'
+expect "just bench doctor documented" docs/benchmarks.md 'just bench doctor'
+expect "just bench compare documented" docs/benchmarks.md 'just bench compare'
+expect "just py-typecheck documented" docs/checks.md 'just py-typecheck'
 
 # 16) a key the parser refuses must be in the configuration page's removed-keys
 #     tables. The parser carries the registry (REMOVED_KEYS: the keys it refuses,

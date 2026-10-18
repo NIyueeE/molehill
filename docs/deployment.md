@@ -17,9 +17,11 @@ default and its allowed values.
 
 Every block below parses with the current binary, enforced by the config
 test suite. The data-plane tables (`[client.data]`, `[server.data]`) require
-the `multiplex` feature, which is part of the default build, and a client
-can mix modes because every service may override `mode`/`carrier` on its own
-`[client.services.<name>]` block.
+the `multiplex` feature, which is part of the default build. A process runs
+one mode (`[client]`, `[server]` or `[transparent]`); the data plane's shape
+follows the service type and its carrier is chosen at runtime, so neither is a
+per-service key
+([Configuration](./configuration.md#migrating-the-data-planes-shape-is-no-longer-a-key)).
 
 ### Minimal
 
@@ -244,8 +246,10 @@ A transparent (L3) client makes the **client** the owner of a public
 and the client's kernel answers the visitor. The keys, the prerequisites and
 the exact refusals belong to
 [Configuration](./configuration.md#transparent-l3-services); this section is the
-network the operator has to build. It is Linux only, needs `CAP_NET_ADMIN` on
-both ends (each side opens a TUN device), and configures nothing itself.
+network the operator has to build. Linux and macOS run both ends; Windows can
+serve transparent clients but cannot be one (its stack has no source-address
+policy routing). The daemon installs no route itself; the platform decides
+which half is the operator's, as the table below states.
 
 One sizing note before the recipes: a claim's inner flows are spread over its
 lanes, and the lanes of a client's claims are lent between them as their flows
@@ -255,7 +259,7 @@ worth a great deal when the *carrier connections* are the limit (a long-haul or
 lossy path) and nothing on a fast, short one, at the cost of more connections
 and more CPU; the numbers and the `lend = false` switch are
 [Configuration](./configuration.md#transparent-l3-services) and
-[Benchmarks](./benchmarks.md#what-lending-lanes-buys-and-when).
+[Benchmarks](./benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
 The server serves L3 only if **its own** config asks for it: the
 `[server.transparent]` table in `server.toml` below is that switch, and without
@@ -263,7 +267,20 @@ it the registration is refused before any device is touched. Run the L3 server
 under a unit that has the capability, and an L4-only server under one that does
 not (see [systemd](#systemd)).
 
-Both recipes start from the same two facts:
+The supported combinations are:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Transparent client | yes | yes | no — run it under WSL2 |
+| Transparent server | yes | yes | yes (Wintun + Administrator) |
+| Device | operator-created TUN | daemon-created `utunN`; daemon assigns the claimed `/32`s | daemon-created Wintun adapter |
+| Routing | `ip route` / `ip rule` | `route` + pf `route-to` | `New-NetRoute` + forwarding |
+| Privilege | `CAP_NET_ADMIN` | root | Administrator + `wintun.dll` |
+
+The Linux recipes below are the reference shape; the macOS and Windows server
+sections follow them.
+
+Both Linux recipes start from the same two facts:
 
 - **The claimed address is not a listener.** Nothing may bind it on the server;
   the server needs a route that hands its packets to the TUN device.
@@ -401,6 +418,150 @@ client claims — it carries it, and its application binds it. Afterwards,
 `ip route get <public-ip> mark 0x1` must name the TUN device, and `ip rule
 show` must list the mark rule above the local lookup.
 
+### IPv6 claims
+
+The same recipes apply with `/128` addresses and the `-6` tools. The claim is
+written in brackets:
+
+```text
+[transparent.claims.web]
+remote_bind_addr = "[2001:db8:99::1]:8443"
+```
+
+```bash
+# Linux server
+sudo sysctl -w net.ipv6.conf.all.forwarding=1
+sudo ip -6 route add 2001:db8:99::1/128 dev molehill0
+
+# Linux client
+sudo ip -6 addr add 2001:db8:99::1/128 dev molehill0
+sudo ip -6 rule add from 2001:db8:99::1 lookup 100
+sudo ip -6 route add default dev molehill0 table 100
+```
+
+macOS uses `ifconfig utunN inet6 <address> prefixlen 128`, an `inet6` pf
+`route-to` rule, `net.inet6.ip6.forwarding=1` and `route add -inet6
+<address>/128 -interface utunN`. A Windows server uses a `/128`
+`New-NetRoute` and `Set-NetIPInterface -AddressFamily IPv6 -Forwarding
+Enabled`.
+
+The upstream network must route the claimed `/128` to the server, exactly as
+for IPv4; the daemon does not proxy NDP and does not install the route. IPv6
+jumbograms are not carried. The data path itself is family-agnostic: a claim
+can be IPv4 or IPv6, and the server/client negotiate the same `Ip`/`Vnet`
+frame format for either.
+
+### macOS: an operator-created utun, pf and forwarding
+
+macOS has no persistent TUN device an operator can create and hand over: the
+daemon opens `/dev/utun` and the kernel creates a `utunN`, which exists only
+while the process holds it. The daemon therefore creates the device and assigns
+each claimed `/32` to it; the operator owns the pf rule, the routes and
+forwarding. Use a fixed `tun = "utunN"` when the pf rule is static.
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transport.noise]
+local_private_key = "<server private key>" # molehill --genkey
+
+[server.transparent]
+tun = "utun7"
+```
+
+```toml
+# client.toml
+[transparent]
+default_token = "change-me"
+tun = "utun7"
+
+[transparent.control]
+default_remote_addr = "<server-address>:2333"
+
+[transparent.transport.noise]
+remote_public_key = "<server public key>"
+
+[transparent.claims.web]
+remote_bind_addr = "<public-ip>:8443"
+```
+
+```bash
+# ---------- server (macOS) ----------
+# The daemon creates utun7 on the first transparent registration.
+sudo sysctl -w net.inet.ip.forwarding=1
+# <public-ip> is routed to this host by the upstream; send it into the utun.
+sudo route add -host <public-ip> -interface utun7
+
+# ---------- client (macOS) ----------
+# The daemon creates utun7 and assigns <public-ip>/32. The replies the local
+# application emits from that address must return into the utun:
+sudo tee /etc/pf.anchors/molehill >/dev/null <<'EOF'
+pass out quick route-to (utun7) from <public-ip> to any
+EOF
+# Add these two lines to /etc/pf.conf, then reload:
+#   anchor "molehill"
+#   load anchor "molehill" from "/etc/pf.anchors/molehill"
+sudo pfctl -f /etc/pf.conf
+sudo pfctl -E
+```
+
+Check the decisions afterwards: on the server, `route -n get <public-ip>` names
+the utun; on the client, `pfctl -sr` shows the `route-to` rule and a visitor's
+reply leaves through the utun. The exact pf syntax can depend on the utun's
+point-to-point peer: `route-to (utunN)` is the form that names only the
+interface; validate it on the host before relying on it.
+
+### Windows server: Wintun, a route and forwarding
+
+A Windows server can serve Linux/macOS transparent clients. It needs
+Administrator privileges and `wintun.dll` next to `molehill.exe` (or on
+`PATH`); the daemon creates the adapter named by `tun`. Windows has no
+source-address policy routing, so a Windows **client** is refused — run that
+client under WSL2 instead.
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["8443"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transport.noise]
+local_private_key = "<server private key>" # molehill --genkey
+
+[server.transparent]
+tun = "molehill0"
+```
+
+```powershell
+# Run elevated. <uplink> is the visitor-facing interface.
+New-NetRoute -DestinationPrefix "<public-ip>/32" -InterfaceAlias "molehill0" `
+  -NextHop "0.0.0.0" -PolicyStore ActiveStore
+Set-NetIPInterface -InterfaceAlias "molehill0" -Forwarding Enabled
+Set-NetIPInterface -InterfaceAlias "<uplink>" -Forwarding Enabled
+# IPv4 routing between interfaces:
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" `
+  -Name IPEnableRouter -Value 1
+```
+
+Windows Firewall must allow the forwarded traffic; a rule for the claimed port
+or for the forwarding profile is deployment-specific. Check the route with
+`Find-NetRoute -RemoteIPAddress <public-ip>` (it must name the Wintun adapter)
+before sending visitors.
+
+A Windows **client** under WSL2 runs the Linux client and its backend inside
+the WSL2 distribution: the claimed address lives on the WSL2 TUN, the server
+tunnels the visitor's packets to it, and the local backend binds it. The WSL2
+instance needs the same Linux prerequisites as the recipe above.
+
 ### What each run mode needs
 
 The three modes ask the host for different things, and only one of them asks
@@ -408,22 +569,23 @@ for anything unusual:
 
 | What is needed | `molehill --server` (forwarding) | `molehill --client` (forwarding) | An L3 pair (`--server` + `--transparent`) |
 |---|---|---|---|
-| `CAP_NET_ADMIN` | no | no | **yes, both ends** — each attaches to a TUN device |
-| A TUN device | no | no | **yes, both ends** — created by the operator, not the daemon |
-| `net.ipv4.ip_forward = 1` | no | no | **yes, on the server** — the packets it routes into the TUN are forwarded |
-| `rp_filter = 0` on the TUN and `all` | no | no | **yes** — injected packets carry the visitor's source |
+| `CAP_NET_ADMIN` / root / Administrator | no | no | **yes, both ends** — the transparent process opens a TUN device on Linux/macOS; Administrator + `wintun.dll` on Windows |
+| A TUN device | no | no | Linux: **yes, both ends**, created by the operator. macOS/Windows: the daemon creates it (utun/Wintun) |
+| `net.ipv4.ip_forward = 1` | no | no | **yes, on a Linux server**; on macOS `net.inet.ip.forwarding`; on Windows interface forwarding + `IPEnableRouter` |
+| `rp_filter = 0` on the TUN and `all` | no | no | **yes on Linux** — injected packets carry the visitor's source |
+| Source policy routing | no | no | Linux `ip rule`; macOS pf `route-to`; **Windows cannot** (use WSL2) |
 | Ports below 1024 | only if a service asks for one | no | only if a claim asks for one |
 
 Two of those are worth stating precisely, because they are the ones a working
 deployment fails on:
 
-- **A server that serves L3, and only such a server, needs `CAP_NET_ADMIN`.**
+- **On Linux, a server that serves L3 — and only such a server — needs `CAP_NET_ADMIN`.**
   The capability is asked for by the `[server.transparent]` table, so a
   `molehill --server` whose config does not carry it runs without it and
   refuses L3 registrations by policy. A forwarding-only server needs nothing
   special, which is why the capability belongs to the unit that needs it
   (see [systemd](#systemd)).
-- **`ip_forward` is checked, not assumed.** With it off, the kernel drops
+- **On Linux, `ip_forward` is checked, not assumed.** With it off, the kernel drops
   every packet addressed to a claim before the daemon reads a byte: the
   process sees a healthy TUN and a silent device, which is the one failure
   mode that looks like nothing at all. The daemon refuses the first

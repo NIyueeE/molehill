@@ -31,9 +31,9 @@ Before touching anything, verify three things:
    cargo install cargo-machete cargo-audit cargo-outdated cargo-deny --locked
    ```
 
-   `uv`/`uvx` must also be on PATH (the python bench gates — ruff lint *and*
-   format check — run in the pre-commit chain; install:
-   `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+   `uv` must also be on PATH (the python bench gates — ruff lint *and* format
+   check, plus pyright — run in the pre-commit chain from the `bench/` project;
+   install: `curl -LsSf https://astral.sh/uv/install.sh | sh`).
 
    Note: `cargo fmt` and `cargo clippy` are guaranteed by the components
    declared in `rust-toolchain.toml`; rustup installs them with the toolchain.
@@ -42,8 +42,8 @@ Before touching anything, verify three things:
    resolves the latest stable automatically. Never hardcode a version number
    and never bypass this file.
 
-When in doubt about environment health, run `githooks/pre-commit` end to end
-as a smoke test (the first run of `cargo audit` fetches the RustSec database;
+When in doubt about environment health, run `just check` end to end as a
+smoke test (its first `cargo audit` run fetches the RustSec database;
 slowness is normal).
 
 ## 2. Lint errors: waiver discipline
@@ -52,11 +52,11 @@ Principle: **fix the code first; a waiver is the last resort, and only
 code-level.**
 
 - Never "make errors disappear" by editing `Cargo.toml` `[lints]`,
-  `ruff.toml`, `githooks/pre-commit`, or any check command. Never delete,
-  comment out, or bypass a check.
-- Every check follows the **same discipline** — the Rust lints, the two ruff
-  gates, and all the audits and extra checks (machete, audit, deny, outdated,
-  docs-sync, secret scan, and anything added later): fix if fixable, waive
+  `bench/pyproject.toml`, `githooks/pre-commit`, or any check command. Never
+  delete, comment out, or bypass a check.
+- Every check follows the **same discipline** — the Rust lints, the ruff and
+  pyright gates, and all the audits and extra checks (machete, audit, deny,
+  outdated, docs alignment, secret scan, and anything added later): fix if fixable, waive
   only when genuinely unfixable, in code, at the narrowest scope, with a
   reason.
 - The waiver *forms* — which attribute, what scope counts as minimal, the one
@@ -82,10 +82,10 @@ code-level.**
   - source doc comments (`//!` / `///`) ↔ actual behavior.
 - User-facing docs (README, configuration, transport, benchmarks, deployment)
   keep Chinese mirrors (`*.zh.md`) and must change together; never update one
-  language only. Governance and contributor docs (checks, lint-policy,
-  release, structure, internals, build-guide, AGENTS.md, HANDOFF.md) are
-  English-only by decision — do not create `*.zh.md` for them. When touching
-  any page, at minimum keep it truthful.
+  language only. Contributor and agent docs (checks, lint-policy, release,
+  structure, internals, build-guide, AGENTS.md, HANDOFF.md) are English-only
+  by decision — do not create `*.zh.md` for them. When touching any page, at
+  minimum keep it truthful.
 - **One topic, one home.** Every fact is written once, in the page that owns
   it; every other page links to it. Putting a fact in two places guarantees
   that one of them goes stale. **The routing table is
@@ -105,13 +105,53 @@ code-level.**
     configuration page keeps its old→new migration callouts. The instruction
     stays; the story does not.
   - **Guidance about *using* the tool never sends a reader to a contributor
-    page.** `HANDOFF.md`, `AGENTS.md` and `docs/checks.md` are for people
-    changing the repository; a user who wants to configure, measure or deploy
-    is sent to `configuration`, `transport`, `benchmarks` or `release`. The one
+    or agent page.** `HANDOFF.md`, `AGENTS.md` and `docs/checks.md` are not
+    user pages; a user who wants to configure, measure or deploy
+    is sent to `configuration`, `transport`, `benchmarks` or `deployment`. The one
     exception is the landing page's own "for people changing it" index group,
     which is how a contributor finds those pages in the first place — keep that
     group clearly labelled and keep it out of the usage sections. Contributor
     pages link each other freely.
+
+### Audience and voice (one tier per page)
+
+Every page belongs to exactly one audience, and its voice follows from it.
+The roster is the Audience column of
+[docs/structure.md](docs/structure.md), "Documentation responsibilities"; this
+is the voice contract for writing it.
+
+| Tier | Pages | Write as | Carries | Never carries |
+|---|---|---|---|---|
+| **User / operator** (the person running it) | `README*.md`, `configuration*.md`, `deployment*.md`, `transport*.md`, `benchmarks*.md`, `CHANGELOG.md` | second person, task first ("run X", "set Y"); `CHANGELOG.md` is the past-tense exception ("changed X") | what is true now, how to do it, what it costs (with the method link), upgrade instructions | repository history, gate/hook names, design rationale that changes no decision |
+| **Contributor / developer** | `CONTRIBUTING.md`, `build-guide.md`, `internals.md`, `checks.md`, `lint-policy.md`, `release.md`, `structure.md` | instructional or descriptive ("the hook runs X", "to add Y, do Z") | how to build/test/release, the design and its trade-offs, the file map | sales copy, user hand-holding, a second copy of a user-page fact |
+| **Agent** | `AGENTS.md`, `HANDOFF.md` (+ archive) | imperative for rules ("do X", "never Y"); state for HANDOFF | binding rules with their reason, current state, open threads, decisions and costs | options without a decision, marketing, tutorial prose |
+| **Vulnerability reporter** | `SECURITY.md` | direct, second person | supported versions, how to report, scope, what to expect | internals, contributor workflow |
+
+- **Open with the reader.** The first paragraph says what the page is for and
+  who it assumes. A page that has to explain its audience later has the wrong
+  opening.
+- **One tier per page.** A section for another tier moves to that tier's page
+  and is linked, not restated. The landing page's labelled "for people
+  changing it" index is the one sanctioned exception (above).
+- **Current truth on user pages.** No "since v0.7", "used to", "the old
+  model", or "this release fixed": release history is `CHANGELOG.md`, design
+  history is `HANDOFF.md`, and the method's own history (why a measurement
+  changed) is `benchmarks.md`. An **upgrade instruction** — "this key was
+  removed; write that instead" — is the only history a user page keeps.
+- **Concision.** One claim per sentence; delete hedging ("simply", "quite",
+  "very"), adjectives without a measured basis, and a caveat already stated on
+  the page that owns it. A number travels with its method link, not with a
+  retelling of the method.
+- **One home for a number.** A measured number lives in `benchmarks.md`, the
+  landing page's published tables, or the results file they cite. Another page
+  may quote the one figure its decision needs, marked as a quotation and linked
+  to the method; it does not copy a table. Two copies of a number are two
+  numbers that will disagree.
+- **Terms once.** Define a term at first use on the page, then keep the same
+  word: user/operator, visitor, service, claim, lane, pool, tunnel, carrier.
+- **No dead ends.** Every command, recipe and link works; a removed key names
+  its replacement; a page that sends a user onward sends them to a user page.
+
 - Changing lint config or the check chain requires syncing the affected docs
   pages, both READMEs, and this file **in the same commit**.
 - The mechanical part is automated in `githooks/check-docs`, wired into the
@@ -144,18 +184,20 @@ code-level.**
   [rathole](https://github.com/rapiz1/rathole) (upstream's last release was
   v0.5.0), and has been numbered independently since. Never renumber.
 - **The wire protocol version moves with the release line, and no two tags are
-  compatible.** A dialect is defined by a release: the number changes when the
-  wire changes, it changes *with* the tag that introduces it, and
-  `SUPPORTED_PROTO_VERSIONS` is the current dialect alone — a peer from another
-  tag is refused on the connection it happens on, in both directions, and
-  upgrading means upgrading both ends. Two releases share a number when their
-  wire is the same (0.8.x and 0.9.x are both v3). While a dialect's release is
-  still in development it is still being defined, so commands may be extended
-  **in place** under that number; once the tag exists, the next change to the
-  wire is the next number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4
-  — each read off its tag's `CURRENT_PROTO_VERSION`. The unreleased line on top
-  of v0.10.0 is v5; it has no tag yet, so its commands may still be extended in
-  place.
+  compatible.** A dialect is `major.minor`; a change to either half is a new
+  dialect, never a compatible extension. It changes *with* the tag that
+  introduces it, and `SUPPORTED_PROTO_VERSIONS` is the current dialect alone —
+  a peer from another tag is refused on the connection it happens on, in both
+  directions, and upgrading means upgrading both ends. Two releases share a
+  number when their wire is the same (0.8.x and 0.9.x are both v3). While a
+  dialect's release is still in development its commands may be extended **in
+  place** under that number; once the tag exists, the next change is the next
+  number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4, 0.11.0 v5.0,
+  0.11.1 v5.1 — each read off its tag's `CURRENT_PROTO_VERSION`. v5.0 is
+  tagged, so its commands are fixed. v5.1 deliberately breaks the v5.0 wire in
+  a patch release (the two-byte version and the transparent frame-format
+  negotiation); `5.1` is a dialect label, not a SemVer-compatible minor. The
+  next wire change is 5.2; a redesign would be 6.0.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -176,12 +218,14 @@ code-level.**
      only section for that version, contains prose, and `[Unreleased]` is
      empty (every extractor takes the first match, so a stray duplicate in
      front of the real section would be published as the notes);
-  4. `just check` is green on the tagged commit;
+  4. `just check` is green on the tagged commit (the branch push that carried
+     it ran the same chain);
   5. the benchmark ritual is done (docs/release.md):
      `benches/records/results-bench-vX.Y.Z.json`, the chart set, and the README
-     benchmark table are refreshed in the release commit, and `just bench-gate`
+     benchmark table are refreshed in the release commit, and `just bench gate`
      is green against the previous release — coverage, the SLO, drift and the
-     capacity ramp must not regress.
+     capacity ramp must not regress. A method-changing release runs the gate
+     **without** a baseline and becomes the next baseline (docs/release.md).
   Re-tagging is allowed only to fix a failed release (delete the tag, fix,
   re-push). For verifying a commit without releasing, use CD test builds (§6).
 - **Mechanics live in [docs/release.md](docs/release.md)**: the exact changelog
@@ -193,8 +237,8 @@ code-level.**
 
 `.github/workflows/test-build.yml` builds **test artifacts** from any commit
 without ever creating a release — dispatch it manually from the Actions tab
-with a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `macos`,
-`windows`). Artifacts are ephemeral (7-day retention): never hand out
+with a `ref` (commit SHA, branch, or tag) and `targets` (`linux`, `linux-arm64`,
+`macos`, `macos-x64`, `windows`). Artifacts are ephemeral (7-day retention): never hand out
 release links for them, and never reference them in the changelog. Typical
 uses: verifying that a specific commit compiles on all platforms before
 tagging (§5), and reproducing platform-specific issues on an exact commit.
@@ -218,29 +262,32 @@ Details: [docs/release.md](docs/release.md).
 ## 8. Day-to-day operations
 
 - commit → fast gates; push to a branch → heavy gates; **push of a `v*` tag →
-  release (§5, deliberate)**; PR (any branch) or push to `main`/`dev` → CI
-  runs the identical chain when the change touches code. A docs-only change
+  release (§5, deliberate)** — a tag-only push runs the release review and
+  stops there, because the tagged commit's heavy gates ran on its branch; PR
+  (any branch) or push to `main`/`dev` → CI runs the identical chain when the
+  change touches code. A docs-only change
   (markdown, `docs/`, `assets/`) skips that chain and runs `docs.yml`'s
   docs-alignment check instead — the one gate such a change can break. A
-  benches-only change (`benches/scripts/**`) skips the cargo gates of the
-  fast gate for the same reason — the scripts are runtime tooling, never
+  benches-only change (`bench/**`, `benches/records/**`) skips the cargo gates
+  of the fast gate for the same reason — the project is runtime tooling, never
   compiled — and pre-push skips the heavy gates for it too (audit, deny,
   outdated and tests cannot move), while CI keeps the full chain.
   **The hooks mirror that split** (`githooks/docs-only` and
   `githooks/benches-only` classify the staged paths or the pushed range):
-  pre-commit keeps the secret scan and the docs check, plus the two ruff
-  gates and the bench-model self-check for a benches-only change; pre-push
+  pre-commit keeps the secret scan and the docs check, plus ruff, pyright and
+  the bench-model self-check for a benches-only change; pre-push
   keeps only the docs check; and anything ambiguous — an empty change set, a
-  new branch, a tag push, a commit mixing docs or benches with code — falls
-  back to the full chain. Deleting a classifier restores the full chain,
-  which is the safe direction. `main`
+  new branch, a commit mixing docs or benches with code — falls back to the
+  full chain. A tag-only push is not ambiguous: it runs the release review and
+  stops there. Deleting a classifier restores the full chain, which is the safe
+  direction. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by
   convention (CI red on main is the top priority; the one sanctioned
   exception to history rules: a coordinated history rebuild, explicitly
   requested and backed up first). Enabling branch protection is a repo
   settings change for a human to make.
-- Formatting: `just fmt` (Rust) and `just py-fmt` (python bench scripts)
+- Formatting: `just fmt` (Rust) and `just py-fmt` (python bench project)
   auto-fix; `just check` rehearses the whole chain before committing.
 - Dependencies: add or remove them only through cargo — `cargo add` (add
   `--dev` for dev-dependencies) and `cargo remove`. Never hand-edit the
@@ -317,15 +364,14 @@ revision) and are as binding as the lint discipline in §2.
   loopback iperf3 ceiling (~46 Gbit/s) for every tool; the same error
   reappeared when a sampler was refactored to reuse the backend port. Record
   the endpoint in the data (the port the probe dials vs the backend's) and
-  assert the invariant: the Soak runner raises when a throughput sample
-  dials the backend instead of the tool's exposed port.
+  assert the invariant: `just bench gate` fails a throughput sample that dials
+  the backend instead of the tool's exposed port.
 - **Instrument parameters are part of the method.** Queue depth, pacing
   rate, client timeout and the window convention change the result, so they
   are recorded in the results meta (the stage order, the settle window, the
-  sample rates) and stated in the README. A constant buried in a function
-  is a method nobody can audit: a
-  hardcoded shallow queue shaped rate cells at ~30% of the nominal rate for
-  a whole baseline.
+  sample rates) and stated on the benchmarks page. A constant buried in a
+  function is a method nobody can audit: a hardcoded shallow queue shaped rate
+  cells at ~30% of the nominal rate for a whole baseline.
 - **One failure must not poison the next sample.** A wedged iperf3 server
   (single-test by design) turned every later repetition into a `null` and
   made the 8-stream slots at the rate cells look unmeasurable. Restart the
@@ -349,20 +395,20 @@ revision) and are as binding as the lint discipline in §2.
   host.
 - **A metric without contrast is not a measurement.** If every arm returns
   the same value, or the probe only ever reaches its own ceiling, remove the
-  chart panel and the claim — and say why in the README and HANDOFF — rather
-  than drawing a degenerate panel.
+  chart panel and the claim — and say why on the benchmarks page and in
+  HANDOFF — rather than drawing a degenerate panel.
 - **Re-check every consumer after reshaping data.** Renaming one field
   silently nulled `mixed_bulk_latency.bulk_gbps` on every loopback arm, and
   the plot still read a removed key and rendered placeholders. Grep for
   every reader of a key you touch, and keep a completeness gate in the
-  ritual (`bench.py gate`: the coverage of every declared cell, the endpoint
+  ritual (`just bench gate`: the coverage of every declared cell, the endpoint
   invariant, the SLO verdicts, the drift and wedge axes).
 - **Prove provenance.** A run must correspond to a committed revision and a
   freshly built binary; check the binary's reported version/hash before
   trusting its numbers (a binary two commits behind HEAD was caught that
   way, and its numbers would have described code that no longer existed).
 - **A performance claim about a change is made with the bench model.**
-  `benches/scripts/bench/` is the standard: a metric exists only as a
+  `bench/src/bench/` is the standard: a metric exists only as a
   declaration in `model.METRICS` (unit, direction, denominator, the workloads
   that can produce it, the smallest difference worth calling a claim), every
   scenario runs against a control arm with no tool in the path, a run records
@@ -400,17 +446,25 @@ pointers, not copies:
   carry forwarded traffic.
 - **Crate**: `molehill-rathole`, binary `molehill`, edition 2024,
   Apache-2.0. Feature-gated: `server` / `client` modes; `noise`;
-  `hot-reload`; `multiplex` (yamux, in the default set); `kcp` (optional
-  KCP-over-UDP data tunnels, in the default set); `transparent` (a
-  client-owned public `ip:port` carried as whole IP packets over a TUN device,
-  Linux only, in the default set); `embedded` (minimal).
+  `hot-reload`; `carrier` (the KCP/TCP choice and fallback, implied by
+  `multiplex` and `transparent`); `multiplex` (yamux, in the default set);
+  `kcp` (KCP-over-UDP data tunnels, in the default set; implies `multiplex`);
+  `transparent` (a client-owned public `ip:port` carried as whole IP packets
+  over a TUN device: Linux and macOS run both ends, Windows can serve but not
+  claim, in the default set; it implies `carrier` (whose lane budget and
+  carrier choice it uses) and `noise` (its control channel), while a claim's
+  own traffic still never runs yamux);
+  `embedded` (minimal).
+  Platform predicates are emitted once by `build.rs` (`mh_linux`, `mh_macos`,
+  `mh_windows`, `mh_l3`, `mh_l3_client`, `mh_l3_server`); L3 code uses those,
+  not repeated `target_os`/feature combinations.
   Clippy runs twice in the pre-commit gate: the second pass covers the
   minimal no-default-features `server,client` build that the default-feature
   pass never compiles.
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v5, one control session per endpoint; the rule and the
+- **Protocol**: v5.1, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at
@@ -419,18 +473,24 @@ pointers, not copies:
 - **Unsafe** is denied crate-wide; the modules that opt in per item, the
   `src/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
-- **Bench/test entries are PEP 723 python scripts run via `uv run`**; their
-  lint and format gates and the waiver rule are
-  [docs/lint-policy.md](docs/lint-policy.md) ("Python (ruff)").
+- **The bench model is the `bench/` uv project**: one console script
+  (`just bench <verb>`), ruff and pyright configured in
+  `bench/pyproject.toml`, and the tool adapters that start the subject and every
+  peer in `bench/src/bench/targets/` (a new peer is an adapter + a `PEERS` row,
+  never a runner branch). The supporting instruments are
+  `bench/src/bench/utils/`; the engine hash covers the method modules, the
+  adapters and the probes, not the CLI, the plotter or the utilities. Their
+  lint, format and type gates and the waiver rules are
+  [docs/lint-policy.md](docs/lint-policy.md) ("Python (ruff)", "Python
+  (pyright)").
 - **Where everything lives**: [docs/structure.md](docs/structure.md) — the
   file map and the topic-ownership contract (§3).
 
 ## 12. One-line summary
 
 > Self-check the environment on entry; when a check blocks you, fix the code —
-> waive only as a last resort, locally, with a named reason; keep docs and
-> code in the same commit; write commit messages in english; commits are free,
+> waive only as a last resort, locally, with a named reason; keep docs and code
+> in the same commit; write commit messages in English; commits are free,
 > release tags are deliberate; let releases speak through CHANGELOG.md; count
-> versions from the fork point; prove every claim with real output and
-> measure the path you claim (§10); end
-> sessions clean; secrets never enter the repo.
+> versions from the fork point; prove every claim with real output and measure
+> the path you claim (§10); end sessions clean; secrets never enter the repo.

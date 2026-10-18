@@ -6,7 +6,7 @@
 决定数据面**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
 语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
 `type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见
-[benchmarks.md](benchmarks.md)的「每个配置选择的代价」。本文只讲
+[benchmarks.zh.md](benchmarks.zh.md#每个配置选择的代价逐项实测)。本文只讲
 `noise`;`plain` 除默认值外无需任何配置。
 
 ## Noise 协议
@@ -15,8 +15,8 @@
 方式:一对 X25519 密钥对,不需要 PKI。
 
 `molehill` 自带合理的默认配置;见[noise 示例](./deployment.zh.md#noise加密传输)。默认
-pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此不再有
-中间人(MITM)问题。
+pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此中间人
+(MITM)无法冒充服务端。
 
 > **ring-accelerated 带来了什么。** 默认构建链接了 `snow` 的
 > **ring-accelerated** resolver,于是 ChaCha20-Poly1305 数据路径——每个
@@ -41,7 +41,7 @@ Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
 ```
 
-(警告:不要使用网上出现的密钥对,包括上面这一对)
+(不要使用网上出现的密钥对,包括上面这一对。)
 
 服务端保留私钥用于标识自己,客户端保留公钥用于验证服务端:
 

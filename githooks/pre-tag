@@ -117,7 +117,7 @@ if exists_at "assets/bench-v${version}.png"; then
 elif [ "$passed_commit" -eq 1 ]; then
   echo "  note  assets/bench-v${version}.png absent at this commit (historical tag?)"
 else
-  fail "assets/bench-v${version}.png missing — run 'just bench-plot' and commit the charts"
+  fail "assets/bench-v${version}.png missing — run 'just bench plot' and commit the charts"
 fi
 # The numbers must describe *this* state (AGENTS.md §10, "prove provenance").
 # The results file records the revision it was measured at, and the ritual
@@ -138,8 +138,7 @@ print((rev[0] if isinstance(rev, list) else rev) or "")' \
     echo "  note  the results file was measured at '${measured}', not a commit here"
   else
     drift="$(git diff --name-only "${measured}..${commit}" -- src tests build.rs \
-      Cargo.toml Cargo.lock 'benches/scripts/bench/*.py' \
-      'benches/scripts/bench/probes/*.py' 2>/dev/null || true)"
+      Cargo.toml Cargo.lock 'bench/src/bench' 2>/dev/null || true)"
     if [ -n "$drift" ]; then
       fail "the results file was measured at ${measured}, but code changed since — re-run the sweep on the release commit (docs/release.md, step 3): $(printf '%s ' $drift)"
     else
@@ -200,7 +199,7 @@ cat <<'EOF'
       transparent (the whole default set — the same list release.yml and the
       CI musl job carry, which githooks/check-docs keeps in step with
       Cargo.toml); the --help smoke test passed in the workflow run
-  [ ] Benchmark ritual done (docs/release.md): sweep run, 'just bench-gate'
+  [ ] Benchmark ritual done (docs/release.md): sweep run, 'just bench gate'
       green vs the previous tag (waivers recorded in HANDOFF.md), README
       benchmark section refreshed
   [ ] Heavy gates green on this commit: 'just check' (pre-commit + pre-push);

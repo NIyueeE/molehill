@@ -33,14 +33,9 @@ use std::time::Duration;
 
 use crate::protocol::LaneId;
 use crate::transparent::Endpoint;
-// The carrier is what the quality rule compares, and only a build with a
-// choice has one; without it the rule's types still exist (the allocator reads
-// them) but no lane can name a carrier — the hub's stub is an empty enum, so
-// every `Option<Carrier>` here is `None` and `carrier_move` is compiled out.
-#[cfg(not(feature = "multiplex"))]
-use crate::transparent::hub::Carrier;
-#[cfg(feature = "multiplex")]
-use crate::transport::multiplex::Carrier;
+// The carrier is what the quality rule compares; `transparent` implies
+// `multiplex`, so a lane always has a carrier to name.
+use crate::transport::carrier::Carrier;
 
 /// How often the runtime looks at the claims.
 ///
@@ -173,10 +168,6 @@ pub const CARRIER_DROP_MARGIN_PCT: f64 = 1.0;
 pub const CARRIER_EDGE: f64 = 1.5;
 
 /// What the rule decided for one claim.
-///
-/// Compiled only where a carrier choice exists: without `multiplex` there is
-/// no carrier a replacement could ride, so there is nothing to decide.
-#[cfg(feature = "multiplex")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CarrierMove {
     /// The slot to ask the peer to drain, so its replacement can ride `prefer`.
@@ -204,10 +195,7 @@ pub struct CarrierMove {
 ///    one whose flows the move costs least — preferring a lane with no flows of
 ///    this end's own so the drain completes promptly.
 ///
-/// Only exists where a carrier choice exists (see [`CarrierMove`]): without
-/// `multiplex` the rule has no carrier to compare against and no move to ask
-/// for.
-#[cfg(feature = "multiplex")]
+/// A lane always names a carrier because `transparent` implies `carrier`.
 #[must_use]
 pub fn carrier_move(evidence: &[LaneEvidence], chosen: Carrier) -> Option<CarrierMove> {
     let other = match chosen {

@@ -49,13 +49,13 @@ jobs:
         with:
           tool: cargo-machete,cargo-audit,cargo-outdated,cargo-deny
 
-      - name: Install uv (python bench gates + ruff lint)
+      - name: "Install uv (python bench gates: ruff + pyright)"
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
 
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
 
-      - name: Full check chain (fmt/secrets/machete/docs/ruff/clippy + audit/deny/outdated/test)
+      - name: Full check chain (fmt/secrets/machete/docs/ruff/pyright/clippy + audit/deny/outdated/test)
         run: just check
 
   features:
@@ -77,8 +77,118 @@ jobs:
         run: >
           cargo hack check --feature-powerset --no-dev-deps
 
+      # The powerset checks the library, not test targets. This was the gap
+      # that let a transparent-without-multiplex test build rot: the feature
+      # combination is part of the public surface, so its tests must compile.
+      - name: Check test targets for the transparent feature set
+        run: >
+          cargo check --tests --no-default-features
+          --features server,client,transparent
+
   musl:
-    name: musl static build
+    name: musl check ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The two release binaries that carry the full default set (and so
+          # the transparent code): the libc-sensitive half of the release
+          # matrix. The aarch64 leg runs natively on GitHub's arm64 runner
+          # (public repositories), so no emulator sits between the compiler
+          # and the code it checks.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}-musl
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Add the musl target
+        run: rustup target add ${{ matrix.target }}
+
+      # release.yml builds these two artifacts (and the GHCR image) with
+      # exactly this feature set; nothing else in CI compiles the full set for
+      # musl. The list is the whole default set and has to stay that way: it
+      # silently stopped covering the release when `transparent` joined
+      # release.yml alone, and a TUN `ioctl` request that only glibc's
+      # signature accepts reached the tag. `githooks/check-docs` fails this
+      # list if it drifts from Cargo.toml.
+      - name: Check the release feature set against musl
+        run: >
+          cargo check --all-targets --target ${{ matrix.target }}
+          --no-default-features
+          --features server,client,noise,hot-reload,multiplex,kcp,transparent
+
+  musl-embedded:
+    name: musl check ${{ matrix.target }} (embedded)
+    runs-on: ubuntu-latest
+    strategy:
+      # The 32-bit release artifacts build `embedded`, not the full set, and
+      # have no native runner: cross's container carries the toolchain.
+      fail-fast: false
+      matrix:
+        target:
+          - arm-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}-musl-embedded
+
+      - name: Install cross
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: cross
+
+      - name: Check the embedded feature set against musl
+        run: >
+          cross check --all-targets --target ${{ matrix.target }}
+          --no-default-features --features embedded
+
+  test-arm64-musl:
+    # The release ships this artifact; CI runs the release's test command on
+    # it natively, so an aarch64-only failure is found on the PR, not on the
+    # tag — both aarch64 failures of the v0.11.0 release were first seen there.
+    name: test aarch64-musl (native)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: aarch64-unknown-linux-musl-test
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Add the musl target
+        run: rustup target add aarch64-unknown-linux-musl
+
+      - name: Run tests (serial — the integration suite binds fixed ports)
+        run: cargo test --release --target aarch64-unknown-linux-musl -- --test-threads=1
+
+  test-x86_64-musl:
+    # The release ships this artifact (it is the GHCR image); CI runs the
+    # release's test command on it natively, so the release matrix does not
+    # have to re-run the suite to cover it.
+    name: test x86_64-musl (native)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -86,6 +196,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-musl-test
 
       - name: Install musl tools
         run: sudo apt-get install -y musl-tools
@@ -93,20 +205,8 @@ jobs:
       - name: Add the musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      # release.yml builds the release binaries (and the GHCR image) with
-      # exactly this target and feature set; nothing else in CI does, so a
-      # glibc-only assumption in Linux-only code reaches the release build.
-      # The list is the whole default set, and it has to stay that way: this
-      # check is the only thing that builds it for musl, and it silently
-      # stopped covering the release when `transparent` was added to
-      # release.yml alone (a TUN `ioctl` request that only glibc's signature
-      # accepts reached the tag). `githooks/check-docs` now fails the three
-      # copies of this list if they disagree with Cargo.toml.
-      - name: Check the release feature set against musl
-        run: >
-          cargo check --all-targets --target x86_64-unknown-linux-musl
-          --no-default-features
-          --features server,client,noise,hot-reload,multiplex,kcp,transparent
+      - name: Run tests (serial — the integration suite binds fixed ports)
+        run: cargo test --release --target x86_64-unknown-linux-musl -- --test-threads=1
 
   test:
     name: test ${{ matrix.name }}
@@ -126,6 +226,14 @@ jobs:
             args: --no-default-features --features server,client,noise,hot-reload,multiplex
           - name: server+client lib only
             args: --lib --no-default-features --features server,client
+          - name: server lib
+            args: --lib --no-default-features --features server
+          - name: client lib
+            args: --lib --no-default-features --features client
+          # `transparent` implies `carrier` and `noise`; this leg keeps yamux
+          # out, so it covers the no-multiplex L3 configuration.
+          - name: transparent lib
+            args: --lib --no-default-features --features server,client,transparent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -172,39 +280,53 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The check job already runs the x86_64 Linux suite; this leg only
+          # proves the target builds and starts.
           - os: ubuntu-latest
             exe: molehill
             target: x86_64-unknown-linux-gnu
+            test: false
+          - os: ubuntu-24.04-arm
+            exe: molehill
+            target: aarch64-unknown-linux-gnu
+            test: true
           - os: windows-latest
             exe: molehill.exe
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            exe: molehill
-            target: x86_64-apple-darwin
-          - os: macos-latest
+            test: true
+          # One native runner per architecture: `cargo test --target` here
+          # runs the binary it just built, not the host's.
+          - os: macos-26
             exe: molehill
             target: aarch64-apple-darwin
+            test: true
+          - os: macos-26-intel
+            exe: molehill
+            target: x86_64-apple-darwin
+            test: true
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch head
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target || matrix.args }}-build
 
       - name: Run tests
-        if: matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --verbose -- --test-threads=1
+        if: matrix.test
+        run: cargo test --verbose --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Build
-        run: cargo build
+        run: cargo build --target ${{ matrix.target }}
 
       - name: Smoke test
-        run: ./target/debug/${{ matrix.exe }} --help
+        run: ./target/${{ matrix.target }}/debug/${{ matrix.exe }} --help
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: molehill-${{ matrix.target }}
-          path: target/debug/${{ matrix.exe }}
+          path: target/${{ matrix.target }}/debug/${{ matrix.exe }}

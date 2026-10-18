@@ -1,4 +1,4 @@
-# requires: transparent
+# requires: transparent-client
 # expect: configuration this version moved
 #
 # `[client.transparent]` held the device when transparent was a service type.

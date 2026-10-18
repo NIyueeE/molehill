@@ -124,7 +124,7 @@ pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 /// second one. The bound is a resource guard, not a tuning knob: a lane is a
 /// connection, measured at 2.6 file descriptors and 0.5–0.8 MiB RSS with no
 /// threads, and a typo should be refused rather than dialled.
-#[cfg(feature = "multiplex")]
+#[cfg(feature = "carrier")]
 pub const MAX_TRANSPARENT_LANES: u16 = 1024;
 
 /// The lanes a claim gets when the client writes no budget
@@ -167,7 +167,6 @@ pub const MAX_TRANSPARENT_LANES: u16 = 1024;
 /// `lanes x claims` connections, each a socket, ~2.6 file descriptors and
 /// 0.5-0.8 MiB RSS on **both** ends, and a slot in the server's
 /// `[server.data].max_tunnels_per_client` valve (unlimited by default).
-#[cfg(feature = "multiplex")]
 pub const DEFAULT_CLAIM_LANES: u16 = 2;
 
 // The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this

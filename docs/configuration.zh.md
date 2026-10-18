@@ -1,20 +1,17 @@
 # 配置
 
-`molehill` 可以根据配置文件的内容自动判断以服务端还是客户端模式运行:如果
-`[server]` 与 `[client]` 块只出现一个,就自动选择对应模式,如
-[快速开始](../README.zh.md#快速开始)中的示例。
-
-`[client]` 与 `[server]` 块也可以放在同一个文件里:此时在服务端运行
-`molehill --server config.toml`,在客户端运行 `molehill --client config.toml`,
-显式指定运行模式。
+`molehill` 从配置文件判断运行模式:`[server]`、`[client]`、`[transparent]`
+三者中至少要出现一个,如[快速开始](../README.zh.md#快速开始)中的示例。文件
+可以包含多个块,但此时必须用 `--server` / `--client` / `--transparent` 选定
+模式;不带标志时进程拒绝猜测。一台机器要扮演两种角色,就跑两个进程。
 
 开箱即用的配置、systemd 单元与容器部署见[部署与示例](./deployment.zh.md)。
 
-加密与 `transport` 块的更多细节见[传输层文档](./transport.md)。
+加密与 `transport` 块的更多细节见[传输层文档](./transport.zh.md)。
 
 页面索引:
 
-- [如何配置(v0.7+ 模型)](#如何配置v07-模型)
+- [如何配置](#如何配置)
 - [选择配置(决策树)](#选择配置决策树)
 - [动态服务注册](#动态服务注册)
 - [多路复用(`multiplex` 特性)](#多路复用multiplex-特性)
@@ -25,9 +22,9 @@
 - [使用说明](#使用说明)
 - [故障排查](#故障排查)
 
-## 如何配置(v0.7+ 模型)
+## 如何配置
 
-自 v0.7 起,**服务定义归客户端所有**,服务端只拥有策略:
+**服务定义归客户端所有**,服务端只拥有策略:
 
 - 客户端在自己的配置里声明每个要转发的服务——包括它应该暴露的公网地址
   (`remote_bind_addr`)。
@@ -38,13 +35,13 @@
 一个进程只运行在**三种模式之一**,由配置文件表明是哪一种:`[server]`、
 `[client]`(转发)或 `[transparent]`(L3——见[透明(L3)服务](#透明l3服务))。
 模式是**进程**的属性——它的能力、它的 socket、它的 TUN 设备——所以同时写了
-两张表的文件会被拒绝,而一台想扮演两种角色的机器就跑两个进程。
+两张表的文件需要用一个标志选定模式,而一台想扮演两种角色的机器就跑两个进程。
 `--server` / `--client` / `--transparent` 覆盖文件里的声明。
 
 典型配置步骤:
 
 1. 选择传输层——`plain` 或 `noise`——`noise` 需要生成一对密钥(见
-   [传输层文档](./transport.md))。
+   [传输层文档](./transport.zh.md))。
 2. 编写 `server.toml`:`[server]` 只需 `default_token` 和 `allow_ports`
    白名单,监听地址是 `[server.control].bind_addr`,仅此而已。
 3. 编写 `client.toml`:`[client]` 配置相同的 `default_token`,服务端地址是
@@ -103,9 +100,14 @@
 > 不会有任何回包。因此请两端一起升级;先后顺序无所谓,因为每一端都会拒绝对方的
 > 方言而不是继续通信,而被拒绝的连接会写明它期待的版本。
 >
-> **升级到 0.11(协议 v5)**:线上要承载透明(L3)服务,所以是 v5,而 0.11.0
-> **只服务 v5**——0.10 对端的连接会在它发生的那条连接上被拒绝、不会有任何回包,
-> 反方向也是一样。请两端一起升级;先后顺序无所谓,每一端都会说出它期待的版本。
+> **升级到 0.11.0(协议 v5.0)**:线上要承载透明(L3)服务,所以是 v5.0,而
+> 0.11.0 **只服务 v5.0**——0.10 对端的连接会在它发生的那条连接上被拒绝、不会有
+> 任何回包,反方向也是一样。请两端一起升级;先后顺序无所谓,每一端都会说出它
+> 期待的版本。
+>
+> **升级到 0.11.1(协议 v5.1)**:v5.1 是线协议断裂,不是兼容的小版本:hello
+> 里是两字节版本号,透明数据通道还要协商帧格式。0.11.0(v5.0)对端会在它发生的
+> 那条连接上被拒绝,两个方向都一样。请两端一起升级,不要混跑版本。
 > **控制通道现在必须使用 Noise**:服务端加 `[server.transport.noise]` 表,客户端
 > 加 `[client.transport].type = "noise"` 与 `[client.transport.noise]` 表,L3
 > 客户端加 `[transparent.transport.noise]` 表——每端一对密钥,用
@@ -146,7 +148,7 @@
 认领的通道**就是**它的载体连接——认领的吞吐是**连接**之和,而不是流之和——所以对它
 做多路复用等于白付成帧成本:同一台主机、同一份负载下,同一条认领走自己的连接时线上
 字节少 6%、每包 CPU 少 33%、每秒往返次数多 65%
-([基准测试](./benchmarks.zh.md#the-transparent-l3-wire-question-the-acceptance-harness))。
+([基准测试](./benchmarks.zh.md#透明-l3-的线上开销问题验收-harness))。
 
 ### 迁移到 0.11:carrier 与池的时钟
 
@@ -176,7 +178,7 @@ KCP、建立不起来再回退 TCP 的数据面——对绝大多数人是正确
 ```mermaid
 flowchart TD
     A["起点:默认配置<br/>tunnels=4、<br/>控制通道 Noise(必需)"] --> B{"该服务的载荷自带加密吗?<br/>(TLS、SSH、WireGuard)"}
-    B -- 是 --> C["该服务:transport = { type = \"plain\" }<br/>- 更省,且防护不减"]
+    B -- 是 --> C["该服务:transport = { type = 'plain' }<br/>- 更省,且防护不减"]
     B -- 否 --> D{"并发访客连接很多?"}
     C --> D
     D -- "> ~256 并发" --> G["tunnels = 8 或更高"]
@@ -195,7 +197,7 @@ flowchart TD
 | `tunnels` | `1` | 所有流量共用一条隧道:没有跨流聚合,且共享同一重传域,一次丢包会一起卡住。实测为所有路径上最差的配置 |
 | `tunnels` | `4`(默认) | 聚合越过单流,并在隧道之间隔离队头阻塞;`4 × 64` 并发连接 |
 | `tunnels` | `8+` | 更多并行隧道(更多 NAT 映射)与按比例更高的连接上限;在干净快速路径上实测从一条隧道到八条吞吐 +77% |
-| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价按决策的测量)) |
+| carrier | (没有对应的键) | 数据面先拨 KCP,会话建立不起来时回退 TCP,因为哪一种能用是网络的性质而不是部署的性质。`MOLEHILL_DATA_CARRIER` 可以强制其一用于测量。实测 TCP 在每一个未做标记的格子上都领先,KCP 唯一的胜场是 100 ms RTT 下的 UDP 会话质量([基准测试](benchmarks.zh.md#每个配置选择的代价逐项实测)) |
 | transport | `"plain"` | 不加密,每字节开销最低 —— 只适用于载荷自带加密的**单个服务**;控制通道始终加密 |
 | transport | `"noise"` | 用单个预共享密钥对加密线路;RTT 代价可忽略,满载无 CPU 惩罚 |
 | 池的建立 | (没有对应的键) | 池的 `tunnels` 条连接在服务启动时拨出,而不是在第一个访客到来时:请求时不需要付任何代价,成本是 `tunnels` 条空闲连接(实测每条 0.5–0.8 MiB RSS 与 2.6 个 FD,不占线程) |
@@ -229,13 +231,13 @@ default_retry_interval = 1 # 可选。重连退避的上限,而非固定间隔:�
 type = "noise" # 必需,且 `"noise"` 是守护进程唯一接受的值:控制通道携带的是每个数据通道用来鉴权的凭证,明文控制腿在启动时即被拒绝。单个*服务*仍可在下面覆盖为 `"plain"
 proxy = "socks5://user:passwd@127.0.0.1:1080" # 可选。仅客户端。通过 `http`/`socks5` 代理连接服务端
 
-[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.md`
+[client.transport.noise] # 必需。Noise 协议。进一步说明见 `docs/transport.zh.md`
 pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # 可选。默认值如所示
 local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # 可选。本客户端自己的密钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
 remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # 必需:服务端的公钥 # security-scan:allow documentation example key
 psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.zh.md`「Noise session resume」
 
 [client.services.service1] # 需要转发的服务。名称标识该服务(显示在日志中)
 protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"。必须自己拥有公网 ip:port 的服务根本不是转发服务:它属于 `[transparent]` 表,那是一种独立的运行模式——见下文「透明(L3)服务」
@@ -277,10 +279,10 @@ local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # 必需:本�
 remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # 可选。客户端的公钥,只有认证客户端的 pattern 才需要 # security-scan:allow documentation example key
 psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # 可选。预共享密钥,base64 编码后必须恰好解码为 32 字节,该长度只在建立连接的 Noise 握手时才检查。仅当配置的 `pattern` 在 `psk_location` 处带有 PSK 修饰符(如 Noise_KKpsk0_...)时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝
 psk_location = 0 # 可选。pattern 中使用的 PSK 槽位索引。默认:0
-resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.md`「Noise session resume」
+resume = true # 可选。Noise 会话恢复:重连时用 MAC 证明持有上一会话的握手哈希,而不是重做握手的密钥交换(选择器 0x02)。默认:false。见 `docs/transport.zh.md`「Noise session resume」
 
-[server.transparent] # 可选,而这张表本身就是开关:它存在,服务端才会提供透明(L3)客户端。没有它,认领会在看任何设备之前被策略拒绝——提供 L3 意味着向本进程索要 CAP_NET_ADMIN 与 TUN 设备,所以这是运维方的决定,永远不是远端客户端的
-tun = "molehill0" # 可选。服务端连接的 TUN 设备。设备必须已存在,并配有通向每个所声明地址的路由——那是运维方的事,不是守护进程的。默认:molehill0
+[server.transparent] # 可选,而这张表本身就是开关:它存在,服务端才会提供透明(L3)客户端。没有它,认领会在看任何设备之前被策略拒绝——提供 L3 意味着向本进程索要 TUN 设备与平台权限,所以这是运维方的决定,永远不是远端客户端的
+tun = "molehill0" # 可选。服务端的 TUN 设备。默认:Linux 与 Windows 为 molehill0,macOS 为 auto(自动选择空闲 utunN)。Linux 上由运维方创建设备并把每个认领路由进去;macOS/Windows 上由守护进程创建,运维方负责路由/转发
 ```
 
 ## 动态服务注册
@@ -366,6 +368,52 @@ FD 占用。形态不是键:转发服务永远走多路复用(没有 `mode` 可�
   配置里出现 `[client.data]` 或 `[server.data]` 就会被拒绝(未知键——
   `deny_unknown_fields`)。删掉这两个表之后,每条数据通道都是自己的一条连接。
 
+**分开绑定数据面。** 默认情况下两个平面共用控制地址。要把数据面放到独立端口,
+两端都要设置:
+
+```toml
+# server.toml
+[server]
+default_token = "change-me"
+allow_ports = ["5202"]
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.data]
+bind_addr = "0.0.0.0:2343"
+
+[server.transport.noise]
+local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+```
+
+```toml
+# client.toml
+[client]
+default_token = "change-me"
+
+[client.control]
+default_remote_addr = "server.example.com:2333"
+
+[client.transport]
+type = "noise"
+
+[client.transport.noise]
+remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+
+[client.data]
+default_data_addr = "server.example.com:2343"
+
+[client.services.echo]
+local_addr = "127.0.0.1:8080"
+remote_bind_addr = "0.0.0.0:5202"
+```
+
+服务端会在 `[server.data].bind_addr` 上再绑一个 TCP 监听,并在第一条 KCP 注册
+到达时打开该地址的 KCP UDP socket;这个端口要同时放行 **TCP 与 UDP**。带自己
+`remote_addr` 的服务会同时跟随该服务端的两个平面,客户端级的
+`default_data_addr` 不作用于它。
+
 **按服务覆盖。** `[client.data]` 存放默认值;每个服务可以在自己的
 `[client.services.<name>]` 块里单独覆盖 `tunnels`,数据面的其它部分不可覆盖:
 carrier 随路径而定,形态随协议而定。于是同一个客户端可以给繁忙的服务更宽的池,
@@ -412,33 +460,43 @@ carrier 随路径而定,形态随协议而定。于是同一个客户端可以�
 `[transparent]` 的文件也会被拒绝——既转发又认领的机器跑**两个进程**,这也正是让
 `CAP_NET_ADMIN` 不落到不需要它的那个进程上的办法。
 
-它**仅支持 Linux**,两端都需要 `CAP_NET_ADMIN`(各自要连接一个 TUN 设备);
-`transparent` 特性属于默认特性集。其他平台上的配置、或在不含该特性的构建里,
-都会在解析配置时被拒绝:信息形如 `... carries whole IP packets through a TUN
-device, and this platform is not Linux`,或指明缺少 `transparent` 特性。目前只
-承载 IPv4——非 IPv4 的包会被丢弃并计数。
+它支持 **Linux 与 macOS**,**Linux、macOS 或 Windows 服务端**都可以提供;
+Windows **不能做客户端**:它的协议栈没有源地址策略路由,应用发出的回包回不到
+隧道,因此 Windows 上的 `[transparent]` 客户端配置会在解析时被拒绝,并给出
+WSL2 的指引。`transparent` 特性属于默认特性集。不支持的平台、或在不含该特性
+的构建里,都会在解析配置时被拒绝并说明原因与可用方案。
+
+设备生命周期按平台分工。Linux 上运维方创建持久 TUN 设备,守护进程连接它,进程
+需要 `CAP_NET_ADMIN`。macOS 上守护进程创建临时的 `utunN`、把所声明的 `/32` 或 `/128`
+配到它上面,运维方负责 pf 规则与路由,进程需要 root。Windows 上守护进程创建
+Wintun 适配器,运维方负责路由、转发与防火墙规则,进程需要管理员权限与放在
+二进制旁边的 `wintun.dll`。IPv4 与 IPv6 都承载:解析器支持 IPv6 基础头、常见
+扩展头链(含分片)和 TCP/UDP 端口;ICMPv6 与 ESP 只按地址路由。IPv6 jumbogram
+不承载(按 malformed 拒绝),解析器不认识的扩展头之后的传输头也按地址路由。
+版本既不是 4 也不是 6 的包会被丢弃并计数。
 
 **服务不服务 L3,由服务端运维决定。** 在服务端,`[server.transparent]` 这张表
 就是开关:没有它,认领会在看任何设备之前被策略拒绝,所以客户端永远不可能成为
-"让服务端去碰 `/dev/net/tun`、向内核索要 `CAP_NET_ADMIN`"的原因。只转发
+"让服务端去打开设备、向内核索要相应权限"的原因。只转发
 `tcp`/`udp` 的服务端因此完全不需要这项能力。启用 L3 有一个后果要直说:这类客户端
 永不加密,所以服务它的服务端会接受来自该客户端的明文连接,无论
 `[server.transport.noise]` 写了什么——Noise 键仍然作用于真正协商了它的客户端。
 
-**守护进程从不配置网络。** 它没有 netlink 代码,也从不调用 `ip`:TUN 设备与
-地址、路由都由运维方创建和安装,守护进程只校验自己依赖的东西,缺什么就用要执行
-的确切命令拒绝。两套配方——地址被路由到服务端,以及单 IP 服务端——见
-[部署文档](./deployment.zh.md#透明l3服务)。
+**守护进程从不安装路由、规则或防火墙规则。** 它没有 netlink 代码,也从不调用
+`ip`。Linux 上它连接运维方创建的持久 TUN 设备,并校验运维方配置的地址与
+`rp_filter`。macOS 与 Windows 上它创建临时设备,因为这两个平台没有等价的
+「运维方先创建」模型;macOS 上它还会配置所声明的地址,而 pf 规则、路由与转发
+仍归运维方。[部署文档](./deployment.zh.md#透明l3服务)里有完整配方。
 
 | 键 | 含义 |
 |---|---|
 | `[transparent]` | **模式本身**:这张表让进程成为 L3 客户端,客户端级的那一半也在这里(`default_token`、`tun`、`control`、`data`、`transport`) |
 | `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
-| `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上) |
-| `[transparent].tun` | 客户端连接的 TUN 设备。默认:`molehill0` |
-| `[transparent.data.tcp\|kcp].tunnels` | 该 carrier 的**车道预算**:这个客户端在该 carrier 上为它所有认领一共持有多少条载体连接,在共用该 carrier 的认领之间平分。一条车道**就是**一条连接(认领永远不做多路复用),且每条认领至少保留一条。默认:每条认领一条车道——认领一直以来的形态——低于认领数的预算会被拒绝并给出该写入的条数。上限 1024。平分只是车道的**起点**:承载的流比车道更多的认领,会从还有空闲车道的认领那里借走一条(但绝不借走最后一条),也就是说预算是「存在多少条连接」的决定者,而谁持有它们由流量决定。平分与出借带来三个后果:**默认**情况(不写 `tunnels`,即每条认领一条车道)下没有任何认领有多余车道,于是什么也不会被出借——预算是这个机制的空间,想要它就用「每条认领至少两条」的量来写;低于认领数的预算会被拒绝(每条认领至少保留一条);而认领数的非整数倍预算会剩下除不尽的部分不被分配——分配器重新分配的是各认领的份额,不会去花除法剩下的余数;想让每条车道都用上,就把预算写成认领数的整数倍 |
+| `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上)。IPv4 写 `10.99.0.1:8443`,IPv6 写 `[2001:db8::1]:8443` |
+| `[transparent].tun` | 客户端连接的 TUN 设备。默认:Linux 与 Windows 为 `molehill0`,macOS 为 `auto`(自动选择一个空闲 `utunN`) |
+| `[transparent.data].tunnels` | **车道预算**:这个客户端为它所有认领一共持有多少条载体连接,在认领之间平分。一条车道**就是**一条连接(认领永远不做多路复用),且每条认领至少保留一条。默认:**每条认领两条**——一个实测的拐点,代价写在表下。低于认领数的预算会被拒绝并给出该写入的条数;上限 1024。平分只是车道的**起点**:承载的流比车道更多的认领,会从还有空闲车道的认领那里借走一条(但绝不借走最后一条),也就是说预算是「存在多少条连接」的决定者,而谁持有它们由流量决定。认领数的非整数倍预算会剩下除不尽的部分不被分配——分配器重新分配各认领的份额,不会去花除法剩下的余数;想让每条车道都用上,就把预算写成认领数的整数倍 |
 | `[server.transparent]` | **开关**:这张表存在,服务端才会提供 L3。缺失时,每一次认领都会在看任何设备之前被策略拒绝 |
-| `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:`molehill0` |
+| `[server.transparent].tun` | 服务端连接的 TUN 设备。默认:Linux 与 Windows 为 `molehill0`,macOS 为 `auto`(自动选择一个空闲 `utunN`) |
 
 按认领的键与转发服务一一对应:`token`、`remote_addr`、`retry_interval`、
 `tunnels`。`[transparent.transport]` 决定 L3 客户端两条线栈怎么建:
@@ -499,24 +557,28 @@ v0.11.0 之前的二进制;该版本起吃的分段 offload 抬高了 bulk 一�
 
 ### 运维方需要准备什么
 
-两端都连接到自己 `tun` 键指定的**已存在**设备;守护进程刻意不创建设备,因为
-运维方的地址和路由就落在它上面。
+平台决定哪一半属于运维方:
 
-- **设备存在**(两端)。设备缺失时,拒绝信息会给出创建它的两条命令——
-  `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`。
-- **客户端承载它声明的每个地址。** 所声明的 IP 就是 `remote_bind_addr` 里的
-  那个,客户端必须拥有它:拒绝信息会打印 `ip addr add <ip>/32 dev <tun>`、
-  `ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table
-  100`。地址必须是本地的,因为应用要绑定它;源地址规则则把该应用发出的回包送回
-  隧道。
-- **关闭反向路径过滤。** `net.ipv4.conf.<tun>.rp_filter` **和**
-  `net.ipv4.conf.all.rp_filter` 都必须读到 `0`——注入的包携带访客的源地址,
-  严格的检查会丢掉它们——拒绝信息会打印确切的 `sysctl -w` 行。这项检查在
-  客户端执行;服务端只校验自己的设备是否存在。
-- **路由要把所声明的地址带到服务端**,并让客户端的回包出得去。两套配方见
-  [部署文档](./deployment.zh.md#透明l3服务)。
-- 两个进程都需要 `CAP_NET_ADMIN`;[部署文档](./deployment.zh.md#systemd)的
-  systemd 单元展示了 `AmbientCapabilities=` 行。
+| | Linux | macOS | Windows(仅服务端) |
+|---|---|---|---|
+| 设备 | 运维方创建持久 TUN | 守护进程创建 `utunN` | 守护进程创建 Wintun 适配器 |
+| 所声明地址 | 运维方配置 `/32` 或 `/128` | 守护进程配置每个 `/32`/`/128` | 不配置地址,只做路由 |
+| 路由 | 运维方(`ip route`/`ip rule`) | 运维方(`route` + pf) | 运维方(`New-NetRoute`) |
+| 权限 | `CAP_NET_ADMIN` | root | 管理员 + `wintun.dll` |
+| 校验 | 设备、地址、`rp_filter`、`ip_forward` | 守护进程创建设备/地址;pf 与路由归运维方 | 守护进程创建设备;路由/转发/防火墙归运维方 |
+
+- **Linux:** 设备必须存在;客户端必须拥有每个所声明地址,且
+  `net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都为 `0`;
+  服务端需要 `ip_forward = 1`。缺少前置条件时会拒绝并打印要执行的命令。
+- **macOS:** 客户端所声明的 `/32` 或 `/128` 由守护进程配置。运维方安装 pf 的
+  `route-to` 规则,把来自这些地址的回包送回 utun;服务端打开
+  `net.inet.ip.forwarding` 并把每个认领路由到它的 utun。pf 规则是静态的时,
+  请写固定的 `tun = "utunN"`;`auto` 会在日志里打印实际名称。已配置的地址在
+  进程生命周期内保留:热重载移除的认领,其地址要到重启才消失。
+- **Windows:** 服务端的 Wintun 适配器由守护进程创建。运维方为每个认领添加
+  路由并打开转发/防火墙规则;客户端不支持(用 WSL2)。
+
+完整配方见[部署文档](./deployment.zh.md#透明l3服务)。
 
 ### 一个完整示例
 
@@ -623,7 +685,8 @@ carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧�
 | `MOLEHILL_CARRIER_SWITCH_AT=<秒>` | 触发时每个认领一行 | 在该客户端的数据池启动这么多秒之后,把每条透明认领切到另一条 carrier,并请求对端排空它最忙的一条车道,于是补位的那条车道会用新 carrier 拨号。排空与自动策略用的是同一个双端约定:两端的该车道都不再接受新流、保留已在它上面的流(所以不会重排序),并且只有两端都确认其中已无流时才退役——因此仍承载长流的车道不会被夺走,切换的效果体现在随后的新流上。它的用途是**测量**一次 carrier 切换能换来什么、代价是什么——生产行为是客户端内部的、由实测驱动的决策,不是旋钮——取值不是整数秒时会报告并忽略 |
 | `MOLEHILL_TUNNEL_SWITCH_AT=<秒>` | 触发时每个 pool 一行 | 上一个开关在 L4 的对应物:多路复用 pool 启动这么多秒之后,把该 pool 当前 carrier 的一条隧道移出新的放置,保留已在它上面的流(所以不会重排序),并只有当它既无 stream 也无 pinned UDP peer 时才退役——随后修复会按另一条 carrier 拨补位。一直不安静(承载长流)的隧道在排空预算到期后回到服务,补位无法建立时切换被放弃、交给普通修复——pool 永远不会一直缺一条隧道。它的用途是**测量**逐隧道切换的代价与其补位能接住什么,与 L3 的诊断开关对认领做的事一样;它不是部署旋钮,取值不是整数秒时会报告并忽略 |
 | `MOLEHILL_TUNNEL_CARRIER_RULE=1` | 每次探测事件或迁移每个 pool 一行 | 为本进程**开启**多路复用 pool 的载体规则(默认关闭,原因见下)。该规则读取每条 KCP 隧道在一秒窗口内的重传份额,凡在窗口内携带过真实流量、且份额越过 4% 的隧道即**怀疑**当前载体:它通过 hatch 驱动的同一种无扰动 handover 把一条隧道交给另一载体,在探测运行期间把新流路由到探测隧道,并在携带字节上比较两个载体——显著更多则切换端点的 carrier 决策(受同样的切换冷却约束),显著更少则归还隧道并退避十分钟,而窗口内没有携带任何流量的探测按"未测量"处理而不是下判。真正**停止交付**的隧道(交付率 < 对端移交量的 60%)无需探测,直接迁移。阈值与单侧形状(KCP → TCP;TCP 隧道的重传状态留在内核里)见 [internals.md](internals.md#the-tunnel-pool)。**为何默认关闭**:规则在它为之设计的路径上能够诚实地触发并比较,但其 Move 路径尚未在 bench 工作负载上端到端演示——UDP 工作负载的通道在服务激活时一次性打开,运行中启动的探测拿不到被路由的新流量,而现有场景没有一个既能武装怀疑、又会在探测启动之后重新拨号的(HANDOFF.md,"the sighting protocol")。在补上这一缺口的工作负载出现之前,是否启用由操作者自行决定,并了解探测能看见什么、看不见什么。
-| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个车道槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ipv4, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`flows`、`forwarded` 与 `no_channel`——即哪个车道承载了多少、有多少条流落在它上面,以及替换窗口让哪个车道丢了多少。这是区分「车道集合」与「全部堆在一个车道上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该车道死亡期间被丢弃的流量 |
+| `MOLEHILL_L3_WIRE=ip` | 在该端选择纯 IP 线格式(若协商结果尚未如此) | 混合格式路径的诊断开关:强制 `StartForwardTransparent` 为 `Ip`,让一对 Linux 端点走一遍 macOS/Windows 对端会走的转换。取值 `ip`/`vnet`/`auto`;其他值在 debug 级别提示后忽略。不要把它当部署调参——服务端会根据两端设备协商格式 |
+| `MOLEHILL_L3_STATS=1` | 每条透明数据路径每秒一行,外加该设备上每条认领每个车道槽位一行 | 透明数据面的累计计数:`forwarded`、`dropped(not_ip, malformed, unclaimed, no_channel)` 与 `channel_errors`;随后按认领给出每个槽位的 `live`、`flows`、`forwarded` 与 `no_channel`——即哪个车道承载了多少、有多少条流落在它上面,以及替换窗口让哪个车道丢了多少。这是区分「车道集合」与「全部堆在一个车道上」的依据(流量全在 `member=0` 就说明该认领没有在分散),而某个槽位上的 `no_channel` 就是该车道死亡期间被丢弃的流量 |
 
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
 就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
@@ -772,7 +835,7 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 
 ### 传输层
 
-传输层配置——Noise 密钥对、pattern 与 PSK——在[传输层文档](./transport.md)
+传输层配置——Noise 密钥对、pattern 与 PSK——在[传输层文档](./transport.zh.md)
 中逐步说明:在上面的规范中选好 `type`,再跟着那篇指南做。
 
 - **代理**:`[client.transport].proxy` 只作用于客户端到服务端的出站连接
@@ -801,8 +864,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5 的 molehill(0.10 系列服务 v4,0.11 系列服务 v5),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
-| 客户端在服务端的 hello 始终不到达后以 `protocol v5` 停止 | 服务端早于本构建:它读到版本 5、自己的版本检查失败并关闭该连接。请升级服务端。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5.1 的 molehill(0.10 服务 v4,0.11.0 服务 v5.0,0.11.1 服务 v5.1),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| 客户端在服务端的 hello 始终不到达后以 `protocol v5.1` 停止 | 服务端早于本构建:它读到版本号、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
 | 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |
@@ -812,12 +875,13 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | UDP 流量不通 | 检查 `protocol = "udp"`;大于 `udp_buffer_size` 的数据报会被截断到该大小;空闲映射在 `udp_idle_timeout` 秒后超时。 |
 | 有状态 UDP 会话(游戏、QUIC、WireGuard)中途断开 | 确保两端运行带 UDP 会话亲和的版本(≥ 本修复);空闲超过 `udp_idle_timeout` 的对端会在下一个数据报时重新绑定到新本地 socket(源端口变化)——调大超时或发送周期流量。 |
 | `Failed to read cmd: early eof` 警告 | 对端关闭了通道(重启或关停);客户端会自动重连。 |
-| 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | 透明服务连接的是运维方创建的设备,守护进程绝不自己创建。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务))。 |
+| IPv6 认领的访客拿不到响应 | Linux 上要配置 `/128`、`ip -6 rule from <addr>` 与表 100 的 `ip -6 route`,并在服务端打开 `net.ipv6.conf.all.forwarding=1`;本地地址缺失时拒绝信息会给出确切命令。macOS 需要 `inet6` 的 pf 规则;Windows 需要 `/128` 路由与 IPv6 转发。 |
+| Linux 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | Linux 上透明服务连接的是运维方创建的设备。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务));macOS/Windows 会自己创建设备。 |
 | 注册被拒:`This server does not serve transparent (L3) services: [server.transparent] is not configured` | 服务端自己的开关没打开,所以注册在看设备之前就被策略拒绝了。如果这台主机确实要路由所声明的地址,就**在服务端的**配置里加上这张表;否则从客户端去掉该服务。 |
-| `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印的 `ip addr add <ip>/32 dev <tun>`、`ip rule add from <ip> lookup 100` 与 `ip route add default dev <tun> table 100`。 |
+| `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印 `ip addr add <ip>/32`(IPv6 为 `ip -6 addr add <ip>/128`)以及对应的 `ip rule`/`ip route`(IPv6 加 `-6`)。 |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | 注入的包携带访客的源地址,严格的检查会丢掉它们。执行信息里打印的 `sysctl -w` 行;`net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都必须读到 `0`。 |
 | `Address <ip:port> is already claimed by another transparent service on this server` | 两个客户端声明了同一个端点;先到的声明在其注册存续期间一直持有。给其中一个换地址或端口。 |
 | 在 `[client.services.<name>]` 里写 `protocol = "transparent"` 会被拒绝,信息指向 `[transparent.claims.<name>]` | 自己拥有公网地址的客户端不是转发客户端:把该条目搬到 `[transparent]` 表,并用 `--transparent` 启动那个进程。见[透明(L3)服务](#透明l3服务)。 |
 | `[client.transparent]` 被作为"配置在本版本中已迁移"拒绝 | 设备现在属于模式:`[client.transparent].tun` → `[transparent].tun`,而每个透明服务变成一个 `[transparent.claims.<name>]` 条目。 |
-| `[transparent]` 表在启动时被拒,信息为 `... and this platform is not Linux`,或指明缺少 `transparent` 特性 | 承载整个 IP 包需要 Linux 构建并启用 `transparent` 特性(默认特性集的一部分)。在其他平台上请继续用转发型 `[client]`。 |
+| `[transparent]` 表在启动时被拒并给出平台原因,或指明缺少 `transparent` 特性 | 透明客户端需要 Linux 或 macOS 并启用 `transparent` 特性(默认特性集的一部分)。Windows 可以提供透明服务端,但不能做客户端;请在 WSL2(Linux)或 Linux/macOS 上跑客户端。 |
 | 透明服务的访客拿不到任何响应,`MOLEHILL_L3_STATS=1` 计入 `unclaimed` 丢弃 | 路由不完整:服务端需要一条把所声明地址送进自己设备的路由,客户端需要 `from <ip>` 规则及其表内路由(见[部署文档](./deployment.zh.md#透明l3服务))。`unclaimed` 也会出现在没有任何成员持有该端点时的重连窗口;`no_channel` 表示某个成员的队列已满,或该流所落的成员已经消失——具体是哪一个,看按槽位的那几行。 |

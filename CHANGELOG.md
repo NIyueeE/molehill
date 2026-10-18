@@ -7,6 +7,93 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-17
+
+### Added
+
+- **Transparent (L3) services are cross-platform.** Linux and macOS run both
+  ends; a Windows server can serve transparent claims (Wintun, Administrator,
+  `wintun.dll`). A Windows client is refused at config parse: Windows has no
+  source-address policy routing, so its replies would not return to the tunnel;
+  the refusal names the WSL2 path. macOS uses a daemon-created utun and assigns
+  the claimed `/32`s, while the operator owns the pf `route-to` rule and routes;
+  Windows uses a daemon-created Wintun adapter plus operator routes and
+  forwarding. Linux keeps its persistent operator-created TUN and the same
+  `ip rule`/`ip route` recipes.
+- **Transparent (L3) carries IPv6 as well as IPv4.** The packet reader walks
+  the IPv6 base header and the common extension-header chain (including
+  fragments), reads TCP/UDP ports when they are reachable, and routes ICMPv6
+  and non-first fragments by address; jumbograms are rejected. The same
+  `Ip`/`Vnet` frame negotiation carries both families, the Linux GSO split
+  handles IPv6, and Linux/macOS/Windows recipes use `/128` addresses and the
+  family's forwarding/routing commands. A focused Linux IPv6 acceptance
+  harness (`just l3-accept-ipv6`) covers the visitor path, transparency and a
+  60 KiB stream on both wire formats.
+- **Prebuilt `aarch64-unknown-linux-gnu` archives.** The release now ships ten
+  archives; the new one serves arm64 Linux hosts that want the system glibc
+  (NSS/DNS) rather than the static musl binary.
+
+### Changed
+
+- **BREAKING: protocol v5.1, incompatible with v5.0.** The hello carries a
+  two-byte `major.minor` version, and a transparent data channel negotiates its
+  frame format (`Ip` for bare IPv4 packets, `Vnet` for Linux virtio-net/GSO
+  frames) in `StartForwardTransparent`. A Linux pair keeps the `Vnet` fast path;
+  any pair with a plain-IP device uses `Ip`, with the Linux side splitting and
+  checksumming at its boundary. A 0.11.0 (v5.0) peer is refused on the
+  connection it happens on; upgrade both ends together. `5.1` is a dialect
+  label, not a SemVer-compatible minor.
+- **The L3 stats counter `not_ipv4` is now `not_ip`.** It counts packets whose
+  version is neither IPv4 nor IPv6; IPv6 is no longer dropped there.
+- **The TUN device layer is `tun-rs`.** One cross-platform API replaces the
+  three audited Linux ioctls, so the crate has no production `unsafe` blocks
+  left. The measured Linux cost was about 0.6 % on the L3 screen arm, inside the
+  15 % materiality floor; the dependency remains covered by the audit/deny
+  gates.
+- **`transparent` now enables `carrier` and `noise`, not `multiplex`.** The
+  carrier choice, fallback and lane budget are their own data-plane feature;
+  `multiplex` includes it for the tunnel pool, but a transparent claim works
+  without yamux because its traffic is one connection per lane. `noise` is
+  explicit because the control channel is always Noise. Default builds are
+  unchanged (all three are in the default set); a custom build that named
+  `transparent` alone previously passed config validation and then refused
+  every claim at runtime.
+- **The benchmark harness is the top-level `bench/` uv project.** Its Python
+  lives under `bench/src/bench/`, dependencies are pinned by `bench/uv.lock`,
+  and one console script dispatches every command (`just bench <verb>`:
+  `run`, `list`, `doctor`, `report`, `gate`, `compare`, `selfcheck`, `plot`,
+  `peers`, `interop`, `udp-stress`, `l3`, `l3-census`, `mux`). The retired
+  historical stall reproduction (`mux/repro_e2e.py`) is gone; the useful
+  instruments remain under `bench/src/bench/utils/`.
+- **A tool adapter now starts every arm.** The subject (`molehill`), the
+  tool-free control and each peer (`frp`, `rathole`, `nps`) implement one
+  `ToolAdapter` contract (`bench/src/bench/targets/`), so a new reference tool
+  is an adapter plus a registry row rather than a branch in the runner. Peer
+  caching is configurable with `--peer-dir` (`~/tmp/bench-peers` by default).
+  The method fingerprint covers the method modules, the adapters and the
+  probes; it deliberately excludes the CLI, the plotter and the diagnostic
+  utilities.
+- **The bench project is gated by ruff (lint + format) and pyright.** The
+  configuration lives in `bench/pyproject.toml`; pyright runs in `standard`
+  mode at zero errors, and the adapter layer opts into per-file `strict`.
+  `just py-lint` and `just py-typecheck` are pre-commit gates, and Dependabot
+  tracks `/bench`'s uv dependencies.
+
+- **The v0.11.1 benchmark record is the next baseline.** The sweep ran on
+  2026-10-18 (90 samples, five arms, fingerprint `f246a9601305cc75`) and
+  `just bench gate` passed the absolute half without a baseline. The record is
+  `benches/records/results-bench-v0.11.1.json`; the README and its chart set
+  are refreshed from it. There is no cross-version performance claim: the
+  changed method makes the fingerprints incomparable with v0.11.0's.
+
+### Fixed
+
+- **The L3 stats line reports its offered/forwarded rates per second, not per
+  millisecond.** `MOLEHILL_L3_STATS=1` divided the sample delta by a
+  millisecond window, so the printed `offered_per_s` and `forwarded_per_s`
+  were 1000x low and integer truncation read zero below 1000 packets per
+  window. The forwarding path is unchanged; only the opt-in telemetry is.
+
 ## [0.11.0] - 2026-10-17
 
 ### Changed
@@ -364,7 +451,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   more than three times — the guarantee is measured, not intended. Details and
   the per-level table: `docs/configuration.md`, "What each level means".
 
-- **The benchmark gate now judges what it says it judges.** `just soak-check`
+- **The benchmark gate now judges what it says it judges.** `just bench-gate`
   compares a run against the previous release only when the two are comparable
   (the runs record their host, and a number from another host is context, not a
   baseline — the rule was documented but not enforced); the fd/RSS drift limits
@@ -372,9 +459,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every test type; the interactive error-rate limit compares percentage points
   rather than a ratio, which had turned a 0.03pp wobble into a "+13%" failure;
   and a reference peer's swing is reported with its numbers instead of blocking
-  this release. Anyone reading a `soak-check` verdict, or reproducing one, is
+  this release. Anyone reading a `bench-gate` verdict, or reproducing one, is
   affected; the reasoning each fix rests on is in HANDOFF.md.
-- **The gate checks the bulk spine per stage, not per run.** `just soak-check`
+- **The gate checks the bulk spine per stage, not per run.** `just bench-gate`
   used to ask only that a stage-scheduled run carry *some* throughput samples
   somewhere; a stage whose bulk probe never connected reported "complete"
   because the other stages had plenty. Completeness now counts each stage's
@@ -467,7 +554,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rate100` 0.1000 against 0.0935-0.1081. The reading rule follows the
   measurement rather than the class, so a cell whose sender can speak is read
   from the sender again, and the receiver's window is left for the cells that
-  still need it. `just soak-check --screen` also reports one verdict per metric
+  still need it. `just bench-compare` also reports one verdict per metric
   now (throughput *and* interactive p99) instead of choosing one for the run —
   which is how the two A/Bs below were read.
 
@@ -760,7 +847,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaced (197 s per tool in total, against 840 s of budget expiry). See
   `docs/benchmarks.md`, "The stage schedule".
 
-- **`just soak-check` compares the method, and refuses a cell the method
+- **`just bench-gate` compares the method, and refuses a cell the method
   cannot measure.** Two things the release gate stated too weakly:
 
   *Comparability was checked as one integer.* `workload_version` is a single
@@ -781,12 +868,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because netem holds each interval's bytes past that interval's own accounting
   window — the peak that remains is not a throughput measurement, and both the
   plot's tables and the README now print that share instead of a figure. The
-  per-stage bulk table is generated by `just soak-plot` for the first time, so
+  per-stage bulk table is generated by `just bench-plot` for the first time, so
   the README's bulk numbers and the tool cannot drift apart.
 
   *And the run now states its own noise.* The schedule measures `clean` at both
   ends of every timeline, so every run contains a replicate of one condition
-  about an hour apart. `just soak-check` reports that spread per tool — 18.83 to
+  about an hour apart. `just bench-gate` reports that spread per tool — 18.83 to
   20.48 Gbit/s for molehill, 0.4 % for frp — and it is the scale a between-tool
   difference has to clear. It is reported, never judged: variance is data, and
   a threshold on it would be invented. Applied to this release's numbers, the
@@ -854,7 +941,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`benches/scripts/bench/`, `assets/benchmark-*.png`,
   `results-v*.json`) are removed; its numbers remain in git history and in
   the v0.8.x release notes and are never a regression signal against this
-  model. Recipes: `just soak` / `soak-plot` / `soak-check` / `soak-peers`;
+  model. Recipes: `just bench` / `bench-plot` / `bench-gate` / `bench-peers`;
   the release review now requires `results-soak-vX.Y.Z.json` and
   `assets/soak-vX.Y.Z.png`.
 
@@ -1366,7 +1453,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes no forwarding path and no measurement code, so re-running the
   matrix would only re-measure the same build on a different day:
   `results-v0.8.1.json` and the charts are the v0.8.0 matrix unchanged, with
-  the provenance recorded in the results meta. `just bench-check` compares
+  the provenance recorded in the results meta. `just bench-gate` compares
   them against `results-v0.8.0.json` and reports no regression.
 
 - CI skips the code chain for a change limited to markdown, `docs/` or
@@ -1401,10 +1488,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1-stream) and +8% (8-stream) on the kcp4 arm, with the weak cells
   flat; the wire format is untouched (datagrams are byte-identical).
 
-- `just test-fast` and `just bench-fast`: a quick verification loop (lib +
-  core integration subset) and a ~2-minute molehill-only smoke matrix into
-  `results-dev.json`; the bench runner's default `--out` derives from
-  `Cargo.toml`'s version, so dev runs never merge into a release baseline.
+- `just test-fast` and `just bench --profile smoke`: a quick verification
+  loop (lib + core integration subset) and a ~2-minute molehill-only smoke
+  matrix into `results-dev.json`; the bench runner's default `--out` derives
+  from `Cargo.toml`'s version, so dev runs never merge into a release
+  baseline.
 
 - v0.8.0 benchmark re-baseline: `results-v0.8.0.json` and the README
   chapter/charts now describe the merged defaults (count=4, ring-
@@ -1456,7 +1544,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rathole (upstream) and bore across loopback and weak-network cells
   (rtt/loss via netem, with a userspace delay-proxy fallback when
   `CAP_NET_ADMIN` is unavailable), chart + table rendering (`just bench-plot`)
-  and a per-tag regression gate (`just bench-check`) required before tagging.
+  and a per-tag regression gate (`just bench-gate`) required before tagging.
 
 ### Changed
 

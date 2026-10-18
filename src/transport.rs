@@ -80,11 +80,12 @@ pub use tcp::TcpTransport;
 
 /// The data plane's carrier and the fallback that chooses it (KCP, else TCP).
 ///
-/// Multiplex-gated because the carrier is: KCP rides on the multiplexed data
-/// plane's runtime, and a build without it has exactly one carrier, TCP.
+/// `carrier` is independent of yamux: a transparent claim uses the carrier
+/// choice without ever multiplexing its traffic, so the type and policy are a
+/// feature of their own; `multiplex` includes them for the tunnel pool.
 pub mod health;
 
-#[cfg(feature = "multiplex")]
+#[cfg(feature = "carrier")]
 pub mod carrier;
 
 #[cfg(feature = "noise")]
@@ -136,7 +137,7 @@ pub(crate) mod pool;
 // guessing it from the telemetry text.
 #[cfg(feature = "multiplex")]
 #[doc(hidden)]
-pub use multiplex::{Carrier, PoolSnapshot, TunnelPool};
+pub use multiplex::{PoolSnapshot, TunnelPool};
 
 #[derive(Debug, Clone, Copy)]
 struct Keepalive {

@@ -1952,8 +1952,21 @@ async fn a_v3_hello_is_refused_on_its_own_connection() -> Result<()> {
     // No answer at all: the version this server does not serve is refused by
     // `read_hello`, which ends that connection.
     let mut reply = [0u8; 1];
-    let read = time::timeout(Duration::from_secs(10), conn.read(&mut reply)).await??;
-    assert_eq!(read, 0, "a v3 hello must be answered with nothing");
+    match time::timeout(Duration::from_secs(10), conn.read(&mut reply)).await? {
+        std::result::Result::Ok(0) => {}
+        // The prefix read refuses the dialect before consuming the rest of a
+        // 34-byte v3 hello; closing with those bytes unread makes the kernel
+        // answer with a reset, which is still "no protocol reply".
+        std::result::Result::Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        std::result::Result::Ok(n) => {
+            panic!("a v3 hello must be answered with nothing, got {n} bytes")
+        }
+        std::result::Result::Err(e) => return Err(e.into()),
+    }
 
     // The refusal was local: that same v4 session is still forwarding.
     wait_for_echo("127.0.0.1:2334", Type::Tcp).await?;
