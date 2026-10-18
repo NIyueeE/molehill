@@ -27,7 +27,7 @@ Why namespaces at all, rather than host loopback: the counters that make a byte
 ratio trustworthy (`/proc/net/dev` per interface, and the TCP MIB of the stack
 that owns each flow) only exist where the paths are *separate* interfaces, and
 per-arm isolation means two arms cannot share a port, a socket or a qdisc by
-accident. It costs root, which `bench.py doctor` checks and states.
+accident. It costs root, which `just bench doctor` checks and states.
 
 Nothing here configures the daemons: they attach to the devices this creates,
 exactly as an operator's would (`src/transparent/check.rs` verifies the parts
@@ -44,7 +44,7 @@ import sys
 import time
 from pathlib import Path
 
-import model
+from bench import model
 
 #: Namespaces and devices carry an `mhb` infix: the L3 acceptance harness's
 #: (`l3vis`, …) and the retired comparison instrument's (`l3cmpvis`, …) must not
@@ -182,7 +182,9 @@ def parse_qdisc(text: str) -> dict:
     return out
 
 
-def run(argv: list, timeout: float = 30.0, check: bool = True):
+def run(
+    argv: list[str], timeout: float = 30.0, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     """One short host command; raises with its own stderr in the message."""
     r = subprocess.run(
         argv, capture_output=True, text=True, timeout=timeout, check=False
@@ -297,10 +299,12 @@ class Topology:
 
     # --- helpers -----------------------------------------------------------
     @staticmethod
-    def ns_argv(ns: str, argv: list) -> list:
+    def ns_argv(ns: str, argv: list[str]) -> list[str]:
         return ["ip", "netns", "exec", ns, *argv]
 
-    def ns_run(self, ns: str, argv: list, timeout: float = 30.0, check: bool = True):
+    def ns_run(
+        self, ns: str, argv: list[str], timeout: float = 30.0, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
         return run(self.ns_argv(ns, argv), timeout=timeout, check=check)
 
     @staticmethod
@@ -683,7 +687,7 @@ class Topology:
         return out
 
 
-def service_config(arm: model.Arm, work: Path) -> dict:
+def service_config(arm: model.Arm, work: Path) -> dict[str, Path]:
     """The server and client TOML for one arm, as an operator would write them.
 
     Both architectures share the port numbers and the backend address *inside
@@ -727,7 +731,7 @@ tun = "{TUN_SRV}"
         # a second `[transparent.data]` header would be a duplicate key the
         # loader refuses (which is how every `pool_cap` arm broke silently when
         # the per-carrier tables were merged — hence the parse check in
-        # `bench.py selfcheck`).
+        # `just bench selfcheck`).
         cap = f"\ntunnels = {arm.pool_cap}" if arm.pool_cap else ""
         client = f"""[transparent]
 default_token = "bench"

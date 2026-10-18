@@ -21,7 +21,7 @@
 # need TUN, namespaces or root otherwise.
 #
 # Usage:
-#   bash benches/scripts/mux/gap_profile.sh [--tunnels N] [--seconds S] [--binary PATH]
+#   bash bench/src/bench/utils/mux/gap_profile.sh [--tunnels N] [--seconds S] [--binary PATH]
 #
 # Output: an iperf3 rate, then the top symbols per daemon under
 # $LOG (default /tmp/mux-gap). The daemons' own report is one-sided on purpose:
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/../../.." && pwd)"
+ROOT="$(cd "$HERE/../../../../.." && pwd)"
 
 TUNNELS=1
 SECONDS_TO_PROFILE=8

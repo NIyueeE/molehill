@@ -49,11 +49,11 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import analysis
 import matplotlib.pyplot as plt
-import model
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+
+from bench import analysis, model
 
 #: One house style, decided once: readability over decoration.
 DPI = 130
@@ -416,10 +416,8 @@ def udp_points(run: Run) -> list:
         for scenario in run.scenarios_of(model.Kind.UDP_LADDER)
         for cell in run.cells(scenario)
     ]
-    return sorted(
-        (point for point in points if point[2] is not None),
-        key=lambda point: point[2],
-    )
+    measured = [point for point in points if point[2] is not None]
+    return sorted(measured, key=lambda point: point[2] or 0.0)
 
 
 # --- figure plumbing --------------------------------------------------------
@@ -1342,7 +1340,7 @@ FIGURES = (
 def parse_args(argv) -> argparse.Namespace:
     """The command line: one results file in, PNGs (and tables) out."""
     parser = argparse.ArgumentParser(
-        prog="plot.py",
+        prog="bench plot",
         description="Render a bench results file's charts and tables.",
     )
     parser.add_argument("results", type=Path, help="the results file to render")
