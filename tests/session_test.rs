@@ -1,4 +1,4 @@
-//! Protocol v4 session tests: this file is the v4 **client half**, spoken by
+//! Protocol v5.1 session tests: this file is the v5.1 **client half**, spoken by
 //! hand over a raw `TcpStream` against the real in-process server.
 //!
 //! The crate's `protocol` module is private, so every frame below is mirrored
@@ -6,13 +6,13 @@
 //! contract, so a change to a variant index, a field order or a frame width has
 //! to be made twice. It covers the control plane (session auth, `Ack::SessionOk`
 //! with its declared cadence, N services on one connection, per-service
-//! rejection, `Deregister` releasing a port) and one *direct* v4 data channel,
+//! rejection, `Deregister` releasing a port) and one *direct* v5.1 data channel,
 //! whose service binding is the 4-byte prologue after the hello.
 //!
 //! The multiplexed tunnel's per-stream prologue is covered by the
 //! `tunnel_streams_route_by_their_prologue` unit test in `src/core/server.rs`:
 //! the yamux engine is crate-private, so an integration test cannot open a
-//! tunnel, and the real v4 client (its own commit) is what exercises that path
+//! tunnel, and the real client is what exercises that path
 //! end to end.
 //!
 //! Run serially (`--test-threads=1`): every scenario binds fixed ports. The
@@ -83,12 +83,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Plain transport selector (the first byte of every connection).
 const PLAIN_SELECTOR: u8 = 0x00;
-/// The dialect this build speaks. The session wire is what these tests pin,
-/// and it is version-independent within v5; taking the number from the crate
-/// keeps a future bump from leaving a copy behind.
+/// The dialect this build speaks. The session wire is what these tests pin;
+/// taking the version from the crate keeps a future bump from leaving a copy
+/// behind.
 use molehill_rathole::CURRENT_PROTO_VERSION as PROTO;
 
 type Digest = [u8; 32];
+/// The two raw version bytes, mirrored independently of the crate's type.
+type Version = (u8, u8);
+
+fn current_version() -> Version {
+    (PROTO.major, PROTO.minor)
+}
 
 // --- the wire contract, mirrored ------------------------------------------
 //
@@ -98,9 +104,9 @@ type Digest = [u8; 32];
 #[expect(clippy::enum_variant_names, reason = "the wire's variant names")]
 #[derive(Serialize, Deserialize, Debug)]
 enum Hello {
-    ControlChannelHello(u8, Digest),
-    DataChannelHello(u8, Digest),
-    DataChannelTunnelHello(u8, Digest),
+    ControlChannelHello(Version, Digest),
+    DataChannelHello(Version, Digest),
+    DataChannelTunnelHello(Version, Digest),
 }
 
 /// `Auth` is a newtype, so it goes on the wire as the bare digest.
@@ -128,12 +134,18 @@ enum Carrier {
 }
 
 #[derive(Serialize, Debug, Clone)]
+struct TransparentCapabilities {
+    vnet_frames: bool,
+}
+
+#[derive(Serialize, Debug, Clone)]
 struct ServiceRegistrationV4 {
     name: String,
     service_type: ServiceType,
     bind_addr: SocketAddr,
     carrier: Carrier,
     udp_buffer_size: u16,
+    transparent_capabilities: Option<TransparentCapabilities>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -267,16 +279,16 @@ async fn read_control_cmd(conn: &mut TcpStream) -> Result<ControlCmd> {
     }
 }
 
-/// Open a connection and complete the v4 hello exchange up to (but not
+/// Open a connection and complete the v5.1 hello exchange up to (but not
 /// including) the auth response; the nonce is the server's session identity.
 async fn open_session() -> Result<(TcpStream, Digest)> {
     let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
     conn.write_u8(PLAIN_SELECTOR).await?;
-    let hello = Hello::ControlChannelHello(PROTO, [0x42; 32]);
+    let hello = Hello::ControlChannelHello(current_version(), [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
 
-    let mut buf = [0u8; 34];
+    let mut buf = [0u8; 35];
     timeout(HANDSHAKE_TIMEOUT, conn.read_exact(&mut buf)).await??;
     let Hello::ControlChannelHello(version, nonce) =
         postcard::from_bytes::<Hello>(&buf).context("failed to parse the server hello")?
@@ -284,15 +296,16 @@ async fn open_session() -> Result<(TcpStream, Digest)> {
         bail!("the server answered a control hello with another hello variant");
     };
     assert_eq!(
-        version, PROTO,
+        version,
+        current_version(),
         "the server must answer in the dialect this build speaks"
     );
     Ok((conn, nonce))
 }
 
-// --- the v4 client ---------------------------------------------------------
+// --- the hand-written client -----------------------------------------------
 
-/// One v4 control session, as this test's client sees it.
+/// One v5.1 control session, as this test's client sees it.
 struct Session {
     conn: TcpStream,
     nonce: Digest,
@@ -334,6 +347,7 @@ impl Session {
             bind_addr: format!("0.0.0.0:{port}").parse()?,
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            transparent_capabilities: None,
         };
         let cmd = SessionCmd::Register(SessionRegistration {
             service_id: id.to_be_bytes(),
@@ -356,12 +370,12 @@ impl Session {
         write_frame(&mut self.conn, &postcard::to_stdvec(&cmd)?).await
     }
 
-    /// Open a *direct* v4 data channel for one service: the same 34-byte hello
-    /// as v3, then the 4-byte service prologue.
+    /// Open a *direct* data channel for one service: the 35-byte v5.1 hello,
+    /// then the 4-byte service prologue.
     async fn open_data_channel(&self, id: u32) -> Result<TcpStream> {
         let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
         conn.write_u8(PLAIN_SELECTOR).await?;
-        let hello = Hello::DataChannelHello(PROTO, self.nonce);
+        let hello = Hello::DataChannelHello(current_version(), self.nonce);
         conn.write_all(&postcard::to_stdvec(&hello)?).await?;
         conn.write_all(&id.to_be_bytes()).await?;
         conn.flush().await?;
@@ -463,18 +477,18 @@ async fn wait_for_free_port(port: u16) -> Result<()> {
 }
 
 /// The mirror is total over the contract, and the widths it fixes are pinned
-/// here: every hello variant is 34 bytes (the server reads that before it knows
-/// the version), every enum tag is one byte, and the failure ack the server
-/// sends outside the framed path is exactly one byte.
+/// here: every v5.1 hello variant is 35 bytes (tag + two version bytes +
+/// digest), every enum tag is one byte, and the failure ack the server sends
+/// outside the framed path is exactly one byte.
 #[test]
 fn the_wire_mirror_is_total() {
     let tag = [0u8; 32];
     for hello in [
-        Hello::ControlChannelHello(PROTO, tag),
-        Hello::DataChannelHello(PROTO, tag),
-        Hello::DataChannelTunnelHello(PROTO, tag),
+        Hello::ControlChannelHello(current_version(), tag),
+        Hello::DataChannelHello(current_version(), tag),
+        Hello::DataChannelTunnelHello(current_version(), tag),
     ] {
-        assert_eq!(postcard::to_stdvec(&hello).unwrap().len(), 34);
+        assert_eq!(postcard::to_stdvec(&hello).unwrap().len(), 35);
     }
     for carrier in [Carrier::Tcp, Carrier::Kcp] {
         assert_eq!(postcard::to_stdvec(&carrier).unwrap().len(), 1);
@@ -656,10 +670,10 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     // The hello exchange, by hand, on the striped fixture's port.
     let mut conn = TcpStream::connect(STRIPED_CONTROL).await?;
     conn.write_u8(PLAIN_SELECTOR).await?;
-    let hello = Hello::ControlChannelHello(PROTO, [0x42; 32]);
+    let hello = Hello::ControlChannelHello(current_version(), [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
-    let mut buf = [0u8; 34];
+    let mut buf = [0u8; 35];
     timeout(HANDSHAKE_TIMEOUT, conn.read_exact(&mut buf)).await??;
     let Hello::ControlChannelHello(version, nonce) =
         postcard::from_bytes::<Hello>(&buf).context("failed to parse the server hello")?
@@ -667,7 +681,8 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
         bail!("the server answered a control hello with another hello variant");
     };
     assert_eq!(
-        version, PROTO,
+        version,
+        current_version(),
         "the server speaks the dialect this build was compiled with"
     );
 
@@ -687,6 +702,7 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
             bind_addr: format!("0.0.0.0:{STRIPED_EXPOSED}").parse()?,
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            transparent_capabilities: None,
         },
     });
     write_frame(&mut conn, &postcard::to_stdvec(&cmd)?).await?;

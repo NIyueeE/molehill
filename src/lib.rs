@@ -21,7 +21,7 @@ mod protocol;
 #[cfg(feature = "client")]
 mod status;
 mod stripe;
-#[cfg(all(feature = "transparent", target_os = "linux"))]
+#[cfg(mh_l3)]
 mod transparent;
 mod transport;
 
@@ -51,6 +51,9 @@ pub use core::control_sessions_accepted;
 #[doc(hidden)]
 pub use protocol::CURRENT_PROTO_VERSION;
 
+#[cfg(feature = "carrier")]
+#[doc(hidden)]
+pub use transport::carrier::Carrier;
 /// The client's pinned tunnel pool, re-exported for the integration suite:
 /// the pool's own state is what the pool tests assert on, instead of parsing
 /// the telemetry text (see `tests/integration_test.rs`).
@@ -59,7 +62,7 @@ pub use protocol::CURRENT_PROTO_VERSION;
 pub use transport::multiplex::live_pools;
 #[cfg(feature = "multiplex")]
 #[doc(hidden)]
-pub use transport::{Carrier, PoolSnapshot, TunnelPool};
+pub use transport::{PoolSnapshot, TunnelPool};
 
 use crate::config::{ConfigChange, ConfigWatcherHandle};
 
@@ -349,7 +352,7 @@ fn undetermined_reason(config: &Config) -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "client", feature = "server"))]
 mod tests {
     use super::*;
     use crate::config::transparent::TransparentClientConfig;
@@ -424,5 +427,27 @@ mod tests {
 
             assert_eq!(determine_run_mode(&config, &args), run_mode);
         }
+    }
+
+    #[test]
+    fn an_undetermined_mode_names_the_blocks_the_file_carries() {
+        let empty = Config {
+            server: None,
+            client: None,
+            transparent: None,
+        };
+        let message = undetermined_reason(&empty);
+        assert!(message.contains("none of"), "{message}");
+
+        let two = Config {
+            server: Some(ServerConfig::default()),
+            client: Some(ClientConfig::default()),
+            transparent: Some(TransparentClientConfig::default()),
+        };
+        let message = undetermined_reason(&two);
+        assert!(message.contains("`[server]`"), "{message}");
+        assert!(message.contains("`[client]`"), "{message}");
+        assert!(message.contains("`[transparent]`"), "{message}");
+        assert!(message.contains("second process"), "{message}");
     }
 }

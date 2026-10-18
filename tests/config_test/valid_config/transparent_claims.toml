@@ -1,4 +1,4 @@
-# requires: transparent
+# requires: transparent-client
 
 # Every per-claim override a claim has, plus the L3 transport table's keys:
 # `proxy` for the path to the server, and the Noise key pair the control

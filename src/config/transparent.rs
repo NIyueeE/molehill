@@ -20,14 +20,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use url::Url;
 
-#[cfg(feature = "multiplex")]
 use crate::common::constants::DEFAULT_CLAIM_LANES;
+#[cfg(feature = "multiplex")]
+use crate::config::parsing::ClientDataConfig;
 use crate::config::parsing::{
     ClientConfig, ClientControlConfig, ClientServiceConfig, ClientServiceTransportConfig,
     MaskedString, NoiseConfig, ServiceType, TransportConfig, TransportType, default_tun_name,
 };
-#[cfg(feature = "multiplex")]
-use crate::config::parsing::{ClientDataConfig, DataCarrierLimits};
 
 /// `[transparent]`: the whole configuration of an L3 client.
 ///
@@ -39,13 +38,14 @@ use crate::config::parsing::{ClientDataConfig, DataCarrierLimits};
 pub struct TransparentClientConfig {
     /// Shared secret, must match `[server].default_token`. Required.
     pub default_token: MaskedString,
-    /// The TUN device this client attaches to; the device, its addresses and
-    /// its routes are the operator's, as on the forwarding side.
+    /// The TUN device this client attaches to. On Linux the operator creates
+    /// it and owns its addresses and routes. On macOS the daemon creates the
+    /// utun and assigns the claimed addresses, while the operator owns the pf
+    /// rule and routes. `auto` (the macOS default) picks a free `utunN`.
     #[serde(default = "default_tun_name")]
     pub tun: String,
     #[serde(default)]
     pub control: ClientControlConfig,
-    #[cfg(feature = "multiplex")]
     #[serde(default)]
     pub data: TransparentDataConfig,
     #[serde(default)]
@@ -67,7 +67,8 @@ pub struct TransparentClientConfig {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentClaimConfig {
-    /// The public address this client **claims**, e.g. `"10.99.0.1:8443"`.
+    /// The public address this client **claims**, e.g. `"10.99.0.1:8443"` or
+    /// `"[2001:db8::1]:8443"`.
     /// Required. The server binds nothing for it; its port must still be
     /// covered by the server's `allow_ports`, because a claim is a
     /// registration like any other.
@@ -82,7 +83,6 @@ pub struct TransparentClaimConfig {
     /// Override `[transparent.control].default_retry_interval` for this claim.
     pub retry_interval: Option<u64>,
     /// Override `[transparent.data].tunnels` for this claim only: its lanes.
-    #[cfg(feature = "multiplex")]
     pub tunnels: Option<u16>,
 }
 
@@ -101,7 +101,6 @@ pub struct TransparentClaimConfig {
 /// carrier connections this client holds for all of its claims together, shared
 /// out by [`TransparentClientConfig::claim_lanes`]. One lane is one connection,
 /// and every claim always has at least one.
-#[cfg(feature = "multiplex")]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentDataConfig {
@@ -110,7 +109,7 @@ pub struct TransparentDataConfig {
     pub default_data_addr: Option<String>,
     /// The **lane budget**: how many carrier connections this client's claims
     /// hold together, divided equally among them. Unset means
-    /// [`DEFAULT_CLAIM_LANES`] per claim (four, the measured knee of the
+    /// [`DEFAULT_CLAIM_LANES`] per claim (two, the measured knee of the
     /// throughput curve — see that constant for the numbers and the cost); a
     /// value below the claim count is refused.
     ///
@@ -134,7 +133,6 @@ pub struct TransparentDataConfig {
 
 /// The default of `[transparent.data].lend`, spelled out because `serde`'s
 /// `Default` for a `bool` is `false` and this key's default is `true`.
-#[cfg(feature = "multiplex")]
 const fn lend_by_default() -> bool {
     true
 }
@@ -142,7 +140,6 @@ const fn lend_by_default() -> bool {
 /// Written out rather than derived: `bool`'s own default is `false`, so a
 /// derived one would turn lending *off* for every config that omits the table
 /// — the opposite of the key's documented default, and invisible in the schema.
-#[cfg(feature = "multiplex")]
 impl Default for TransparentDataConfig {
     fn default() -> Self {
         Self {
@@ -185,7 +182,6 @@ pub struct TransparentTransportConfig {
     pub noise: Option<NoiseConfig>,
 }
 
-#[cfg(feature = "multiplex")]
 impl TransparentClientConfig {
     /// How many claims share the lane budget.
     pub(crate) fn claims(&self) -> usize {
@@ -194,10 +190,7 @@ impl TransparentClientConfig {
 
     /// The lane budget as the operator wrote it, or `None`.
     pub(crate) fn written_budget(&self) -> Option<usize> {
-        DataCarrierLimits {
-            tunnels: self.data.tunnels,
-        }
-        .written()
+        self.data.tunnels.map(usize::from)
     }
 
     /// The lane budget: what the operator wrote, else
@@ -290,18 +283,14 @@ impl TransparentClientConfig {
                     transport_type: Some(lane_transport.transport_type),
                     noise: lane_transport.noise.clone(),
                 });
-                #[cfg(feature = "multiplex")]
-                {
-                    // The claim's lane count, resolved here so the engine has one
-                    // number to read: an equal share of the lane budget, never
-                    // below the one connection every claim has. A claim's own
-                    // `tunnels` does not divide the budget — the budget belongs to
-                    // the client — so it is a refusal when written on a claim, and
-                    // the schema is where that is said.
-                    service.transparent_lanes =
-                        u16::try_from(self.claim_lanes()).unwrap_or(u16::MAX);
-                    service.transparent_lend = self.data.lend;
-                }
+                // The claim's lane count, resolved here so the engine has one
+                // number to read: an equal share of the lane budget, never
+                // below the one connection every claim has. A claim's own
+                // `tunnels` does not divide the budget — the budget belongs to
+                // the client — so it is a refusal when written on a claim, and
+                // the schema is where that is said.
+                service.transparent_lanes = u16::try_from(self.claim_lanes()).unwrap_or(u16::MAX);
+                service.transparent_lend = self.data.lend;
                 (name.clone(), service)
             })
             .collect();
@@ -339,18 +328,16 @@ impl TransparentClientConfig {
     }
 }
 
-#[cfg(all(test, feature = "transparent", target_os = "linux"))]
+#[cfg(all(test, mh_l3_client))]
 mod tests {
     #![expect(
         clippy::unwrap_used,
         reason = "tests unwrap values they just constructed"
     )]
-    #[cfg(feature = "multiplex")]
+    use super::TransparentClientConfig;
     use crate::common::constants::DEFAULT_CLAIM_LANES;
     use crate::config::parsing::Config;
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     use crate::config::parsing::{ServiceType, TransportType};
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     use url::Url;
 
     /// The lowering is the whole of the model difference, so it is pinned key
@@ -360,7 +347,6 @@ mod tests {
     /// (its keys are this table's), the lanes are plain by default — the
     /// visitor's TLS is the end-to-end protection — and the resolved pair
     /// travels per service so the engine's overlay dials each with its own.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_lowers_to_a_transparent_service() {
         let config = Config::from_str(
@@ -422,15 +408,10 @@ token = "claim-token"
         );
     }
 
-    /// A claim's lanes are an equal share of its lane budget: one each
-    /// when the key is unwritten (the shape a claim had before the budget), and
-    /// the written budget divided among the claims that draw on that carrier.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     /// `type = "noise"` on the lanes: the table's keys are the control
     /// channel's and the lanes' at once (one pair per host), and the per-service
     /// overlay carries the resolved pair so a lane dials Noise without the
     /// engine knowing this model exists.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn noise_lanes_inherit_the_table_keys() {
         let config = Config::from_str(
@@ -466,7 +447,9 @@ remote_bind_addr = "10.99.0.1:8443"
         assert_eq!(lanes.noise.clone(), client.transport.noise.clone());
     }
 
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
+    /// A claim's lanes are an equal share of its lane budget: two each when
+    /// the key is unwritten, and the written budget divided among the claims
+    /// that draw on that carrier.
     #[test]
     fn a_claims_lanes_are_an_equal_share_of_the_carriers_budget() {
         let lanes = |budget: &str, claims: &str| {
@@ -543,7 +526,6 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
     /// Lending is on unless the client says otherwise, and the switch reaches
     /// the claim the runtime reads it from.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
         let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
@@ -570,7 +552,6 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
     /// A budget below the claim count is refused with the number to write: a
     /// claim's lane is a connection of its own, so some claim would otherwise
     /// have no carrier at all.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_lane_budget_below_the_claim_count_is_refused() {
         let err = format!(
@@ -610,7 +591,6 @@ remote_bind_addr = "10.99.0.1:2222"
     /// The `[transparent.control]` block is where the server is named, so a
     /// block without one is refused — and the message names the block the
     /// reader actually wrote, not `[client.control]`.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_needs_a_server_to_dial() {
         let err = Config::from_str(
@@ -636,7 +616,6 @@ remote_bind_addr = "10.99.0.1:8443"
 
     /// An L3 client has claims and nothing else: a forwarding key has no home
     /// in the model, and the parse says so rather than ignoring it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_claim_has_no_home_for_forwarding_keys() {
         let err = Config::from_str(
@@ -663,25 +642,20 @@ local_addr = "127.0.0.1:8080"
             "a key the model has no home for must be an unknown field, got: {message}"
         );
     }
-}
-
-#[cfg(all(
-    test,
-    feature = "multiplex",
-    feature = "transparent",
-    target_os = "linux"
-))]
-mod data_tests {
-    #![expect(
-        clippy::unwrap_used,
-        reason = "tests unwrap values they just constructed"
-    )]
-    use crate::config::parsing::Config;
 
     /// A claim never multiplexes: its data channels are carrier connections of
     /// its own, which is what `ClientServiceConfig::uses_pool` derives from the
     /// service type — the shape is a property of the model, not a key.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
+    /// A block that never went through `Config::from_str` has no lowering;
+    /// the runtime reads `client_config()` and must get a named error rather
+    /// than an empty client.
+    #[test]
+    fn an_unvalidated_block_has_no_lowered_client() {
+        let block = TransparentClientConfig::default();
+        let err = block.client_config().unwrap_err();
+        assert!(format!("{err:#}").contains("not validated"), "{err:#}");
+    }
+
     #[test]
     fn a_claim_never_multiplexes() {
         let config = Config::from_str(
@@ -708,7 +682,6 @@ remote_bind_addr = "10.99.0.1:8443"
     /// connections of its own and `tunnels` is a budget rather than a width.
     /// The carrier is not a key anywhere, which is what this pins: a claim over
     /// KCP is what the runtime chooses when the path carries it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
     #[test]
     fn a_kcp_carrier_is_not_a_key_a_claim_can_write() {
         let config = r#"
@@ -750,129 +723,6 @@ remote_bind_addr = "10.99.0.1:8443"
         assert!(
             message.contains("default_carrier"),
             "the refusal must name the key the reader wrote, got: {message}"
-        );
-    }
-
-    /// Lending is on unless the client says otherwise, and the switch reaches
-    /// the claim the runtime reads it from.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
-    #[test]
-    fn lending_is_on_unless_the_client_turns_it_off() {
-        let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
-                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n\
-                    [transparent.transport.noise]\n\
-                    remote_public_key = \"{TEST_CLIENT_REMOTE_PUBLIC}\"\n\n";
-        let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
-
-        let on = Config::from_str(&format!("{base}{claim}")).unwrap();
-        let service = on.into_l3_client().unwrap().client.unwrap().services["web"].clone();
-        assert!(service.transparent_lend);
-
-        let off = Config::from_str(&format!(
-            "{base}[transparent.data]\nlend = false\n\n{claim}"
-        ))
-        .unwrap();
-        let service = off.into_l3_client().unwrap().client.unwrap().services["web"].clone();
-        assert!(
-            !service.transparent_lend,
-            "an operator who turns lending off gets the equal split held static"
-        );
-    }
-
-    /// A budget below the claim count is refused with the number to write: a
-    /// claim's lane is a connection of its own, so some claim would otherwise
-    /// have no carrier at all.
-    #[cfg(all(feature = "multiplex", feature = "transparent", target_os = "linux"))]
-    #[test]
-    fn a_lane_budget_below_the_claim_count_is_refused() {
-        let err = format!(
-            "{:#}",
-            Config::from_str(
-                r#"
-[transparent]
-default_token = "t"
-tun = "l3test0"
-
-[transparent.control]
-default_remote_addr = "example.com:2333"
-
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
-
-[transparent.data]
-tunnels = 1
-
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-
-[transparent.claims.ssh]
-remote_bind_addr = "10.99.0.1:2222"
-"#
-            )
-            .unwrap_err()
-        );
-        assert!(
-            err.contains("`[transparent.data].tunnels = 1`")
-                && err.contains("`[transparent.data].tunnels = 2`")
-                && err.contains("2 claim(s)"),
-            "the refusal must name the key, the count and the count to write: {err}"
-        );
-    }
-
-    /// The `[transparent.control]` block is where the server is named, so a
-    /// block without one is refused — and the message names the block the
-    /// reader actually wrote, not `[client.control]`.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
-    #[test]
-    fn a_claim_needs_a_server_to_dial() {
-        let err = Config::from_str(
-            r#"
-[transparent]
-default_token = "t"
-
-[transparent.transport.noise]
-remote_public_key = "{TEST_CLIENT_REMOTE_PUBLIC}"
-
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-"#,
-        )
-        .unwrap_err();
-
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("[transparent.control].default_remote_addr"),
-            "the refusal must name the block the reader wrote, got: {message}"
-        );
-    }
-
-    /// An L3 client has claims and nothing else: a forwarding key has no home
-    /// in the model, and the parse says so rather than ignoring it.
-    #[cfg(all(feature = "transparent", target_os = "linux"))]
-    #[test]
-    fn a_claim_has_no_home_for_forwarding_keys() {
-        let err = Config::from_str(
-            r#"
-[transparent]
-default_token = "t"
-
-[transparent.control]
-default_remote_addr = "example.com:2333"
-
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
-
-[transparent.claims.web]
-remote_bind_addr = "10.99.0.1:8443"
-local_addr = "127.0.0.1:8080"
-"#,
-        )
-        .unwrap_err();
-
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("unknown field `local_addr`"),
-            "a key the model has no home for must be an unknown field, got: {message}"
         );
     }
 }

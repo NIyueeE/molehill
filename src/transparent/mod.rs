@@ -1,11 +1,13 @@
 //! Transparent (L3) services: the client owns the public `ip:port`.
 //!
 //! A transparent service is never bound by the server. The claimed address is
-//! carried by the **client's** TUN device — the operator's own routing moves
-//! traffic in and out, this module never installs a route or a netfilter rule
-//! — so the visitor's packets reach the client's kernel *as packets*: the
-//! backend sees the visitor's real address, TCP keeps its end-to-end
-//! semantics, and the server holds no connection state for the flow.
+//! carried by the **client's** TUN device, and the visitor's packets reach the
+//! client's kernel *as packets*: the backend sees the visitor's real address,
+//! TCP keeps its end-to-end semantics, and the server holds no connection
+//! state for the flow. This module installs no route, rule or firewall rule on
+//! any platform: Linux attaches to the operator's persistent device, while
+//! macOS and Windows create the ephemeral device and leave the routes to the
+//! operator.
 //!
 //! Both ends share the same two primitives:
 //!
@@ -14,21 +16,46 @@
 //! - [`EndpointTable`] decides which packet belongs to which service — a
 //!   router on the server, an allow-list on the client.
 //!
-//! Linux only, because the data path is a TUN device.
+//! Linux and macOS run both ends; Windows can serve a transparent client but
+//! cannot be one (its stack has no source-address policy routing). The local
+//! frame shape is `Vnet` on a Linux device with segmentation offload and `Ip`
+//! everywhere else; the server negotiates one shape for the claim, and
+//! [`frame`] converts at a Linux boundary when the pair is mixed.
 
 pub mod check;
 pub mod flow;
+pub mod frame;
 pub mod hub;
 pub mod ip;
+#[cfg(mh_l3_client)]
 pub mod lanes;
 pub mod tun;
 
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::transparent::ip::{PacketInfo, ParseError, TCP, UDP};
+
+/// `MOLEHILL_L3_WIRE=ip` forces the plain-IP wire on either end, which is how
+/// the Linux acceptance harness exercises the mixed-format conversion without a
+/// macOS or Windows host. Any other value leaves the negotiated format alone.
+pub fn force_ip_wire() -> bool {
+    static FORCE: LazyLock<bool> = LazyLock::new(|| match std::env::var("MOLEHILL_L3_WIRE") {
+        Ok(value) if value.eq_ignore_ascii_case("ip") => true,
+        Ok(value) if value.eq_ignore_ascii_case("vnet") || value.eq_ignore_ascii_case("auto") => {
+            false
+        }
+        Ok(value) => {
+            tracing::debug!("Ignoring MOLEHILL_L3_WIRE={value:?}: use `ip`, `vnet` or `auto`");
+            false
+        }
+        Err(_) => false,
+    });
+    *FORCE
+}
 
 /// Which end of a packet a routing table keys on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -56,7 +83,10 @@ impl Endpoint {
 
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.ip, self.port)
+        match self.ip {
+            IpAddr::V4(ip) => write!(f, "{ip}:{}", self.port),
+            IpAddr::V6(ip) => write!(f, "[{ip}]:{}", self.port),
+        }
     }
 }
 
@@ -219,8 +249,8 @@ impl<V> EndpointTable<V> {
 /// misdirected packet is not an operator's problem, a stream of them is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropReason {
-    /// The header is not IPv4 (IPv6 is not carried yet).
-    NotIpv4,
+    /// The version nibble is neither IPv4 nor IPv6.
+    NotIp,
     /// Too short, or a header length that runs past the packet.
     Malformed,
     /// Well formed, but no registered endpoint claims its destination.
@@ -230,7 +260,7 @@ pub enum DropReason {
 impl From<ParseError> for DropReason {
     fn from(e: ParseError) -> Self {
         match e {
-            ParseError::NotIpv4 => Self::NotIpv4,
+            ParseError::NotIp => Self::NotIp,
             ParseError::Malformed => Self::Malformed,
         }
     }
@@ -240,7 +270,8 @@ impl From<ParseError> for DropReason {
 #[derive(Default)]
 pub struct Stats {
     pub forwarded: AtomicU64,
-    pub dropped_not_ipv4: AtomicU64,
+    /// Packets whose version is neither 4 nor 6.
+    pub dropped_not_ip: AtomicU64,
     pub dropped_malformed: AtomicU64,
     pub dropped_unclaimed: AtomicU64,
     /// Packets whose channel was gone (reconnect window): UDP semantics, the
@@ -315,10 +346,22 @@ fn unix_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// A count's per-second rate from a millisecond window.
+///
+/// The rate is scaled *before* the division; `u128` keeps a large delta from
+/// overflowing, and the conversion saturates rather than wrapping. The
+/// previous form divided by milliseconds and therefore under-reported by
+/// 1000x — and, with integer truncation, reported zero below 1000 packets
+/// per window.
+fn per_second(delta: u64, elapsed_ms: u64) -> u64 {
+    let rate = u128::from(delta).saturating_mul(1_000) / u128::from(elapsed_ms.max(1));
+    u64::try_from(rate).unwrap_or(u64::MAX)
+}
+
 impl Stats {
     pub fn count_drop(&self, reason: DropReason) {
         let counter = match reason {
-            DropReason::NotIpv4 => &self.dropped_not_ipv4,
+            DropReason::NotIp => &self.dropped_not_ip,
             DropReason::Malformed => &self.dropped_malformed,
             DropReason::Unclaimed => &self.dropped_unclaimed,
         };
@@ -373,7 +416,12 @@ impl Stats {
     /// run's average — the very number this replaces — and assuming a one-second
     /// window makes the rate drift with the reporter.
     pub fn sample_rates(&self) {
-        let now = unix_ms();
+        self.sample_rates_at(unix_ms());
+    }
+
+    /// The clock-taking half of [`Self::sample_rates`]: separated so tests
+    /// can measure an exact window instead of sleeping on the wall clock.
+    fn sample_rates_at(&self, now: u64) {
         let prev = self.rate_at_ms.swap(now, Ordering::Relaxed);
         let offered = self.device_offered.load(Ordering::Relaxed);
         let forwarded = self.forwarded.load(Ordering::Relaxed);
@@ -387,13 +435,13 @@ impl Stats {
             self.forwarded_rate.store(0, Ordering::Relaxed);
             return;
         }
-        let elapsed = now.saturating_sub(prev).max(1);
+        let elapsed = now.saturating_sub(prev);
         self.device_offered_rate.store(
-            offered.saturating_sub(was_offered) / elapsed,
+            per_second(offered.saturating_sub(was_offered), elapsed),
             Ordering::Relaxed,
         );
         self.forwarded_rate.store(
-            forwarded.saturating_sub(was_forwarded) / elapsed,
+            per_second(forwarded.saturating_sub(was_forwarded), elapsed),
             Ordering::Relaxed,
         );
     }
@@ -466,6 +514,12 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_endpoint_is_bracketed_in_logs() {
+        let endpoint = Endpoint::new("2001:db8::1".parse().unwrap(), 8443);
+        assert_eq!(endpoint.to_string(), "[2001:db8::1]:8443");
+    }
+
+    #[test]
     fn a_port_carrying_packet_routes_by_ip_and_port() {
         let mut table = EndpointTable::new();
         table.insert(Endpoint::new("10.99.0.1".parse().unwrap(), 443), "web");
@@ -529,46 +583,43 @@ mod tests {
         assert_eq!(table.lookup(&info("10.99.0.1", None, 1)), Some(&2));
     }
 
-    /// The rate is a *delta* against the previous sample, and the first sample
-    /// only sets the baseline. Both are what make it a per-second reading
-    /// instead of the run's average — the difference that lets a five-second
-    /// starvation be seen inside a ten-minute run.
+    /// The rate is a *per-second* delta against the previous sample, and the
+    /// first sample only sets the baseline. The clock is injected so the
+    /// window is exact: a test that slept for a second could not tell a
+    /// per-millisecond division from a per-second one.
     #[test]
-    fn a_rate_is_the_delta_since_the_last_sample() {
+    fn a_rate_is_a_per_second_delta_since_the_last_sample() {
         let stats = Stats::default();
 
         stats.count_device_offered_by(10);
-        stats.sample_rates();
+        stats.sample_rates_at(1_000);
         // Nothing to measure yet: the first sample is a baseline, not a rate.
         assert_eq!(stats.device_offered_rate.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.rate_offered_was.load(Ordering::Relaxed), 10);
 
-        // A second that offered 40 more packets, of which 30 more were
-        // forwarded.
+        // One second in which 40 more packets were offered and 30 forwarded.
         stats.count_device_offered_by(40);
         stats.count_forwarded_by(30);
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-        stats.sample_rates();
-        let offered = stats.device_offered_rate.load(Ordering::Relaxed);
-        let forwarded = stats.forwarded_rate.load(Ordering::Relaxed);
-        // The window is real time, so the rate is a rate only because the
-        // sampler divided by the window it measured. What the test can assert
-        // without a fake clock is that it is *strictly less* than the running
-        // total (50 offered, 40 forwarded) — which is the property a
-        // counter-divided-by-elapsed-time would fail, because that reading grows
-        // with the run instead of with the second.
-        assert!(
-            offered < 50,
-            "a rate of {offered} is the running total, not a delta"
+        stats.sample_rates_at(2_000);
+        assert_eq!(
+            stats.device_offered_rate.load(Ordering::Relaxed),
+            40,
+            "40 packets in one second is 40/s, not 40 per millisecond"
         );
-        assert!(
-            forwarded < 40,
-            "a rate of {forwarded} is the running total, not a delta"
-        );
-        // And the baseline the next sample divides against has moved on, so the
-        // same total is never reported twice.
+        assert_eq!(stats.forwarded_rate.load(Ordering::Relaxed), 30);
+        assert_eq!(stats.rate_offered_was.load(Ordering::Relaxed), 50);
+
+        // A half-second window scales the delta up, and an empty window reads
+        // zero: both prove the sample uses the measured elapsed time rather
+        // than assuming one second.
+        stats.count_device_offered_by(20);
+        stats.sample_rates_at(2_500);
+        assert_eq!(stats.device_offered_rate.load(Ordering::Relaxed), 40);
+        stats.sample_rates_at(3_500);
+        assert_eq!(stats.device_offered_rate.load(Ordering::Relaxed), 0);
         assert_eq!(
             stats.rate_offered_was.load(Ordering::Relaxed),
-            50,
+            70,
             "the baseline must be the counter as it stands now"
         );
     }
