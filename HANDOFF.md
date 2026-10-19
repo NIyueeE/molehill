@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-18.** **v0.11.1 is released: the tag names `4874f05`,
+> **State as of 2026-10-19.** **v0.11.1 is released: the tag names `4874f05`,
 > the `main` tip at tag time; `main` carries `version = "0.11.1"`.** v0.11.1 moves the wire to
 > **protocol v5.1** (a deliberate v5.0 break), makes transparent (L3)
 > services cross-platform through `tun-rs` — Linux/macOS clients and servers,
@@ -14,6 +14,10 @@
 > 2026-10-18 (90 samples; `just bench gate` passed without a baseline); its
 > record is `benches/records/results-bench-v0.11.1.json` and it becomes the
 > next baseline.
+>
+> **v0.11.2 development is open on `feat/v0.11.2`:** the branch's manifest
+> carries `version = "0.11.2"`; `main` stays at the released 0.11.1 until the
+> cycle merges.
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -96,9 +100,11 @@
 - **The repository state**: v0.11.1 is released and the tag names `4874f05`,
   the `main` tip at tag time; `main` carries `version = "0.11.1"`;
   `CHANGELOG.md` keeps the dated `## [0.11.1] - 2026-10-17` section and an empty
-  `[Unreleased]`. `v0.11.0` names `f3295e8`. Only `main` remains on the remote;
-  the non-`main` branches (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and
-  the four local `backup/*`) were retired on 2026-10-19. The measured v0.11.1
+  `[Unreleased]`. `v0.11.0` names `f3295e8`. `feat/v0.11.2` is the open
+  development branch and carries `version = "0.11.2"`; `main` keeps the
+  released 0.11.1 until the cycle merges. The previous cycle's branches
+  (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and the four local
+  `backup/*`) were retired on 2026-10-19. The measured v0.11.1
   revision is `0b56438`, recorded here and in the results file's
   `meta.provenance`; the tag review's drift check applies wherever that commit
   is reachable, so for this record a fresh clone prints a note instead of the
@@ -125,6 +131,55 @@
 
 ## Open threads for the next cycle
 
+- **Decision (2026-10-19): one top-level tunnel pool in both modes; the
+  per-service/per-claim model is rejected, not renamed.** There is exactly one
+  tunnel pool per control session (one per data endpoint), and every service
+  draws its channels from it; `[client.services.<name>].tunnels` is removed.
+  The same shape holds for L3: `[transparent.data].tunnels` is the client's one
+  carrier-connection budget, and `[transparent.claims.*].tunnels` is removed —
+  that key is a dead field today (the parser accepts it, the lowering never
+  reads it; verified 2026-10-19 with a budget of 4 and two claims writing 8 and
+  6: the client started and ran on 2 lanes each). The current per-service
+  implementation is wrong; 0.11.2 replaces it with the model below.
+  - **Defaults are the measured optima, not the cheapest value.**
+    - **L4: `tunnels = 4`** — the shipped knee, and now the *total* width of
+      one pool rather than four per service: yamux spreads streams over it (up
+      to 56 per tunnel), and the 0.10 A/B found 8 does not move a mixed
+      workload's throughput while costing 42-61 % of interactive p99 at 15+
+      streams. One pool serves about 224 concurrent streams; a deployment
+      above that raises the one key.
+    - **L3: `tunnels = 2 × claims`** — the measured knee (1 lane 2.351 Gbit/s,
+      2 lanes 3.283, 4 lanes 5.191 but p99 271 ms from three streams). Two per
+      claim also leaves the spare lane `lend` needs: at one per claim the
+      allocator can never lend, because a donor must have more than its last
+      lane. The public `DEFAULT_CLAIM_LANES` goes; the derivation lives
+      privately in the L3 module.
+    - An explicit `tunnels` is always the **total**: L4 clamps to `1..=64`; L3
+      must cover the claim count and is capped at 1024, with integer division
+      leaving the remainder unallocated (write a multiple of the claim count).
+  - `[client.data].shared_pool` stops being a switch: one pool is the only
+    shape, so the key is removed (or kept as a no-op for one release — to be
+    decided).
+  - The proposed `default_tunnels` name no longer describes the key. With no
+    per-service inheritance it is the pool's width, not a default; the final
+    name is open (`tunnels` today).
+  - The UDP-derived floor becomes the deepest demand across every UDP service
+    that draws on the pool, and validation and runtime must read the same
+    source; the first-service-width defect below disappears with the model.
+  - Per-service `remote_addr` and `transport` still fragment the L4 pool today
+    (the key is session + data endpoint, and the transport is the first
+    service's), so the model needs a rule for them: refuse the override, or
+    move both to the client-wide block. L3's per-claim `remote_addr` is fine —
+    there is no shared pool, only a total count.
+  - Pinned vs elastic stays open. "On-demand" today means channel placement on
+    a pinned pool; the 0.10 elastic pool (grow on load, shrink on idle) was
+    replaced in 0.11 for capacity predictability (CHANGELOG, "The tunnel pool
+    is pinned"). If 0.11.2 also restores growth, that is a second decision.
+  - The 0.10 measurement (shared p99 8.15 ms against per-service 5.00 at 19/20
+    steps) is why the per-service default shipped. This decision overrides it,
+    and the single-pool model needs its own measurement before any claim; `4`
+    and `2 × claims` are the best-evidenced defaults until that sweep.
+  No code change yet: this entry is the decision record for the branch.
 - **Operator decision (2026-10-19): the production pair stays on forwarding
   (L4) until L3 is stable; L3 remains the target.** The maintainer's own
   deployment (ssh/http/https, Minecraft UDP, Mumble TCP+UDP) keeps the
@@ -162,7 +217,9 @@
   refusal, the `githooks/check-docs` removed-key table, both language pages, an
   invalid-config test and an `[Unreleased]` entry). A rename leaves the
   per-service `tunnels` and `[transparent.data].tunnels` (a lane budget) alone.
-  No decision yet; not a release blocker.
+  Superseded (2026-10-19) by the one-pool decision above: with no per-service
+  inheritance the key is the pool's width, not a default, so `default_tunnels`
+  no longer describes it. The final name is open.
 - **`shared_pool`'s width is decided by whichever service activates first
   (verified 2026-10-19).** With `[client.data].shared_pool = true`, the session
   pool is created by the first service to become active and uses *that
@@ -176,7 +233,10 @@
   deployment issue for the pair above (it does not set `shared_pool`), but a
   defect to fix before the key's semantics are frozen: either honour the
   client-wide count in shared mode, or validate the per-service overrides and
-  document the first-service rule. No fix made.
+  document the first-service rule. No fix made. Subsumed by the one-pool
+  decision above (2026-10-19): the model removes the per-service pool and the
+  switch, so the defect goes away with the replacement rather than with a local
+  fix.
 - **The 32-bit embedded targets are compile-checked, not test-run.**
   `5e585b7` closed the aarch64 half — the two full-set musl targets build in
   CI (x86_64 on `ubuntu-latest`, aarch64 natively on `ubuntu-24.04-arm`) and a
