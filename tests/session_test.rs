@@ -1,5 +1,5 @@
 //! Protocol v5.1 session tests: this file is the v5.1 **client half**, spoken by
-//! hand over a raw `TcpStream` against the real in-process server.
+//! hand over a KK record stream against the real in-process server.
 //!
 //! The crate's `protocol` module is private, so every frame below is mirrored
 //! here — which is the point: this is a second, independent reading of the wire
@@ -19,6 +19,7 @@
 //! existing suites own 2333-2351 (control + exposed) and 8080-8099 (backends);
 //! this file uses 2360 (control, which is also the data-plane listener) and
 //! 2361-2364 (exposed services), with backends on 8100-8101.
+#![cfg(feature = "noise")]
 #![expect(
     clippy::expect_used,
     clippy::panic,
@@ -29,6 +30,10 @@
 mod common;
 
 use anyhow::{Context, Result, bail};
+use molehill_rathole::{
+    AddrMaybeCached, MaskedString, NoiseConfig, NoiseStream, NoiseTransport, Transport,
+    TransportConfig, TransportType,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::net::SocketAddr;
@@ -81,8 +86,22 @@ const WRONG_TOKEN: &str = "not_the_server_token";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Plain transport selector (the first byte of every connection).
-const PLAIN_SELECTOR: u8 = 0x00;
+/// The fixed test keypair this file's hand-written client uses; the fixture's
+/// server noise table carries the matching pair.
+const CLIENT_PRIVATE: &str = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=";
+const SERVER_PUBLIC: &str = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=";
+
+/// Open a KK-wrapped connection to a control/data listener.
+async fn connect_noise(addr: &str) -> Result<NoiseStream<TcpStream>> {
+    let transport = NoiseTransport::new(&TransportConfig {
+        transport_type: TransportType::Noise,
+        noise: Some(NoiseConfig {
+            public_key: SERVER_PUBLIC.to_owned(),
+            private_key: MaskedString::from(CLIENT_PRIVATE),
+        }),
+    })?;
+    transport.connect(&AddrMaybeCached::new(addr)).await
+}
 /// The dialect this build speaks. The session wire is what these tests pin;
 /// taking the version from the crate keeps a future bump from leaving a copy
 /// behind.
@@ -233,7 +252,7 @@ fn key_for(token: &str, nonce: &Digest) -> Digest {
     hasher.finalize().into()
 }
 
-async fn write_frame(conn: &mut TcpStream, payload: &[u8]) -> Result<()> {
+async fn write_frame<W: AsyncWriteExt + Unpin>(conn: &mut W, payload: &[u8]) -> Result<()> {
     let len = u16::try_from(payload.len()).context("frame longer than the u16 prefix")?;
     conn.write_u16(len).await?;
     conn.write_all(payload).await?;
@@ -241,7 +260,7 @@ async fn write_frame(conn: &mut TcpStream, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn read_frame(conn: &mut TcpStream) -> Result<Vec<u8>> {
+async fn read_frame<R: AsyncReadExt + Unpin>(conn: &mut R) -> Result<Vec<u8>> {
     let len = conn.read_u16().await?;
     let mut buf = vec![0u8; usize::from(len)];
     conn.read_exact(&mut buf).await?;
@@ -250,7 +269,7 @@ async fn read_frame(conn: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// Read one control-channel command (tag-dispatched, exactly as the client
 /// does: the tag alone decides how many bytes follow).
-async fn read_control_cmd(conn: &mut TcpStream) -> Result<ControlCmd> {
+async fn read_control_cmd<R: AsyncReadExt + Unpin>(conn: &mut R) -> Result<ControlCmd> {
     let tag = conn.read_u8().await?;
     match tag {
         0 => Ok(ControlCmd::CreateDataChannel),
@@ -281,9 +300,8 @@ async fn read_control_cmd(conn: &mut TcpStream) -> Result<ControlCmd> {
 
 /// Open a connection and complete the v5.1 hello exchange up to (but not
 /// including) the auth response; the nonce is the server's session identity.
-async fn open_session() -> Result<(TcpStream, Digest)> {
-    let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
-    conn.write_u8(PLAIN_SELECTOR).await?;
+async fn open_session() -> Result<(NoiseStream<TcpStream>, Digest)> {
+    let mut conn = connect_noise(CONTROL_ADDR).await?;
     let hello = Hello::ControlChannelHello(current_version(), [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;
@@ -307,7 +325,7 @@ async fn open_session() -> Result<(TcpStream, Digest)> {
 
 /// One v5.1 control session, as this test's client sees it.
 struct Session {
-    conn: TcpStream,
+    conn: NoiseStream<TcpStream>,
     nonce: Digest,
     /// The session credential (`digest(default_token ‖ nonce)`), which the
     /// server also accepts as each service's credential — it owns no
@@ -372,9 +390,8 @@ impl Session {
 
     /// Open a *direct* data channel for one service: the 35-byte v5.1 hello,
     /// then the 4-byte service prologue.
-    async fn open_data_channel(&self, id: u32) -> Result<TcpStream> {
-        let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
-        conn.write_u8(PLAIN_SELECTOR).await?;
+    async fn open_data_channel(&self, id: u32) -> Result<NoiseStream<TcpStream>> {
+        let mut conn = connect_noise(CONTROL_ADDR).await?;
         let hello = Hello::DataChannelHello(current_version(), self.nonce);
         conn.write_all(&postcard::to_stdvec(&hello)?).await?;
         conn.write_all(&id.to_be_bytes()).await?;
@@ -421,7 +438,10 @@ async fn visitor_round_trip(exposed: u16) -> Result<()> {
 }
 
 /// Bridge one established data channel to a backend until either side ends.
-async fn bridge(mut channel: TcpStream, backend: &'static str) -> Result<()> {
+async fn bridge<C: AsyncReadExt + AsyncWriteExt + Unpin>(
+    mut channel: C,
+    backend: &'static str,
+) -> Result<()> {
     let mut backend_conn = TcpStream::connect(backend).await?;
     tokio::io::copy_bidirectional(&mut channel, &mut backend_conn).await?;
     Ok(())
@@ -565,6 +585,34 @@ async fn a_rejected_port_does_not_kill_the_session() -> Result<()> {
     Ok(())
 }
 
+/// A plaintext control channel is refused on its own connection: the control
+/// leg publishes the session nonce every data channel authenticates with, so
+/// the server closes it instead of answering.
+#[tokio::test]
+async fn a_plaintext_control_channel_is_refused() -> Result<()> {
+    init();
+    let _server = start_server().await?;
+
+    let mut conn = TcpStream::connect(CONTROL_ADDR).await?;
+    conn.write_u8(0x00).await?;
+    let hello = Hello::ControlChannelHello(current_version(), [0x42; 32]);
+    conn.write_all(&postcard::to_stdvec(&hello)?).await?;
+    conn.flush().await?;
+
+    let mut byte = [0u8; 1];
+    match timeout(HANDSHAKE_TIMEOUT, conn.read(&mut byte)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(_)) => panic!("the server answered a plaintext control hello: {byte:?}"),
+        Ok(Err(error)) => {
+            // A reset is the same refusal as a clean close; the bytes are
+            // what must not arrive.
+            eprintln!("the server closed the plaintext control channel: {error}");
+        }
+        Err(error) => panic!("the server left a plaintext control channel open: {error}"),
+    }
+    Ok(())
+}
+
 /// The wrong *session* token is refused with `Ack::AuthFailed` (the bare
 /// fixed-width ack) and the connection is closed.
 #[tokio::test]
@@ -668,8 +716,7 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     let _server = start_server_at(STRIPED_CONFIG, STRIPED_CONTROL).await?;
 
     // The hello exchange, by hand, on the striped fixture's port.
-    let mut conn = TcpStream::connect(STRIPED_CONTROL).await?;
-    conn.write_u8(PLAIN_SELECTOR).await?;
+    let mut conn = connect_noise(STRIPED_CONTROL).await?;
     let hello = Hello::ControlChannelHello(current_version(), [0x42; 32]);
     conn.write_all(&postcard::to_stdvec(&hello)?).await?;
     conn.flush().await?;

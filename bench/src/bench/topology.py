@@ -76,14 +76,26 @@ SERVICE_PORTS = (ECHO_PORT, IPERF_PORT, IPERF2_PORT, UDP_PORT, IPERF_UDP_PORT)
 #: throwaway namespaces, and a reader reproducing a run must get the same
 #: config. A deployment generates its own with `molehill --genkey`.
 NOISE_SERVER_PRIVATE = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
-NOISE_CLIENT_REMOTE_PUBLIC = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_SERVER_PUBLIC = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_CLIENT_PRIVATE = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+NOISE_CLIENT_PUBLIC = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="
 
 #: The server's half of the control block, common to every arm. The client
 #: decides `type` per connection and the server only places its keys, so this
 #: table carries no `type`.
 NOISE_SERVER_BLOCK = f"""
-[server.transport.noise]
-local_private_key = "{NOISE_SERVER_PRIVATE}"
+[server.noise]
+private_key = "{NOISE_SERVER_PRIVATE}"
+public_key = "{NOISE_CLIENT_PUBLIC}"
+"""
+
+#: The client half: its own private key and the server's public key. The
+#: control channel is always KK; the data planes follow data_enable.
+NOISE_CLIENT_BLOCK = f"""
+[client.noise]
+public_key = "{NOISE_SERVER_PUBLIC}"
+private_key = "{NOISE_CLIENT_PRIVATE}"
+data_enable = true
 """
 
 #: The `/proc/net/dev` fields per interface: name, then 16 counters.
@@ -740,8 +752,10 @@ tun = "{TUN_CLI}"
 [transparent.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
-[transparent.transport.noise]
-remote_public_key = "{NOISE_CLIENT_REMOTE_PUBLIC}"
+[transparent.noise]
+public_key = "{NOISE_SERVER_PUBLIC}"
+private_key = "{NOISE_CLIENT_PRIVATE}"
+data_enable = false
 
 [transparent.data]
 lend = {str(arm.lend).lower()}{cap}
@@ -757,7 +771,7 @@ lend = {str(arm.lend).lower()}{cap}
             block.append(f'local_addr = "127.0.0.1:{port}"')
             block.append(f'remote_bind_addr = "{model.TOPO_SRV_IP}:{port}"')
             if port in (UDP_PORT, IPERF_UDP_PORT):
-                block.append("udp_workers = 2")
+                block.append("max_udp_workers = 2")
             services.append("\n".join(block) + "\n")
         # iperf3's UDP test still opens a TCP control connection to the same
         # port, so that port carries both protocols for an L4 arm. L3 needs no
@@ -786,12 +800,7 @@ default_token = "bench"
 [client.control]
 default_remote_addr = "{model.TOPO_SRV_IP}:{CONTROL_PORT}"
 
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-remote_public_key = "{NOISE_CLIENT_REMOTE_PUBLIC}"
-
+{NOISE_CLIENT_BLOCK}
 [client.data]{cap}
 
 {"".join(services)}"""

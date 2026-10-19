@@ -1248,23 +1248,23 @@ matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), `CLAIM_LANES` (unse
 which measures the product's own default of one carrier connection per claim; a
 higher number spreads the claim's flows over that many connections) and
 `CLAIM_LANE_CAP` (unset; a value below `CLAIM_LANES` measures the server's
-`[server.data].max_tunnels_per_client` valve refusing a claim's surplus lanes
+`[server.data].max_tunnels` valve refusing a claim's surplus lanes
 while the claim keeps serving on the rest).
 
 ## The UDP queue question (a molehill-only diagnostic)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the
 stage schedule, so it has its own instrument: `bench/src/bench/utils/udp_stress.py`
-starts a real pair with a configurable `udp_workers`, blasts paced or flat-out
+starts a real pair with a configurable `max_udp_workers`, blasts paced or flat-out
 visitors at it, reads the server's `MOLEHILL_UDP_STATS` line around each step,
 and ends with a control step that blasts the same visitors **straight at the
 sink** — without that control a slow sink and a slow tunnel look identical from
 the counters. Measured on one host, 1400-byte datagrams: a single visitor never
 drops (its own socket buffer throttles it at ~29.8k datagrams/s), many visitors
-saturate the pool at ~1 Gbit/s regardless of `udp_workers` (1.14 / 1.00 / 0.98 at
+saturate the pool at ~1 Gbit/s regardless of `max_udp_workers` (1.14 / 1.00 / 0.98 at
 1 / 2 / 4) or visitor count, the spread stays even, and the drops equal the
 excess over that ceiling to within 0.07 %. The number a user needs is on the
-configuration page beside `udp_workers`. The probe behind it is
+configuration page beside `max_udp_workers`. The probe behind it is
 `bench/src/bench/utils/udp_stress.py`; run it the same way to reproduce the ceiling on
 your own host.
 

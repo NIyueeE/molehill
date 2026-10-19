@@ -73,7 +73,7 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 - **Small binary** — the `minimal` profile builds a **1.84 MiB** client binary and a **2.55 MiB** embedded one (measured 2026-10-17; see the [build guide](docs/build-guide.md)).
 - **Client-authoritative services** — the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
 - **Multiplexing** — every data channel of a forwarding service rides as a yamux stream over one of a fixed pool of tunnel connections (`[client.data].tunnels`, default 4) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The pool is established at service start and never resized for load (a dead tunnel is repaired); the data plane itself runs over KCP (feature `kcp`) and falls back to TCP when a KCP session cannot be established, which is what `MOLEHILL_DATA_CARRIER` forces apart for a measurement. A transparent (L3) claim is the one shape that does not multiplex — its channels *are* its carrier connections, allotted by the lane budget and lent between claims as their flows come and go (`[transparent.data].lend`) — and the `[client.data]` knobs are covered in [Configuration](./docs/configuration.md).
-- **Security** — a shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The control channel **always** speaks Noise: it carries the credential every data channel authenticates with, so a plain control leg would publish it to the path, and both ends refuse to start without a key pair (`molehill --genkey`). One pre-shared X25519 keypair, no PKI, no CA; with `resume = true` a reconnect proves itself with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 → 38.5 us per pair). A *service* or an L3 lane may still run plain where the payload carries its own crypto.
+- **Security** — a shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The control channel **always** speaks Noise with the fixed KK handshake: both ends know each other's static X25519 key, so a man in the middle can impersonate neither, and a plaintext control leg is refused because it would publish the credential every data channel authenticates with. Both ends refuse to start without a key pair (`molehill --genkey`). One keypair per host, no PKI and no CA. A *service* or an L3 lane may still run plain (`data_enable = false`) where the payload carries its own crypto.
 - **An optional status API** — a token-gated `GET /status` on its own listener, answering what the client is carrying as JSON, so a panel or a script can read it. See [Configuration](./docs/configuration.md).
 - **Hot reload** — services can be added or removed dynamically by hot-reloading the configuration file.
 
@@ -172,8 +172,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333" # Port that molehill listens for clients
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 Then run:
@@ -194,12 +195,11 @@ default_token = "use_a_secret_that_only_you_know" # Must match the server's `def
 [client.control]
 default_remote_addr = "myserver.com:2333" # The address of the server. The port must match `server.control.bind_addr`
 
-[client.transport]
-type = "noise"
 
 # The server's public key, from `molehill --genkey`
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # The local service to forward

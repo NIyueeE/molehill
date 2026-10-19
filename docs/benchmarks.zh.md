@@ -995,19 +995,19 @@ materiality 10%、符号一致 1.0,并且越过本轮 A/A 地板)。同样比较
 `SMALL_REQUESTS` 与 `SMALL_BYTES`(默认 2000 × 64 B)、`CLAIM_LANES`(不设置,即测量
 产品自身的默认值——每条认领一条承载连接;设为更大的数字会把该认领的流铺到那么多条
 连接上),以及 `CLAIM_LANE_CAP`(不设置;设成小于 `CLAIM_LANES` 的值,即测量服务端
-`[server.data].max_tunnels_per_client` 阀门拒绝认领多余车道、而认领用剩下的车道继续
+`[server.data].max_tunnels` 阀门拒绝认领多余车道、而认领用剩下的车道继续
 服务的情形)。
 
 ## UDP 队列问题(仅 molehill 的诊断)
 
 UDP 服务的数据报上限是**服务**的属性,不是阶段日程的属性,所以它有专门的仪器:
-`bench/src/bench/utils/udp_stress.py` 启动真实的一对进程(`udp_workers` 可配),用**限速或
+`bench/src/bench/utils/udp_stress.py` 启动真实的一对进程(`max_udp_workers` 可配),用**限速或
 全速**的访客打它,并在每一步前后读取服务端的 `MOLEHILL_UDP_STATS` 行;最后一步是
 对照——同样的访客**直接打 sink**。没有这个对照,慢 sink 和慢隧道从计数器上看是
 一样的。同一主机、1400 字节数据报实测:单个访客从不丢包(它自己的 socket 缓冲把它
-限在约 29.8k 数据报/秒),多访客把池打到约 1 Gbit/s 饱和,与 `udp_workers`(1/2/4 分别
+限在约 29.8k 数据报/秒),多访客把池打到约 1 Gbit/s 饱和,与 `max_udp_workers`(1/2/4 分别
 1.14/1.00/0.98)和访客数都无关,扩散保持均匀,而丢弃量与该上限之上的超出部分相差
-0.07% 以内。用户需要的数字在配置页 `udp_workers` 旁边。背后的探针是
+0.07% 以内。用户需要的数字在配置页 `max_udp_workers` 旁边。背后的探针是
 `bench/src/bench/utils/udp_stress.py`;用同样的方式运行,就能在自己的主机上复现这个上限。
 
 ## 可比性

@@ -424,7 +424,7 @@ pub enum Ack {
         heartbeat_interval_secs: u64,
     },
     /// v4: a data tunnel was refused because the operator's valve
-    /// (`[server.data].max_tunnels_per_client`) is already reached for this
+    /// (`[server.data].max_tunnels`) is already reached for this
     /// client. A **unit** variant on purpose: a tunnel hello is answered on the
     /// fixed-width ack path, which carries exactly one byte, so the refusal
     /// cannot carry the cap with it — the server names the cap in its own log,
@@ -447,7 +447,7 @@ impl std::fmt::Display for Ack {
                     heartbeat_interval_secs,
                 } => return write!(f, "session ok, heartbeat every {heartbeat_interval_secs}s"),
                 Ack::TunnelRefused =>
-                    "the server's `[server.data].max_tunnels_per_client` is reached, so this \
+                    "the server's `[server.data].max_tunnels` is reached, so this \
                      tunnel was refused; the session keeps running",
             }
         )
@@ -1657,7 +1657,7 @@ mod tests {
         assert!(matches!(ack, Ack::TunnelRefused));
         let msg = ack.to_string();
         assert!(
-            msg.contains("max_tunnels_per_client"),
+            msg.contains("max_tunnels"),
             "the refusal must name the valve: {msg}"
         );
     }

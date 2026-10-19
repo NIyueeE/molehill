@@ -1,25 +1,20 @@
+
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
 
 [client.control]
 default_remote_addr = "127.0.0.1:2339"
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-# One UDP service with an explicit worker set: the session-affinity
-# regression test sends one peer's datagrams through these channels and
-# requires them to surface at the local service from a single source port.
-
-
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [client.services.game]
 protocol = "udp"
 local_addr = "127.0.0.1:8082"
 remote_bind_addr = "0.0.0.0:2340"
-udp_workers = 2
+max_udp_workers = 2
 
 [server]
 default_token = "default_token_if_not_specify" # security-scan:allow fixture placeholder, not a credential
@@ -28,7 +23,6 @@ allow_ports = ["2340"]
 [server.control]
 bind_addr = "0.0.0.0:2339"
 
-
-
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

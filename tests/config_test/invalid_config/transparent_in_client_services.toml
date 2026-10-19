@@ -14,9 +14,7 @@ default_remote_addr = "example.com:2333"
 protocol = "transparent"
 remote_bind_addr = "10.99.0.1:8443"
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture key
-
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="

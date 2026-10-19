@@ -1,18 +1,15 @@
+# Fixed KK: the control channel is a fresh handshake on every reconnect.
+
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures
 
 [client.control]
 default_remote_addr = "127.0.0.1:2333"
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
-# Session resume: the client caches the server's ticket after the first
-# full handshake and proves possession of the cached session on the next
-# connect (selector 0x02) instead of repeating the key exchanges.
-resume = true
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [client.services.echo]
 local_addr = "127.0.0.1:8080"
@@ -29,6 +26,6 @@ allow_ports = ["2334-2337"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
-resume = true
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

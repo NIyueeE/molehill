@@ -48,7 +48,7 @@ molehill 通过一台有公网 IP 的服务器，把 NAT 后设备上的服务�
 - **小二进制** —— `minimal` profile 构建的客户端二进制为 **1.84 MiB**、嵌入式特性集为 **2.55 MiB**(2026-10-17 实测,见[构建指南](docs/build-guide.md))。
 - **客户端声明服务** —— 服务端不需要逐服务配置:客户端声明要暴露的内容(包括公网端口),服务端通过 `allow_ports` 白名单和共享 `default_token` 执行策略。
 - **多路复用** —— 转发服务的每个数据通道都作为 yamux 流跑在一个固定隧道池（`[client.data].tunnels`，默认 4）的某条隧道上——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。池在服务启动时建立、永不按负载调整大小（死亡的隧道会被修复）；数据面本身跑在 KCP 上（feature `kcp`），KCP 会话建立不起来时回退到 TCP——想分开测两条路径时用 `MOLEHILL_DATA_CARRIER` 强制其一。透明（L3）认领是唯一不做多路复用的形态——它的通道**就是**它的载体连接,由车道预算分配,并随各认领流量的起落互相出借(`[transparent.data].lend`);`[client.data]` 选项见[配置文档](./docs/configuration.zh.md)。
-- **安全性** —— 共享 token 强制鉴权，`allow_ports` 白名单限制客户端可暴露的端口。控制通道**始终**使用 Noise：它携带的是每个数据通道用来鉴权的凭证，明文控制腿会把该凭证广播给路径上的所有人，因此两端没有密钥对就拒绝启动（`molehill --genkey`）。只需一对预共享 X25519 密钥，没有 PKI、没有 CA；设置 `resume = true` 后，重连用一次 MAC 证明持有上次会话的握手摘要即可，不必重跑密钥交换(建连从每对 442.7 us 降到 38.5 us)。单个*服务*或一条 L3 车道在载荷自带加密时仍可走明文。
+- **安全性** —— 共享 token 强制鉴权,`allow_ports` 白名单限制客户端可暴露的端口。控制通道**始终**使用固定 KK 握手的 Noise:两端都知道对方的 X25519 静态公钥,中间人无法冒充任何一端,明文控制腿会被拒绝,因为它会把每条数据通道鉴权所用的凭证广播到路径上。两端没有密钥对就拒绝启动(`molehill --genkey`)。每台主机一对密钥,没有 PKI,也没有 CA。单个*服务*或一条 L3 lane 在载荷自带加密时仍可走明文(`data_enable = false`)。
 - **可选的状态 API** —— 一个带 token 的 `GET /status`，跑在自己的监听地址上，以 JSON 回答"这个客户端正在承载什么"，供面板或脚本读取。见[配置文档](./docs/configuration.zh.md)。
 - **热重载** —— 支持配置文件热重载，动态添加或移除端口转发服务。
 
@@ -136,8 +136,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333" # molehill 监听客户端连接的端口
 
 # 必需：控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 然后运行:
@@ -158,12 +159,11 @@ default_token = "use_a_secret_that_only_you_know" # 必须和服务端的 `defau
 [client.control]
 default_remote_addr = "myserver.com:2333" # 服务器的地址，端口必须和 `server.control.bind_addr` 中的端口一致
 
-[client.transport]
-type = "noise"
 
 # 服务端的公钥，来自 `molehill --genkey`
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # 需要被转发的服务地址

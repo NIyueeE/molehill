@@ -444,7 +444,7 @@ struct PoolEvent {
 /// what the integration suite asserts on.
 #[derive(Debug, Clone)]
 pub struct PoolSnapshot {
-    /// The pool's key in its session: `session` (shared) or `service:<id>`.
+    /// The pool's key in its session: `session:<data endpoint>`.
     pub key: String,
     /// `Carrier::as_str`.
     pub carrier: &'static str,
@@ -453,8 +453,6 @@ pub struct PoolSnapshot {
     /// How many tunnels the pool establishes (`[client.data].tunnels`).
     /// A pool at this size is complete; one below it is repairing.
     pub count: usize,
-    /// The UDP-derived floor the pool's configured count must cover (D7).
-    pub udp_floor: usize,
     /// Cumulative establishments since the pool was created.
     pub grows: u64,
     /// Cumulative removals since the pool was created: dead tunnels and
@@ -590,7 +588,7 @@ pub(crate) enum OpenError {
     Refused(crate::mux::ConnectionError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
     /// the pool could not reach its count (its own `tunnels`, or the server's
-    /// `max_tunnels_per_client` valve), or the carrier's dial failed.
+    /// `max_tunnels` valve), or the carrier's dial failed.
     ///
     /// A typed refusal rather than a queued open: the engine's cap is *fatal*
     /// to a tunnel, so the pool refuses one visitor instead of risking every
@@ -661,8 +659,7 @@ struct PoolShared {
     /// several pools would hand the hatch to the first one only.)
     hatch_at: Option<std::time::Duration>,
 
-    /// The pool's key within its session: `session` (shared) or
-    /// `service:<name>`.
+    /// The pool's key within its session: `session:<data endpoint>`.
     key: String,
     /// Streams per tunnel (`DEFAULT_MUX_MAX_STREAMS`): the engine cap the
     /// placement ceiling leaves headroom below.
@@ -670,10 +667,6 @@ struct PoolShared {
     /// When a repair attempt last failed: the pool stops dialing until
     /// `GROW_FAILURE_COOLDOWN` has passed, or a tunnel dies (D14).
     grow_failed_at: std::sync::Mutex<Option<std::time::Instant>>,
-    /// The UDP-derived floor (D7). The session maintains it from its active
-    /// UDP services, and it survives a tunnel's death: what it encodes is how
-    /// many tunnels the *services* need, not how many exist.
-    udp_floor: std::sync::atomic::AtomicUsize,
     /// Counters for the opt-in telemetry line.
     grows: std::sync::atomic::AtomicU64,
     shrinks: std::sync::atomic::AtomicU64,
@@ -947,7 +940,6 @@ impl TunnelPool {
             key,
             stream_cap: stream_cap(),
             grow_failed_at: std::sync::Mutex::new(None),
-            udp_floor: std::sync::atomic::AtomicUsize::new(0),
             grows: std::sync::atomic::AtomicU64::new(0),
             shrinks: std::sync::atomic::AtomicU64::new(0),
             events: std::sync::Mutex::new(Vec::new()),
@@ -1765,14 +1757,6 @@ impl TunnelPool {
         self.inner.state.lock().entries.len()
     }
 
-    /// The UDP-derived floor (D7) the pool's configured count must cover.
-    pub fn set_udp_floor(&self, floor: usize) {
-        self.inner
-            .shared
-            .udp_floor
-            .store(floor, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// A consistent view of the pool: the telemetry line's content, and what
     /// the integration suite asserts on.
     #[cfg(test)]
@@ -1783,7 +1767,6 @@ impl TunnelPool {
             carrier: self.inner.shared.carrier.as_str(),
             size: 0,
             count: 0,
-            udp_floor: 0,
             grows: 0,
             shrinks: 0,
             tunnels: Vec::new(),
@@ -1804,7 +1787,6 @@ impl TunnelPool {
             carrier: self.inner.shared.carrier.as_str(),
             size: state.entries.len(),
             count: state.count,
-            udp_floor: self.inner.shared.udp_floor.load(Ordering::Relaxed),
             grows: self.inner.shared.grows.load(Ordering::Relaxed),
             shrinks: self.inner.shared.shrinks.load(Ordering::Relaxed),
             tunnels: state
@@ -2293,7 +2275,7 @@ impl TunnelPool {
                 // D14: a refusal stops growth. Without the stamp below the
                 // maintenance tick would retry every 50 ms — a dial storm
                 // against the server's accept path, which is what the
-                // `max_tunnels_per_client` valve exists to prevent.
+                // `max_tunnels` valve exists to prevent.
                 *self.lock_grow_failure() = Some(std::time::Instant::now());
                 // One line the first time (an operator who set the valve wants
                 // to know it is biting, and a server-side outage is visible on
@@ -3185,7 +3167,6 @@ impl TunnelPool {
             carrier = snapshot.carrier,
             size = snapshot.size,
             count = snapshot.count,
-            udp_floor = snapshot.udp_floor,
             streams = snapshot.streams(),
             pinned = snapshot.pinned(),
             tunnels = %tunnels.join(","),
@@ -4421,7 +4402,7 @@ mod tests {
 
     /// D14's other half: a refused repair *stops* the repair dials. The
     /// maintenance tick runs every 50 ms, so without the hold a client at the
-    /// server's `max_tunnels_per_client` cap would dial-and-be-refused twenty
+    /// server's `max_tunnels` cap would dial-and-be-refused twenty
     /// times a second against the server's accept path.
     #[tokio::test]
     async fn a_refused_repair_holds_the_pool_back() {
@@ -4429,7 +4410,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         // A dialer that always refuses, counted: the shape the server's
-        // `max_tunnels_per_client` valve takes at the pool.
+        // `max_tunnels` valve takes at the pool.
         let dials = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&dials);
         let dial: Dialer = Arc::new(move |_: Carrier| {

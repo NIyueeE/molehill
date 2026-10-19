@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The read-only status API is available to a transparent (L3) client.**
+  `[transparent.status]` takes the same `bind_addr` and `token` as
+  `[client.status]`, and the lowered L3 client runs the same listener: the
+  answer carries the client's claims and lanes beside its pools.
+
+### Changed
+
+- **BREAKING: the UDP policy follows the path.** `udp_workers` becomes `max_udp_workers` (default 2, clamp 1..=64): the client starts one worker and the server asks for another on queue pressure, then retires an idle one. `udp_send_queue_size`, `udp_idle_timeout` and `udp_forwarder_ipv6` are removed: the queue uses CoDel (10 ms sojourn target), a peer mapping's lifetime follows its own largest gap (30-300 s), and the forwarder follows `local_addr`'s address family.
+- **BREAKING: one global tunnel valve.** `[server.data].max_tunnels` caps every live multiplexed tunnel and every transparent lane of the server, not one client's session. Unset derives the cap from the process's open-file limit and 0 is unlimited; `[server.data].max_tunnels_per_client` is refused with the replacement.
+- **The heartbeat cadence has an adaptive default.** With `[server.control].heartbeat_interval` unset the server declares 30 s up to eight sessions, 60 s up to 32 and 120 s above, computed from the live session count when each session authenticates. An explicit value (including 0, which disables it) replaces the tier.
+- **BREAKING: Noise is fixed to KK and the wire tables are flat.** The
+  handshake is always `Noise_KK_25519_ChaChaPoly_BLAKE2s`; both ends need their
+  own private key and the peer's public key. `[client.transport]` becomes
+  `[client.noise]`, `[server.transport]` becomes `[server.noise]`, and a
+  service's `[client.services.<name>.transport]` becomes
+  `[client.services.<name>.noise]`; `local_private_key` / `remote_public_key`
+  are now `private_key` / `public_key`. `data_enable` (default true for a
+  forwarding client, false for an L3 client) replaces `type`; `pattern`,
+  `psk`, `psk_location`, `resume` and `proxy` are removed. The control
+  channel is always KK and a plaintext control connection is refused; the
+  data channels follow `data_enable`. The session key is the endpoint plus the
+  two keys, so a service that targets another server with its own pair
+  gets its own session while `data_enable` never splits one.
+- **BREAKING: the retry keys are named for what they do, and default
+  adaptively.** `default_retry_interval` and `retry_interval` (client and L3)
+  become `retry_backoff_max`. Left unset, the cap follows consecutive
+  failures - 1, 2, 4, 8, 16, 32, then 60 seconds - and an explicit value pins
+  it. A config that still writes an old key is refused with the replacement.
+- **BREAKING: TCP_NODELAY is always on.** The per-service `nodelay` key is
+  removed; every forwarded connection — data channels, a claim's lanes and the
+  client's connection to the local service — has it enabled. A config that
+  still writes it is refused with that advice.
+- **BREAKING: one lane budget for transparent claims.** A claim no longer has
+  its own `tunnels` key; `[transparent.data].tunnels` is the client's single
+  lane budget (default two lanes per claim, at least one per claim, at most
+  1024), divided equally and then lent by traffic. Writing a per-claim
+  `tunnels` is refused with the budget key to write instead.
+- **BREAKING: one tunnel pool per forwarding session.** Every service of a
+  control session now draws on the same `[client.data].tunnels` connections
+  (default 4), and that key is the session's total width. A per-service width
+  is gone: write `[client.data].tunnels` instead of
+  `[client.services.<name>].tunnels`, and remove `[client.data].shared_pool`
+  (one pool per session is the only shape). A UDP service's worker set no
+  longer raises the pool: its channels are streams of the same pool.
+
 ## [0.11.1] - 2026-10-17
 
 ### Added

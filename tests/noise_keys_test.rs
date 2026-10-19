@@ -1,20 +1,20 @@
 //! The Noise key material contract, driven through the **real binary**: what
-//! `--genkey` prints and accepts, and what a PSK does to a real handshake.
+//! `--genkey` prints and accepts, and whether a generated pair really carries
+//! traffic over the fixed KK handshake.
 //!
 //! - `--genkey` defaults to X25519 and prints a keypair in the documented
 //!   shape; the pair has to *work*, so the test feeds it back into a real
-//!   server/client pair over the pattern `--genkey` itself builds
-//!   (`Noise_KK_<curve>_ChaChaPoly_BLAKE2s`, see `docs/transport.md`).
+//!   server/client pair over the fixed `Noise_KK_25519_ChaChaPoly_BLAKE2s`
+//!   handshake.
 //! - A curve the build cannot do must be **refused**, not silently downgraded
 //!   to a 25519 pair: the assertion is on the size of what was printed, or on
 //!   the absence of any key at all.
-//! - A PSK that matches on both ends must carry traffic; one that does not (or
-//!   one only one side has) must fail the handshake **and say so** in the
-//!   process's own output. `docs/configuration.md` names "Noise handshake
-//!   fails" as the user-visible symptom, and a silent hang would be a
-//!   different — much worse — product.
+//! - A keypair that does not match the peer's static key must fail the
+//!   handshake **and say so** in the process's own output. There is no PSK and
+//!   no resume path: the two cases this file used to drive are gone with the
+//!   fixed handshake.
 //!
-//! The handshake cases drive child processes rather than the in-process
+//! The handshake case drives child processes rather than the in-process
 //! helpers because the diagnosis *is* the assertion: the client retries a
 //! failed handshake for ever, so its log is the only place the reason appears,
 //! and a child's captured stderr is exactly what an operator would see.
@@ -53,29 +53,6 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
-/// The pattern `--genkey` builds its keypairs for: `KK`, the curve it names,
-/// `ChaChaPoly`, `BLAKE2s`. Spelled here so a change to the binary's own
-/// pattern has to be made twice.
-const KK_25519: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
-/// The PSK-carrying spelling of the same handshake (`docs/transport.md`).
-const KK_PSK0_25519: &str = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s";
-
-/// Two X25519 keypairs, generated once with this binary's own `--genkey` and
-/// pinned here as fixtures (exactly like `tests/for_tcp/noise_transport.toml`
-/// does): a handshake test must not depend on the generator it ships beside.
-/// security-scan:allow dummy key material for a test fixture, never a real key
-const SERVER_PRIV: &str = "f2h02meRzyrwtFiIpG+S4uN4EUtxjUWHmC+PS1tE4Sk=";
-const SERVER_PUB: &str = "MzrK8bCg9THzJTCRLkMsc0FiS1418u4IYo10cqKfEDA=";
-const CLIENT_PRIV: &str = "UFtmCGmNPwxuTn1hL4EQGp5oVCxrsvB6x6Xsz/piiow=";
-const CLIENT_PUB: &str = "Db/j5zBHbV8zmZ9lAllkYQuBtFh5ScR+vodz17QnihA=";
-
-/// The shared PSK both ends agree on (32 zero bytes: a fixture, not a secret).
-/// security-scan:allow dummy psk for a test fixture, never a real credential
-const SHARED_PSK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-/// A PSK the server does not have: the handshake must fail on it.
-/// security-scan:allow dummy psk for a test fixture, never a real credential
-const WRONG_PSK: &str = "DRE4m6IroPoUqifsfANWNI+aQyoDpOYWPzKibcp1Lgc=";
-
 const TOKEN: &str = "dummy_fixture_token"; // security-scan:allow dummy fixture token
 
 /// How long a handshake or a forwarding path may take before the test calls it
@@ -101,7 +78,7 @@ fn free_ports<const N: usize>() -> ([u16; N], Vec<std::net::TcpListener>) {
     (ports, held)
 }
 
-/// A scratch directory of its own per scenario, so the two binary-driven
+/// A scratch directory of its own per scenario, so the binary-driven
 /// scenarios cannot see each other's config files.
 fn scratch_dir(name: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join(format!("molehill-{name}-{}", std::process::id()));
@@ -149,8 +126,8 @@ fn decode(b64: &str) -> Result<Vec<u8>> {
 
 /// The documented default: no curve means X25519, and the explicit spelling of
 /// the same curve prints the same shape. Both keys are raw 25519 keys (32
-/// bytes), which is what makes them usable as `local_private_key` /
-/// `remote_public_key` in the first place.
+/// bytes), which is what makes them usable as `private_key` / `public_key`
+/// in the first place.
 #[test]
 fn genkey_defaults_to_x25519_and_its_keys_are_the_right_size() {
     for curve in [None, Some("x25519")] {
@@ -178,12 +155,6 @@ fn genkey_defaults_to_x25519_and_its_keys_are_the_right_size() {
 /// the failure mode worth catching is a 32-byte X25519 pair printed under an
 /// `x448` request, which would silently put both ends on a key the operator
 /// did not ask for.
-///
-/// The shipped build (snow with ring's resolver) has no X448, so the refusal
-/// branch is the one that runs today; the accepting branch is written out too,
-/// because "this build grew the curve" must stay a *correct* outcome rather
-/// than a test failure, and it is the branch that says what 448-bit output
-/// would have to look like.
 #[test]
 fn genkey_refuses_a_curve_the_build_cannot_do() {
     let out = run_genkey(Some("x448"));
@@ -201,10 +172,6 @@ fn genkey_refuses_a_curve_the_build_cannot_do() {
         );
     } else {
         assert!(
-            !out.stdout.is_empty() || !out.stderr.is_empty(),
-            "a refused curve must produce a diagnostic, not silence"
-        );
-        assert!(
             !String::from_utf8_lossy(&out.stdout).contains("Private Key"),
             "a refused curve must not print key material: {}",
             String::from_utf8_lossy(&out.stdout)
@@ -216,13 +183,103 @@ fn genkey_refuses_a_curve_the_build_cannot_do() {
     }
 }
 
-/// The generated pair is a *working* pair for the transport `--genkey` names:
-/// two keys from the binary, a real `Noise_KK_25519_ChaChaPoly_BLAKE2s`
-/// handshake between an in-process client and server, and a ping/pong through
-/// it. A generator that printed a mismatched public key (or a key for another
-/// curve) passes every structural assertion above and fails here.
+// --- real pairs -------------------------------------------------------------
+
+/// Write a server config for one KK pair: its own private key and the peer's
+/// public key.
+fn write_server(
+    dir: &Path,
+    control: u16,
+    exposed: u16,
+    private: &str,
+    peer_public: &str,
+) -> Result<PathBuf> {
+    let path = dir.join("server.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\n\
+             default_token = \"{TOKEN}\"\n\
+             allow_ports = [\"{exposed}\"]\n\
+             \n\
+             [server.control]\n\
+             bind_addr = \"127.0.0.1:{control}\"\n\
+             \n\
+             [server.noise]\n\
+             private_key = \"{private}\"\n\
+             public_key = \"{peer_public}\"\n"
+        ),
+    )?;
+    Ok(path)
+}
+
+/// The client half, with its own private key and the server's public key.
+fn write_client(
+    dir: &Path,
+    name: &str,
+    control: u16,
+    exposed: u16,
+    backend: u16,
+    private: &str,
+    server_public: &str,
+) -> Result<PathBuf> {
+    let path = dir.join(format!("client_{name}.toml"));
+    std::fs::write(
+        &path,
+        format!(
+            "[client]\n\
+             default_token = \"{TOKEN}\"\n\
+             \n\
+             [client.control]\n\
+             default_remote_addr = \"127.0.0.1:{control}\"\n\
+             \n\
+             [client.noise]\n\
+             private_key = \"{private}\"\n\
+             public_key = \"{server_public}\"\n\
+             \n\
+             [client.services.pingpong]\n\
+             local_addr = \"127.0.0.1:{backend}\"\n\
+             remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
+        ),
+    )?;
+    Ok(path)
+}
+
+/// One ping/pong round trip through the exposed endpoint: the readiness probe
+/// for every scenario here, and the proof that a handshake actually carried a
+/// connection rather than merely not failing.
+async fn probe_pong(addr: &str) -> Result<()> {
+    let attempt = async {
+        let mut conn = TcpStream::connect(addr).await?;
+        conn.write_all(PING.as_bytes()).await?;
+        let mut rd = [0u8; 4];
+        conn.read_exact(&mut rd).await?;
+        anyhow::ensure!(rd.as_slice() == PONG.as_bytes(), "unexpected reply {rd:?}");
+        Ok::<_, anyhow::Error>(())
+    };
+    time::timeout(Duration::from_millis(500), attempt).await??;
+    Ok(())
+}
+
+async fn wait_for_pong(addr: &str, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if probe_pong(addr).await.is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("{addr} did not answer a ping within {budget:?}");
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Two keys from the binary, a real KK handshake between the compiled client
+/// and server, and a ping/pong through it. A generator that printed a
+/// mismatched public key (or a key for another curve) passes every structural
+/// assertion above and fails here.
 #[tokio::test]
-async fn a_generated_keypair_carries_traffic_over_the_pattern_genkey_names() -> Result<()> {
+async fn a_generated_keypair_carries_traffic() -> Result<()> {
     init();
 
     let (server_priv, server_pub) =
@@ -238,45 +295,15 @@ async fn a_generated_keypair_carries_traffic_over_the_pattern_genkey_names() -> 
     });
 
     let dir = scratch_dir("genkey-transport")?;
-    let server_config = dir.join("server.toml");
-    std::fs::write(
-        &server_config,
-        format!(
-            "[server]\n\
-             default_token = \"{TOKEN}\"\n\
-             allow_ports = [\"{exposed}\"]\n\
-             \n\
-             [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [server.transport.noise]\n\
-             pattern = \"{KK_25519}\"\n\
-             local_private_key = \"{server_priv}\"\n\
-             remote_public_key = \"{client_pub}\"\n"
-        ),
-    )?;
-    let client_config = dir.join("client.toml");
-    std::fs::write(
-        &client_config,
-        format!(
-            "[client]\n\
-             default_token = \"{TOKEN}\"\n\
-             \n\
-             [client.control]\n\
-             default_remote_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [client.transport]\n\
-             type = \"noise\"\n\
-             \n\
-             [client.transport.noise]\n\
-             pattern = \"{KK_25519}\"\n\
-             local_private_key = \"{client_priv}\"\n\
-             remote_public_key = \"{server_pub}\"\n\
-             \n\
-             [client.services.pingpong]\n\
-             local_addr = \"127.0.0.1:{backend}\"\n\
-             remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
-        ),
+    let server_config = write_server(&dir, control, exposed, &server_priv, &client_pub)?;
+    let client_config = write_client(
+        &dir,
+        "generated",
+        control,
+        exposed,
+        backend,
+        &client_priv,
+        &server_pub,
     )?;
 
     drop(held);
@@ -305,41 +332,8 @@ async fn a_generated_keypair_carries_traffic_over_the_pattern_genkey_names() -> 
     Ok(())
 }
 
-/// One ping/pong round trip through the exposed endpoint: the readiness probe
-/// for every scenario here, and the proof that a handshake actually carried a
-/// connection rather than merely not failing.
-async fn probe_pong(addr: &str) -> Result<()> {
-    let attempt = async {
-        let mut conn = TcpStream::connect(addr).await?;
-        conn.write_all(PING.as_bytes()).await?;
-        let mut rd = [0u8; 4];
-        conn.read_exact(&mut rd).await?;
-        anyhow::ensure!(rd.as_slice() == PONG.as_bytes(), "unexpected reply {rd:?}");
-        Ok::<_, anyhow::Error>(())
-    };
-    time::timeout(Duration::from_millis(500), attempt).await??;
-    Ok(())
-}
-
-/// Poll the endpoint until it answers, or fail after `budget`.
-async fn wait_for_pong(addr: &str, budget: Duration) -> Result<()> {
-    let deadline = Instant::now() + budget;
-    loop {
-        if probe_pong(addr).await.is_ok() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("{addr} did not answer a ping within {budget:?}");
-        }
-        time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-// --- PSK handshakes, through the real binary -------------------------------
-
 /// One child of the compiled binary. Its whole output goes to a file, so a
-/// refusal can be quoted from what the process actually said — which is the
-/// assertion for the two failure cases.
+/// refusal can be quoted from what the process actually said.
 struct Child {
     process: std::process::Child,
     log: PathBuf,
@@ -369,11 +363,7 @@ impl Child {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// SIGINT first (the binary turns it into a clean exit), then SIGKILL if it
-    /// is still alive: a leaked child would hold the scenario's ports.
     fn stop(&mut self) {
-        // Already reaped — an explicit `stop()` followed by `drop` — so a
-        // second `kill` would only print "No such process" over the output.
         if matches!(self.process.try_wait(), Ok(Some(_))) {
             return;
         }
@@ -397,8 +387,6 @@ impl Drop for Child {
     }
 }
 
-/// Wait until the child's output contains `needle`, quoting the tail of what
-/// it did print when the budget runs out.
 async fn wait_for_log(child: &Child, needle: &str, budget: Duration) -> Result<()> {
     let deadline = Instant::now() + budget;
     loop {
@@ -417,91 +405,20 @@ async fn wait_for_log(child: &Child, needle: &str, budget: Duration) -> Result<(
     }
 }
 
-/// Write the server side: the `KKpsk0` pattern, the fixture keypair, and the
-/// shared PSK when the case has one.
-fn write_noise_server(
-    dir: &Path,
-    control: u16,
-    exposed: u16,
-    psk: Option<&str>,
-) -> Result<PathBuf> {
-    let psk_line = psk.map_or_else(String::new, |psk| {
-        format!("psk = \"{psk}\"\npsk_location = 0\n")
-    });
-    let path = dir.join("server.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "[server]\n\
-             default_token = \"{TOKEN}\"\n\
-             allow_ports = [\"{exposed}\"]\n\
-             \n\
-             [server.control]\n\
-             bind_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [server.transport.noise]\n\
-             pattern = \"{KK_PSK0_25519}\"\n\
-             local_private_key = \"{SERVER_PRIV}\"\n\
-             remote_public_key = \"{CLIENT_PUB}\"\n\
-             {psk_line}"
-        ),
-    )?;
-    Ok(path)
-}
-
-/// The same for the client: `name` distinguishes the three PSK variants, and
-/// `psk = None` leaves the key out entirely (the "only one end has it" case).
-fn write_noise_client(
-    dir: &Path,
-    name: &str,
-    control: u16,
-    exposed: u16,
-    backend: u16,
-    psk: Option<&str>,
-) -> Result<PathBuf> {
-    let psk_line = psk.map_or_else(String::new, |psk| {
-        format!("psk = \"{psk}\"\npsk_location = 0\n")
-    });
-    let path = dir.join(format!("client_{name}.toml"));
-    // The service block follows the PSK lines either way: `psk_line` ends with
-    // a newline when present, and an empty string is nothing when absent.
-    std::fs::write(
-        &path,
-        format!(
-            "[client]\n\
-             default_token = \"{TOKEN}\"\n\
-             \n\
-             [client.control]\n\
-             default_remote_addr = \"127.0.0.1:{control}\"\n\
-             \n\
-             [client.transport]\n\
-             type = \"noise\"\n\
-             \n\
-             [client.transport.noise]\n\
-             pattern = \"{KK_PSK0_25519}\"\n\
-             local_private_key = \"{CLIENT_PRIV}\"\n\
-             remote_public_key = \"{SERVER_PUB}\"\n\
-             {psk_line}\n\
-             [client.services.pingpong]\n\
-             local_addr = \"127.0.0.1:{backend}\"\n\
-             remote_bind_addr = \"127.0.0.1:{exposed}\"\n"
-        ),
-    )?;
-    Ok(path)
-}
-
-/// With the same PSK on both ends the handshake completes and traffic flows;
-/// with a different one, or with the key present on only one end, the
-/// connection fails **and both are reported by name** — a mismatch as a failed
-/// Noise handshake, a missing key as `MissingPsk`.
-///
-/// The three cases share one server, exactly as an operator would meet them:
-/// the same policy, three clients. Traffic is asserted only in the matching
-/// case; in the other two the *absence* of a working path is the point, and
-/// the process's own words are what makes it diagnosable.
+/// A client whose static key is not the one the server expects cannot complete
+/// KK: the handshake fails, the failure is named in the client's own output,
+/// and nothing is forwarded. (There is no PSK and no resume path to test.)
 #[tokio::test]
-async fn a_matching_psk_carries_traffic_and_a_mismatch_says_why() -> Result<()> {
+async fn a_mismatched_keypair_says_the_handshake_failed() -> Result<()> {
     init();
+
+    let (server_priv, server_pub) =
+        parse_genkey(&String::from_utf8_lossy(&run_genkey(None).stdout))?;
+    let (client_priv, _client_pub) =
+        parse_genkey(&String::from_utf8_lossy(&run_genkey(None).stdout))?;
+    // The server is told a *different* client public key, so KK cannot verify
+    // the client's static key.
+    let (_, other_pub) = parse_genkey(&String::from_utf8_lossy(&run_genkey(None).stdout))?;
 
     let ([control, exposed, backend], held) = free_ports::<3>();
     tokio::spawn(async move {
@@ -510,55 +427,28 @@ async fn a_matching_psk_carries_traffic_and_a_mismatch_says_why() -> Result<()> 
         }
     });
 
-    let dir = scratch_dir("psk")?;
-    let server_config = write_noise_server(&dir, control, exposed, Some(SHARED_PSK))?;
-    let matching = write_noise_client(
-        &dir,
-        "matching",
-        control,
-        exposed,
-        backend,
-        Some(SHARED_PSK),
-    )?;
-    let mismatched = write_noise_client(
+    let dir = scratch_dir("mismatch")?;
+    let server_config = write_server(&dir, control, exposed, &server_priv, &other_pub)?;
+    let client_config = write_client(
         &dir,
         "mismatched",
         control,
         exposed,
         backend,
-        Some(WRONG_PSK),
+        &client_priv,
+        &server_pub,
     )?;
-    let missing = write_noise_client(&dir, "missing", control, exposed, backend, None)?;
     drop(held);
 
-    let exposed_addr = format!("127.0.0.1:{exposed}");
     let mut server = Child::spawn(&server_config, true)?;
-
-    // The matching key: a real session, a real registration, real traffic.
-    let mut client = Child::spawn(&matching, false)?;
-    wait_for_pong(&exposed_addr, BUDGET).await?;
-    client.stop();
-
-    // A different key: the handshake must fail, the failure must be named, and
-    // nothing may be forwarded.
-    let mut client = Child::spawn(&mismatched, false)?;
+    let mut client = Child::spawn(&client_config, false)?;
     wait_for_log(&client, "noise handshake", BUDGET).await?;
+    let exposed_addr = format!("127.0.0.1:{exposed}");
     assert!(
         probe_pong(&exposed_addr).await.is_err(),
-        "a client with the wrong psk must not be able to forward traffic"
+        "a mismatched key pair must not forward traffic"
     );
     client.stop();
-
-    // No key at all on the client while the server requires one: refused for
-    // the named reason, not by timing out.
-    let mut client = Child::spawn(&missing, false)?;
-    wait_for_log(&client, "MissingPsk", BUDGET).await?;
-    assert!(
-        probe_pong(&exposed_addr).await.is_err(),
-        "a client without the psk must not be able to forward traffic"
-    );
-    client.stop();
-
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

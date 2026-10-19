@@ -1,5 +1,5 @@
 use crate::common::constants::FORWARD_IDLE_TIMEOUT;
-use crate::common::constants::{DEFAULT_UDP_SENDQ_SIZE, TCP_COPY_BUFFER_SIZE, UDP_ROUTE_TTL_SECS};
+use crate::common::constants::{TCP_COPY_BUFFER_SIZE, UDP_QUEUE_SIZE, UDP_ROUTE_TTL_SECS};
 use crate::common::forward::copy_bidirectional_with_idle;
 use crate::common::helper::write_and_flush;
 use crate::config::ConfigChange;
@@ -16,7 +16,6 @@ use crate::protocol::{
     read_session_cmd, read_stream_prologue, write_register_result,
 };
 #[cfg(feature = "noise")]
-use crate::transport::noise_resume::NOISE_RESUME_SELECTOR;
 #[cfg(feature = "noise")]
 use crate::transport::{NoiseKeys, NoiseStream};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
@@ -155,12 +154,6 @@ struct SessionHandle {
     /// entry stops that service's control task, which stops its pool task and
     /// releases its listener and public port.
     services: HashMap<ServiceId, ControlChannelHandle>,
-    /// The multiplexed tunnels this client holds right now, shared with the
-    /// guards the tunnel tasks own. It is what
-    /// `[server.data].max_tunnels_per_client` is checked against. No tunnels
-    /// exist without the `multiplex` feature, so neither does the count.
-    #[cfg(feature = "multiplex")]
-    tunnels: TunnelCount,
     /// The session's one and only writer: every service's commands are queued
     /// here as framed bytes, and a single task drains the queue into the
     /// socket. A session carries N services, so no service may write directly.
@@ -179,8 +172,6 @@ impl SessionHandle {
     ) -> SessionHandle {
         SessionHandle {
             services: HashMap::new(),
-            #[cfg(feature = "multiplex")]
-            tunnels: TunnelCount::default(),
             write_tx,
             shutdown,
         }
@@ -191,7 +182,7 @@ impl SessionHandle {
 ///
 /// The count is taken with a compare-exchange rather than a load-then-add so
 /// two tunnels of the same client arriving together cannot both slip past
-/// `max_tunnels_per_client`; the guard releases the slot when the tunnel ends,
+/// `max_tunnels`; the guard releases the slot when the tunnel ends,
 /// whatever ended it (a clean close, a dead peer, a shutdown).
 #[cfg(feature = "multiplex")]
 #[derive(Clone, Default)]
@@ -233,7 +224,7 @@ impl Drop for TunnelGuard {
 /// The session counter a transparent service charges its lanes to, when this
 /// build has one.
 ///
-/// `[server.data].max_tunnels_per_client` was checked on the tunnel hello, so it
+/// `[server.data].max_tunnels` was checked on the tunnel hello, so it
 /// counted multiplexed tunnels and nothing else — and a transparent claim's lane
 /// is a plain data channel of its own, which made a claim's carrier connections
 /// the one kind of establishment no server-side policy bounded. The counter is
@@ -252,7 +243,7 @@ type LaneCounter = ();
 #[derive(Clone, Default)]
 struct LaneValve {
     counter: LaneCounter,
-    /// `[server.data].max_tunnels_per_client`; `0` is unlimited.
+    /// `[server.data].max_tunnels`; `0` is unlimited.
     cap: usize,
 }
 
@@ -351,12 +342,17 @@ type SessionMap = HashMap<Nonce, SessionHandle>;
 /// identity is a nonce and its services are looked up by [`ServiceId`].
 struct Registry {
     sessions: Arc<RwLock<SessionMap>>,
+    /// Every live tunnel and lane of every session: the global valve's count.
+    #[cfg(feature = "multiplex")]
+    tunnels: TunnelCount,
 }
 
 impl Registry {
     fn new() -> Registry {
         Registry {
             sessions: Arc::new(RwLock::new(SessionMap::new())),
+            #[cfg(feature = "multiplex")]
+            tunnels: TunnelCount::default(),
         }
     }
 }
@@ -488,19 +484,6 @@ async fn upgrade_conn(
                 )
             }
         }
-        #[cfg(feature = "noise")]
-        NOISE_RESUME_SELECTOR => {
-            let keys = noise_keys.ok_or_else(|| {
-                anyhow!("Client requested a noise session resume, but the server has no Noise keys")
-            })?;
-            // A declined request ends here: the responder already wrote
-            // its verdict, and the client falls back to a full handshake
-            // on a fresh connection.
-            match keys.run_resume(conn).await? {
-                Some(stream) => Ok(ServerStream::Noise(Box::new(stream))),
-                None => bail!("Declined a noise session resume"),
-            }
-        }
         other => bail!("Unknown transport selector {other:#04x}"),
     }
 }
@@ -511,6 +494,8 @@ async fn upgrade_conn(
 /// tasks spawned after startup.
 struct ServerShared {
     tcp: Arc<TcpTransport>,
+    /// The resolved global carrier-connection cap (`0` = unlimited).
+    max_tunnels: usize,
     #[cfg(feature = "noise")]
     noise_keys: Option<NoiseKeys>,
     #[cfg(feature = "kcp")]
@@ -575,7 +560,7 @@ async fn ensure_kcp_listener(
         Arc::clone(&registry),
         Arc::clone(&shared),
         shared.shutdown_tx.subscribe(),
-        server_config.max_tunnels_per_client(),
+        shared.max_tunnels,
     ));
     Ok(())
 }
@@ -603,12 +588,11 @@ impl Server {
         #[cfg(feature = "kcp")]
         let kcp = Arc::new(KcpListenerState::default());
         #[cfg(feature = "noise")]
-        let noise_keys = match &config.transport.noise {
-            Some(cfg) => Some(NoiseKeys::from_config(cfg)?),
-            None => None,
-        };
+        let noise_keys = Some(NoiseKeys::from_config(&config.noise)?);
+        let max_tunnels = config.max_tunnels();
         let shared = Arc::new(ServerShared {
             tcp,
+            max_tunnels,
             #[cfg(feature = "noise")]
             noise_keys,
             #[cfg(feature = "kcp")]
@@ -816,6 +800,17 @@ async fn handle_connection(
     let (_version, hello) = read_hello(&mut conn).await?;
     match hello {
         ControlChannelHello(_, _tag) => {
+            // The control channel is never plain: the session nonce it
+            // publishes is the credential every data channel authenticates
+            // with, so a plaintext control leg would hand that credential to
+            // everyone on the path. Data channels may be plain (data_enable
+            // is the client's choice); the control leg may not.
+            #[cfg(feature = "noise")]
+            if matches!(conn, ServerStream::Plain(_)) {
+                bail!(
+                    "Refused a plaintext control channel: the control channel must speak Noise                      (Noise_KK_25519_ChaChaPoly_BLAKE2s)"
+                );
+            }
             // The v4 hello's digest is a client-chosen session tag; the
             // session's identity is the nonce *this* end issues below.
             do_session_handshake(conn, registry, server_config, shared).await?;
@@ -831,13 +826,7 @@ async fn handle_connection(
         Hello::DataChannelTunnelHello(_, nonce) => {
             // A tunnel carries no service of its own: it belongs to the
             // session, and every stream inside it names its own service.
-            do_v4_tunnel(
-                conn,
-                registry,
-                nonce,
-                server_config.max_tunnels_per_client(),
-            )
-            .await?;
+            do_v4_tunnel(conn, registry, nonce, shared.max_tunnels).await?;
         }
         #[cfg(not(feature = "multiplex"))]
         Hello::DataChannelTunnelHello(..) => {
@@ -1117,7 +1106,18 @@ async fn do_session_handshake(
     // The server *declares* its cadence here (0 = none). `SessionOk` carries a
     // payload, so it travels through the framed helper — never through the
     // fixed-width 1-byte ack path.
-    let heartbeat_interval = server_config.control.heartbeat_interval;
+    // The declared cadence: the operator's value when written, else the
+    // adaptive tier of the current session count. The ack is the one place the
+    // client learns it, and the session loop below uses the same number.
+    let sessions = registry.sessions.read().await.len();
+    let heartbeat_interval = server_config.heartbeat_interval(sessions);
+    let explicit = server_config.control.heartbeat_interval.is_some();
+    debug!(
+        sessions,
+        heartbeat_interval_secs = heartbeat_interval,
+        explicit,
+        "declared heartbeat cadence"
+    );
     let session_ok = Ack::SessionOk {
         heartbeat_interval_secs: heartbeat_interval,
     };
@@ -1437,15 +1437,10 @@ impl SessionCtx {
         // (see `LaneValve`). The counter is cloned here, so the transparent
         // supervisor never has to reach back into the registry on the lane path.
         #[cfg(feature = "multiplex")]
-        let lane_counter = {
-            let sessions = self.registry.sessions.read().await;
-            sessions
-                .get(&self.nonce)
-                .map(|session| session.tunnels.clone())
-        };
+        let lane_counter = Some(self.registry.tunnels.clone());
         #[cfg(not(feature = "multiplex"))]
         let lane_counter = ();
-        let lane_valve = LaneValve::new(lane_counter, self.server_config.max_tunnels_per_client());
+        let lane_valve = LaneValve::new(lane_counter, self.shared.max_tunnels);
 
         let handle = ControlChannelHandle::new(
             ControlSink::Session {
@@ -1622,14 +1617,14 @@ async fn do_v4_data_channel(
 /// A direct data channel accepted on the TCP data listener: apply the
 /// per-connection TCP options first — there is a socket to apply them to.
 fn tcp_data_channel(conn: ServerStream) -> DataChannel {
-    conn.hint(SocketOpts::for_service(None));
+    conn.hint(SocketOpts::for_service());
     new_data_channel(conn)
 }
 
 /// A v4 multiplex tunnel: it belongs to the session, not to a service, and
 /// each stream inside it names its service with the 4-byte prologue.
 ///
-/// **This is where `[server.data].max_tunnels_per_client` lives** (the
+/// **This is where `[server.data].max_tunnels` lives** (the
 /// operator's valve): a tunnel that would push the client past its cap is
 /// refused with a typed answer and a `debug` line naming the cap, and the
 /// session keeps running — never killed, so an over-eager client loses one
@@ -1639,14 +1634,14 @@ async fn do_v4_tunnel(
     mut conn: ServerStream,
     registry: Arc<Registry>,
     nonce: Nonce,
-    max_tunnels_per_client: usize,
+    max_tunnels: usize,
 ) -> Result<()> {
     debug!("Handshaking a multiplexed data tunnel");
 
     // The reservation travels into `upgrade_to_tunnel`, which hands it to the
     // task that lives as long as the tunnel: this function itself returns as
     // soon as the tunnel is up.
-    let slot = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
+    let slot = match reserve_tunnel(&registry, &nonce, max_tunnels).await {
         TunnelSlot::NoSession => {
             debug!("Data tunnel has an incorrect nonce");
             return Ok(());
@@ -1658,15 +1653,15 @@ async fn do_v4_tunnel(
             // the reason in the log, and the client reads it in the ack.
             debug!(
                 "Refused a data tunnel for session {}: it already holds \
-                 {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
-                 {max_tunnels_per_client}",
+                 {held} tunnel(s), and `[server.data].max_tunnels` is \
+                 {max_tunnels}",
                 hex::encode(nonce)
             );
             return refuse_tunnel(&mut conn).await;
         }
     };
 
-    conn.hint(SocketOpts::for_service(None));
+    conn.hint(SocketOpts::for_service());
     upgrade_to_tunnel(
         conn,
         TunnelOwner {
@@ -1720,7 +1715,9 @@ async fn reserve_tunnel(registry: &Registry, nonce: &Nonce, cap: usize) -> Tunne
     let Some(session) = guard.get(nonce) else {
         return TunnelSlot::NoSession;
     };
-    match session.tunnels.try_reserve(cap) {
+    // The valve is global: every tunnel and lane of every session charges the
+    // same counter, while the session lookup is still what proves the nonce.
+    match registry.tunnels.try_reserve(cap) {
         Ok(slot) => TunnelSlot::Held(SessionTunnel {
             slot,
             ended: session.shutdown.subscribe(),
@@ -1778,7 +1775,7 @@ fn report_lane_refusal(held: usize, cap: usize) {
         || {
             info!(
                 "Refused a transparent lane: this client already holds {held} carrier \
-                 connections and `[server.data].max_tunnels_per_client` is {cap}. Further \
+                 connections and `[server.data].max_tunnels` is {cap}. Further \
                  refusals are logged at debug level."
             );
         },
@@ -1807,7 +1804,7 @@ struct TunnelOwner {
 /// one implementation.
 ///
 /// `session` is what a v4 tunnel holds for its whole life — its reservation in
-/// the session's tunnel count (`[server.data].max_tunnels_per_client`) and the
+/// the session's tunnel count (`[server.data].max_tunnels`) and the
 /// session's shutdown signal — when it has one. This function returns as soon
 /// as the tunnel is up, so both have to travel into the task that lives as
 /// long as the tunnel; a v3 tunnel belongs to one control channel and takes
@@ -2140,7 +2137,7 @@ async fn run_kcp_listener(
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-    max_tunnels_per_client: usize,
+    max_tunnels: usize,
 ) {
     loop {
         tokio::select! {
@@ -2156,7 +2153,7 @@ async fn run_kcp_listener(
                             session,
                             registry,
                             shared,
-                            max_tunnels_per_client,
+                            max_tunnels,
                         )
                         .await
                         {
@@ -2178,7 +2175,7 @@ async fn handle_kcp_session(
     mut session: crate::transport::kcp::AcceptedSession,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
-    max_tunnels_per_client: usize,
+    max_tunnels: usize,
 ) -> Result<()> {
     use crate::transport::kcp::KcpTunnelStream;
 
@@ -2230,7 +2227,7 @@ async fn handle_kcp_session(
         }
         Hello::DataChannelTunnelHello(_, nonce) => {
             let owner = tunnel_owner(&registry, nonce, "KCP").await?;
-            serve_kcp_tunnel(io, owner, nonce, registry, max_tunnels_per_client).await
+            serve_kcp_tunnel(io, owner, nonce, registry, max_tunnels).await
         }
         other @ Hello::ControlChannelHello(..) => {
             bail!("Expected a data-plane hello on the KCP session, got {other:?}")
@@ -2250,16 +2247,16 @@ async fn serve_kcp_tunnel(
     owner: TunnelOwner,
     nonce: Nonce,
     registry: Arc<Registry>,
-    max_tunnels_per_client: usize,
+    max_tunnels: usize,
 ) -> Result<()> {
-    let session = match reserve_tunnel(&registry, &nonce, max_tunnels_per_client).await {
+    let session = match reserve_tunnel(&registry, &nonce, max_tunnels).await {
         TunnelSlot::Held(slot) => Some(slot),
         TunnelSlot::NoSession => bail!("KCP tunnel hello carried an incorrect nonce"),
         TunnelSlot::OverCap { held } => {
             debug!(
                 "Refused a KCP data tunnel for session {}: it already \
-                 holds {held} tunnel(s), and `[server.data].max_tunnels_per_client` is \
-                 {max_tunnels_per_client}",
+                 holds {held} tunnel(s), and `[server.data].max_tunnels` is \
+                 {max_tunnels}",
                 hex::encode(nonce)
             );
             refuse_tunnel(&mut io).await?;
@@ -2552,7 +2549,7 @@ impl ControlChannelHandle {
         let shutdown_rx_clone = shutdown_tx.subscribe();
         // Socket options for visitor-facing connections: latency-friendly
         // defaults (nodelay + keepalive)
-        let sock_opts = SocketOpts::for_service(None);
+        let sock_opts = SocketOpts::for_service();
 
         // Create the control channel and run it *before* the pool: the pool
         // takes the control task's join handle, because a control channel
@@ -3783,6 +3780,9 @@ struct UdpWorkerGuard {
     workers: Arc<UdpWorkerMap>,
     req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     shutting_down: Arc<AtomicBool>,
+    /// Workers the pool retired on purpose: their exit must not ask for a
+    /// replacement.
+    retiring: Arc<std::sync::Mutex<std::collections::HashSet<usize>>>,
 }
 
 impl Drop for UdpWorkerGuard {
@@ -3793,15 +3793,25 @@ impl Drop for UdpWorkerGuard {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&self.id)
             .is_some();
-        if removed && !self.shutting_down.load(Ordering::Relaxed) {
-            debug!(
-                "UDP data channel {} exited, requesting a replacement",
-                self.id
-            );
-            // Fails only when the control channel is gone; the pool loop
-            // breaks on its own in that case.
-            let _ = self.req_tx.send(DataChannelRequest::Plain);
+        if !removed || self.shutting_down.load(Ordering::Relaxed) {
+            return;
         }
+        let retired = self
+            .retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+        if retired {
+            debug!("UDP data channel {} retired", self.id);
+            return;
+        }
+        debug!(
+            "UDP data channel {} exited, requesting a replacement",
+            self.id
+        );
+        // Fails only when the control channel is gone; the pool loop
+        // breaks on its own in that case.
+        let _ = self.req_tx.send(DataChannelRequest::Plain);
     }
 }
 
@@ -3820,6 +3830,10 @@ struct UdpWorkerSet {
     req_tx: mpsc::UnboundedSender<DataChannelRequest>,
     /// Set while the pool shuts down, so an exit asks for nothing.
     shutting_down: Arc<AtomicBool>,
+    /// Workers retired on purpose, so their exit asks for nothing.
+    retiring: Arc<std::sync::Mutex<std::collections::HashSet<usize>>>,
+    /// When each live worker was started: the idle-retirement age.
+    spawned: std::collections::HashMap<usize, Instant>,
     /// The next worker id, and the round-robin cursor a route starts from.
     next: usize,
 }
@@ -3841,18 +3855,20 @@ impl UdpWorkerSet {
     ) where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+        let (tx, rx) = mpsc::channel(UDP_QUEUE_SIZE);
         let id = self.next;
         self.next = self.next.wrapping_add(1);
         self.workers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, tx);
+        self.spawned.insert(id, Instant::now());
         let guard = UdpWorkerGuard {
             id,
             workers: Arc::clone(&self.workers),
             req_tx: self.req_tx.clone(),
             shutting_down: Arc::clone(&self.shutting_down),
+            retiring: Arc::clone(&self.retiring),
         };
         tokio::spawn(udp_forward_worker(
             Arc::clone(l),
@@ -3862,6 +3878,73 @@ impl UdpWorkerSet {
             buffer_size,
             guard,
         ));
+    }
+}
+
+/// Ask the client for one more UDP worker when the socket is dropping
+/// datagrams, at most once a second. The client enforces its own ceiling.
+fn note_udp_pressure(
+    worker_set: &UdpWorkerSet,
+    last_growth: &mut Instant,
+    outcome: UdpRouteOutcome,
+) {
+    if outcome == UdpRouteOutcome::Enqueued || last_growth.elapsed() < Duration::from_secs(1) {
+        return;
+    }
+    *last_growth = Instant::now();
+    debug!("UDP pool under pressure, asking for one more worker");
+    let _ = worker_set.req_tx.send(DataChannelRequest::Plain);
+}
+
+/// Retire one worker that has held no peer for 30 s, never the last one.
+///
+/// Dropping its sender closes the worker's queue; the task exits, and the
+/// guard sees the id in the retiring set, so its exit asks for no replacement.
+fn retire_idle_udp_worker(
+    worker_set: &mut UdpWorkerSet,
+    workers: &UdpWorkerMap,
+    routes: &UdpRouteMap,
+) {
+    // A worker carrying many peers is the signal that the set should grow
+    // *before* its queue overflows: ask for one more, and let the client
+    // enforce max_udp_workers. The pressure is recomputed every second, so a
+    // saturated worker gets another sibling on the next tick.
+    let mut per_worker: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let pinned: std::collections::HashSet<usize> = {
+        let guard = routes.lock().unwrap_or_else(PoisonError::into_inner);
+        for route in guard.values() {
+            *per_worker.entry(route.worker).or_default() += 1;
+        }
+        guard.values().map(|route| route.worker).collect()
+    };
+    let busiest = per_worker.values().copied().max().unwrap_or(0);
+    if busiest > 8
+        && workers.lock().unwrap_or_else(PoisonError::into_inner).len() < usize::from(u16::MAX)
+    {
+        debug!("A UDP worker carries {busiest} peers, asking for another");
+        let _ = worker_set.req_tx.send(DataChannelRequest::Plain);
+    }
+    let mut live = workers.lock().unwrap_or_else(PoisonError::into_inner);
+    if live.len() <= 1 {
+        return;
+    }
+    let candidate = worker_set
+        .spawned
+        .iter()
+        .filter(|(id, started)| {
+            !pinned.contains(*id) && started.elapsed() >= Duration::from_secs(30)
+        })
+        .map(|(id, _)| *id)
+        .max();
+    if let Some(id) = candidate {
+        live.remove(&id);
+        worker_set.spawned.remove(&id);
+        worker_set
+            .retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id);
+        debug!("Retiring idle UDP worker {id}");
     }
 }
 
@@ -3894,6 +3977,8 @@ where
         workers: Arc::new(Mutex::new(HashMap::new())),
         req_tx: data_ch_req_tx.clone(),
         shutting_down: Arc::new(AtomicBool::new(false)),
+        retiring: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        spawned: std::collections::HashMap::new(),
         next: 0,
     };
     let workers = Arc::clone(&worker_set.workers);
@@ -3910,6 +3995,13 @@ where
     });
     register_udp_pool(&shared);
     let mut worker_set = worker_set;
+    // Growth is driven by pressure, at most once a second: a queue-full
+    // datagram asks the client for one more worker, which it honours up to
+    // its own max_udp_workers. Retirement is the mirror: a worker with no
+    // pinned peer for 30 s is dropped, and its exit asks for nothing.
+    let mut last_growth = Instant::now();
+    let mut retire_tick = time::interval(Duration::from_secs(1));
+    retire_tick.tick().await;
     // One socket reader: `recv_from` is the single entry point for all
     // visitors, and the affinity table below decides the channel. A single
     // reader also means one slow worker can never stall other peers.
@@ -3960,13 +4052,14 @@ where
                     // longer than it arrives as its prefix (see the buffer
                     // comment above).
                     let n = n.min(buffer_size);
-                    match route_udp_datagram(
+                    let outcome = route_udp_datagram(
                         &workers,
                         &routes,
                         &mut worker_set.next,
                         from,
                         Bytes::copy_from_slice(&buf[..n]),
-                    ) {
+                    );
+                    match outcome {
                         UdpRouteOutcome::Enqueued => {}
                         UdpRouteOutcome::DroppedQueueFull => {
                             UDP_DROPS_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
@@ -3975,6 +4068,7 @@ where
                             UDP_DROPS_NO_WORKER.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    note_udp_pressure(&worker_set, &mut last_growth, outcome);
                 }
                 // Linux surfaces a stale ICMP error (the recipient of an
                 // earlier datagram has gone) as ECONNREFUSED on the next
@@ -3989,6 +4083,7 @@ where
                     return Err(e).with_context(|| "UDP service socket failed");
                 }
             },
+            _ = retire_tick.tick() => retire_idle_udp_worker(&mut worker_set, &workers, &routes),
             _ = sweep.tick() => {
                 // Evict idle affinity entries so address churn (e.g. scans)
                 // cannot grow the table unboundedly. Expiry only re-shards a
@@ -4274,7 +4369,7 @@ mod tests {
     }
 
     /// A lane and a tunnel draw on the **same** session counter, which is what
-    /// makes `[server.data].max_tunnels_per_client` a bound on the carrier
+    /// makes `[server.data].max_tunnels` a bound on the carrier
     /// connections one client holds rather than on one kind of them.
     #[cfg(all(mh_l3_server, feature = "multiplex"))]
     // The module-level waiver cannot carry `expect_used`: this test is gated on
@@ -4382,7 +4477,7 @@ mod tests {
         let routes = Arc::new(Mutex::new(HashMap::new()));
         let mut rxs = Vec::new();
         for id in 0..n {
-            let (tx, rx) = mpsc::channel(DEFAULT_UDP_SENDQ_SIZE);
+            let (tx, rx) = mpsc::channel(UDP_QUEUE_SIZE);
             workers.lock().unwrap().insert(id, tx);
             rxs.push(rx);
         }

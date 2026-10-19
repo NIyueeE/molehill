@@ -3,9 +3,6 @@ use std::net::SocketAddr;
 use super::{AddrMaybeCached, NoiseStream, TcpTransport, Transport};
 use crate::common::owned_write::AsyncWriteOwned;
 use crate::config::{NoiseConfig, TransportConfig};
-use crate::transport::noise_resume::{
-    self, ClientResumeCache, NOISE_RESUME_SELECTOR, ResumeRequest, ServerResumeStore,
-};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use base64::Engine;
@@ -14,221 +11,86 @@ use snow::params::NoiseParams;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
-/// Parsed Noise key material from `[transport.noise]`.
+/// The one handshake every session speaks.
 ///
-/// Shared by the Noise transport (TCP control/data channels) and the KCP
-/// tunnel path (arm 2 of the transport comparison), where the same Noise
-/// handshake rides on a KCP byte stream instead of TCP — only the plaintext
-/// leg is replaced, keys and pattern are unchanged.
+/// KK is fixed rather than configured: both ends already know each other's
+/// static key, so the handshake authenticates both directions and no config
+/// can select an anonymous suite. Declaring it once here is what lets the
+/// server refuse a plaintext control channel by name.
+pub(crate) const NOISE_PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
+
+/// Parsed KK key material: this host's private key and the peer's public key.
+///
+/// Shared by the TCP transport (control and, when enabled, data) and the KCP
+/// tunnel path, where the same handshake rides on a KCP byte stream instead.
 #[derive(Clone)]
 pub(crate) struct NoiseKeys {
-    config: NoiseConfig,
     params: NoiseParams,
     local_private_key: Vec<u8>,
-    remote_public_key: Option<Vec<u8>>,
-    psk: Option<(u8, Vec<u8>)>,
-    /// Session resume is opt-in (`[transport.noise].resume`): the client's
-    /// ticket cache and the server's ticket store live with the keys, so
-    /// every connection of every transport built from these keys shares
-    /// them. Without the feature the stores exist but are never used.
-    resume: bool,
-    client_cache: std::sync::Arc<ClientResumeCache>,
-    server_store: std::sync::Arc<ServerResumeStore>,
+    remote_public_key: Vec<u8>,
 }
-
-/// The error a declined resume produces: the caller re-dials and runs a
-/// full handshake instead.
-#[derive(Debug)]
-pub(crate) struct ResumeDeclined;
-
-impl std::fmt::Display for ResumeDeclined {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the server declined the noise session resume")
-    }
-}
-
-impl std::error::Error for ResumeDeclined {}
 
 impl std::fmt::Debug for NoiseKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{:?}", self.config)
+        write!(f, "NoiseKeys({NOISE_PATTERN})")
     }
 }
 
-/// The outcome of a client's resume attempt. The stream is boxed in the
-/// resumed variant so the enum stays small (`NoiseStream` carries three
-/// 64 KiB buffer references and the pin-projected inner stream).
-enum ResumeAttempt<S> {
-    /// Resume is off or nothing is cached: the stream is untouched.
-    NotAttempted(S),
-    /// The session resumed.
-    Resumed(Box<NoiseStream<S>>),
-    /// The server declined: the connection is spent.
-    Declined,
+fn decode_key(encoded: &str, what: &str) -> Result<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("Failed to decode the Noise {what}"))?;
+    anyhow::ensure!(
+        bytes.len() == 32,
+        "The Noise {what} must decode to 32 bytes, got {}",
+        bytes.len()
+    );
+    Ok(bytes)
 }
 
 impl NoiseKeys {
-    /// Parse and validate a `[transport.noise]` block. When no local private
-    /// key is configured, an ephemeral keypair is generated (matching the
-    /// long-standing `NoiseTransport` behavior).
+    /// Parse a KK key pair. The parser has already validated both keys; this
+    /// repeats the length check because the transport is also built by tests
+    /// that construct a config directly.
     pub(crate) fn from_config(config: &NoiseConfig) -> Result<Self> {
-        let builder = Builder::new(config.pattern.parse()?);
-
-        let remote_public_key = match &config.remote_public_key {
-            Some(x) => Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(x)
-                    .with_context(|| "Failed to decode remote_public_key")?,
-            ),
-            None => None,
-        };
-
-        let local_private_key = match &config.local_private_key {
-            Some(x) => base64::engine::general_purpose::STANDARD
-                .decode(x.as_bytes())
-                .with_context(|| "Failed to decode local_private_key")?,
-            None => builder.generate_keypair()?.private,
-        };
-
-        let params: NoiseParams = config.pattern.parse()?;
-
-        let psk = match &config.psk {
-            Some(psk_b64) => {
-                let psk_location = config.psk_location.unwrap_or(0);
-                let psk_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(psk_b64.as_bytes())
-                    .with_context(|| "Failed to decode psk")?;
-                Some((psk_location, psk_bytes))
-            }
-            None => None,
-        };
-
+        let params: NoiseParams = NOISE_PATTERN.parse()?;
         Ok(NoiseKeys {
-            config: config.clone(),
             params,
-            client_cache: std::sync::Arc::new(ClientResumeCache::default()),
-            server_store: std::sync::Arc::new(ServerResumeStore::new(&local_private_key)),
-            resume: config.resume.unwrap_or(false),
-            local_private_key,
-            remote_public_key,
-            psk,
+            local_private_key: decode_key(&config.private_key, "private_key")?,
+            remote_public_key: decode_key(&config.public_key, "public_key")?,
         })
     }
 
     fn builder(&self) -> Result<Builder<'_>> {
-        let mut builder =
-            Builder::new(self.params.clone()).local_private_key(&self.local_private_key)?;
-        if let Some(x) = &self.remote_public_key {
-            builder = builder.remote_public_key(x)?;
-        }
-        if let Some((loc, key)) = &self.psk {
-            // snow 0.10 takes a fixed-size PSK slice; a key of another length
-            // fails here, which is where the length is really checked. The
-            // parser only stores the decoded string, so this is the first
-            // place that can refuse it (docs/configuration.md says the same).
-            builder = builder.psk(*loc, key.as_slice().try_into()?)?;
-        }
-        Ok(builder)
+        Ok(Builder::new(self.params.clone())
+            .local_private_key(&self.local_private_key)?
+            .remote_public_key(&self.remote_public_key)?)
     }
 
-    /// Whether this key set is configured for session resume.
-    fn resume_enabled(&self) -> bool {
-        self.resume
-    }
-
-    /// The client's half of a resume attempt: announce the selector, run
-    /// the exchange, and report the outcome.
-    async fn try_resume<S>(&self, mut stream: S) -> Result<ResumeAttempt<S>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
-    {
-        let Some(server_static) = self.remote_public_key.as_deref() else {
-            return Ok(ResumeAttempt::NotAttempted(stream)); // no known static key
-        };
-        let Some(request) = ResumeRequest::build(&self.client_cache, server_static)? else {
-            return Ok(ResumeAttempt::NotAttempted(stream)); // nothing cached
-        };
-        stream.write_all(&[NOISE_RESUME_SELECTOR]).await?;
-        stream.flush().await?;
-        match noise_resume::client_resume(&mut stream, &request, &self.client_cache).await? {
-            Some(cipher) => Ok(ResumeAttempt::Resumed(Box::new(NoiseStream::from_resumed(
-                stream, cipher,
-            )))),
-            None => Ok(ResumeAttempt::Declined),
-        }
-    }
-
-    /// Run the Noise handshake as the initiator (client side) over any byte
-    /// stream. A resume attempt comes first when one is configured and
-    /// cached; a decline surfaces as [`ResumeDeclined`] so the caller can
-    /// re-dial with a full handshake.
-    pub(crate) async fn wrap_initiator<S>(&self, stream: S) -> Result<NoiseStream<S>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
-    {
-        if self.resume_enabled() {
-            match self.try_resume(stream).await? {
-                ResumeAttempt::Resumed(stream) => return Ok(*stream),
-                ResumeAttempt::Declined => return Err(ResumeDeclined.into()),
-                ResumeAttempt::NotAttempted(stream) => {
-                    return self.wrap_initiator_full(stream).await;
-                }
-            }
-        }
-        self.wrap_initiator_full(stream).await
-    }
-
-    /// The initiator's full handshake, always: the selector byte, the
-    /// Noise exchange, and (when resume is configured) the ticket that
-    /// makes the *next* connection resumable.
-    pub(crate) async fn wrap_initiator_full<S>(&self, mut stream: S) -> Result<NoiseStream<S>>
+    /// Run the initiator's side of the KK handshake over any byte stream.
+    pub(crate) async fn wrap_initiator<S>(&self, mut stream: S) -> Result<NoiseStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
     {
         stream.write_all(&[crate::protocol::NOISE_SELECTOR]).await?;
         stream.flush().await?;
-        let state = self.builder()?.build_initiator()?;
-        // The ticket exchange runs on every full handshake, on both sides:
-        // the initiator's `want` byte is what tells the responder an
-        // exchange follows, so gating it per side would deadlock (or
-        // reframe the peer's bytes as payload). What the *configuration*
-        // decides is whether a ticket is issued (responder) and whether a
-        // cached one is attempted (initiator) — an empty answer is a
-        // well-formed "no", not an error.
-        let static_for_cache = self.remote_public_key.clone().unwrap_or_default();
-        NoiseStream::handshake_and_take_ticket(stream, state, &self.client_cache, &static_for_cache)
+        NoiseStream::handshake(stream, self.builder()?.build_initiator()?)
             .await
             .with_context(|| "Failed to do noise handshake")
     }
 
-    /// Run the Noise handshake as the responder (server side) over any byte
-    /// stream, issuing a session-resume ticket when configured.
+    /// Run the responder's side of the KK handshake over any byte stream.
     pub(crate) async fn wrap_responder<S>(&self, stream: S) -> Result<NoiseStream<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
     {
-        // The exchange always runs (see `wrap_initiator_full`); the store
-        // decides whether this handshake earns a ticket.
-        let store = self.resume_enabled().then(|| &*self.server_store);
-        NoiseStream::handshake_and_issue_ticket(stream, self.builder()?.build_responder()?, store)
+        NoiseStream::handshake(stream, self.builder()?.build_responder()?)
             .await
             .with_context(|| "Failed to do noise handshake")
     }
-
-    /// The responder's half of a resume attempt: read the request, verify
-    /// it, and return the resumed stream. `Ok(None)` means the request was
-    /// declined (the caller drops the connection).
-    pub(crate) async fn run_resume<S>(&self, mut stream: S) -> Result<Option<NoiseStream<S>>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + AsyncWriteOwned,
-    {
-        match noise_resume::server_resume(&mut stream, &self.server_store).await? {
-            Some(cipher) => Ok(Some(NoiseStream::from_resumed(stream, cipher))),
-            None => Ok(None),
-        }
-    }
 }
 
+#[doc(hidden)]
 pub struct NoiseTransport {
     tcp: TcpTransport,
     keys: NoiseKeys,
@@ -241,8 +103,7 @@ impl std::fmt::Debug for NoiseTransport {
 }
 
 impl NoiseTransport {
-    /// Dial the endpoint (no transport upgrade), for the resume attempt
-    /// and its full-handshake fallback.
+    /// Dial the endpoint without a transport upgrade.
     #[cfg(feature = "client")]
     async fn dial(&self, addr: &AddrMaybeCached) -> Result<TcpStream> {
         self.tcp
@@ -256,10 +117,9 @@ impl NoiseTransport {
 impl Transport for NoiseTransport {
     type Acceptor = TcpListener;
     type RawStream = TcpStream;
-    // `snow` supplies the crypto: the ring-accelerated ChaChaPoly data
-    // path serves every pattern (see the `noise` feature in Cargo.toml);
-    // `NoiseStream` (noise_stream.rs) wraps the stream in tokio IO with
-    // the u16-framed message format.
+    // `snow` supplies the crypto: the ring-accelerated ChaChaPoly data path
+    // is used for the fixed KK handshake; `NoiseStream` wraps the stream in
+    // tokio IO with the u16-framed message format.
     type Stream = super::NoiseStream<TcpStream>;
 
     fn new(config: &TransportConfig) -> Result<Self> {
@@ -289,15 +149,7 @@ impl Transport for NoiseTransport {
 
     #[cfg(feature = "client")]
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
-        match self.keys.wrap_initiator(self.dial(addr).await?).await {
-            Ok(stream) => Ok(stream),
-            // A declined resume consumed its connection: re-dial and run
-            // the full handshake, which re-issues the ticket.
-            Err(e) if e.downcast_ref::<ResumeDeclined>().is_some() => {
-                self.keys.wrap_initiator_full(self.dial(addr).await?).await
-            }
-            Err(e) => Err(e),
-        }
+        self.keys.wrap_initiator(self.dial(addr).await?).await
     }
 }
 
@@ -309,82 +161,51 @@ mod tests {
         reason = "tests unwrap and expect on values they just constructed"
     )]
     use super::*;
-    use crate::config::{MaskedString, NoiseConfig, TransportConfig};
+    use crate::config::MaskedString;
     use crate::transport::Transport;
     use base64::Engine;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
 
-    const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
-
-    /// A server static keypair, base64-encoded the way the config carries it.
-    fn server_keypair() -> (String, String) {
-        let params = PATTERN.parse().unwrap();
-        let keypair = snow::Builder::new(params).generate_keypair().unwrap();
+    /// A KK pair for one host: the private key it keeps and the public key its
+    /// peer records.
+    fn keypair() -> (String, String) {
+        let params = NOISE_PATTERN.parse().unwrap();
+        let pair = snow::Builder::new(params).generate_keypair().unwrap();
         let engine = base64::engine::general_purpose::STANDARD;
-        (
-            engine.encode(keypair.private),
-            engine.encode(keypair.public),
-        )
+        (engine.encode(pair.private), engine.encode(pair.public))
     }
 
-    /// A full handshake first caches a ticket; a second server with the same
-    /// static key but a fresh ticket store declines it. The client must then
-    /// re-dial and complete a *third* full handshake instead of surfacing the
-    /// decline as a connection failure.
+    /// The fixed KK handshake carries a payload both ways, and the transport
+    /// builds it from the two static keys alone.
     #[tokio::test]
-    async fn a_declined_resume_redials_and_falls_back_to_a_full_handshake() {
-        let (server_private, server_public) = server_keypair();
+    async fn a_kk_pair_carries_a_payload() {
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
         let server_cfg = NoiseConfig {
-            pattern: PATTERN.to_owned(),
-            local_private_key: Some(MaskedString::from(server_private.as_str())),
-            remote_public_key: None,
-            psk: None,
-            psk_location: None,
-            resume: Some(true),
+            public_key: client_public,
+            private_key: MaskedString::from(server_private.as_str()),
         };
         let client_cfg = NoiseConfig {
-            pattern: PATTERN.to_owned(),
-            local_private_key: None,
-            remote_public_key: Some(server_public),
-            psk: None,
-            psk_location: None,
-            resume: Some(true),
+            public_key: server_public,
+            private_key: MaskedString::from(client_private.as_str()),
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_a = NoiseKeys::from_config(&server_cfg).unwrap();
-        let server_b = NoiseKeys::from_config(&server_cfg).unwrap();
+        let server_keys = NoiseKeys::from_config(&server_cfg).unwrap();
         let server = tokio::spawn(async move {
-            // 1. Full handshake; this issues the ticket the client caches.
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
             let mut selector = [0u8; 1];
+            let mut stream = stream;
             stream.read_exact(&mut selector).await.unwrap();
             assert_eq!(selector[0], crate::protocol::NOISE_SELECTOR);
-            let _first = server_a.wrap_responder(stream).await.unwrap();
-
-            // 2. The resume reaches a server that has a different store, so the
-            //    ticket cannot open: `run_resume` sends the decline verdict.
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream.read_exact(&mut selector).await.unwrap();
-            assert_eq!(selector[0], NOISE_RESUME_SELECTOR);
-            assert!(
-                server_b.run_resume(stream).await.unwrap().is_none(),
-                "the fresh store must decline the old ticket"
-            );
-
-            // 3. The client's fallback re-dial: a fresh full handshake, then
-            //    the data path.
-            let (mut stream, _) = listener.accept().await.unwrap();
-            stream.read_exact(&mut selector).await.unwrap();
-            assert_eq!(selector[0], crate::protocol::NOISE_SELECTOR);
-            let mut third = server_b.wrap_responder(stream).await.unwrap();
+            let mut stream = server_keys.wrap_responder(stream).await.unwrap();
             let mut ping = [0u8; 4];
-            third.read_exact(&mut ping).await.unwrap();
+            stream.read_exact(&mut ping).await.unwrap();
             assert_eq!(&ping, b"ping");
-            third.write_all(b"pong").await.unwrap();
+            stream.write_all(b"pong").await.unwrap();
         });
 
         let client_transport: NoiseTransport = Transport::new(&TransportConfig {
@@ -394,11 +215,6 @@ mod tests {
         .unwrap();
         let target = AddrMaybeCached::new(&addr.to_string());
         let result = timeout(Duration::from_secs(10), async move {
-            // First connection: full handshake, which caches the ticket.
-            let first = client_transport.connect(&target).await.unwrap();
-            drop(first);
-            // Second connection: resume is declined, and `connect` must
-            // transparently re-dial for the third (full) handshake.
             let mut stream = client_transport.connect(&target).await.unwrap();
             stream.write_all(b"ping").await.unwrap();
             let mut pong = [0u8; 4];
@@ -406,7 +222,7 @@ mod tests {
             assert_eq!(&pong, b"pong");
         })
         .await;
-        result.expect("the resume fallback timed out");
+        result.expect("the KK round trip timed out");
         timeout(Duration::from_secs(10), server)
             .await
             .expect("the server task timed out")

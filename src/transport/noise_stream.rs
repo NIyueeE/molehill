@@ -51,38 +51,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use bytes::{Bytes, BytesMut};
 
 use crate::common::owned_write::AsyncWriteOwned;
-use crate::transport::noise_resume::ResumedCipher;
 
 const TAG_LEN: usize = 16;
-/// The record cipher of an established stream: the handshake-derived
-/// stateful transport state, or the symmetric-only state of a resumed
-/// session (`noise_resume`).
-enum RecordCipher {
-    Snow(TransportState),
-    Resumed(ResumedCipher),
-}
-
-impl RecordCipher {
-    /// Encrypt one record into `out`, returning its wire length.
-    fn encrypt(&mut self, plaintext: &[u8], out: &mut [u8]) -> Result<usize, snow::Error> {
-        match self {
-            RecordCipher::Snow(t) => t.write_message(plaintext, out),
-            RecordCipher::Resumed(c) => c.encrypt(plaintext, out).map_err(|_| {
-                snow::Error::Input // a record buffer sizing bug: impossible on a sized record
-            }),
-        }
-    }
-
-    /// Decrypt one record into `out`, returning its plaintext length.
-    fn decrypt(&mut self, ciphertext: &[u8], out: &mut [u8]) -> Result<usize, snow::Error> {
-        match self {
-            RecordCipher::Snow(t) => t.read_message(ciphertext, out),
-            RecordCipher::Resumed(c) => {
-                c.decrypt(ciphertext, out).map_err(|_| snow::Error::Decrypt)
-            }
-        }
-    }
-}
 /// Largest Noise message: the wire format carries a `u16` length.
 const MAX_MESSAGE_LEN: usize = u16::MAX as usize;
 /// Bound for a *handshake* message (not a record): every pattern the
@@ -168,6 +138,7 @@ impl Drop for RecordBuffers {
 /// Errors the wrapper surfaces: the handshake or transport state machine
 /// failed, or the underlying IO failed.
 #[derive(Debug)]
+#[doc(hidden)]
 pub enum NoiseStreamError {
     Snow(snow::Error),
     Io(std::io::Error),
@@ -195,8 +166,6 @@ impl std::fmt::Display for NoiseStreamError {
 }
 
 impl std::error::Error for NoiseStreamError {}
-
-type NoiseStreamResult<T> = Result<T, NoiseStreamError>;
 
 #[derive(Debug, Clone, Copy)]
 enum ReadState {
@@ -233,11 +202,12 @@ enum WriteState {
 }
 
 #[pin_project]
+#[doc(hidden)]
 pub struct NoiseStream<T> {
     #[pin]
     inner: T,
 
-    transport: RecordCipher,
+    transport: TransportState,
     read_state: ReadState,
     write_state: WriteState,
     write_clean_waker: Option<Waker>,
@@ -279,48 +249,40 @@ impl<T> NoiseStream<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    pub async fn handshake_with_verifier<F: FnOnce(&[u8]) -> NoiseStreamResult<()>>(
+    /// Run the fixed KK handshake over the inner stream.
+    ///
+    /// Handshake messages are bounded by KK's tokens (two key exchanges plus
+    /// tags), far below the buffer below; snow rejects a larger message, so a
+    /// corrupt frame fails loudly instead of truncating.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer's frame is malformed or the handshake does not
+    /// verify.
+    pub async fn handshake(
         mut inner: T,
         mut state: HandshakeState,
-        verifier: F,
-    ) -> Result<(Self, Vec<u8>), NoiseStreamError> {
-        let mut f = Some(verifier);
-        // Handshake messages are bounded by the pattern's tokens: at most
-        // three key exchanges (≤ 56 bytes each for X448) plus tags and at
-        // most one 32-byte PSK per message — under 300 bytes for every
-        // pattern the config accepts. Stack buffers keep the setup path
-        // free of the two 64 KiB per-turn heap allocations the snowstorm
-        // original made (512 KiB per connection pair). snow rejects a
-        // message that does not fit, so an unexpected pattern fails the
-        // handshake loudly instead of truncating; the inbound length is
-        // checked for the same reason.
+    ) -> Result<Self, NoiseStreamError> {
         let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
         let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
-        // Taken before the loop so a failed handshake returns the set to
-        // the pool through its Drop.
+        // Taken before the loop so a failed handshake returns the set to the
+        // pool through its Drop.
         let bufs = RecordBuffers::take();
         loop {
             if state.is_handshake_finished() {
-                // Captured before the state is consumed: the session's
-                // handshake hash is the cached secret a later resume
-                // proves possession of (`noise_resume`).
-                let handshake_hash = state.get_handshake_hash().to_vec();
-                let transport = RecordCipher::Snow(state.into_transport_mode()?);
-                return Ok((
-                    Self {
-                        inner,
-                        transport,
-                        read_state: ReadState::ReadingRecord,
-                        write_state: WriteState::Idle,
-                        write_clean_waker: None,
-                        bufs,
-                        read_start: 0,
-                        read_filled: 0,
-                        read_expected: UNKNOWN_FRAME_LEN,
-                        payload_len: 0,
-                    },
-                    handshake_hash,
-                ));
+                let transport = state.into_transport_mode()?;
+                return Ok(Self {
+                    inner,
+                    transport,
+                    read_state: ReadState::ReadingRecord,
+                    write_state: WriteState::Idle,
+                    write_clean_waker: None,
+                    bufs,
+                    read_start: 0,
+                    read_filled: 0,
+                    read_expected: UNKNOWN_FRAME_LEN,
+                    payload_len: 0,
+                });
             }
 
             if state.is_my_turn() {
@@ -348,96 +310,7 @@ where
                 }
                 inner.read_exact(&mut message[..len]).await?;
                 state.read_message(&message[..len], &mut payload)?;
-                if let Some(pubkey) = state.get_remote_static()
-                    && let Some(verifier) = f.take()
-                {
-                    verifier(pubkey)?;
-                }
             }
-        }
-    }
-
-    /// Run the handshake, returning the stream and the session's
-    /// handshake hash (the cached secret a resume proves possession of).
-    async fn handshake_with_hash(
-        inner: T,
-        state: HandshakeState,
-    ) -> Result<(Self, Vec<u8>), NoiseStreamError> {
-        Self::handshake_with_verifier(inner, state, |_| Ok(())).await
-    }
-
-    /// The plain handshake: no verifier, no resume material. Production
-    /// callers use the resume-aware variants below; this one remains the
-    /// simplest form (and the one the unit tests drive).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production connections run the resume-aware variants"
-        )
-    )]
-    #[inline]
-    pub async fn handshake(inner: T, state: HandshakeState) -> Result<Self, NoiseStreamError> {
-        let (stream, _hash) = Self::handshake_with_hash(inner, state).await?;
-        Ok(stream)
-    }
-
-    /// Run the initiator's side of a full handshake and then the resume
-    /// ticket exchange, caching the ticket under the server's static key.
-    /// The resulting stream is an ordinary handshake-derived one.
-    pub async fn handshake_and_take_ticket(
-        inner: T,
-        state: HandshakeState,
-        cache: &crate::transport::noise_resume::ClientResumeCache,
-        server_static: &[u8],
-    ) -> Result<Self, NoiseStreamError>
-    where
-        T: AsyncWriteOwned,
-    {
-        let (mut stream, handshake_hash) = Self::handshake_with_hash(inner, state).await?;
-        if !server_static.is_empty() {
-            crate::transport::noise_resume::client_take_ticket(
-                &mut stream,
-                cache,
-                server_static,
-                &handshake_hash,
-            )
-            .await?;
-        }
-        Ok(stream)
-    }
-
-    /// Run the responder's side of a full handshake and then the ticket
-    /// exchange, issuing a ticket when resume is configured.
-    pub async fn handshake_and_issue_ticket(
-        inner: T,
-        state: HandshakeState,
-        store: Option<&crate::transport::noise_resume::ServerResumeStore>,
-    ) -> Result<Self, NoiseStreamError>
-    where
-        T: AsyncWriteOwned,
-    {
-        let (mut stream, handshake_hash) = Self::handshake_with_hash(inner, state).await?;
-        crate::transport::noise_resume::server_issue_ticket(&mut stream, store, &handshake_hash)
-            .await?;
-        Ok(stream)
-    }
-
-    /// Build a stream that speaks a resumed session's record cipher. The
-    /// exchange itself (`noise_resume::client_resume` /
-    /// `server_resume`) ran on the raw socket before this point.
-    pub(crate) fn from_resumed(inner: T, cipher: ResumedCipher) -> Self {
-        Self {
-            inner,
-            transport: RecordCipher::Resumed(cipher),
-            read_state: ReadState::ReadingRecord,
-            write_state: WriteState::Idle,
-            write_clean_waker: None,
-            bufs: RecordBuffers::take(),
-            read_start: 0,
-            read_filled: 0,
-            read_expected: UNKNOWN_FRAME_LEN,
-            payload_len: 0,
         }
     }
 }
@@ -476,7 +349,7 @@ where
                         // cipher) is not worth an unsafe block here.
                         let mut record = BytesMut::zeroed(LENGTH_FIELD_LEN + payload_len + TAG_LEN);
                         let message_len = transport
-                            .encrypt(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
+                            .write_message(&buf[..payload_len], &mut record[LENGTH_FIELD_LEN..])
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         // `message_len` is bounded by MAX_MESSAGE_LEN
                         // (u16::MAX); an impossible overrun is an error,
@@ -497,7 +370,7 @@ where
                         continue;
                     }
                     let message_len = transport
-                        .encrypt(
+                        .write_message(
                             &buf[..payload_len],
                             &mut write_message_buffer[LENGTH_FIELD_LEN..],
                         )
@@ -679,7 +552,7 @@ where
                             // a memset for `ReadBuf::uninit` callers.
                             let out = read_buf.initialize_unfilled_to(plaintext_len);
                             let n = transport
-                                .decrypt(ciphertext, out)
+                                .read_message(ciphertext, out)
                                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                             if n > 0 {
                                 read_buf.advance(n);
@@ -694,7 +567,7 @@ where
                         // the record is empty): stage the plaintext and
                         // serve it progressively.
                         let n = transport
-                            .decrypt(ciphertext, &mut this.bufs.payload[..])
+                            .read_message(ciphertext, &mut this.bufs.payload[..])
                             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                         *this.payload_len = n;
                         if n > 0 {
@@ -1033,147 +906,5 @@ mod tests {
             s.read_exact(&mut buf).await.unwrap();
             assert_eq!(buf, payload, "round {round}");
         }
-    }
-
-    /// Time N full-handshake pairs (with the ticket exchange) and
-    /// return the per-pair microseconds.
-    fn time_full_pairs(
-        rt: &tokio::runtime::Runtime,
-        params: &snow::params::NoiseParams,
-        server_keypair: &snow::Keypair,
-        store: &std::sync::Arc<crate::transport::noise_resume::ServerResumeStore>,
-        cache: &std::sync::Arc<crate::transport::noise_resume::ClientResumeCache>,
-        n: usize,
-    ) -> f64 {
-        let mut total_us = 0f64;
-        for _ in 0..n {
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let store = std::sync::Arc::clone(store);
-            let cache = std::sync::Arc::clone(cache);
-            let params = params.clone();
-            let server_static = server_keypair.public.clone();
-            let server_private = server_keypair.private.clone();
-            let started = std::time::Instant::now();
-            rt.block_on(async move {
-                let (client_stream, server_stream) = tokio::join!(
-                    NoiseStream::handshake_and_take_ticket(
-                        client_io,
-                        Builder::new(params.clone())
-                            .remote_public_key(&server_static)
-                            .unwrap()
-                            .build_initiator()
-                            .unwrap(),
-                        &cache,
-                        &server_static,
-                    ),
-                    NoiseStream::handshake_and_issue_ticket(
-                        server_io,
-                        Builder::new(params)
-                            .local_private_key(&server_private)
-                            .unwrap()
-                            .build_responder()
-                            .unwrap(),
-                        Some(&store),
-                    )
-                );
-                client_stream.unwrap();
-                server_stream.unwrap();
-            });
-            total_us += started.elapsed().as_secs_f64() * 1e6;
-        }
-        // Dividing by the pair count through u32 keeps the division
-        // exact (n is far below 2^32).
-        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
-    }
-
-    /// Time N resumed exchanges and return the per-pair microseconds.
-    fn time_resumed_pairs(
-        rt: &tokio::runtime::Runtime,
-        store: &std::sync::Arc<crate::transport::noise_resume::ServerResumeStore>,
-        cache: &std::sync::Arc<crate::transport::noise_resume::ClientResumeCache>,
-        server_static: &[u8],
-        n: usize,
-    ) -> f64 {
-        let mut total_us = 0f64;
-        for _ in 0..n {
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let store = std::sync::Arc::clone(store);
-            let cache = std::sync::Arc::clone(cache);
-            let server_static = server_static.to_vec();
-            let request =
-                crate::transport::noise_resume::ResumeRequest::build(&cache, &server_static)
-                    .unwrap()
-                    .unwrap();
-            let started = std::time::Instant::now();
-            rt.block_on(async move {
-                let (_, _) = tokio::join!(
-                    async {
-                        let mut client_io = client_io;
-                        client_io
-                            .write_all(&[crate::transport::noise_resume::NOISE_RESUME_SELECTOR])
-                            .await
-                            .unwrap();
-                        crate::transport::noise_resume::client_resume(
-                            &mut client_io,
-                            &request,
-                            &cache,
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap()
-                    },
-                    async {
-                        let mut server_io = server_io;
-                        server_io.read_u8().await.unwrap(); // the selector
-                        crate::transport::noise_resume::server_resume(&mut server_io, &store)
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    }
-                );
-            });
-            total_us += started.elapsed().as_secs_f64() * 1e6;
-        }
-        // Dividing by the pair count through u32 keeps the division
-        // exact (n is far below 2^32).
-        total_us / f64::from(u32::try_from(n).unwrap_or(u32::MAX))
-    }
-
-    /// Setup-cost comparison for the session-resume path (release mode —
-    /// see `handshake_phase_attribution`): a full-handshake pair (with
-    /// the ticket exchange) versus a resumed pair, both over a tokio
-    /// duplex so the exchange records and the IO are included. The DH
-    /// turns are what the resume removes.
-    #[test]
-    fn resume_setup_cost() {
-        use crate::transport::noise_resume::{ClientResumeCache, ServerResumeStore};
-
-        const N: usize = 200;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let params: snow::params::NoiseParams =
-            "Noise_NK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
-        let server_keypair = Builder::new(params.clone()).generate_keypair().unwrap();
-        let store = std::sync::Arc::new(ServerResumeStore::new(&server_keypair.private));
-        let cache = std::sync::Arc::new(ClientResumeCache::default());
-
-        // One full pair with the ticket exchange, timed. The cache is
-        // kept across repetitions, like a long-lived client's.
-        let full = time_full_pairs(&rt, &params, &server_keypair, &store, &cache, N);
-        // Then N resumed exchanges from the cached ticket.
-        let resumed = time_resumed_pairs(&rt, &store, &cache, &server_keypair.public, N);
-
-        eprintln!(
-            "resume setup cost (release build, N={N}):\n  \
-             full handshake + ticket: {:7.2} us\n  \
-             resumed exchange:        {:7.2} us\n  \
-             saving:                  {:7.2} us",
-            full,
-            resumed,
-            full - resumed,
-        );
-        assert!(resumed < full, "the resume path did not remove the DH cost");
     }
 }

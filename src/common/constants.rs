@@ -41,19 +41,25 @@ pub const TCP_COPY_BUFFER_SIZE: usize = 32 * 1024;
 #[cfg(any(feature = "client", feature = "server"))]
 pub const FORWARD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Default number of data channels a UDP service's worker set uses
-/// (`[client.services.<name>].udp_workers`).
+/// The default ceiling on a UDP service's worker set
+/// (`[client.services.<name>].max_udp_workers`).
 ///
-/// A UDP service's channels are its *workers*: the server shards distinct
-/// visitors across them (session affinity) and the pool keeps at least as many
-/// tunnels as the workers need, so this is the one per-service channel count
-/// that survives. A TCP service has no worker set — one data channel is opened
-/// per visitor, on demand.
-pub const DEFAULT_UDP_WORKERS: u16 = 2;
+/// A UDP service starts with **one** data channel and the server asks for
+/// another when its affinity/queue state needs one, up to this ceiling. The
+/// set is therefore demand-driven rather than configured at its final width.
+pub const DEFAULT_MAX_UDP_WORKERS: u16 = 2;
 
-/// Queue size for visitor-bound UDP datagrams per data channel, on both the
-/// server (affinity routing queue) and the client (channel writer queue).
-pub const DEFAULT_UDP_SENDQ_SIZE: usize = 1024;
+/// The hard ceiling on `max_udp_workers`, like the pool cap: a configuration
+/// typo is clamped rather than obeyed.
+pub const MAX_UDP_WORKERS_CAP: u16 = 64;
+
+/// Queue depth of one UDP data channel's writer, on both ends. Internal: the
+/// policy that matters is `CoDel`'s sojourn target below, not a queue length.
+pub const UDP_QUEUE_SIZE: usize = 1024;
+
+/// `CoDel`'s sojourn target for UDP: a datagram that has waited longer than this
+/// in a queue is dropped instead of being delivered late.
+pub const UDP_CODEL_TARGET: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Default total yamux receive window (bytes) advertised per tunnel, on both
 /// ends.
@@ -166,7 +172,7 @@ pub const MAX_TRANSPARENT_LANES: u16 = 1024;
 /// The cost is linear in the claim count, and the configuration page prices it:
 /// `lanes x claims` connections, each a socket, ~2.6 file descriptors and
 /// 0.5-0.8 MiB RSS on **both** ends, and a slot in the server's
-/// `[server.data].max_tunnels_per_client` valve (unlimited by default).
+/// `[server.data].max_tunnels` valve (unlimited by default).
 pub const DEFAULT_CLAIM_LANES: u16 = 2;
 
 // The pool no longer reaps idle tunnels (`[client.data].idle_timeout` and this
@@ -174,9 +180,20 @@ pub const DEFAULT_CLAIM_LANES: u16 = 2;
 // at service start and kept, so that the capacity a deployment offers does not
 // depend on what it happened to be doing a minute ago.
 
-/// Default idle timeout (seconds) after which an inactive UDP peer mapping is
-/// cleaned up on the client side.
-pub const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
+/// The adaptive lifetime of one UDP peer mapping.
+///
+/// A peer that talks steadily keeps its mapping (and the local source port the
+/// service sees); a peer that has gone quiet gives it back. Four times the
+/// largest gap observed for that peer, bounded to 30-300 s: the lower bound
+/// keeps a bursty game session alive between rounds, and the upper bound is
+/// the same resource guard the fixed timeout used to be. Pure and logged by
+/// the caller.
+#[must_use]
+pub fn udp_lifetime(max_gap: std::time::Duration) -> std::time::Duration {
+    const MIN: std::time::Duration = std::time::Duration::from_secs(30);
+    const MAX: std::time::Duration = std::time::Duration::from_secs(300);
+    (max_gap.saturating_mul(4)).clamp(MIN, MAX)
+}
 
 /// Time-to-live (seconds) for the server-side UDP session-affinity table.
 ///
@@ -187,10 +204,139 @@ pub const DEFAULT_UDP_IDLE_TIMEOUT_SECS: u64 = 60;
 #[cfg(feature = "server")]
 pub const UDP_ROUTE_TTL_SECS: u64 = 300;
 
+/// The adaptive cap on a control channel's reconnect backoff, in seconds.
+///
+/// **The cap follows the failure count, not the clock.** A server that is
+/// restarting (or a laptop that changed networks) is reachable again in
+/// seconds, and hammering it with the same one-second retry a client uses for
+/// a five-hour outage is what turns one restart into a reconnect storm. The
+/// sequence doubles with each consecutive failure and stops at a minute:
+/// 1, 2, 4, 8, 16, 32, 60, 60, ... A session that stayed up for more than a
+/// few seconds starts over (see `ClientSession::drive`), so the sequence
+/// describes one outage rather than a process's lifetime.
+///
+/// An explicit `retry_backoff_max` replaces it for every step. The function is
+/// pure and logged where it is used, so a deployment can say which cap the
+/// client chose without guessing from the timing.
 #[cfg(feature = "client")]
-pub fn run_control_chan_backoff(interval: u64) -> ExponentialBuilder {
+#[must_use]
+pub fn backoff_cap(failures: u32) -> u64 {
+    const STEPS: [u64; 6] = [1, 2, 4, 8, 16, 32];
+    STEPS.get(failures as usize).copied().unwrap_or(60)
+}
+
+#[cfg(feature = "client")]
+pub fn run_control_chan_backoff(cap_secs: u64) -> ExponentialBuilder {
     ExponentialBuilder::default()
         .with_factor(3.0)
-        .with_max_delay(Duration::from_secs(interval))
+        .with_max_delay(Duration::from_secs(cap_secs))
         .with_jitter()
+}
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    use super::backoff_cap;
+
+    #[test]
+    fn the_backoff_cap_doubles_then_stops_at_a_minute() {
+        assert_eq!(backoff_cap(0), 1);
+        assert_eq!(backoff_cap(1), 2);
+        assert_eq!(backoff_cap(2), 4);
+        assert_eq!(backoff_cap(3), 8);
+        assert_eq!(backoff_cap(4), 16);
+        assert_eq!(backoff_cap(5), 32);
+        assert_eq!(backoff_cap(6), 60);
+        assert_eq!(backoff_cap(u32::MAX), 60, "the cap is bounded");
+    }
+}
+
+/// The adaptive control-channel heartbeat cadence, in seconds.
+///
+/// The heartbeat is a liveness check, and how often it must run follows how
+/// many sessions one server carries: a handful of clients need a short beat to
+/// notice a dead one quickly, while a busy server would spend more time
+/// writing heartbeats than serving. The tiers are 30 s up to eight sessions,
+/// 60 s up to 32, and 120 s above that; a configured
+/// `[server.control].heartbeat_interval` replaces this entirely, and 0 turns
+/// the heartbeat off. The function is pure and logged where it is used.
+#[must_use]
+pub fn heartbeat_interval_for(sessions: usize) -> u64 {
+    if sessions <= 8 {
+        30
+    } else if sessions <= 32 {
+        60
+    } else {
+        120
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::heartbeat_interval_for;
+
+    #[test]
+    fn the_heartbeat_cadence_follows_the_session_count() {
+        assert_eq!(heartbeat_interval_for(0), 30);
+        assert_eq!(heartbeat_interval_for(8), 30);
+        assert_eq!(heartbeat_interval_for(9), 60);
+        assert_eq!(heartbeat_interval_for(32), 60);
+        assert_eq!(heartbeat_interval_for(33), 120);
+        assert_eq!(heartbeat_interval_for(usize::MAX), 120);
+    }
+}
+
+/// The adaptive global tunnel cap, derived from the process's open-file limit.
+///
+/// A tunnel and a lane are each one file descriptor, so the soft `RLIMIT_NOFILE`
+/// is the one hard ceiling the operator already set for the process. Half of it
+/// is left for listeners, accepted visitors, backends and the control channels;
+/// 64 more are held back for everything that is not a tunnel. A limit that
+/// cannot be read answers 0 (unlimited), which is the same value the operator
+/// writes to disable the valve: refusing every tunnel because `/proc` is absent
+/// would be worse than not capping at all.
+#[must_use]
+#[cfg(feature = "multiplex")]
+pub fn max_tunnels_for(soft_nofile: u64) -> usize {
+    if soft_nofile == 0 {
+        return 0;
+    }
+    usize::try_from((soft_nofile / 2).saturating_sub(64)).unwrap_or(usize::MAX)
+}
+
+/// The process's soft open-file limit, or 0 when it cannot be read.
+///
+/// Linux exposes it in `/proc/self/limits`. Other platforms answer 0, which
+/// makes the derived cap unlimited: the valve is an optimisation, never a
+/// correctness requirement.
+#[must_use]
+#[cfg(feature = "multiplex")]
+pub fn soft_nofile() -> u64 {
+    let Ok(limits) = std::fs::read_to_string("/proc/self/limits") else {
+        return 0;
+    };
+    for line in limits.lines() {
+        if let Some(rest) = line.strip_prefix("Max open files") {
+            let mut fields = rest.split_whitespace();
+            if let Some(soft) = fields.next()
+                && let Ok(value) = soft.parse::<u64>()
+            {
+                return value;
+            }
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+#[cfg(feature = "multiplex")]
+mod max_tunnels_tests {
+    use super::max_tunnels_for;
+
+    #[test]
+    fn the_global_cap_leaves_room_for_everything_else() {
+        assert_eq!(max_tunnels_for(0), 0, "unreadable = unlimited");
+        assert_eq!(max_tunnels_for(128), 0, "half of 128 minus 64");
+        assert_eq!(max_tunnels_for(1024), 448);
+        assert!(max_tunnels_for(u64::MAX) > 1_000_000);
+    }
 }

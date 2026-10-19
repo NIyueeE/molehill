@@ -10,7 +10,7 @@ two roles runs two processes.
 Ready-to-run configurations, systemd units and container deployments live
 in [Deployment & examples](./deployment.md).
 
-See [Transport](./transport.md) for more details about encryption and the `transport` block.
+See [Transport](./transport.md) for the Noise keypairs and the data-encryption switch.
 
 Page index:
 
@@ -47,7 +47,7 @@ file says.
 
 A typical setup:
 
-1. Pick a transport — `plain` or `noise` — and, for `noise`, generate a keypair (see [Transport](./transport.md)).
+1. Generate one X25519 keypair per host with `molehill --genkey` (see [Transport](./transport.md)).
 2. Write `server.toml`: `[server]` with `default_token` and the `allow_ports` whitelist, plus `[server.control].bind_addr`. That's all.
 3. Write `client.toml`: `[client]` with the same `default_token`, `[client.control].default_remote_addr`, and one `[client.services.<name>]` block per service: `local_addr` (where your service listens) and `remote_bind_addr` (the public endpoint).
 4. Start the server first, then the client. Both run indefinitely; the client retries automatically while the server is unreachable.
@@ -69,7 +69,7 @@ A typical setup:
 > `[client.transport].type = "tcp"` → `"plain"`;
 > `[client.transport.tcp].proxy` → `[client.transport].proxy`;
 > `[client.transport.tcp].nodelay` / `keepalive_secs` / `keepalive_interval`
-> were removed (fixed internal defaults; the per-service `nodelay` remains);
+> were removed (fixed internal defaults). The per-service `nodelay` key is removed in 0.11.2: TCP_NODELAY is always on.
 > the `tls` and `websocket` transport values were removed in 0.8: only
 > `"plain"` and `"noise"` remain, and the `[client.transport.tls]` /
 > `[client.transport.websocket]` / `[server.transport.tls]` /
@@ -84,10 +84,10 @@ A typical setup:
 > (`default_data_addr`, `tunnels`) — so they read
 > distinctly from the per-service overlay keys on
 > `[client.services.<name>]` (`protocol`, `remote_addr`, `token`,
-> `retry_interval`, `transport`, `udp_workers`,
+> `retry_interval`, `transport` (both removed in 0.11.2), `max_udp_workers`,
 > `udp_forwarder_ipv6`, `udp_send_queue_size`, ...; new in 0.8).
-> `[client.transport]` keeps `type`/`noise` unprefixed: its per-service
-> overrides live in the nested `transport` table, so there is no same-name
+> The 0.8 `[client.transport]` table was replaced in 0.11.2 by `[client.noise]` (see the 0.11.2 migration above).
+> The per-service key is `[client.services.<name>.noise]`.
 > collision at the service level (the `default_` prefix exists to
 > disambiguate exactly that).
 > Old keys are rejected (`deny_unknown_fields`), never silently ignored.
@@ -117,15 +117,17 @@ A typical setup:
 > channel negotiates its frame format. A 0.11.0 peer (v5.0) is refused on the
 > connection it happens on, in both directions. Upgrade both ends together;
 > there is no mixed-version deployment.
-> **The control channel must now use Noise**: add a `[server.transport.noise]`
-> block on the server, `[client.transport].type = "noise"` with a
-> `[client.transport.noise]` block on the client, or
-> `[transparent.transport.noise]` on an L3 client — one key pair per end, from
-> `molehill --genkey`. A plain control channel is refused at startup, because
-> it carries the credential every data channel authenticates with. That is the
-> only migration step for a deployment that already ran Noise; a service or an
-> L3 *lane* may still be plain, which is the per-service `transport` override
-> you already have.
+> **Upgrading to 0.11.2 (flat Noise tables)**: the handshake is fixed KK and
+> the wire tables are flat. Replace `[client.transport]` / `[client.transport.noise]`
+> with `[client.noise]`, `[server.transport.noise]` with `[server.noise]`, and
+> `[transparent.transport.noise]` with `[transparent.noise]`; rename
+> `local_private_key` to `private_key` and `remote_public_key` to
+> `public_key`. KK needs both sides' keys, so the server adds the client's
+> public key and the client adds its own private key (one `molehill --genkey`
+> per host). `type = "noise"` becomes the absent `data_enable` (default true),
+> and `type = "plain"` becomes `data_enable = false`. `pattern`, `psk`,
+> `psk_location`, `resume` and `proxy` have no replacement. See
+> [Transport](./transport.md#migrating).
 
 ### Migrating to 0.10: removed keys
 
@@ -140,9 +142,9 @@ write). Write this instead:
 |---|---|
 | `[client.data].default_count` | Nothing: the pool's width is `[client.data].tunnels`, default 4 |
 | `[client.services.<name>].count` | Nothing: the pool belongs to the session rather than to one service. `[client.data].tunnels` (or the service's own) is its width |
-| `[client.services.<name>].pool_size` | `[client.services.<name>].udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
+| `[client.services.<name>].pool_size` | `[client.services.<name>].max_udp_workers` for a UDP service (default 2). A TCP service opens one data channel per visitor, on demand |
 | `[client.services.<name>].heartbeat_timeout` | Nothing: the server declares its cadence in the session ack and the client derives the timeout from it. `[client.control].default_heartbeat_timeout` remains as an optional floor |
-| `[server].max_pool_size` | `[server.data].max_tunnels_per_client` (the carrier connections one client may hold; 0 = unlimited) |
+| `[server].max_pool_size` | `[server.data].max_tunnels` (the server-wide cap on live tunnels and lanes; unset = open-file-derived, 0 = unlimited) |
 | `[client.services.<name>].health_check` | Nothing: a service stays registered for as long as its client runs; a request that cannot be forwarded fails for that visitor |
 
 The next section states what each of the replacements does and what it costs;
@@ -183,6 +185,28 @@ there is no shrink clock to configure:
 | `[client.data.kcp]` | `[client.data].tunnels` — the same |
 | `[client.data].idle_timeout` | Nothing: a pinned pool is never reaped for idleness, so there is no timeout to set |
 
+### Migrating to 0.11.2: one pool per session
+
+A forwarding client holds one tunnel pool for its whole control session now, so
+the keys that described a per-service width or a pool-ownership switch are
+gone:
+
+| Removed key | Write instead |
+|---|---|
+| `[client.services.<name>].tunnels` | `[client.data].tunnels`: it is the session's total width, and every service of the session draws on it |
+| `[client.data].shared_pool` | Nothing: one pool per session is the only shape. Its width is `[client.data].tunnels` |
+| `[client.services.<name>].nodelay` | Nothing: every forwarded connection has TCP_NODELAY on |
+| `[client.services.<name>].udp_workers` | `[client.services.<name>].max_udp_workers`: the ceiling on the worker set, not the count it starts with |
+| `[client.services.<name>].udp_send_queue_size` | Nothing: the queue is internal and uses CoDel |
+| `[client.services.<name>].udp_idle_timeout` | Nothing: a peer mapping's lifetime follows the peer's own traffic |
+| `[client.services.<name>].udp_forwarder_ipv6` | Nothing: the forwarder follows the address family of `local_addr` |
+| `[client.control].default_retry_interval` | `[client.control].retry_backoff_max`: the key names the retry cap; unset means the adaptive 1-60 s default |
+| `[client.services.<name>].retry_interval` | `[client.services.<name>].retry_backoff_max`: unset inherits `[client.control].retry_backoff_max` |
+| `[transparent.control].default_retry_interval` | `[transparent.control].retry_backoff_max`: the same cap, for the L3 client |
+| `[transparent.claims.<name>].retry_interval` | `[transparent.claims.<name>].retry_backoff_max`: unset inherits `[transparent.control].retry_backoff_max` |
+| `[transparent.claims.<name>].tunnels` | `[transparent.data].tunnels`: a claim's lane count is its share of the client's budget |
+| `[server.data].max_tunnels_per_client` | `[server.data].max_tunnels`: the valve is global now; unset derives it from the open-file limit and 0 is unlimited |
+
 ## Choosing your configuration (decision tree)
 
 The first choice is the mode: `[client]` forwards to a local application,
@@ -200,7 +224,7 @@ in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
 ```mermaid
 flowchart TD
     A["Start: defaults<br/>tunnels=4,<br/>control Noise (required)"] --> B{"Does a service's payload<br/>carry its own crypto<br/>(TLS, SSH, WireGuard)?"}
-    B -- Yes --> C["that service: transport = { type = 'plain' }<br/>- cheaper, and no less protected"]
+    B -- Yes --> C["that service: data_enable = false<br/>- cheaper, and no less protected"]
     B -- No --> D{"Many concurrent<br/>visitor connections?"}
     C --> D
     D -- "> ~256 concurrent" --> G["tunnels = 8 or higher"]
@@ -220,10 +244,10 @@ flowchart TD
 | `tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
 | `tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling; measured worth +77 % throughput from one tunnel to eight on a clean fast path |
 | carrier | (no key) | the data plane dials KCP and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement. Measured, TCP is ahead in every unflagged cell and KCP's one win is UDP session quality at 100 ms RTT ([Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)) |
-| transport | `"plain"` | no encryption; lowest per-byte cost |
-| transport | `"noise"` | encrypted wire with a single pre-shared keypair, at a negligible RTT cost and no CPU penalty under full load |
+| `data_enable` | `false` | data channels are plain; lowest per-byte cost. The control channel stays KK |
+| `data_enable` | `true` (default) | every data and lane channel is wrapped in KK, at a small CPU cost and no extra round trip |
 | pool establishment | (no key) | the pool's `tunnels` connections are dialed at service start, not on the first visitor: nothing is paid at request time, and the cost is `tunnels` idle connections (measured at 0.5–0.8 MiB RSS and 2.6 FDs each, no threads) |
-| `udp_workers` | 2 (default) | UDP only: how many data channels the service's worker set uses. Distinct visitors shard across them; one visitor is never split across channels (session affinity). It is a fan-out, not a capacity knob: it does not raise the service's datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic) |
+| `max_udp_workers` | 2 (default) | UDP only: the ceiling on the service's worker set. It starts one data channel and grows only when the server asks (queue pressure), then retires an idle worker; distinct visitors shard across the live workers and one visitor is never split across channels. It does not raise the datagram ceiling, whose measurement is in [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic) |
 
 The measured cost of each option — including the figures these trade-offs come
 from, and their provenance — is in [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
@@ -240,72 +264,57 @@ Here is the full configuration specification:
 [client]
 default_token = "change-me" # Necessary. Must match `[server].default_token`
 
-[client.control] # Necessary. Control-channel defaults: authentication, registration, heartbeat
+[client.control]
 default_remote_addr = "example.com:2333" # Necessary. The address of the server
 # default_heartbeat_timeout = 65 # Optional. Application-layer heartbeat timeout. Unset (the default) derives it from the cadence the server declares in the session ack: `max(10 s, 2 × server.control.heartbeat_interval + 5 s)`. A value below that floor is refused at startup (it would time out a healthy server); 0 disables the check
-default_retry_interval = 1 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay starts at 1 s, grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap), for 3 retries; once the backoff is exhausted the client falls back to a fixed 1 s retry loop. Default: 1 second
+retry_backoff_max = 30 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap). Unset = adaptive: 1, 2, 4, 8, 16, 32, then 60 s as consecutive failures grow. Set a value to pin the cap for every outage
 
-[client.data] # Optional. Data-plane defaults for every service (feature `multiplex`, part of the default build). Each service can override `tunnels` individually — see the per-service keys in `[client.services.*]` below
+[client.data]
 # default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). The KCP sessions dial that address over UDP, so a TCP control channel and the KCP data plane can share one port (distinct protocols)
-# tunnels = 4 # Optional. The pool's width: how many carrier connections this client holds for a service (or, with `shared_pool`, for a session). Default: 4, raised to the UDP-derived floor of the services that share the pool. Validated `>= 1` and `>=` that floor; clamped to 1..=64
-# shared_pool = false # Optional. Serve every service of one control session from ONE tunnel pool (true), instead of one pool per service (false, the default). Both are one code path; they differ only in the pool's key
+# tunnels = 4 # Optional. The session's single pool width: how many carrier connections the client holds for every service it carries. Default: 4. Must be `>= 1`; values above 64 are clamped
 # The carrier is deliberately **not** a key here: the data plane tries KCP (feature `kcp`) and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. A transparent claim goes further and moves a lane *while it runs*: each lane is measured (what the server offered it, what that lane's queue refused there, what the client injected off it), and a lane whose carrier is refusing a material share of what it is offered is handed over to the other one — the peer stops placing new flows in it, and it is retired once both ends agree it holds nothing, so a running flow finishes where it is and nothing is reordered. `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one, for a measurement or a test that needs the paths apart — it also disables the fallback and the automatic move
 
-[client.transport] # Required. How the wire is wrapped; applies to both planes
-type = "noise" # Required, and `"noise"` is the only value the daemon accepts: the control channel carries the credential every data channel authenticates with, so a plain control leg is refused at startup. A *service* may still override it to `"plain"` below
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Client only. Connect to the server through an `http`/`socks5` proxy
 
-[client.transport.noise] # Required. Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # Optional. This client's own key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # Required: the server's public key # security-scan:allow documentation example key
-psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
+[client.noise]
 
-[client.services.service1] # A service that needs forwarding. The name identifies the service (shown in logs)
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # Necessary. The client private key, base64 32 bytes
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # Necessary. The server public key, base64 32 bytes; the handshake is fixed KK
+data_enable = true # Optional. Encrypt this client data channels (tunnels and lanes). Default: true; the control channel is always Noise
+
+[client.services.service1]
 protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp". A service that must own its public ip:port instead is not a forwarding service at all: it belongs to a `[transparent]` block, which is its own run mode — see "Transparent (L3) services" below
 local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
 remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
-nodelay = true # Optional. TCP_NODELAY for this service's data channels. Default: true even when unset; set `false` to disable
-retry_interval = 1 # Optional. Per-service cap of the reconnect backoff, with the same semantics as `client.control.default_retry_interval`. Default: inherits `client.control.default_retry_interval`
+retry_backoff_max = 30 # Optional. This service's cap of the reconnect backoff, with the same semantics as `client.control.retry_backoff_max`. Default: inherits `client.control.retry_backoff_max`, then the adaptive default
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder
 remote_addr = "server2.example.com:2333" # Optional. Override `client.control.default_remote_addr` for this service only — its control channel (and, by default, its data plane) dials this server. Lets one client spread services across several molehill servers
-# tunnels = 2 # Optional. This service's own pool width; inherits `[client.data].tunnels` when unset
-transport = { type = "plain" } # Optional. Per-service transport override: `type` ("noise" = encrypt, "plain" = plaintext; unset = follow `client.transport.type`) and `noise` keys (used when this service is encrypted; unset = use `client.transport.noise`). Lets one client run plain and encrypted services side by side — e.g. a service dialing a different server with its own public key
+# [client.services.service1.noise] # Optional. Per-service KK overrides: public_key and private_key (to dial another server with its own pair) and data_enable (to make this service data channels plain). Unset fields inherit [client.noise]
 
-[client.services.service2] # Multiple services can be defined
+[client.services.service2]
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. UDP services only: how many data channels this service's worker set uses; distinct visitors shard across them, and one visitor is never split across channels. The tunnel pool keeps at least the tunnels these channels need. Default: 2. It is a fan-out, not a capacity knob: the datagram ceiling is a property of the service and does not move with this value (many visitors saturate it at roughly 1 Gbit/s of 1400-byte datagrams), and datagrams beyond the ceiling are dropped — the design accepts that instead of head-of-line blocking other visitors, and `MOLEHILL_UDP_STATS` counts it (`queue_full`). Measurement: [Benchmarks](benchmarks.md#the-udp-queue-question-a-molehill-only-diagnostic)
-udp_forwarder_ipv6 = false # Optional. UDP services only: prefer IPv6 for the UDP forwarder's connection to the local service. Default: false
+max_udp_workers = 2 # Optional. UDP services only: the ceiling on this service's worker set (1..=64). The client starts one data channel and opens another only when the server asks, up to this value; idle workers retire. Default: 2
 udp_buffer_size = 2048 # Optional. UDP receive buffer in bytes. Default: 2048, maximum 65535
-udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped on the client (its local socket, i.e. the source port the local service sees, is recycled with it). Default: 60
-udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
 default_token = "change-me" # Necessary. Must match `[client].default_token`
 allow_ports = ["6000-6999", "8080"] # Necessary to enable dynamic registration. Empty or missing: ALL registrations are rejected. A requested port is admitted when one of these entries contains it — a literal port, or a range covering it, privileged ports (<1024) included
 
-[server.control] # Necessary. Control-channel listener
+[server.control]
 bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for clients. Generally only the port needs to be changed
-heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats; the client derives its own timeout from this declared cadence. Set to 0 to disable sending heartbeats. Default: 30 seconds
+heartbeat_interval = 30 # Optional. The interval between two application-layer heartbeats. Unset = adaptive: 30 s up to 8 sessions, 60 s up to 32, 120 s above. Set to 0 to disable heartbeats
 
-[server.data] # Optional. Data-plane listener (feature `multiplex`)
+[server.data]
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
 # stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `[transparent]` client's claims: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
-# max_tunnels_per_client = 0 # Optional. The operator's valve on the carrier connections ONE client may hold across every service of its session: a multiplexed data tunnel, or a transparent claim's lane (a lane is a connection of its own — a claim never multiplexes). A client whose configured `tunnels` / lane budget exceeds it has the extra establishments refused at startup (and retried by the repair tick), so it serves on what it got. 0 (the default) is unlimited. Over the cap a tunnel is refused with a typed answer naming the cap, and a lane is dropped with one INFO line naming the cap; the session keeps running
+# max_tunnels = 0 # Optional. The server-wide valve on live carrier connections: every multiplexed tunnel and every transparent lane of every client counts against it. Unset derives the cap from the process's open-file limit; 0 is unlimited. A connection over the cap is refused with a typed answer naming it, and the session keeps running
 
-[server.transport] # Required. Keys only — no `type`. Whether a connection is encrypted is the client's decision (every connection starts with a one-byte transport selector), but this server refuses to start without the keys: the control channel has to be able to speak Noise
-[server.transport.noise] # Required. Keys. Present = the server can accept Noise (selector 0x01)
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # Required: this server's own key # security-scan:allow documentation example key
-remote_public_key = "JKHGbV9Gf0MHYiX9EUi0FRkqr5A0LXwK7iO0Atba7FQ=" # Optional. The client's public key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
-psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key, base64-encoded; it must decode to exactly 32 bytes, a length checked only when a connection's Noise handshake is set up. The psk is used only when the configured `pattern` carries a PSK modifier at `psk_location` (e.g. Noise_KKpsk0_...); with a non-PSK pattern it is silently ignored, not rejected
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-resume = true # Optional. Noise session resume: a reconnect proves possession of the previous session's handshake hash instead of repeating the handshake's key exchanges (selector 0x02). Default: false. See `docs/transport.md`, "Noise session resume"
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # Necessary. This server private key, base64 32 bytes
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # Necessary. The client public key, base64 32 bytes; the handshake is fixed KK
 
-[server.transparent] # Optional, and this table IS the switch: its presence is what lets the server serve transparent (L3) clients at all. Without it a claim is refused by policy, before any device is looked at — serving L3 is what asks this process for a TUN device and the platform privilege, so the decision belongs to the operator, never to a remote client
+[server.transparent]
 tun = "molehill0" # Optional. The server's TUN device. Default: molehill0 on Linux and Windows, auto (a free utunN) on macOS. Linux: the operator creates it and routes every claim into it. macOS/Windows: the daemon creates it; the operator routes/forwards
 ```
 
@@ -319,7 +328,7 @@ There are no `[server.services.*]` blocks anymore. The lifecycle is:
    `carrier` it will use (tcp/kcp — a `kcp` carrier triggers the server's lazy
    UDP listener) and the UDP buffer size. The channel count is not part of the
    message: the client opens the channels it configured (one per visitor for
-   TCP, `udp_workers` for UDP, the carrier's lane share — long-lived connections
+   TCP, `max_udp_workers` for UDP, the carrier's lane share — long-lived connections
    — for a transparent claim) and the server asks for another when a visitor
    arrives or a channel ends.
 3. The server validates:
@@ -371,7 +380,7 @@ service always multiplexes (there is no `mode` to write), and a
   Independent TCP flows isolate head-of-line blocking (a lost segment stalls
   only its own tunnel) and aggregate beyond a single flow's congestion window.
   If a tunnel dies, opens transparently fall through to the survivors and the
-  repair tick dials a replacement. Default: 4 (raised to a UDP service's worker
+  repair tick dials a replacement. Default: 4
   count when that is larger); `1` reproduces single-tunnel behavior at a
   measured cost — one tunnel was the worst configuration on every path in the
   model's cells, because every stream then shares one congestion window.
@@ -392,7 +401,7 @@ service always multiplexes (there is no `mode` to write), and a
   comparison itself is in
   [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
   The crypto stack is unchanged — with
-  transport `noise` the same Noise handshake wraps each KCP session — and
+  data encryption on, the same Noise handshake wraps each KCP session — and
   yamux still carries the data channels, so `tunnels` applies as usual. The
   server opens its UDP listener lazily — the first registration that
   declares the `kcp` carrier triggers the bind, and a bind failure is a
@@ -442,8 +451,9 @@ bind_addr = "0.0.0.0:2333"
 [server.data]
 bind_addr = "0.0.0.0:2343"
 
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # Necessary. The client public key, base64 32 bytes; the handshake is fixed KK
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # Necessary. This server private key, base64 32 bytes
 ```
 
 ```toml
@@ -454,11 +464,12 @@ default_token = "change-me"
 [client.control]
 default_remote_addr = "server.example.com:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # Necessary. The client private key, base64 32 bytes
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # Necessary. The server public key, base64 32 bytes; the handshake is fixed KK
+data_enable = true # Optional. Encrypt this client data channels (tunnels and lanes). Default: true; the control channel is always Noise
 
 [client.data]
 default_data_addr = "server.example.com:2343"
@@ -482,8 +493,8 @@ change: the server adapts per connection and opens its KCP listener on the first
 registration that declares it (there
 is no per-carrier server configuration). The same overlay pattern covers the
 control defaults: `token` and `remote_addr` override `[client].default_token` and
-`[client.control].default_remote_addr`, and `retry_interval` overrides
-`default_retry_interval`. A service's heartbeat is not a per-service knob: one
+`[client.control].default_remote_addr`, and `retry_backoff_max` overrides
+`the control-wide cap`. A service's heartbeat is not a per-service knob: one
 session carries one timer, derived from the cadence the server declares (see
 `[client.control].default_heartbeat_timeout`). `default_data_addr` itself
 cannot be overridden per service — the data-plane endpoint follows the
@@ -562,7 +573,7 @@ capability. A server that only forwards `tcp`/`udp` services therefore
 needs no capability for this feature at all. Enabling L3 does have a
 consequence worth stating plainly: such a client is never encrypted, so a
 server that serves one accepts plaintext connections from it, whatever
-`[server.transport.noise]` says — the Noise keys keep applying to the clients
+`[server.noise]` says — the Noise keys keep applying to the clients
 that do negotiate them.
 
 **The daemon never installs a route, a rule or a firewall rule.** It has no
@@ -576,7 +587,8 @@ forwarding. The recipes are in
 
 | Key | Meaning |
 |---|---|
-| `[transparent]` | **the mode**: this block is what makes the process an L3 client, and it is where the client-wide half lives (`default_token`, `tun`, `control`, `data`, `transport`) |
+| `[transparent]` | **the mode**: this block is what makes the process an L3 client, and it is where the client-wide half lives (`default_token`, `tun`, `control`, `data`, `noise`) |
+| `[transparent.status]` | the optional read-only status API, the same shape as `[client.status]`: `bind_addr` and a non-empty `token` |
 | `[transparent.claims.<name>]` | one claimed public address. The name identifies the claim (shown in logs) |
 | `[transparent.claims.<name>].remote_bind_addr` | the public `ip:port` the client **claims**. Its port must be covered by the server's `allow_ports` — a claim is a registration like any other; the address has to be local on the client (the recipes assign it to the TUN device). IPv4 is written as `10.99.0.1:8443`, IPv6 as `[2001:db8::1]:8443` |
 | `[transparent].tun` | the TUN device the client attaches to. Default: `molehill0` on Linux and Windows, `auto` (a free `utunN`) on macOS |
@@ -605,7 +617,7 @@ that release takes raises the bulk column's absolute values, but the *shape* —
 the knee at two, the SLO cost past it — is the trade this table prices, and the
 SLO column is probe-bound rather than throughput-bound, so it does not move.) It is paid for in connections — `lanes x claims` of them, each a
 socket, **≈2.6 file descriptors and 0.5–0.8 MiB RSS on both ends**, plus a slot
-in the server's `[server.data].max_tunnels_per_client` valve (unlimited by
+in the server's `[server.data].max_tunnels` global valve (unset =
 default). A claim carrying a *single* flow gains nothing from any of them
 (1.966 / 1.962 / 2.050 / 2.087 Gbit/s from one lane to eight), so a client that
 serves many claims — or whose claims each carry one connection — should write
@@ -614,23 +626,21 @@ writing `tunnels` equal to the claim count is how a deployment that wants that
 behaviour back keeps it.
 
 Per-claim keys mirror a forwarding service's: `token`, `remote_addr`,
-`retry_interval`, `tunnels`. `[transparent.transport]` decides how the two
-wire stacks of an L3 client are built:
+`retry_backoff_max`, and `noise`. `[transparent.noise]` carries the KK key
+pair and the lanes' switch:
 
-- **The control channel is Noise, always.** The session nonce it publishes is
-  the credential every lane authenticates with, so a plain control leg would
-  hand that credential to everyone on the path. Its key pair lives in
-  `[transparent.transport.noise]` — required, and the same pair the lanes
-  inherit below. This is not configurable: it is what keeps the data plane's
-  credential off the wire.
+- **The control channel is KK, always.** The session nonce it publishes is the
+  credential every lane authenticates with, so a plain control leg would hand
+  that credential to everyone on the path. Its keys live in
+  `[transparent.noise]` and are required.
 - **The lanes are plain by default.** What a lane carries is the visitor's own
   IP packets — the visitor's TLS is the end-to-end protection, and per-packet
-  encryption spends CPU the carried flows did not ask for. `type = "noise"`
-  turns lane encryption on, using the control channel's key pair and pattern
-  (one key pair per host, inherited); a `[transparent.transport.noise]` block
-  written beside `type` overrides the keys for deployments where the lanes
-  must not share the control pair.
-- `proxy` applies to every connection this client dials (control and lanes).
+  encryption spends CPU the carried flows did not ask for.
+  `data_enable = true` turns lane encryption on with the same pair.
+- A claim may override the pair or the switch with
+  `[transparent.claims.<name>.noise]`; unset fields inherit
+  `[transparent.noise]`.
+- There is no dialing proxy key.
 
 and `[transparent].tun` is where a device is named.
 
@@ -700,8 +710,9 @@ allow_ports = ["8443"]
 bind_addr = "0.0.0.0:2333"
 
 # The control channel is always Noise — required
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # Necessary. The client public key, base64 32 bytes; the handshake is fixed KK
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # Necessary. This server private key, base64 32 bytes
 
 [server.transparent]
 tun = "molehill0"
@@ -718,8 +729,14 @@ tun = "molehill0"
 default_remote_addr = "203.0.113.5:2333"
 
 # The control channel's key pair — required
-[transparent.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # Necessary. The client private key, base64 32 bytes
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # Necessary. The server public key, base64 32 bytes; the handshake is fixed KK
+
+# The same read-only status API a forwarding client serves (optional)
+# [transparent.status]
+# bind_addr = "127.0.0.1:9090"
+# token = "a-long-random-string" # security-scan:allow documentation placeholder
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -804,18 +821,16 @@ beside `stripe_count`, the value it replaces.
 
 ## Tuning
 
-The step-by-step way to pick `tunnels` and the transport for
+The step-by-step way to pick `tunnels` and the data-encryption switch for
 your workload is the [decision tree](#choosing-your-configuration-decision-tree)
 above (with the trade-offs and how to validate them). This section covers
 the per-connection knobs.
 
 From v0.4.7, molehill enables TCP_NODELAY by default on every TCP connection: the control channel, the data-plane tunnels, both ends of each data channel, the visitor-facing sockets, and the client's connection towards the local service. This benefits latency and interactive applications like SSH, rdp, Minecraft servers. However, it slightly decreases the bandwidth.
 
-Only the client honours `nodelay`, and only on the two socket kinds the client creates for a service: its data-channel connections (a claim's lanes, and every channel in a build without the `multiplex` feature), and its TCP connection towards the local service. Every other socket stays nodelay regardless: the control channel is always set up with TCP_NODELAY at both ends, the client's multiplexed tunnels use those same control-channel options, and the server always applies its fixed latency-friendly defaults (nodelay + keepalive) to its end of every data channel and to the visitor-facing sockets. `nodelay = false` therefore cannot turn Nagle back on there.
 
 TCP keepalive is also enabled by default on these sockets (20s idle time, 8s probe interval), so pooled data channels that were silently dropped by NATs or middleboxes are detected instead of being handed out to visitors.
 
-If the bandwidth is more important, TCP_NODELAY can be opted out with `nodelay = false` per service — on the client-side sockets above.
 
 ## Status API
 
@@ -833,11 +848,12 @@ default_token = "the-servers-token" # security-scan:allow documentation placehol
 [client.control]
 default_remote_addr = "server.example.com:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # Necessary. The client private key, base64 32 bytes
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # Necessary. The server public key, base64 32 bytes; the handshake is fixed KK
+data_enable = true # Optional. Encrypt this client data channels (tunnels and lanes). Default: true; the control channel is always Noise
 
 [client.status]
 bind_addr = "127.0.0.1:9090"   # default suggestion: the loopback
@@ -847,6 +863,9 @@ token = "a-long-random-string" # required; every request needs it # security-sca
 local_addr = "127.0.0.1:8080"
 remote_bind_addr = "0.0.0.0:2334"
 ```
+
+A transparent (L3) client writes the same block as `[transparent.status]`; the
+answer carries its claims and their lanes beside its pools.
 
 Absent, the block is off: no listener, no port, nothing to probe. Present:
 
@@ -913,22 +932,23 @@ deployments are in [Deployment & examples](./deployment.md).
 
 - The datagram limit follows the service's `udp_buffer_size` (default 2048 bytes, up to 65535): a datagram larger than it is **truncated to that size** on the way in — the first `udp_buffer_size` bytes are delivered and the rest is discarded — so the channel stays usable but the payload is short. Measured on a `udp_buffer_size = 1024` service: a 2000-byte datagram arrives at the backend as 1024 bytes and its reply reaches the visitor as 1024 bytes. Size it for the largest datagram the service sends, configure it identically on both ends, and remember that the server enforces its own copy received at registration time.
 - **Session affinity**: all datagrams from one visitor address travel a single data channel and leave the client through one dedicated local socket for the visitor's whole session, so stateful UDP services (game servers like Minecraft Bedrock/RakNet, QUIC, WireGuard, ...) see a stable `(ip, port)` and their sessions stay intact.
-- A mapping (and its local socket) is cleaned up after `udp_idle_timeout` seconds (default 60) without traffic in either direction; the next datagram re-binds a fresh socket, which changes the source port the local service sees. Keep the default or raise it for long-lived stateful sessions.
+- A mapping (and its local socket) is cleaned up when the peer has been quiet for its adaptive lifetime: four times the largest gap observed for it, bounded to 30-300 s. The next datagram re-binds a fresh socket, which changes the source port the local service sees.
 
 ### Transports
 
-Transport setup — Noise keypairs, patterns and PSKs — is documented step by
-step in [Transport](./transport.md): pick the `type` in the specification
-above and follow that guide.
+Transport setup — the KK keypairs and `data_enable` — is documented step by
+step in [Transport](./transport.md): generate one keypair per host and write
+the peer's public key beside your private key.
 
-- **Proxy**: `[client.transport].proxy` only applies to the client's outbound
-  connections to the server (control channel, data-plane tunnels, and direct
-  data channels). Both `socks5` and `http` (CONNECT), with optional basic
-  auth, are supported. It is client-only; the server rejects it.
+- **Data encryption** is the only transport switch: `data_enable` (default
+  true for a forwarding client, false for a transparent one). The control
+  channel is always KK and has no switch.
+- **No proxy.** The dialer has no proxy implementation; a config that still
+  writes a proxy key is refused at startup.
 
 ### Hot reload
 
-- Editing the client config while running: general changes (transport, addresses, tokens, data-plane settings) restart the instance; adding, removing, or modifying a service applies without a restart (services are unregistered/re-registered over the existing control channels).
+- Editing the client config while running: general changes (Noise keys, addresses, tokens, data-plane settings) restart the instance; adding, removing, or modifying a service applies without a restart (services are unregistered/re-registered over the existing control channels).
 - Keep the file valid while editing — an invalid config is rejected at startup or reload, and the previous state keeps running.
 
 ### Multiple services and instances
@@ -948,10 +968,10 @@ above and follow that guide.
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |
 | Repeated `Heartbeat timed out` | The network path drops the connection, or the server stalls. A configured timeout *below* the derived floor does not appear here — it is refused at startup. |
-| Noise handshake fails | Keypairs, `psk`, or pattern mismatch between the two sides. |
-| `Proxy URL is missing the port` at startup | The `proxy` URL lacks a port; fix the config. |
-| UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; idle mappings time out after `udp_idle_timeout` seconds. |
-| Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer whose traffic idles longer than `udp_idle_timeout` is re-bound to a fresh local socket (new source port) on the next datagram — raise the timeout or send periodic traffic. |
+| Noise handshake fails | Keypairs do not match: each side needs its own private key and the other side's public key. |
+| `[client.transport]` / `[server.transport]` rejected at startup | The wire tables moved; write `[client.noise]` / `[server.noise]` (see the migration above). |
+| UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; a mapping is re-bound after its adaptive idle lifetime. |
+| Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer quiet for its adaptive lifetime is re-bound to a fresh local socket (new source port) on the next datagram — keep it talking or accept the re-bind. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |
 | An IPv6 claim's visitors get nothing | On Linux, assign the `/128`, add the `ip -6 rule from <addr>` and the `ip -6 route` in table 100, and enable `net.ipv6.conf.all.forwarding=1` on the server. The refusal prints the exact commands when the local address is missing. macOS needs an `inet6` pf rule; Windows needs a `/128` route and IPv6 forwarding. |
 | `Interface <tun> does not exist. Prepare it first` (Linux; client, or a registration rejection on the server) | On Linux a transparent service attaches to a device the operator creates. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). macOS/Windows create their own device. |

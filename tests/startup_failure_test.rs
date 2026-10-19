@@ -102,8 +102,9 @@ fn a_server_whose_control_port_is_taken_exits_with_the_reason() {
              [server.control]\n\
              bind_addr = \"{addr}\"\n\
              \n\
-             [server.transport.noise]\n\
-             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
+             [server.noise]\n\
+             public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+             private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

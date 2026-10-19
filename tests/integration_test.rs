@@ -51,19 +51,12 @@ const AFFINITY_PACKETS: usize = 64;
 // the transport fixtures, 2360-2366 to the session tests).
 const UDP_KNOBS_CONFIG: &str = "tests/for_udp/knob_effects.toml";
 const KNOB_SMALL_LOCAL: &str = "127.0.0.1:8102";
-const KNOB_IDLE_LOCAL: &str = "127.0.0.1:8103";
 const KNOB_SMALL_EXPOSED: &str = "127.0.0.1:2353";
-const KNOB_IDLE_EXPOSED: &str = "127.0.0.1:2354";
 /// The fixture's `udp_buffer_size`; the assertions below are written in terms
 /// of it so a changed fixture fails loudly instead of drifting.
 const KNOB_BUFFER_SIZE: usize = 1024;
 /// The fixture's `udp_idle_timeout`, and the silence the test waits out before
 /// expecting the mapping (and its local socket) to be gone.
-const KNOB_IDLE_TIMEOUT_SECS: u64 = 2;
-const KNOB_IDLE_SILENCE: f64 = 3.5;
-/// Datagrams sent inside one idle window before the silence starts.
-const KNOB_IDLE_BURST: usize = 4;
-
 // Ports for the transparent-visibility regression
 // (`dead_backend_fails_one_visitor_and_stays_registered`): one service whose
 // backend is not running, and one healthy service on the same client.
@@ -311,14 +304,13 @@ async fn multiplex_tunnel_pool() -> Result<()> {
     Ok(())
 }
 
-/// Noise session resume: the client caches the server's ticket on the
-/// first full handshake and the next control connection (after the
-/// client restarts) resumes the session instead of repeating the key
-/// exchanges (transport selector 0x02). The service must behave
-/// identically across the restart — same replies, same payloads.
+/// The fixed KK handshake after a client restart: the control channel is a
+/// fresh KK session with the same static keys, and the service must behave
+/// identically across the restart — same replies, same payloads. There is no
+/// resume path (selector 0x02 is gone), so this is an ordinary reconnect.
 #[cfg(feature = "noise")]
 #[tokio::test]
-async fn noise_session_resume() -> Result<()> {
+async fn noise_kk_survives_a_client_restart() -> Result<()> {
     init();
 
     spawn_tcp_backends();
@@ -326,13 +318,13 @@ async fn noise_session_resume() -> Result<()> {
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let client = tokio::spawn(async move {
-        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+        run_molehill_client("tests/for_tcp/noise_reconnect.toml", client_shutdown_rx)
             .await
             .unwrap();
     });
     settle(1.0).await;
     let server = tokio::spawn(async move {
-        run_molehill_server("tests/for_tcp/noise_resume.toml", server_shutdown_rx)
+        run_molehill_server("tests/for_tcp/noise_reconnect.toml", server_shutdown_rx)
             .await
             .unwrap();
     });
@@ -341,15 +333,14 @@ async fn noise_session_resume() -> Result<()> {
         .await
         .unwrap();
 
-    // Restart the client: the control channel reconnects and the resume
-    // path engages (the server's ticket from the first connection is
-    // cached client-side).
+    // Restart the client: the control channel reconnects with a fresh KK
+    // handshake and re-registers its services.
     info!("restart the client onto the resumed session");
     client_shutdown_tx.send(true)?;
     let _ = tokio::join!(client);
     let client_shutdown_rx = client_shutdown_tx.subscribe();
     let client = tokio::spawn(async move {
-        run_molehill_client("tests/for_tcp/noise_resume.toml", client_shutdown_rx)
+        run_molehill_client("tests/for_tcp/noise_reconnect.toml", client_shutdown_rx)
             .await
             .unwrap();
     });
@@ -1201,117 +1192,6 @@ async fn udp_buffer_size_bounds_a_datagram_without_breaking_the_channel() -> Res
 
     pair.stop().await;
     Ok(())
-}
-
-/// `udp_idle_timeout`: a peer mapping (and the local socket it owns) is
-/// recycled after the configured silence, and the *next* datagram from the
-/// same peer reaches the backend from a different source port — exactly the
-/// consequence `docs/configuration.md` documents, and the reason a stateful
-/// UDP session has to keep talking or raise the timeout.
-///
-/// Within the window the port must be stable instead: the first half is the
-/// existing affinity guarantee, observed here because the second half is
-/// meaningless without it.
-///
-/// The one assumption in the second half is that the kernel does not hand the
-/// very same ephemeral port back to the fresh socket; with the whole range in
-/// play that is a draw of one in tens of thousands, and it is the same
-/// assumption the affinity test above rests on in the other direction.
-#[tokio::test]
-async fn udp_idle_timeout_rebinds_the_peer_to_a_fresh_local_socket() -> Result<()> {
-    init();
-
-    // Every datagram's source address, in arrival order: the ports the backend
-    // observes are the only place the client's per-peer socket is visible.
-    let seen_srcs: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
-    let recorded = Arc::clone(&seen_srcs);
-    tokio::spawn(async move {
-        if let Err(e) = port_recording_echo_server(KNOB_IDLE_LOCAL, recorded).await {
-            panic!("Failed to run the port-recording UDP server for testing: {e:?}");
-        }
-    });
-
-    let pair = start_udp_knob_pair(KNOB_IDLE_EXPOSED).await?;
-
-    // One peer for the whole scenario: the mapping under test is this
-    // socket's, and re-binding the visitor would create a second peer whose
-    // ports say nothing about the first one.
-    let conn = UdpSocket::bind("127.0.0.1:0").await?;
-    conn.connect(KNOB_IDLE_EXPOSED).await?;
-    wait_for_udp_socket(&conn).await?;
-    // The readiness probes (the fixture helper's and this socket's) are behind
-    // this index, so the window below is exactly this test's own datagrams.
-    let settled = seen_srcs.lock().unwrap().len();
-
-    // A burst well inside the timeout: one peer, one socket, one port.
-    for i in 0..KNOB_IDLE_BURST {
-        conn.send(format!("inside-{i}").as_bytes()).await?;
-    }
-    let mut buf = [0u8; 64];
-    for _ in 0..KNOB_IDLE_BURST {
-        time::timeout(Duration::from_secs(5), conn.recv(&mut buf))
-            .await
-            .context("a datagram of the within-timeout burst went missing")??;
-    }
-    let within = {
-        let seen = seen_srcs.lock().unwrap();
-        seen[settled..].to_vec()
-    };
-    assert_eq!(
-        within.len(),
-        KNOB_IDLE_BURST,
-        "every datagram of the burst must have arrived: {within:?}"
-    );
-    let first_port = within[0].port();
-    assert!(
-        within.iter().all(|src| src.port() == first_port),
-        "every datagram inside udp_idle_timeout must leave one local socket: {within:?}"
-    );
-
-    // Now go quiet for longer than the timeout. Nothing in either direction
-    // resets the client's idle timer, so the forwarder (and its socket) is
-    // gone by the time the next datagram arrives; that datagram re-binds, and
-    // the backend sees the new bind.
-    settle(KNOB_IDLE_SILENCE).await;
-    conn.send(b"after-idle").await?;
-    time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
-        .await
-        .context("the datagram after the idle timeout was never echoed")??;
-
-    let after = {
-        let seen = seen_srcs.lock().unwrap();
-        seen[settled..].to_vec()
-    };
-    assert_eq!(
-        after.len(),
-        KNOB_IDLE_BURST + 1,
-        "the post-timeout datagram must have arrived: {after:?}"
-    );
-    let rebound_port = after.last().unwrap().port();
-    assert_ne!(
-        rebound_port, first_port,
-        "a peer idle for {KNOB_IDLE_TIMEOUT_SECS} s must be re-bound to a fresh local socket, \
-         so the backend sees a new source port; the observed addresses were {after:?}"
-    );
-
-    pair.stop().await;
-    Ok(())
-}
-
-/// Echo server for the idle-timeout scenario: records the source address of
-/// every datagram, in order (the affinity test's set is unordered and cannot
-/// show *which* datagram came from where).
-async fn port_recording_echo_server(
-    addr: &'static str,
-    seen: Arc<Mutex<Vec<SocketAddr>>>,
-) -> Result<()> {
-    let l = UdpSocket::bind(addr).await?;
-    let mut buf = [0u8; 2048];
-    loop {
-        let (n, from) = l.recv_from(&mut buf).await?;
-        seen.lock().unwrap().push(from);
-        l.send_to(&buf[..n], from).await?;
-    }
 }
 
 #[instrument]

@@ -32,11 +32,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -54,8 +53,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # 必需:控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### Noise(加密传输)
@@ -71,11 +71,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo="
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -92,8 +91,9 @@ allow_ports = ["5202"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM="
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### UDP 服务
@@ -106,11 +106,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 protocol = "udp"
@@ -129,8 +128,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # 必需:控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### 服务端与客户端合并到一个文件
@@ -146,11 +146,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -165,8 +164,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # 必需:控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### 通过代理连接
@@ -179,12 +179,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "127.0.0.1:2333"
 
-[client.transport]
-type = "noise"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -203,11 +201,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.iperf3-udp]
 protocol = "udp"
@@ -231,8 +228,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # 必需:控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ## 透明(L3)服务
@@ -299,8 +297,9 @@ allow_ports = ["8443"]
 bind_addr = "0.0.0.0:2333"
 
 # 必需:控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "molehill0"
@@ -316,8 +315,9 @@ tun = "molehill0"
 default_remote_addr = "<server-address>:2333"
 
 # 必需:控制通道始终使用 Noise
-[transparent.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
@@ -436,8 +436,9 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "<服务端私钥>" # molehill --genkey
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "utun7"
@@ -452,8 +453,9 @@ tun = "utun7"
 [transparent.control]
 default_remote_addr = "<server-address>:2333"
 
-[transparent.transport.noise]
-remote_public_key = "<服务端公钥>"
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
@@ -500,8 +502,9 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "<服务端私钥>" # molehill --genkey
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "molehill0"

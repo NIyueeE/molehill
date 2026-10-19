@@ -2740,7 +2740,7 @@ pub async fn connect_stream(
     if let Some(cfg) = noise {
         let keys = crate::transport::NoiseKeys::from_config(cfg)?;
         return Ok(KcpTunnelStream::Noise(Box::new(
-            keys.wrap_initiator_full(stream).await?,
+            keys.wrap_initiator(stream).await?,
         )));
     }
     let mut stream = stream;
