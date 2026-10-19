@@ -12,19 +12,22 @@
 > `d0f22b9` passed `just bench gate` (90 samples over five arms; the record is
 > `benches/records/results-bench-v0.11.0.json`). The v0.11.1 sweep ran on
 > 2026-10-18 (90 samples; `just bench gate` passed without a baseline); its
-> record is `benches/records/results-bench-v0.11.1.json` and it becomes the
-> next baseline.
+> record is `benches/records/results-bench-v0.11.1.json` and it was the
+> baseline until the v0.11.2 record.
 >
-> **v0.11.2 development is open on `feat/v0.11.2`:** the branch's manifest
-> carries `version = "0.11.2"`; `main` stays at the released 0.11.1 until the
-> cycle merges. **The configuration-model migration is implemented
-> (2026-10-19) in ten commits** — one pool per forwarding session, one L3 lane
-> budget, no per-service/per-claim sizes, fixed KK Noise in four same-shaped
-> layers, session/data separation, adaptive retry/heartbeat/valve defaults, a
-> global `max_tunnels`, the dynamic UDP policy and protocol v5.2 with dynamic
-> striping. `just check`, `githooks/check-docs` and `just bench-selfcheck`
-> are green; the benchmark sweep and the release remain, and the sweep must
-> re-baseline because the wire and the default shapes changed.
+> **v0.11.2 is ready for review on `feat/v0.11.2` (2026-10-19):** the
+> branch's manifest carries `version = "0.11.2"`; `main` stays at the released
+> 0.11.1 until the PR merges. The cycle consolidates the configuration model
+> (one pool per forwarding session, one L3 lane budget, fixed KK Noise in four
+> flat layers), adds a global `max_tunnels`, adaptive retry/heartbeat
+> defaults, the path-derived UDP policy, protocol v5.2 with dynamic striping,
+> the configured/actual status API and the symmetric L3 device/address step.
+> `just check` is green. **The release sweep was re-run after the CI fix**
+> (19:19–21:04 UTC, 90 samples, five arms, fingerprint `257343fa3fd158d3`;
+> `just bench gate` PASS **without** a baseline); the record is
+> `benches/records/results-bench-v0.11.2.json` and it is the next baseline.
+> The branch is squashed to eight commits, with the benchmark record as a
+> docs-only commit on top. No tag exists: the release is a human decision.
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -44,13 +47,63 @@
 
 ## Where this stands
 
-- **The 0.11.2 configuration migration is in (2026-10-19).** The ten commits
-  on `feat/v0.11.2` replace the per-service pool/tunnel/transport model with
-  one session pool, one L3 lane budget, four flat KK Noise layers, dynamic
+- **The release sweep is done and the PR is ready (2026-10-19).** The
+  published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
+  `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
+  identity as the v0.11.1 record; CPU probe 417.3 MiB/s, loopback
+  21.06 Gbit/s), fingerprint `257343fa3fd158d3`. The first run
+  (16:46–18:29, at `04f5c5d`) was discarded when CI found the no-multiplex
+  forwarding defect: fixing it changed `src/`, so the record had to be
+  re-measured rather than name a revision whose code no longer matched.
+  `just bench gate` passed the absolute half without a baseline on both; the
+  v0.11.1 record is **refused** as a baseline because the engine hash changed
+  with the flat Noise configs (`c4d337fbd8ee2adc` → `deec5d29798c5a68`).
+  Every arm carried the ramp's full eight streams (a floor) and no arm wedged.
+  The clean-stage bulk reading is 8.641 Gbit/s on L4 (clean#2 7.066) and 5.811
+  on L3; the previous record's 8.907 is **not** a comparison — the method
+  changed, and striping now starts at one channel and grows only on
+  backpressure. The L4 clean p99 is 30.8 ms here against 8.8 ms in the
+  discarded run with the same host identity and calibration; both runs pass
+  the gate's 50 ms SLO, and the difference is recorded as run-to-run variance,
+  not a claim about the fix (its cfg changes add nothing to the default
+  build's data path). Charts and README are refreshed from the record.
+- **The interop matrix was fixed and is green (2026-10-19).** v0.11.2 moved the
+  Noise tables, and the matrix wrote one config for both binaries, so the
+  released side refused the file before the wire was tested. Each side now
+  gets its own schema, and the released side is configured with KK (a
+  supported v0.11.1 setting) so the hello's version check is reachable: 3/3
+  pass. Two observations from the same session: the default v0.11.1 client
+  (NK) is refused cleanly, while a v0.11.1 client with its own static key (KK)
+  leaves both sides waiting (ESTAB, no bytes) instead of closing — reproduced,
+  not root-caused; and the L3 harness passed 13/15 on its first run at
+  `04f5c5d` (the two lane-lending arms failed on the known ~5 s stall) and
+  15/15 on a second run.
+- **CI caught the no-multiplex forwarding defect before merge (2026-10-19).**
+  The `noise` integration leg (`server,client,noise,hot-reload`, which is
+  exactly the `embedded` set) registered its services but every visitor hung:
+  v5.2 made the striped command the only TCP forward, and the client refused it
+  without `multiplex`. The stripe registry and its release path are
+  transport-agnostic and are compiled in every client build now; a group of one
+  runs over the direct channel the server opened. The same CI run also caught
+  the featureless compile (client/server-gated constants in `stripe`,
+  client-gated socket2 imports in the keepalive helper, a wrong parameter name
+  in `transport/tcp.rs`) and two Noise-key tests that need the `noise`
+  feature. `just check`, the feature powerset, both lib legs and the no-mux
+  hot-reload suite pass.
+- **The branch history is squashed for review (2026-10-19).** 24 commits became
+  eight. The configuration/runtime-policy consolidation is one commit because
+  the intermediate trees' bench configs were unreadable by their own binary
+  (the original gate passed on a stale release build), so they could not each
+  satisfy `bench-selfcheck`; the other groups are striping, the L3 step, the
+  status schema, the deployment docs, the cycle opener, the interop fix and the
+  no-multiplex forwarding fix. The squash preserved the tree, and every commit
+  passes its own gate.
+- **The 0.11.2 configuration migration is in (2026-10-19).** The branch
+  replaces the per-service pool/tunnel/transport model with one session pool,
+  one L3 lane budget, four flat KK Noise layers, dynamic
   striping/worker/heartbeat/valve defaults and wire v5.2. `just check` is
-  green. Open threads: the release sweep (a method-changing release, so it
-  becomes the next baseline) and manual acceptance of the full §4 table and
-  the old-key refusals.
+  green. Open threads: manual acceptance of the full §4 table and the old-key
+  refusals, and the tag decision.
 - **Linux L3 takes the same device/address step macOS and Windows own
   (2026-10-19).** A Linux transparent service now creates its persistent TUN
   device when one is missing and, on the client, assigns each claimed address
@@ -71,8 +124,10 @@
   already have. The narrowed mode was re-proven on this host in the same
   topology, both recipes: the daemons created the devices and the client's
   address, the operator's steps followed, and the visitor was echoed through
-  the claim. The default L3 harness ran on this branch on 2026-10-19 (15/15).
-  A local variant that skipped the harness's own device setup created both
+  the claim. The default L3 harness ran again at `04f5c5d` on 2026-10-19:
+  13/15 on the first run (the lending arms stalled) and 15/15 on a second; the
+  device/address arms passed on both. A local variant that skipped the
+  harness's own device setup created both
   devices and the client's address and passed every device-path arm, but its
   two lane-lending arms failed: the 16-flow arm stalled for about five seconds
   when a lane was lent, a window the default load finishes before. That is a
@@ -154,17 +209,18 @@
   archive. A long-hold scenario is what would settle it; the arms already exist
   (`l3-budget10-lending` against `l3-budget10-nolend`).
 - **The repository state**: v0.11.1 is released and the tag names `4874f05`,
-  the `main` tip at tag time; `main` carries `version = "0.11.1"`;
-  `CHANGELOG.md` keeps the dated `## [0.11.1] - 2026-10-17` section and an empty
-  `[Unreleased]`. `v0.11.0` names `f3295e8`. `feat/v0.11.2` is the open
-  development branch and carries `version = "0.11.2"`; `main` keeps the
-  released 0.11.1 until the cycle merges. The previous cycle's branches
+  the `main` tip at tag time; `main` carries `version = "0.11.1"`. The
+  `## [0.11.1] - 2026-10-17` section is dated, and the 0.11.2 work sits under
+  `[Unreleased]`. `v0.11.0` names `f3295e8`. `feat/v0.11.2` carries
+  `version = "0.11.2"` and is squashed to eight commits plus the benchmark
+  record; the PR is open and no tag exists. The measured v0.11.2 revision is
+  `69e8bd9` (`tree_clean` true; the record commit is docs/assets only, so the
+  tag review's drift check still holds). The previous cycle's branches
   (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and the four local
-  `backup/*`) were retired on 2026-10-19. The measured v0.11.1
-  revision is `0b56438`, recorded here and in the results file's
-  `meta.provenance`; the tag review's drift check applies wherever that commit
-  is reachable, so for this record a fresh clone prints a note instead of the
-  verdict.
+  `backup/*`) were retired on 2026-10-19. The measured v0.11.1 revision is
+  `0b56438`, recorded here and in the results file's `meta.provenance`; the
+  tag review's drift check applies wherever that commit is reachable, so for
+  this record a fresh clone prints a note instead of the verdict.
   The v0.11.1 tag was re-created on `4874f05` after a transient 0.11.2 bump was
   reset off `main`; that commit's tree is identical to the first tagged commit,
   so the rebuilt archives and image describe the same code. A re-tag re-runs
@@ -235,7 +291,9 @@
     steps) is why the per-service default shipped. This decision overrides it,
     and the single-pool model needs its own measurement before any claim; `4`
     and `2 × claims` are the best-evidenced defaults until that sweep.
-  No code change yet: this entry is the decision record for the branch.
+  Implemented in 0.11.2: `[client.data].tunnels` is the session's total
+  width and `[transparent.data].tunnels` the L3 lane budget. This entry stays
+  as the decision record.
 - **Operator decision (2026-10-19): the production pair stays on forwarding
   (L4) until L3 is stable; L3 remains the target.** The maintainer's own
   deployment (ssh/http/https, Minecraft UDP, Mumble TCP+UDP) keeps the

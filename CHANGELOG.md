@@ -81,6 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[client.services.<name>].tunnels`, and remove `[client.data].shared_pool`
   (one pool per session is the only shape). A UDP service's worker set no
   longer raises the pool: its channels are streams of the same pool.
+- **The v0.11.2 benchmark record is the next baseline.** The sweep ran on
+  2026-10-19 (90 samples, five arms, fingerprint `257343fa3fd158d3`) and
+  `just bench gate` passed the absolute half without a baseline; the v0.11.1
+  record is refused as a baseline because the method hash changed with the flat
+  Noise configs. The record is
+  `benches/records/results-bench-v0.11.2.json`, and the README and its chart set
+  are refreshed from it. There is no cross-version performance claim: the
+  changed method makes the fingerprints incomparable with v0.11.1's.
 
 ### Fixed
 

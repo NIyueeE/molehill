@@ -40,7 +40,7 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 - [molehill](#molehill)
   - [Features](#features)
   - [Benchmarks](#benchmarks)
-    - [The v0.11.1 run](#the-v0111-run)
+    - [The v0.11.2 run](#the-v0112-run)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
   - [Deployment](#deployment)
@@ -86,22 +86,24 @@ reproduction: [Benchmarks](./docs/benchmarks.md); the decision tree behind the
 settings, and the two numbers worth measuring on your own path:
 [Configuration](./docs/configuration.md#choosing-your-configuration-decision-tree).
 
-### The v0.11.1 run
+### The v0.11.2 run
 
 Every tool is driven through the identical workload while the path follows the
 stage schedule, changed in place so a session is never rebuilt. This is the
-v0.11.1 sweep on one host, with the v0.11.1 binary's defaults — a multiplexed
-pool of four tunnels, and **the control channel's Noise keys applied to the data
-plane too**, because that is what this release's mandatory-Noise rule means for
-a client that does not override it per service. The v0.11.1 harness is a method
-re-baseline, so these readings are comparable only within this method; the
-comparability rule is in [Benchmarks](./docs/benchmarks.md#comparability).
+v0.11.2 sweep on one host, with the v0.11.2 binary's defaults — one multiplexed
+pool of four tunnels per session, the fixed-KK Noise keypair on the control
+channel (a forwarding service's data channels inherit it unless
+`data_enable = false`), and dynamic striping that starts each TCP visitor at one
+data channel and grows only on path backpressure. The v0.11.2 harness is a
+method re-baseline, so these readings are comparable only within this method;
+the comparability rule is in
+[Benchmarks](./docs/benchmarks.md#comparability).
 
-![molehill and the peers over the stage schedule](assets/bench-v0.11.1-timeline.png)
+![molehill and the peers over the stage schedule](assets/bench-v0.11.2-timeline.png)
 
 The same run as small multiples — one panel per stage, a lollipop per tool:
 
-![Interactive RTT per stage, per tool](assets/bench-v0.11.1-stages.png)
+![Interactive RTT per stage, per tool](assets/bench-v0.11.2-stages.png)
 
 **Interactive stream RTT p99, per stage** (ms). Every stage after `clean` is
 shaped — the harness installed the queue or the delay that dominates it — so no
@@ -110,38 +112,38 @@ winner is marked in those columns. Sample counts and the full reading rules:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 4.9 | 402.2 | 1069.1 | 2459.2 | 196.0 | 430.1 | 264.0 | 4.2 |
-| molehill (L3) | 1.5 | 401.4 | 1071.3 | 1775.5 | 195.8 | 442.8 | 299.0 | 1.5 |
-| frp | 1.2 | 401.3 | 1061.8 | 1461.4 | 196.0 | 431.7 | 286.8 | 1.2 |
-| rathole | 1.8 | 401.1 | 1063.2 | 2442.3 | 195.7 | 432.7 | 294.4 | 1.6 |
-| nps | 94.2 | 496.2 | 1073.0 | 4102.0 | 196.6 | 431.5 | 264.4 | 80.3 |
+| molehill (L4) | 30.8 | 401.3 | 1083.4 | 1463.5 | 196.2 | 433.9 | 268.5 | 11.9 |
+| molehill (L3) | 1.4 | 401.4 | 1057.4 | 1451.4 | 196.1 | 419.9 | 263.9 | 1.5 |
+| frp | 1.2 | 401.3 | 1064.8 | 2475.0 | 196.1 | 429.3 | 268.2 | 1.7 |
+| rathole | 1.7 | 401.0 | 1058.0 | 1897.1 | 198.7 | 430.4 | 276.2 | 1.7 |
+| nps | 201.2 | 415.6 | 1065.8 | 1460.7 | 196.3 | 431.5 | 301.1 | 18.3 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 8.907 | 3.405 | 8.670 | 1.197 | 0.094 | 0.019 | 0.019 | 9.133 |
-| molehill (L3) | 5.859 | 3.170 | 5.001 | 1.011 | 0.093 | 0.019 | 0.019 | 5.883 |
-| frp | 5.949 | 3.383 | 6.049 | 1.074 | 0.094 | 0.019 | 0.019 | 5.964 |
-| rathole | 29.105 | 3.404 | 14.676 | 1.121 | 0.094 | 0.019 | 0.019 | 29.034 |
-| nps | 0.134 | 0.136 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 8.641 | 3.370 | 6.950 | 1.136 | 0.094 | 0.019 | 0.019 | 7.066 |
+| molehill (L3) | 5.811 | 3.164 | 4.715 | 1.036 | 0.093 | 0.019 | 0.019 | 5.830 |
+| frp | 6.073 | 3.387 | 6.167 | 1.195 | 0.094 | 0.019 | 0.019 | 6.056 |
+| rathole | 29.038 | 3.401 | 14.746 | 1.202 | 0.094 | 0.019 | 0.019 | 29.153 |
+| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **How to read it.** `molehill (L3)` is this project's second architecture, not
 a fifth tool: its comparison is `molehill (L4)` and the tool-free control arm.
-These are one host's v0.11.1 readings; only same-schema, same-method, same-host
+These are one host's v0.11.2 readings; only same-schema, same-method, same-host
 runs compare directly. The stage schedule, the run's own noise floor, the
 capacity ramp, the drift and cost panels, and how to reproduce a run are in
 [Benchmarks](./docs/benchmarks.md).
 
 A deployment that wants the data plane unencrypted sets
-`transport = { type = "plain" }` per service and keeps the encrypted control
-channel; the cost of that choice is measured at
+`data_enable = false` on the client or on that service and keeps the encrypted
+control channel; the cost of that choice is measured at
 [Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
-The rest of the run's chart set: `bench-v0.11.1-capacity.png` (the load ramp),
-`bench-v0.11.1-drift.png` (RSS, fds and threads over the run) and
-`bench-v0.11.1-cost.png` (CPU-seconds per carried Gbit).
+The rest of the run's chart set: `bench-v0.11.2-capacity.png` (the load ramp),
+`bench-v0.11.2-drift.png` (RSS, fds and threads over the run) and
+`bench-v0.11.2-cost.png` (CPU-seconds per carried Gbit).
 
 ## Quickstart
 

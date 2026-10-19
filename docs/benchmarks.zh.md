@@ -426,7 +426,7 @@ backlog 时带单位后缀(`b`、`Kb`、`Mb`、`Gb`),所以 drain 先把它解�
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the staged schedule and the load ramp, four arms
+# the release sweep: the staged schedule and the load ramp, five arms
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
