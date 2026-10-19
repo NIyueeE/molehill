@@ -26,7 +26,7 @@ impl Transport for TcpTransport {
 
     fn new(_config: &TransportConfig) -> Result<Self> {
         #[cfg(not(feature = "client"))]
-        let _ = config;
+        let _ = _config;
         Ok(TcpTransport {
             // Fixed latency-friendly defaults; every call site applies a
             // hint right after connecting, so this is only the base.

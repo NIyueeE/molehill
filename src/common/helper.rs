@@ -3,7 +3,6 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(feature = "client")]
 use anyhow::anyhow;
-#[cfg(feature = "client")]
 use socket2::{SockRef, TcpKeepalive};
 #[cfg(any(feature = "client", feature = "server"))]
 use std::io;

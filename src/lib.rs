@@ -20,6 +20,7 @@ mod mux;
 mod protocol;
 #[cfg(feature = "client")]
 mod status;
+#[cfg(any(feature = "client", feature = "server"))]
 mod stripe;
 #[cfg(mh_l3)]
 mod transparent;
@@ -57,6 +58,7 @@ pub use protocol::CURRENT_PROTO_VERSION;
 #[cfg(feature = "noise")]
 #[doc(hidden)]
 pub use config::{MaskedString, NoiseConfig, TransportConfig, TransportType};
+#[cfg(any(feature = "client", feature = "server"))]
 #[doc(hidden)]
 pub use stripe::set_initial_stripes;
 #[cfg(feature = "carrier")]

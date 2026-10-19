@@ -82,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (one pool per session is the only shape). A UDP service's worker set no
   longer raises the pool: its channels are streams of the same pool.
 
+### Fixed
+
+- **TCP forwarding works in a build without `multiplex`.** v5.2 made the
+  striped command the only TCP forward, and the client refused it outside a
+  `multiplex` build — so the `embedded` set (the smallest release artifacts)
+  registered its services but every visitor hung. A group of one now runs over
+  the direct data channel the server opened: the stripe registry is
+  transport-agnostic and is compiled in every client build. The featureless
+  and no-noise configurations also compile again (the stripe module follows
+  `client`/`server`, the keepalive helper's socket2 imports are
+  unconditional, and the two Noise-key tests are gated on `noise`).
+
 ## [0.11.1] - 2026-10-17
 
 ### Added

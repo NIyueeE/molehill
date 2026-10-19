@@ -2277,6 +2277,7 @@ remote_bind_addr = "0.0.0.0:6080"
         );
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn test_noise_keys_must_be_32_bytes() {
         let config = r#"
@@ -2584,6 +2585,7 @@ private_key = "SJEjSnPAXtkDx8oP0M5ksDypP8hc92/n1bvh+Wqpi3E="
         );
     }
 
+    #[cfg(feature = "noise")]
     #[test]
     fn test_per_service_noise_key_is_validated() {
         let bad = r#"

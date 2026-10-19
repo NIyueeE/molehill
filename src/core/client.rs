@@ -938,7 +938,6 @@ struct RunDataChannelArgs {
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
     /// here until the group is complete (see [`crate::stripe`]).
-    #[cfg(feature = "multiplex")]
     stripes: Arc<crate::stripe::StripeGroups<ClientDataChannel>>,
     /// Placement state of this service's stripe groups, by group id (D24).
     #[cfg(feature = "multiplex")]
@@ -1118,34 +1117,15 @@ impl StripePlacement {
     }
 }
 
-/// The service session's stripe-group registry type (a no-op stand-in
-/// without the `multiplex` feature, which can never receive a striped
-/// command).
-#[cfg(feature = "multiplex")]
+/// The service session's stripe-group registry type. The registry is
+/// transport-agnostic: a stripe may be a yamux stream or a direct data
+/// channel, so the type exists in every client build.
 type StripeRegistry = crate::stripe::StripeGroups<ClientDataChannel>;
-#[cfg(not(feature = "multiplex"))]
-type StripeRegistry = ();
 
 impl RunDataChannelArgs {
-    /// The session's stripe-group registry. Without the `multiplex` feature
-    /// a striped command can never arrive, and the registry degenerates to
-    /// a unit reference the (unreachable) striped arm ignores.
-    #[cfg(feature = "multiplex")]
+    /// The session's stripe-group registry.
     fn stripes(&self) -> &StripeRegistry {
         &self.stripes
-    }
-
-    #[cfg(not(feature = "multiplex"))]
-    #[cfg_attr(
-        not(feature = "multiplex"),
-        allow(
-            clippy::unused_self,
-            reason = "the unit stand-in has no field to read; the multiplex arm keeps the method shape"
-        )
-    )]
-    fn stripes(&self) -> &StripeRegistry {
-        const UNIT: () = ();
-        &UNIT
     }
 }
 
@@ -1596,13 +1576,6 @@ async fn forward_data_channel(
     mut conn: ClientDataChannel,
     service: &ClientServiceConfig,
     udp_hub: Option<Arc<UdpHub>>,
-    #[cfg_attr(
-        not(feature = "multiplex"),
-        expect(
-            unused_variables,
-            reason = "only the multiplex build can receive striped commands"
-        )
-    )]
     stripes: &StripeRegistry,
     #[cfg_attr(
         not(mh_l3_client),
@@ -1614,8 +1587,6 @@ async fn forward_data_channel(
     lane: Option<LaneId>,
 ) -> Result<()> {
     let sock_opts = SocketOpts::for_service();
-    #[cfg(not(feature = "multiplex"))]
-    let _ = &sock_opts;
     match read_data_cmd(&mut conn).await? {
         DataChannelCmd::StartForwardUdp => {
             if service.service_type != ServiceType::Udp {
@@ -1625,7 +1596,6 @@ async fn forward_data_channel(
                 .ok_or_else(|| anyhow!("Service {} has no UDP forwarding hub", service.name))?;
             run_data_channel_for_udp(conn, hub).await?;
         }
-        #[cfg(feature = "multiplex")]
         DataChannelCmd::StartForwardStripedTcp(group_bytes, index, count) => {
             if service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
@@ -1646,12 +1616,6 @@ async fn forward_data_channel(
                 // reports to nobody.
                 crate::stripe::spawn_group(read, write, done.streams, None);
             }
-        }
-        #[cfg(not(feature = "multiplex"))]
-        DataChannelCmd::StartForwardStripedTcp(..) => {
-            bail!(
-                "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
-            );
         }
         DataChannelCmd::StartForwardTransparent(wire) => {
             if service.service_type != ServiceType::Transparent {
@@ -4550,7 +4514,6 @@ impl ClientSession {
                 noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "multiplex")]
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
                 #[cfg(feature = "multiplex")]
                 stripe_placements: StripePlacements::default(),
@@ -4619,7 +4582,6 @@ impl ClientSession {
     /// back now rather than at the registry's TTL. The group id is tombstoned
     /// on the way out: a stripe the client was already opening when the
     /// release was written must not park after it.
-    #[cfg(feature = "multiplex")]
     fn release_stripe_group(&self, id: ServiceId, group: [u8; 4]) {
         if let Some(entry) = self.services.get(&id)
             && let ServiceState::Active(active) = &entry.state
@@ -4628,15 +4590,6 @@ impl ClientSession {
             debug!("Service {id} released stripe group {group:02x?} ({released} parked stripes)");
         }
     }
-
-    /// Without `multiplex` no striped channel can exist, so there is never
-    /// anything parked to release; the command is accepted and ignored.
-    #[cfg(not(feature = "multiplex"))]
-    #[expect(
-        clippy::unused_self,
-        reason = "without `multiplex` the release is a no-op and nothing on the session is read"
-    )]
-    fn release_stripe_group(&self, _id: ServiceId, _group: [u8; 4]) {}
 
     /// Open one data channel for a service the server asked about.
     fn open_placed_channel(&self, id: ServiceId, stripe: Option<StripeOpen>) {

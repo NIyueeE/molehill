@@ -41,11 +41,9 @@
 //! [`DataChannelCmd::StartForwardStripedTcp`]: crate::protocol::DataChannelCmd::StartForwardStripedTcp
 
 use std::collections::BTreeMap;
-#[cfg(feature = "multiplex")]
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-#[cfg(feature = "multiplex")]
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -173,7 +171,6 @@ impl std::fmt::Debug for StripePlan {
 /// incomplete this long belongs to a server-side gather that was abandoned
 /// (its control channel died), and its parked channels would otherwise
 /// never be reaped.
-#[cfg(feature = "multiplex")]
 const STRIPE_GROUP_TTL: Duration = Duration::from_secs(60);
 
 /// Environment override for the server's stripe count (multiplex builds
@@ -684,9 +681,9 @@ fn epoch_millis() -> u64 {
 /// gather) are dropped after [`STRIPE_GROUP_TTL`], which also closes their
 /// parked channels.
 ///
-/// Multiplex-only: without the feature the client can never receive a
-/// striped command, so the registry has nothing to register.
-#[cfg(feature = "multiplex")]
+/// The registry is transport-agnostic: a stripe may be a yamux stream or a
+/// direct data channel (a no-multiplex build forwards a group of one over the
+/// channel the server opened).
 pub struct StripeGroups<S> {
     state: Mutex<RegistryState<S>>,
 }
@@ -696,7 +693,6 @@ pub struct StripeGroups<S> {
 ///
 /// One lock, not two: `register` has to look at both, and a release that took
 /// the other lock first could otherwise deadlock against it.
-#[cfg(feature = "multiplex")]
 struct RegistryState<S> {
     groups: HashMap<u32, PartialGroup<S>>,
     /// Group ids the server released, oldest first. A stripe that was already
@@ -711,11 +707,9 @@ struct RegistryState<S> {
 /// release was sent. The cap keeps a flood of abandoned gathers from growing
 /// the queue without bound; forgetting one early costs at most one parked
 /// channel until the TTL reaps it.
-#[cfg(feature = "multiplex")]
 const MAX_RELEASED_GROUPS: usize = 512;
 
 /// One stripe parked while its group is still incomplete.
-#[cfg(feature = "multiplex")]
 struct PartialGroup<S> {
     /// How many stripes the group has (from each stripe's command).
     count: u8,
@@ -729,14 +723,12 @@ struct PartialGroup<S> {
 }
 
 /// A complete stripe group, ready to be forwarded.
-#[cfg(feature = "multiplex")]
 pub struct CompleteGroup<S> {
     pub streams: Vec<S>,
     pub local_addr: String,
     pub sock_opts: crate::transport::SocketOpts,
 }
 
-#[cfg(feature = "multiplex")]
 impl<S> Default for StripeGroups<S> {
     fn default() -> Self {
         StripeGroups {
@@ -748,7 +740,6 @@ impl<S> Default for StripeGroups<S> {
     }
 }
 
-#[cfg(feature = "multiplex")]
 impl<S> StripeGroups<S> {
     pub fn new() -> Self {
         StripeGroups::default()
@@ -1175,7 +1166,6 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "multiplex")]
     #[test]
     fn registry_completes_a_group_and_validates_stripes() {
         let mut parked = (0..4).map(|_| duplex(16).0).collect::<Vec<_>>();
@@ -1314,7 +1304,6 @@ mod tests {
         assert_eq!(plan.note_stall(STRIPE_BACKPRESSURE), Some(MAX_STRIPES));
     }
 
-    #[cfg(feature = "multiplex")]
     #[tokio::test]
     async fn releasing_a_group_drops_its_parked_stripes() {
         let (mut peer, parked) = duplex(16);
@@ -1340,7 +1329,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "multiplex")]
     #[tokio::test]
     async fn a_stripe_that_arrives_after_its_release_is_dropped() {
         let groups = StripeGroups::new();
