@@ -74,8 +74,9 @@
   absolute checks — coverage, the endpoint invariant, the SLO, drift, wedge and
   the capacity ramp — and its record is what future releases compare against:
   `benches/records/results-bench-v0.11.1.json`, 90 samples, fingerprint
-  `f246a9601305cc75`. The measured revision is `0b56438`, preserved as
-  `bench/v0.11.1-measured` after the history compression.
+  `f246a9601305cc75`. The measured revision is `0b56438`; the preservation
+  branch was retired with the other non-`main` branches on 2026-10-19, so the
+  hash is recorded here — a fresh clone cannot resolve it.
 - **An L3 claim's lane budget is a live tuning surface, and its default is
   two.** The throughput ceiling is a serialized per-packet path, so a claim's
   throughput follows its lanes; four lanes buys 121 % of bulk throughput and
@@ -95,9 +96,13 @@
 - **The repository state**: v0.11.1 is released and the tag names `4874f05`,
   the `main` tip at tag time; `main` carries `version = "0.11.1"`;
   `CHANGELOG.md` keeps the dated `## [0.11.1] - 2026-10-17` section and an empty
-  `[Unreleased]`. `v0.11.0` names `f3295e8`. The measured v0.11.1 revision is
-  `0b56438`, preserved as `bench/v0.11.1-measured`. The tag review checks that
-  no measured code changed between that revision and the tagged commit.
+  `[Unreleased]`. `v0.11.0` names `f3295e8`. Only `main` remains on the remote;
+  the non-`main` branches (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and
+  the four local `backup/*`) were retired on 2026-10-19. The measured v0.11.1
+  revision is `0b56438`, recorded here and in the results file's
+  `meta.provenance`; the tag review's drift check applies wherever that commit
+  is reachable, so for this record a fresh clone prints a note instead of the
+  verdict.
   The v0.11.1 tag was re-created on `4874f05` after a transient 0.11.2 bump was
   reset off `main`; that commit's tree is identical to the first tagged commit,
   so the rebuilt archives and image describe the same code. A re-tag re-runs
