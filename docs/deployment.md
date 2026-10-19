@@ -346,6 +346,21 @@ remote_bind_addr = "<public-ip>:8443"
 
 The device names are per host, so the two `tun` values need not match.
 
+The mode is selected by the flag and the block, not by `tun`: `tun` only names
+the device. Start the two ends with the same binary:
+
+```bash
+# server: [server.transparent] is the L3 switch; --server runs it
+sudo ./molehill --server server.toml
+# client: [transparent] is the L3 model; --transparent (or -t) runs it
+sudo ./molehill --transparent client.toml
+```
+
+A `[transparent]` config started with `--client` is refused; a server with
+`[server.transparent]` still uses `--server`. The client needs
+`CAP_NET_ADMIN`/`root` for its TUN; the server needs it only when its own
+`[server.transparent]` table is present.
+
 ### Recipe A: an address routed to the server
 
 The clean, NAT-free case: the upstream network routes the claimed address (a
@@ -704,6 +719,12 @@ ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
 [Install]
 WantedBy=multi-user.target
 ```
+
+A `[transparent]` client is the same template with `--transparent` (`-t`)
+instead of `-c`; `molehillc` is the forwarding client and refuses a
+`[transparent]` config. The auto-detect `molehill@.service` also runs it when
+the unit omits the mode flag. A transparent client needs `CAP_NET_ADMIN` for
+its TUN, exactly like a transparent server.
 
 Both units are templates; two variants cover the rest:
 

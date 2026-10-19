@@ -325,6 +325,20 @@ remote_bind_addr = "<public-ip>:8443"
 
 设备名是按主机各自取的,因此两端的 `tun` 值不必相同。
 
+模式由启动标志和配置块决定,不是由 `tun` 决定:`tun` 只是设备名。两端用同一个
+二进制启动:
+
+```bash
+# 服务端:[server.transparent] 是 L3 开关;--server 运行服务端
+sudo ./molehill --server server.toml
+# 客户端:[transparent] 是 L3 模型;--transparent(或 -t)运行客户端
+sudo ./molehill --transparent client.toml
+```
+
+用 `--client` 启动 `[transparent]` 配置会被拒绝;带 `[server.transparent]` 的
+服务端仍用 `--server`。客户端需要 `CAP_NET_ADMIN`/`root` 打开 TUN;服务端只在
+自己的 `[server.transparent]` 表存在时才需要。
+
 ### 配方 A:地址被路由到服务端
 
 最干净、无 NAT 的情形:上游网络把所声明的地址(一条被路由的 /32,或交付给本
@@ -643,6 +657,11 @@ ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
 [Install]
 WantedBy=multi-user.target
 ```
+
+`[transparent]` 客户端用同一个模板,把 `-c` 换成 `--transparent`(`-t`);
+`molehillc` 是转发客户端,会拒绝 `[transparent]` 配置。自动判断模式的
+`molehill@.service` 在不带模式标志时也能运行它。透明客户端和透明服务端一样,
+需要 `CAP_NET_ADMIN` 才能打开 TUN。
 
 两个单元都是模板;其余用法由两个变体覆盖:
 
