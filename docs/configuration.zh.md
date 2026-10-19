@@ -290,7 +290,7 @@ private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # sec
 public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
-tun = "molehill0" # 可选。服务端的 TUN 设备。默认:Linux 与 Windows 为 molehill0,macOS 为 auto(自动选择空闲 utunN)。Linux 上由运维方创建设备并把每个认领路由进去;macOS/Windows 上由守护进程创建,运维方负责路由/转发
+tun = "molehill0" # 可选。服务端的 TUN 设备。默认:Linux 与 Windows 为 molehill0,macOS 为 auto(自动选择空闲 utunN)。Linux 上设备缺失时由守护进程创建,已存在则原样使用;macOS/Windows 上由守护进程创建,运维方负责路由/转发
 ```
 
 ## 动态服务注册
@@ -474,10 +474,12 @@ Windows **不能做客户端**:它的协议栈没有源地址策略路由,应用
 WSL2 的指引。`transparent` 特性属于默认特性集。不支持的平台、或在不含该特性
 的构建里,都会在解析配置时被拒绝并说明原因与可用方案。
 
-设备生命周期按平台分工。Linux 上运维方创建持久 TUN 设备,守护进程连接它,进程
-需要 `CAP_NET_ADMIN`。macOS 上守护进程创建临时的 `utunN`、把所声明的 `/32` 或 `/128`
-配到它上面,运维方负责 pf 规则与路由,进程需要 root。Windows 上守护进程创建
-Wintun 适配器,运维方负责路由、转发与防火墙规则,进程需要管理员权限与放在
+设备生命周期按平台分工,守护进程只负责设备,以及客户端上的认领地址。Linux 上
+设备缺失时由守护进程创建持久 TUN,已存在则原样使用;客户端上它还会把尚未配置的
+认领地址配上去。路由、策略规则与转发开关仍归运维方,进程需要
+`CAP_NET_ADMIN`。macOS 上守护进程创建临时的 `utunN`,并在客户端把所声明的
+`/32` 或 `/128` 配到它上面,运维方负责 pf 规则与路由,进程需要 root。Windows 上守护进程
+创建 Wintun 适配器,运维方负责路由、转发与防火墙规则,进程需要管理员权限与放在
 二进制旁边的 `wintun.dll`。IPv4 与 IPv6 都承载:解析器支持 IPv6 基础头、常见
 扩展头链(含分片)和 TCP/UDP 端口;ICMPv6 与 ESP 只按地址路由。IPv6 jumbogram
 不承载(按 malformed 拒绝),解析器不认识的扩展头之后的传输头也按地址路由。
@@ -490,15 +492,17 @@ Wintun 适配器,运维方负责路由、转发与防火墙规则,进程需要�
 永不加密,所以服务它的服务端会接受来自该客户端的明文连接,无论
 `[server.noise]` 写了什么——Noise 键仍然作用于真正协商了它的客户端。
 
-**守护进程从不安装路由、规则或防火墙规则。** 它没有 netlink 代码,也从不调用
-`ip`。Linux 上它连接运维方创建的持久 TUN 设备,并校验运维方配置的地址与
-`rp_filter`。macOS 与 Windows 上它创建临时设备,因为这两个平台没有等价的
-「运维方先创建」模型;macOS 上它还会配置所声明的地址,而 pf 规则、路由与转发
-仍归运维方。[部署文档](./deployment.zh.md#透明l3服务)里有完整配方。
+**守护进程只创建设备,以及客户端上的认领地址。** 它不在任何平台安装路由、策略
+规则或防火墙规则:Linux 上它创建缺失的 TUN 设备并校验运维方配置的状态。已存在的
+设备原样使用,所以想指定 MTU 就先自己创建;客户端上已经配好的认领地址也不会被
+改动。macOS 创建 utun 并在客户端配置认领地址,Windows 服务端创建 Wintun 适配器。
+退出时保留这些状态。它们之外的一切仍归运维方,三个平台一致:服务端的转发与每条
+认领的路由、客户端的策略规则与表路由、macOS 的 pf 规则、Windows 的路由与防火墙
+规则。[部署文档](./deployment.zh.md#透明l3服务)里有完整配方。
 
 | 键 | 含义 |
 |---|---|
-| `[transparent]` | **模式本身**:这张表让进程成为 L3 客户端,客户端级的那一半也在这里(`default_token`、`tun`、`control`、`data`、`transport`) |
+| `[transparent]` | **模式本身**:这张表让进程成为 L3 客户端,客户端级的那一半也在这里(`default_token`、`tun`、`control`、`data`、`noise`) |
 | `[transparent.status]` | 可选的只读状态 API,形态与 `[client.status]` 相同:`bind_addr` 与非空 `token` |
 | `[transparent.claims.<name>]` | 一个被认领的公网地址。名称标识该认领(显示在日志中) |
 | `[transparent.claims.<name>].remote_bind_addr` | 客户端**声明拥有**的公网 `ip:port`。端口必须被服务端的 `allow_ports` 覆盖——认领和别的注册一样;地址必须是客户端本地的(配方会把它配到 TUN 设备上)。IPv4 写 `10.99.0.1:8443`,IPv6 写 `[2001:db8::1]:8443` |
@@ -534,6 +538,11 @@ Wintun 适配器,运维方负责路由、转发与防火墙规则,进程需要�
 在这里的含义也不同:转发服务的 `tunnels` 是池的宽度,而认领的是一份连接预算,因为这里
 没有池;每条认领分到的份额是 `tunnels / 认领数`,且永不低于一条。
 
+**`tun` 是接口名,不是展示标签。** Linux 上守护进程创建或连接的正是这个名字,
+运维方的每条路由/规则也必须用它;macOS 上 `auto` 会解析成一个空闲的 `utunN`
+(会打进日志,所以静态 pf 规则要写明确的 `utunN`);Windows 上它是 Wintun 适配器
+的名字。服务端与客户端各有一份,不必相同。
+
 **这份预算的缺省值是每条认领两条车道,而这是一笔交易,不是偏好。** 认领的数据路径
 是按车道串行的(一个设备读取者、一个注入者),所以繁忙认领的吞吐跟着车道数走,而它给
 「所有认领共享的那个读取者」施加的压力也一样。两条轴都测过(同一主机、同一二进制、
@@ -568,15 +577,16 @@ v0.11.0 之前的二进制;该版本起吃的分段 offload 抬高了 bulk 一�
 
 | | Linux | macOS | Windows(仅服务端) |
 |---|---|---|---|
-| 设备 | 运维方创建持久 TUN | 守护进程创建 `utunN` | 守护进程创建 Wintun 适配器 |
-| 所声明地址 | 运维方配置 `/32` 或 `/128` | 守护进程配置每个 `/32`/`/128` | 不配置地址,只做路由 |
+| 设备 | 设备缺失时由守护进程创建持久 TUN;想指定 MTU 就先自行创建 | 守护进程创建 `utunN` | 守护进程创建 Wintun 适配器 |
+| 所声明地址 | 设备上还没有该地址时由守护进程配置 `/32` 或 `/128` | 守护进程配置每个 `/32`/`/128` | 不配置地址,只做路由 |
 | 路由 | 运维方(`ip route`/`ip rule`) | 运维方(`route` + pf) | 运维方(`New-NetRoute`) |
 | 权限 | `CAP_NET_ADMIN` | root | 管理员 + `wintun.dll` |
 | 校验 | 设备、地址、`rp_filter`、`ip_forward` | 守护进程创建设备/地址;pf 与路由归运维方 | 守护进程创建设备;路由/转发/防火墙归运维方 |
 
-- **Linux:** 设备必须存在;客户端必须拥有每个所声明地址,且
-  `net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都为 `0`;
-  服务端需要 `ip_forward = 1`。缺少前置条件时会拒绝并打印要执行的命令。
+- **Linux:** 设备缺失时由守护进程创建,客户端上尚未配置的认领地址也会被配上;
+  已存在的设备原样使用。客户端需要 `net.ipv4.conf.<tun>.rp_filter` 与
+  `net.ipv4.conf.all.rp_filter` 都为 `0`;服务端需要 `ip_forward = 1`。缺少
+  前置条件时会拒绝并打印要执行的命令。
 - **macOS:** 客户端所声明的 `/32` 或 `/128` 由守护进程配置。运维方安装 pf 的
   `route-to` 规则,把来自这些地址的回包送回 utun;服务端打开
   `net.inet.ip.forwarding` 并把每个认领路由到它的 utun。pf 规则是静态的时,
@@ -881,8 +891,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 | UDP 流量不通 | 检查 `protocol = "udp"`;大于 `udp_buffer_size` 的数据报会被截断到该大小;空闲映射在其自适应寿命后超时。 |
 | 有状态 UDP 会话(游戏、QUIC、WireGuard)中途断开 | 确保两端运行带 UDP 会话亲和的版本(≥ 本修复);静默超过自适应寿命的对端会在下一个数据报时重新绑定到新本地 socket(源端口变化)——保持通信或接受重新绑定。 |
 | `Failed to read cmd: early eof` 警告 | 对端关闭了通道(重启或关停);客户端会自动重连。 |
-| IPv6 认领的访客拿不到响应 | Linux 上要配置 `/128`、`ip -6 rule from <addr>` 与表 100 的 `ip -6 route`,并在服务端打开 `net.ipv6.conf.all.forwarding=1`;本地地址缺失时拒绝信息会给出确切命令。macOS 需要 `inet6` 的 pf 规则;Windows 需要 `/128` 路由与 IPv6 转发。 |
-| Linux 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | Linux 上透明服务连接的是运维方创建的设备。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务));macOS/Windows 会自己创建设备。 |
+| IPv6 认领的访客拿不到响应 | Linux 上先确认 `/128` 已在设备上(缺失时守护进程会配),再配置 `ip -6 rule from <addr>` 与表 100 的 `ip -6 route`,并在服务端打开 `net.ipv6.conf.all.forwarding=1`;本地地址缺失时拒绝信息会给出确切命令。macOS 需要 `inet6` 的 pf 规则;Windows 需要 `/128` 路由与 IPv6 转发。 |
+| Linux 客户端报 `Interface <tun> does not exist. Prepare it first`(服务端则表现为注册被拒) | Linux 上守护进程会创建缺失的设备,所以这条信息说明创建失败(检查 `ip` 是否在 `PATH` 上、进程是否有 `CAP_NET_ADMIN`)或设备随后消失了。执行信息里打印的 `ip tuntap add dev <tun> mode tun` 与 `ip link set <tun> up mtu 1400`(配方见[部署文档](./deployment.zh.md#透明l3服务));macOS/Windows 会自己创建设备。 |
 | 注册被拒:`This server does not serve transparent (L3) services: [server.transparent] is not configured` | 服务端自己的开关没打开,所以注册在看设备之前就被策略拒绝了。如果这台主机确实要路由所声明的地址,就**在服务端的**配置里加上这张表;否则从客户端去掉该服务。 |
 | `Transparent service claims <ip>, but no local interface carries it` | 客户端必须拥有它声明的地址:执行信息里打印 `ip addr add <ip>/32`(IPv6 为 `ip -6 addr add <ip>/128`)以及对应的 `ip rule`/`ip route`(IPv6 加 `-6`)。 |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | 注入的包携带访客的源地址,严格的检查会丢掉它们。执行信息里打印的 `sysctl -w` 行;`net.ipv4.conf.<tun>.rp_filter` 与 `net.ipv4.conf.all.rp_filter` 都必须读到 `0`。 |

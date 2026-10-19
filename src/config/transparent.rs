@@ -37,10 +37,13 @@ use crate::config::parsing::{
 pub struct TransparentClientConfig {
     /// Shared secret, must match `[server].default_token`. Required.
     pub default_token: MaskedString,
-    /// The TUN device this client attaches to. On Linux the operator creates
-    /// it and owns its addresses and routes. On macOS the daemon creates the
-    /// utun and assigns the claimed addresses, while the operator owns the pf
-    /// rule and routes. `auto` (the macOS default) picks a free `utunN`.
+    /// The TUN device this client attaches to. On Linux the daemon creates a
+    /// missing device and assigns each claimed address that is not already on
+    /// it; an existing device is used as it is, so pre-create it to choose its
+    /// MTU. The operator owns the policy rule and routes. On macOS the daemon
+    /// creates the utun and assigns the claimed addresses, while the operator
+    /// owns the pf rule and routes. `auto` (the macOS default) picks a free
+    /// `utunN`.
     #[serde(default = "default_tun_name")]
     pub tun: String,
     #[serde(default)]

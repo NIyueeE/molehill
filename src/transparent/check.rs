@@ -1,8 +1,11 @@
 //! Startup prerequisites: what the operator must have prepared, checked here
 //! so a misconfiguration is one precise message instead of silent packet loss.
 //!
-//! The daemon deliberately does not configure the network (no netlink, no
-//! `ip` calls); it verifies what it depends on and says exactly what to run.
+//! The daemon verifies what it depends on and says exactly what to run. The
+//! only host state it creates itself is the TUN device (and, on the client, the
+//! claimed addresses): Linux creates a missing one, and macOS and Windows create
+//! theirs. Routes, policy rules and forwarding are the operator's on every
+//! platform.
 
 #[cfg(mh_linux)]
 use std::net::IpAddr;
@@ -16,18 +19,30 @@ use anyhow::{Context, Result, bail};
 #[cfg(not(mh_linux))]
 use std::net::IpAddr;
 
-/// The TUN interface must already exist: the operator's addresses and routes
-/// live on it, and a device this process creates would be missing both.
+/// The TUN interface must exist by the time the caller checks: the Linux
+/// daemon creates a missing one first, and an existing one is the operator's.
+///
+/// Read from `/proc/net/dev`, not `/sys/class/net`: sysfs is mounted once and
+/// is not filtered by network namespace, so a daemon in its own namespace (or
+/// a container with its own netns and the host's `/sys`) would see the host's
+/// devices and miss its own. `/proc/self/net` is the reading process's
+/// namespace by definition.
 #[cfg(mh_linux)]
 pub fn require_interface(name: &str) -> Result<()> {
-    require_interface_at(Path::new("/sys/class/net"), name)
+    let interfaces = match std::fs::read_to_string("/proc/net/dev") {
+        Ok(dev) => parse_proc_net_dev(&dev),
+        // No readable `/proc` (an unusual sandbox): the attach itself is the
+        // real check, and it reports a precise error.
+        Err(_) => return Ok(()),
+    };
+    require_interface_in(&interfaces, name)
 }
 
-/// The filesystem-taking half of [`require_interface`], so tests can use a
-/// temporary directory instead of the host's `/sys`.
+/// The name-taking half of [`require_interface`], pure so the parsing and the
+/// message are testable without touching the host's interfaces.
 #[cfg(mh_linux)]
-fn require_interface_at(root: &Path, name: &str) -> Result<()> {
-    if !root.join(name).exists() {
+fn require_interface_in(interfaces: &[String], name: &str) -> Result<()> {
+    if !interfaces.iter().any(|seen| seen == name) {
         bail!(
             "Interface {name} does not exist. Prepare it first (docs/deployment.md, \
              \"Transparent services\"):\n  \
@@ -36,6 +51,25 @@ fn require_interface_at(root: &Path, name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The interface names of one `/proc/net/dev`: two header lines, then
+/// `name: counters` per interface, the name left-padded to the first colon.
+#[cfg(mh_linux)]
+fn parse_proc_net_dev(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Whether one interface exists in this network namespace.
+#[cfg(mh_linux)]
+pub(crate) fn interface_exists(name: &str) -> bool {
+    std::fs::read_to_string("/proc/net/dev")
+        .is_ok_and(|dev| parse_proc_net_dev(&dev).iter().any(|seen| seen == name))
 }
 
 /// The server's contract for serving claims: it must be willing to *forward*.
@@ -151,18 +185,34 @@ fn check_rp_filter_at(path: &Path, key: &str) -> Result<()> {
 }
 
 #[cfg(mh_linux)]
-fn local_addresses() -> Result<Vec<IpAddr>> {
+pub(crate) fn local_addresses() -> Result<Vec<IpAddr>> {
     let addrs = nix::ifaddrs::getifaddrs().with_context(|| "Failed to list local addresses")?;
     Ok(addrs
         .filter_map(|interface| interface.address)
-        .filter_map(|address| {
-            if let Some(v4) = address.as_sockaddr_in() {
-                Some(IpAddr::V4(v4.ip()))
-            } else {
-                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
-            }
-        })
+        .filter_map(socket_ip)
         .collect())
+}
+
+/// Whether one interface already carries an address. The daemon's device step
+/// asks before it assigns one: a second claim on the same IP, or a restart over
+/// a persistent device, finds it there, and replacing it would bounce the
+/// address while an earlier claim's lanes are carrying traffic.
+#[cfg(mh_linux)]
+pub(crate) fn interface_has_address(tun: &str, ip: IpAddr) -> Result<bool> {
+    let mut addrs = nix::ifaddrs::getifaddrs().with_context(|| "Failed to list local addresses")?;
+    Ok(addrs.any(|interface| {
+        interface.interface_name == tun && interface.address.and_then(socket_ip) == Some(ip)
+    }))
+}
+
+/// The IP one interface address carries, for either family.
+#[cfg(mh_linux)]
+fn socket_ip(address: nix::sys::socket::SockaddrStorage) -> Option<IpAddr> {
+    if let Some(v4) = address.as_sockaddr_in() {
+        Some(IpAddr::V4(v4.ip()))
+    } else {
+        address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
+    }
 }
 
 /// macOS and Windows create the device themselves; there is no pre-existing
@@ -203,15 +253,33 @@ mod tests {
 
     #[test]
     fn an_interface_must_exist_and_the_message_names_the_recipe() {
-        let dir = scratch("interface");
-        let err = require_interface_at(&dir, "l3test0").unwrap_err();
+        let err = require_interface_in(&[], "l3test0").unwrap_err();
         let message = format!("{err:#}");
         assert!(message.contains("does not exist"), "{message}");
         assert!(message.contains("ip tuntap add dev l3test0"), "{message}");
 
-        fs::write(dir.join("l3test0"), b"").unwrap();
-        require_interface_at(&dir, "l3test0").unwrap();
-        fs::remove_dir_all(dir).unwrap();
+        require_interface_in(&["lo".to_owned(), "l3test0".to_owned()], "l3test0").unwrap();
+    }
+
+    /// The namespace-correct source: two header lines, then a `name:` column
+    /// per interface.
+    #[test]
+    fn proc_net_dev_names_every_interface_in_the_namespace() {
+        let sample = "Inter-|   Receive |  Transmit
+ face |bytes    packets |bytes    packets
+    lo: 1234 12 0 0 0 0 0 0 1234 12 0 0 0 0 0 0
+mhsrv0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+";
+        assert_eq!(parse_proc_net_dev(sample), ["lo", "mhsrv0"]);
+    }
+
+    #[test]
+    fn an_interface_is_found_by_its_namespace_name() {
+        assert!(interface_exists("lo"));
+        assert!(
+            !interface_exists("l3test0-does-not-exist"),
+            "a missing device must not match"
+        );
     }
 
     #[test]
@@ -290,6 +358,22 @@ mod tests {
         assert!(
             message.contains("sudo ip -6 rule add from 2001:db8::1 lookup 100"),
             "{message}"
+        );
+    }
+
+    /// The device step asks before assigning, so a second claim (or a restart)
+    /// does not replace an address under live lanes.
+    #[test]
+    fn an_interface_address_is_matched_by_device_and_family() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(interface_has_address("lo", loopback).unwrap());
+        assert!(
+            !interface_has_address("lo", "10.99.0.9".parse().unwrap()).unwrap(),
+            "an address on another interface must not match"
+        );
+        assert!(
+            !interface_has_address("l3test0-does-not-exist", loopback).unwrap(),
+            "a missing device must not match"
         );
     }
 }

@@ -251,8 +251,8 @@ class Topology:
             self._ip("link", "set", dev, "up", "mtu", str(self.link_mtu), ns=ns)
         self._ip("route", "add", "default", "via", model.TOPO_SRV_IP, ns=VIS_NS)
 
-        # The TUN devices exist before the daemons start: they attach to the
-        # name and refuse to create a device themselves.
+        # The bench configs leave the device to the operator: the TUN devices
+        # exist before the daemons start, so the daemons attach to them.
         self._ip("tuntap", "add", "dev", TUN_SRV, "mode", "tun", ns=SRV_NS)
         self._ip("link", "set", TUN_SRV, "up", "mtu", str(self.tun_mtu), ns=SRV_NS)
         self._ip(

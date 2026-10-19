@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[transparent.status]` takes the same `bind_addr` and `token` as
   `[client.status]`, and the lowered L3 client runs the same listener: the
   answer carries the client's claims and lanes beside its pools.
+- **Linux L3 device and address preparation.**
+  A Linux transparent service now creates its persistent TUN device when one
+  is missing (MTU 1400), and the client assigns each claimed address that is
+  not already on the device — the same division macOS and Windows already
+  have: macOS creates its utun and assigns the claimed addresses, and the
+  Windows server creates its Wintun adapter. An existing device is used as it
+  is, so pre-create it to choose another MTU; an address already assigned is
+  left alone, so a second claim or a restart does not bounce a live interface.
+  Routes, policy routing and forwarding stay the operator's on every platform,
+  so the three are symmetric. Recipe B's manual server recipe gains the
+  `accept_local` line it was missing.
 
 ### Changed
 

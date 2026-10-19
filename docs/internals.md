@@ -313,16 +313,23 @@ it is injected into the local kernel, so a compromised or buggy peer cannot
 steer traffic into an arbitrary local address. On the client that check doubles
 as an allow-list, because the client is the end that owns local addresses.
 
-**What the daemon does not do.** It installs no route, rule or firewall rule,
-and it has no netlink code or shell-out to `ip` on any platform. On Linux it
-attaches to the operator's persistent TUN device and verifies what it depends
-on: the device must exist on both ends; on the client, every claimed address
-must be one the host carries and `rp_filter` (the device's and `all`) must read
-0; on the server, a registration is rejected if its device is missing or
-`ip_forward` is off. On macOS and Windows there is no persistent
-operator-created device to attach to: the daemon creates the utun or Wintun
-adapter (and on macOS assigns the claimed `/32`/`/128` addresses), while the operator owns the
-pf rule, routes and forwarding. The recipes are in
+**What the daemon does not do.** It installs no route, policy rule or firewall
+rule on any platform. On Linux it creates a missing TUN device first and then
+attaches to it (an existing device is used as it is), verifying what it
+depends on: the device must exist on both ends; on the client, every claimed
+address must be one the host carries and `rp_filter` (the device's and `all`)
+must read 0; on the server, a registration is rejected if the device cannot
+be created or opened, or `ip_forward` is off. The interface check reads `/proc/net/dev`,
+not `/sys/class/net`: sysfs is not filtered by network namespace, so a daemon
+in its own namespace would see the host's devices and miss its own.
+
+The one host state the daemon creates is the device itself — and, on the
+client, the claimed addresses that are not already on it — which is exactly
+what macOS already does (a utun and its addresses) and what the Windows server
+does for its adapter. An existing device is left as it is (pre-create it to
+choose its MTU), and an address already assigned is left alone. Everything
+around them — the pf rule, the routes, the policy rules and forwarding — is the
+operator's on every platform. The recipes are in
 [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 and IPv6 are both carried. The IPv6 parser
@@ -410,8 +417,8 @@ Two limits worth knowing: the probe answers only on Linux, the one platform
 where the dependency it needs is declared — elsewhere a session keeps the
 previous behaviour and relies on kernel fragmentation, which is also what an
 oversized datagram does on any path whose MTU cannot be read; and the size is
-never *grown*, so `mtu` in the config's sense does not exist: the engine's
-1400-byte default is the ceiling.
+never *grown*, so there is no configurable MTU: the engine's 1400-byte default
+is the ceiling.
 
 ## Heartbeat
 

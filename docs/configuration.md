@@ -317,7 +317,7 @@ private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # Necessary. This s
 public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # Necessary. The client public key, base64 32 bytes; the handshake is fixed KK
 
 [server.transparent]
-tun = "molehill0" # Optional. The server's TUN device. Default: molehill0 on Linux and Windows, auto (a free utunN) on macOS. Linux: the operator creates it and routes every claim into it. macOS/Windows: the daemon creates it; the operator routes/forwards
+tun = "molehill0" # Optional. The server's TUN device. Default: molehill0 on Linux and Windows, auto (a free utunN) on macOS. Linux: the daemon creates it if missing and uses an existing one as it is; macOS/Windows: the daemon creates it; the operator routes/forwards
 ```
 
 ## Dynamic service registration
@@ -554,14 +554,18 @@ Windows client config is refused at parse time with the WSL2 guidance. The
 client on an unsupported platform, or in a build without the feature, is
 refused at parse time with the reason and the supported alternative.
 
-The device lifecycle follows the platform. On Linux the operator creates a
-persistent TUN device and the daemon attaches to it; the process needs
-`CAP_NET_ADMIN`. On macOS the daemon creates an ephemeral `utunN`, assigns each
-claimed address (`/32` or `/128`) to it, and the operator owns the pf rule and
-routes; the process needs root. On Windows the daemon creates a Wintun adapter,
-and the operator owns the route, forwarding and firewall rules; the process
-needs Administrator and `wintun.dll` beside the binary. Both IPv4 and IPv6 are
-carried: the parser understands the IPv6 base header, the common
+The device lifecycle follows the platform, and the daemon owns only the
+device and, on the client, the claimed addresses. On Linux it creates a
+persistent TUN device when one is missing and attaches to an existing one as
+it is; on the client it also assigns each claimed address that is not already
+on the device. The routes, policy rules and forwarding switches stay the
+operator's, and the process needs `CAP_NET_ADMIN`. On macOS the daemon creates
+an ephemeral `utunN` and, on the client, assigns each claimed address (`/32`
+or `/128`), and the operator owns the pf rule and routes; the process needs
+root. On Windows the daemon creates a Wintun
+adapter, and the operator owns the route, forwarding and firewall rules; the
+process needs Administrator and `wintun.dll` beside the binary. Both IPv4 and
+IPv6 are carried: the parser understands the IPv6 base header, the common
 extension-header chain (including fragments), and TCP/UDP ports; ICMPv6 and ESP
 are routed by address alone. IPv6 jumbograms are rejected as malformed, and a
 transport header behind an extension this parser does not understand is routed
@@ -578,14 +582,17 @@ server that serves one accepts plaintext connections from it, whatever
 `[server.noise]` says — the Noise keys keep applying to the clients
 that do negotiate them.
 
-**The daemon never installs a route, a rule or a firewall rule.** It has no
-netlink code and never shells out to `ip`. On Linux it attaches to the
-operator's persistent TUN device and verifies the addresses and `rp_filter` the
-operator configured. On macOS and Windows it creates the ephemeral device
-because those platforms have no operator-created equivalent; it assigns the
-claimed addresses on macOS, while the operator installs the pf rule, routes and
-forwarding. The recipes are in
-[Deployment](./deployment.md#transparent-services).
+**The daemon creates only the device and, on the client, the claimed
+addresses.** It installs no route, no policy rule and no firewall rule on any
+platform: on Linux it creates a missing TUN device and verifies what the
+operator configured. An existing device is left as it is, so pre-create it to
+choose its MTU; on the client, an address already on the device is left alone.
+macOS creates its utun and, on the client, assigns the claimed addresses, and
+the Windows server creates its Wintun adapter. It leaves that state in place
+when it stops. Everything around them stays with the operator on every
+platform: the server's forwarding and per-claim routes, the client's policy
+rule and table route, macOS' pf rule, Windows' route and firewall rules. The
+recipes are in [Deployment](./deployment.md#transparent-services).
 
 | Key | Meaning |
 |---|---|
@@ -597,6 +604,12 @@ forwarding. The recipes are in
 | `[transparent.data].tunnels` | the **lane budget**: how many carrier connections this client holds for all of its claims together, divided equally among the claims. One lane **is** one connection (a claim never multiplexes), and every claim keeps at least one. Default: **two lanes per claim** — a measured knee, and the trade it makes is priced in the note below this table. The division is where the lanes *start*: a claim carrying more flows than it has lanes takes an idle lane from a claim that can spare one (never its last), so the budget decides how many connections exist and the traffic decides who holds them. A budget below the claim count is refused with the number to write; the ceiling is 1024 lanes per client; a budget that is not a multiple of the claim count leaves the remainder unallocated — the allocator redistributes the shares, it does not spend what the division left over, so write a multiple when you want every lane used |
 | `[server.transparent]` | **the switch**: the presence of this table is what lets the server serve L3 at all. Absent, every transparent registration is refused by policy before any device is looked at |
 | `[server.transparent].tun` | the TUN device the server attaches to. Default: `molehill0` on Linux and Windows, `auto` (a free `utunN`) on macOS |
+
+**`tun` is the interface, not a label.** On Linux the daemon creates or
+attaches to exactly this name, and every operator route and rule must use it;
+on macOS `auto` resolves to a free `utunN` (logged, so a static pf rule needs
+an explicit `utunN`); on Windows it names the Wintun adapter. The server and
+client each have their own value, and they need not match.
 
 **The lane budget's default is two lanes per claim, and that is a trade, not
 a preference.** A claim's data path is serialized per lane — one device reader
@@ -677,16 +690,17 @@ The platform decides which half is the operator's:
 
 | | Linux | macOS | Windows (server only) |
 |---|---|---|---|
-| Device | operator creates the persistent TUN | daemon creates a `utunN` | daemon creates the Wintun adapter |
-| Claimed address | operator assigns `/32` or `/128` | daemon assigns each claimed `/32`/`/128` | not assigned; the claim is routed |
+| Device | daemon creates the persistent TUN when missing; pre-create it to choose the MTU | daemon creates a `utunN` | daemon creates the Wintun adapter |
+| Claimed address | daemon assigns `/32` or `/128` when it is not already on the device | daemon assigns each claimed `/32`/`/128` | not assigned; the claim is routed |
 | Routing | operator (`ip route`/`ip rule`) | operator (`route` + pf) | operator (`New-NetRoute`) |
 | Privilege | `CAP_NET_ADMIN` | root | Administrator + `wintun.dll` |
 | Checks | device, address, `rp_filter`, `ip_forward` | daemon creates/assigns; operator owns pf/routes | daemon creates; operator owns route/forwarding/firewall |
 
-- **Linux:** the device must exist; the client must own every claimed address
-  and have `net.ipv4.conf.<tun>.rp_filter` and
-  `net.ipv4.conf.all.rp_filter` at `0`; the server needs `ip_forward = 1`. A
-  missing prerequisite is refused with the exact command to run.
+- **Linux:** a missing device is created and, on the client, a missing claimed
+  address is assigned; an existing device is left as it is. The client needs
+  `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` at `0`;
+  the server needs `ip_forward = 1`. A missing prerequisite is refused with the
+  exact command to run.
 - **macOS:** the client's claimed `/32` or `/128` addresses are assigned by the daemon. The
   operator installs the pf `route-to` rule that sends replies from those
   addresses back into the utun; the server enables `net.inet.ip.forwarding` and
@@ -975,8 +989,8 @@ the peer's public key beside your private key.
 | UDP traffic not flowing | Check `protocol = "udp"`; datagrams larger than `udp_buffer_size` are truncated to it; a mapping is re-bound after its adaptive idle lifetime. |
 | Stateful UDP sessions (games, QUIC, WireGuard) break mid-session | Ensure both ends run a version with UDP session affinity (≥ this fix); a peer quiet for its adaptive lifetime is re-bound to a fresh local socket (new source port) on the next datagram — keep it talking or accept the re-bind. |
 | `Failed to read cmd: early eof` warnings | The peer closed the channel (restart or shutdown); the client reconnects automatically. |
-| An IPv6 claim's visitors get nothing | On Linux, assign the `/128`, add the `ip -6 rule from <addr>` and the `ip -6 route` in table 100, and enable `net.ipv6.conf.all.forwarding=1` on the server. The refusal prints the exact commands when the local address is missing. macOS needs an `inet6` pf rule; Windows needs a `/128` route and IPv6 forwarding. |
-| `Interface <tun> does not exist. Prepare it first` (Linux; client, or a registration rejection on the server) | On Linux a transparent service attaches to a device the operator creates. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). macOS/Windows create their own device. |
+| An IPv6 claim's visitors get nothing | On Linux, check that the `/128` is on the device (the daemon assigns it when missing), add the `ip -6 rule from <addr>` and the `ip -6 route` in table 100, and enable `net.ipv6.conf.all.forwarding=1` on the server. The refusal prints the exact commands when the local address is missing. macOS needs an `inet6` pf rule; Windows needs a `/128` route and IPv6 forwarding. |
+| `Interface <tun> does not exist. Prepare it first` (Linux; client, or a registration rejection on the server) | On Linux the daemon creates a missing device, so this means creation failed (check that `ip` is on `PATH` and the process has `CAP_NET_ADMIN`) or the device disappeared. Run the `ip tuntap add dev <tun> mode tun` and `ip link set <tun> up mtu 1400` lines the message prints (recipes: [Deployment](./deployment.md#transparent-services)). macOS/Windows create their own device. |
 | `This server does not serve transparent (L3) services: [server.transparent] is not configured` (registration rejection) | The server's own switch is off, so the registration was refused by policy before the device was looked at. Add the table to the **server's** config if this host is meant to route the claimed address, or drop the service from the client. |
 | `Transparent service claims <ip>, but no local interface carries it` | The client must own the address it claims. For IPv4 run the `ip addr add <ip>/32`, `ip rule add from <ip> lookup 100` and `ip route add default dev <tun> table 100` lines; for IPv6 the same commands with `ip -6` and `/128`. The refusal prints the exact family's commands. |
 | `Reverse-path filtering is on (net.ipv4.conf.<tun>.rp_filter = 1)` | Injected packets carry the visitor's source address, which a strict check drops. Run the `sysctl -w` line the message prints; both `net.ipv4.conf.<tun>.rp_filter` and `net.ipv4.conf.all.rp_filter` must read `0`. |

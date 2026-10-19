@@ -1,6 +1,8 @@
 use crate::common::constants::{UDP_QUEUE_SIZE, UDP_ROUTE_TTL_SECS};
 use crate::common::helper::write_and_flush;
 use crate::config::ConfigChange;
+#[cfg(mh_l3_server)]
+use crate::config::parsing::TransparentConfig;
 use crate::config::{Config, ServerConfig, ServiceType};
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -874,9 +876,9 @@ enum Registration {
 /// makes this host reach for `/dev/net/tun`. A server without the table
 /// therefore refuses by policy, before any device is looked at.
 #[cfg(mh_l3_server)]
-fn transparent_tun_for(server_config: &ServerConfig) -> Result<&str, String> {
+fn transparent_for(server_config: &ServerConfig) -> Result<&TransparentConfig, String> {
     match server_config.transparent.as_ref() {
-        Some(transparent) => Ok(&transparent.tun),
+        Some(transparent) => Ok(transparent),
         None => Err(
             "This server does not serve transparent (L3) services: `[server.transparent]` is \
              not configured"
@@ -961,20 +963,31 @@ async fn register_service(
     // A transparent service claims a public address this host never binds, so
     // four things have to hold before it is accepted: this server serves L3 at
     // all (the operator's own `[server.transparent]`, checked first so that a
-    // client's registration is never what makes this process reach for a
-    // device), the build and platform can carry it, the device can be opened
-    // (Linux requires the operator's TUN to exist; macOS/Windows create theirs),
-    // and no other service already owns that address.
+    // client's registration is never what enables L3), the build and platform
+    // can carry it, the device can be opened (Linux creates a missing TUN;
+    // macOS/Windows create theirs), and no other service already owns that
+    // address.
     #[cfg(mh_l3_server)]
     let (claim, transparent_tun, wire_format) = {
         if reg.service_type == ServiceType::Transparent {
-            let tun = match transparent_tun_for(server_config) {
-                Ok(tun) => tun,
+            let transparent = match transparent_for(server_config) {
+                Ok(transparent) => transparent,
                 Err(reason) => {
                     warn!(service = %reg.name, "{reason}");
                     return Ok(Registration::Rejected(reason));
                 }
             };
+            let tun = transparent.tun.as_str();
+            // The daemon owns the device step on every platform: Linux creates
+            // a missing one and uses an existing one as the operator prepared
+            // it, while macOS and Windows create theirs. Every route, policy
+            // rule and forwarding switch stays the operator's.
+            #[cfg(mh_linux)]
+            if let Err(e) = crate::transparent::net::prepare_device(tun) {
+                let reason = format!("Failed to prepare the TUN device: {e:#}");
+                warn!(service = %reg.name, "Registration failed: {reason}");
+                return Ok(Registration::Rejected(reason));
+            }
             if let Err(e) = crate::transparent::check::require_interface(tun) {
                 let reason = format!("{e:#}");
                 warn!(service = %reg.name, "Registration failed: {reason}");
@@ -1341,10 +1354,10 @@ impl SessionCtx {
         };
         // The transparent device is a server-wide setting: the service's data
         // path is a hub keyed by that device and the endpoint it claimed.
-        let Ok(tun) = transparent_tun_for(&self.server_config) else {
+        let Ok(transparent) = transparent_for(&self.server_config) else {
             return ack(LANE_DRAIN_UNKNOWN);
         };
-        let Ok(hub) = TunHub::get_or_spawn(tun, Direction::Destination) else {
+        let Ok(hub) = TunHub::get_or_spawn(&transparent.tun, Direction::Destination) else {
             return ack(LANE_DRAIN_UNKNOWN);
         };
         let endpoint = Endpoint::new(handle.endpoint.ip(), handle.endpoint.port());
@@ -4310,7 +4323,7 @@ mod tests {
     #[test]
     fn the_server_switch_governs_transparent_registrations() {
         let mut server = ServerConfig::default();
-        let refusal = transparent_tun_for(&server).unwrap_err();
+        let refusal = transparent_for(&server).unwrap_err();
         assert!(
             refusal.contains("[server.transparent]"),
             "the refusal must name the missing switch, got: {refusal}"
@@ -4319,9 +4332,9 @@ mod tests {
         server.transparent = Some(crate::config::parsing::TransparentConfig {
             tun: "l3test0".to_string(),
         });
+        let transparent = transparent_for(&server).unwrap();
         assert_eq!(
-            transparent_tun_for(&server).unwrap(),
-            "l3test0",
+            transparent.tun, "l3test0",
             "the device comes from the table the operator wrote"
         );
     }

@@ -260,7 +260,7 @@ unit 下(见 [systemd](#systemd))。
 |---|---|---|---|
 | 透明客户端 | 是 | 是 | 否 —— 请跑在 WSL2 里 |
 | 透明服务端 | 是 | 是 | 是(Wintun + 管理员) |
-| 设备 | 运维方创建持久 TUN | 守护进程创建 `utunN`,并配置所声明的 `/32`/`/128` | 守护进程创建 Wintun 适配器 |
+| 设备 | 缺失时由守护进程创建持久 TUN,并配置缺失的认领地址 | 守护进程创建 `utunN`,并配置所声明的 `/32`/`/128` | 守护进程创建 Wintun 适配器 |
 | 路由 | `ip route` / `ip rule` | `route` + pf `route-to` | `New-NetRoute` + 转发 |
 | 权限 | `CAP_NET_ADMIN` | root | 管理员 + `wintun.dll` |
 
@@ -372,6 +372,9 @@ sudo ip link set molehill0 up mtu 1400
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
 sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+# 客户端交回来的回复包,其源地址是本机自己的地址,内核会按 martian 拒绝转发:
+# 必须让隧道这个接口接受本地源。
+sudo sysctl -w net.ipv4.conf.molehill0.accept_local=1
 
 # 在路由决策之前给所声明的端口打 mark(iptables;用 nftables 时同一条规则以
 # `meta mark set 0x1` 结尾)。服务同时使用 UDP 时也要标记 UDP。发往
@@ -419,6 +422,26 @@ Enabled`。
 上游网络必须把所声明的 `/128` 路由到服务端,与 IPv4 相同;守护进程不做 NDP
 代理,也不安装路由。IPv6 jumbogram 不承载。数据面与地址族无关:一条认领可以
 是 IPv4 或 IPv6,两端对两种地址族协商同一套 `Ip`/`Vnet` 帧格式。
+
+### Linux 的设备与地址自动化
+
+配方里只有两步可以由守护进程代劳:设备,以及客户端上的认领地址。透明服务在设备
+缺失时创建 TUN(持久设备,与 `ip tuntap add` 留下的状态一致)、用 MTU 1400 拉起,
+并在客户端把尚未配置的认领地址配上去。已存在的设备原样使用,所以想指定别的 MTU
+就先自己创建。这正是 macOS 守护进程无条件执行的那两步(`utunN` 与其认领地址),
+也是 Windows 守护进程为 Wintun 适配器执行的那一步,三个平台因此对称。
+
+其余一切在任何平台都仍是上面的配方:服务端的转发开关、`rp_filter` 与每条认领的
+路由(或配方 B 的 mark 与策略路由),以及客户端的 `from <claim>` 规则与表路由。
+每一步都是幂等的,守护进程退出时状态保留,所以重启、reload 或第二条认领都会收敛。
+需要守护进程执行这些步骤时:`PATH` 上有 `ip`,以及 `CAP_NET_ADMIN`。
+
+设备由守护进程创建带来两个后果:属于"创建时"的设备设置要写进
+`net.ipv4.conf.default.*`——启动前设好 `net.ipv4.conf.default.rp_filter=0` 与
+`net.ipv4.conf.all.rp_filter=0`,否则客户端会拒绝它刚创建设备;而引用设备的
+路由要在设备出现之后再应用,这正是 macOS 与 Windows 配方已有的顺序。守护进程
+创建的设备使用 MTU 1400;如果路径需要别的 MTU,请在启动前自己创建设备,守护进程
+会原样使用。
 
 ### macOS:utun、pf 与转发
 
@@ -535,7 +558,7 @@ WSL2 实例需要与上面 Linux 配方相同的前置条件。
 | 需要什么 | `molehill --server`(转发) | `molehill --client`(转发) | L3 两端(`--server` + `--transparent`) |
 |---|---|---|---|
 | `CAP_NET_ADMIN` / root / 管理员 | 否 | 否 | **是,两端都要** —— Linux/macOS 上透明进程要打开 TUN 设备;Windows 上需要管理员 + `wintun.dll` |
-| TUN 设备 | 否 | 否 | Linux:**是,两端都要**,由运维方创建。macOS/Windows:守护进程创建(utun/Wintun) |
+| TUN 设备 | 否 | 否 | Linux:**是,两端都要** —— 守护进程创建缺失的设备(MTU 1400),已存在则原样使用;macOS/Windows:守护进程创建(utun/Wintun) |
 | `net.ipv4.ip_forward = 1` | 否 | 否 | **Linux 服务端上是**;macOS 上是 `net.inet.ip.forwarding`;Windows 上是接口转发 + `IPEnableRouter` |
 | TUN 与 `all` 上的 `rp_filter = 0` | 否 | 否 | **仅 Linux 上是** —— 注入的包携带的是访客的源地址 |
 | 源地址策略路由 | 否 | 否 | Linux `ip rule`;macOS pf `route-to`;**Windows 不支持**(用 WSL2) |
@@ -557,9 +580,9 @@ WSL2 实例需要与上面 Linux 配方相同的前置条件。
 - 上面的 `ip` 与 `sysctl` 命令都只是运行时状态。请用发行版的机制让它们持久化
   (开机执行的单元、networkd/NetworkManager 的 dispatcher、`rp_filter` 两个键
   用 `sysctl.d`);守护进程只在服务启动时校验它看到的东西。
-- `mtu 1400` 是守护进程自己的拒绝信息里给出的值,也是这两套配方使用的值。请把
-  它保持在路径 MTU 或以下:客户端内核根据 TUN 设备的 MTU 推导自己要宣告的 MSS,
-  隧道 MTU 小于路径 MTU 正是让分片不会超出路径的原因。
+- 守护进程创建的设备使用 `mtu 1400`,它的拒绝信息也打印同一个值;这两套配方也用
+  1400。请把它保持在路径 MTU 或以下:客户端内核根据 TUN 设备的 MTU 推导自己要宣告的
+  MSS,隧道 MTU 小于路径 MTU 正是让分片不会超出路径的原因。
 - `MOLEHILL_L3_STATS=1`(见
   [配置文档](./configuration.zh.md#诊断开关按需开启))每秒打印一次数据面的
   计数,这是判断两端设备是否真的在过包的办法。

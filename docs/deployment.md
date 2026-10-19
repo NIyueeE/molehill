@@ -271,7 +271,7 @@ The supported combinations are:
 |---|---|---|---|
 | Transparent client | yes | yes | no — run it under WSL2 |
 | Transparent server | yes | yes | yes (Wintun + Administrator) |
-| Device | operator-created TUN | daemon-created `utunN`; daemon assigns the claimed `/32`s | daemon-created Wintun adapter |
+| Device | daemon-created TUN when missing; daemon assigns missing claim addresses | daemon-created `utunN`; daemon assigns the claimed `/32`s | daemon-created Wintun adapter |
 | Routing | `ip route` / `ip rule` | `route` + pf `route-to` | `New-NetRoute` + forwarding |
 | Privilege | `CAP_NET_ADMIN` | root | Administrator + `wintun.dll` |
 
@@ -398,6 +398,10 @@ sudo ip link set molehill0 up mtu 1400
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
 sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+# The replies the client hands back carry this host's own address as their
+# source, so the kernel would refuse to forward them as martians: the tunnel
+# is the interface that must accept a local source.
+sudo sysctl -w net.ipv4.conf.molehill0.accept_local=1
 
 # Mark the claimed port before the routing decision (iptables; with nftables the
 # same rule ends in `meta mark set 0x1`). Mark UDP as well if the service uses
@@ -451,7 +455,35 @@ jumbograms are not carried. The data path itself is family-agnostic: a claim
 can be IPv4 or IPv6, and the server/client negotiate the same `Ip`/`Vnet`
 frame format for either.
 
-### macOS: an operator-created utun, pf and forwarding
+### Device and address automation on Linux
+
+Two steps of the recipes are the daemon's to take, and only those two: the
+device and, on the client, the claimed address. A transparent service creates
+the TUN device when it is missing (persistent, what `ip tuntap add` leaves),
+brings it up with MTU 1400, and on the client assigns each claimed address
+that is not already on it. An existing device is used as it is, so pre-create
+it to choose another MTU. That is the same pair of steps the macOS daemon
+takes unconditionally (a `utunN` and its claimed addresses) and the device
+step the Windows daemon takes for its adapter, so the three stay symmetric.
+
+Everything else stays the recipes above on every platform: the server's
+forwarding switch, `rp_filter` and each claim's route (or the mark and policy
+routing of recipe B), and the client's `from <claim>` rule with its table
+route. Every step is idempotent and the state is left in place when the daemon
+stops, so a restart, a reload or a second claim converges. When the daemon has
+to create the device or assign an address, it needs `ip` on `PATH` and
+`CAP_NET_ADMIN`.
+
+Two consequences of the daemon creating the device: a setting that belongs to
+the device at creation time comes from `net.ipv4.conf.default.*`, so set
+`net.ipv4.conf.default.rp_filter=0` and `net.ipv4.conf.all.rp_filter=0` before
+starting (the client refuses a device whose reverse-path filter is on), and
+routes that name the device are applied after it appears — the same ordering
+the macOS and Windows recipes already have. A device the daemon creates gets
+MTU 1400; create it yourself before starting if the path wants another MTU,
+and the daemon uses it as it is.
+
+### macOS: a daemon-created utun, operator pf and forwarding
 
 macOS has no persistent TUN device an operator can create and hand over: the
 daemon opens `/dev/utun` and the kernel creates a `utunN`, which exists only
@@ -573,7 +605,7 @@ for anything unusual:
 | What is needed | `molehill --server` (forwarding) | `molehill --client` (forwarding) | An L3 pair (`--server` + `--transparent`) |
 |---|---|---|---|
 | `CAP_NET_ADMIN` / root / Administrator | no | no | **yes, both ends** — the transparent process opens a TUN device on Linux/macOS; Administrator + `wintun.dll` on Windows |
-| A TUN device | no | no | Linux: **yes, both ends**, created by the operator. macOS/Windows: the daemon creates it (utun/Wintun) |
+| A TUN device | no | no | Linux: **yes, both ends** — the daemon creates a missing one (MTU 1400) and uses an existing one as it is; macOS/Windows: the daemon creates it (utun/Wintun) |
 | `net.ipv4.ip_forward = 1` | no | no | **yes, on a Linux server**; on macOS `net.inet.ip.forwarding`; on Windows interface forwarding + `IPEnableRouter` |
 | `rp_filter = 0` on the TUN and `all` | no | no | **yes on Linux** — injected packets carry the visitor's source |
 | Source policy routing | no | no | Linux `ip rule`; macOS pf `route-to`; **Windows cannot** (use WSL2) |
@@ -600,10 +632,11 @@ deployment fails on:
   your distribution's mechanism (a boot unit, a networkd/NetworkManager
   dispatcher, `sysctl.d` for the `rp_filter` keys); the daemon only verifies
   what it finds when the service starts.
-- `mtu 1400` is the value the daemon's own refusal prints, and the value these
-  recipes use. Keep it at or below the path MTU: the client's kernel derives the
-  MSS it advertises from the TUN device's MTU, and a tunnel MTU smaller than the
-  path is what keeps a segment from being too large for it.
+- A device the daemon creates gets `mtu 1400`, and its refusal prints the same
+  value; these recipes use 1400 too. Keep it at or below the path MTU: the
+  client's kernel derives the MSS it advertises from the TUN device's MTU, and a
+  tunnel MTU smaller than the path is what keeps a segment from being too large
+  for it.
 - `MOLEHILL_L3_STATS=1` (see
   [Configuration](./configuration.md#diagnostics-switches-opt-in)) prints the
   data path's counters once a second, which is how you see whether the two

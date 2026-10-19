@@ -423,12 +423,12 @@ pub struct ClientDataConfig {
 }
 /// The TUN device a transparent (L3) service attaches to.
 ///
-/// Only the *name* is configuration: this daemon installs no route, rule or
-/// firewall rule ([deployment.md](../../docs/deployment.md) owns the recipes).
-/// Linux attaches to an operator-created persistent device; macOS and Windows
-/// create the ephemeral utun/Wintun adapter, and macOS also assigns the claimed
-/// `/32`s. Both ends need a device — the server routes the claimed address into
-/// its own, the client carries the address on its own.
+/// This table names the device. It installs no route, rule or firewall rule
+/// ([deployment.md](../../docs/deployment.md) owns the recipes). Linux creates
+/// a missing persistent device and attaches to an existing one untouched;
+/// macOS and Windows create the ephemeral utun/Wintun adapter, and macOS also
+/// assigns the claimed `/32`s. Both ends need a device — the server routes the
+/// claimed address into its own, the client carries the address on its own.
 ///
 /// On the **server** the table carries a second meaning: it is the operator's
 /// own switch for the feature, because serving L3 is what asks this process for
@@ -438,8 +438,8 @@ pub struct ClientDataConfig {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentConfig {
-    /// Interface name. On Linux it is created and configured by the operator
-    /// before the daemon starts; on macOS `auto` chooses a free `utunN`; on
+    /// Interface name. On Linux the daemon creates a missing device and uses
+    /// an existing one as it is; on macOS `auto` chooses a free `utunN`; on
     /// Windows it names the Wintun adapter. Default: `molehill0` (Linux and
     /// Windows), `auto` (macOS).
     #[serde(default = "default_tun_name")]

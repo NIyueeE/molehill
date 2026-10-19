@@ -51,6 +51,33 @@
   green. Open threads: the release sweep (a method-changing release, so it
   becomes the next baseline) and manual acceptance of the full §4 table and
   the old-key refusals.
+- **Linux L3 takes the same device/address step macOS and Windows own
+  (2026-10-19).** A Linux transparent service now creates its persistent TUN
+  device when one is missing and, on the client, assigns each claimed address
+  that is not already on it — exactly what macOS already does on its own (the
+  device and the claimed addresses) and what the Windows server does for its
+  adapter. No config key gates it: an existing device is used as it is (create
+  it first to choose its MTU), and an address already assigned is left alone,
+  so a second claim or a restart does not bounce a live interface. Routes,
+  policy routing and forwarding stay the operator's on all three, which is the
+  symmetry the maintainer asked for. An earlier version automated the routing
+  half too (mark, policy rules, sysctls, `accept_local`); it was proven in a
+  three-namespace topology and then withdrawn by decision. Two facts survive
+  it: recipe B needs `net.ipv4.conf.<tun>.accept_local=1` (the manual recipe
+  now documents it), and a device the daemon creates appears at
+  startup/registration, so per-device sysctls must come from
+  `net.ipv4.conf.default.*` before the start and routes that name the device
+  must be applied after it appears — the ordering macOS and Windows recipes
+  already have. The narrowed mode was re-proven on this host in the same
+  topology, both recipes: the daemons created the devices and the client's
+  address, the operator's steps followed, and the visitor was echoed through
+  the claim. The default L3 harness ran on this branch on 2026-10-19 (15/15).
+  A local variant that skipped the harness's own device setup created both
+  devices and the client's address and passed every device-path arm, but its
+  two lane-lending arms failed: the 16-flow arm stalled for about five seconds
+  when a lane was lent, a window the default load finishes before. That is a
+  lane-allocator observation, not root-caused here and not part of the device
+  step.
 - **Striped-group release and the striping signal were corrected (2026-10-19).**
   Two defects from the migration's striping commit. A group that ended by
   aborting a direction left its reader tasks parked on the mux streams, so the

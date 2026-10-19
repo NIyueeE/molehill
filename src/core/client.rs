@@ -1696,6 +1696,22 @@ fn check_transparent_client(
             cfg.name, cfg.remote_bind_addr
         )
     })?;
+    // The device and the claimed address are the part the daemon owns on every
+    // platform: Linux creates a missing device and assigns a missing address,
+    // while macOS does both through the hub below. Everything around them —
+    // the routes, the policy rule and the forwarding switches — stays the
+    // operator's.
+    #[cfg(mh_linux)]
+    {
+        crate::transparent::net::prepare_device(&cfg.transparent_tun)
+            .with_context(|| format!("service {}: failed to prepare the TUN device", cfg.name))?;
+        crate::transparent::net::claim_client(&cfg.transparent_tun, addr).with_context(|| {
+            format!(
+                "service {}: failed to assign {addr} to the device",
+                cfg.name
+            )
+        })?;
+    }
     let hub = TunHub::get_or_spawn(&cfg.transparent_tun, Direction::Source).with_context(|| {
         format!(
             "service {}: transparent prerequisites are not met",
