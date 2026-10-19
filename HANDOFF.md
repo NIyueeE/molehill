@@ -15,6 +15,10 @@
 > record is `benches/records/results-bench-v0.11.1.json` and it becomes the
 > next baseline.
 >
+> **Operator decision (2026-10-19):** the maintainer's deployment stays on
+> forwarding (L4) until L3 is stable; the open threads record the gaps that
+> hold it back and the `tunnels` naming question.
+>
 > **This file owns the working state**: what is open, what was decided and why,
 > and the release checklist. Per AGENTS.md §3 it is an agent page — user-facing
 > facts belong in the docs pages, and anything released belongs in
@@ -116,6 +120,58 @@
 
 ## Open threads for the next cycle
 
+- **Operator decision (2026-10-19): the production pair stays on forwarding
+  (L4) until L3 is stable; L3 remains the target.** The maintainer's own
+  deployment (ssh/http/https, Minecraft UDP, Mumble TCP+UDP) keeps the
+  forwarding model for now and moves to claims when the gaps below close — the
+  visitor's real source address is what a claim buys, and it is worth waiting
+  for. The 0.11.1 client migration that decision needs is schema only:
+  `default_mode`, `default_carrier`, `[client.data.tcp]`, `[client.data.kcp]`
+  and the per-service `carrier` are gone, the carrier is chosen at runtime
+  (KCP, TCP fallback), and a host that both forwards and claims runs two
+  processes. No code change is implied by this decision.
+- **Recipe B's single-IP client side is a documentation gap (found
+  2026-10-19).** With the claim on the server's own public address, the client
+  assigns that address to its TUN, so the kernel treats it as local and the
+  client's control channel to `<server-ip>:2333` loops back to itself.
+  `docs/deployment.md` says the client side is "recipe A's, unchanged"; that is
+  not sufficient. Verified in a network namespace: demote the `local` table
+  (`ip rule add pref 200 lookup local; ip rule del pref 0`) and add
+  `ip rule add pref 100 iif lo to <server-ip> lookup main` — locally generated
+  traffic then leaves via the gateway while inbound visitor packets are still
+  delivered locally. Both language pages need the extra steps, and a single-IP
+  acceptance case would keep it from regressing. A documentation and
+  acceptance gap, not a data-path defect.
+- **Naming decision pending: `[client.data].tunnels` vs `default_tunnels`
+  (raised 2026-10-19).** The key is the client-wide default for every service
+  that does not write its own `[client.services.<name>].tunnels`, which is
+  exactly what `default_token`, `default_remote_addr` and
+  `default_retry_interval` signal, so the unprefixed name reads as an
+  inconsistency. It is `tunnels` today because the per-service key has the same
+  name (the `default_` family is used where the child key is named
+  differently), and because 0.10 deliberately replaced `default_count` with
+  `tunnels` when the pool became pinned — the old "initial size" reading no
+  longer applied. Options: a sentence in the configuration page naming it the
+  default for services (cheap, preferred while the line is stabilizing), or a
+  rename to `default_tunnels` through the removed-keys migration (parser
+  refusal, the `githooks/check-docs` removed-key table, both language pages, an
+  invalid-config test and an `[Unreleased]` entry). A rename leaves the
+  per-service `tunnels` and `[transparent.data].tunnels` (a lane budget) alone.
+  No decision yet; not a release blocker.
+- **`shared_pool`'s width is decided by whichever service activates first
+  (verified 2026-10-19).** With `[client.data].shared_pool = true`, the session
+  pool is created by the first service to become active and uses *that
+  service's* `tunnels` (its override, else `[client.data].tunnels`), so a
+  per-service override can size the shared pool. The comment on
+  `ClientConfig::tunnels` says the client-wide count is the one a shared pool
+  uses, and the config validation checks only that count against the UDP
+  floor, so the runtime and the stated rule disagree. Reproduced with two
+  services (`tunnels = 16` and `4`, client-wide `8`): four runs logged
+  `tunnels=16` twice and `tunnels=4` twice, tracking activation order. Not a
+  deployment issue for the pair above (it does not set `shared_pool`), but a
+  defect to fix before the key's semantics are frozen: either honour the
+  client-wide count in shared mode, or validate the per-service overrides and
+  document the first-service rule. No fix made.
 - **The 32-bit embedded targets are compile-checked, not test-run.**
   `5e585b7` closed the aarch64 half — the two full-set musl targets build in
   CI (x86_64 on `ubuntu-latest`, aarch64 natively on `ubuntu-24.04-arm`) and a
