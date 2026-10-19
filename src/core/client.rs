@@ -575,6 +575,10 @@ struct Client {
     /// without a `[client.status]` block has no entry, and nothing reads the
     /// map.
     status_asks: HashMap<String, mpsc::UnboundedSender<crate::status::SessionAsk>>,
+    /// The configured half of the status answer, kept current across hot
+    /// reloads. The listener clones a receiver per request; a receiver that
+    /// subscribes after a reload still sees the latest list.
+    status_configured: tokio::sync::watch::Sender<Vec<crate::status::ConfiguredService>>,
 }
 
 impl Client {
@@ -582,12 +586,34 @@ impl Client {
     // resolved per service (see `ClientTransport`), so there is nothing
     // to build here.
     fn from(config: ClientConfig) -> Client {
+        let (status_configured, _) = tokio::sync::watch::channel(Vec::new());
         Client {
             config,
             sessions: Vec::new(),
             services: HashMap::new(),
             status_asks: HashMap::new(),
+            status_configured,
         }
+    }
+
+    /// Keep the status listener's configured half aligned with the live service
+    /// table. Called after startup and after every hot-reload add or delete;
+    /// the watch retains the latest list for a listener that subscribes later.
+    fn sync_status_configured(&self) {
+        let configured: Vec<crate::status::ConfiguredService> = self
+            .config
+            .services
+            .values()
+            .map(|service| crate::status::ConfiguredService {
+                name: service.name.clone(),
+                kind: crate::status::kind_name(service.service_type),
+                remote_addr: service.remote_bind_addr.clone(),
+                local_addr: service.local_addr.clone(),
+                lanes: (service.service_type == ServiceType::Transparent)
+                    .then_some(service.transparent_lanes),
+            })
+            .collect();
+        self.status_configured.send_replace(configured);
     }
 
     // The entrypoint of Client
@@ -603,6 +629,8 @@ impl Client {
             self.add_service(config)?;
         }
 
+        self.sync_status_configured();
+
         // The optional status API: one read-only listener the sessions answer.
         // Off unless `[client.status]` exists; the asks map is empty without
         // it, so spawning the task anyway would only cost a dead select arm —
@@ -610,8 +638,9 @@ impl Client {
         let status_task = self.config.status.clone().map(|status| {
             let asks = self.status_asks.clone();
             let shutdown = shutdown_rx.resubscribe();
+            let configured = self.status_configured.subscribe();
             tokio::spawn(async move {
-                if let Err(e) = crate::status::run(status, shutdown, asks).await {
+                if let Err(e) = crate::status::run(status, shutdown, asks, configured).await {
                     error!("status API stopped: {e:#}");
                 }
             })
@@ -852,11 +881,13 @@ impl Client {
             ConfigChange::ClientChange(client_change) => match *client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    self.config.services.insert(name.clone(), (*cfg).clone());
                     if let Err(e) = self.add_service(*cfg) {
                         warn!("Failed to start service {name}: {e:#}");
                     }
                 }
                 ClientServiceChange::Delete(s) => {
+                    self.config.services.remove(&s);
                     // Deregister from the session that owns the service: the
                     // server releases its public port, the session and the
                     // siblings carry on.
@@ -872,6 +903,7 @@ impl Client {
                 warn!("Ignored {ignored:?} since running as a client");
             }
         }
+        self.sync_status_configured();
     }
 }
 
@@ -3964,21 +3996,19 @@ impl ClientSession {
         let services = self
             .services
             .values()
-            .map(|entry| crate::status::ServiceStatus {
-                name: entry.slot.service.name.clone(),
-                kind: match entry.slot.service.service_type {
-                    crate::config::ServiceType::Tcp => "tcp",
-                    crate::config::ServiceType::Udp => "udp",
-                    crate::config::ServiceType::Transparent => "transparent",
+            .map(|entry| {
+                let service = &entry.slot.service;
+                crate::status::ServiceSnapshot {
+                    name: service.name.clone(),
+                    kind: crate::status::kind_name(service.service_type),
+                    remote_addr: service.remote_bind_addr.clone(),
+                    local_addr: service.local_addr.clone(),
+                    state: match entry.state {
+                        ServiceState::Registering => "registering",
+                        ServiceState::Active(_) => "active",
+                        ServiceState::Rejected => "rejected",
+                    },
                 }
-                .to_owned(),
-                remote_addr: entry.slot.service.remote_bind_addr.clone(),
-                local_addr: entry.slot.service.local_addr.clone(),
-                state: match entry.state {
-                    ServiceState::Registering => "registering",
-                    ServiceState::Active(_) => "active",
-                    ServiceState::Rejected => "rejected",
-                },
             })
             .collect();
 
@@ -3987,34 +4017,59 @@ impl ClientSession {
             .lane_pool
             .as_ref()
             .map(|pool| {
+                let claims: HashMap<String, (String, u16)> = self
+                    .services
+                    .values()
+                    .map(|entry| {
+                        (
+                            entry.slot.service.remote_bind_addr.clone(),
+                            (
+                                entry.slot.service.name.clone(),
+                                entry.slot.service.transparent_lanes,
+                            ),
+                        )
+                    })
+                    .collect();
                 pool.snapshot()
                     .0
                     .into_iter()
-                    .map(|load| crate::status::ClaimStatus {
-                        endpoint: load.endpoint.to_string(),
-                        lanes: load
-                            .lanes
-                            .into_iter()
-                            .map(|lane| crate::status::LaneStatus {
-                                slot: lane.slot,
-                                flows: lane.flows,
-                                handover: lane.handover,
-                            })
-                            .collect(),
+                    .map(|load| {
+                        let endpoint = load.endpoint.to_string();
+                        let (name, configured_lanes) = claims
+                            .get(&endpoint)
+                            .cloned()
+                            .unwrap_or_else(|| (endpoint.clone(), 0));
+                        crate::status::ClaimSnapshot {
+                            name,
+                            endpoint,
+                            configured_lanes: Some(configured_lanes),
+                            lanes: load
+                                .lanes
+                                .into_iter()
+                                .map(|lane| crate::status::LaneStatus {
+                                    slot: lane.slot,
+                                    flows: lane.flows,
+                                    handover: lane.handover,
+                                })
+                                .collect(),
+                        }
                     })
                     .collect()
             })
             .unwrap_or_default();
 
         #[cfg(not(mh_l3_client))]
-        let claims = ();
+        let claims = Vec::new();
+
+        #[cfg(feature = "multiplex")]
+        let pool_key = self.pools.keys().next().cloned();
+        #[cfg(not(feature = "multiplex"))]
+        let pool_key = None;
 
         crate::status::SessionView {
             services,
-            #[cfg(mh_l3_client)]
             claims,
-            #[cfg(not(mh_l3_client))]
-            claims,
+            pool_key,
         }
     }
 

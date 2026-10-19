@@ -880,6 +880,85 @@ local_addr = "127.0.0.1:8080"
 remote_bind_addr = "0.0.0.0:2334"
 ```
 
+**The answer has two layers.** `summary` counts what is configured, active
+and down; every entry then states its configured shape beside what the
+sessions report. `services[].actual.state` is `active`, `registering`,
+`rejected`, or `disconnected` when no session answered. A configured service
+side follows hot reloads: a service added or removed at runtime is listed or
+gone on the next request.
+`claims` is omitted entirely when the client has none; a configured claim
+still appears when it is down, with `actual.lanes_live` at zero. A transparent
+service's `configured.local_addr` is omitted — a claim has no local backend —
+and its configured lane share is on the matching `claims[]` entry.
+`pools[].configured.size` is the width asked for; `actual.size` is what is
+live, `session_up` is false when the owning session did not answer (the
+registry's stale counters are suppressed), and `actual.streams`, `pending`,
+`idle_tunnels`, `busiest_streams` and `accepting_tunnels` are the utilization
+view. `grows`, `shrinks`, `handover` and the per-tunnel counters are actual. When `session_up` is false, those live counters and `tunnels` are zero or
+empty; `configured.size` remains.
+`claims[].configured.lanes` is the budget share; `actual.lanes_live` and
+`actual.lanes` are what is attached.
+
+```json
+{
+  "summary": {
+    "services": { "configured": 2, "active": 1, "down": 1 },
+    "claims": { "configured": 1, "active": 1, "down": 0, "lanes_configured": 2, "lanes_live": 1 },
+    "pools": { "live": 1, "tunnels_configured": 4, "tunnels_live": 4, "streams": 2 }
+  },
+  "services": [
+    {
+      "name": "db",
+      "configured": { "kind": "tcp", "remote_addr": "127.0.0.1:8080", "local_addr": "127.0.0.1:8081" },
+      "actual": { "state": "disconnected" }
+    },
+    {
+      "name": "web",
+      "configured": { "kind": "transparent", "remote_addr": "10.99.0.1:8443" },
+      "actual": { "state": "active" }
+    }
+  ],
+  "pools": [
+    {
+      "key": "session:server.example.com:2333",
+      "configured": { "size": 4 },
+      "actual": {
+        "session_up": true,
+        "size": 4,
+        "streams": 2,
+        "pending": 0,
+        "idle_tunnels": 3,
+        "busiest_streams": 2,
+        "accepting_tunnels": 4,
+        "grows": 0,
+        "shrinks": 0,
+        "handover": null,
+        "tunnels": [
+          { "index": 0, "streams": 2, "pending": 0, "accepting": true, "carrier": "kcp", "delivered_bytes": 0, "written_bytes": 0, "kcp_datagrams_out": 9, "kcp_retransmits": 0 }
+        ]
+      }
+    }
+  ],
+  "claims": [
+    {
+      "name": "web",
+      "endpoint": "10.99.0.1:8443",
+      "configured": { "lanes": 2 },
+      "actual": {
+        "state": "active",
+        "lanes_live": 1,
+        "flows": 2,
+        "lanes": [ { "slot": 0, "flows": 2, "handover": false } ]
+      }
+    }
+  ]
+}
+```
+
+The example mixes a forwarding service (`db`) and an L3 claim (`web`) to show
+both shapes; a real answer is one mode or the other. The `tunnels` array is
+truncated; the counts cover the whole pool.
+
 A transparent (L3) client writes the same block as `[transparent.status]`; the
 answer carries its claims and their lanes beside its pools.
 
@@ -890,11 +969,11 @@ Absent, the block is off: no listener, no port, nothing to probe. Present:
   `Authorization: Bearer <token>`, and `401` with a
   `WWW-Authenticate: Bearer` challenge otherwise. The comparison runs over
   a digest, so timing leaks nothing about the token.
-- The answer states the *whole* client: services with their registration
-  state, every live tunnel pool with per-tunnel counters, and — where the
-  build and config carry transparent services — the claims and their
-  lanes. A session between reconnects is a gap in the report, not an
-  error: what is still known is what is shown.
+- The answer lists every configured service and claim beside its actual
+  state, and every live pool with its configured width beside its live
+  tunnels, stream distribution and per-tunnel counters. `disconnected` marks
+  a configured entry no session answered for; a session between reconnects is
+  a gap in the report, not an error: what is still known is what is shown.
 - `Access-Control-Allow-Origin: *` is sent on every response, so a browser
   panel on another origin can read it (with the token, which is the
   bearer).
@@ -906,6 +985,16 @@ Absent, the block is off: no listener, no port, nothing to probe. Present:
   the one connection the data plane trusts, which is why this is a
   separate listener.
 
+**Upgrading from 0.11.1:** the flat fields moved under `configured` and
+`actual`: `services[].{kind,remote_addr,local_addr}` -> `services[].configured.*`,
+`services[].state` -> `services[].actual.state` (a transparent claim's
+`local_addr` is omitted; its lanes are `claims[].configured.lanes`), `pools[].count` ->
+`pools[].configured.size`, `pools[].size` -> `pools[].actual.size`,
+`pools[].{grows,shrinks,handover,tunnels}` -> `pools[].actual.*`, and
+`claims[].lanes` -> `claims[].actual.lanes`. `pools[].carrier` is gone; use
+`pools[].actual.tunnels[].carrier`. `summary` is new. Update a panel or script
+that reads the old shape.
+
 Binding it beyond the loopback publishes the machine's own topology —
 make that decision deliberately, with the token, and behind whatever the
 host already has.
@@ -915,12 +1004,12 @@ Plain `curl` is the whole client: one header, one path, JSON out.
 ```sh
 # Per-tunnel health: what each tunnel carried, and what its carrier made it re-send
 curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
-  | jq '.pools[].tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
+  | jq '.pools[].actual.tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
 
 # Watch the re-send counter: a carrier losing traffic re-sends by the thousands,
 # a healthy one sits at ~nothing (this is the signal the carrier rule acts on)
 watch -n 1 "curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
-  | jq '.pools[].tunnels[].kcp_retransmits'"
+  | jq '.pools[].actual.tunnels[].kcp_retransmits'"
 ```
 
 ## Examples & deployment

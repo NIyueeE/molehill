@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING: the status API separates configured from actual state.**
+  Each service now carries `configured` (kind and addresses; a claim's
+  `local_addr` is omitted because it has no local backend, and its lane count
+  is on `claims[]`) beside `actual.state` (`active`, `registering`, `rejected`,
+  or `disconnected`); each pool carries `configured.size` beside `actual.size`,
+  `session_up`, total `streams`/`pending`, `idle_tunnels`, `busiest_streams`,
+  `accepting_tunnels`, the handover counters and the per-tunnel counters; each
+  claim carries `configured.lanes` beside `actual.lanes_live`, `actual.flows`
+  and its lanes; and `summary` counts configured/active/down services and
+  claims and configured/live pool tunnels. The flat 0.11.1 fields moved:
+  `services[].{kind,remote_addr,local_addr}` and `.state` to
+  `services[].configured.*` / `services[].actual.state`, `pools[].count` to
+  `pools[].configured.size`, `pools[].size` to `pools[].actual.size`,
+  `pools[].{grows,shrinks,handover,tunnels}` to `pools[].actual.*`, and
+  `claims[].lanes` to `claims[].actual.lanes`; `pools[].carrier` is gone (the
+  per-tunnel carrier remains). Update panels that read the old shape.
 - **BREAKING: protocol v5.2, dynamic striping.** `[server.data].stripe_count` is removed: every TCP visitor is a stripe group that starts at one data channel and grows by one when a group reports path backpressure — its send direction parked for at least 250 ms and then moved a frame — capped by `MAX_STRIPES` and gated to one step per 500 ms, never shrinking. A group the server abandons before forwarding is released on the client at once, and a group that ends without seeing the peer close drops its own channels rather than parking them. `StartForwardTcp` is gone — the striped command is the only TCP forward — the registration carries `max_udp_workers`, and the resume selector stays removed. A v5.1 peer is refused on the connection it happens on; upgrade both ends together.
 - **BREAKING: the UDP policy follows the path.** `udp_workers` becomes `max_udp_workers` (default 2, clamp 1..=64): the client starts one worker and the server asks for another on queue pressure, then retires an idle one. `udp_send_queue_size`, `udp_idle_timeout` and `udp_forwarder_ipv6` are removed: the queue uses CoDel (10 ms sojourn target), a peer mapping's lifetime follows its own largest gap (30-300 s), and the forwarder follows `local_addr`'s address family.
 - **BREAKING: one global tunnel valve.** `[server.data].max_tunnels` caps every live multiplexed tunnel and every transparent lane of the server, not one client's session. Unset derives the cap from the process's open-file limit and 0 is unlimited; `[server.data].max_tunnels_per_client` is refused with the replacement.

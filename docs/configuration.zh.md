@@ -763,6 +763,78 @@ local_addr = "127.0.0.1:8080"
 remote_bind_addr = "0.0.0.0:2334"
 ```
 
+**应答分两层。** `summary` 给出配置数、活跃数与 down 数;每个条目再把配置形状
+与实际状态并排列出。`services[].actual.state` 是 `active`、`registering`、
+`rejected`,或没有会话应答时的 `disconnected`;配置侧跟随热重载:运行时新增或删除的服务,
+在下一次请求里出现或消失。没有 claim 时 `claims` 整个省略;配置了但断开的 claim
+仍会出现,`actual.lanes_live` 为 0。透明服务的 `configured.local_addr` 会省略——
+claim 没有本地后端——其配置车道份额在对应的 `claims[]` 条目里。`pools[].configured.size` 是要求的宽度,
+`actual.size` 是存活数;`session_up` 为 false 表示所属会话没有应答(注册表里的
+旧计数器被抑制),`actual.streams`、`pending`、`idle_tunnels`、
+`busiest_streams`、`accepting_tunnels` 是利用情况;`grows`、`shrinks`、
+`handover` 与每隧道计数器都是实际值。 `session_up` 为 false 时,这些存活计数与 `tunnels` 为零或空;`configured.size`
+保留。`claims[].configured.lanes` 是预算份额,
+`actual.lanes_live` 与 `actual.lanes` 是实际挂上的。
+
+```json
+{
+  "summary": {
+    "services": { "configured": 2, "active": 1, "down": 1 },
+    "claims": { "configured": 1, "active": 1, "down": 0, "lanes_configured": 2, "lanes_live": 1 },
+    "pools": { "live": 1, "tunnels_configured": 4, "tunnels_live": 4, "streams": 2 }
+  },
+  "services": [
+    {
+      "name": "db",
+      "configured": { "kind": "tcp", "remote_addr": "127.0.0.1:8080", "local_addr": "127.0.0.1:8081" },
+      "actual": { "state": "disconnected" }
+    },
+    {
+      "name": "web",
+      "configured": { "kind": "transparent", "remote_addr": "10.99.0.1:8443" },
+      "actual": { "state": "active" }
+    }
+  ],
+  "pools": [
+    {
+      "key": "session:server.example.com:2333",
+      "configured": { "size": 4 },
+      "actual": {
+        "session_up": true,
+        "size": 4,
+        "streams": 2,
+        "pending": 0,
+        "idle_tunnels": 3,
+        "busiest_streams": 2,
+        "accepting_tunnels": 4,
+        "grows": 0,
+        "shrinks": 0,
+        "handover": null,
+        "tunnels": [
+          { "index": 0, "streams": 2, "pending": 0, "accepting": true, "carrier": "kcp", "delivered_bytes": 0, "written_bytes": 0, "kcp_datagrams_out": 9, "kcp_retransmits": 0 }
+        ]
+      }
+    }
+  ],
+  "claims": [
+    {
+      "name": "web",
+      "endpoint": "10.99.0.1:8443",
+      "configured": { "lanes": 2 },
+      "actual": {
+        "state": "active",
+        "lanes_live": 1,
+        "flows": 2,
+        "lanes": [ { "slot": 0, "flows": 2, "handover": false } ]
+      }
+    }
+  ]
+}
+```
+
+示例同时放了转发服务(`db`)与 L3 claim(`web`)以展示两种形状;真实应答只会是其中一种
+模式。`tunnels` 数组截断显示,计数覆盖整个池。
+
 透明(L3)客户端把同一个块写成 `[transparent.status]`;应答会连同它的池一起带上认领与其 lane。
 
 没有这个块,功能整体关闭:无监听、无端口、无可探测面。写了它:
@@ -771,9 +843,9 @@ remote_bind_addr = "0.0.0.0:2334"
   `Authorization: Bearer <token>` 时返回 `application/json`,否则返回
   `401` 与 `WWW-Authenticate: Bearer` 质询。比对走摘要,时序不泄漏
   token 的任何信息。
-- 应答陈述**整个**客户端:服务及其注册状态、每个活跃隧道池与每隧道
-  计数器,构建与配置带透明服务时还有 claim 与 lane。处于重连间隙的
-  会话是应答里的一段空白,而不是一个错误:还知道的就照实显示。
+- 应答把每个配置的服务/claim 与其实际状态并列,并把每个活跃池的配置宽度与
+  实际隧道、流分布、每隧道计数器并列。`disconnected` 表示配置了但没有会话
+  应答;处于重连间隙的会话是应答里的一段空白,而不是错误:还知道的就照实显示。
 - 每个响应都带 `Access-Control-Allow-Origin: *`,因此另一 origin 上的
   浏览器面板可以读取(带 token,这就是 bearer)。
 - 为什么在客户端而不是服务端:隧道池与 lane 分配器是客户端的,而服务端
@@ -781,6 +853,16 @@ remote_bind_addr = "0.0.0.0:2334"
   全部图景。控制端口承载的是客户端的协议与其认证,不是 HTTP;教它嗅探
   请求等于把一个解析器放到数据面唯一信任的连接上,所以这是一个
   独立的监听器。
+
+**从 0.11.1 升级:** 扁平字段已移到 `configured` / `actual` 下:
+`services[].{kind,remote_addr,local_addr}` -> `services[].configured.*`,
+`services[].state` -> `services[].actual.state`(透明 claim 的 `local_addr` 省略,
+车道看 `claims[].configured.lanes`), `pools[].count` ->
+`pools[].configured.size`, `pools[].size` -> `pools[].actual.size`,
+`pools[].{grows,shrinks,handover,tunnels}` -> `pools[].actual.*`,
+`claims[].lanes` -> `claims[].actual.lanes`。`pools[].carrier` 已移除,载体看
+`pools[].actual.tunnels[].carrier`。`summary` 是新增的。请更新读取旧形状的
+面板或脚本。
 
 把它绑定到回环之外,等于发布这台机器自身的拓扑——请带着 token、放在
 主机已有的防护之后,刻意地做这个决定。
@@ -790,12 +872,12 @@ remote_bind_addr = "0.0.0.0:2334"
 ```sh
 # 每隧道健康:各隧道承载了多少,载体让它重发了多少
 curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
-  | jq '.pools[].tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
+  | jq '.pools[].actual.tunnels[] | {index, carrier, delivered_bytes, kcp_retransmits}'
 
 # 轮询观察重发计数:载体在丢流量时重发数以千计,健康时几乎为零
 # (这正是载体规则所依据的信号)
 watch -n 1 "curl -sS -H 'Authorization: Bearer <token>' http://127.0.0.1:9090/status \
-  | jq '.pools[].tunnels[].kcp_retransmits'"
+  | jq '.pools[].actual.tunnels[].kcp_retransmits'"
 ```
 
 ## 示例与部署
