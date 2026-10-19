@@ -117,6 +117,8 @@ A typical setup:
 > channel negotiates its frame format. A 0.11.0 peer (v5.0) is refused on the
 > connection it happens on, in both directions. Upgrade both ends together;
 > there is no mixed-version deployment.
+>
+> **Upgrading to 0.11.2 (protocol v5.2)**: the wire is v5.2. `StartForwardTcp` is gone — every TCP data channel is a stripe group, starting at one data channel and growing under backpressure — and the registration carries `max_udp_workers`. A 0.11.1 (v5.1) peer is refused on the connection it happens on; upgrade both ends together.
 > **Upgrading to 0.11.2 (flat Noise tables)**: the handshake is fixed KK and
 > the wire tables are flat. Replace `[client.transport]` / `[client.transport.noise]`
 > with `[client.noise]`, `[server.transport.noise]` with `[server.noise]`, and
@@ -206,6 +208,7 @@ gone:
 | `[transparent.claims.<name>].retry_interval` | `[transparent.claims.<name>].retry_backoff_max`: unset inherits `[transparent.control].retry_backoff_max` |
 | `[transparent.claims.<name>].tunnels` | `[transparent.data].tunnels`: a claim's lane count is its share of the client's budget |
 | `[server.data].max_tunnels_per_client` | `[server.data].max_tunnels`: the valve is global now; unset derives it from the open-file limit and 0 is unlimited |
+| `[server.data].stripe_count` | Nothing: striping starts at one channel per visitor and grows under backpressure |
 
 ## Choosing your configuration (decision tree)
 
@@ -307,7 +310,6 @@ heartbeat_interval = 30 # Optional. The interval between two application-layer h
 
 [server.data]
 # bind_addr = "0.0.0.0:2343" # Optional. Data-plane listener; defaults to `server.control.bind_addr`. The KCP UDP listener binds here too on the first `kcp` registration — with the default address, TCP control and UDP KCP coexist on one port (distinct protocols)
-# stripe_count = 4 # Optional. Data channels per visitor connection, clamped to 1..=64. Default: 1 — one data channel per visitor. A higher count spreads every visitor connection over that many parallel channels (a stripe group): its throughput ceiling and in-flight window become the sum of the channels', at the cost of per-connection reorder buffering. Applies to TCP services only, and never to a `[transparent]` client's claims: nothing stripes the packets of a claimed address. Both ends need the striped data-channel framing (see docs/internals.md, "Data-channel striping"): the group's channels land on distinct tunnels whenever the pool has that many, and share them when it does not. Experimental measurement override: the `MOLEHILL_STRIPE_COUNT` environment variable replaces this value when it is set to a valid count (1..=64); an unparsable or out-of-range value is ignored with a warning
 # max_tunnels = 0 # Optional. The server-wide valve on live carrier connections: every multiplexed tunnel and every transparent lane of every client counts against it. Unset derives the cap from the process's open-file limit; 0 is unlimited. A connection over the cap is refused with a typed answer naming it, and the session keeps running
 
 [server.noise]
@@ -815,9 +817,9 @@ The counters are cumulative, so a reader that knows the window — or takes the
 first and the last line of a run — gets per-second rates and cost per unit. The
 pool and placement lines are the S1 observation of the shared pool (what it
 does, and why the numbers are aggregated rather than per event:
-[internals.md](internals.md#the-tunnel-pool)). `MOLEHILL_STRIPE_COUNT` is the
-one switch that changes behaviour rather than observing it; it is documented
-beside `stripe_count`, the value it replaces.
+[internals.md](internals.md#the-tunnel-pool)). `MOLEHILL_STRIPE_COUNT` is an
+internal measurement override for the *initial* stripe target; the production
+default starts at one and grows under backpressure, without a configuration key.
 
 ## Tuning
 
@@ -963,7 +965,7 @@ the peer's public key beside your private key.
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
 | `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5.1 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1), so an older client *or* an older server gets this; upgrade both ends together. |
-| The client stops with `protocol v5.1` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
+| The client stops with `protocol v5.2` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
 | Config starts but the connection fails with a resolve error (`failed to lookup address information`) | These address keys are only checked for a `:` in the string, not parsed as socket addresses: `client.control.default_remote_addr`, `client.services.<name>.remote_addr`, `client.data.default_data_addr`, `server.data.bind_addr`. A bare IPv6 literal such as `"::1"` therefore passes startup and has no port, failing when the address is resolved. Always write host **and** port, bracketing IPv6 literals — `"[::1]:2333"`. (A service's `remote_bind_addr` is parsed as a `SocketAddr` and rejected at startup instead.) |

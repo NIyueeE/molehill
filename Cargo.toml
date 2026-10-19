@@ -157,3 +157,6 @@ pedantic = { level = "deny", priority = -1 }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.189"
 nix = { version = "0.31.3", features = ["socket", "net", "feature", "uio"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

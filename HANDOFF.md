@@ -17,7 +17,14 @@
 >
 > **v0.11.2 development is open on `feat/v0.11.2`:** the branch's manifest
 > carries `version = "0.11.2"`; `main` stays at the released 0.11.1 until the
-> cycle merges.
+> cycle merges. **The configuration-model migration is implemented
+> (2026-10-19) in ten commits** — one pool per forwarding session, one L3 lane
+> budget, no per-service/per-claim sizes, fixed KK Noise in four same-shaped
+> layers, session/data separation, adaptive retry/heartbeat/valve defaults, a
+> global `max_tunnels`, the dynamic UDP policy and protocol v5.2 with dynamic
+> striping. `just check`, `githooks/check-docs` and `just bench-selfcheck`
+> are green; the benchmark sweep and the release remain, and the sweep must
+> re-baseline because the wire and the default shapes changed.
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -37,6 +44,28 @@
 
 ## Where this stands
 
+- **The 0.11.2 configuration migration is in (2026-10-19).** The ten commits
+  on `feat/v0.11.2` replace the per-service pool/tunnel/transport model with
+  one session pool, one L3 lane budget, four flat KK Noise layers, dynamic
+  striping/worker/heartbeat/valve defaults and wire v5.2. `just check` is
+  green. Open threads: the release sweep (a method-changing release, so it
+  becomes the next baseline) and manual acceptance of the full §4 table and
+  the old-key refusals.
+- **Striped-group release and the striping signal were corrected (2026-10-19).**
+  Two defects from the migration's striping commit. A group that ended by
+  aborting a direction left its reader tasks parked on the mux streams, so the
+  client's stream leases never came back — the saturated-pool test only passed
+  because it restarted the client — and the target grew off *gather* latency, a
+  proxy on the pairing path rather than path backpressure. The readers are now
+  owned by the receive direction and aborted with it; the server releases an
+  abandoned group on the client (`ReleaseStripedGroup`, tag 8 of the still
+  unreleased v5.2 dialect, so it is extended in place); the client tombstones a
+  released group so a stripe still in flight is dropped; and growth follows a
+  group's own parked send direction (at least 250 ms, one step per 500 ms,
+  capped at `MAX_STRIPES` 64). `a_saturated_pool_still_serves_the_next_visitor`
+  now asserts the pool gets its streams back within 15 s and no longer restarts
+  the client. No throughput claim is made from this: the sweep has to measure
+  it, and it re-baselines anyway.
 - **Platform cfg and CI verification were hardened after review (2026-10-18).**
   `build.rs` now emits the `mh_*` platform aliases (`mh_linux`, `mh_macos`,
   `mh_windows`, `mh_l3`, `mh_l3_client`, `mh_l3_server`) and makes

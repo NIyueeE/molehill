@@ -553,7 +553,7 @@ sudo -n just bench --arm id=l3-deep,txqueuelen=20000
 | transport | `"plain"` | 回环 10.0 / 19.5 Gbit/s(1 / 8 流) |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s;RTT 代价亚毫秒;满载下 CPU 持平 |
 | `pool_size` | 8 TCP / 2 UDP(默认值) | 16 路 churn 下建连到首字节 p99 ~3.5 ms;UDP 把不同访客分片到不同通道,绝不拆分单个会话(会话亲和) |
-| `[server.data].stripe_count` | `K = 4`(条带组把一条访客连接摊到 K 条数据通道上;见[配置文档](configuration.zh.md)) | 单条长连接不再被一条隧道流钉死:回环 1 流吞吐 +48.7%,代价是重排缓冲、RSS +8.7%、CPU +40.8%(每帧 CPU 减半,因为帧摊到了四个驱动任务上) |
+| 条带(striping) | 四条通道为一组(测量时用 `stripe_count = 4`;该键已移除——现在每组从一条开始、在背压下增长,见[内部设计](internals.md#data-channel-striping)) | 单条长连接不再被一条隧道流钉死:回环 1 流吞吐 +48.7%,代价是重排缓冲、RSS +8.7%、CPU +40.8%(每帧 CPU 减半,因为帧摊到了四个驱动任务上) |
 
 ### L3 数据面:瓶颈在哪(2026-10-10,本模型)
 

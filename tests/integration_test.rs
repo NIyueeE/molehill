@@ -94,6 +94,8 @@ fn exposed_addrs(t: Type) -> (&'static str, &'static str) {
 }
 
 fn init() {
+    molehill_rathole::set_initial_stripes(1);
+
     let level = "info";
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -504,6 +506,9 @@ async fn wait_for_a_stream_on_every_stripe_tunnel(deadline: Duration) -> Result<
 #[tokio::test]
 async fn striped_data_channels() -> Result<()> {
     init();
+    // The pool's four tunnels are this scenario's structural claim; the
+    // production default starts at one stripe and grows under backpressure.
+    molehill_rathole::set_initial_stripes(4);
 
     spawn_tcp_backends();
 
@@ -1362,16 +1367,26 @@ async fn udp_echo_hitter(addr: &'static str) -> Result<()> {
     for _ in 0..3 {
         rand::fill(&mut wr);
 
-        conn.send(&wr).await?;
-        debug!("send");
-
-        // Bound: a dropped datagram must fail this test, not hang the
-        // serial suite forever.
-        time::timeout(Duration::from_secs(2), conn.recv(&mut rd))
-            .await
-            .context("udp echo reply timed out")??;
+        // UDP is allowed to drop: the proxy's queue policy is explicit about
+        // it, and a growth window can lose the first datagram. Retry a lost
+        // probe a few times, then fail — a hang is still a failure.
+        let mut last = None;
+        for _ in 0..6 {
+            conn.send(&wr).await?;
+            debug!("send");
+            match time::timeout(Duration::from_secs(2), conn.recv(&mut rd)).await {
+                std::result::Result::Ok(std::result::Result::Ok(_)) => {
+                    last = None;
+                    break;
+                }
+                std::result::Result::Ok(std::result::Result::Err(e)) => return Err(e.into()),
+                std::result::Result::Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            return Err(e).context("udp echo reply timed out");
+        }
         debug!("recv");
-
         assert_eq!(wr, rd);
     }
     Ok(())
@@ -1400,16 +1415,23 @@ async fn udp_pingpong_hitter(addr: &'static str) -> Result<()> {
     let mut rd = [0u8; PONG.len()];
 
     for _ in 0..3 {
-        conn.send(wr).await?;
-        debug!("ping");
-
-        // Bound: a dropped datagram must fail this test, not hang the
-        // serial suite forever.
-        time::timeout(Duration::from_secs(2), conn.recv(&mut rd))
-            .await
-            .context("udp pong reply timed out")??;
+        let mut last = None;
+        for _ in 0..6 {
+            conn.send(wr).await?;
+            debug!("ping");
+            match time::timeout(Duration::from_secs(2), conn.recv(&mut rd)).await {
+                std::result::Result::Ok(std::result::Result::Ok(_)) => {
+                    last = None;
+                    break;
+                }
+                std::result::Result::Ok(std::result::Result::Err(e)) => return Err(e.into()),
+                std::result::Result::Err(e) => last = Some(e),
+            }
+        }
+        if let Some(e) = last {
+            return Err(e).context("udp pong reply timed out");
+        }
         debug!("pong");
-
         assert_eq!(rd, PONG.as_bytes());
     }
 

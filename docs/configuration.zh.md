@@ -283,7 +283,6 @@ heartbeat_interval = 30 # 可选。两次应用层心跳之间的间隔。不设
 
 [server.data]
 # bind_addr = "0.0.0.0:2343" # 可选。数据面监听地址;默认为 `server.control.bind_addr`。KCP UDP 监听也在第一条 `kcp` 注册到达时绑定到这里——默认地址下,TCP 控制与 UDP KCP 共用一个端口(协议不同互不冲突)
-# stripe_count = 4 # 可选。每个访客连接使用的数据通道数,收敛到 1..=64。默认:1——每个访客一条数据通道。更大的值把每个访客连接摊到这么多条并行通道上(条带组):其吞吐天花板与在途窗口变为各通道之和,代价是每连接的重排缓冲。仅对 TCP 服务生效,对 `[transparent]` 客户端的认领永不生效——被认领地址的报文不会被条带化。两端都需要支持条带数据通道格式(见 docs/internals.md"数据通道条带"):只要池里有足够多的隧道,组的各条通道会落在不同隧道上,不够时则共享隧道。实验性测量覆盖:环境变量 `MOLEHILL_STRIPE_COUNT` 在取值为合法数量(1..=64)时替换此值;无法解析或超出范围的值会被忽略并打一条警告
 # max_tunnels = 0 # 可选。服务端全局的存活承载连接阀门:每个客户端的每条多路复用隧道与每条透明 lane 都计入。不设置 = 由进程的打开文件上限推导;0 = 不限。超过上限的连接会被带类型地拒绝并写明上限,会话继续运行
 
 [server.noise]
@@ -706,9 +705,9 @@ carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧�
 这些计数都是累计值:知道窗口的读者——或者取一轮运行的第一行与最后一行——
 就能算出每秒速率与单位成本。pool 与 placement 两行就是共享 pool 的 S1
 观测(它做什么,以及为什么这些数字是聚合而不是逐个事件:
-[internals.md](internals.md#the-tunnel-pool))。`MOLEHILL_STRIPE_COUNT` 是唯一
-一个改变行为而不是观测行为的开关,它记录在 `stripe_count` 旁边——也就是它所
-替换的那个值那里。
+[internals.md](internals.md#the-tunnel-pool))。`MOLEHILL_STRIPE_COUNT` 是内部
+测量用的覆盖开关,只决定**初始**条带目标;生产默认从一条开始、在路径背压下
+增长,没有对应的配置键。
 
 ## 调优
 
@@ -871,8 +870,8 @@ systemd 单元以及容器 / compose / Quadlet 部署见[部署与示例](./depl
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | 请求的 `remote_bind_addr` 端口未在服务端白名单中,或服务端禁用了动态注册。修复 `allow_ports`。 |
 | `Port N is already in use` | 服务端上另一个服务(或程序)占用了该端口。换一个 `remote_bind_addr` 端口。 |
-| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5.1 的 molehill(0.10 服务 v4,0.11.0 服务 v5.0,0.11.1 服务 v5.1),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
-| 客户端在服务端的 hello 始终不到达后以 `protocol v5.1` 停止 | 服务端早于本构建:它读到版本号、自己的版本检查失败并关闭该连接。请升级服务端。 |
+| `Protocol version mismatched ... Please update` | 一端运行的是不说协议 v5.2 的 molehill(0.10 服务 v4,0.11.0 服务 v5.0,0.11.1 服务 v5.1、0.11.2 服务 v5.2),因此旧客户端或旧服务端都会得到它;请两端一起升级。 |
+| 客户端在服务端的 hello 始终不到达后以 `protocol v5.2` 停止 | 服务端早于本构建:它读到版本号、自己的版本检查失败并关闭该连接。请升级服务端。 |
 | 客户端出现 `Authentication failed` | 客户端与服务端的 `default_token` 不一致。 |
 | `Failed to connect to <addr>: Connection refused` | 服务端未运行、`client.control.default_remote_addr` 端口错误,或 `server.control.bind_addr` 不可达。 |
 | 配置能启动,但连接时报地址解析错误(`failed to lookup address information`) | 这些地址键只检查字符串里有没有 `:`,并不按 socket 地址解析:`client.control.default_remote_addr`、`client.services.<name>.remote_addr`、`client.data.default_data_addr`、`server.data.bind_addr`。因此裸 IPv6 字面量(如 `"::1"`)能通过启动校验,却没有端口,解析地址时才会失败。始终写 `主机:端口`,IPv6 字面量要加方括号——`"[::1]:2333"`。(服务的 `remote_bind_addr` 反而会按 `SocketAddr` 解析,启动时就会拒绝。) |

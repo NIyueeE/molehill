@@ -59,7 +59,7 @@ impl std::fmt::Debug for ProtocolVersion {
 /// was gone.
 /// The data plane (hellos, prologue, the striping frames) is unchanged.
 ///
-/// v5.1 is the transparent cross-platform revision.
+/// v5.2 is the dynamic-striping revision.
 ///
 /// It keeps v5.0's service type and data-channel command, and changes two
 /// things:
@@ -81,7 +81,7 @@ pub const PROTO_V5_0_VERSION: ProtocolVersion = ProtocolVersion::new(5, 0);
 /// The dialect this build *speaks*: the version it puts in the hellos it
 /// originates. It is deliberately separate from [`SUPPORTED_PROTO_VERSIONS`],
 /// because a server has to keep serving the dialects it no longer speaks.
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = ProtocolVersion::new(5, 1);
+pub const CURRENT_PROTO_VERSION: ProtocolVersion = ProtocolVersion::new(5, 2);
 
 /// The dialect a *server* accepts, and the only one it speaks.
 ///
@@ -181,6 +181,10 @@ pub struct ServiceRegistration {
     /// Receive buffer size for UDP datagrams of this service. Ignored for
     /// TCP services. Wire-compatible up to `u16::MAX`.
     pub udp_buffer_size: u16,
+    /// The ceiling on this UDP service's worker set (0 for a non-UDP service).
+    /// The server uses it to stop asking for more workers past the client's
+    /// own limit.
+    pub max_udp_workers: u16,
     /// What the client's transparent device can do. `None` for every
     /// forwarding service; the server rejects a capability on one of those.
     pub transparent_capabilities: Option<TransparentCapabilities>,
@@ -463,7 +467,7 @@ pub enum ControlChannelCmd {
     /// order, and the session reader tells an ack frame from a command by the
     /// first byte — an ack's is its length's high byte, which is `0` as long
     /// as the frame stays under 256 bytes. Keeping a variant at tag 0 is what
-    /// makes every command this build does speak sit at 1..=5, where that
+    /// makes every command this build does speak sit at 1..=8, where that
     /// disambiguation holds.
     CreateDataChannel,
     HeartBeat,
@@ -553,6 +557,19 @@ pub enum ControlChannelCmd {
     /// compare is what the peer *handed* this tunnel against what it *received*
     /// from it: policed ~10-20 %, healthy ~95-100 %.
     TunnelHealth(ServiceId, [u8; 4], [u8; 4], [u8; 4], [u8; 4], u8),
+    /// The server gave up on a striped visitor's group before forwarding it:
+    /// the service it belonged to and the group's id.
+    ///
+    /// The client parked the group's early stripes while it waited for the
+    /// rest; this command is what tells it to drop them. Without it the parked
+    /// channels would hold their tunnel slots until the registry's TTL, which
+    /// is exactly the capacity a saturated pool needs back. A stripe that is
+    /// still in flight when the release arrives is dropped rather than parked.
+    ///
+    /// Fixed width like every other session command: two raw four-byte fields
+    /// rather than `u32`s (postcard varints integers), so the tag alone decides
+    /// that exactly 8 bytes follow.
+    ReleaseStripedGroup(ServiceId, [u8; 4]),
 }
 
 /// [`ControlChannelCmd::LaneDrainAck`] states: the server is draining the lane
@@ -593,7 +610,6 @@ pub const LANE_DRAIN_CANCELLED: u8 = 3;
 #[expect(clippy::enum_variant_names, reason = "wire-contract variant names")]
 #[derive(Deserialize, Serialize, Debug)]
 pub enum DataChannelCmd {
-    StartForwardTcp,
     StartForwardUdp,
     /// Striped TCP forwarding: this data channel is stripe `index` of
     /// `count` of the group named by the fixed 4 bytes (big-endian `u32`).
@@ -1307,6 +1323,9 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
         5 => 17,
         7 => 21,
         6 => 9,
+        // The group release: service and group, the same fixed-width pair the
+        // stripe request carries.
+        8 => 8,
         tag => bail!("Unknown control channel command tag {tag:#x}"),
     };
     conn.read_exact(&mut buf[1..=suffix])
@@ -1367,17 +1386,26 @@ pub async fn read_control_cmd<T: AsyncRead + Unpin>(conn: &mut T) -> Result<Cont
                 buf[21],
             )
         }
-        // The only tag left is 4, the stripe request: the dispatch above
-        // returned on 0 and 1 and bailed on everything but 2, 3, 4, 5, 6 and 7.
-        // Parsed with postcard as one tuple rather than field by field, so the
-        // reader and the writer agree on the layout by construction: a
-        // reordered or resized field fails here instead of silently reading the
-        // next frame's bytes as an index.
-        _ => {
+        // The group release: service and group, decoded like the reports above
+        // so the frame's width never depends on the id's value.
+        8 => {
+            let mut service = [0u8; 4];
+            let mut group = [0u8; 4];
+            service.copy_from_slice(&buf[1..5]);
+            group.copy_from_slice(&buf[5..9]);
+            ControlChannelCmd::ReleaseStripedGroup(ServiceId(service), group)
+        }
+        // The stripe request. Parsed with postcard as one tuple rather than
+        // field by field, so the reader and the writer agree on the layout by
+        // construction: a reordered or resized field fails here instead of
+        // silently reading the next frame's bytes as an index.
+        4 => {
             let (service_id, group, index, count): (ServiceId, [u8; 4], u8, u8) =
                 postcard::from_bytes(&buf[1..11]).with_context(|| "Failed to deserialize cmd")?;
             ControlChannelCmd::CreateDataChannelForStripe(service_id, group, index, count)
         }
+        // The suffix table above already refused every other tag.
+        tag => bail!("Unknown control channel command tag {tag:#x}"),
     })
 }
 
@@ -1441,13 +1469,10 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = [0u8; 7]; // 1 tag byte + the largest suffix below
     let suffix = match read_cmd_tag(conn, &mut buf).await? {
         0 => {
-            return Ok(DataChannelCmd::StartForwardTcp);
-        }
-        1 => {
             return Ok(DataChannelCmd::StartForwardUdp);
         }
-        2 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
-        3 => 1, // StartForwardTransparent(FrameFormat): one format byte
+        1 => 6, // StartForwardStripedTcp(group u32, index u8, count u8)
+        2 => 1, // StartForwardTransparent(FrameFormat): one format byte
 
         tag => bail!("Unknown data channel command tag {tag:#x}"),
     };
@@ -1696,6 +1721,7 @@ mod tests {
             bind_addr: sample_addr(),
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            max_udp_workers: 2,
             transparent_capabilities: Some(TransparentCapabilities { vnet_frames: true }),
         };
         let bytes = postcard::to_stdvec(&reg).unwrap();
@@ -1833,6 +1859,7 @@ mod tests {
                 bind_addr: sample_addr(),
                 carrier: Carrier::Tcp,
                 udp_buffer_size: 2048,
+                max_udp_workers: 2,
                 transparent_capabilities: None,
             },
         });
@@ -1881,6 +1908,14 @@ mod tests {
             "the stripe request must keep tag 4: a new variant inserted before \
              it would move every later command's tag"
         );
+        assert_eq!(
+            tag(&ControlChannelCmd::ReleaseStripedGroup(
+                ServiceId::new(0),
+                [0; 4]
+            )),
+            8,
+            "a new command is appended after every existing tag"
+        );
     }
 
     #[cfg(feature = "client")]
@@ -1898,6 +1933,10 @@ mod tests {
                 [0xde, 0xad, 0xbe, 0xef],
                 3,
                 4,
+            ),
+            ControlChannelCmd::ReleaseStripedGroup(
+                ServiceId::new(0xdead_beef),
+                [0xde, 0xad, 0xbe, 0xef],
             ),
         ] {
             let (mut tx, mut rx) = duplex(64);
@@ -2104,18 +2143,12 @@ mod tests {
         tx.write_all(&hello).await.unwrap();
         let err = read_hello(&mut rx).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("Supported versions: [v5.1]"), "{msg}");
+        assert!(msg.contains("Supported versions: [v5.2]"), "{msg}");
         assert!(msg.contains("got v5."), "{msg}");
     }
 
     #[test]
     fn data_cmd_roundtrip() {
-        // StartForwardTcp
-        let cmd = DataChannelCmd::StartForwardTcp;
-        let bytes = postcard::to_stdvec(&cmd).unwrap();
-        let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
-        assert!(matches!(back, DataChannelCmd::StartForwardTcp));
-
         // StartForwardUdp
         let cmd = DataChannelCmd::StartForwardUdp;
         let bytes = postcard::to_stdvec(&cmd).unwrap();
@@ -2126,7 +2159,7 @@ mod tests {
         for format in [FrameFormat::Ip, FrameFormat::Vnet] {
             let cmd = DataChannelCmd::StartForwardTransparent(format);
             let bytes = postcard::to_stdvec(&cmd).unwrap();
-            assert_eq!(bytes, [3, u8::from(format == FrameFormat::Vnet)]);
+            assert_eq!(bytes, [2, u8::from(format == FrameFormat::Vnet)]);
             let back: DataChannelCmd = postcard::from_bytes(&bytes).unwrap();
             assert!(matches!(back, DataChannelCmd::StartForwardTransparent(f) if f == format));
         }
@@ -2138,11 +2171,9 @@ mod tests {
         // for peers that predate the striped variant: the reader dispatches
         // on the tag, so a plain command can never be mistaken for one that
         // carries a suffix.
-        let tcp = postcard::to_stdvec(&DataChannelCmd::StartForwardTcp).unwrap();
         let udp = postcard::to_stdvec(&DataChannelCmd::StartForwardUdp).unwrap();
-        assert_eq!(tcp.len(), 1);
         assert_eq!(udp.len(), 1);
-        assert_ne!(tcp[0], udp[0]);
+        assert_eq!(udp[0], 0);
 
         // The striped command is fixed 7 bytes for every group id: the
         // group id is 4 wire bytes, not a varint u32.
@@ -2167,7 +2198,6 @@ mod tests {
         use tokio::io::duplex;
 
         for cmd in [
-            DataChannelCmd::StartForwardTcp,
             DataChannelCmd::StartForwardUdp,
             DataChannelCmd::StartForwardStripedTcp(0xdead_beefu32.to_be_bytes(), 3, 4),
         ] {
@@ -2392,6 +2422,7 @@ mod tests {
                 bind_addr: sample_addr(),
                 carrier: Carrier::Tcp,
                 udp_buffer_size: 2048,
+                max_udp_workers: 2,
                 transparent_capabilities: None,
             },
         });

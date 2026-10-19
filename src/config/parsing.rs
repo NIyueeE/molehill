@@ -568,16 +568,6 @@ pub struct ServerControlConfig {
 pub struct ServerDataConfig {
     /// Data-plane listener; defaults to `[server.control].bind_addr`.
     pub bind_addr: Option<String>,
-    /// Data channels per visitor connection.
-    ///
-    /// `1` (the default) is the classic shape: one data channel per
-    /// visitor. A higher count spreads every visitor connection over that
-    /// many parallel data channels ("stripes"), which multiplies its
-    /// throughput ceiling and in-flight window; both ends must be able to
-    /// speak the striped data-channel framing (a molehill new enough to
-    /// know the `StartForwardStripedTcp` command on both sides). See
-    /// `docs/internals.md` ("Data-channel striping").
-    pub stripe_count: Option<u16>,
     /// The server's **global** valve on live carrier connections: every
     /// multiplexed tunnel and every transparent lane of every client counts
     /// against it. `0` is unlimited; unset derives the cap from the process's
@@ -636,15 +626,6 @@ impl ServerConfig {
             .bind_addr
             .as_deref()
             .unwrap_or(self.control.bind_addr.as_str())
-    }
-
-    /// Effective data channels per visitor connection: the configured
-    /// `[server.data].stripe_count` clamped to `1..=MAX_STRIPES` (an
-    /// environment override for measurements wins when set — see
-    /// `crate::stripe::stripe_count`).
-    #[cfg(feature = "multiplex")]
-    pub fn stripe_count(&self) -> usize {
-        crate::stripe::stripe_count(self.data.stripe_count)
     }
 
     /// The global tunnel cap, resolved once at server start: the written
@@ -804,8 +785,7 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     (
         "client.services.*.pool_size",
         "v0.10.0",
-        "write `udp_workers` for a UDP service: it is the number of data channels the service's \
-         worker set uses; a TCP service's channels are opened on demand, one per visitor",
+        "write `max_udp_workers` for a UDP service: it is the ceiling on the worker set; a TCP service opens one channel per visitor",
     ),
     (
         "client.services.*.heartbeat_timeout",
@@ -825,6 +805,11 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
         "v0.11.2",
         "the valve is global now: write `[server.data].max_tunnels` (unset = \
          derived from the open-file limit, 0 = unlimited)",
+    ),
+    (
+        "server.data.stripe_count",
+        "v0.11.2",
+        "striping is dynamic now: it starts at one data channel per visitor and grows under backpressure; remove the key",
     ),
     (
         "client.services.*.udp_workers",

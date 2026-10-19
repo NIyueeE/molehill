@@ -60,10 +60,9 @@ use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 use crate::transport::multiplex::{ClientTunnel, Dialer, StreamLease, TunnelPool};
 
 use crate::common::constants::{
-    DEFAULT_MAX_UDP_WORKERS, DEFAULT_UDP_BUFFER_SIZE, FORWARD_IDLE_TIMEOUT, TCP_COPY_BUFFER_SIZE,
-    UDP_CODEL_TARGET, UDP_QUEUE_SIZE, backoff_cap, run_control_chan_backoff, udp_lifetime,
+    DEFAULT_MAX_UDP_WORKERS, DEFAULT_UDP_BUFFER_SIZE, UDP_CODEL_TARGET, UDP_QUEUE_SIZE,
+    backoff_cap, run_control_chan_backoff, udp_lifetime,
 };
-use crate::common::forward::copy_bidirectional_with_idle;
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -102,9 +101,6 @@ struct DataOpts {
     /// service of the session draws on this one pool.
     #[cfg(feature = "multiplex")]
     tunnels: usize,
-    /// The ceiling on a UDP service's worker set. The service starts one and
-    /// grows only when the server asks.
-    max_udp_workers: u16,
     /// Noise key config, `Some` iff the control transport is `noise`; KCP
     /// tunnels wrap it on top (the crypto stack is kept).
     #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
@@ -324,7 +320,6 @@ impl DataOpts {
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
             tunnels: c.tunnels(),
-            max_udp_workers: s.max_udp_workers.unwrap_or(DEFAULT_MAX_UDP_WORKERS),
             #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
             noise: s
                 .data_enabled_with(c.noise.data_enable.unwrap_or(true))
@@ -404,6 +399,13 @@ impl ServiceSlot {
                     .service
                     .udp_buffer_size
                     .unwrap_or_else(|| u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX)),
+                max_udp_workers: match self.service.service_type {
+                    ServiceType::Udp => self
+                        .service
+                        .max_udp_workers
+                        .unwrap_or(DEFAULT_MAX_UDP_WORKERS),
+                    ServiceType::Tcp | ServiceType::Transparent => 0,
+                },
                 transparent_capabilities: self.transparent_capabilities,
             },
         })
@@ -909,8 +911,6 @@ struct RunDataChannelArgs {
     /// Placement state of this service's stripe groups, by group id (D24).
     #[cfg(feature = "multiplex")]
     stripe_placements: StripePlacements,
-    /// The ceiling on this UDP service's worker set; ignored for other types.
-    max_udp_workers: u16,
     /// Mints the *lane* ids this service's transparent claims dial.
     ///
     /// A lane is one physical carrier connection, and it is the unit a carrier
@@ -1582,13 +1582,9 @@ async fn forward_data_channel(
     lane: Option<LaneId>,
 ) -> Result<()> {
     let sock_opts = SocketOpts::for_service();
+    #[cfg(not(feature = "multiplex"))]
+    let _ = &sock_opts;
     match read_data_cmd(&mut conn).await? {
-        DataChannelCmd::StartForwardTcp => {
-            if service.service_type != ServiceType::Tcp {
-                bail!("Expect TCP traffic. Please check the configuration.")
-            }
-            run_data_channel_for_tcp(conn, &service.local_addr, sock_opts).await?;
-        }
         DataChannelCmd::StartForwardUdp => {
             if service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
@@ -1614,7 +1610,9 @@ async fn forward_data_channel(
                     .with_context(|| format!("Failed to connect to {}", done.local_addr))?;
                 done.sock_opts.apply(&local);
                 let (read, write) = local.into_split();
-                crate::stripe::spawn_group(read, write, done.streams);
+                // The client does not size groups: no plan, so a stall here
+                // reports to nobody.
+                crate::stripe::spawn_group(read, write, done.streams, None);
             }
         }
         #[cfg(not(feature = "multiplex"))]
@@ -2116,41 +2114,6 @@ fn udp_buffer_size(s: &ClientServiceConfig) -> usize {
         .map_or(DEFAULT_UDP_BUFFER_SIZE, |v| v as usize)
 }
 
-// Simply copying back and forth for TCP
-#[instrument(skip_all)]
-async fn run_data_channel_for_tcp<S>(
-    mut conn: S,
-    local_addr: &str,
-    sock_opts: SocketOpts,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    debug!("New data channel starts forwarding");
-
-    let mut local = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("Failed to connect to {local_addr}"))?;
-    // The leg towards the local service needs explicit socket options;
-    // without them Nagle stays enabled and interactive traffic stalls.
-    sock_opts.apply(&local);
-    // A stalled forward is closed by the watchdog rather than left to hold a
-    // tunnel stream for the session's lifetime (see `FORWARD_IDLE_TIMEOUT`).
-    if let Err(e) = copy_bidirectional_with_idle(
-        &mut conn,
-        &mut local,
-        TCP_COPY_BUFFER_SIZE,
-        FORWARD_IDLE_TIMEOUT,
-    )
-    .await
-    {
-        // A reaped connection is a failed request, not a lifecycle event:
-        // DEBUG, like every other per-connection failure.
-        debug!("Data channel closed: {e}");
-    }
-    Ok(())
-}
-
 /// Creation-time parameters for the per-service UDP hub, resolved once from
 /// the service configuration per control-channel session.
 struct UdpForwardParams {
@@ -2186,9 +2149,6 @@ struct UdpHub {
     /// Writers of the currently live data channels, used as the outbound
     /// fallback when a pinned channel died.
     channels: RwLock<Vec<mpsc::Sender<UdpTraffic>>>,
-    /// Live data channels, read by the `max_udp_workers` check without taking
-    /// the channels lock.
-    live_channels: AtomicUsize,
     next_channel: AtomicUsize,
     /// Source of this service session's data-channel ids: the UDP pin
     /// accounting's keys. Deliberately *not* `next_channel`, which is the
@@ -2211,7 +2171,6 @@ impl UdpHub {
             params,
             routes: RwLock::new(HashMap::new()),
             channels: RwLock::new(Vec::new()),
-            live_channels: AtomicUsize::new(0),
             next_channel: AtomicUsize::new(0),
             #[cfg(feature = "multiplex")]
             next_channel_id: std::sync::atomic::AtomicU64::new(0),
@@ -2245,20 +2204,10 @@ impl UdpHub {
 
     async fn register_channel(&self, tx: mpsc::Sender<UdpTraffic>) {
         self.channels.write().await.push(tx);
-        self.live_channels
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn unregister_channel(&self, tx: &mpsc::Sender<UdpTraffic>) {
         self.channels.write().await.retain(|c| !c.same_channel(tx));
-        self.live_channels
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// The live data channels, for the `max_udp_workers` gate.
-    fn live_channels(&self) -> usize {
-        self.live_channels
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Forward one datagram from the server to the peer's local socket,
@@ -3751,30 +3700,7 @@ impl ClientSession {
         // connecting *before* re-registering: a service deleted in the
         // meantime must not come back for one round.
         self.apply_pending_requests();
-        // A reconnect starts from nothing: the server has forgotten every
-        // service of this session, so they all go back to `Registering`. A
-        // service the server once refused stays refused.
-        //
-        // The tunnel pools go with the connection they were built on: their
-        // tunnels carry the *previous* session nonce and died with it, so a
-        // pool kept across a reconnect can only refuse streams — and its
-        // growth would be rejected as a stale nonce. Each service builds a
-        // fresh pool when it re-activates below.
-        #[cfg(feature = "multiplex")]
-        self.pools.clear();
-        for entry in self.services.values_mut() {
-            if !matches!(entry.state, ServiceState::Rejected) {
-                entry.state = ServiceState::Registering;
-            }
-        }
-        let mut ids: Vec<ServiceId> = self
-            .services
-            .iter()
-            .filter(|(_, e)| matches!(e.state, ServiceState::Registering))
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_unstable();
-        for id in ids {
+        for id in self.services_to_reregister() {
             self.register(id, &nonce, &mut rd, &mut wr).await?;
             self.drain_dropped(&nonce, &mut rd, &mut wr).await?;
         }
@@ -3788,6 +3714,11 @@ impl ClientSession {
                     // channel can be placed on a tunnel of its own (D24).
                     ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                         self.open_stripe_channel(id, group, index, count);
+                    }
+                    // The server will never forward that group: the stripes
+                    // parked for it are capacity nobody can use.
+                    ControlChannelCmd::ReleaseStripedGroup(id, group) => {
+                        self.release_stripe_group(id, group);
                     }
                     ControlChannelCmd::HeartBeat => (),
                     // What the server offered one of this claim's lanes, and
@@ -3867,6 +3798,34 @@ impl ClientSession {
 
         info!("Control session shutdown");
         Ok(())
+    }
+
+    /// A reconnect starts from nothing: the server has forgotten every service
+    /// of this session, so they all go back to `Registering` — a service the
+    /// server once refused stays refused — and the ids to re-register come
+    /// back in order.
+    ///
+    /// The tunnel pools go with the connection they were built on: their
+    /// tunnels carry the *previous* session nonce and died with it, so a pool
+    /// kept across a reconnect can only refuse streams, and its growth would be
+    /// rejected as a stale nonce. Each service builds a fresh pool when it
+    /// re-activates.
+    fn services_to_reregister(&mut self) -> Vec<ServiceId> {
+        #[cfg(feature = "multiplex")]
+        self.pools.clear();
+        for entry in self.services.values_mut() {
+            if !matches!(entry.state, ServiceState::Rejected) {
+                entry.state = ServiceState::Registering;
+            }
+        }
+        let mut ids: Vec<ServiceId> = self
+            .services
+            .iter()
+            .filter(|(_, e)| matches!(e.state, ServiceState::Registering))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The session handshake: the hello that names the session, the server's
@@ -4169,6 +4128,9 @@ impl ClientSession {
                 ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
                 ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                     self.open_stripe_channel(id, group, index, count);
+                }
+                ControlChannelCmd::ReleaseStripedGroup(id, group) => {
+                    self.release_stripe_group(id, group);
                 }
                 ControlChannelCmd::HeartBeat => (),
                 ControlChannelCmd::ServiceDropped(id) => self.pending_drops.push(id),
@@ -4513,7 +4475,6 @@ impl ClientSession {
                 socket_opts: SocketOpts::for_service(),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
-                max_udp_workers: slot.data.max_udp_workers,
                 #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
                 noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
@@ -4580,6 +4541,32 @@ impl ClientSession {
         self.open_placed_channel(id, stripe);
     }
 
+    /// The server gave up on a stripe group before forwarding it
+    /// (`ReleaseStripedGroup`): drop the stripes it parked here.
+    ///
+    /// Those channels are pool capacity the server will never use, so they go
+    /// back now rather than at the registry's TTL. The group id is tombstoned
+    /// on the way out: a stripe the client was already opening when the
+    /// release was written must not park after it.
+    #[cfg(feature = "multiplex")]
+    fn release_stripe_group(&self, id: ServiceId, group: [u8; 4]) {
+        if let Some(entry) = self.services.get(&id)
+            && let ServiceState::Active(active) = &entry.state
+        {
+            let released = active.args.stripes.release(u32::from_be_bytes(group));
+            debug!("Service {id} released stripe group {group:02x?} ({released} parked stripes)");
+        }
+    }
+
+    /// Without `multiplex` no striped channel can exist, so there is never
+    /// anything parked to release; the command is accepted and ignored.
+    #[cfg(not(feature = "multiplex"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "without `multiplex` the release is a no-op and nothing on the session is read"
+    )]
+    fn release_stripe_group(&self, _id: ServiceId, _group: [u8; 4]) {}
+
     /// Open one data channel for a service the server asked about.
     fn open_placed_channel(&self, id: ServiceId, stripe: Option<StripeOpen>) {
         let Some(entry) = self.services.get(&id) else {
@@ -4602,18 +4589,6 @@ impl ClientSession {
                     debug!(
                         "Ignoring a data channel request for {id}: the claim holds the lanes it \
                          was allotted"
-                    );
-                    return;
-                }
-                // A UDP service grows only up to its ceiling: the server asks
-                // for another worker on queue pressure, and the answer stops
-                // here.
-                if let Some(hub) = &active.args.udp
-                    && hub.live_channels() >= usize::from(active.args.max_udp_workers)
-                {
-                    debug!(
-                        "Ignoring a data channel request for {id}: the UDP service holds its {}                          workers",
-                        active.args.max_udp_workers
                     );
                     return;
                 }

@@ -675,7 +675,7 @@ to two).
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
-| `[server.data].stripe_count` | `K = 4` (a striped group spreads one visitor connection over K data channels; see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
+| striping | a group of four channels (the measured arm set `stripe_count = 4`; the key is gone — a group now starts at one and grows under backpressure, see [internals.md](internals.md#data-channel-striping)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
 
 ### The L3 data path: what limits it (2026-10-10, this model)
 

@@ -164,6 +164,7 @@ struct ServiceRegistrationV4 {
     bind_addr: SocketAddr,
     carrier: Carrier,
     udp_buffer_size: u16,
+    max_udp_workers: u16,
     transparent_capabilities: Option<TransparentCapabilities>,
 }
 
@@ -194,6 +195,7 @@ enum ControlCmd {
 // --- fixtures --------------------------------------------------------------
 
 fn init() {
+    molehill_rathole::set_initial_stripes(1);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from("info")),
@@ -365,6 +367,7 @@ impl Session {
             bind_addr: format!("0.0.0.0:{port}").parse()?,
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            max_udp_workers: 2,
             transparent_capabilities: None,
         };
         let cmd = SessionCmd::Register(SessionRegistration {
@@ -405,6 +408,7 @@ impl Session {
         loop {
             match timeout(PROBE_TIMEOUT, read_control_cmd(&mut self.conn)).await?? {
                 ControlCmd::CreateDataChannelFor(got) if got == id => return Ok(()),
+                ControlCmd::CreateDataChannelForStripe(got, _, _, 1) if got == id => return Ok(()),
                 // A session heartbeat is not this test's business; keep reading.
                 ControlCmd::HeartBeat => {}
                 other => bail!("expected a data-channel request for service {id}, got {other:?}"),
@@ -438,12 +442,50 @@ async fn visitor_round_trip(exposed: u16) -> Result<()> {
 }
 
 /// Bridge one established data channel to a backend until either side ends.
-async fn bridge<C: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut channel: C,
+async fn bridge_striped<C: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static>(
+    channel: C,
     backend: &'static str,
 ) -> Result<()> {
-    let mut backend_conn = TcpStream::connect(backend).await?;
-    tokio::io::copy_bidirectional(&mut channel, &mut backend_conn).await?;
+    let backend_conn = TcpStream::connect(backend).await?;
+    let (mut channel_rd, mut channel_wr) = tokio::io::split(channel);
+    let (mut backend_rd, mut backend_wr) = backend_conn.into_split();
+    let up = tokio::spawn(async move {
+        let mut seq = 0u64;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = backend_rd.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let mut header = [0u8; 10];
+            header[..8].copy_from_slice(&seq.to_be_bytes());
+            header[8..].copy_from_slice(
+                &u16::try_from(n)
+                    .expect("a stripe chunk fits u16")
+                    .to_be_bytes(),
+            );
+            channel_wr.write_all(&header).await?;
+            channel_wr.write_all(&buf[..n]).await?;
+            channel_wr.flush().await?;
+            seq += 1;
+        }
+        channel_wr.shutdown().await
+    });
+    let down = tokio::spawn(async move {
+        loop {
+            let mut header = [0u8; 10];
+            if channel_rd.read_exact(&mut header).await.is_err() {
+                break;
+            }
+            let len = usize::from(u16::from_be_bytes([header[8], header[9]]));
+            let mut payload = vec![0u8; len];
+            channel_rd.read_exact(&mut payload).await?;
+            backend_wr.write_all(&payload).await?;
+        }
+        backend_wr.shutdown().await
+    });
+    up.await.context("the stripe sender task failed")??;
+    down.await.context("the stripe receiver task failed")??;
     Ok(())
 }
 
@@ -460,13 +502,17 @@ async fn direct_round_trip(session: &mut Session, id: u32, exposed: u16, backend
         .open_data_channel(id)
         .await
         .expect("failed to open a data channel");
-    let mut cmd = [0u8; 1];
+    let mut cmd = [0u8; 7];
     timeout(PROBE_TIMEOUT, channel.read_exact(&mut cmd))
         .await
-        .expect("the server never sent StartForwardTcp")
-        .expect("failed to read StartForwardTcp");
-    assert_eq!(cmd, [0x00], "the first data command is StartForwardTcp");
-    tokio::spawn(bridge(channel, backend));
+        .expect("the server never sent the forward command")
+        .expect("failed to read the forward command");
+    assert_eq!(
+        cmd[0], 0x01,
+        "the first data command is StartForwardStripedTcp"
+    );
+    assert_eq!(cmd[6], 1, "a single-stripe group is the default shape");
+    tokio::spawn(bridge_striped(channel, backend));
     visitor
         .await
         .expect("the visitor task panicked")
@@ -713,6 +759,9 @@ async fn deregister_releases_the_port() -> Result<()> {
 #[tokio::test]
 async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
     init();
+    // The production default starts at one stripe; this scenario pins the
+    // width its fixture used to name, without a configuration key.
+    molehill_rathole::set_initial_stripes(2);
     let _server = start_server_at(STRIPED_CONFIG, STRIPED_CONTROL).await?;
 
     // The hello exchange, by hand, on the striped fixture's port.
@@ -749,6 +798,7 @@ async fn a_striped_gather_names_its_group_on_every_request() -> Result<()> {
             bind_addr: format!("0.0.0.0:{STRIPED_EXPOSED}").parse()?,
             carrier: Carrier::Tcp,
             udp_buffer_size: 2048,
+            max_udp_workers: 2,
             transparent_capabilities: None,
         },
     });

@@ -57,6 +57,8 @@ pub use protocol::CURRENT_PROTO_VERSION;
 #[cfg(feature = "noise")]
 #[doc(hidden)]
 pub use config::{MaskedString, NoiseConfig, TransportConfig, TransportType};
+#[doc(hidden)]
+pub use stripe::set_initial_stripes;
 #[cfg(feature = "carrier")]
 #[doc(hidden)]
 pub use transport::carrier::Carrier;

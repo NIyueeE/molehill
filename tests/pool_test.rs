@@ -841,9 +841,29 @@ async fn a_saturated_pool_still_serves_the_next_visitor() -> Result<()> {
     settle(2.0).await;
 
     // Return the capacity: every held visitor goes away, so the tunnel is
-    // empty again.
+    // empty again. A group's channels come back when its own tasks end, which
+    // is asynchronous (the visitor's EOF crosses the group first), so wait for
+    // the pool to report it rather than assuming one sleep is enough. This is
+    // also the regression guard for the release path: a group that ends by
+    // aborting one direction must still drop its streams, or the capacity it
+    // took never returns.
     drop(held);
-    settle(2.0).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if molehill_rathole::live_pools()
+            .first()
+            .is_none_or(|pool| pool.streams() == 0)
+        {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the pool must get its streams back within 15 s of the visitors leaving: {:?}",
+            molehill_rathole::live_pools()
+        );
+        settle(0.1).await;
+    }
+    settle(0.2).await;
 
     let pools = molehill_rathole::live_pools();
     if let Some(pool) = pools.first() {
