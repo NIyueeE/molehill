@@ -1,6 +1,18 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-19.** **v0.11.1 is released: the tag names `4874f05`,
+> **State as of 2026-10-20.** **v0.11.2 is released: the tag names `64d8ebc`,
+> the release commit on `main`.** The GitHub release is published (ten
+> archives and `SHA256SUMS`), GHCR carries `:v0.11.2` and `:latest`, and
+> crates.io has `molehill-rathole 0.11.2`. v0.11.2 moves the wire to
+> **protocol v5.2** (dynamic striping; `StartForwardTcp` and
+> `[server.data].stripe_count` are gone), consolidates the configuration
+> model (one pool per forwarding session, one L3 lane budget, fixed KK Noise
+> in four flat layers), derives the UDP and heartbeat policies from the path,
+> adds a global `max_tunnels`, splits the status API into configured/actual
+> state, and gives Linux the symmetric L3 device/address step. Its sweep is
+> the next baseline (the details are under "Where this stands").
+>
+> **v0.11.1 is released: the tag names `4874f05`,
 > the `main` tip at tag time; `main` carries `version = "0.11.1"`.** v0.11.1 moves the wire to
 > **protocol v5.1** (a deliberate v5.0 break), makes transparent (L3)
 > services cross-platform through `tun-rs` — Linux/macOS clients and servers,
@@ -15,19 +27,10 @@
 > record is `benches/records/results-bench-v0.11.1.json` and it was the
 > baseline until the v0.11.2 record.
 >
-> **v0.11.2 is ready for review on `feat/v0.11.2` (2026-10-19):** the
-> branch's manifest carries `version = "0.11.2"`; `main` stays at the released
-> 0.11.1 until the PR merges. The cycle consolidates the configuration model
-> (one pool per forwarding session, one L3 lane budget, fixed KK Noise in four
-> flat layers), adds a global `max_tunnels`, adaptive retry/heartbeat
-> defaults, the path-derived UDP policy, protocol v5.2 with dynamic striping,
-> the configured/actual status API and the symmetric L3 device/address step.
-> `just check` is green. **The release sweep was re-run after the CI fix**
-> (19:19–21:04 UTC, 90 samples, five arms, fingerprint `257343fa3fd158d3`;
-> `just bench gate` PASS **without** a baseline); the record is
-> `benches/records/results-bench-v0.11.2.json` and it is the next baseline.
-> The branch is squashed to eight commits, with the benchmark record as a
-> docs-only commit on top. No tag exists: the release is a human decision.
+> **The v0.11.2 branch is merged and released (2026-10-20).** The tag names
+> the `chore(release)` commit `64d8ebc`; `main` carries it plus this record.
+> `[Unreleased]` is empty and the next cycle is not open yet. The merged
+> branch `feat/v0.11.2` can be retired.
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -47,8 +50,8 @@
 
 ## Where this stands
 
-- **The release sweep is done and the PR is ready (2026-10-19).** The
-  published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
+- **v0.11.2 is released, and its sweep is the next baseline (2026-10-20).**
+  The published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
   `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
   identity as the v0.11.1 record; CPU probe 417.3 MiB/s, loopback
   21.06 Gbit/s), fingerprint `257343fa3fd158d3`. The first run
@@ -66,7 +69,10 @@
   discarded run with the same host identity and calibration; both runs pass
   the gate's 50 ms SLO, and the difference is recorded as run-to-run variance,
   not a claim about the fix (its cfg changes add nothing to the default
-  build's data path). Charts and README are refreshed from the record.
+  build's data path). Charts and README are refreshed from the record. The
+  release workflow then built all ten archives, published the GitHub release
+  (`v0.11.2`, 2026-10-20), the GHCR image and crates.io `molehill-rathole
+  0.11.2`.
 - **The interop matrix was fixed and is green (2026-10-19).** v0.11.2 moved the
   Noise tables, and the matrix wrote one config for both binaries, so the
   released side refused the file before the wire was tested. Each side now
@@ -208,14 +214,14 @@
   run that did show it converging was voided by the shaper bug recorded in the
   archive. A long-hold scenario is what would settle it; the arms already exist
   (`l3-budget10-lending` against `l3-budget10-nolend`).
-- **The repository state**: v0.11.1 is released and the tag names `4874f05`,
-  the `main` tip at tag time; `main` carries `version = "0.11.1"`. The
-  `## [0.11.1] - 2026-10-17` section is dated, and the 0.11.2 work sits under
-  `[Unreleased]`. `v0.11.0` names `f3295e8`. `feat/v0.11.2` carries
-  `version = "0.11.2"` and is squashed to eight commits plus the benchmark
-  record; the PR is open and no tag exists. The measured v0.11.2 revision is
-  `69e8bd9` (`tree_clean` true; the record commit is docs/assets only, so the
-  tag review's drift check still holds). The previous cycle's branches
+- **The repository state**: v0.11.2 is released; the tag names `64d8ebc`
+  (the release commit), and `main` carries it plus this record.
+  `CHANGELOG.md` keeps the dated `## [0.11.2] - 2026-10-20` section and an
+  empty `[Unreleased]`; the next cycle is not open yet. `v0.11.1` names
+  `4874f05`, `v0.11.0` names `f3295e8`. The merged `feat/v0.11.2` branch
+  can be retired. The measured v0.11.2 revision is `69e8bd9` (`tree_clean`
+  true; the record commit is docs/assets only, so the tag review's drift check
+  held). The previous cycle's branches
   (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and the four local
   `backup/*`) were retired on 2026-10-19. The measured v0.11.1 revision is
   `0b56438`, recorded here and in the results file's `meta.provenance`; the
