@@ -2,11 +2,9 @@ use crate::common::helper::{datagram_len, udp_connect};
 #[cfg(feature = "hot-reload")]
 use crate::config::ClientServiceChange;
 use crate::config::ConfigChange;
-#[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
-use crate::config::NoiseConfig;
 use crate::config::{
-    ClientConfig, ClientServiceConfig, Config, MaskedString, ServiceType, TransportConfig,
-    TransportType,
+    ClientConfig, ClientServiceConfig, Config, MaskedString, NoiseConfig, ServiceType,
+    TransportConfig, TransportType,
 };
 use crate::logging::RepeatNotice;
 use crate::protocol::Hello::{self, ControlChannelHello};
@@ -61,13 +59,10 @@ use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 #[cfg(feature = "multiplex")]
 use crate::transport::multiplex::{ClientTunnel, Dialer, StreamLease, TunnelPool};
 
-#[cfg(feature = "multiplex")]
-use crate::common::constants::DEFAULT_MUX_TUNNELS;
 use crate::common::constants::{
-    DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
-    DEFAULT_UDP_WORKERS, FORWARD_IDLE_TIMEOUT, TCP_COPY_BUFFER_SIZE, run_control_chan_backoff,
+    DEFAULT_MAX_UDP_WORKERS, DEFAULT_UDP_BUFFER_SIZE, UDP_CODEL_TARGET, UDP_QUEUE_SIZE,
+    backoff_cap, run_control_chan_backoff, udp_lifetime,
 };
-use crate::common::forward::copy_bidirectional_with_idle;
 
 // The entrypoint of running a client
 pub async fn run_client(
@@ -102,39 +97,14 @@ struct DataOpts {
     /// channel's
     /// `remote_addr`.
     addr: String,
-    /// How many tunnels this service's pool establishes at start
-    /// (`[client.data].tunnels`, or the service's own), or `None` when the
-    /// operator left it to the default — which the pool raises to the
-    /// UDP-derived floor of the services sharing it.
+    /// The session's single pool width (`[client.data].tunnels`). Every
+    /// service of the session draws on this one pool.
     #[cfg(feature = "multiplex")]
-    tunnels: Option<usize>,
-    /// How many data channels this service opens itself (a UDP service's
-    /// worker set; 0 for the others). It is the service's own contribution to
-    /// the pool's UDP-derived floor.
-    #[cfg(feature = "multiplex")]
-    channels: u16,
+    tunnels: usize,
     /// Noise key config, `Some` iff the control transport is `noise`; KCP
     /// tunnels wrap it on top (the crypto stack is kept).
     #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
     noise: Option<NoiseConfig>,
-}
-
-#[cfg(feature = "multiplex")]
-impl DataOpts {
-    /// How many tunnels to establish, given the UDP-derived floor of the
-    /// services that will share this pool.
-    ///
-    /// The operator's number when they wrote one (the configuration is
-    /// validated against the floor before a client ever gets here), else the
-    /// default raised to it — so a deployment that declares four UDP workers
-    /// gets at least four tunnels without the operator having to repeat the
-    /// arithmetic, and a TCP-only deployment keeps the plain default.
-    fn tunnel_target(&self, floor: usize) -> usize {
-        match self.tunnels {
-            Some(n) => n,
-            None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
-        }
-    }
 }
 
 /// Placeholder so the channel-opening code keeps one shape without the
@@ -270,21 +240,37 @@ enum ClientTransport {
 }
 
 impl ClientTransport {
-    /// The effective wire config of one service: the client-wide
-    /// `[client.transport]` with the service's own `transport` overlay
-    /// applied. It is also the session's identity input — two services share
-    /// a control connection exactly when their effective config is equal.
-    fn effective_config(client: &ClientConfig, service: &ClientServiceConfig) -> TransportConfig {
-        let mut cfg = client.transport.clone();
-        if let Some(st) = &service.transport {
-            if let Some(t) = st.transport_type {
-                cfg.transport_type = t;
-            }
-            if let Some(noise) = &st.noise {
-                cfg.noise = Some(noise.clone());
-            }
+    /// The KK pair one service's session authenticates with: the client-wide
+    /// pair with the service's own key overrides applied.
+    ///
+    /// It is the session's identity input beside the endpoint: two services
+    /// share a control connection exactly when both match. A service that
+    /// only flips `data_enable` keeps the same pair and therefore the same
+    /// session — the switch changes its data channels, never the control leg.
+    fn noise_keys(client: &ClientConfig, service: &ClientServiceConfig) -> NoiseConfig {
+        service.noise_keys_with(&client.noise.keys)
+    }
+
+    /// The control channel's stack: always Noise with the effective pair.
+    fn control_config(client: &ClientConfig, service: &ClientServiceConfig) -> TransportConfig {
+        TransportConfig {
+            transport_type: TransportType::Noise,
+            noise: Some(Self::noise_keys(client, service)),
         }
-        cfg
+    }
+
+    /// The data plane's stack: Noise with the same pair when the service's
+    /// effective `data_enable` is true, plain otherwise.
+    fn data_config(client: &ClientConfig, service: &ClientServiceConfig) -> TransportConfig {
+        let enabled = service.data_enabled_with(client.noise.data_enable.unwrap_or(true));
+        TransportConfig {
+            transport_type: if enabled {
+                TransportType::Noise
+            } else {
+                TransportType::Plain
+            },
+            noise: enabled.then(|| Self::noise_keys(client, service)),
+        }
     }
 
     /// Build a wire stack from an effective transport config.
@@ -322,33 +308,22 @@ impl ClientTransport {
 }
 
 impl DataOpts {
-    /// Resolve the data-plane knobs for one service: `[client.data]` as
-    /// defaults, overridden by the service's own `tunnels`.
-    /// The data endpoint follows the service's own server: its `remote_addr`
-    /// override when set, else `[client.data].default_data_addr` (or the
-    /// client-wide
-    /// control endpoint when that is unset either).
+    /// Resolve the data-plane knobs for one service: `[client.data]` is the
+    /// session's pool, and the data endpoint follows the service's own server:
+    /// its `remote_addr` override when set, else
+    /// `[client.data].default_data_addr` (or the client-wide control endpoint
+    /// when that is unset either).
     fn for_service(c: &ClientConfig, s: &ClientServiceConfig) -> DataOpts {
         DataOpts {
             #[cfg(feature = "multiplex")]
             enabled: s.uses_pool(),
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
-            tunnels: c.limits_for(s).tunnels(),
-            #[cfg(feature = "multiplex")]
-            channels: match s.service_type {
-                ServiceType::Udp => s.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS),
-                // A claim's lanes are connections of its own, drawn from its
-                // carrier's budget — never a pool. The budget is capped at
-                // `MAX_TRANSPARENT_LANES`, so the conversion cannot truncate.
-                ServiceType::Transparent => u16::try_from(s.lanes()).unwrap_or(u16::MAX),
-                ServiceType::Tcp => 0,
-            },
+            tunnels: c.tunnels(),
             #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
-            noise: match s.transport_type_with(c.transport.transport_type) {
-                TransportType::Noise => s.noise_config_with(c.transport.noise.as_ref()).cloned(),
-                TransportType::Plain => None,
-            },
+            noise: s
+                .data_enabled_with(c.noise.data_enable.unwrap_or(true))
+                .then(|| ClientTransport::noise_keys(c, s)),
         }
     }
 }
@@ -424,6 +399,13 @@ impl ServiceSlot {
                     .service
                     .udp_buffer_size
                     .unwrap_or_else(|| u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap_or(u16::MAX)),
+                max_udp_workers: match self.service.service_type {
+                    ServiceType::Udp => self
+                        .service
+                        .max_udp_workers
+                        .unwrap_or(DEFAULT_MAX_UDP_WORKERS),
+                    ServiceType::Tcp | ServiceType::Transparent => 0,
+                },
                 transparent_capabilities: self.transparent_capabilities,
             },
         })
@@ -561,8 +543,10 @@ struct SessionKey {
     /// `[client.control].default_remote_addr`, or the service's own
     /// `remote_addr`.
     addr: String,
-    /// The effective `[client.transport]` config (service overlay applied).
-    transport: TransportConfig,
+    /// The effective KK pair (the service's key overrides applied). The
+    /// control channel is always Noise, so the pair — not a transport type —
+    /// is what distinguishes one session from another.
+    noise: NoiseConfig,
 }
 
 /// A live session, as the client's other code sees it.
@@ -591,6 +575,10 @@ struct Client {
     /// without a `[client.status]` block has no entry, and nothing reads the
     /// map.
     status_asks: HashMap<String, mpsc::UnboundedSender<crate::status::SessionAsk>>,
+    /// The configured half of the status answer, kept current across hot
+    /// reloads. The listener clones a receiver per request; a receiver that
+    /// subscribes after a reload still sees the latest list.
+    status_configured: tokio::sync::watch::Sender<Vec<crate::status::ConfiguredService>>,
 }
 
 impl Client {
@@ -598,12 +586,34 @@ impl Client {
     // resolved per service (see `ClientTransport`), so there is nothing
     // to build here.
     fn from(config: ClientConfig) -> Client {
+        let (status_configured, _) = tokio::sync::watch::channel(Vec::new());
         Client {
             config,
             sessions: Vec::new(),
             services: HashMap::new(),
             status_asks: HashMap::new(),
+            status_configured,
         }
+    }
+
+    /// Keep the status listener's configured half aligned with the live service
+    /// table. Called after startup and after every hot-reload add or delete;
+    /// the watch retains the latest list for a listener that subscribes later.
+    fn sync_status_configured(&self) {
+        let configured: Vec<crate::status::ConfiguredService> = self
+            .config
+            .services
+            .values()
+            .map(|service| crate::status::ConfiguredService {
+                name: service.name.clone(),
+                kind: crate::status::kind_name(service.service_type),
+                remote_addr: service.remote_bind_addr.clone(),
+                local_addr: service.local_addr.clone(),
+                lanes: (service.service_type == ServiceType::Transparent)
+                    .then_some(service.transparent_lanes),
+            })
+            .collect();
+        self.status_configured.send_replace(configured);
     }
 
     // The entrypoint of Client
@@ -619,6 +629,8 @@ impl Client {
             self.add_service(config)?;
         }
 
+        self.sync_status_configured();
+
         // The optional status API: one read-only listener the sessions answer.
         // Off unless `[client.status]` exists; the asks map is empty without
         // it, so spawning the task anyway would only cost a dead select arm —
@@ -626,8 +638,9 @@ impl Client {
         let status_task = self.config.status.clone().map(|status| {
             let asks = self.status_asks.clone();
             let shutdown = shutdown_rx.resubscribe();
+            let configured = self.status_configured.subscribe();
             tokio::spawn(async move {
-                if let Err(e) = crate::status::run(status, shutdown, asks).await {
+                if let Err(e) = crate::status::run(status, shutdown, asks, configured).await {
                     error!("status API stopped: {e:#}");
                 }
             })
@@ -681,7 +694,7 @@ impl Client {
             addr: cfg
                 .endpoint_with(&self.config.control.default_remote_addr)
                 .to_owned(),
-            transport: ClientTransport::effective_config(&self.config, cfg),
+            noise: ClientTransport::noise_keys(&self.config, cfg),
         }
     }
 
@@ -694,7 +707,15 @@ impl Client {
     fn add_service(&mut self, cfg: ClientServiceConfig) -> Result<()> {
         let name = cfg.name.clone();
         let key = self.session_key(&cfg);
-        let transport = Arc::new(ClientTransport::from_config(&key.transport)?);
+        // Two stacks per service: the session's control channel always speaks
+        // KK, while its data channels follow the service's effective
+        // `data_enable`. They share the pair, never the type.
+        let control_transport = Arc::new(ClientTransport::from_config(
+            &ClientTransport::control_config(&self.config, &cfg),
+        )?);
+        let transport = Arc::new(ClientTransport::from_config(
+            &ClientTransport::data_config(&self.config, &cfg),
+        )?);
         let token = cfg
             .token
             .clone()
@@ -710,10 +731,17 @@ impl Client {
         // that ends.
         let channels = match cfg.service_type {
             ServiceType::Tcp => 0,
-            ServiceType::Udp => usize::from(cfg.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS)),
+            // UDP starts one worker; the server asks for another when its
+            // queue/affinity state needs one, up to max_udp_workers.
+            ServiceType::Udp => 1,
             ServiceType::Transparent => cfg.lanes(),
         };
-        let retry_interval = cfg.retry_interval.unwrap_or(1);
+        // The cap belongs to the session (one reconnect loop), so the service
+        // that starts it decides: its own key, else the client-wide one, else
+        // the adaptive default (resolved per failure inside the session).
+        let retry_backoff_max = cfg
+            .retry_backoff_max
+            .or(self.config.control.retry_backoff_max);
 
         // A transparent service's prerequisites are the operator's to satisfy
         // and this process's to verify: on Linux it must already own the
@@ -738,7 +766,7 @@ impl Client {
             }
         }
 
-        let idx = self.session_index(key.clone(), transport.clone(), retry_interval);
+        let idx = self.session_index(key.clone(), control_transport, retry_backoff_max);
         let entry = &mut self.sessions[idx];
         let id = match &previous {
             Some(loc) if loc.session == key => loc.id,
@@ -793,7 +821,7 @@ impl Client {
         &mut self,
         key: SessionKey,
         transport: Arc<ClientTransport>,
-        retry_interval: u64,
+        retry_backoff_max: Option<u64>,
     ) -> usize {
         if let Some(i) = self.sessions.iter().position(|s| s.key == key) {
             return i;
@@ -814,8 +842,6 @@ impl Client {
             #[cfg(feature = "multiplex")]
             pools: HashMap::new(),
             #[cfg(feature = "multiplex")]
-            shared_pool: self.config.shared_pool(),
-            #[cfg(feature = "multiplex")]
             pins: Arc::new(crate::transport::multiplex::PinRegistry::new()),
             #[cfg(mh_l3_client)]
             lane_pool: None,
@@ -828,7 +854,7 @@ impl Client {
         };
         tokio::spawn(
             async move {
-                session.drive(retry_interval).await;
+                session.drive(retry_backoff_max).await;
             }
             .instrument(Span::current()),
         );
@@ -855,11 +881,13 @@ impl Client {
             ConfigChange::ClientChange(client_change) => match *client_change {
                 ClientServiceChange::Add(cfg) => {
                     let name = cfg.name.clone();
+                    self.config.services.insert(name.clone(), (*cfg).clone());
                     if let Err(e) = self.add_service(*cfg) {
                         warn!("Failed to start service {name}: {e:#}");
                     }
                 }
                 ClientServiceChange::Delete(s) => {
+                    self.config.services.remove(&s);
                     // Deregister from the session that owns the service: the
                     // server releases its public port, the session and the
                     // siblings carry on.
@@ -875,6 +903,7 @@ impl Client {
                 warn!("Ignored {ignored:?} since running as a client");
             }
         }
+        self.sync_status_configured();
     }
 }
 
@@ -909,7 +938,6 @@ struct RunDataChannelArgs {
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
     /// here until the group is complete (see [`crate::stripe`]).
-    #[cfg(feature = "multiplex")]
     stripes: Arc<crate::stripe::StripeGroups<ClientDataChannel>>,
     /// Placement state of this service's stripe groups, by group id (D24).
     #[cfg(feature = "multiplex")]
@@ -1089,34 +1117,15 @@ impl StripePlacement {
     }
 }
 
-/// The service session's stripe-group registry type (a no-op stand-in
-/// without the `multiplex` feature, which can never receive a striped
-/// command).
-#[cfg(feature = "multiplex")]
+/// The service session's stripe-group registry type. The registry is
+/// transport-agnostic: a stripe may be a yamux stream or a direct data
+/// channel, so the type exists in every client build.
 type StripeRegistry = crate::stripe::StripeGroups<ClientDataChannel>;
-#[cfg(not(feature = "multiplex"))]
-type StripeRegistry = ();
 
 impl RunDataChannelArgs {
-    /// The session's stripe-group registry. Without the `multiplex` feature
-    /// a striped command can never arrive, and the registry degenerates to
-    /// a unit reference the (unreachable) striped arm ignores.
-    #[cfg(feature = "multiplex")]
+    /// The session's stripe-group registry.
     fn stripes(&self) -> &StripeRegistry {
         &self.stripes
-    }
-
-    #[cfg(not(feature = "multiplex"))]
-    #[cfg_attr(
-        not(feature = "multiplex"),
-        allow(
-            clippy::unused_self,
-            reason = "the unit stand-in has no field to read; the multiplex arm keeps the method shape"
-        )
-    )]
-    fn stripes(&self) -> &StripeRegistry {
-        const UNIT: () = ();
-        &UNIT
     }
 }
 
@@ -1567,13 +1576,6 @@ async fn forward_data_channel(
     mut conn: ClientDataChannel,
     service: &ClientServiceConfig,
     udp_hub: Option<Arc<UdpHub>>,
-    #[cfg_attr(
-        not(feature = "multiplex"),
-        expect(
-            unused_variables,
-            reason = "only the multiplex build can receive striped commands"
-        )
-    )]
     stripes: &StripeRegistry,
     #[cfg_attr(
         not(mh_l3_client),
@@ -1584,14 +1586,8 @@ async fn forward_data_channel(
     )]
     lane: Option<LaneId>,
 ) -> Result<()> {
-    let sock_opts = SocketOpts::from_client_cfg(service);
+    let sock_opts = SocketOpts::for_service();
     match read_data_cmd(&mut conn).await? {
-        DataChannelCmd::StartForwardTcp => {
-            if service.service_type != ServiceType::Tcp {
-                bail!("Expect TCP traffic. Please check the configuration.")
-            }
-            run_data_channel_for_tcp(conn, &service.local_addr, sock_opts).await?;
-        }
         DataChannelCmd::StartForwardUdp => {
             if service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
@@ -1600,7 +1596,6 @@ async fn forward_data_channel(
                 .ok_or_else(|| anyhow!("Service {} has no UDP forwarding hub", service.name))?;
             run_data_channel_for_udp(conn, hub).await?;
         }
-        #[cfg(feature = "multiplex")]
         DataChannelCmd::StartForwardStripedTcp(group_bytes, index, count) => {
             if service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
@@ -1617,14 +1612,10 @@ async fn forward_data_channel(
                     .with_context(|| format!("Failed to connect to {}", done.local_addr))?;
                 done.sock_opts.apply(&local);
                 let (read, write) = local.into_split();
-                crate::stripe::spawn_group(read, write, done.streams);
+                // The client does not size groups: no plan, so a stall here
+                // reports to nobody.
+                crate::stripe::spawn_group(read, write, done.streams, None);
             }
-        }
-        #[cfg(not(feature = "multiplex"))]
-        DataChannelCmd::StartForwardStripedTcp(..) => {
-            bail!(
-                "This binary was built without the `multiplex` feature, so it cannot forward striped data channels"
-            );
         }
         DataChannelCmd::StartForwardTransparent(wire) => {
             if service.service_type != ServiceType::Transparent {
@@ -1701,6 +1692,22 @@ fn check_transparent_client(
             cfg.name, cfg.remote_bind_addr
         )
     })?;
+    // The device and the claimed address are the part the daemon owns on every
+    // platform: Linux creates a missing device and assigns a missing address,
+    // while macOS does both through the hub below. Everything around them —
+    // the routes, the policy rule and the forwarding switches — stays the
+    // operator's.
+    #[cfg(mh_linux)]
+    {
+        crate::transparent::net::prepare_device(&cfg.transparent_tun)
+            .with_context(|| format!("service {}: failed to prepare the TUN device", cfg.name))?;
+        crate::transparent::net::claim_client(&cfg.transparent_tun, addr).with_context(|| {
+            format!(
+                "service {}: failed to assign {addr} to the device",
+                cfg.name
+            )
+        })?;
+    }
     let hub = TunHub::get_or_spawn(&cfg.transparent_tun, Direction::Source).with_context(|| {
         format!(
             "service {}: transparent prerequisites are not met",
@@ -1792,17 +1799,16 @@ async fn establish_tunnel(
 async fn establish_tunnels(
     dial: PoolDial<'_>,
     key: &str,
-    floor: usize,
     pins: Arc<crate::transport::multiplex::PinRegistry>,
     choice: &Arc<CarrierChoice>,
 ) -> Result<Tunnels> {
     let opts = dial.opts;
     // The pool's tunnels are established here, together, and kept for the
-    // service's lifetime: a deployment's capacity is what its configuration
+    // session's lifetime: a deployment's capacity is what its configuration
     // says it is, not what it happened to be doing a minute ago. The dialer
     // stays with the pool for repair — a tunnel that dies is replaced so the
     // count survives — which is the only runtime establishment left.
-    let target = opts.tunnel_target(floor);
+    let target = opts.tunnels;
     // The carrier is decided once, here, and the choice remembers it for the
     // endpoints's other channels: a pool that established on TCP keeps dialing
     // TCP (its repair included), because a pool whose tunnels rode two carriers
@@ -2120,65 +2126,18 @@ fn udp_buffer_size(s: &ClientServiceConfig) -> usize {
         .map_or(DEFAULT_UDP_BUFFER_SIZE, |v| v as usize)
 }
 
-fn udp_idle_timeout_secs(s: &ClientServiceConfig) -> u64 {
-    s.udp_idle_timeout.unwrap_or(DEFAULT_UDP_IDLE_TIMEOUT_SECS)
-}
-
-fn udp_send_queue_size(s: &ClientServiceConfig) -> usize {
-    s.udp_send_queue_size
-        .map_or(DEFAULT_UDP_SENDQ_SIZE, |v| v as usize)
-}
-
-// Simply copying back and forth for TCP
-#[instrument(skip_all)]
-async fn run_data_channel_for_tcp<S>(
-    mut conn: S,
-    local_addr: &str,
-    sock_opts: SocketOpts,
-) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    debug!("New data channel starts forwarding");
-
-    let mut local = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("Failed to connect to {local_addr}"))?;
-    // The leg towards the local service needs explicit socket options;
-    // without them Nagle stays enabled and interactive traffic stalls.
-    sock_opts.apply(&local);
-    // A stalled forward is closed by the watchdog rather than left to hold a
-    // tunnel stream for the session's lifetime (see `FORWARD_IDLE_TIMEOUT`).
-    if let Err(e) = copy_bidirectional_with_idle(
-        &mut conn,
-        &mut local,
-        TCP_COPY_BUFFER_SIZE,
-        FORWARD_IDLE_TIMEOUT,
-    )
-    .await
-    {
-        // A reaped connection is a failed request, not a lifecycle event:
-        // DEBUG, like every other per-connection failure.
-        debug!("Data channel closed: {e}");
-    }
-    Ok(())
-}
-
 /// Creation-time parameters for the per-service UDP hub, resolved once from
 /// the service configuration per control-channel session.
 struct UdpForwardParams {
     local_addr: String,
-    udp_forwarder_ipv6: bool,
     buffer_size: usize,
-    idle_timeout_secs: u64,
-    sendq_size: usize,
 }
 
 /// One remote peer's forwarding state.
 struct UdpVisitorRoute {
     /// Queue into the peer's forwarder task (datagrams bound for the local
-    /// service).
-    inbound: mpsc::Sender<Bytes>,
+    /// service), carrying the sojourn timestamp `CoDel` reads.
+    inbound: mpsc::Sender<(Instant, Bytes)>,
     /// Data-channel writer currently carrying the peer's traffic.
     outbound: mpsc::Sender<UdpTraffic>,
     /// That channel's id, so moving the peer to another channel moves the
@@ -2284,7 +2243,7 @@ impl UdpHub {
                 {
                     route.outbound = channel;
                 }
-                if let Err(e) = route.inbound.try_send(data) {
+                if let Err(e) = route.inbound.try_send((Instant::now(), data)) {
                     debug!("UDP forwarder queue full for {from}, dropping a datagram: {e}");
                 }
                 return;
@@ -2293,7 +2252,7 @@ impl UdpHub {
         // First datagram from this peer: bind its dedicated local socket
         // outside the lock, then insert the route. Another channel may have
         // created the peer in the meantime; reuse that forwarder.
-        let socket = match udp_connect(&me.params.local_addr, me.params.udp_forwarder_ipv6).await {
+        let socket = match udp_connect(&me.params.local_addr).await {
             Ok(s) => s,
             Err(e) => {
                 debug!("Failed to connect to the local UDP service: {e:#}");
@@ -2313,11 +2272,11 @@ impl UdpHub {
             {
                 route.outbound = channel;
             }
-            if let Err(e) = route.inbound.try_send(data) {
+            if let Err(e) = route.inbound.try_send((Instant::now(), data)) {
                 debug!("UDP forwarder queue full for {from}, dropping a datagram: {e}");
             }
         } else {
-            let (inbound_tx, inbound_rx) = mpsc::channel(me.params.sendq_size);
+            let (inbound_tx, inbound_rx) = mpsc::channel(UDP_QUEUE_SIZE);
             debug!("New UDP peer {from}, binding a local forwarder socket");
             tokio::spawn(run_udp_forwarder(
                 socket,
@@ -2340,7 +2299,7 @@ impl UdpHub {
             if let Some(pins) = me.pins.as_deref() {
                 pins.update(channel_id, true);
             }
-            if let Err(e) = inbound_tx.try_send(data) {
+            if let Err(e) = inbound_tx.try_send((Instant::now(), data)) {
                 debug!("UDP forwarder queue full for {from}, dropping a datagram: {e}");
             }
         }
@@ -2447,7 +2406,7 @@ where
     let channel_id = hub.next_channel_id();
     #[cfg(not(feature = "multiplex"))]
     let channel_id = 0u64;
-    let (wr_tx, mut wr_rx) = mpsc::channel::<UdpTraffic>(hub.params.sendq_size);
+    let (wr_tx, mut wr_rx) = mpsc::channel::<UdpTraffic>(UDP_QUEUE_SIZE);
     hub.register_channel(wr_tx.clone()).await;
 
     let (mut rd, mut wr) = io::split(conn);
@@ -2521,21 +2480,35 @@ where
 #[instrument(skip_all, fields(from))]
 async fn run_udp_forwarder(
     s: UdpSocket,
-    mut inbound_rx: mpsc::Receiver<Bytes>,
+    mut inbound_rx: mpsc::Receiver<(Instant, Bytes)>,
     hub: Arc<UdpHub>,
     from: SocketAddr,
-    my_inbound: mpsc::Sender<Bytes>,
+    my_inbound: mpsc::Sender<(Instant, Bytes)>,
     channel_id: u64,
 ) {
     debug!("Forwarder created");
     let mut buf = BytesMut::zeroed(hub.params.buffer_size);
+    // The peer's own pace: the largest gap between two datagrams observed so
+    // far. The mapping lifetime is a multiple of it (see udp_lifetime), so a
+    // steady game session keeps its source port and a scanner does not.
+    let mut last_seen = Instant::now();
+    let mut max_gap = Duration::ZERO;
 
     loop {
         tokio::select! {
             // Receive from the server
             data = inbound_rx.recv() => {
                 match data {
-                    Some(data) => {
+                    Some((enqueued, data)) => {
+                        let now = Instant::now();
+                        max_gap = max_gap.max(now.duration_since(last_seen));
+                        last_seen = now;
+                        if enqueued.elapsed() > UDP_CODEL_TARGET {
+                            // CoDel: a datagram that waited past the sojourn
+                            // target is dropped, not delivered late.
+                            trace!("UDP CoDel drop for {from}: {:?}", enqueued.elapsed());
+                            continue;
+                        }
                         if let Err(e) = s.send(&data).await {
                             debug!("Failed to send to the local UDP service: {e:#}");
                             break;
@@ -2556,6 +2529,9 @@ async fn run_udp_forwarder(
                     break;
                 };
 
+                let now = Instant::now();
+                max_gap = max_gap.max(now.duration_since(last_seen));
+                last_seen = now;
                 let t = UdpTraffic{
                     from,
                     data: Bytes::copy_from_slice(&buf[..len])
@@ -2564,8 +2540,9 @@ async fn run_udp_forwarder(
                 hub.send_outbound(from, t, channel_id).await;
             },
 
-            // No traffic for the duration of the idle timeout, clean up the state
-            () = time::sleep(Duration::from_secs(hub.params.idle_timeout_secs)) => {
+            // No traffic for this peer's adaptive lifetime: give the mapping
+            // (and the local source port) back.
+            () = time::sleep(udp_lifetime(max_gap)) => {
                 break;
             }
         }
@@ -2603,10 +2580,7 @@ fn build_udp_hub(
         ServiceType::Udp => Some(Arc::new(UdpHub::new(
             UdpForwardParams {
                 local_addr: service.local_addr.clone(),
-                udp_forwarder_ipv6: service.udp_forwarder_ipv6.unwrap_or(false),
                 buffer_size: udp_buffer_size(service),
-                idle_timeout_secs: udp_idle_timeout_secs(service),
-                sendq_size: udp_send_queue_size(service),
             },
             pins,
         ))),
@@ -2811,7 +2785,7 @@ enum ServiceState {
 ///   so lending cannot reorder anything;
 /// - the receiver's lane is dialed only after the donor's lane has actually
 ///   ended, so the pair never holds more carrier connections than the budget at
-///   any instant: the server's `max_tunnels_per_client` valve, and the
+///   any instant: the server's `max_tunnels` valve, and the
 ///   operator's bill, both see a swap rather than a growth.
 ///
 /// The allocator redistributes what the configuration gave these claims; it does
@@ -3587,18 +3561,13 @@ struct ClientSession {
     /// flight*. They are re-registered once that registration is done rather
     /// than from inside it, which would nest one verdict wait in another.
     pending_drops: Vec<ServiceId>,
-    /// This session's tunnel pools, by key.
+    /// The session's one tunnel pool, by key (`session:<data endpoint>`).
     ///
-    /// With `[client.data].shared_pool` the key is `session` per carrier, so
-    /// every service of the session shares one pool; without it the key is
-    /// `service:<id>` per carrier, so each service keeps its own. One code
-    /// path, two keys — and the session owns them, because a shared pool must
-    /// outlive any single service.
+    /// The session owns it, not a service: every service of the session draws
+    /// on the same connections, and dropping one service must not tear them
+    /// down.
     #[cfg(feature = "multiplex")]
     pools: HashMap<String, Tunnels>,
-    /// `[client.data].shared_pool`.
-    #[cfg(feature = "multiplex")]
-    shared_pool: bool,
     /// The client's UDP pin accounting, shared by every hub of this session's
     /// services: a tunnel with pinned peers is never shrunk (D30).
     #[cfg(feature = "multiplex")]
@@ -3632,10 +3601,13 @@ impl ClientSession {
     ///
     /// A [`SessionFatal`] error ends the task instead: no retry can fix a
     /// dialect mismatch or a refused credential, and the operator has to act.
-    async fn drive(mut self, retry_interval: u64) {
-        let backoff_builder = run_control_chan_backoff(retry_interval);
+    async fn drive(mut self, retry_backoff_max: Option<u64>) {
         let mut start = Instant::now();
-        let mut retry_backoff = backoff_builder.build();
+        // Consecutive failures in the current outage: what the adaptive cap
+        // reads. A session that stayed up for more than a few seconds starts
+        // over, so the count describes one outage.
+        let mut failures: u32 = 0;
+        let mut logged_cap: Option<u64> = None;
         // A session that starts before its server retries every second. The
         // first line tells the operator what is happening; the hundredth only
         // fills the log, so it is a `debug`.
@@ -3665,12 +3637,25 @@ impl ClientSession {
                     }
 
                     if start.elapsed() > Duration::from_secs(3) {
-                        // The session ran for at least 3 secs and then dropped
-                        retry_backoff = backoff_builder.build();
+                        // The session ran for at least 3 secs and then dropped:
+                        // this is a new outage.
+                        failures = 0;
                         // It was up, so the next failure is news again.
                         retry_notice.clear();
                     }
 
+                    failures = failures.saturating_add(1);
+                    let cap = retry_backoff_max.unwrap_or_else(|| backoff_cap(failures));
+                    if logged_cap != Some(cap) {
+                        debug!(
+                            failures,
+                            cap_secs = cap,
+                            explicit = retry_backoff_max.is_some(),
+                            "control-channel retry backoff cap"
+                        );
+                        logged_cap = Some(cap);
+                    }
+                    let mut retry_backoff = run_control_chan_backoff(cap).build();
                     if let Some(duration) = retry_backoff.next() {
                         retry_notice.report(
                             || info!("{:#}. Retry in {:?}...", err, duration),
@@ -3727,30 +3712,7 @@ impl ClientSession {
         // connecting *before* re-registering: a service deleted in the
         // meantime must not come back for one round.
         self.apply_pending_requests();
-        // A reconnect starts from nothing: the server has forgotten every
-        // service of this session, so they all go back to `Registering`. A
-        // service the server once refused stays refused.
-        //
-        // The tunnel pools go with the connection they were built on: their
-        // tunnels carry the *previous* session nonce and died with it, so a
-        // pool kept across a reconnect can only refuse streams — and its
-        // growth would be rejected as a stale nonce. Each service builds a
-        // fresh pool when it re-activates below.
-        #[cfg(feature = "multiplex")]
-        self.pools.clear();
-        for entry in self.services.values_mut() {
-            if !matches!(entry.state, ServiceState::Rejected) {
-                entry.state = ServiceState::Registering;
-            }
-        }
-        let mut ids: Vec<ServiceId> = self
-            .services
-            .iter()
-            .filter(|(_, e)| matches!(e.state, ServiceState::Registering))
-            .map(|(id, _)| *id)
-            .collect();
-        ids.sort_unstable();
-        for id in ids {
+        for id in self.services_to_reregister() {
             self.register(id, &nonce, &mut rd, &mut wr).await?;
             self.drain_dropped(&nonce, &mut rd, &mut wr).await?;
         }
@@ -3764,6 +3726,11 @@ impl ClientSession {
                     // channel can be placed on a tunnel of its own (D24).
                     ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                         self.open_stripe_channel(id, group, index, count);
+                    }
+                    // The server will never forward that group: the stripes
+                    // parked for it are capacity nobody can use.
+                    ControlChannelCmd::ReleaseStripedGroup(id, group) => {
+                        self.release_stripe_group(id, group);
                     }
                     ControlChannelCmd::HeartBeat => (),
                     // What the server offered one of this claim's lanes, and
@@ -3843,6 +3810,34 @@ impl ClientSession {
 
         info!("Control session shutdown");
         Ok(())
+    }
+
+    /// A reconnect starts from nothing: the server has forgotten every service
+    /// of this session, so they all go back to `Registering` — a service the
+    /// server once refused stays refused — and the ids to re-register come
+    /// back in order.
+    ///
+    /// The tunnel pools go with the connection they were built on: their
+    /// tunnels carry the *previous* session nonce and died with it, so a pool
+    /// kept across a reconnect can only refuse streams, and its growth would be
+    /// rejected as a stale nonce. Each service builds a fresh pool when it
+    /// re-activates.
+    fn services_to_reregister(&mut self) -> Vec<ServiceId> {
+        #[cfg(feature = "multiplex")]
+        self.pools.clear();
+        for entry in self.services.values_mut() {
+            if !matches!(entry.state, ServiceState::Rejected) {
+                entry.state = ServiceState::Registering;
+            }
+        }
+        let mut ids: Vec<ServiceId> = self
+            .services
+            .iter()
+            .filter(|(_, e)| matches!(e.state, ServiceState::Registering))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// The session handshake: the hello that names the session, the server's
@@ -3965,21 +3960,19 @@ impl ClientSession {
         let services = self
             .services
             .values()
-            .map(|entry| crate::status::ServiceStatus {
-                name: entry.slot.service.name.clone(),
-                kind: match entry.slot.service.service_type {
-                    crate::config::ServiceType::Tcp => "tcp",
-                    crate::config::ServiceType::Udp => "udp",
-                    crate::config::ServiceType::Transparent => "transparent",
+            .map(|entry| {
+                let service = &entry.slot.service;
+                crate::status::ServiceSnapshot {
+                    name: service.name.clone(),
+                    kind: crate::status::kind_name(service.service_type),
+                    remote_addr: service.remote_bind_addr.clone(),
+                    local_addr: service.local_addr.clone(),
+                    state: match entry.state {
+                        ServiceState::Registering => "registering",
+                        ServiceState::Active(_) => "active",
+                        ServiceState::Rejected => "rejected",
+                    },
                 }
-                .to_owned(),
-                remote_addr: entry.slot.service.remote_bind_addr.clone(),
-                local_addr: entry.slot.service.local_addr.clone(),
-                state: match entry.state {
-                    ServiceState::Registering => "registering",
-                    ServiceState::Active(_) => "active",
-                    ServiceState::Rejected => "rejected",
-                },
             })
             .collect();
 
@@ -3988,34 +3981,59 @@ impl ClientSession {
             .lane_pool
             .as_ref()
             .map(|pool| {
+                let claims: HashMap<String, (String, u16)> = self
+                    .services
+                    .values()
+                    .map(|entry| {
+                        (
+                            entry.slot.service.remote_bind_addr.clone(),
+                            (
+                                entry.slot.service.name.clone(),
+                                entry.slot.service.transparent_lanes,
+                            ),
+                        )
+                    })
+                    .collect();
                 pool.snapshot()
                     .0
                     .into_iter()
-                    .map(|load| crate::status::ClaimStatus {
-                        endpoint: load.endpoint.to_string(),
-                        lanes: load
-                            .lanes
-                            .into_iter()
-                            .map(|lane| crate::status::LaneStatus {
-                                slot: lane.slot,
-                                flows: lane.flows,
-                                handover: lane.handover,
-                            })
-                            .collect(),
+                    .map(|load| {
+                        let endpoint = load.endpoint.to_string();
+                        let (name, configured_lanes) = claims
+                            .get(&endpoint)
+                            .cloned()
+                            .unwrap_or_else(|| (endpoint.clone(), 0));
+                        crate::status::ClaimSnapshot {
+                            name,
+                            endpoint,
+                            configured_lanes: Some(configured_lanes),
+                            lanes: load
+                                .lanes
+                                .into_iter()
+                                .map(|lane| crate::status::LaneStatus {
+                                    slot: lane.slot,
+                                    flows: lane.flows,
+                                    handover: lane.handover,
+                                })
+                                .collect(),
+                        }
                     })
                     .collect()
             })
             .unwrap_or_default();
 
         #[cfg(not(mh_l3_client))]
-        let claims = ();
+        let claims = Vec::new();
+
+        #[cfg(feature = "multiplex")]
+        let pool_key = self.pools.keys().next().cloned();
+        #[cfg(not(feature = "multiplex"))]
+        let pool_key = None;
 
         crate::status::SessionView {
             services,
-            #[cfg(mh_l3_client)]
             claims,
-            #[cfg(not(mh_l3_client))]
-            claims,
+            pool_key,
         }
     }
 
@@ -4145,6 +4163,9 @@ impl ClientSession {
                 ControlChannelCmd::CreateDataChannelFor(id) => self.open_channel(id),
                 ControlChannelCmd::CreateDataChannelForStripe(id, group, index, count) => {
                     self.open_stripe_channel(id, group, index, count);
+                }
+                ControlChannelCmd::ReleaseStripedGroup(id, group) => {
+                    self.release_stripe_group(id, group);
                 }
                 ControlChannelCmd::HeartBeat => (),
                 ControlChannelCmd::ServiceDropped(id) => self.pending_drops.push(id),
@@ -4335,45 +4356,32 @@ impl ClientSession {
         Ok(())
     }
 
-    /// The tunnel pool this service must use, creating it when the service is
-    /// the first of that key to become active.
+    /// The session's one tunnel pool, created when its first service becomes
+    /// active.
     ///
-    /// The key is `session` for a shared pool (`[client.data].shared_pool`),
-    /// so the *second* service of the session finds the pool here and does not
-    /// dial a second one; without the flag it is `service:<id>`, so every
-    /// service keeps the pool it had. The key also carries the data endpoint:
-    /// two services cannot share a physical tunnel to different endpoints.
+    /// The key is always `session:<data endpoint>`: one control session holds
+    /// one pool, so the *second* service of the session finds it here and does
+    /// not dial a second one. The key carries the data endpoint because two
+    /// services cannot share a physical tunnel to different endpoints.
     #[cfg(feature = "multiplex")]
     async fn service_pool(
         &mut self,
-        id: ServiceId,
+        _id: ServiceId,
         name: &str,
         data_addr: &AddrMaybeCached,
         slot: &ServiceSlot,
         nonce: &Nonce,
     ) -> Result<(Tunnels, String)> {
-        let owner = if self.shared_pool {
-            "session".to_owned()
-        } else {
-            format!("service:{id}")
-        };
-        // The key carries the data endpoint as well as the owner: two services
-        // cannot share a physical tunnel to different endpoints. The carrier is
-        // *not* part of it — a pool has one carrier for its lifetime, chosen
-        // when it is established, so there is never a second pool on the same
-        // key to tell apart.
-        let key = format!("{owner}:{data_addr}");
+        // The key carries the data endpoint: two services cannot share a
+        // physical tunnel to different endpoints. The carrier is *not* part of
+        // it — a pool has one carrier for its lifetime, chosen when it is
+        // established, so there is never a second pool on the same key to tell
+        // apart.
+        let key = format!("session:{data_addr}");
         if let Some(pool) = self.pools.get(&key) {
             debug!(service = %name, pool = %key, "Reusing the session's tunnel pool");
             return Ok((pool.clone(), key));
         }
-        // This service's own contribution to the pool's floor: a UDP worker
-        // set shards across tunnels, so the pool must be at least that wide
-        // before the first channel is placed.
-        let floor = crate::transport::pool::udp_floor(
-            [usize::from(slot.data.channels)],
-            crate::transport::multiplex::stream_cap(),
-        );
         let choice = self.carrier_for(data_addr);
         let dial = PoolDial {
             transport: &slot.transport,
@@ -4382,7 +4390,7 @@ impl ClientSession {
             opts: &slot.data,
             choice: &choice,
         };
-        let tunnel = establish_tunnels(dial, &key, floor, Arc::clone(&self.pins), &choice)
+        let tunnel = establish_tunnels(dial, &key, Arc::clone(&self.pins), &choice)
             .await
             .with_context(|| format!("service {name}: failed to establish its tunnel pool"))?;
         self.pools.insert(key.clone(), tunnel.clone());
@@ -4499,14 +4507,13 @@ impl ClientSession {
                 connector: slot.transport.clone(),
                 #[cfg(any(feature = "multiplex", mh_l3_client))]
                 carrier: Arc::clone(&choice),
-                socket_opts: SocketOpts::from_client_cfg(&slot.service),
+                socket_opts: SocketOpts::for_service(),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
                 #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
                 noise: slot.data.noise.clone(),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),
-                #[cfg(feature = "multiplex")]
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
                 #[cfg(feature = "multiplex")]
                 stripe_placements: StripePlacements::default(),
@@ -4534,47 +4541,7 @@ impl ClientSession {
                 state: ServiceState::Active(Box::new(active)),
             },
         );
-        // A newly active (or newly gone) service that draws from a pool — a
-        // UDP worker set, a claim's member set — changes what the pool must be
-        // able to carry (D7).
-        #[cfg(feature = "multiplex")]
-        self.refresh_pool_floors();
         Ok(())
-    }
-
-    /// Recompute every pool's data-derived floor (D7) from the services that
-    /// are active right now, and hand it to the pool.
-    ///
-    /// The floor is `ceil(channels / streams-per-tunnel)` of the deepest
-    /// active service that draws from a pool — a UDP worker set, or an L3
-    /// claim's member set — maintained across a tunnel's death: the pool may
-    /// lose an idle tunnel to a failure without the floor moving, because the
-    /// floor describes what the *services* need, not how many tunnels exist.
-    #[cfg(feature = "multiplex")]
-    fn refresh_pool_floors(&self) {
-        let cap = crate::transport::multiplex::stream_cap();
-        let mut floors: HashMap<&str, usize> = HashMap::new();
-        for entry in self.services.values() {
-            let ServiceState::Active(active) = &entry.state else {
-                continue;
-            };
-            let Some(key) = active.pool_key.as_deref() else {
-                continue;
-            };
-            if !matches!(
-                entry.slot.service.service_type,
-                ServiceType::Udp | ServiceType::Transparent
-            ) {
-                continue;
-            }
-            let floor = crate::transport::pool::udp_floor([entry.slot.channels], cap);
-            let slot = floors.entry(key).or_insert(0);
-            *slot = (*slot).max(floor);
-        }
-        for (key, pool) in &self.pools {
-            let floor = floors.get(key.as_str()).copied().unwrap_or(0);
-            pool.pool().set_udp_floor(floor);
-        }
     }
 
     /// One visitor arrived: hand the server one more channel for that service.
@@ -4606,6 +4573,22 @@ impl ClientSession {
         #[cfg(not(feature = "multiplex"))]
         let stripe = None;
         self.open_placed_channel(id, stripe);
+    }
+
+    /// The server gave up on a stripe group before forwarding it
+    /// (`ReleaseStripedGroup`): drop the stripes it parked here.
+    ///
+    /// Those channels are pool capacity the server will never use, so they go
+    /// back now rather than at the registry's TTL. The group id is tombstoned
+    /// on the way out: a stripe the client was already opening when the
+    /// release was written must not park after it.
+    fn release_stripe_group(&self, id: ServiceId, group: [u8; 4]) {
+        if let Some(entry) = self.services.get(&id)
+            && let ServiceState::Active(active) = &entry.state
+        {
+            let released = active.args.stripes.release(u32::from_be_bytes(group));
+            debug!("Service {id} released stripe group {group:02x?} ({released} parked stripes)");
+        }
     }
 
     /// Open one data channel for a service the server asked about.
@@ -4672,10 +4655,6 @@ impl ClientSession {
         // rebuilds both.
         debug!(service = %entry.slot.service.name, "Service dropped by the server, re-registering");
         entry.state = ServiceState::Registering;
-        // The service's data plane is gone with its registration, so the floor
-        // its channels contributed goes with it.
-        #[cfg(feature = "multiplex")]
-        self.refresh_pool_floors();
         self.register(id, nonce, rd, wr).await
     }
 
@@ -4705,10 +4684,6 @@ impl ClientSession {
         if self.services.remove(&id).is_some() {
             debug!("Deregistering service {id}");
             write_session_cmd(wr, &SessionCmd::Deregister(id)).await?;
-            // A service that is gone asks for nothing: the floor its channels
-            // contributed is recomputed for the pools it drew from (D7).
-            #[cfg(feature = "multiplex")]
-            self.refresh_pool_floors();
         }
         Ok(())
     }
@@ -4842,7 +4817,6 @@ mod tests {
             service_type: ServiceType::Udp,
             local_addr: "127.0.0.1:8103".to_owned(),
             remote_bind_addr: "127.0.0.1:2354".to_owned(),
-            udp_send_queue_size: Some(2),
             ..Default::default()
         };
         // The session's pin registry: a real one with tunnels, the unit handle
@@ -4850,14 +4824,10 @@ mod tests {
         // (and the one the `unit_arg` lint accepts).
         let pins: Arc<Pins> = Arc::default();
         let hub = build_udp_hub(&service, pins).expect("a UDP service must build a hub");
-        assert_eq!(
-            hub.params.sendq_size, 2,
-            "the configured queue size must reach the runtime"
-        );
 
         // The queue `run_data_channel_for_udp` creates for one channel's
         // writer, with nobody draining it: a writer parked on a closed window.
-        let (tx, mut rx) = mpsc::channel::<UdpTraffic>(hub.params.sendq_size);
+        let (tx, mut rx) = mpsc::channel::<UdpTraffic>(2);
         hub.register_channel(tx).await;
 
         let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
@@ -4881,7 +4851,7 @@ mod tests {
         assert_eq!(
             queued,
             vec![0, 1],
-            "exactly sendq_size datagrams are queued (in order); the rest are dropped"
+            "exactly the queue capacity is queued (in order); the rest are dropped"
         );
     }
 

@@ -1,4 +1,4 @@
-# The operator's valve (`[server.data].max_tunnels_per_client`) against a
+# The operator's valve (`[server.data].max_tunnels`) against a
 # client that asks for more: the client's own count is 2, the server's valve
 # is 1, so one of the two startup establishments is refused while the tunnel
 # the client got keeps forwarding. `tests/pool_test.rs` asserts the pool holds
@@ -12,12 +12,10 @@ default_token = "default_token_if_not_specify" # security-scan:allow fixture pla
 [client.control]
 default_remote_addr = "127.0.0.1:2370"
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [client.data]
 
@@ -34,9 +32,10 @@ allow_ports = ["2371"]
 [server.control]
 bind_addr = "127.0.0.1:2370"
 
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
 
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="
 
 [server.data]
-max_tunnels_per_client = 1
+max_tunnels = 1

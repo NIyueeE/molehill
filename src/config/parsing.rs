@@ -6,23 +6,15 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::Path;
 use tokio::fs;
-use url::Url;
 
 #[cfg(feature = "carrier")]
 use crate::common::constants::MAX_TRANSPARENT_LANES;
+use crate::common::constants::{
+    DEFAULT_MAX_UDP_WORKERS, DEFAULT_UDP_BUFFER_SIZE, MAX_UDP_WORKERS_CAP,
+};
 #[cfg(feature = "multiplex")]
 use crate::common::constants::{DEFAULT_MUX_TUNNELS, MAX_MUX_TUNNELS_CAP};
-use crate::common::constants::{
-    DEFAULT_UDP_BUFFER_SIZE, DEFAULT_UDP_IDLE_TIMEOUT_SECS, DEFAULT_UDP_SENDQ_SIZE,
-    DEFAULT_UDP_WORKERS,
-};
 use crate::config::transparent::TransparentClientConfig;
-
-/// Application-layer heartbeat interval in secs
-const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
-
-/// Client
-const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
@@ -53,6 +45,7 @@ impl From<&str> for MaskedString {
 /// Only the control channel, which is always TCP. The data plane's own carrier
 /// is chosen at runtime (KCP, falling back to TCP) and is not a key.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
+#[doc(hidden)]
 pub enum TransportType {
     #[default]
     #[serde(rename = "plain")]
@@ -61,24 +54,24 @@ pub enum TransportType {
     Noise,
 }
 
-/// Per-service transport override (`[client.services.<name>].transport`).
+/// Per-service Noise overrides (`[client.services.<name>.noise]`).
 ///
-/// Client-first encryption: the client-wide `[client.transport].type`
-/// decides by default, and a service can override it individually with the
-/// same vocabulary (`type = "noise"` / `type = "plain"`). `noise` holds the
-/// keys for THIS service (e.g. a different server's public key in
-/// multi-server setups); when absent, the global
-/// `[client.transport].noise` keys are used.
+/// The same three keys as `[client.noise]`, each optional: an unset key
+/// inherits the client-wide value. Keys override the *session's* identity
+/// (a service may therefore dial another server with its own pair), while
+/// `data_enable` only selects whether this service's data channels are
+/// encrypted.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ClientServiceTransportConfig {
-    /// `None` = follow `[client.transport].type`; `"noise"` forces this
-    /// service to encrypt; `"plain"` forces plaintext.
-    #[serde(rename = "type")]
-    pub transport_type: Option<TransportType>,
-    /// Per-service Noise keys (pattern, remote key, psk). When absent, the
-    /// global `[client.transport].noise` keys are used.
-    pub noise: Option<NoiseConfig>,
+pub struct ServiceNoiseConfig {
+    /// The peer's public key, base64 32 bytes. Unset inherits `[client.noise]`.
+    pub public_key: Option<String>,
+    /// This host's private key, base64 32 bytes. Unset inherits
+    /// `[client.noise]`.
+    pub private_key: Option<MaskedString>,
+    /// Whether this service's data channels are encrypted. Unset inherits
+    /// `[client.noise].data_enable`.
+    pub data_enable: Option<bool>,
 }
 
 /// Per service config (client side).
@@ -102,11 +95,10 @@ pub struct ClientServiceConfig {
     /// The public address (e.g. `"0.0.0.0:6022"`) this service is exposed at
     /// on the server. Required.
     pub remote_bind_addr: String,
-    /// Prefer IPv6 for the UDP forwarder's connection to the local
-    /// service (UDP services only). `None` = the key was not written.
-    pub udp_forwarder_ipv6: Option<bool>,
-    pub nodelay: Option<bool>,
-    pub retry_interval: Option<u64>,
+    /// This service's cap on the reconnect backoff. Unset inherits
+    /// `[client.control].retry_backoff_max`; when that is unset too, the cap
+    /// is the adaptive default of [`crate::common::constants::backoff_cap`].
+    pub retry_backoff_max: Option<u64>,
     /// Override `[client].default_token` for this service only — e.g. to
     /// authenticate against a server that has its own token.
     pub token: Option<MaskedString>,
@@ -114,26 +106,16 @@ pub struct ClientServiceConfig {
     /// only: the service's control channel (and, by default, its data
     /// plane) dials this server instead of the client-wide one.
     pub remote_addr: Option<String>,
-    /// `[client.data].tunnels` for this service only: the pool's width, or a
-    /// transparent claim's lane budget.
-    #[cfg(feature = "multiplex")]
-    pub tunnels: Option<u16>,
-    /// Per-service transport override (encryption enablement + keys).
-    pub transport: Option<ClientServiceTransportConfig>,
-    /// How many data channels this UDP service's worker set uses. The server
-    /// shards distinct visitors across the workers (session affinity) and the
-    /// tunnel pool keeps at least the tunnels they need. Default: 2. UDP
-    /// services only — a TCP service opens one data channel per visitor, on
-    /// demand, so the key is an error there.
-    pub udp_workers: Option<u16>,
+    /// Per-service Noise overrides (keys + data-channel encryption).
+    pub noise: Option<ServiceNoiseConfig>,
+    /// The ceiling on this UDP service's worker set: the client starts one
+    /// data channel and opens another only when the server asks for one.
+    /// Default: 2; clamped to 1..=64. UDP services only — a TCP service opens
+    /// one data channel per visitor, on demand, so the key is an error there.
+    pub max_udp_workers: Option<u16>,
     /// Receive buffer size for UDP datagrams in bytes. Default: 2048,
     /// maximum 65535 (bounded by the wire format's `u16` length).
     pub udp_buffer_size: Option<u16>,
-    /// Seconds of inactivity after which a UDP peer mapping is cleaned up on
-    /// the client side. Default: 60.
-    pub udp_idle_timeout: Option<u64>,
-    /// Queue size for outbound UDP datagrams per data channel. Default: 1024.
-    pub udp_send_queue_size: Option<u16>,
     /// The TUN device this service attaches to, filled for a claim by
     /// [`crate::config::transparent::TransparentClientConfig::lower`]. Empty
     /// for every forwarding service: only a claim touches a device.
@@ -169,13 +151,34 @@ impl ClientServiceConfig {
         self.remote_addr.as_deref().unwrap_or(default)
     }
 
-    /// The transport type this service will use: its `transport.type`
-    /// override when set, else the client-wide default
-    /// (`[client.transport].type`).
-    pub fn transport_type_with(&self, global: TransportType) -> TransportType {
-        self.transport
+    /// The effective KK key pair this service's session uses: its own
+    /// `noise` overrides applied to the client-wide pair.
+    ///
+    /// A service that names another server's keys therefore gets a session of
+    /// its own (the session key is the endpoint plus this pair), while a
+    /// service that only flips `data_enable` keeps sharing one.
+    pub fn noise_keys_with(&self, global: &NoiseConfig) -> NoiseConfig {
+        let Some(noise) = &self.noise else {
+            return global.clone();
+        };
+        NoiseConfig {
+            public_key: noise
+                .public_key
+                .clone()
+                .unwrap_or_else(|| global.public_key.clone()),
+            private_key: noise
+                .private_key
+                .clone()
+                .unwrap_or_else(|| global.private_key.clone()),
+        }
+    }
+
+    /// Whether this service's data channels are encrypted: its own override,
+    /// else the client-wide default.
+    pub fn data_enabled_with(&self, global: bool) -> bool {
+        self.noise
             .as_ref()
-            .and_then(|t| t.transport_type)
+            .and_then(|noise| noise.data_enable)
             .unwrap_or(global)
     }
 
@@ -200,20 +203,6 @@ impl ClientServiceConfig {
     /// connection of its own — the same answer.
     pub fn uses_pool(&self) -> bool {
         cfg!(feature = "multiplex") && self.service_type != ServiceType::Transparent
-    }
-
-    /// The Noise config this service will use: its own
-    /// `transport.noise` keys when set, else the client-wide
-    /// `[client.transport].noise` keys. `None` when neither side has keys
-    /// (only valid for services whose effective transport is plain).
-    pub fn noise_config_with<'a>(
-        &'a self,
-        global: Option<&'a NoiseConfig>,
-    ) -> Option<&'a NoiseConfig> {
-        self.transport
-            .as_ref()
-            .and_then(|t| t.noise.as_ref())
-            .or(global)
     }
 }
 
@@ -305,48 +294,57 @@ impl Serialize for PortRange {
     }
 }
 
-fn default_noise_pattern() -> String {
-    // The ring-accelerated snow resolver (see Cargo.toml `noise` feature)
-    // serves the ChaChaPoly data path for every pattern, so the hash choice
-    // only affects the one-time handshake — BLAKE2s stays the default.
-    String::from("Noise_NK_25519_ChaChaPoly_BLAKE2s")
-}
-
+/// Noise key material: the fixed KK handshake's two static keys.
+///
+/// Both keys are required and base64-encoded 32-byte Curve25519 values. The
+/// pattern is not configurable: every session is
+/// `Noise_KK_25519_ChaChaPoly_BLAKE2s`, so both ends already know each
+/// other's static key and no anonymous suite can be selected by a config.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NoiseConfig {
-    #[serde(default = "default_noise_pattern")]
-    pub pattern: String,
-    pub local_private_key: Option<MaskedString>,
-    pub remote_public_key: Option<String>,
-    pub psk: Option<MaskedString>,
-    #[serde(default)]
-    pub psk_location: Option<u8>,
-    /// Noise session resume: a reconnect that proves possession of the
-    /// previous session's handshake hash with a MAC instead of repeating
-    /// the handshake's key exchanges. Opt-in (default off) because a
-    /// resumed session's keys derive without a fresh DH — see
-    /// docs/transport.md, "Noise session resume".
-    #[serde(default)]
-    pub resume: Option<bool>,
+    /// The peer's public key, base64 32 bytes.
+    pub public_key: String,
+    /// This host's private key, base64 32 bytes.
+    pub private_key: MaskedString,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
+impl Default for NoiseConfig {
+    /// An empty pair: only a default-constructed value that never reaches a
+    /// handshake. Validation refuses it before a config can start.
+    fn default() -> Self {
+        Self {
+            public_key: String::new(),
+            private_key: MaskedString::default(),
+        }
+    }
+}
+
+/// Client-wide Noise settings (`[client.noise]`).
+///
+/// The control channel always speaks KK with these keys. `data_enable`
+/// decides only whether data channels (a forwarding client's tunnels and
+/// lanes) are wrapped in the same session's record stream; the control
+/// channel is never plain.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TransportConfig {
-    #[serde(rename = "type")]
-    pub transport_type: TransportType,
-    /// Client only: proxy used to reach the server (`http` / `socks5`).
-    ///
-    /// TCP socket options (`nodelay`, keepalive) are fixed internal defaults
-    /// rather than configuration — they are applied per connection kind and
-    /// exposing them invited misconfiguration.
-    pub proxy: Option<Url>,
-    pub noise: Option<NoiseConfig>,
+pub struct ClientNoiseConfig {
+    #[serde(flatten)]
+    pub keys: NoiseConfig,
+    /// Whether data channels are encrypted. Default: `true` for a forwarding
+    /// client, `false` for a transparent one (computed by its lowering).
+    pub data_enable: Option<bool>,
 }
 
-fn default_client_retry_interval() -> u64 {
-    DEFAULT_CLIENT_RETRY_INTERVAL_SECS
+/// An internal wire-stack selection, built by the runtime from the client
+/// settings. It is deliberately **not** a configuration table: the control
+/// channel is always Noise and `data_enable` is the only switch, so this
+/// type exists to keep one call shape in `transport.rs`.
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[doc(hidden)]
+pub struct TransportConfig {
+    pub transport_type: TransportType,
+    pub noise: Option<NoiseConfig>,
 }
 
 /// The optional status API (`[client.status]`).
@@ -374,15 +372,9 @@ pub struct StatusConfig {
 /// Control-channel defaults (`[client.control]`).
 ///
 /// Every service inherits these and may override `remote_addr` and
-/// `retry_interval` on its own `[client.services.<name>]` block.
+/// `retry_backoff_max` on its own `[client.services.<name>]` block.
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the `default_` prefix is the config-surface naming rule that \
-              distinguishes client-wide defaults from the per-service overlay \
-              keys on `[client.services.<name>]`"
-)]
 pub struct ClientControlConfig {
     /// Server address of the control channel, e.g. `"example.com:2333"`.
     /// Required.
@@ -394,23 +386,23 @@ pub struct ClientControlConfig {
     /// healthy server.
     #[serde(default)]
     pub default_heartbeat_timeout: Option<u64>,
-    /// Delay between control-channel reconnect attempts.
-    #[serde(default = "default_client_retry_interval")]
-    pub default_retry_interval: u64,
+    /// Cap on the control-channel reconnect backoff, in seconds. Unset means
+    /// the adaptive default of [`crate::common::constants::backoff_cap`],
+    /// computed from the number of consecutive failures.
+    #[serde(default)]
+    pub retry_backoff_max: Option<u64>,
 }
 
 /// Data-plane defaults (`[client.data]`).
 ///
-/// Every service inherits these and may override `tunnels` on its own
-/// `[client.services.<name>]` block; `addr` itself cannot be overridden per
-/// service, but a service with its own `remote_addr` dials that server's data
-/// endpoint instead.
+/// Every service of one control session shares one tunnel pool; `addr` itself
+/// cannot be overridden per service, but a service with its own `remote_addr`
+/// dials that server's data endpoint instead.
 ///
 /// Neither the *shape* of the data plane nor its *carrier* is a key: a
 /// forwarding service always multiplexes ([`ClientServiceConfig::uses_pool`]), a
 /// transparent claim never does, and the carrier is chosen at runtime (KCP,
-/// falling back to TCP). The rows an operator used to write per carrier
-/// (`[client.data]`, `[client.data]`) are now the one table below.
+/// falling back to TCP).
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -420,82 +412,23 @@ pub struct ClientDataConfig {
     /// `[client.control].default_remote_addr`). Applies to every service
     /// that does not override `remote_addr` itself.
     pub default_data_addr: Option<String>,
-    /// Serve every service of one control session from **one** shared tunnel
-    /// pool, instead of one pool per service. Default: `false` (one pool per
-    /// service, the classic shape). Both shapes are one code path; they differ
-    /// only in the pool's key.
-    #[serde(default)]
-    pub shared_pool: bool,
-    /// The pool's width: how many carrier connections this client holds for a
-    /// service (or, with `shared_pool`, for a session). Unset means the default
-    /// ([`DEFAULT_MUX_TUNNELS`]), raised by the UDP-derived floor of the
-    /// services that share the pool. Must be `>= 1`; values above
+    /// The pool's width: how many carrier connections this session holds for
+    /// every service it carries. Unset means the default
+    /// ([`DEFAULT_MUX_TUNNELS`]). Must be `>= 1`; values above
     /// [`MAX_MUX_TUNNELS_CAP`] are clamped.
     ///
     /// A transparent client writes the same key for a different quantity — a
     /// claim's **lane budget** — because a claim never multiplexes.
     pub tunnels: Option<u16>,
 }
-
-/// One data plane's connection count, read the same way in both models.
-///
-/// The pool established at service start, held for the service's lifetime and
-/// never resized: a deployment's capacity is a function of its configuration,
-/// not of what it happened to be doing a minute ago. Failure repair is the one
-/// exception — a dead tunnel is replaced so the count survives — and it is not
-/// growth.
-#[cfg(feature = "multiplex")]
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct DataCarrierLimits {
-    /// How many connections this data plane holds: a pool's tunnels, or a
-    /// transparent claim's lanes.
-    pub tunnels: Option<u16>,
-}
-
-#[cfg(feature = "multiplex")]
-impl DataCarrierLimits {
-    /// The count the operator asked for, clamped into `1..=MAX_MUX_TUNNELS_CAP`,
-    /// or `None` for "the default, raised by the floor".
-    pub fn tunnels(&self) -> Option<usize> {
-        self.tunnels
-            .map(|n| usize::from(n).clamp(1, usize::from(MAX_MUX_TUNNELS_CAP)))
-    }
-
-    /// The count to establish, given the UDP-derived floor of the services
-    /// that share this pool: the operator's number when they wrote one, else
-    /// the default raised to the floor.
-    ///
-    /// A floor *above* an explicit count is a configuration the pool refuses to
-    /// reconcile silently (the services need more tunnels than the operator
-    /// allows them), so the caller validates it first; this function only has
-    /// to be total.
-    pub fn resolved_tunnels(&self, floor: usize) -> usize {
-        match self.tunnels() {
-            Some(n) => n,
-            None => floor.max(usize::from(DEFAULT_MUX_TUNNELS)),
-        }
-    }
-
-    /// The count the operator wrote, unclamped, or `None`.
-    ///
-    /// The L3 model reads this one rather than [`Self::tunnels`]: a transparent
-    /// client's `tunnels` is a *lane budget* (one lane is one connection,
-    /// [`MAX_TRANSPARENT_LANES`]), not the multiplexed pool's ceiling, so a
-    /// value above that ceiling is a refusal with a number to write rather than
-    /// a silent clamp.
-    pub fn written(&self) -> Option<usize> {
-        self.tunnels.map(usize::from)
-    }
-}
 /// The TUN device a transparent (L3) service attaches to.
 ///
-/// Only the *name* is configuration: this daemon installs no route, rule or
-/// firewall rule ([deployment.md](../../docs/deployment.md) owns the recipes).
-/// Linux attaches to an operator-created persistent device; macOS and Windows
-/// create the ephemeral utun/Wintun adapter, and macOS also assigns the claimed
-/// `/32`s. Both ends need a device — the server routes the claimed address into
-/// its own, the client carries the address on its own.
+/// This table names the device. It installs no route, rule or firewall rule
+/// ([deployment.md](../../docs/deployment.md) owns the recipes). Linux creates
+/// a missing persistent device and attaches to an existing one untouched;
+/// macOS and Windows create the ephemeral utun/Wintun adapter, and macOS also
+/// assigns the claimed `/32`s. Both ends need a device — the server routes the
+/// claimed address into its own, the client carries the address on its own.
 ///
 /// On the **server** the table carries a second meaning: it is the operator's
 /// own switch for the feature, because serving L3 is what asks this process for
@@ -505,8 +438,8 @@ impl DataCarrierLimits {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct TransparentConfig {
-    /// Interface name. On Linux it is created and configured by the operator
-    /// before the daemon starts; on macOS `auto` chooses a free `utunN`; on
+    /// Interface name. On Linux the daemon creates a missing device and uses
+    /// an existing one as it is; on macOS `auto` chooses a free `utunN`; on
     /// Windows it names the Wintun adapter. Default: `molehill0` (Linux and
     /// Windows), `auto` (macOS).
     #[serde(default = "default_tun_name")]
@@ -577,40 +510,19 @@ pub struct ClientConfig {
     /// The optional read-only status API (`[client.status]`). Absent = off.
     #[serde(default)]
     pub status: Option<StatusConfig>,
-    #[serde(default)]
-    pub transport: TransportConfig,
+    /// The fixed KK key pair and whether data channels are encrypted.
+    pub noise: ClientNoiseConfig,
 }
 
 impl ClientConfig {
-    /// Whether one control session's services share one tunnel pool per
-    /// carrier (`[client.data].shared_pool`). `false` is the classic shape:
-    /// one pool per service.
-    #[cfg(feature = "multiplex")]
-    pub fn shared_pool(&self) -> bool {
-        self.data.shared_pool
-    }
-
-    /// The data-plane counts one service's pool is configured with: the
-    /// service's own `tunnels` when it wrote one, else `[client.data].tunnels`.
-    #[cfg(feature = "multiplex")]
-    pub fn limits_for(&self, service: &ClientServiceConfig) -> DataCarrierLimits {
-        DataCarrierLimits {
-            tunnels: service.tunnels.or(self.data.tunnels),
-        }
-    }
-
-    /// The client-wide data-plane count, clamped into
-    /// `1..=MAX_MUX_TUNNELS_CAP`, or `None` when the operator left it to the
-    /// default (which the UDP-derived floor raises).
+    /// The session's single pool width, clamped into `1..=MAX_MUX_TUNNELS_CAP`.
     ///
-    /// This is the count a *shared* pool uses: it is one pool for the session,
-    /// so a per-service override has nothing to attach to.
+    /// One control session holds one pool, so this is the client-wide count
+    /// every service of the session draws on; a service cannot resize it.
     #[cfg(feature = "multiplex")]
-    pub fn tunnels(&self) -> Option<usize> {
-        DataCarrierLimits {
-            tunnels: self.data.tunnels,
-        }
-        .tunnels()
+    pub fn tunnels(&self) -> usize {
+        usize::from(self.data.tunnels.unwrap_or(DEFAULT_MUX_TUNNELS))
+            .clamp(1, usize::from(MAX_MUX_TUNNELS_CAP))
     }
 
     /// Endpoint the data plane dials: `[client.data].default_data_addr`,
@@ -632,10 +544,6 @@ impl ClientConfig {
     }
 }
 
-fn default_heartbeat_interval() -> u64 {
-    DEFAULT_HEARTBEAT_INTERVAL_SECS
-}
-
 /// Control-channel listener (`[server.control]`).
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -643,8 +551,10 @@ pub struct ServerControlConfig {
     /// Address the control channel listens on. Required.
     pub bind_addr: String,
     /// Application-layer heartbeat interval in seconds; `0` disables it.
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval: u64,
+    /// Unset means the adaptive tier of
+    /// [`crate::common::constants::heartbeat_interval_for`], chosen from the
+    /// session count when a session is authenticated.
+    pub heartbeat_interval: Option<u64>,
 }
 
 /// Data-plane listener (`[server.data]`).
@@ -658,23 +568,13 @@ pub struct ServerControlConfig {
 pub struct ServerDataConfig {
     /// Data-plane listener; defaults to `[server.control].bind_addr`.
     pub bind_addr: Option<String>,
-    /// Data channels per visitor connection.
-    ///
-    /// `1` (the default) is the classic shape: one data channel per
-    /// visitor. A higher count spreads every visitor connection over that
-    /// many parallel data channels ("stripes"), which multiplies its
-    /// throughput ceiling and in-flight window; both ends must be able to
-    /// speak the striped data-channel framing (a molehill new enough to
-    /// know the `StartForwardStripedTcp` command on both sides). See
-    /// `docs/internals.md` ("Data-channel striping").
-    pub stripe_count: Option<u16>,
-    /// The operator's valve on the client's tunnel pools: how many multiplexed
-    /// data tunnels **one client** may hold across every service of its
-    /// session. `0` (the default) is unlimited. A tunnel over the cap is
-    /// refused with a typed answer and a `debug` line naming the cap; the
-    /// session itself is never touched (D14). It bounds every establishment a
-    /// client's pools make — at service start and on repair alike.
-    pub max_tunnels_per_client: Option<u16>,
+    /// The server's **global** valve on live carrier connections: every
+    /// multiplexed tunnel and every transparent lane of every client counts
+    /// against it. `0` is unlimited; unset derives the cap from the process's
+    /// open-file limit (`[crate::common::constants::max_tunnels_for]`). A
+    /// connection over the cap is refused with a typed answer and a `debug!`
+    /// line naming the cap; the session itself is never touched (D14).
+    pub max_tunnels: Option<u32>,
 }
 
 /// The server owns no per-service configuration. Services are registered at
@@ -697,8 +597,8 @@ pub struct ServerConfig {
     #[cfg(feature = "multiplex")]
     #[serde(default)]
     pub data: ServerDataConfig,
-    #[serde(default)]
-    pub transport: ServerTransportConfig,
+    /// The fixed KK key pair. Required: the control channel is never plain.
+    pub noise: NoiseConfig,
     /// `[server.transparent]`: **the presence of this table is the switch**
     /// that lets this server serve transparent (L3) services. Without it a
     /// registration of that type is refused by policy before any device is
@@ -707,22 +607,17 @@ pub struct ServerConfig {
     pub transparent: Option<TransparentConfig>,
 }
 
-/// Server-side wire material (`[server.transport]`): only the Noise keys.
-///
-/// Client-first: the server declares **what it can speak**, not what it
-/// speaks — whether a connection is encrypted is decided by the client
-/// (every connection starts with a transport selector byte). Placing the
-/// Noise keys makes the server accept both plain and Noise connections;
-/// without them it accepts plain only.
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct ServerTransportConfig {
-    /// Noise keys. When present, the server accepts Noise connections
-    /// (transport selector `0x01`) in addition to plain ones.
-    pub noise: Option<NoiseConfig>,
-}
-
 impl ServerConfig {
+    /// The control-channel heartbeat cadence to declare, in seconds.
+    ///
+    /// The operator's value when written (including `0`, which disables it),
+    /// else the adaptive tier of the current session count.
+    pub fn heartbeat_interval(&self, sessions: usize) -> u64 {
+        self.control
+            .heartbeat_interval
+            .unwrap_or_else(|| crate::common::constants::heartbeat_interval_for(sessions))
+    }
+
     /// Data-plane listener address: `[server.data].bind_addr`, or the
     /// control channel's `bind_addr` when unset.
     #[cfg(feature = "multiplex")]
@@ -733,30 +628,24 @@ impl ServerConfig {
             .unwrap_or(self.control.bind_addr.as_str())
     }
 
-    /// Effective data channels per visitor connection: the configured
-    /// `[server.data].stripe_count` clamped to `1..=MAX_STRIPES` (an
-    /// environment override for measurements wins when set — see
-    /// `crate::stripe::stripe_count`).
+    /// The global tunnel cap, resolved once at server start: the written
+    /// value, or the adaptive default derived from the process's open-file
+    /// limit. `0` is unlimited.
     #[cfg(feature = "multiplex")]
-    pub fn stripe_count(&self) -> usize {
-        crate::stripe::stripe_count(self.data.stripe_count)
-    }
-
-    /// The operator's tunnel valve, `[server.data].max_tunnels_per_client`:
-    /// the number of multiplexed data tunnels one client may hold. `0`
-    /// (including an absent key) means unlimited. Read by the two places that
-    /// accept a v4 tunnel and by the v3 registration path, which clamps the
-    /// channel count its dialect still asks for.
-    #[cfg(feature = "multiplex")]
-    pub fn max_tunnels_per_client(&self) -> usize {
-        usize::from(self.data.max_tunnels_per_client.unwrap_or(0))
+    pub fn max_tunnels(&self) -> usize {
+        match self.data.max_tunnels {
+            Some(written) => usize::try_from(written).unwrap_or(usize::MAX),
+            None => {
+                crate::common::constants::max_tunnels_for(crate::common::constants::soft_nofile())
+            }
+        }
     }
 
     /// Without the `multiplex` feature there is no `[server.data]` table and
     /// no tunnel pool to bound, so the v3 clamp this feeds is a no-op; the
     /// method keeps one signature across the two builds.
     #[cfg(not(feature = "multiplex"))]
-    pub fn max_tunnels_per_client(&self) -> usize {
+    pub fn max_tunnels(&self) -> usize {
         let _ = self;
         0
     }
@@ -840,16 +729,6 @@ impl ClientModel {
     }
 }
 
-/// What asked for a pool's width floor: which knob wants one tunnel per unit.
-///
-/// The refusal names the knob the operator wrote, so it carries both the source
-/// and the count it stood for (see `Config::validate_tunnel_floor`).
-#[cfg(feature = "multiplex")]
-enum FloorCause {
-    /// A UDP service's worker set (`udp_workers`): its shards must stay apart.
-    UdpWorkers(u16),
-}
-
 /// Keys a release removed, the version that removed each one, and what to
 /// write instead.
 ///
@@ -906,8 +785,7 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     (
         "client.services.*.pool_size",
         "v0.10.0",
-        "write `udp_workers` for a UDP service: it is the number of data channels the service's \
-         worker set uses; a TCP service's channels are opened on demand, one per visitor",
+        "write `max_udp_workers` for a UDP service: it is the ceiling on the worker set; a TCP service opens one channel per visitor",
     ),
     (
         "client.services.*.heartbeat_timeout",
@@ -919,8 +797,39 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     (
         "server.max_pool_size",
         "v0.10.0",
-        "write `[server.data].max_tunnels_per_client`: it is the tunnel cap one client may hold \
+        "write `[server.data].max_tunnels`: it is the tunnel cap one client may hold \
          (0 = unlimited), where the old key bounded a v3 client's requested channel count",
+    ),
+    (
+        "server.data.max_tunnels_per_client",
+        "v0.11.2",
+        "the valve is global now: write `[server.data].max_tunnels` (unset = \
+         derived from the open-file limit, 0 = unlimited)",
+    ),
+    (
+        "server.data.stripe_count",
+        "v0.11.2",
+        "striping is dynamic now: it starts at one data channel per visitor and grows under backpressure; remove the key",
+    ),
+    (
+        "client.services.*.udp_workers",
+        "v0.11.2",
+        "write `max_udp_workers`: it is the ceiling on the service worker set, not the count it starts with (one channel, grown on the server request)",
+    ),
+    (
+        "client.services.*.udp_send_queue_size",
+        "v0.11.2",
+        "the queue is internal now (CoDel); remove the key",
+    ),
+    (
+        "client.services.*.udp_idle_timeout",
+        "v0.11.2",
+        "a peer mapping lifetime adapts to the peer traffic now; remove the key",
+    ),
+    (
+        "client.services.*.udp_forwarder_ipv6",
+        "v0.11.2",
+        "the forwarder follows the address family of local_addr; remove the key",
     ),
     (
         "client.services.*.health_check",
@@ -936,10 +845,57 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
          write; remove the key",
     ),
     (
+        "client.services.*.tunnels",
+        "v0.11.2",
+        "one control session holds one tunnel pool now: write `[client.data].tunnels` for the \
+         session's total width, and remove this key",
+    ),
+    (
+        "client.data.shared_pool",
+        "v0.11.2",
+        "a session always has one tunnel pool now; remove the key (its width is \
+         `[client.data].tunnels`)",
+    ),
+    (
+        "transparent.claims.*.tunnels",
+        "v0.11.2",
+        "a claim's lane count is its share of the client's lane budget: write \
+         `[transparent.data].tunnels` for the budget, and remove this key",
+    ),
+    (
         "client.services.*.mode",
         "the next release",
         "a service's shape follows its protocol — a forwarding service multiplexes and a claim \
          does not — so there is no mode to write; remove the key",
+    ),
+    (
+        "client.services.*.nodelay",
+        "v0.11.2",
+        "every forwarded connection has TCP_NODELAY on now; remove the key",
+    ),
+    (
+        "client.control.default_retry_interval",
+        "v0.11.2",
+        "the key names a cap, not an interval: write `[client.control].retry_backoff_max` \
+         (unset = the adaptive default)",
+    ),
+    (
+        "client.services.*.retry_interval",
+        "v0.11.2",
+        "the key names a cap, not an interval: write this service's `retry_backoff_max` \
+         (unset = inherit `[client.control].retry_backoff_max`)",
+    ),
+    (
+        "transparent.control.default_retry_interval",
+        "v0.11.2",
+        "the key names a cap, not an interval: write `[transparent.control].retry_backoff_max` \
+         (unset = the adaptive default)",
+    ),
+    (
+        "transparent.claims.*.retry_interval",
+        "v0.11.2",
+        "the key names a cap, not an interval: write this claim's `retry_backoff_max` \
+         (unset = inherit `[transparent.control].retry_backoff_max`)",
     ),
 ];
 
@@ -980,12 +936,39 @@ fn reject_removed_keys(doc: &mut toml::Value) -> Result<()> {
 /// write. No version is named here because nothing of this surface was ever
 /// released — the transparent model is being shaped before its first tag — so
 /// there is no release for an operator to have upgraded from.
-const MOVED_TABLES: &[(&str, &str)] = &[(
-    "client.transparent",
-    "a transparent (L3) client is its own run mode now: name the device in \
-     `[transparent].tun`, write every claimed address as a `[transparent.claims.<name>]` \
-     entry, and start it with `molehill <config> --transparent`",
-)];
+const MOVED_TABLES: &[(&str, &str)] = &[
+    (
+        "client.transparent",
+        "a transparent (L3) client is its own run mode now: name the device in \
+         `[transparent].tun`, write every claimed address as a `[transparent.claims.<name>]` \
+         entry, and start it with `molehill <config> --transparent`",
+    ),
+    (
+        "client.transport",
+        "the wire tables are flat now: write `[client.noise]` with `public_key`, \
+         `private_key` and `data_enable`. The handshake is fixed KK, so `pattern`, \
+         `psk`, `psk_location`, `resume` and `proxy` have no replacement",
+    ),
+    (
+        "server.transport",
+        "the wire table is flat now: write `[server.noise]` with this server's \
+         `private_key` and the client's `public_key`. The handshake is fixed KK, so \
+         `pattern`, `psk`, `psk_location` and `resume` have no replacement",
+    ),
+    (
+        "transparent.transport",
+        "the wire table is flat now: write `[transparent.noise]` with `public_key`, \
+         `private_key` and `data_enable` (default false). The control channel is always \
+         KK; `proxy` is gone",
+    ),
+    (
+        "client.services.*.transport",
+        "a service's wire settings are `[client.services.<name>.noise]` now: write \
+         `public_key` / `private_key` (to use another server's pair) and `data_enable`. \
+         There is no `type`: the control channel is always Noise, and data_enable only \
+         selects the data channels",
+    ),
+];
 
 /// Refuse a config that still carries a table this version moved, naming it
 /// and what to write instead.
@@ -1136,7 +1119,8 @@ impl Config {
         // putting the check here is what makes every consumer of `from_str`
         // agree with the daemon — the fixtures, the doc examples, and a future
         // reader that parses a config to describe it.
-        Config::validate_control_transport(&config)?;
+        #[cfg(feature = "noise")]
+        Config::validate_noise_material(&config)?;
 
         if config.transparent.is_some() && !transparent_client_supported() {
             bail!(
@@ -1212,52 +1196,77 @@ impl Config {
         })
     }
 
-    /// The control channel speaks Noise, and the configuration has to say how.
+    #[cfg(feature = "noise")]
+    /// Validate every Noise key the configuration carries.
     ///
-    /// Whatever else the file carries — server, client, transparent, forwarding
-    /// or claiming — the control leg authenticates a session whose nonce is the
-    /// data plane's credential, so a plain control channel would publish that
-    /// credential to everyone on the path. This is the one transport rule the
-    /// daemon enforces rather than offers.
-    pub(crate) fn validate_control_transport(config: &Config) -> Result<()> {
-        if let Some(server) = &config.server
-            && server.transport.noise.is_none()
-        {
-            bail!(
-                "The control channel must use Noise: add a `[server.transport.noise]` block with \
-                 this server's key pair (`molehill --genkey` prints one). A plain control \
-                 channel would broadcast the session nonce the data channels authenticate with."
-            );
+    /// The handshake is fixed KK, so each side needs its own private key and
+    /// the peer's public key, both base64 32-byte Curve25519 values. Checking
+    /// here — rather than at the first handshake — is what turns a typo into a
+    /// start-up refusal that names the block; the control channel is always
+    /// encrypted, so a file without usable keys could never serve anyway.
+    pub(crate) fn validate_noise_material(config: &Config) -> Result<()> {
+        if let Some(server) = &config.server {
+            Self::validate_noise_block("[server.noise]", &server.noise)?;
         }
         if let Some(client) = &config.client {
-            let transport = &client.transport;
-            if transport.transport_type != TransportType::Noise {
-                bail!(
-                    "The control channel must use Noise: set `[client.transport].type = \"noise\"` \
-                     and add a `[client.transport.noise]` block with a key pair \
-                     (`molehill --genkey` prints one). A plain control channel would \
-                     broadcast the session nonce the data channels authenticate with."
-                );
-            }
-            if transport.noise.is_none() {
-                bail!(
-                    "`type = \"noise\"` needs a `[client.transport.noise]` block: the key pair \
-                     the control channel authenticates with"
-                );
+            Self::validate_noise_block("[client.noise]", &client.noise.keys)?;
+            for (name, service) in &client.services {
+                if let Some(noise) = &service.noise {
+                    Self::validate_noise_overrides(
+                        &format!("[client.services.{name}.noise]"),
+                        noise,
+                    )?;
+                }
             }
         }
-        // The L3 client's control transport is decided in its own lowering (it
-        // has no `[client]` block): there the table is
-        // `[transparent.transport.noise]`, and its absence is the plain-control
-        // refusal.
-        if let Some(transparent) = &config.transparent
-            && transparent.transport.noise.is_none()
+        if let Some(transparent) = &config.transparent {
+            Self::validate_noise_block("[transparent.noise]", &transparent.noise.keys)?;
+            for (name, claim) in &transparent.claims {
+                if let Some(noise) = &claim.noise {
+                    Self::validate_noise_overrides(
+                        &format!("[transparent.claims.{name}.noise]"),
+                        noise,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "noise")]
+    fn validate_noise_block(block: &str, keys: &NoiseConfig) -> Result<()> {
+        Self::validate_noise_key(block, "public_key", &keys.public_key)?;
+        Self::validate_noise_key(block, "private_key", &keys.private_key)
+    }
+
+    #[cfg(feature = "noise")]
+    fn validate_noise_overrides(block: &str, noise: &ServiceNoiseConfig) -> Result<()> {
+        if let Some(public_key) = noise.public_key.as_deref() {
+            Self::validate_noise_key(block, "public_key", public_key)?;
+        }
+        if let Some(private_key) = &noise.private_key {
+            Self::validate_noise_key(block, "private_key", private_key)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "noise")]
+    fn validate_noise_key(block: &str, key: &str, encoded: &str) -> Result<()> {
+        #[cfg(feature = "noise")]
         {
-            bail!(
-                "The control channel must use Noise: add a `[transparent.transport.noise]` block \
-                 with a key pair (`molehill --genkey` prints one). A plain control channel \
-                 would broadcast the session nonce the data lanes authenticate with."
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .with_context(|| format!("{block}: {key} is not valid base64"))?;
+            anyhow::ensure!(
+                bytes.len() == 32,
+                "{block}: {key} must decode to a 32-byte Curve25519 key, got {} bytes",
+                bytes.len()
             );
+        }
+        #[cfg(not(feature = "noise"))]
+        {
+            let _ = (block, key, encoded);
         }
         Ok(())
     }
@@ -1331,9 +1340,6 @@ impl Config {
         for (name, s) in &mut client.services {
             s.name.clone_from(name);
 
-            if s.retry_interval.is_none() {
-                s.retry_interval = Some(client.control.default_retry_interval);
-            }
             if let Some(addr) = s.remote_addr.as_deref()
                 && addr.rfind(':').is_none()
             {
@@ -1341,19 +1347,6 @@ impl Config {
             }
             if s.token.as_ref().is_some_and(|t| t.is_empty()) {
                 bail!("{entry} {name}: `token` must not be empty");
-            }
-
-            // Effective transport is client-decided per service: the
-            // `transport.type` override wins over the client-wide
-            // `[client.transport].type`, and effective Noise needs keys
-            // (per-service or global).
-            if s.transport_type_with(client.transport.transport_type) == TransportType::Noise
-                && s.noise_config_with(client.transport.noise.as_ref())
-                    .is_none()
-            {
-                bail!(
-                    "{entry} {name}: Noise is the effective transport (per-service                     `transport.type = \"noise\"` or the client-wide `type = \"noise\"`)                     but no Noise keys are configured — set them in                     `[client.transport.noise]` or                     `[client.services.{name}.transport.noise]`"
-                );
             }
 
             // The public endpoint is client-declared and required.
@@ -1371,10 +1364,12 @@ impl Config {
 
             // Fill in runtime defaults.
             if matches!(s.service_type, ServiceType::Udp) {
-                match s.udp_workers {
-                    None => s.udp_workers = Some(DEFAULT_UDP_WORKERS),
-                    Some(0) => bail!("{entry} {name}: udp_workers must be at least 1"),
-                    Some(_) => {}
+                match s.max_udp_workers {
+                    None => s.max_udp_workers = Some(DEFAULT_MAX_UDP_WORKERS),
+                    Some(0) => bail!("{entry} {name}: max_udp_workers must be at least 1"),
+                    Some(n) => {
+                        s.max_udp_workers = Some(n.clamp(1, MAX_UDP_WORKERS_CAP));
+                    }
                 }
             }
             if s.udp_buffer_size.is_none() {
@@ -1383,20 +1378,7 @@ impl Config {
             } else if s.udp_buffer_size == Some(0) {
                 bail!("{entry} {name}: udp_buffer_size must be greater than 0");
             }
-            if s.udp_idle_timeout.is_none() {
-                s.udp_idle_timeout = Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS);
-            } else if s.udp_idle_timeout == Some(0) {
-                bail!("{entry} {name}: udp_idle_timeout must be greater than 0");
-            }
-            if s.udp_send_queue_size.is_none() {
-                s.udp_send_queue_size =
-                    Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap_or(u16::MAX));
-            } else if s.udp_send_queue_size == Some(0) {
-                bail!("{entry} {name}: udp_send_queue_size must be greater than 0");
-            }
         }
-
-        Config::validate_transport_config(&client.transport)?;
 
         Ok(())
     }
@@ -1457,11 +1439,8 @@ impl Config {
         // nothing read it. The message names the key and the protocol.
         if matches!(s.service_type, ServiceType::Tcp) {
             for (key, written) in [
-                ("udp_workers", s.udp_workers.is_some()),
+                ("max_udp_workers", s.max_udp_workers.is_some()),
                 ("udp_buffer_size", s.udp_buffer_size.is_some()),
-                ("udp_idle_timeout", s.udp_idle_timeout.is_some()),
-                ("udp_send_queue_size", s.udp_send_queue_size.is_some()),
-                ("udp_forwarder_ipv6", s.udp_forwarder_ipv6.is_some()),
             ] {
                 if written {
                     bail!(
@@ -1482,20 +1461,19 @@ impl Config {
         let data = &client.data;
         let block = model.data_block();
 
-        // The pool's per-carrier tunnel count. `0` would mean "a pool with no
-        // tunnel"; the value is validated rather than clamped so a typo is
-        // refused with the carrier's name in it, and a count *below* what the
-        // services need is refused below (the pool no longer grows to fit).
+        // The pool's tunnel count. `0` would mean "a pool with no tunnel"; the
+        // value is validated rather than clamped so a typo is refused with the
+        // block's name in it. A count above the cap is clamped by
+        // [`ClientConfig::tunnels`] when the pool is established.
         if data.tunnels == Some(0) {
-            bail!("`{}.tunnels` must be at least 1", model.data_block());
+            bail!("`{block}.tunnels` must be at least 1");
         }
-        Self::validate_tunnel_floor(client, model)?;
         if let Some(addr) = data.default_data_addr.as_deref()
             && addr.rfind(':').is_none()
         {
             bail!("{block}.default_data_addr is missing the port: {addr}");
         }
-
+        let _ = client;
         Ok(())
     }
 
@@ -1542,125 +1520,6 @@ impl Config {
         Ok(())
     }
 
-    /// Refuse a tunnel count smaller than what the pool it sizes needs.
-    ///
-    /// One thing asks for one tunnel per unit of demand: a UDP service's worker
-    /// set shards across tunnels. A pinned pool keeps one tunnel per worker so
-    /// those shards stay on distinct tunnels — that is the floor, and a pool that
-    /// cannot grow cannot meet it later either, so a count below it is a
-    /// configuration that would silently degrade the service it was written
-    /// for. The message names the count to write instead, because an operator
-    /// who has just been told "no" needs the number, not the rule.
-    ///
-    /// A transparent claim is not part of this floor: it never draws from a
-    /// pool, and what bounds its own carrier connections is validated on the L3
-    /// block itself.
-    #[cfg(feature = "multiplex")]
-    fn validate_tunnel_floor(client: &ClientConfig, model: ClientModel) -> Result<()> {
-        let block = model.data_block();
-        let why = |name: &str, workers: u16, needed: usize| {
-            format!(
-                "service `{name}` declares {workers} UDP workers, and a pool keeps one tunnel per \
-                 worker so their shards stay on distinct tunnels. Write `{block}.tunnels = \
-                 {needed}` or more, or lower that service's `udp_workers`."
-            )
-        };
-        if client.shared_pool() {
-            // One pool for the session: the client-wide count is the one that
-            // sizes it, so it must cover the deepest demand any of the
-            // services sharing it can make.
-            if let Some(written) = client.tunnels()
-                && let Some((needed, name, FloorCause::UdpWorkers(workers))) =
-                    Self::deepest_floor(client)
-                && needed > written
-            {
-                bail!(
-                    "`{block}.tunnels = {written}` is below what the services sharing one pool \
-                     need: {}",
-                    why(&name, workers, needed)
-                );
-            }
-            return Ok(());
-        }
-        // A pool per service: each service's own count sizes its own pool, so
-        // each is checked against its own demand.
-        for (name, service) in &client.services {
-            let Some(written) = client.limits_for(service).tunnels() else {
-                continue;
-            };
-            let ServiceType::Udp = service.service_type else {
-                continue;
-            };
-            let workers = service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS);
-            let needed = crate::transport::pool::udp_floor(
-                [usize::from(workers)],
-                crate::transport::multiplex::stream_cap(),
-            );
-            if needed > written {
-                bail!(
-                    "`{block}.tunnels = {written}` for service `{name}` is below what it needs: \
-                     {}",
-                    why(name, workers, needed)
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// The deepest floor among the services that share one pool, the service
-    /// that owns it, and what asked for it.
-    ///
-    /// "Deepest" rather than "summed": every pool is keyed per service (or, with
-    /// `shared_pool`, per session), and a service's own pool only ever has to
-    /// carry that service's workers at once, because what a floor buys is
-    /// distinctness *within* one set of channels. The floor of the largest
-    /// demand is therefore what every pool on that carrier must be able to hold:
-    /// the conservative reading, and the one that cannot under-provision a
-    /// service.
-    ///
-    /// Only a service that draws from a pool counts. A transparent claim never
-    /// does: its channels are carrier connections of its own (it never
-    /// multiplexes), so its count is no reason to refuse a tunnel count.
-    #[cfg(feature = "multiplex")]
-    fn deepest_floor(client: &ClientConfig) -> Option<(usize, String, FloorCause)> {
-        let stream_cap = crate::transport::multiplex::stream_cap();
-        let mut deepest: Option<(usize, String, FloorCause)> = None;
-        for (name, service) in &client.services {
-            let (demand, cause) = match service.service_type {
-                ServiceType::Udp => {
-                    let workers = service.udp_workers.unwrap_or(DEFAULT_UDP_WORKERS);
-                    (usize::from(workers), FloorCause::UdpWorkers(workers))
-                }
-                ServiceType::Transparent | ServiceType::Tcp => continue,
-            };
-            let floor = crate::transport::pool::udp_floor([demand], stream_cap);
-            if deepest
-                .as_ref()
-                .is_none_or(|(widest, _, _)| floor > *widest)
-            {
-                deepest = Some((floor, name.clone(), cause));
-            }
-        }
-        deepest
-    }
-
-    fn validate_transport_config(config: &TransportConfig) -> Result<()> {
-        config.proxy.as_ref().map_or(Ok(()), |u| {
-            match u.scheme() {
-                "socks5" | "http" => {}
-                scheme => bail!("Unknown proxy scheme: {scheme}"),
-            }
-            if u.host_str().is_none() {
-                bail!("Proxy URL is missing the host: {u}");
-            }
-            if u.port().is_none() {
-                bail!("Proxy URL is missing the port: {u}");
-            }
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     /// Load and validate the configuration from `path`.
     ///
     /// # Errors
@@ -1678,60 +1537,51 @@ impl Config {
     }
 }
 
-/// The control channel's Noise key pair for the configs these tests build,
-/// and the blocks that carry it.
+/// The KK key pairs the configs these tests build use.
 ///
-/// The control channel must use Noise, so a config a test builds by hand needs
-/// the block like any other — otherwise the test measures the rule instead of
-/// what it is about. These are test keys, generated once and published here
-/// because a test has to be reproducible; a deployment generates its own with
-/// `molehill --genkey`.
+/// The control channel is always KK, so a config a test builds by hand needs
+/// both sides' keys: each host's private key and the peer's public key. These
+/// are test keys, generated once and published here because a test has to be
+/// reproducible; a deployment generates its own with molehill --genkey.
+/// The client pair was generated with openssl genpkey -algorithm X25519.
 #[cfg(test)]
 pub(crate) const TEST_SERVER_PRIVATE: &str = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=";
 #[cfg(test)]
-pub(crate) const TEST_CLIENT_REMOTE_PUBLIC: &str = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=";
+pub(crate) const TEST_SERVER_PUBLIC: &str = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=";
+#[cfg(test)]
+pub(crate) const TEST_CLIENT_PRIVATE: &str = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=";
+#[cfg(test)]
+pub(crate) const TEST_CLIENT_PUBLIC: &str = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=";
 
-/// `config` with the control channel's Noise blocks appended.
+/// config with the KK blocks appended.
 ///
-/// Which block is added follows the config's own shape: the server's private
-/// key when it carries a `[server]`, the client's `type` and the server's
-/// public key when it carries a `[client]`, and the L3 table when it carries a
-/// `[transparent]`. A test that asserts on the transport rule itself does not
-/// call this.
+/// Which block is added follows the config's own shape: [server.noise] when
+/// it carries a [server], [client.noise] for a [client], and
+/// [transparent.noise] for the L3 table. A test that asserts on the key
+/// rules itself does not call this.
 #[cfg(test)]
 pub(crate) fn with_noise(config: impl AsRef<str>) -> String {
     let config = config.as_ref();
     let mut out = config.trim_end().to_owned();
-    // A config that already carries a block keeps its own: the two
-    // `test_noise_config_with_*` tests build their key material by hand, and
-    // appending a second `[...transport.noise]` header is a duplicate key.
-    let has_server = config.contains("[server.transport.noise]");
-    let has_client = config.contains("[client.transport.noise]");
-    let has_transparent = config.contains("[transparent.transport.noise]");
-    if config.contains("[server]") && !has_server {
-        out.push_str("\n\n[server.transport.noise]\nlocal_private_key = \"");
+    if config.contains("[server]") && !config.contains("[server.noise]") {
+        out.push_str("\n\n[server.noise]\npublic_key = \"");
+        out.push_str(TEST_CLIENT_PUBLIC);
+        out.push_str("\"\nprivate_key = \"");
         out.push_str(TEST_SERVER_PRIVATE);
         out.push_str("\"\n");
     }
-    if config.contains("[client]") && !has_client {
-        if config.contains("[client.transport]") {
-            // The table exists (a proxy example writes `proxy` into it), so
-            // only the type and the keys are added — a second header is a
-            // duplicate key. `type = "plain"` is what the daemon refuses, so
-            // it is rewritten rather than left beside a Noise block.
-            out = out.replace("type = \"plain\"", "type = \"noise\"");
-            out.push_str("\n\n[client.transport.noise]\nremote_public_key = \"");
-            out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
-            out.push_str("\"\n");
-        } else {
-            out.push_str("\n\n[client.transport]\ntype = \"noise\"\n\n[client.transport.noise]\nremote_public_key = \"");
-            out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
-            out.push_str("\"\n");
-        }
+    if config.contains("[client]") && !config.contains("[client.noise]") {
+        out.push_str("\n\n[client.noise]\npublic_key = \"");
+        out.push_str(TEST_SERVER_PUBLIC);
+        out.push_str("\"\nprivate_key = \"");
+        out.push_str(TEST_CLIENT_PRIVATE);
+        out.push_str("\"\n");
     }
-    if config.contains("[transparent]") && !has_transparent {
-        out.push_str("\n\n[transparent.transport.noise]\nremote_public_key = \"");
-        out.push_str(TEST_CLIENT_REMOTE_PUBLIC);
+    if config.contains("[transparent]") && !config.contains("[transparent.noise]") {
+        out.push_str("\n\n[transparent.noise]\npublic_key = \"");
+        out.push_str(TEST_SERVER_PUBLIC);
+        out.push_str("\"\nprivate_key = \"");
+        out.push_str(TEST_CLIENT_PRIVATE);
         out.push_str("\"\n");
     }
     out
@@ -1758,7 +1608,7 @@ mod tests {
     // feature-minimal build warns about unused imports.
     #[cfg(feature = "multiplex")]
     use crate::common::constants::DEFAULT_MUX_MAX_STREAMS;
-    use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS, DEFAULT_NODELAY};
+    use crate::transport::{DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_KEEPALIVE_SECS};
     use std::{fs, path::PathBuf};
 
     use anyhow::Result;
@@ -1919,7 +1769,7 @@ mod tests {
                 {
                     continue;
                 }
-                Config::from_str(b).map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
+                Config::from_str(b).map_err(|e| anyhow::anyhow!("{path}: {e:#}"))?;
                 total += 1;
             }
         }
@@ -1962,32 +1812,35 @@ mod tests {
     // it is simply no longer a compile-time tautology.
     fn test_documented_defaults_are_pinned() {
         assert_eq!(
-            std::hint::black_box(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+            crate::common::constants::heartbeat_interval_for(0),
             30,
             "server heartbeats"
         );
         assert_eq!(
-            std::hint::black_box(DEFAULT_CLIENT_RETRY_INTERVAL_SECS),
-            1,
-            "retry interval"
+            std::hint::black_box(DEFAULT_MAX_UDP_WORKERS),
+            2,
+            "max_udp_workers"
         );
-        assert_eq!(std::hint::black_box(DEFAULT_UDP_WORKERS), 2, "udp_workers");
+        assert_eq!(
+            std::hint::black_box(MAX_UDP_WORKERS_CAP),
+            64,
+            "the max_udp_workers clamp"
+        );
         assert_eq!(
             std::hint::black_box(DEFAULT_UDP_BUFFER_SIZE),
             2048,
             "udp_buffer_size"
         );
         assert_eq!(
-            std::hint::black_box(DEFAULT_UDP_IDLE_TIMEOUT_SECS),
-            60,
-            "udp_idle_timeout"
+            std::hint::black_box(crate::common::constants::UDP_QUEUE_SIZE),
+            1024,
+            "the UDP queue depth"
         );
         assert_eq!(
-            std::hint::black_box(DEFAULT_UDP_SENDQ_SIZE),
-            1024,
-            "udp_send_queue_size"
+            crate::common::constants::udp_lifetime(std::time::Duration::ZERO),
+            std::time::Duration::from_secs(30),
+            "the UDP mapping lifetime floor"
         );
-        assert!(std::hint::black_box(DEFAULT_NODELAY), "nodelay");
         assert_eq!(
             std::hint::black_box(DEFAULT_KEEPALIVE_SECS),
             20,
@@ -2022,7 +1875,7 @@ mod tests {
     /// the same thing, and neither refuses a tunnel.
     #[cfg(feature = "multiplex")]
     #[test]
-    fn test_max_tunnels_per_client_defaults_to_unlimited() {
+    fn test_max_tunnels_defaults_to_the_fd_derived_cap() {
         let config = r#"
 [server]
 default_token = "t"
@@ -2031,9 +1884,15 @@ default_token = "t"
 bind_addr = "0.0.0.0:2333"
 "#;
         let cfg = Config::from_str(&with_noise(config)).unwrap();
-        assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 0);
+        assert_eq!(
+            cfg.server.unwrap().max_tunnels(),
+            crate::common::constants::max_tunnels_for(crate::common::constants::soft_nofile()),
+            "an unwritten valve follows the open-file limit"
+        );
 
-        let config = r#"
+        for (written, expected) in [("0", 0usize), ("6", 6usize)] {
+            let config = format!(
+                r#"
 [server]
 default_token = "t"
 
@@ -2041,10 +1900,16 @@ default_token = "t"
 bind_addr = "0.0.0.0:2333"
 
 [server.data]
-max_tunnels_per_client = 6
-"#;
-        let cfg = Config::from_str(&with_noise(config)).unwrap();
-        assert_eq!(cfg.server.unwrap().max_tunnels_per_client(), 6);
+max_tunnels = {written}
+"#
+            );
+            let cfg = Config::from_str(&with_noise(config)).unwrap();
+            assert_eq!(
+                cfg.server.unwrap().max_tunnels(),
+                expected,
+                "a written valve is the cap, including 0 = unlimited"
+            );
+        }
     }
 
     /// `[server.transparent]` is opt-in, and the *table's presence* is the
@@ -2233,15 +2098,10 @@ tun = "molehill0"
         cfg.services.insert("foo1".into(), svc("0.0.0.0:6081"));
         Config::validate_client_config(&mut cfg, ClientModel::Forwarding)?;
         let s = cfg.services.get("foo1").unwrap();
-        assert_eq!(s.udp_workers, Some(DEFAULT_UDP_WORKERS));
+        assert_eq!(s.max_udp_workers, Some(DEFAULT_MAX_UDP_WORKERS));
         assert_eq!(
             s.udp_buffer_size,
             Some(u16::try_from(DEFAULT_UDP_BUFFER_SIZE).unwrap())
-        );
-        assert_eq!(s.udp_idle_timeout, Some(DEFAULT_UDP_IDLE_TIMEOUT_SECS));
-        assert_eq!(
-            s.udp_send_queue_size,
-            Some(u16::try_from(DEFAULT_UDP_SENDQ_SIZE).unwrap())
         );
 
         Ok(())
@@ -2260,26 +2120,27 @@ default_remote_addr = "example.com:2333"
 protocol = "udp"
 local_addr = "127.0.0.1:53"
 remote_bind_addr = "0.0.0.0:6053"
-udp_workers = 4
+max_udp_workers = 4
 udp_buffer_size = 65535
-udp_idle_timeout = 30
-udp_send_queue_size = 128
 "#;
         let cfg = Config::from_str(&with_noise(config)).unwrap();
         let s = &cfg.client.unwrap().services["test"];
-        assert_eq!(s.udp_workers, Some(4));
+        assert_eq!(s.max_udp_workers, Some(4));
         assert_eq!(s.udp_buffer_size, Some(65535));
-        assert_eq!(s.udp_idle_timeout, Some(30));
-        assert_eq!(s.udp_send_queue_size, Some(128));
 
         // Zero values are rejected
         let bad = config.replace("udp_buffer_size = 65535", "udp_buffer_size = 0");
         assert!(Config::from_str(&bad).is_err());
 
-        // So is a worker set with no workers: the pool's UDP floor counts the
-        // channels, and a count of zero would ask for none.
-        let bad = config.replace("udp_workers = 4", "udp_workers = 0");
+        // So is a ceiling of zero, and one above the cap is clamped.
+        let bad = config.replace("max_udp_workers = 4", "max_udp_workers = 0");
         assert!(Config::from_str(&bad).is_err());
+        let clamped = config.replace("max_udp_workers = 4", "max_udp_workers = 1000");
+        let cfg = Config::from_str(&with_noise(clamped)).unwrap();
+        assert_eq!(
+            cfg.client.unwrap().services["test"].max_udp_workers,
+            Some(MAX_UDP_WORKERS_CAP)
+        );
     }
 
     /// The UDP-only keys are refused on a TCP service instead of being
@@ -2300,13 +2161,7 @@ local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 {key}
 "#;
-        for key in [
-            "udp_workers = 4",
-            "udp_buffer_size = 2048",
-            "udp_idle_timeout = 30",
-            "udp_send_queue_size = 128",
-            "udp_forwarder_ipv6 = false",
-        ] {
+        for key in ["max_udp_workers = 4", "udp_buffer_size = 2048"] {
             let bad = config.replace("{key}", key);
             let err = Config::from_str(&with_noise(&bad)).unwrap_err();
             let msg = format!("{err:#}");
@@ -2319,9 +2174,11 @@ remote_bind_addr = "0.0.0.0:6080"
 
         // The same keys on a UDP service stay valid.
         let ok = config
-            .replace("{key}", "protocol = \"udp\"\nudp_workers = 4")
+            .replace("{key}", "protocol = \"udp\"\nmax_udp_workers = 4")
             .replace("127.0.0.1:80", "127.0.0.1:53");
-        assert!(Config::from_str(&with_noise(ok)).is_ok());
+        if let Err(e) = Config::from_str(&with_noise(ok)) {
+            panic!("the UDP equivalents must parse: {e:#}");
+        }
     }
 
     #[test]
@@ -2394,7 +2251,9 @@ bind_addr = "0.0.0.0:2333"
     }
 
     #[test]
-    fn test_noise_config_with_psk() {
+    fn test_the_noise_pattern_is_fixed() {
+        // The handshake is fixed KK now: pattern, psk and resume have no home
+        // in the noise table, and the strict parse says so by name.
         let config = r#"
 [client]
 default_token = "t"
@@ -2402,23 +2261,51 @@ default_token = "t"
 [client.control]
 default_remote_addr = "example.com:2333"
 
+[client.noise]
+pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-psk_location = 0
 "#;
-        assert!(Config::from_str(&with_noise(config)).is_ok());
+        let err = format!("{:#}", Config::from_str(config).unwrap_err());
+        assert!(
+            err.contains("unknown field") && err.contains("pattern"),
+            "the refusal must name the key that has no home: {err}"
+        );
+    }
+
+    #[cfg(feature = "noise")]
+    #[test]
+    fn test_noise_keys_must_be_32_bytes() {
+        let config = r#"
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.noise]
+public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+private_key = "dG9vLXNob3J0"
+
+[client.services.test]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
+"#;
+        let err = format!("{:#}", Config::from_str(config).unwrap_err());
+        assert!(
+            err.contains("[client.noise]")
+                && err.contains("private_key")
+                && err.contains("32-byte"),
+            "the refusal must name the block, the key and the length: {err}"
+        );
     }
 
     #[test]
-    fn test_noise_config_with_default_psk_location() {
+    fn test_client_noise_is_required() {
         let config = r#"
 [client]
 default_token = "t"
@@ -2429,15 +2316,12 @@ default_remote_addr = "example.com:2333"
 [client.services.test]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-
-[client.transport]
-type = "noise"
-
-[client.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 "#;
-        assert!(Config::from_str(&with_noise(config)).is_ok());
+        let err = format!("{:#}", Config::from_str(config).unwrap_err());
+        assert!(
+            err.contains("noise"),
+            "a client without a key pair cannot serve: {err}"
+        );
     }
 
     #[test]
@@ -2484,6 +2368,7 @@ default_token = "t"
 
 [client.control]
 default_remote_addr = "example.com:2333"
+default_retry_interval = 1
 
 "#,
         );
@@ -2499,6 +2384,8 @@ count = 2
 pool_size = 8
 heartbeat_timeout = 90
 health_check = { type = "tcp", interval = 5 }
+nodelay = true
+retry_interval = 1
 
 [server]
 default_token = "t"
@@ -2519,6 +2406,9 @@ bind_addr = "0.0.0.0:2333"
             "client.services.*.pool_size",
             "client.services.*.heartbeat_timeout",
             "client.services.*.health_check",
+            "client.services.*.nodelay",
+            "client.control.default_retry_interval",
+            "client.services.*.retry_interval",
             "server.max_pool_size",
         ] {
             if pattern == "client.data.default_count" && !cfg!(feature = "multiplex") {
@@ -2532,7 +2422,7 @@ bind_addr = "0.0.0.0:2333"
         assert!(
             err.contains("max_tunnels")
                 && err.contains("udp_workers")
-                && err.contains("max_tunnels_per_client"),
+                && err.contains("max_tunnels"),
             "each removed key's replacement must be named: {err}"
         );
     }
@@ -2557,100 +2447,13 @@ remote_bind_addr = "0.0.0.0:6080"
         assert!(Config::from_str(&with_noise(config)).is_ok());
     }
 
-    #[test]
-    fn test_service_udp_forwarder_ipv6_parsing() {
-        // The client-level `prefer_ipv6` was removed (no consumer); the
-        // per-service key stays (renamed `udp_forwarder_ipv6`): it steers
-        // the UDP forwarder's bind choice. It is UDP-only, so the service
-        // declares its protocol.
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.services.test]
-protocol = "udp"
-local_addr = "127.0.0.1:53"
-remote_bind_addr = "0.0.0.0:6080"
-udp_forwarder_ipv6 = true
-"#;
-        let cfg = Config::from_str(&with_noise(config)).unwrap();
-        assert_eq!(
-            cfg.client.unwrap().services["test"].udp_forwarder_ipv6,
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn test_proxy_socks5() {
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.transport]
-type = "plain"
-proxy = "socks5://127.0.0.1:1080"
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-"#;
-        Config::from_str(&with_noise(config)).unwrap();
-    }
-
-    #[test]
-    fn test_proxy_http() {
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.transport]
-type = "plain"
-proxy = "http://user:pass@proxy.example.com:8080"
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-"#;
-        Config::from_str(&with_noise(config)).unwrap();
-    }
-
-    #[test]
-    fn test_proxy_invalid_scheme() {
-        let config = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.transport]
-type = "plain"
-proxy = "https://127.0.0.1:443"
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-"#;
-        assert!(Config::from_str(&with_noise(config)).is_err());
-    }
-
+    /// One control session holds one tunnel pool: `[client.data].tunnels` is
+    /// its total width, there is no per-service width, and `shared_pool` is
+    /// gone because a session is the only pool key.
     #[cfg(feature = "multiplex")]
     #[test]
-    fn test_per_service_data_overrides_parse() {
-        // `[client.data]` acts as defaults; a service's own `tunnels` wins. The
-        // runtime merge lives in `DataOpts::for_service` (client code); here we
-        // pin that the key parses and validates per service.
-        let config = String::from(
-            r#"
+    fn test_data_tunnels_is_one_session_pool() {
+        let config = r#"
 [client]
 default_token = "t"
 
@@ -2659,42 +2462,72 @@ default_remote_addr = "example.com:2333"
 
 [client.data]
 tunnels = 6
-"#,
-        );
-        let mut config = config;
-        config.push_str(
-            r#"
-[client.services.muxed]
+
+[client.services.a]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
 
-[client.services.bulk]
+[client.services.b]
 local_addr = "127.0.0.1:81"
 remote_bind_addr = "0.0.0.0:6081"
-tunnels = 2
-"#,
+"#;
+        let cfg = Config::from_str(&with_noise(config))
+            .unwrap()
+            .client
+            .unwrap();
+        assert_eq!(cfg.tunnels(), 6, "the written width is the session's pool");
+        assert_eq!(cfg.services.len(), 2, "both services draw on that one pool");
+
+        // Unwritten, the pool is the documented four.
+        let unset = config.replace(
+            "tunnels = 6
+",
+            "",
         );
-        let cfg = Config::from_str(&with_noise(config)).unwrap();
-        let services = &cfg.client.unwrap().services;
-        assert_eq!(services["muxed"].tunnels, None);
-        assert_eq!(services["bulk"].tunnels, Some(2));
+        let cfg = Config::from_str(&with_noise(unset))
+            .unwrap()
+            .client
+            .unwrap();
+        assert_eq!(cfg.tunnels(), 4);
+
+        // A per-service width is a removed key, refused with the key to write
+        // instead rather than left to `deny_unknown_fields`.
+        let per_service = config.replace(
+            "[client.services.b]\nlocal_addr = \"127.0.0.1:81\"",
+            "[client.services.b]\nlocal_addr = \"127.0.0.1:81\"\ntunnels = 2",
+        );
+        let err = format!(
+            "{:#}",
+            Config::from_str(&with_noise(per_service)).unwrap_err()
+        );
+        assert!(
+            err.contains("client.services.*.tunnels") && err.contains("[client.data].tunnels"),
+            "the refusal must name the removed key and its replacement: {err}"
+        );
+
+        // `shared_pool` is gone the same way: one pool per session is the only
+        // shape.
+        let shared = config.replace(
+            "[client.data]\ntunnels = 6",
+            "[client.data]\ntunnels = 6\nshared_pool = true",
+        );
+        let err = format!("{:#}", Config::from_str(&with_noise(shared)).unwrap_err());
+        assert!(
+            err.contains("client.data.shared_pool") && err.contains("[client.data].tunnels"),
+            "the refusal must name the removed key and its replacement: {err}"
+        );
     }
 
     #[test]
-    fn test_per_service_transport_enable() {
-        // Global noise default: services inherit it, a service can opt out
-        // with `transport.type = "plain"`.
+    fn test_per_service_data_enable_and_keys() {
+        // The client-wide switch is data_enable; a service may flip it
+        // without changing the session it shares.
         let config = r#"
 [client]
 default_token = "t"
 
 [client.control]
 default_remote_addr = "example.com:2333"
-
-[client.transport]
-type = "noise"
-[client.transport.noise]
-remote_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 [client.services.ssh]
 local_addr = "127.0.0.1:80"
@@ -2703,61 +2536,58 @@ remote_bind_addr = "0.0.0.0:6080"
 [client.services.bulk]
 local_addr = "127.0.0.1:81"
 remote_bind_addr = "0.0.0.0:6081"
-[client.services.bulk.transport]
-type = "plain"
+[client.services.bulk.noise]
+data_enable = false
 "#;
         let cfg = Config::from_str(&with_noise(config)).unwrap();
-        let services = &cfg.client.unwrap().services;
-        assert_eq!(
-            services["ssh"].transport_type_with(TransportType::Noise),
-            TransportType::Noise
+        let client = cfg.client.unwrap();
+        let global = client.noise.data_enable.unwrap_or(true);
+        assert!(
+            client.services["ssh"].data_enabled_with(global),
+            "an unset per-service switch follows the client-wide one"
+        );
+        assert!(
+            !client.services["bulk"].data_enabled_with(global),
+            "a service may make its data channels plain"
         );
         assert_eq!(
-            services["bulk"].transport_type_with(TransportType::Noise),
-            TransportType::Plain
+            client.services["bulk"].noise_keys_with(&client.noise.keys),
+            client.noise.keys,
+            "flipping data_enable does not change the session's key pair"
         );
 
-        // Plain global default + a service opting in with its own keys (the
-        // multi-server scenario: different server, different public key).
-        let config = r#"
+        // A service may name another server's pair; the session key follows
+        // it, which is what keeps one client on two servers with two keys.
+        let per_service_keys = r#"
 [client]
 default_token = "t"
 
 [client.control]
 default_remote_addr = "example.com:2333"
 
-[client.transport]
-type = "plain"
-
 [client.services.enc]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-[client.services.enc.transport]
-type = "noise"
-[client.services.enc.transport.noise]
-remote_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+[client.services.enc.noise]
+public_key = "aoRns7OwLrdZUTd8A7dKG/g257V6tp7U7yD8GBSwHhM="
+private_key = "SJEjSnPAXtkDx8oP0M5ksDypP8hc92/n1bvh+Wqpi3E="
 "#;
-        let cfg = Config::from_str(&with_noise(config)).unwrap();
-        let services = &cfg.client.unwrap().services;
+        let cfg = Config::from_str(&with_noise(per_service_keys)).unwrap();
+        let client = cfg.client.unwrap();
+        let keys = client.services["enc"].noise_keys_with(&client.noise.keys);
         assert_eq!(
-            services["enc"].transport_type_with(TransportType::Plain),
-            TransportType::Noise
+            keys.public_key, "aoRns7OwLrdZUTd8A7dKG/g257V6tp7U7yD8GBSwHhM=",
+            "the per-service public key wins"
         );
-        assert!(services["enc"].noise_config_with(None).is_some());
-        // The per-service key wins over the (absent) global one.
         assert_eq!(
-            services["enc"]
-                .noise_config_with(None)
-                .unwrap()
-                .remote_public_key
-                .as_deref(),
-            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            &*keys.private_key, "SJEjSnPAXtkDx8oP0M5ksDypP8hc92/n1bvh+Wqpi3E=",
+            "the per-service private key wins"
         );
     }
 
+    #[cfg(feature = "noise")]
     #[test]
-    fn test_per_service_noise_requires_keys() {
-        // Effective Noise without keys anywhere is rejected at parse time.
+    fn test_per_service_noise_key_is_validated() {
         let bad = r#"
 [client]
 default_token = "t"
@@ -2765,16 +2595,17 @@ default_token = "t"
 [client.control]
 default_remote_addr = "example.com:2333"
 
-[client.transport]
-type = "plain"
-
 [client.services.enc]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-[client.services.enc.transport]
-type = "noise"
+[client.services.enc.noise]
+public_key = "not-base64"
 "#;
-        assert!(Config::from_str(bad).is_err());
+        let err = format!("{:#}", Config::from_str(&with_noise(bad)).unwrap_err());
+        assert!(
+            err.contains("[client.services.enc.noise]") && err.contains("public_key"),
+            "the refusal must name the block and the key: {err}"
+        );
     }
 
     #[test]
@@ -2813,50 +2644,11 @@ remote_addr = "other.example.com:2444"
         assert!(Config::from_str(&bad).is_err());
     }
 
+    /// `0` is refused with the key's block named, and a value above the pool
+    /// cap is clamped rather than obeyed.
     #[cfg(feature = "multiplex")]
     #[test]
-    fn test_per_service_data_validation() {
-        // A service may state its own pool width; the carrier is not a key at
-        // all any more, so the only per-service data-plane key left is
-        // `tunnels`.
-        let per_service = r#"
-[client]
-default_token = "t"
-
-[client.control]
-default_remote_addr = "example.com:2333"
-
-[client.data]
-tunnels = 4
-
-[client.services.test]
-local_addr = "127.0.0.1:80"
-remote_bind_addr = "0.0.0.0:6080"
-tunnels = 2
-"#;
-        let cfg = Config::from_str(&with_noise(per_service)).unwrap();
-        let client = cfg.client.unwrap();
-        assert_eq!(client.data.tunnels, Some(4));
-        assert_eq!(
-            client.limits_for(&client.services["test"]).tunnels(),
-            Some(2)
-        );
-
-        // `tunnels = 0` is rejected, and the refusal names the key to fix.
-        let bad = per_service.replace("tunnels = 4", "tunnels = 0");
-        let err = Config::from_str(&with_noise(&bad)).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("tunnels"),
-            "the refusal must name the key: {err:#}"
-        );
-    }
-
-    /// An explicit tunnel count below the UDP-derived floor is refused: a
-    /// pinned pool cannot grow to meet it, so the configuration would silently
-    /// under-provision the workers the service declared.
-    #[cfg(feature = "multiplex")]
-    #[test]
-    fn test_a_tunnel_count_below_the_udp_floor_is_refused() {
+    fn test_data_tunnels_is_validated_and_clamped() {
         let config = |tunnels: u16| {
             format!(
                 r#"
@@ -2869,39 +2661,28 @@ default_remote_addr = "example.com:2333"
 [client.data]
 tunnels = {tunnels}
 
-[client.services.dns]
-protocol = "udp"
-local_addr = "127.0.0.1:53"
-remote_bind_addr = "0.0.0.0:5353"
-udp_workers = 4
+[client.services.test]
+local_addr = "127.0.0.1:80"
+remote_bind_addr = "0.0.0.0:6080"
 "#
             )
         };
 
-        // Four workers ask for four paths; two tunnels cannot hold them, and
-        // the refusal names the number to write instead.
         let err = format!(
             "{:#}",
-            Config::from_str(&with_noise(config(2))).unwrap_err()
+            Config::from_str(&with_noise(config(0))).unwrap_err()
         );
         assert!(
-            err.contains("`[client.data].tunnels = 2`")
-                && err.contains("`[client.data].tunnels = 4`")
-                && err.contains("udp_workers"),
-            "the refusal must name the key, the count to write and the knob: {err}"
+            err.contains("`[client.data].tunnels`") && err.contains("at least 1"),
+            "the refusal must name the key: {err}"
         );
 
-        // The floor itself (and anything above it) is accepted: the operator's
-        // number is the pool.
-        for tunnels in [4u16, 8] {
-            let cfg = Config::from_str(&with_noise(config(tunnels))).unwrap();
-            assert_eq!(cfg.client.unwrap().tunnels(), Some(usize::from(tunnels)));
-        }
-
-        // Leaving it unset is always fine: the default is raised to the floor
-        // at establishment time.
-        let unset = config(4).replace("tunnels = 4\n", "");
-        assert!(Config::from_str(&with_noise(unset)).is_ok());
+        let cfg = Config::from_str(&with_noise(config(u16::MAX))).unwrap();
+        assert_eq!(
+            cfg.client.unwrap().tunnels(),
+            usize::from(MAX_MUX_TUNNELS_CAP),
+            "a width above the cap is clamped to it, never dialed"
+        );
     }
 
     /// A lane budget is a count like any other: above the resource guard it is

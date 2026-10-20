@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The read-only status API is available to a transparent (L3) client.**
+  `[transparent.status]` takes the same `bind_addr` and `token` as
+  `[client.status]`, and the lowered L3 client runs the same listener: the
+  answer carries the client's claims and lanes beside its pools.
+- **Linux L3 device and address preparation.**
+  A Linux transparent service now creates its persistent TUN device when one
+  is missing (MTU 1400), and the client assigns each claimed address that is
+  not already on the device — the same division macOS and Windows already
+  have: macOS creates its utun and assigns the claimed addresses, and the
+  Windows server creates its Wintun adapter. An existing device is used as it
+  is, so pre-create it to choose another MTU; an address already assigned is
+  left alone, so a second claim or a restart does not bounce a live interface.
+  Routes, policy routing and forwarding stay the operator's on every platform,
+  so the three are symmetric. Recipe B's manual server recipe gains the
+  `accept_local` line it was missing.
+
+### Changed
+
+- **BREAKING: the status API separates configured from actual state.**
+  Each service now carries `configured` (kind and addresses; a claim's
+  `local_addr` is omitted because it has no local backend, and its lane count
+  is on `claims[]`) beside `actual.state` (`active`, `registering`, `rejected`,
+  or `disconnected`); each pool carries `configured.size` beside `actual.size`,
+  `session_up`, total `streams`/`pending`, `idle_tunnels`, `busiest_streams`,
+  `accepting_tunnels`, the handover counters and the per-tunnel counters; each
+  claim carries `configured.lanes` beside `actual.lanes_live`, `actual.flows`
+  and its lanes; and `summary` counts configured/active/down services and
+  claims and configured/live pool tunnels. The flat 0.11.1 fields moved:
+  `services[].{kind,remote_addr,local_addr}` and `.state` to
+  `services[].configured.*` / `services[].actual.state`, `pools[].count` to
+  `pools[].configured.size`, `pools[].size` to `pools[].actual.size`,
+  `pools[].{grows,shrinks,handover,tunnels}` to `pools[].actual.*`, and
+  `claims[].lanes` to `claims[].actual.lanes`; `pools[].carrier` is gone (the
+  per-tunnel carrier remains). Update panels that read the old shape.
+- **BREAKING: protocol v5.2, dynamic striping.** `[server.data].stripe_count` is removed: every TCP visitor is a stripe group that starts at one data channel and grows by one when a group reports path backpressure — its send direction parked for at least 250 ms and then moved a frame — capped by `MAX_STRIPES` and gated to one step per 500 ms, never shrinking. A group the server abandons before forwarding is released on the client at once, and a group that ends without seeing the peer close drops its own channels rather than parking them. `StartForwardTcp` is gone — the striped command is the only TCP forward — the registration carries `max_udp_workers`, and the resume selector stays removed. A v5.1 peer is refused on the connection it happens on; upgrade both ends together.
+- **BREAKING: the UDP policy follows the path.** `udp_workers` becomes `max_udp_workers` (default 2, clamp 1..=64): the client starts one worker and the server asks for another on queue pressure, then retires an idle one. `udp_send_queue_size`, `udp_idle_timeout` and `udp_forwarder_ipv6` are removed: the queue uses CoDel (10 ms sojourn target), a peer mapping's lifetime follows its own largest gap (30-300 s), and the forwarder follows `local_addr`'s address family.
+- **BREAKING: one global tunnel valve.** `[server.data].max_tunnels` caps every live multiplexed tunnel and every transparent lane of the server, not one client's session. Unset derives the cap from the process's open-file limit and 0 is unlimited; `[server.data].max_tunnels_per_client` is refused with the replacement.
+- **The heartbeat cadence has an adaptive default.** With `[server.control].heartbeat_interval` unset the server declares 30 s up to eight sessions, 60 s up to 32 and 120 s above, computed from the live session count when each session authenticates. An explicit value (including 0, which disables it) replaces the tier.
+- **BREAKING: Noise is fixed to KK and the wire tables are flat.** The
+  handshake is always `Noise_KK_25519_ChaChaPoly_BLAKE2s`; both ends need their
+  own private key and the peer's public key. `[client.transport]` becomes
+  `[client.noise]`, `[server.transport]` becomes `[server.noise]`, and a
+  service's `[client.services.<name>.transport]` becomes
+  `[client.services.<name>.noise]`; `local_private_key` / `remote_public_key`
+  are now `private_key` / `public_key`. `data_enable` (default true for a
+  forwarding client, false for an L3 client) replaces `type`; `pattern`,
+  `psk`, `psk_location`, `resume` and `proxy` are removed. The control
+  channel is always KK and a plaintext control connection is refused; the
+  data channels follow `data_enable`. The session key is the endpoint plus the
+  two keys, so a service that targets another server with its own pair
+  gets its own session while `data_enable` never splits one.
+- **BREAKING: the retry keys are named for what they do, and default
+  adaptively.** `default_retry_interval` and `retry_interval` (client and L3)
+  become `retry_backoff_max`. Left unset, the cap follows consecutive
+  failures - 1, 2, 4, 8, 16, 32, then 60 seconds - and an explicit value pins
+  it. A config that still writes an old key is refused with the replacement.
+- **BREAKING: TCP_NODELAY is always on.** The per-service `nodelay` key is
+  removed; every forwarded connection — data channels, a claim's lanes and the
+  client's connection to the local service — has it enabled. A config that
+  still writes it is refused with that advice.
+- **BREAKING: one lane budget for transparent claims.** A claim no longer has
+  its own `tunnels` key; `[transparent.data].tunnels` is the client's single
+  lane budget (default two lanes per claim, at least one per claim, at most
+  1024), divided equally and then lent by traffic. Writing a per-claim
+  `tunnels` is refused with the budget key to write instead.
+- **BREAKING: one tunnel pool per forwarding session.** Every service of a
+  control session now draws on the same `[client.data].tunnels` connections
+  (default 4), and that key is the session's total width. A per-service width
+  is gone: write `[client.data].tunnels` instead of
+  `[client.services.<name>].tunnels`, and remove `[client.data].shared_pool`
+  (one pool per session is the only shape). A UDP service's worker set no
+  longer raises the pool: its channels are streams of the same pool.
+- **The v0.11.2 benchmark record is the next baseline.** The sweep ran on
+  2026-10-19 (90 samples, five arms, fingerprint `257343fa3fd158d3`) and
+  `just bench gate` passed the absolute half without a baseline; the v0.11.1
+  record is refused as a baseline because the method hash changed with the flat
+  Noise configs. The record is
+  `benches/records/results-bench-v0.11.2.json`, and the README and its chart set
+  are refreshed from it. There is no cross-version performance claim: the
+  changed method makes the fingerprints incomparable with v0.11.1's.
+
+### Fixed
+
+- **TCP forwarding works in a build without `multiplex`.** v5.2 made the
+  striped command the only TCP forward, and the client refused it outside a
+  `multiplex` build — so the `embedded` set (the smallest release artifacts)
+  registered its services but every visitor hung. A group of one now runs over
+  the direct data channel the server opened: the stripe registry is
+  transport-agnostic and is compiled in every client build. The featureless
+  and no-noise configurations also compile again (the stripe module follows
+  `client`/`server`, the keepalive helper's socket2 imports are
+  unconditional, and the two Noise-key tests are gated on `noise`).
+
 ## [0.11.1] - 2026-10-17
 
 ### Added

@@ -1,10 +1,10 @@
-//! The TUN device: attaching to the interface the operator prepared, and
-//! reading/writing whole frames.
+//! The TUN device: creating or attaching to the interface, and reading/writing
+//! whole frames.
 //!
-//! The daemon never creates routes. On Linux the device is the operator's
-//! persistent TUN and this process only attaches to it; on macOS and Windows
+//! The daemon never creates routes. On Linux it creates a missing persistent
+//! TUN and otherwise attaches to the operator's device; on macOS and Windows
 //! the device is created by the daemon because those platforms have no
-//! operator-created equivalent, and the operator owns the routes and
+//! persistent operator-created equivalent. The operator owns the routes and
 //! forwarding rules around it.
 //!
 //! The device layer is `tun-rs`, which gives one interface across Linux,
@@ -43,10 +43,9 @@ pub struct Tun {
 impl Tun {
     /// Attach to (or, on macOS/Windows, create) the interface `name`.
     ///
-    /// Linux requires the interface to exist already — the operator's
-    /// addresses and routes live on it — and that check runs before this
-    /// constructor. macOS accepts `"auto"` (a free `utunN`) or an explicit
-    /// `utunN`; Windows uses the adapter `name`.
+    /// Linux expects the interface to exist: `net::prepare_device` creates a
+    /// missing one before this constructor. macOS accepts `"auto"` (a free
+    /// `utunN`) or an explicit `utunN`; Windows uses the adapter `name`.
     pub fn attach(name: &str) -> Result<Self> {
         let (device, format) = build(name)?;
         let actual = device
@@ -117,10 +116,11 @@ impl Tun {
     /// Assign a claimed IPv4 or IPv6 address to the daemon-created device.
     ///
     /// Only macOS needs this: its utun exists only while the process holds it,
-    /// so there is no operator-created device to carry the address. Linux and
-    /// Windows keep the address the operator assigned (Windows servers route
-    /// the claim rather than owning it). Re-adding an address already present
-    /// is not an error, which makes a config reload idempotent.
+    /// so the address cannot be prepared before the device exists. The Linux
+    /// client assigns a missing claim address in
+    /// [`crate::transparent::net::claim_client`]; Windows servers route the
+    /// claim rather than owning it. Re-adding an address already present is
+    /// not an error, which makes a config reload idempotent.
     #[cfg(mh_macos)]
     pub fn ensure_claimed(&self, ip: IpAddr) -> Result<()> {
         let result = match ip {

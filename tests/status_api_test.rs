@@ -85,12 +85,14 @@ async fn the_status_api_answers_the_token_and_refuses_everybody_else() -> Result
     );
     let Some(echo) = services
         .iter()
-        .find(|s| s["name"] == "echo" && s["state"] == "active")
+        .find(|s| s["name"] == "echo" && s["actual"]["state"] == "active")
     else {
         anyhow::bail!("the echo service is registered and active: {body}");
     };
-    assert_eq!(echo["remote_addr"], "0.0.0.0:2334");
-    assert_eq!(echo["local_addr"], "127.0.0.1:8080");
+    assert_eq!(echo["configured"]["remote_addr"], "0.0.0.0:2334");
+    assert_eq!(echo["configured"]["local_addr"], "127.0.0.1:8080");
+    assert_eq!(report["summary"]["services"]["active"], 1);
+    assert_eq!(report["summary"]["services"]["down"], 0);
 
     // Anything but GET, and anywhere but /status: refused with a status
     // code, not an error page worth reading.
@@ -144,16 +146,17 @@ async fn the_report_carries_the_pool_registry() -> Result<()> {
     };
     for pool in pools {
         // The configured width is stated even mid-repair; the live size
-        // cannot exceed it.
+        // cannot exceed it, and the session that owns the pool answered.
         let (size, count) = (
-            pool["size"].as_u64().unwrap_or(0),
-            pool["count"].as_u64().unwrap_or(0),
+            pool["actual"]["size"].as_u64().unwrap_or(0),
+            pool["configured"]["size"].as_u64().unwrap_or(0),
         );
+        assert_eq!(pool["actual"]["session_up"], true);
         assert!(
             size <= count,
             "live tunnels above the configured width: {pool}"
         );
-        let tunnels = pool["tunnels"].as_array().map_or(0, Vec::len);
+        let tunnels = pool["actual"]["tunnels"].as_array().map_or(0, Vec::len);
         assert!(
             tunnels as u64 == size,
             "the per-tunnel block covers every live tunnel: {pool}"

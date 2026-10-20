@@ -1,6 +1,6 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-18.** **v0.11.1 is released: the tag names `4874f05`,
+> **State as of 2026-10-19.** **v0.11.1 is released: the tag names `4874f05`,
 > the `main` tip at tag time; `main` carries `version = "0.11.1"`.** v0.11.1 moves the wire to
 > **protocol v5.1** (a deliberate v5.0 break), makes transparent (L3)
 > services cross-platform through `tun-rs` — Linux/macOS clients and servers,
@@ -12,8 +12,22 @@
 > `d0f22b9` passed `just bench gate` (90 samples over five arms; the record is
 > `benches/records/results-bench-v0.11.0.json`). The v0.11.1 sweep ran on
 > 2026-10-18 (90 samples; `just bench gate` passed without a baseline); its
-> record is `benches/records/results-bench-v0.11.1.json` and it becomes the
-> next baseline.
+> record is `benches/records/results-bench-v0.11.1.json` and it was the
+> baseline until the v0.11.2 record.
+>
+> **v0.11.2 is ready for review on `feat/v0.11.2` (2026-10-19):** the
+> branch's manifest carries `version = "0.11.2"`; `main` stays at the released
+> 0.11.1 until the PR merges. The cycle consolidates the configuration model
+> (one pool per forwarding session, one L3 lane budget, fixed KK Noise in four
+> flat layers), adds a global `max_tunnels`, adaptive retry/heartbeat
+> defaults, the path-derived UDP policy, protocol v5.2 with dynamic striping,
+> the configured/actual status API and the symmetric L3 device/address step.
+> `just check` is green. **The release sweep was re-run after the CI fix**
+> (19:19–21:04 UTC, 90 samples, five arms, fingerprint `257343fa3fd158d3`;
+> `just bench gate` PASS **without** a baseline); the record is
+> `benches/records/results-bench-v0.11.2.json` and it is the next baseline.
+> The branch is squashed to eight commits, with the benchmark record as a
+> docs-only commit on top. No tag exists: the release is a human decision.
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -33,6 +47,107 @@
 
 ## Where this stands
 
+- **The release sweep is done and the PR is ready (2026-10-19).** The
+  published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
+  `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
+  identity as the v0.11.1 record; CPU probe 417.3 MiB/s, loopback
+  21.06 Gbit/s), fingerprint `257343fa3fd158d3`. The first run
+  (16:46–18:29, at `04f5c5d`) was discarded when CI found the no-multiplex
+  forwarding defect: fixing it changed `src/`, so the record had to be
+  re-measured rather than name a revision whose code no longer matched.
+  `just bench gate` passed the absolute half without a baseline on both; the
+  v0.11.1 record is **refused** as a baseline because the engine hash changed
+  with the flat Noise configs (`c4d337fbd8ee2adc` → `deec5d29798c5a68`).
+  Every arm carried the ramp's full eight streams (a floor) and no arm wedged.
+  The clean-stage bulk reading is 8.641 Gbit/s on L4 (clean#2 7.066) and 5.811
+  on L3; the previous record's 8.907 is **not** a comparison — the method
+  changed, and striping now starts at one channel and grows only on
+  backpressure. The L4 clean p99 is 30.8 ms here against 8.8 ms in the
+  discarded run with the same host identity and calibration; both runs pass
+  the gate's 50 ms SLO, and the difference is recorded as run-to-run variance,
+  not a claim about the fix (its cfg changes add nothing to the default
+  build's data path). Charts and README are refreshed from the record.
+- **The interop matrix was fixed and is green (2026-10-19).** v0.11.2 moved the
+  Noise tables, and the matrix wrote one config for both binaries, so the
+  released side refused the file before the wire was tested. Each side now
+  gets its own schema, and the released side is configured with KK (a
+  supported v0.11.1 setting) so the hello's version check is reachable: 3/3
+  pass. Two observations from the same session: the default v0.11.1 client
+  (NK) is refused cleanly, while a v0.11.1 client with its own static key (KK)
+  leaves both sides waiting (ESTAB, no bytes) instead of closing — reproduced,
+  not root-caused; and the L3 harness passed 13/15 on its first run at
+  `04f5c5d` (the two lane-lending arms failed on the known ~5 s stall) and
+  15/15 on a second run.
+- **CI caught the no-multiplex forwarding defect before merge (2026-10-19).**
+  The `noise` integration leg (`server,client,noise,hot-reload`, which is
+  exactly the `embedded` set) registered its services but every visitor hung:
+  v5.2 made the striped command the only TCP forward, and the client refused it
+  without `multiplex`. The stripe registry and its release path are
+  transport-agnostic and are compiled in every client build now; a group of one
+  runs over the direct channel the server opened. The same CI run also caught
+  the featureless compile (client/server-gated constants in `stripe`,
+  client-gated socket2 imports in the keepalive helper, a wrong parameter name
+  in `transport/tcp.rs`) and two Noise-key tests that need the `noise`
+  feature. `just check`, the feature powerset, both lib legs and the no-mux
+  hot-reload suite pass.
+- **The branch history is squashed for review (2026-10-19).** 24 commits became
+  eight. The configuration/runtime-policy consolidation is one commit because
+  the intermediate trees' bench configs were unreadable by their own binary
+  (the original gate passed on a stale release build), so they could not each
+  satisfy `bench-selfcheck`; the other groups are striping, the L3 step, the
+  status schema, the deployment docs, the cycle opener, the interop fix and the
+  no-multiplex forwarding fix. The squash preserved the tree, and every commit
+  passes its own gate.
+- **The 0.11.2 configuration migration is in (2026-10-19).** The branch
+  replaces the per-service pool/tunnel/transport model with one session pool,
+  one L3 lane budget, four flat KK Noise layers, dynamic
+  striping/worker/heartbeat/valve defaults and wire v5.2. `just check` is
+  green. Open threads: manual acceptance of the full §4 table and the old-key
+  refusals, and the tag decision.
+- **Linux L3 takes the same device/address step macOS and Windows own
+  (2026-10-19).** A Linux transparent service now creates its persistent TUN
+  device when one is missing and, on the client, assigns each claimed address
+  that is not already on it — exactly what macOS already does on its own (the
+  device and the claimed addresses) and what the Windows server does for its
+  adapter. No config key gates it: an existing device is used as it is (create
+  it first to choose its MTU), and an address already assigned is left alone,
+  so a second claim or a restart does not bounce a live interface. Routes,
+  policy routing and forwarding stay the operator's on all three, which is the
+  symmetry the maintainer asked for. An earlier version automated the routing
+  half too (mark, policy rules, sysctls, `accept_local`); it was proven in a
+  three-namespace topology and then withdrawn by decision. Two facts survive
+  it: recipe B needs `net.ipv4.conf.<tun>.accept_local=1` (the manual recipe
+  now documents it), and a device the daemon creates appears at
+  startup/registration, so per-device sysctls must come from
+  `net.ipv4.conf.default.*` before the start and routes that name the device
+  must be applied after it appears — the ordering macOS and Windows recipes
+  already have. The narrowed mode was re-proven on this host in the same
+  topology, both recipes: the daemons created the devices and the client's
+  address, the operator's steps followed, and the visitor was echoed through
+  the claim. The default L3 harness ran again at `04f5c5d` on 2026-10-19:
+  13/15 on the first run (the lending arms stalled) and 15/15 on a second; the
+  device/address arms passed on both. A local variant that skipped the
+  harness's own device setup created both
+  devices and the client's address and passed every device-path arm, but its
+  two lane-lending arms failed: the 16-flow arm stalled for about five seconds
+  when a lane was lent, a window the default load finishes before. That is a
+  lane-allocator observation, not root-caused here and not part of the device
+  step.
+- **Striped-group release and the striping signal were corrected (2026-10-19).**
+  Two defects from the migration's striping commit. A group that ended by
+  aborting a direction left its reader tasks parked on the mux streams, so the
+  client's stream leases never came back — the saturated-pool test only passed
+  because it restarted the client — and the target grew off *gather* latency, a
+  proxy on the pairing path rather than path backpressure. The readers are now
+  owned by the receive direction and aborted with it; the server releases an
+  abandoned group on the client (`ReleaseStripedGroup`, tag 8 of the still
+  unreleased v5.2 dialect, so it is extended in place); the client tombstones a
+  released group so a stripe still in flight is dropped; and growth follows a
+  group's own parked send direction (at least 250 ms, one step per 500 ms,
+  capped at `MAX_STRIPES` 64). `a_saturated_pool_still_serves_the_next_visitor`
+  now asserts the pool gets its streams back within 15 s and no longer restarts
+  the client. No throughput claim is made from this: the sweep has to measure
+  it, and it re-baselines anyway.
 - **Platform cfg and CI verification were hardened after review (2026-10-18).**
   `build.rs` now emits the `mh_*` platform aliases (`mh_linux`, `mh_macos`,
   `mh_windows`, `mh_l3`, `mh_l3_client`, `mh_l3_server`) and makes
@@ -94,15 +209,18 @@
   archive. A long-hold scenario is what would settle it; the arms already exist
   (`l3-budget10-lending` against `l3-budget10-nolend`).
 - **The repository state**: v0.11.1 is released and the tag names `4874f05`,
-  the `main` tip at tag time; `main` carries `version = "0.11.1"`;
-  `CHANGELOG.md` keeps the dated `## [0.11.1] - 2026-10-17` section and an empty
-  `[Unreleased]`. `v0.11.0` names `f3295e8`. Only `main` remains on the remote;
-  the non-`main` branches (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and
-  the four local `backup/*`) were retired on 2026-10-19. The measured v0.11.1
-  revision is `0b56438`, recorded here and in the results file's
-  `meta.provenance`; the tag review's drift check applies wherever that commit
-  is reachable, so for this record a fresh clone prints a note instead of the
-  verdict.
+  the `main` tip at tag time; `main` carries `version = "0.11.1"`. The
+  `## [0.11.1] - 2026-10-17` section is dated, and the 0.11.2 work sits under
+  `[Unreleased]`. `v0.11.0` names `f3295e8`. `feat/v0.11.2` carries
+  `version = "0.11.2"` and is squashed to eight commits plus the benchmark
+  record; the PR is open and no tag exists. The measured v0.11.2 revision is
+  `69e8bd9` (`tree_clean` true; the record commit is docs/assets only, so the
+  tag review's drift check still holds). The previous cycle's branches
+  (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and the four local
+  `backup/*`) were retired on 2026-10-19. The measured v0.11.1 revision is
+  `0b56438`, recorded here and in the results file's `meta.provenance`; the
+  tag review's drift check applies wherever that commit is reachable, so for
+  this record a fresh clone prints a note instead of the verdict.
   The v0.11.1 tag was re-created on `4874f05` after a transient 0.11.2 bump was
   reset off `main`; that commit's tree is identical to the first tagged commit,
   so the rebuilt archives and image describe the same code. A re-tag re-runs
@@ -125,6 +243,57 @@
 
 ## Open threads for the next cycle
 
+- **Decision (2026-10-19): one top-level tunnel pool in both modes; the
+  per-service/per-claim model is rejected, not renamed.** There is exactly one
+  tunnel pool per control session (one per data endpoint), and every service
+  draws its channels from it; `[client.services.<name>].tunnels` is removed.
+  The same shape holds for L3: `[transparent.data].tunnels` is the client's one
+  carrier-connection budget, and `[transparent.claims.*].tunnels` is removed —
+  that key is a dead field today (the parser accepts it, the lowering never
+  reads it; verified 2026-10-19 with a budget of 4 and two claims writing 8 and
+  6: the client started and ran on 2 lanes each). The current per-service
+  implementation is wrong; 0.11.2 replaces it with the model below.
+  - **Defaults are the measured optima, not the cheapest value.**
+    - **L4: `tunnels = 4`** — the shipped knee, and now the *total* width of
+      one pool rather than four per service: yamux spreads streams over it (up
+      to 56 per tunnel), and the 0.10 A/B found 8 does not move a mixed
+      workload's throughput while costing 42-61 % of interactive p99 at 15+
+      streams. One pool serves about 224 concurrent streams; a deployment
+      above that raises the one key.
+    - **L3: `tunnels = 2 × claims`** — the measured knee (1 lane 2.351 Gbit/s,
+      2 lanes 3.283, 4 lanes 5.191 but p99 271 ms from three streams). Two per
+      claim also leaves the spare lane `lend` needs: at one per claim the
+      allocator can never lend, because a donor must have more than its last
+      lane. The public `DEFAULT_CLAIM_LANES` goes; the derivation lives
+      privately in the L3 module.
+    - An explicit `tunnels` is always the **total**: L4 clamps to `1..=64`; L3
+      must cover the claim count and is capped at 1024, with integer division
+      leaving the remainder unallocated (write a multiple of the claim count).
+  - `[client.data].shared_pool` stops being a switch: one pool is the only
+    shape, so the key is removed (or kept as a no-op for one release — to be
+    decided).
+  - The proposed `default_tunnels` name no longer describes the key. With no
+    per-service inheritance it is the pool's width, not a default; the final
+    name is open (`tunnels` today).
+  - The UDP-derived floor becomes the deepest demand across every UDP service
+    that draws on the pool, and validation and runtime must read the same
+    source; the first-service-width defect below disappears with the model.
+  - Per-service `remote_addr` and `transport` still fragment the L4 pool today
+    (the key is session + data endpoint, and the transport is the first
+    service's), so the model needs a rule for them: refuse the override, or
+    move both to the client-wide block. L3's per-claim `remote_addr` is fine —
+    there is no shared pool, only a total count.
+  - Pinned vs elastic stays open. "On-demand" today means channel placement on
+    a pinned pool; the 0.10 elastic pool (grow on load, shrink on idle) was
+    replaced in 0.11 for capacity predictability (CHANGELOG, "The tunnel pool
+    is pinned"). If 0.11.2 also restores growth, that is a second decision.
+  - The 0.10 measurement (shared p99 8.15 ms against per-service 5.00 at 19/20
+    steps) is why the per-service default shipped. This decision overrides it,
+    and the single-pool model needs its own measurement before any claim; `4`
+    and `2 × claims` are the best-evidenced defaults until that sweep.
+  Implemented in 0.11.2: `[client.data].tunnels` is the session's total
+  width and `[transparent.data].tunnels` the L3 lane budget. This entry stays
+  as the decision record.
 - **Operator decision (2026-10-19): the production pair stays on forwarding
   (L4) until L3 is stable; L3 remains the target.** The maintainer's own
   deployment (ssh/http/https, Minecraft UDP, Mumble TCP+UDP) keeps the
@@ -162,7 +331,9 @@
   refusal, the `githooks/check-docs` removed-key table, both language pages, an
   invalid-config test and an `[Unreleased]` entry). A rename leaves the
   per-service `tunnels` and `[transparent.data].tunnels` (a lane budget) alone.
-  No decision yet; not a release blocker.
+  Superseded (2026-10-19) by the one-pool decision above: with no per-service
+  inheritance the key is the pool's width, not a default, so `default_tunnels`
+  no longer describes it. The final name is open.
 - **`shared_pool`'s width is decided by whichever service activates first
   (verified 2026-10-19).** With `[client.data].shared_pool = true`, the session
   pool is created by the first service to become active and uses *that
@@ -176,7 +347,10 @@
   deployment issue for the pair above (it does not set `shared_pool`), but a
   defect to fix before the key's semantics are frozen: either honour the
   client-wide count in shared mode, or validate the per-service overrides and
-  document the first-service rule. No fix made.
+  document the first-service rule. No fix made. Subsumed by the one-pool
+  decision above (2026-10-19): the model removes the per-service pool and the
+  switch, so the defect goes away with the replacement rather than with a local
+  fix.
 - **The 32-bit embedded targets are compile-checked, not test-run.**
   `5e585b7` closed the aarch64 half — the two full-set musl targets build in
   CI (x86_64 on `ubuntu-latest`, aarch64 natively on `ubuntu-24.04-arm`) and a

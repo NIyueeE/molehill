@@ -191,8 +191,9 @@ impl Scenario {
                  [server.control]\n\
                  bind_addr = \"127.0.0.1:{control}\"\n\
                  \n\
-                 [server.transport.noise]\n\
-                 local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
+                 [server.noise]\n\
+                 public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+                 private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
             ),
         )
         .unwrap();
@@ -206,11 +207,10 @@ impl Scenario {
                  default_remote_addr = \"127.0.0.1:{control}\"\n\
                  \n\
                  {data_block}\
-                 [client.transport]\n\
-                 type = \"noise\"\n\
+                 [client.noise]\n\
+                 private_key = \"8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=\"\n\
                  \n\
-                 [client.transport.noise]\n\
-                 remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+                 public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
                  \n\
                  [client.services.echo]\n\
                  local_addr = \"127.0.0.1:{backend}\"\n\
@@ -488,14 +488,14 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
         ("client.data.default_carrier", "chosen at runtime"),
         ("client.services.*.carrier", "chosen at runtime"),
         ("client.data.idle_timeout", "no shrink clock"),
-        ("client.services.*.pool_size", "udp_workers"),
+        ("client.services.*.pool_size", "max_udp_workers"),
         (
             "client.services.*.heartbeat_timeout",
             "default_heartbeat_timeout",
         ),
         ("client.services.*.health_check", "registered"),
     ];
-    const SERVER_KEYS: [(&str, &str); 1] = [("server.max_pool_size", "max_tunnels_per_client")];
+    const SERVER_KEYS: [(&str, &str); 1] = [("server.max_pool_size", "max_tunnels")];
     // `[client.data]` (and so the removed pool keys) exists only with the
     // `multiplex` feature; the other client keys live in tables every build
     // has, so they are asserted everywhere.
@@ -531,10 +531,9 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              default_token = \"{TOKEN}\"\n\
              [client.control]\n\
              default_remote_addr = \"127.0.0.1:{control}\"\n\
-             [client.transport]\n\
-             type = \"noise\"\n\
-             [client.transport.noise]\n\
-             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+             [client.noise]\n\
+             private_key = \"8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=\"\n\
+             public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              [client.services.echo]\n\
              local_addr = \"127.0.0.1:{backend}\"\n\
              remote_bind_addr = \"0.0.0.0:{exposed}\"\n\
@@ -558,8 +557,9 @@ fn every_removed_key_refuses_the_start_with_its_replacement() {
              [server.control]\n\
              bind_addr = \"127.0.0.1:{control}\"\n\
              \n\
-             [server.transport.noise]\n\
-             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
+             [server.noise]\n\
+             public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+             private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

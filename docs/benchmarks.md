@@ -516,7 +516,7 @@ carries the instrument's own reason.
 sudo -n just bench
 sudo -n just bench --profile dev --aa
 
-# the release sweep: the staged schedule and the load ramp, four arms
+# the release sweep: the staged schedule and the load ramp, five arms
 just bench peers fetch
 sudo -n just bench --profile sweep --out benches/records/results-bench-vX.Y.Z.json
 
@@ -675,7 +675,7 @@ to two).
 | transport | `"plain"` | 10.0 / 19.5 Gbit/s (1 / 8 streams) on loopback |
 | transport | `"noise"` | 5.8 / 14.9 Gbit/s; sub-millisecond RTT cost; CPU parity under full load |
 | `pool_size` | 8 TCP / 2 UDP (defaults) | setup-to-first-byte p99 ~3.5 ms at 16-way churn; UDP shards distinct visitors across channels and never splits one session (session affinity) |
-| `[server.data].stripe_count` | `K = 4` (a striped group spreads one visitor connection over K data channels; see [configuration.md](configuration.md)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
+| striping | a group of four channels (the measured arm set `stripe_count = 4`; the key is gone — a group now starts at one and grows under backpressure, see [internals.md](internals.md#data-channel-striping)) | a single long-lived connection stops being bounded by one tunnel flow: 1-stream throughput +48.7 % on loopback, at the cost of a reorder buffer, +8.7 % RSS and +40.8 % CPU (per-frame CPU is halved, because the frames spread over four driver tasks) |
 
 ### The L3 data path: what limits it (2026-10-10, this model)
 
@@ -1248,23 +1248,23 @@ matters), `SMALL_REQUESTS` and `SMALL_BYTES` (2000 × 64 B), `CLAIM_LANES` (unse
 which measures the product's own default of one carrier connection per claim; a
 higher number spreads the claim's flows over that many connections) and
 `CLAIM_LANE_CAP` (unset; a value below `CLAIM_LANES` measures the server's
-`[server.data].max_tunnels_per_client` valve refusing a claim's surplus lanes
+`[server.data].max_tunnels` valve refusing a claim's surplus lanes
 while the claim keeps serving on the rest).
 
 ## The UDP queue question (a molehill-only diagnostic)
 
 A UDP service's datagram ceiling is a property of the *service*, not of the
 stage schedule, so it has its own instrument: `bench/src/bench/utils/udp_stress.py`
-starts a real pair with a configurable `udp_workers`, blasts paced or flat-out
+starts a real pair with a configurable `max_udp_workers`, blasts paced or flat-out
 visitors at it, reads the server's `MOLEHILL_UDP_STATS` line around each step,
 and ends with a control step that blasts the same visitors **straight at the
 sink** — without that control a slow sink and a slow tunnel look identical from
 the counters. Measured on one host, 1400-byte datagrams: a single visitor never
 drops (its own socket buffer throttles it at ~29.8k datagrams/s), many visitors
-saturate the pool at ~1 Gbit/s regardless of `udp_workers` (1.14 / 1.00 / 0.98 at
+saturate the pool at ~1 Gbit/s regardless of `max_udp_workers` (1.14 / 1.00 / 0.98 at
 1 / 2 / 4) or visitor count, the spread stays even, and the drops equal the
 excess over that ceiling to within 0.07 %. The number a user needs is on the
-configuration page beside `udp_workers`. The probe behind it is
+configuration page beside `max_udp_workers`. The probe behind it is
 `bench/src/bench/utils/udp_stress.py`; run it the same way to reproduce the ceiling on
 your own host.
 

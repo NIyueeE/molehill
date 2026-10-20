@@ -18,7 +18,7 @@ pub(crate) const MAINTAIN_INTERVAL: std::time::Duration = std::time::Duration::f
 
 /// How long a pool waits after a repair dial failed before it tries again.
 ///
-/// D14's other half: a refusal (the server's `max_tunnels_per_client` valve, or
+/// D14's other half: a refusal (the server's `max_tunnels` valve, or
 /// a dial that could not be established) must *stop* the repair dials, not
 /// merely fail one — the maintenance tick runs every 50 ms, so without this the
 /// client would dial-and-be-refused twenty times a second against the server's
@@ -65,7 +65,7 @@ pub(crate) const OPEN_BUDGET: usize = 16;
 /// stream is refused (the engine used to terminate the *whole connection* for
 /// it — see `mux/connection.rs`), and a refused stream is a visitor that fails.
 /// Crossing the ceiling needed a pool that could not reach its configured
-/// count (the server's `max_tunnels_per_client` valve, an unreachable
+/// count (the server's `max_tunnels` valve, an unreachable
 /// endpoint, or a `tunnels` count below the load) while the load kept
 /// arriving, which is exactly what a bulk run does; the reservation is charged
 /// before the first `await`, so the ceiling has to bound `streams + pending`,
@@ -241,36 +241,6 @@ pub(crate) fn order_candidates_for(
     candidates
 }
 
-/// The UDP-derived floor (D7): how many tunnels the deepest UDP service of a
-/// carrier needs so its configured workers keep distinct paths.
-///
-/// `active_channels` is each service's channel count (`udp_workers`) and
-/// `stream_cap` the per-tunnel stream ceiling, so the floor is
-/// `ceil(channels / cap)` — the smallest pool that can carry all of a service's
-/// channels *at once*.
-///
-/// The floor is the larger of that capacity term and the service's own worker
-/// count (capped at `cap` by the `ceil` term when the workers do not fit): a
-/// service configured with N workers is asking for N paths, and the pool it
-/// draws from establishes at least N tunnels so those paths are spread rather
-/// than stacked. An explicit `tunnels` below this floor is refused by the
-/// configuration layer (the pinned pool cannot grow to meet it); an unset one
-/// resolves to `max(default, floor)`.
-///
-/// An inactive service contributes nothing; the floor is what *active* UDP
-/// demand needs.
-pub(crate) fn udp_floor(
-    active_channels: impl IntoIterator<Item = usize>,
-    stream_cap: usize,
-) -> usize {
-    let cap = stream_cap.max(1);
-    active_channels
-        .into_iter()
-        .map(|channels| channels.max(channels.div_ceil(cap)))
-        .max()
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,19 +266,6 @@ mod tests {
         // the proportional headroom binds instead.
         assert_eq!(tunnel_ceiling(16), 14);
         assert_eq!(tunnel_ceiling(4), 3);
-    }
-
-    #[test]
-    fn floor_is_the_deepest_active_udp_service() {
-        assert_eq!(udp_floor([], 64), 0, "no active UDP service: no floor");
-        // Two workers ask for two paths; one tunnel carries 64 streams, so the
-        // workers would fit — but they would share one path, which is not what
-        // the service configured them for.
-        assert_eq!(udp_floor([2], 64), 2);
-        // Past the stream cap the capacity term wins and keeps growing.
-        assert_eq!(udp_floor([64], 64), 64);
-        assert_eq!(udp_floor([65], 64), 65);
-        assert_eq!(udp_floor([2, 130], 64), 130, "the deepest service wins");
     }
 
     #[test]

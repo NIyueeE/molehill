@@ -5,9 +5,9 @@
 //! client's kernel *as packets*: the backend sees the visitor's real address,
 //! TCP keeps its end-to-end semantics, and the server holds no connection
 //! state for the flow. This module installs no route, rule or firewall rule on
-//! any platform: Linux attaches to the operator's persistent device, while
-//! macOS and Windows create the ephemeral device and leave the routes to the
-//! operator.
+//! any platform: Linux creates a missing device and attaches to an existing
+//! one, while macOS and Windows create their device and leave the routes to
+//! the operator.
 //!
 //! Both ends share the same two primitives:
 //!
@@ -29,6 +29,8 @@ pub mod hub;
 pub mod ip;
 #[cfg(mh_l3_client)]
 pub mod lanes;
+#[cfg(mh_linux)]
+pub(crate) mod net;
 pub mod tun;
 
 use std::collections::HashMap;

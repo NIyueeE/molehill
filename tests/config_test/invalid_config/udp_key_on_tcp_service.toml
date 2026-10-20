@@ -1,9 +1,9 @@
-# expect: `udp_idle_timeout` is only valid for a UDP service
+# expect: `udp_buffer_size` is only valid for a UDP service
 
 # The UDP-only keys used to be accepted on a TCP service and silently
 # ignored, which let a reader believe the value was in effect. `udp_buffer_size`,
-# `udp_idle_timeout`, `udp_send_queue_size`, `udp_forwarder_ipv6` and
-# `udp_workers` are refused now; this fixture pins one of them.
+# `udp_buffer_size` and
+# `max_udp_workers` are refused now; this fixture pins one of them.
 
 [client]
 default_token = "t"
@@ -14,11 +14,9 @@ default_remote_addr = "example.com:2333"
 [client.services.tcp_service]
 local_addr = "127.0.0.1:80"
 remote_bind_addr = "0.0.0.0:6080"
-udp_idle_timeout = 30
+udp_buffer_size = 64
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture key
-
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="

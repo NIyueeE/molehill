@@ -1,201 +1,144 @@
 # Transport
 
-The control channel always speaks Noise (it publishes the session nonce the
-data channels authenticate with, so a plain control leg would hand the data
-plane's credential to the path). The client's
-`[client.transport]` block supports two types — `plain` and `noise` — and
-**the client decides**: every connection starts with a one-byte transport selector
-byte, and the server accepts whatever the client speaks (its
-`[server.transport]` block only places the Noise keys — there is no
-server-side `type`). The noise-vs-plain benchmark is the price list for
-this choice: see [benchmarks.md](benchmarks.md), "What each configuration
-choice costs". This page covers `noise`;
-`plain` needs no configuration beyond the default.
+The control channel always speaks Noise, and it speaks one handshake:
+**Noise_KK_25519_ChaChaPoly_BLAKE2s**. KK authenticates both ends — the
+client knows the server's static key and the server knows the client's — so a
+man-in-the-middle cannot impersonate either, and a config cannot select an
+anonymous suite. This page covers the keys, the one switch that controls data
+encryption, and the per-service and L3 overrides. The removed tables are on
+[Configuration](configuration.md#migrating-to-0112-one-pool-per-session).
 
 ## Noise Protocol
 
 The [Noise Protocol](http://noiseprotocol.org/noise.html) is a lightweight,
-easy-to-configure way to encrypt the connection: one X25519 keypair, no PKI.
-
-`molehill` comes with a reasonable default configuration; see the minimal [noise example](./deployment.md#noise-encrypted-transport). The default pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticates the server, so a MITM cannot impersonate it.
-
-> **What ring-accelerated buys.** The default build links `snow`'s
-> **ring-accelerated** resolver, so the ChaCha20-Poly1305 data path — the
-> hot path for every encrypted byte — runs ring's hardware-dispatched
-> implementation: measured ~1.5x the pure-Rust resolver at the transport
-> level and ~1.3x end-to-end on x86-64. The pattern's hash (BLAKE2s by
-> default, or SHA-256/SHA-512 for other patterns) only runs during the
-> one-time handshake, so it does not affect throughput: every pattern gets
-> the accelerated cipher. The wire format is unchanged.
-
-To use it, an X25519 keypair is needed.
+easy-to-configure way to encrypt the connection: X25519 keys and no PKI. Every
+handshake is fresh, so each connection derives its own keys.
 
 ### Generate a keypair
 
-Run `molehill --genkey`, which generates an X25519 keypair (the only curve the
-shipped `snow` backend provides):
+Run `molehill --genkey` on each host. It prints an X25519 private
+key and its public key:
 
-```sh
+`sh
 $ molehill --genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 
 Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
-```
+`
 
-(Do not use a keypair from the Internet, including this one.)
+(Do not use a keypair from the Internet, including this one.) Each host keeps
+its own private key and writes the **other** host's public key.
 
-The server keeps the private key to identify itself, and the client keeps the public key to verify the server:
+`toml
+# Server side
+[server.noise]
+private_key = "the server's private key"
+public_key = "the client's public key"
 
-```toml
 # Client side
-[client.transport]
-type = "noise"
-[client.transport.noise]
-remote_public_key = "GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE="
+[client.noise]
+private_key = "the client's private key"
+public_key = "the server's public key"
+data_enable = true
+`
 
-# Server side (keys only — no `type`; the client's choice decides)
-[server.transport.noise]
-local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
-```
+Both keys are required in both blocks and must decode to 32 bytes, or the
+daemon refuses to start and names the block and the key. The same pair also
+seeds the data plane, so one keypair per host is the normal deployment.
 
-### Per-service encryption
+### The fixed pattern
 
-One client mode has no encryption to configure: a transparent (L3) client is
-always plain, because it carries whole IP packets whose content the visitor's
-own end-to-end protection already covers, and this hop is a plain link by
-design. That is structural rather than a rule — its `[transparent.transport]`
-table holds the `proxy` key and no key for a cipher, so there is nowhere to ask
-— see [Configuration](./configuration.md#transparent-l3-services). What a
-*server* accepts is unaffected: its Noise keys still apply to every client that
-negotiates them, and an L3 client never does.
+There is no `pattern` key, no `psk` / `psk_location`, no
+`resume` and no dialing proxy. The handshake is KK with
+ChaCha20-Poly1305 and BLAKE2s in every build; a config that still writes any of
+those keys is refused with the replacement (or the note that there is none).
+The BLAKE2s hash runs only during the one-time handshake; the ChaCha20-Poly1305
+data path is ring-accelerated and is the same for every session.
 
-The client-wide `[client.transport].type` is the default for every service,
-and each service can override it individually — including its own keys, which
-is what a multi-server setup needs (each server holds its own keypair):
+### Control and data channels
 
-```toml
-[client.transport]
-type = "noise"            # default: every service is encrypted
-[client.transport.noise]
-remote_public_key = "server-a-pub-key"
+The **control channel is always encrypted** with the client's pair. It
+publishes the session nonce the data channels authenticate with, so a plaintext
+control leg would hand that credential to everyone on the path; a server
+refuses a plaintext control channel on the connection it arrives on.
 
-[client.services.ssh]     # inherits: encrypted with the global key
+The **data channels** follow `data_enable`:
+
+- `true` (the client default) wraps every TCP tunnel, direct channel and
+  KCP session in the same KK record stream. Both ends pay the cipher's CPU per
+  byte, and the path learns nothing about the forwarded payload.
+- `false` sends the data channels plain. The visitor's own TLS/SSH is the
+  end-to-end protection in that deployment, and this hop spends no CPU on a
+  second encryption. The control channel stays encrypted either way.
+
+`toml
+[client.noise]
+private_key = "the client's private key"
+public_key = "the server's public key"
+data_enable = false # data channels are plain; the control channel is still KK
+`
+
+The server needs no switch: it accepts a plain data channel from a client that
+chose `data_enable = false` and a Noise one from everyone else, on the same
+listener.
+
+### Per-service overrides
+
+A forwarding service may override the pair (to dial another server with its own
+keypair) and the data switch. Unset fields inherit `[client.noise]`:
+
+`toml
+[client.services.ssh]              # inherits the client pair and data_enable
 
 [client.services.bulk]
-transport = { type = "plain" }   # opt out: plain
+[client.services.bulk.noise]
+data_enable = false                # this service's data channels are plain
 
-[client.services.region-b]       # global plain + this service encrypted
+[client.services.region-b]
 remote_addr = "region-b.example.com:2333"
-transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" } }
-```
+[client.services.region-b.noise]
+private_key = "this client's other private key"
+public_key = "region-b's public key"
+`
 
-Rules: `transport.type` unset follows the client-wide `type`; `"noise"`
-forces encryption, `"plain"` forces plaintext. A service whose effective transport is
-Noise needs keys — its own `transport.noise` if set, else the global
-`[client.transport].noise`; configuring effective Noise with no keys
-anywhere is a startup error. The data plane follows the service: its TCP tunnels and
-the Noise-over-KCP wrapping of its KCP sessions both use the service's
-effective keys. The server needs nothing beyond placing its
-keys (the transport selector: it accepts whatever each connection speaks).
+The pair is the session's identity: services with the same endpoint and the
+same pair share one control connection, and a different pair gets a session of
+its own. `data_enable` alone never splits a session.
 
-### Specifying the pattern
+### Transparent (L3) clients
 
-The default pattern satisfies most use cases, but other patterns can be useful:
+An L3 client writes the same three keys under `[transparent.noise]`. Its
+control channel is KK; its lanes default to **plain**
+(`data_enable = false`), because what a lane carries is the visitor's own IP
+packets and the visitor's TLS is the end-to-end protection:
 
-**No authentication** (`Noise_XX_...`): encrypts traffic but provides no authentication, so it is vulnerable to MITM attacks while resisting sniffing and replay attacks. Use it when MITM is not a concern:
+`toml
+[transparent.noise]
+private_key = "the client's private key"
+public_key = "the server's public key"
+data_enable = false
 
-```toml
-[server.transport.noise]
-pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
 
-[client.transport.noise]
-pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
-```
+[transparent.claims.web.noise]
+data_enable = true                 # only this claim's lanes are encrypted
+`
 
-**Bidirectional authentication** (`Noise_KK_...`): both sides authenticate each other:
+A claim may also override the keypair to reach a second server; unset fields
+inherit `[transparent.noise]`.
 
-```toml
-[server.transport.noise]
-pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "server-priv-key-here"
-remote_public_key = "client-pub-key-here"
+### Migrating
 
-[client.transport.noise]
-pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "client-priv-key-here"
-remote_public_key = "server-pub-key-here"
-```
-
-### Pre-shared keys
-
-`psk` and `psk_location` add a pre-shared key to the handshake. The key is
-only used when the configured `pattern` carries a PSK modifier at
-`psk_location` (e.g. `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`); with a pattern
-that has none, the value is silently ignored rather than rejected. The key must
-decode to exactly 32 bytes (checked when a handshake is set up), and both sides
-must use the same `psk` and `psk_location`:
-
-```toml
-[server.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "server-priv-key-here"
-remote_public_key = "client-pub-key-here"
-psk = "the-same-32-byte-key-in-base64"
-psk_location = 0
-
-[client.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "client-priv-key-here"
-remote_public_key = "server-pub-key-here"
-psk = "the-same-32-byte-key-in-base64"
-psk_location = 0
-```
-
-### Noise session resume
-
-With `resume = true` (both sides, default off), a reconnect does not
-repeat the handshake's key exchanges: after a full handshake the server
-issues a ticket sealed with a key derived from its Noise static private
-key, and the client caches it together with the session's handshake
-hash. On the next connect the client offers the ticket with a fresh
-nonce and a MAC proving it holds the cached hash; the server verifies
-and both sides derive fresh record keys from the cached hash plus two
-fresh nonces (HKDF-SHA256 over ChaCha20-Poly1305). The connection starts
-with transport selector `0x02` instead of `0x01`; peers that do not know
-the selector reject it and the client falls back to a full handshake
-(which re-issues the ticket).
-
-Measured on this host (release build, in-process pair over a duplex, the
-default pattern): the full handshake plus the ticket exchange costs
-442.7 us per pair, a resumed exchange 38.5 us — the handshake's key
-exchanges are ~97% of the setup CPU, and resume removes them. The
-remaining cost is symmetric crypto plus two round trips.
-
-The tradeoff is forward secrecy: the original session keeps its
-DH-derived keys, but a resumed session's keys derive from the cached
-hash, so a later compromise of the server's static key (or of the
-client's cache) reaches the resumed sessions' traffic. That is the
-standard session-resumption tradeoff — leave `resume = false` (the
-default) when per-connection forward secrecy matters more than
-reconnect latency. Tickets expire after 24 hours, and a repeated
-`(ticket, nonce)` pair is rejected, so a captured resume request cannot
-be replayed or shared between sessions.
-
-```toml
-[server.transport.noise]
-local_private_key = "server-priv-key-here"
-resume = true
-
-[client.transport.noise]
-remote_public_key = "server-pub-key-here"
-resume = true
-```
-
-### Other patterns
-
-To find out which pattern to use, refer to:
-
-- [7.5. Interactive handshake patterns (fundamental)](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
-- [8. Protocol names and modifiers](https://noiseprotocol.org/noise.html#protocol-names-and-modifiers)
+The old `[client.transport]`, `[server.transport]` and
+`[transparent.transport]` tables move to `[client.noise]`,
+`[server.noise]` and `[transparent.noise]`;
+`local_private_key` becomes `private_key` and
+`remote_public_key` becomes `public_key`. The handshake now needs both
+sides' keys, so add the client's public key to `[server.noise]` and the
+client's private key to `[client.noise]`. `type = "noise"` becomes the
+absence of `data_enable` (default true); `type = "plain"` becomes
+`data_enable = false`; and `[client.services.<name>.transport]` becomes
+`[client.services.<name>.noise]`.

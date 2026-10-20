@@ -11,16 +11,15 @@ tun = "molehill-test0"
 
 [transparent.control]
 default_remote_addr = "example.com:2333"
-default_retry_interval = 2
+retry_backoff_max = 2
 
 [transparent.data]
 tunnels = 6
 
-[transparent.transport]
-proxy = "socks5://127.0.0.1:1080"
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
-[transparent.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -29,4 +28,4 @@ remote_bind_addr = "10.99.0.1:8443"
 remote_bind_addr = "10.99.0.1:2222"
 token = "per-claim-token"
 remote_addr = "other.example.com:2333"
-retry_interval = 5
+retry_backoff_max = 5

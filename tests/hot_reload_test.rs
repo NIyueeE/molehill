@@ -183,8 +183,10 @@ fn write_server_config(dir: &Path, control: u16, allowed: [u16; 2]) -> Result<Pa
              [server.control]\n\
              bind_addr = \"127.0.0.1:{control}\"\n\
              \n\
-             [server.transport.noise]\n\
-             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n",
+             [server.noise]\n\
+             private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n\
+             public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+             \n",
             allowed[0], allowed[1]
         ),
     )?;
@@ -201,11 +203,10 @@ fn write_client_config(path: &Path, control: u16, services: &[(&str, u16, u16)])
          [client.control]\n\
          default_remote_addr = \"127.0.0.1:{control}\"\n\
          \n\
-         [client.transport]\n\
-         type = \"noise\"\n\
-         \n\
-         [client.transport.noise]\n\
-         remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n"
+         [client.noise]\n\
+         public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+         private_key = \"8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=\"\n\
+         \n",
     );
     for (name, local, remote) in services {
         write!(

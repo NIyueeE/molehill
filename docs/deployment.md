@@ -35,11 +35,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -57,8 +56,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### Noise (encrypted transport)
@@ -75,11 +75,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo="
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -96,8 +95,9 @@ allow_ports = ["5202"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM="
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### UDP service
@@ -110,11 +110,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 protocol = "udp"
@@ -133,8 +132,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### Server and client in one file
@@ -150,11 +150,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -169,8 +168,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ### Connect through a proxy
@@ -183,12 +183,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "127.0.0.1:2333"
 
-[client.transport]
-type = "noise"
-proxy = "socks5://myuser:mypass@127.0.0.1:1080"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.foo1]
 local_addr = "127.0.0.1:80"
@@ -207,11 +205,10 @@ default_token = "123"
 [client.control]
 default_remote_addr = "localhost:2333"
 
-[client.transport]
-type = "noise"
 
-[client.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.iperf3-udp]
 protocol = "udp"
@@ -235,8 +232,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333"
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 ## Transparent services
@@ -273,7 +271,7 @@ The supported combinations are:
 |---|---|---|---|
 | Transparent client | yes | yes | no — run it under WSL2 |
 | Transparent server | yes | yes | yes (Wintun + Administrator) |
-| Device | operator-created TUN | daemon-created `utunN`; daemon assigns the claimed `/32`s | daemon-created Wintun adapter |
+| Device | daemon-created TUN when missing; daemon assigns missing claim addresses | daemon-created `utunN`; daemon assigns the claimed `/32`s | daemon-created Wintun adapter |
 | Routing | `ip route` / `ip rule` | `route` + pf `route-to` | `New-NetRoute` + forwarding |
 | Privilege | `CAP_NET_ADMIN` | root | Administrator + `wintun.dll` |
 
@@ -319,8 +317,9 @@ allow_ports = ["8443"]
 bind_addr = "0.0.0.0:2333"
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "QLYMByBnjgM254zT6YKaBVvuAA61swyZfFxoA/SKZHM=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "molehill0"
@@ -337,14 +336,30 @@ tun = "molehill0"
 default_remote_addr = "<server-address>:2333"
 
 # Required: the control channel is always Noise
-[transparent.transport.noise]
-remote_public_key = "xrpknQcAagcd/b9foMwxSCD+EindWxq450NEONk8XQo=" # security-scan:allow documentation example key
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
 ```
 
 The device names are per host, so the two `tun` values need not match.
+
+The mode is selected by the flag and the block, not by `tun`: `tun` only names
+the device. Start the two ends with the same binary:
+
+```bash
+# server: [server.transparent] is the L3 switch; --server runs it
+sudo ./molehill --server server.toml
+# client: [transparent] is the L3 model; --transparent (or -t) runs it
+sudo ./molehill --transparent client.toml
+```
+
+A `[transparent]` config started with `--client` is refused; a server with
+`[server.transparent]` still uses `--server`. The client needs
+`CAP_NET_ADMIN`/`root` for its TUN; the server needs it only when its own
+`[server.transparent]` table is present.
 
 ### Recipe A: an address routed to the server
 
@@ -398,6 +413,10 @@ sudo ip link set molehill0 up mtu 1400
 sudo sysctl -w net.ipv4.ip_forward=1
 sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
 sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+# The replies the client hands back carry this host's own address as their
+# source, so the kernel would refuse to forward them as martians: the tunnel
+# is the interface that must accept a local source.
+sudo sysctl -w net.ipv4.conf.molehill0.accept_local=1
 
 # Mark the claimed port before the routing decision (iptables; with nftables the
 # same rule ends in `meta mark set 0x1`). Mark UDP as well if the service uses
@@ -451,7 +470,35 @@ jumbograms are not carried. The data path itself is family-agnostic: a claim
 can be IPv4 or IPv6, and the server/client negotiate the same `Ip`/`Vnet`
 frame format for either.
 
-### macOS: an operator-created utun, pf and forwarding
+### Device and address automation on Linux
+
+Two steps of the recipes are the daemon's to take, and only those two: the
+device and, on the client, the claimed address. A transparent service creates
+the TUN device when it is missing (persistent, what `ip tuntap add` leaves),
+brings it up with MTU 1400, and on the client assigns each claimed address
+that is not already on it. An existing device is used as it is, so pre-create
+it to choose another MTU. That is the same pair of steps the macOS daemon
+takes unconditionally (a `utunN` and its claimed addresses) and the device
+step the Windows daemon takes for its adapter, so the three stay symmetric.
+
+Everything else stays the recipes above on every platform: the server's
+forwarding switch, `rp_filter` and each claim's route (or the mark and policy
+routing of recipe B), and the client's `from <claim>` rule with its table
+route. Every step is idempotent and the state is left in place when the daemon
+stops, so a restart, a reload or a second claim converges. When the daemon has
+to create the device or assign an address, it needs `ip` on `PATH` and
+`CAP_NET_ADMIN`.
+
+Two consequences of the daemon creating the device: a setting that belongs to
+the device at creation time comes from `net.ipv4.conf.default.*`, so set
+`net.ipv4.conf.default.rp_filter=0` and `net.ipv4.conf.all.rp_filter=0` before
+starting (the client refuses a device whose reverse-path filter is on), and
+routes that name the device are applied after it appears — the same ordering
+the macOS and Windows recipes already have. A device the daemon creates gets
+MTU 1400; create it yourself before starting if the path wants another MTU,
+and the daemon uses it as it is.
+
+### macOS: a daemon-created utun, operator pf and forwarding
 
 macOS has no persistent TUN device an operator can create and hand over: the
 daemon opens `/dev/utun` and the kernel creates a `utunN`, which exists only
@@ -468,8 +515,9 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "<server private key>" # molehill --genkey
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "utun7"
@@ -484,8 +532,9 @@ tun = "utun7"
 [transparent.control]
 default_remote_addr = "<server-address>:2333"
 
-[transparent.transport.noise]
-remote_public_key = "<server public key>"
+[transparent.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [transparent.claims.web]
 remote_bind_addr = "<public-ip>:8443"
@@ -534,8 +583,9 @@ allow_ports = ["8443"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "<server private key>" # molehill --genkey
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 
 [server.transparent]
 tun = "molehill0"
@@ -570,7 +620,7 @@ for anything unusual:
 | What is needed | `molehill --server` (forwarding) | `molehill --client` (forwarding) | An L3 pair (`--server` + `--transparent`) |
 |---|---|---|---|
 | `CAP_NET_ADMIN` / root / Administrator | no | no | **yes, both ends** — the transparent process opens a TUN device on Linux/macOS; Administrator + `wintun.dll` on Windows |
-| A TUN device | no | no | Linux: **yes, both ends**, created by the operator. macOS/Windows: the daemon creates it (utun/Wintun) |
+| A TUN device | no | no | Linux: **yes, both ends** — the daemon creates a missing one (MTU 1400) and uses an existing one as it is; macOS/Windows: the daemon creates it (utun/Wintun) |
 | `net.ipv4.ip_forward = 1` | no | no | **yes, on a Linux server**; on macOS `net.inet.ip.forwarding`; on Windows interface forwarding + `IPEnableRouter` |
 | `rp_filter = 0` on the TUN and `all` | no | no | **yes on Linux** — injected packets carry the visitor's source |
 | Source policy routing | no | no | Linux `ip rule`; macOS pf `route-to`; **Windows cannot** (use WSL2) |
@@ -597,10 +647,11 @@ deployment fails on:
   your distribution's mechanism (a boot unit, a networkd/NetworkManager
   dispatcher, `sysctl.d` for the `rp_filter` keys); the daemon only verifies
   what it finds when the service starts.
-- `mtu 1400` is the value the daemon's own refusal prints, and the value these
-  recipes use. Keep it at or below the path MTU: the client's kernel derives the
-  MSS it advertises from the TUN device's MTU, and a tunnel MTU smaller than the
-  path is what keeps a segment from being too large for it.
+- A device the daemon creates gets `mtu 1400`, and its refusal prints the same
+  value; these recipes use 1400 too. Keep it at or below the path MTU: the
+  client's kernel derives the MSS it advertises from the TUN device's MTU, and a
+  tunnel MTU smaller than the path is what keeps a segment from being too large
+  for it.
 - `MOLEHILL_L3_STATS=1` (see
   [Configuration](./configuration.md#diagnostics-switches-opt-in)) prints the
   data path's counters once a second, which is how you see whether the two
@@ -668,6 +719,12 @@ ExecStart=/usr/bin/molehill -c /etc/molehill/%i.toml
 [Install]
 WantedBy=multi-user.target
 ```
+
+A `[transparent]` client is the same template with `--transparent` (`-t`)
+instead of `-c`; `molehillc` is the forwarding client and refuses a
+`[transparent]` config. The auto-detect `molehill@.service` also runs it when
+the unit omits the mode flag. A transparent client needs `CAP_NET_ADMIN` for
+its TUN, exactly like a transparent server.
 
 Both units are templates; two variants cover the rest:
 

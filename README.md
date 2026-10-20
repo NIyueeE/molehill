@@ -40,7 +40,7 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 - [molehill](#molehill)
   - [Features](#features)
   - [Benchmarks](#benchmarks)
-    - [The v0.11.1 run](#the-v0111-run)
+    - [The v0.11.2 run](#the-v0112-run)
   - [Quickstart](#quickstart)
   - [Configuration](#configuration)
   - [Deployment](#deployment)
@@ -73,7 +73,7 @@ molehill exposes a service on a device behind NAT to the Internet through a serv
 - **Small binary** — the `minimal` profile builds a **1.84 MiB** client binary and a **2.55 MiB** embedded one (measured 2026-10-17; see the [build guide](docs/build-guide.md)).
 - **Client-authoritative services** — the server needs no per-service configuration: clients declare what to expose (including the public port) and the server enforces an `allow_ports` whitelist. One shared token authenticates everything.
 - **Multiplexing** — every data channel of a forwarding service rides as a yamux stream over one of a fixed pool of tunnel connections (`[client.data].tunnels`, default 4) — no per-connection handshakes, dramatically fewer file descriptors, throughput beyond a single TCP flow, and head-of-line isolation (a lost segment stalls only its own tunnel). The pool is established at service start and never resized for load (a dead tunnel is repaired); the data plane itself runs over KCP (feature `kcp`) and falls back to TCP when a KCP session cannot be established, which is what `MOLEHILL_DATA_CARRIER` forces apart for a measurement. A transparent (L3) claim is the one shape that does not multiplex — its channels *are* its carrier connections, allotted by the lane budget and lent between claims as their flows come and go (`[transparent.data].lend`) — and the `[client.data]` knobs are covered in [Configuration](./docs/configuration.md).
-- **Security** — a shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The control channel **always** speaks Noise: it carries the credential every data channel authenticates with, so a plain control leg would publish it to the path, and both ends refuse to start without a key pair (`molehill --genkey`). One pre-shared X25519 keypair, no PKI, no CA; with `resume = true` a reconnect proves itself with a MAC instead of repeating the handshake's key exchanges (connection setup 442.7 → 38.5 us per pair). A *service* or an L3 lane may still run plain where the payload carries its own crypto.
+- **Security** — a shared token is mandatory and the `allow_ports` whitelist bounds what any client can expose. The control channel **always** speaks Noise with the fixed KK handshake: both ends know each other's static X25519 key, so a man in the middle can impersonate neither, and a plaintext control leg is refused because it would publish the credential every data channel authenticates with. Both ends refuse to start without a key pair (`molehill --genkey`). One keypair per host, no PKI and no CA. A *service* or an L3 lane may still run plain (`data_enable = false`) where the payload carries its own crypto.
 - **An optional status API** — a token-gated `GET /status` on its own listener, answering what the client is carrying as JSON, so a panel or a script can read it. See [Configuration](./docs/configuration.md).
 - **Hot reload** — services can be added or removed dynamically by hot-reloading the configuration file.
 
@@ -86,22 +86,24 @@ reproduction: [Benchmarks](./docs/benchmarks.md); the decision tree behind the
 settings, and the two numbers worth measuring on your own path:
 [Configuration](./docs/configuration.md#choosing-your-configuration-decision-tree).
 
-### The v0.11.1 run
+### The v0.11.2 run
 
 Every tool is driven through the identical workload while the path follows the
 stage schedule, changed in place so a session is never rebuilt. This is the
-v0.11.1 sweep on one host, with the v0.11.1 binary's defaults — a multiplexed
-pool of four tunnels, and **the control channel's Noise keys applied to the data
-plane too**, because that is what this release's mandatory-Noise rule means for
-a client that does not override it per service. The v0.11.1 harness is a method
-re-baseline, so these readings are comparable only within this method; the
-comparability rule is in [Benchmarks](./docs/benchmarks.md#comparability).
+v0.11.2 sweep on one host, with the v0.11.2 binary's defaults — one multiplexed
+pool of four tunnels per session, the fixed-KK Noise keypair on the control
+channel (a forwarding service's data channels inherit it unless
+`data_enable = false`), and dynamic striping that starts each TCP visitor at one
+data channel and grows only on path backpressure. The v0.11.2 harness is a
+method re-baseline, so these readings are comparable only within this method;
+the comparability rule is in
+[Benchmarks](./docs/benchmarks.md#comparability).
 
-![molehill and the peers over the stage schedule](assets/bench-v0.11.1-timeline.png)
+![molehill and the peers over the stage schedule](assets/bench-v0.11.2-timeline.png)
 
 The same run as small multiples — one panel per stage, a lollipop per tool:
 
-![Interactive RTT per stage, per tool](assets/bench-v0.11.1-stages.png)
+![Interactive RTT per stage, per tool](assets/bench-v0.11.2-stages.png)
 
 **Interactive stream RTT p99, per stage** (ms). Every stage after `clean` is
 shaped — the harness installed the queue or the delay that dominates it — so no
@@ -110,38 +112,38 @@ winner is marked in those columns. Sample counts and the full reading rules:
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 4.9 | 402.2 | 1069.1 | 2459.2 | 196.0 | 430.1 | 264.0 | 4.2 |
-| molehill (L3) | 1.5 | 401.4 | 1071.3 | 1775.5 | 195.8 | 442.8 | 299.0 | 1.5 |
-| frp | 1.2 | 401.3 | 1061.8 | 1461.4 | 196.0 | 431.7 | 286.8 | 1.2 |
-| rathole | 1.8 | 401.1 | 1063.2 | 2442.3 | 195.7 | 432.7 | 294.4 | 1.6 |
-| nps | 94.2 | 496.2 | 1073.0 | 4102.0 | 196.6 | 431.5 | 264.4 | 80.3 |
+| molehill (L4) | 30.8 | 401.3 | 1083.4 | 1463.5 | 196.2 | 433.9 | 268.5 | 11.9 |
+| molehill (L3) | 1.4 | 401.4 | 1057.4 | 1451.4 | 196.1 | 419.9 | 263.9 | 1.5 |
+| frp | 1.2 | 401.3 | 1064.8 | 2475.0 | 196.1 | 429.3 | 268.2 | 1.7 |
+| rathole | 1.7 | 401.0 | 1058.0 | 1897.1 | 198.7 | 430.4 | 276.2 | 1.7 |
+| nps | 201.2 | 415.6 | 1065.8 | 1460.7 | 196.3 | 431.5 | 301.1 | 18.3 |
 
 **Bulk throughput per stage** (Gbit/s, over the stage's whole measured window,
 not its best second).
 
 | tool | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean (repeat) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 8.907 | 3.405 | 8.670 | 1.197 | 0.094 | 0.019 | 0.019 | 9.133 |
-| molehill (L3) | 5.859 | 3.170 | 5.001 | 1.011 | 0.093 | 0.019 | 0.019 | 5.883 |
-| frp | 5.949 | 3.383 | 6.049 | 1.074 | 0.094 | 0.019 | 0.019 | 5.964 |
-| rathole | 29.105 | 3.404 | 14.676 | 1.121 | 0.094 | 0.019 | 0.019 | 29.034 |
-| nps | 0.134 | 0.136 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 8.641 | 3.370 | 6.950 | 1.136 | 0.094 | 0.019 | 0.019 | 7.066 |
+| molehill (L3) | 5.811 | 3.164 | 4.715 | 1.036 | 0.093 | 0.019 | 0.019 | 5.830 |
+| frp | 6.073 | 3.387 | 6.167 | 1.195 | 0.094 | 0.019 | 0.019 | 6.056 |
+| rathole | 29.038 | 3.401 | 14.746 | 1.202 | 0.094 | 0.019 | 0.019 | 29.153 |
+| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **How to read it.** `molehill (L3)` is this project's second architecture, not
 a fifth tool: its comparison is `molehill (L4)` and the tool-free control arm.
-These are one host's v0.11.1 readings; only same-schema, same-method, same-host
+These are one host's v0.11.2 readings; only same-schema, same-method, same-host
 runs compare directly. The stage schedule, the run's own noise floor, the
 capacity ramp, the drift and cost panels, and how to reproduce a run are in
 [Benchmarks](./docs/benchmarks.md).
 
 A deployment that wants the data plane unencrypted sets
-`transport = { type = "plain" }` per service and keeps the encrypted control
-channel; the cost of that choice is measured at
+`data_enable = false` on the client or on that service and keeps the encrypted
+control channel; the cost of that choice is measured at
 [Benchmarks](./docs/benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 
-The rest of the run's chart set: `bench-v0.11.1-capacity.png` (the load ramp),
-`bench-v0.11.1-drift.png` (RSS, fds and threads over the run) and
-`bench-v0.11.1-cost.png` (CPU-seconds per carried Gbit).
+The rest of the run's chart set: `bench-v0.11.2-capacity.png` (the load ramp),
+`bench-v0.11.2-drift.png` (RSS, fds and threads over the run) and
+`bench-v0.11.2-cost.png` (CPU-seconds per carried Gbit).
 
 ## Quickstart
 
@@ -172,8 +174,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333" # Port that molehill listens for clients
 
 # Required: the control channel is always Noise
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 Then run:
@@ -194,12 +197,11 @@ default_token = "use_a_secret_that_only_you_know" # Must match the server's `def
 [client.control]
 default_remote_addr = "myserver.com:2333" # The address of the server. The port must match `server.control.bind_addr`
 
-[client.transport]
-type = "noise"
 
 # The server's public key, from `molehill --genkey`
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # The local service to forward

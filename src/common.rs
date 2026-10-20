@@ -1,6 +1,4 @@
 pub mod constants;
-#[cfg(any(feature = "client", feature = "server"))]
-pub mod forward;
 pub mod helper;
 /// The owned-write boundary, used by both transports that need to hand their
 /// writer across a channel (`noise`'s record stream and `kcp`'s, which is a mux

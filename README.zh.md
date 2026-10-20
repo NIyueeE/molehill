@@ -32,7 +32,7 @@ molehill 通过一台有公网 IP 的服务器，把 NAT 后设备上的服务�
 - [molehill](#molehill)
   - [特性](#特性)
   - [基准测试](#基准测试)
-    - [v0.11.1 一次运行](#v0111-一次运行)
+    - [v0.11.2 一次运行](#v0112-一次运行)
   - [快速开始](#快速开始)
   - [配置](#配置)
   - [部署](#部署)
@@ -48,7 +48,7 @@ molehill 通过一台有公网 IP 的服务器，把 NAT 后设备上的服务�
 - **小二进制** —— `minimal` profile 构建的客户端二进制为 **1.84 MiB**、嵌入式特性集为 **2.55 MiB**(2026-10-17 实测,见[构建指南](docs/build-guide.md))。
 - **客户端声明服务** —— 服务端不需要逐服务配置:客户端声明要暴露的内容(包括公网端口),服务端通过 `allow_ports` 白名单和共享 `default_token` 执行策略。
 - **多路复用** —— 转发服务的每个数据通道都作为 yamux 流跑在一个固定隧道池（`[client.data].tunnels`，默认 4）的某条隧道上——省去每条连接的握手、显著减少文件描述符，吞吐超越单条 TCP 流并隔离队头阻塞（丢段只停滞自己的隧道）。池在服务启动时建立、永不按负载调整大小（死亡的隧道会被修复）；数据面本身跑在 KCP 上（feature `kcp`），KCP 会话建立不起来时回退到 TCP——想分开测两条路径时用 `MOLEHILL_DATA_CARRIER` 强制其一。透明（L3）认领是唯一不做多路复用的形态——它的通道**就是**它的载体连接,由车道预算分配,并随各认领流量的起落互相出借(`[transparent.data].lend`);`[client.data]` 选项见[配置文档](./docs/configuration.zh.md)。
-- **安全性** —— 共享 token 强制鉴权，`allow_ports` 白名单限制客户端可暴露的端口。控制通道**始终**使用 Noise：它携带的是每个数据通道用来鉴权的凭证，明文控制腿会把该凭证广播给路径上的所有人，因此两端没有密钥对就拒绝启动（`molehill --genkey`）。只需一对预共享 X25519 密钥，没有 PKI、没有 CA；设置 `resume = true` 后，重连用一次 MAC 证明持有上次会话的握手摘要即可，不必重跑密钥交换(建连从每对 442.7 us 降到 38.5 us)。单个*服务*或一条 L3 车道在载荷自带加密时仍可走明文。
+- **安全性** —— 共享 token 强制鉴权,`allow_ports` 白名单限制客户端可暴露的端口。控制通道**始终**使用固定 KK 握手的 Noise:两端都知道对方的 X25519 静态公钥,中间人无法冒充任何一端,明文控制腿会被拒绝,因为它会把每条数据通道鉴权所用的凭证广播到路径上。两端没有密钥对就拒绝启动(`molehill --genkey`)。每台主机一对密钥,没有 PKI,也没有 CA。单个*服务*或一条 L3 lane 在载荷自带加密时仍可走明文(`data_enable = false`)。
 - **可选的状态 API** —— 一个带 token 的 `GET /status`，跑在自己的监听地址上，以 JSON 回答"这个客户端正在承载什么"，供面板或脚本读取。见[配置文档](./docs/configuration.zh.md)。
 - **热重载** —— 支持配置文件热重载，动态添加或移除端口转发服务。
 
@@ -60,20 +60,21 @@ molehill 通过一台有公网 IP 的服务器，把 NAT 后设备上的服务�
 以及值得在你自己路径上测的两个数:
 [配置文档](docs/configuration.zh.md#选择配置决策树)。
 
-### v0.11.1 一次运行
+### v0.11.2 一次运行
 
 每个工具都被驱以完全相同的工作负载,同时路径按阶段表推进、原地切换,会话
-从不重建。下图是本主机上的 v0.11.1 一轮 sweep,用 v0.11.1 二进制的默认值——4 条隧道
-的多路复用池,并且**控制通道的 Noise 密钥也作用在数据面上**,因为这正是本版本
-「控制通道必须 Noise」这条规则对不按服务覆盖的客户端的含义。v0.11.1 的 harness
-是一次 method re-baseline,因此这些读数只在本方法内可比;可比性规则见
+从不重建。下图是本主机上的 v0.11.2 一轮 sweep,用 v0.11.2 二进制的默认值——每个
+会话 4 条隧道的多路复用池,控制通道使用固定 KK 的 Noise 密钥对(转发服务的
+数据通道默认继承它,除非 `data_enable = false`),以及从每条 TCP 访客的一条数据
+通道起步、只在路径背压下增长的动态条带。v0.11.2 的 harness 是一次 method
+re-baseline,因此这些读数只在本方法内可比;可比性规则见
 [基准测试](./docs/benchmarks.zh.md#可比性)。
 
-![molehill 与对端在阶段日程上的形态](assets/bench-v0.11.1-timeline.png)
+![molehill 与对端在阶段日程上的形态](assets/bench-v0.11.2-timeline.png)
 
 同一轮运行的小倍数视图——每个阶段一个面板,每个工具一根棒棒糖线:
 
-![逐阶段、逐工具的交互流 RTT](assets/bench-v0.11.1-stages.png)
+![逐阶段、逐工具的交互流 RTT](assets/bench-v0.11.2-stages.png)
 
 **逐阶段的交互流 RTT p99**(毫秒)。`clean` 之后的每个阶段都是被整形的——
 测试台装上了主导该阶段的队列或延迟——所以这些列不标注赢家。样本数与完整读法见
@@ -81,34 +82,34 @@ molehill 通过一台有公网 IP 的服务器，把 NAT 后设备上的服务�
 
 | 工具 | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean(重复) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 4.9 | 402.2 | 1069.1 | 2459.2 | 196.0 | 430.1 | 264.0 | 4.2 |
-| molehill (L3) | 1.5 | 401.4 | 1071.3 | 1775.5 | 195.8 | 442.8 | 299.0 | 1.5 |
-| frp | 1.2 | 401.3 | 1061.8 | 1461.4 | 196.0 | 431.7 | 286.8 | 1.2 |
-| rathole | 1.8 | 401.1 | 1063.2 | 2442.3 | 195.7 | 432.7 | 294.4 | 1.6 |
-| nps | 94.2 | 496.2 | 1073.0 | 4102.0 | 196.6 | 431.5 | 264.4 | 80.3 |
+| molehill (L4) | 30.8 | 401.3 | 1083.4 | 1463.5 | 196.2 | 433.9 | 268.5 | 11.9 |
+| molehill (L3) | 1.4 | 401.4 | 1057.4 | 1451.4 | 196.1 | 419.9 | 263.9 | 1.5 |
+| frp | 1.2 | 401.3 | 1064.8 | 2475.0 | 196.1 | 429.3 | 268.2 | 1.7 |
+| rathole | 1.7 | 401.0 | 1058.0 | 1897.1 | 198.7 | 430.4 | 276.2 | 1.7 |
+| nps | 201.2 | 415.6 | 1065.8 | 1460.7 | 196.3 | 431.5 | 301.1 | 18.3 |
 
 **逐阶段的批量吞吐**(Gbit/s,取自该阶段整个测量窗口,而非最好的那一秒)。
 
 | 工具 | clean | rtt100 | loss1 | loss5 | rate100 | rate20 | jitter | clean(重复) |
 |---|---|---|---|---|---|---|---|---|
-| molehill (L4) | 8.907 | 3.405 | 8.670 | 1.197 | 0.094 | 0.019 | 0.019 | 9.133 |
-| molehill (L3) | 5.859 | 3.170 | 5.001 | 1.011 | 0.093 | 0.019 | 0.019 | 5.883 |
-| frp | 5.949 | 3.383 | 6.049 | 1.074 | 0.094 | 0.019 | 0.019 | 5.964 |
-| rathole | 29.105 | 3.404 | 14.676 | 1.121 | 0.094 | 0.019 | 0.019 | 29.034 |
-| nps | 0.134 | 0.136 | 0.134 | 0.135 | 0.094 | 0.019 | 0.019 | 0.134 |
+| molehill (L4) | 8.641 | 3.370 | 6.950 | 1.136 | 0.094 | 0.019 | 0.019 | 7.066 |
+| molehill (L3) | 5.811 | 3.164 | 4.715 | 1.036 | 0.093 | 0.019 | 0.019 | 5.830 |
+| frp | 6.073 | 3.387 | 6.167 | 1.195 | 0.094 | 0.019 | 0.019 | 6.056 |
+| rathole | 29.038 | 3.401 | 14.746 | 1.202 | 0.094 | 0.019 | 0.019 | 29.153 |
+| nps | 0.134 | 0.136 | 0.134 | 0.136 | 0.094 | 0.019 | 0.019 | 0.134 |
 
 **怎么读。** `molehill (L3)` 是本项目的第二种架构,不是第五个工具:它的对照是
-`molehill (L4)` 与无工具的 control 臂。以上是本主机上的 v0.11.1 读数;只有同
+`molehill (L4)` 与无工具的 control 臂。以上是本主机上的 v0.11.2 读数;只有同
 模型、同方法、同主机的运行之间才可直接比较。阶段日程、这一轮自己的噪声下限、
 容量爬坡、漂移与成本图,以及如何复现,见[基准测试](./docs/benchmarks.zh.md)。
 
-想要数据面明文的部署,给每个服务设 `transport = { type = "plain" }`,同时保留
+想要数据面明文的部署,在客户端或该服务上设 `data_enable = false`,同时保留
 加密的控制通道;这个选择的代价见
 [基准测试](./docs/benchmarks.zh.md#每个配置选择的代价逐项实测)。
 
-这一轮其余的图与上面两张一起发布:`bench-v0.11.1-capacity.png`(负载爬坡)、
-`bench-v0.11.1-drift.png`(整轮运行中的 RSS、fd 与线程)和
-`bench-v0.11.1-cost.png`(每承载 1 Gbit 的 CPU 秒数)。
+这一轮其余的图与上面两张一起发布:`bench-v0.11.2-capacity.png`(负载爬坡)、
+`bench-v0.11.2-drift.png`(整轮运行中的 RSS、fd 与线程)和
+`bench-v0.11.2-cost.png`(每承载 1 Gbit 的 CPU 秒数)。
 
 ## 快速开始
 
@@ -136,8 +137,9 @@ allow_ports = ["5202"]
 bind_addr = "0.0.0.0:2333" # molehill 监听客户端连接的端口
 
 # 必需：控制通道始终使用 Noise
-[server.transport.noise]
-local_private_key = "2wOFku4PdLhcWQyqUXBWRrKhQV72S/9rkN9jktqiUS8=" # security-scan:allow documentation example key
+[server.noise]
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=" # example key # security-scan:allow documentation example key
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # example key # security-scan:allow documentation example key
 ```
 
 然后运行:
@@ -158,12 +160,11 @@ default_token = "use_a_secret_that_only_you_know" # 必须和服务端的 `defau
 [client.control]
 default_remote_addr = "myserver.com:2333" # 服务器的地址，端口必须和 `server.control.bind_addr` 中的端口一致
 
-[client.transport]
-type = "noise"
 
 # 服务端的公钥，来自 `molehill --genkey`
-[client.transport.noise]
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # security-scan:allow documentation example key
+[client.noise]
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=" # example key # security-scan:allow documentation example key
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # example key # security-scan:allow documentation example key
 
 [client.services.my_nas_ssh]
 local_addr = "127.0.0.1:22" # 需要被转发的服务地址

@@ -1,8 +1,6 @@
 #[cfg(feature = "client")]
 use crate::common::helper::to_socket_addr;
 use crate::common::helper::try_set_tcp_keepalive;
-#[cfg(feature = "client")]
-use crate::config::ClientServiceConfig;
 use crate::config::TransportConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -13,12 +11,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tracing::{error, trace};
 
-pub const DEFAULT_NODELAY: bool = true;
-
 pub const DEFAULT_KEEPALIVE_SECS: u64 = 20;
 pub const DEFAULT_KEEPALIVE_INTERVAL: u64 = 8;
 
 #[derive(Clone)]
+#[doc(hidden)]
 pub struct AddrMaybeCached {
     pub addr: String,
     pub socket_addr: Option<SocketAddr>,
@@ -26,6 +23,7 @@ pub struct AddrMaybeCached {
 
 impl AddrMaybeCached {
     #[cfg(feature = "client")]
+    #[must_use]
     pub fn new(addr: &str) -> AddrMaybeCached {
         AddrMaybeCached {
             addr: addr.to_string(),
@@ -34,6 +32,11 @@ impl AddrMaybeCached {
     }
 
     #[cfg(feature = "client")]
+    /// Resolve the address to one socket address.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the name does not resolve.
     pub async fn resolve(&mut self) -> Result<()> {
         match to_socket_addr(&self.addr).await {
             Ok(s) => {
@@ -56,6 +59,7 @@ impl Display for AddrMaybeCached {
 
 /// Specify a transport layer: plain TCP or Noise.
 #[async_trait]
+#[doc(hidden)]
 pub trait Transport: Debug + Send + Sync {
     type Acceptor: Send + Sync;
     type RawStream: Send + Sync;
@@ -97,11 +101,7 @@ pub use noise::NoiseTransport;
 #[cfg(feature = "noise")]
 pub(crate) mod noise_stream;
 #[cfg(feature = "noise")]
-pub(crate) use noise_stream::NoiseStream;
-/// Noise session resume: a reconnect that skips the handshake's DH turns.
-/// Both the TCP and the KCP Noise paths go through it.
-#[cfg(feature = "noise")]
-pub(crate) mod noise_resume;
+pub use noise_stream::NoiseStream;
 // Key material: the Noise transport, the server's dual-transport accept,
 // and the KCP tunnel path (Noise-over-KCP) all build sessions from it.
 #[cfg(feature = "noise")]
@@ -176,24 +176,18 @@ impl SocketOpts {
     /// Socket options for the legs of a forwarded service: the data channels
     /// on both ends and, on the server, the visitor-facing sockets.
     ///
-    /// Defaults are latency-friendly: when the per-service `nodelay` option is
-    /// unset, `TCP_NODELAY` is enabled (Nagle off) — otherwise interactive
-    /// traffic like SSH suffers Nagle x delayed-ACK stalls. TCP keepalive is
-    /// also enabled by default so pooled idle data channels don't hand out
+    /// Latency-friendly and fixed: `TCP_NODELAY` is always on — otherwise
+    /// interactive traffic like SSH suffers Nagle x delayed-ACK stalls — and
+    /// TCP keepalive is enabled so pooled idle data channels don't hand out
     /// silently-dead connections to visitors.
-    pub fn for_service(nodelay: Option<bool>) -> SocketOpts {
+    pub fn for_service() -> SocketOpts {
         SocketOpts {
-            nodelay: Some(nodelay.unwrap_or(DEFAULT_NODELAY)),
+            nodelay: Some(true),
             keepalive: Some(Keepalive {
                 keepalive_secs: DEFAULT_KEEPALIVE_SECS,
                 keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             }),
         }
-    }
-
-    #[cfg(feature = "client")]
-    pub fn from_client_cfg(cfg: &ClientServiceConfig) -> SocketOpts {
-        Self::for_service(cfg.nodelay)
     }
 
     pub fn apply(&self, conn: &TcpStream) {

@@ -7,6 +7,7 @@ allow_ports = ["6999-6000"]
 [server.control]
 bind_addr = "0.0.0.0:2333"
 
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture key
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
 
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

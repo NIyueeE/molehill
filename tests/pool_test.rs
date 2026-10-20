@@ -1,13 +1,12 @@
-//! The shared pinned pool (M2a): one pool per `(session, carrier)` when
-//! `[client.data].shared_pool` is on, per service when it is off, and the S1
-//! observation that makes the policy falsifiable.
+//! The session's one pinned pool: every service of a control session draws
+//! on the same `[client.data].tunnels` connections, and the S1 observation
+//! that makes the policy falsifiable.
 //!
-//! The pool is **pinned**: it establishes `[client.data.tcp|kcp].tunnels`
-//! (default 4, raised to the services' UDP-derived floor) at service start and
-//! keeps them for the service's lifetime. It never grows for load and never
-//! shrinks when idle; repairing a dead tunnel until the count is met again is
-//! the only establishment after service start, and placement — 56 streams per
-//! tunnel — is the only oversubscription protection.
+//! The pool is **pinned**: it establishes `[client.data].tunnels` (default 4)
+//! at service start and keeps them for the session's lifetime. It never grows
+//! for load and never shrinks when idle; repairing a dead tunnel until the
+//! count is met again is the only establishment after service start, and
+//! placement — 56 streams per tunnel — is the only oversubscription protection.
 //!
 //! The pool's own state is what these tests assert on
 //! ([`molehill_rathole::live_pools`]): a snapshot is exactly what the
@@ -36,7 +35,6 @@ use anyhow::{Ok, Result, anyhow};
 use common::{PING, run_molehill_client, run_molehill_server};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::{
@@ -175,12 +173,11 @@ fn spawn_tcp_backends() {
     }
 }
 
-/// `[client.data].shared_pool = true`: two services of one client are served
-/// by **one** pool, and it carries both services' channels. Both services
-/// forward, or a shared pool would only prove that a broken service shares a
-/// broken pool.
+/// Two services of one client are served by **one** pool, and it carries both
+/// services' channels. Both services forward, or one pool would only prove
+/// that a broken service shares a broken pool.
 #[tokio::test]
-async fn a_shared_pool_serves_two_services_of_one_session() -> Result<()> {
+async fn one_pool_serves_two_services_of_one_session() -> Result<()> {
     init();
     spawn_tcp_backends();
 
@@ -207,21 +204,21 @@ async fn a_shared_pool_serves_two_services_of_one_session() -> Result<()> {
     assert_eq!(
         pools.len(),
         1,
-        "two services with `shared_pool = true` must share one pool, got {pools:?}"
+        "two services of one session must share one pool, got {pools:?}"
     );
     let pool = &pools[0];
     assert_eq!(
         pool.key, "session:127.0.0.1:2380",
-        "a shared pool is keyed by the session and its data endpoint (the carrier is a\
+        "the pool is keyed by the session and its data endpoint (the carrier is a\
          property of the pool, not of its name)"
     );
     assert!(
         pool.size >= 1 && pool.streams() > 0,
-        "the shared pool must be serving both services' channels: {pool:?}"
+        "the pool must be serving both services' channels: {pool:?}"
     );
     assert_eq!(
         pool.size, pool.count,
-        "a pinned shared pool holds exactly the count it was configured with: {pool:?}"
+        "a pinned pool holds exactly the count it was configured with: {pool:?}"
     );
 
     // Still one pool, and still serving, after both services have taken
@@ -232,7 +229,7 @@ async fn a_shared_pool_serves_two_services_of_one_session() -> Result<()> {
     assert_eq!(after.len(), 1, "the pools must not multiply under traffic");
     assert!(
         after[0].streams() > 0,
-        "a serving shared pool must report its live streams: {:?}",
+        "a serving pool must report its live streams: {:?}",
         after[0]
     );
 
@@ -240,82 +237,6 @@ async fn a_shared_pool_serves_two_services_of_one_session() -> Result<()> {
     server_shutdown_tx.send(true)?;
     let _ = tokio::join!(client, server);
     Ok(())
-}
-
-/// `[client.data].shared_pool = false` (the default): every service keeps its
-/// own pool. The control for the test above — the same fixture, one key
-/// different.
-#[tokio::test]
-async fn without_shared_pool_every_service_keeps_its_own() -> Result<()> {
-    init();
-    spawn_tcp_backends();
-
-    let variant = write_client_variant("tests/for_tcp/shared_pool.toml", "false")?;
-    let path = variant.to_string_lossy().into_owned();
-
-    let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
-    let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
-    let client_path = path.clone();
-    let client = tokio::spawn(async move {
-        run_molehill_client(&client_path, client_shutdown_rx)
-            .await
-            .unwrap();
-    });
-    settle(1.0).await;
-    let server_path = path.clone();
-    let server = tokio::spawn(async move {
-        run_molehill_server(&server_path, server_shutdown_rx)
-            .await
-            .unwrap();
-    });
-
-    wait_for_tcp(POOL_ALPHA).await?;
-    wait_for_tcp(POOL_BETA).await?;
-
-    let pools = molehill_rathole::live_pools();
-    assert_eq!(
-        pools.len(),
-        2,
-        "without `shared_pool` every service keeps its own pool: {pools:?}"
-    );
-    for pool in &pools {
-        assert!(
-            pool.key.starts_with("service:"),
-            "a per-service pool is keyed by the service: {pool:?}"
-        );
-    }
-
-    client_shutdown_tx.send(true)?;
-    server_shutdown_tx.send(true)?;
-    let _ = tokio::join!(client, server);
-    let _ = std::fs::remove_file(&variant);
-    Ok(())
-}
-
-/// Materialize a copy of `config_path` with `shared_pool` forced to `value`.
-fn write_client_variant(config_path: &str, value: &str) -> Result<PathBuf> {
-    let source = std::path::Path::new(config_path);
-    let contents = std::fs::read_to_string(source)?;
-    let mut doc: toml::Value = toml::from_str(&contents)?;
-    let data = doc
-        .get_mut("client")
-        .and_then(|c| c.get_mut("data"))
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("{config_path} has no [client.data] table"))?;
-    data.insert(
-        "shared_pool".to_owned(),
-        toml::Value::Boolean(value == "true"),
-    );
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("pool");
-    let variant = std::env::temp_dir().join(format!(
-        "molehill_pool_{stem}_{}_{value}.toml",
-        std::process::id()
-    ));
-    std::fs::write(&variant, toml::to_string(&doc)?)?;
-    Ok(variant)
 }
 
 /// The UDP invariant a pinned pool has to hold (D30): the pool is established
@@ -381,15 +302,7 @@ async fn udp_source_port_survives_a_pinned_pool() -> Result<()> {
     });
     assert_eq!(
         pool.count, 3,
-        "the fixture's `tunnels` is the starting width: {pool:?}"
-    );
-    assert!(
-        pool.count >= pool.udp_floor,
-        "the configured count must cover the UDP-derived floor of its workers: {pool:?}"
-    );
-    assert_eq!(
-        pool.udp_floor, 2,
-        "the fixture's two UDP workers are the pool's floor: {pool:?}"
+        "the fixture's `tunnels` is the session's pool width: {pool:?}"
     );
 
     // Keep the peer talking across the window in which the pool used to shrink
@@ -409,10 +322,6 @@ async fn udp_source_port_survives_a_pinned_pool() -> Result<()> {
         assert_eq!(
             pool.size, pool.count,
             "a pinned pool must not resize around the pinned peer: {pool:?}"
-        );
-        assert!(
-            pool.size >= pool.udp_floor,
-            "the pool must never drop below the floor its workers need: {pool:?}"
         );
         assert_eq!(
             (pool.grows, pool.shrinks),
@@ -684,7 +593,7 @@ async fn a_pinned_pool_starts_at_its_count_and_stays_there() -> Result<()> {
 }
 
 /// The operator's valve (D14), end to end: the server's
-/// `[server.data].max_tunnels_per_client = 1` refuses one of the two tunnels
+/// `[server.data].max_tunnels = 1` refuses one of the two tunnels
 /// the client's own count (`tunnels = 2`) asks for when the service starts, and
 /// the refusal is non-fatal — the tunnel the client got keeps carrying its
 /// visitors, the session is never closed, and the pool keeps trying for the
@@ -778,7 +687,7 @@ async fn the_server_tunnel_valve_refuses_a_startup_establishment() -> Result<()>
 /// A stream past the engine's cap is refused on its own now, but the refusal
 /// is a failed visitor and the vendored engine logs an unguarded `error!`
 /// first — so the load that matters is the one the pool cannot relieve by
-/// adding a tunnel. The server's valve (`max_tunnels_per_client = 1`) is
+/// adding a tunnel. The server's valve (`max_tunnels = 1`) is
 /// exactly that state: the client asked for two and holds one, and this
 /// scenario puts more concurrent visitors on it than one tunnel may carry.
 ///
@@ -932,9 +841,29 @@ async fn a_saturated_pool_still_serves_the_next_visitor() -> Result<()> {
     settle(2.0).await;
 
     // Return the capacity: every held visitor goes away, so the tunnel is
-    // empty again.
+    // empty again. A group's channels come back when its own tasks end, which
+    // is asynchronous (the visitor's EOF crosses the group first), so wait for
+    // the pool to report it rather than assuming one sleep is enough. This is
+    // also the regression guard for the release path: a group that ends by
+    // aborting one direction must still drop its streams, or the capacity it
+    // took never returns.
     drop(held);
-    settle(2.0).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if molehill_rathole::live_pools()
+            .first()
+            .is_none_or(|pool| pool.streams() == 0)
+        {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the pool must get its streams back within 15 s of the visitors leaving: {:?}",
+            molehill_rathole::live_pools()
+        );
+        settle(0.1).await;
+    }
+    settle(0.2).await;
 
     let pools = molehill_rathole::live_pools();
     if let Some(pool) = pools.first() {
@@ -1126,8 +1055,9 @@ fn write_stats_pair(
              [server.control]\n\
              bind_addr = \"{control}\"\n\
              \n\
-             [server.transport.noise]\n\
-             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n\
+             [server.noise]\n\
+             public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+             private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n\
              {valve_block}"
         ),
     )
@@ -1141,14 +1071,12 @@ fn write_stats_pair(
              [client.control]\n\
              default_remote_addr = \"{control}\"\n\
              \n\
-             [client.transport]\n\
-             type = \"noise\"\n\
+             [client.noise]\n\
+             private_key = \"8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=\"\n\
              \n\
-             [client.transport.noise]\n\
-             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+             public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              \n\
              [client.data]\n\
-             shared_pool = true\n\
              tunnels = {tunnels}\n\
              \n\
              [client.services.echo]\n\
@@ -1164,7 +1092,7 @@ fn write_stats_pair(
 /// visitor through it, and return everything the client printed.
 ///
 /// `tunnels` is the client's `[client.data].tunnels`; `valve` is the
-/// server's `[server.data].max_tunnels_per_client` when the scenario wants the
+/// server's `[server.data].max_tunnels` when the scenario wants the
 /// valve to bite. The pairing is what lets one runner measure both the healthy
 /// establishment and the refused one.
 #[cfg(native_target)]
@@ -1180,7 +1108,7 @@ async fn run_binary_pair(
     let exposed = format!("127.0.0.1:{exposed_port}");
     let pool_key = format!("session:{control}");
     let valve_block = valve.map_or_else(String::new, |n| {
-        format!("\n[server.data]\nmax_tunnels_per_client = {n}\n")
+        format!("\n[server.data]\nmax_tunnels = {n}\n")
     });
 
     let (server_cfg, client_cfg) = write_stats_pair(&control, exposed_port, tunnels, &valve_block);
@@ -1380,11 +1308,10 @@ fn write_handover_fixture(control_port: u16, exposed_port: u16) -> (String, Stri
              [client.control]\n\
              default_remote_addr = \"{control}\"\n\
              \n\
-             [client.transport]\n\
-             type = \"noise\"\n\
+             [client.noise]\n\
+             private_key = \"8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE=\"\n\
              \n\
-             [client.transport.noise]\n\
-             remote_public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
+             public_key = \"mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=\"\n\
              \n\
              [client.data]\n\
              tunnels = 2\n\
@@ -1400,8 +1327,9 @@ fn write_handover_fixture(control_port: u16, exposed_port: u16) -> (String, Stri
              [server.control]\n\
              bind_addr = \"{control}\"\n\
              \n\
-             [server.transport.noise]\n\
-             local_private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
+             [server.noise]\n\
+             public_key = \"zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE=\"\n\
+             private_key = \"kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=\"\n"
         ),
     )
     .unwrap();

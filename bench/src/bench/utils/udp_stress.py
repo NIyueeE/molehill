@@ -119,7 +119,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--visitors", type=int, default=16, help="visitors in the flat-out step"
     )
     p.add_argument("--secs", type=float, default=8.0, help="seconds per step")
-    p.add_argument("--workers", type=int, default=2, help="the service's udp_workers")
+    p.add_argument(
+        "--workers", type=int, default=2, help="the service's max_udp_workers"
+    )
     p.add_argument("--out", type=Path, help="write the numbers here as JSON")
     return p.parse_args(argv)
 
@@ -144,7 +146,7 @@ def write_configs(dirpath: Path, workers: int) -> tuple[Path, Path, int, int]:
         'protocol = "udp"\n'
         f'local_addr = "127.0.0.1:{backend}"\n'
         f'remote_bind_addr = "127.0.0.1:{exposed}"\n'
-        f"udp_workers = {workers}\n"
+        f"max_udp_workers = {workers}\n"
     )
     return server, client, exposed, backend
 
@@ -366,7 +368,7 @@ def measure(args: argparse.Namespace) -> dict:
         "work": str(work),
         "packet_bytes": PACKET,
         "worker_queue": WORKER_QUEUE,
-        "udp_workers": args.workers,
+        "max_udp_workers": args.workers,
         "steps": steps,
         "verdict": verdict(ramp, steps, many, control),
     }
@@ -375,7 +377,8 @@ def measure(args: argparse.Namespace) -> dict:
 def report(record: dict) -> None:
     print(
         f"# per-worker queue = {record['worker_queue']} datagrams, "
-        f"udp_workers = {record['udp_workers']}, {record['packet_bytes']} B payloads; "
+        f"max_udp_workers = {record['max_udp_workers']}, "
+        f"{record['packet_bytes']} B payloads; "
         "the sink is a separate receive-only process"
     )
     print(

@@ -1,184 +1,131 @@
-# 传输层
+# 传输
 
-控制通道永远使用 Noise(它发布的会话 nonce 是数据通道认证所用的凭证,
-明文控制段等于把数据面凭证交给路径上的所有人)。客户端的
-`[client.transport]` 块支持两种类型——`plain` 与 `noise`——**由客户端
-决定数据面**:每条连接以 1 字节传输选择器开头,服务端接受客户端说的任何一种
-语言(服务端的 `[server.transport]` 块只放置 Noise 密钥,没有服务端侧的
-`type`)。noise 对比明文的 benchmark 就是这份选择的价目表:见
-[benchmarks.zh.md](benchmarks.zh.md#每个配置选择的代价逐项实测)。本文只讲
-`noise`;`plain` 除默认值外无需任何配置。
+控制通道永远是 Noise,而且只有一种握手:
+**Noise_KK_25519_ChaChaPoly_BLAKE2s**。KK 双向认证——客户端知道服务端的静态
+公钥,服务端也知道客户端的——所以中间人无法冒充任何一端,配置里也没有可选的
+匿名套件。本页讲密钥、唯一的数据加密开关,以及按服务和 L3 的覆盖。已移除的表
+见[配置](configuration.zh.md#迁移到-0112每条会话一个池)。
 
 ## Noise 协议
 
-[Noise 协议](http://noiseprotocol.org/noise.html)是轻量、易配置的传输加密
-方式:一对 X25519 密钥对,不需要 PKI。
-
-`molehill` 自带合理的默认配置;见[noise 示例](./deployment.zh.md#noise加密传输)。默认
-pattern `Noise_NK_25519_ChaChaPoly_BLAKE2s` 对服务端进行认证,因此中间人
-(MITM)无法冒充服务端。
-
-> **ring-accelerated 带来了什么。** 默认构建链接了 `snow` 的
-> **ring-accelerated** resolver,于是 ChaCha20-Poly1305 数据路径——每个
-> 加密字节的热路径——走 ring 的硬件分派实现:x86-64 上传输层实测约为
-> 纯 Rust resolver 的 1.5 倍,端到端约 1.3 倍。pattern 的哈希(默认
-> BLAKE2s,其他 pattern 用 SHA-256/SHA-512)只在一次性握手中运行,不影响
-> 吞吐:所有 pattern 都走加速后的密码算法。线缆格式不变。
-
-使用它需要一个 X25519 密钥对。
+[Noise 协议](http://noiseprotocol.org/noise.html)是一种轻量、易配置的连接
+加密方式:X25519 密钥,不需要 PKI。每次握手都是新的,因此每条连接派生出自己
+的密钥。
 
 ### 生成密钥对
 
-运行 `molehill --genkey`,生成一对 X25519 密钥(这是随包发布的 `snow`
-后端唯一提供的曲线):
+在每台主机上运行 `molehill --genkey`,它会打印 X25519 私钥与对应公钥:
 
-```sh
+`sh
 $ molehill --genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 
 Public Key:
 GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE=
-```
+`
 
-(不要使用网上出现的密钥对,包括上面这一对。)
+(不要使用来自互联网的密钥对,包括上面这一对。)每台主机保留自己的私钥,写
+**对方**的公钥。
 
-服务端保留私钥用于标识自己,客户端保留公钥用于验证服务端:
+`toml
+# 服务端
+[server.noise]
+private_key = "服务端的私钥"
+public_key = "客户端的公钥"
 
-```toml
 # 客户端
-[client.transport]
-type = "noise"
-[client.transport.noise]
-remote_public_key = "GQYTKSbWLBUSZiGfdWPSgek9yoOuaiwGD/GIX8Z1kkE="
+[client.noise]
+private_key = "客户端的私钥"
+public_key = "服务端的公钥"
+data_enable = true
+`
 
-# 服务端(只有密钥,没有 `type`;是否加密由客户端选择决定)
-[server.transport.noise]
-local_private_key = "cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q="
-```
+两个块里的两把密钥都必填,且都必须解码为 32 字节,否则守护进程拒绝启动并点
+名该块与该键。同一对密钥也用于数据面,所以通常每台主机一对密钥。
 
-### 按服务加密
+### 固定握手
 
-有一种客户端模式没有加密可配:透明(L3)客户端永远是明文,因为它承载的是整个
-IP 包,内容由访问者自己的端到端保护负责,这一跳按设计就是明文链路。这是结构性的,
-不是一条规则——它的 `[transparent.transport]` 表只有 `proxy` 键,没有任何放密码
-的地方,想要求加密也无处可写——见[配置文档](./configuration.zh.md#透明l3服务)。
-服务端接受什么不受影响:它的 Noise 键仍然作用于每一个协商了 Noise 的客户端,
-而 L3 客户端从不会协商。
+没有 `pattern` 键,没有 `psk` / `psk_location`,没有
+`resume`,也没有拨号代理。所有构建都用 KK + ChaCha20-Poly1305 +
+BLAKE2s;仍写这些键的配置会被拒绝,并给出替代写法(或说明没有替代)。BLAKE2s
+只在一次性握手中运行;ChaCha20-Poly1305 数据路径由 ring 加速,每个会话相同。
 
-客户端全局的 `[client.transport].type` 是每个服务的默认值,每个服务都可以
-单独覆盖——包括自己的密钥,这正是多服务端场景需要的(每个服务端持有自己的
-密钥对):
+### 控制通道与数据通道
 
-```toml
-[client.transport]
-type = "noise"            # 默认:所有服务加密
-[client.transport.noise]
-remote_public_key = "server-a-pub-key"
+**控制通道永远用客户端密钥对加密**。它发布数据通道认证所用的会话 nonce,明文
+控制段等于把该凭证交给路径上的所有人;服务端会在连接到达时拒绝明文控制通道。
 
-[client.services.ssh]     # 继承:用全局密钥加密
+**数据通道**由 `data_enable` 决定:
+
+- `true`(客户端默认)把每条 TCP 隧道、直连通道和 KCP 会话都包进同一个
+  KK 记录流。两端为每个字节支付密码学 CPU,路径上学不到转发载荷的任何信息。
+- `false` 让数据通道走明文。此时访客自己的 TLS/SSH 就是端到端保护,
+  这一跳不再为第二次加密花 CPU。控制通道无论如何都是加密的。
+
+`toml
+[client.noise]
+private_key = "客户端的私钥"
+public_key = "服务端的公钥"
+data_enable = false # 数据通道走明文;控制通道仍为 KK
+`
+
+服务端不需要开关:它在同一个监听器上接受选择 `data_enable = false` 的客户端的
+明文数据通道,以及其他客户端的 Noise 数据通道。
+
+### 按服务覆盖
+
+转发服务可以覆盖密钥对(用另一套密钥连另一台服务器)和数据开关。未设置的字段
+继承 `[client.noise]`:
+
+`toml
+[client.services.ssh]              # 继承客户端密钥对与 data_enable
 
 [client.services.bulk]
-transport = { type = "plain" }   # 退出:明文
+[client.services.bulk.noise]
+data_enable = false                # 这个服务的数据通道走明文
 
-[client.services.region-b]       # 全局明文 + 本服务加密
+[client.services.region-b]
 remote_addr = "region-b.example.com:2333"
-transport = { type = "noise", noise = { remote_public_key = "server-b-pub-key" } }
-```
+[client.services.region-b.noise]
+private_key = "这个客户端的另一把私钥"
+public_key = "region-b 的公钥"
+`
 
-规则:`transport.type` 不设则跟随全局 `type`;`"noise"` 强制加密,`"plain"`
-强制明文。有效传输为 Noise 的服务必须要有密钥——优先用自己
-`transport.noise` 的密钥,否则用全局 `[client.transport].noise`;有效
-Noise 但任何地方都没有密钥是启动错误。数据面跟随服务:TCP 隧道以及
-以及其 KCP 会话的 Noise-over-KCP 包裹,都用该服务的有效密钥。服务端
-只需要放置自己的密钥(传输选择器:它接受每条连接所说的语言)。
+密钥对是会话的身份:端点相同、密钥对相同的服务共用一条控制连接,不同的密钥对
+得到自己的会话。单靠 `data_enable` 永远不会拆分会话。
 
-### 指定 pattern
+### 透明(L3)客户端
 
-默认 pattern 满足大多数场景,但其他 pattern 也有用武之地:
+L3 客户端把同样的三个键写在 `[transparent.noise]` 下。它的控制通道是 KK;
+lane 默认**明文**(`data_enable = false`),因为 lane 承载的是访客自己的
+IP 包,访客的 TLS 就是端到端保护:
 
-**无认证**(`Noise_XX_...`):加密流量但不提供认证,因此对 MITM 攻击
-脆弱,但能抵抗嗅探与重放攻击。在无需担心 MITM 时使用:
+`toml
+[transparent.noise]
+private_key = "客户端的私钥"
+public_key = "服务端的公钥"
+data_enable = false
 
-```toml
-[server.transport.noise]
-pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
 
-[client.transport.noise]
-pattern = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
-```
+[transparent.claims.web.noise]
+data_enable = true                 # 只加密这个 claim 的 lane
+`
 
-**双向认证**(`Noise_KK_...`):两端互相认证:
+claim 也可以覆盖密钥对去连第二台服务器;未设置的字段继承
+`[transparent.noise]`。
 
-```toml
-[server.transport.noise]
-pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "server-priv-key-here"
-remote_public_key = "client-pub-key-here"
+### 迁移
 
-[client.transport.noise]
-pattern = "Noise_KK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "client-priv-key-here"
-remote_public_key = "server-pub-key-here"
-```
-
-### 预共享密钥
-
-`psk` 与 `psk_location` 为握手增加预共享密钥。只有配置的 `pattern` 在
-`psk_location` 处带有 PSK 修饰符(如 `Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s`)
-时才会使用它;pattern 不含 PSK 时该值被静默忽略,而不是被拒绝。密钥 base64
-解码后必须恰好是 32 字节(在建立握手时检查),且两端使用相同的 `psk` 与
-`psk_location`:
-
-```toml
-[server.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "server-priv-key-here"
-remote_public_key = "client-pub-key-here"
-psk = "the-same-32-byte-key-in-base64"
-psk_location = 0
-
-[client.transport.noise]
-pattern = "Noise_KKpsk0_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "client-priv-key-here"
-remote_public_key = "server-pub-key-here"
-psk = "the-same-32-byte-key-in-base64"
-psk_location = 0
-```
-
-### Noise 会话恢复
-
-双方都设置 `resume = true`(默认关闭)时,重连不再重跑握手的密钥交换:
-完整握手结束后,服务端签发一张票据(用由其 Noise 静态私钥派生的密钥封存),
-客户端把票据与会话握手摘要一起缓存。下次连接时,客户端带上票据、一个新
-nonce 和证明自己持有该摘要的 MAC;服务端校验通过后,双方用缓存摘要加两个
-全新 nonce(HKDF-SHA256 over ChaCha20-Poly1305)派生新的记录密钥。这条连接
-以传输选择器 `0x02`(而非 `0x01`)开头;不认识该选择器的对端会拒绝它,
-客户端随即回退到完整握手(并重新取得票据)。
-
-在本机测量(release 构建,双工管道上的进程内配对,默认 pattern):完整握手
-加票据交换每对 442.7 us,恢复交换 38.5 us——握手的密钥交换占建连 CPU 的
-约 97%,而恢复正好去掉它们。剩余开销是对称加密加两个往返。
-
-代价是前向保密:原始会话保留其 DH 派生密钥,但恢复会话的密钥由缓存摘要
-派生,因此日后服务端静态密钥(或客户端缓存)一旦泄露,恢复会话的流量也会
-受影响。这是会话恢复的标准取舍——当每条连接的前向保密比重连时延更重要
-时,保持 `resume = false`(默认)。票据 24 小时后过期,且重复的
-`(票据, nonce)` 会被拒绝,因此捕获到的恢复请求无法重放或跨会话复用。
-
-```toml
-[server.transport.noise]
-local_private_key = "server-priv-key-here"
-resume = true
-
-[client.transport.noise]
-remote_public_key = "server-pub-key-here"
-resume = true
-```
-
-### 其他 pattern
-
-要弄清该用哪个 pattern,请参考:
-
-- [7.5. 交互式握手 pattern(基础)](https://noiseprotocol.org/noise.html#interactive-handshake-patterns-fundamental)
-- [8. 协议名与修饰符](https://noiseprotocol.org/noise.html#protocol-names-and-modifiers)
+旧的 `[client.transport]`、`[server.transport]` 与
+`[transparent.transport]` 表分别移到 `[client.noise]`、
+`[server.noise]` 与 `[transparent.noise]`;
+`local_private_key` 变成 `private_key`,
+`remote_public_key` 变成 `public_key`。现在的握手需要两端的密钥,
+所以要在 `[server.noise]` 里补上客户端的公钥,在 `[client.noise]` 里
+补上客户端的私钥。`type = "noise"` 变成不写 `data_enable`(默认
+true);`type = "plain"` 变成 `data_enable = false`;
+`[client.services.<name>.transport]` 变成
+`[client.services.<name>.noise]`。

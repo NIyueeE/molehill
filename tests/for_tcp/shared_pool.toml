@@ -1,8 +1,8 @@
-# The shared pinned pool (M2a): two services of one client share one pool
-# when `[client.data].shared_pool` is on, and the pool's own state — its
-# establishment, its placement, its pinned peers — is what the assertions
-# read. `tunnels = 4` is the count the pool establishes at service start and
-# keeps: it neither grows for load nor shrinks when idle.
+# One pinned pool for a session (M2a): two services of one client draw on the
+# same pool, and the pool's own state — its establishment, its placement, its
+# pinned peers — is what the assertions read. `tunnels = 4` is the count the
+# pool establishes at service start and keeps: it neither grows for load nor
+# shrinks when idle.
 #
 # One client per process: the client's live pools are a process-global
 # registry, so running two scenarios in one process would mix their pools.
@@ -15,16 +15,12 @@ default_token = "default_token_if_not_specify" # security-scan:allow fixture pla
 [client.control]
 default_remote_addr = "127.0.0.1:2380"
 
-[client.transport]
-type = "noise"
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
 
-
-[client.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [client.data]
-shared_pool = true
-
 tunnels = 4
 
 [client.services.alpha]
@@ -42,6 +38,6 @@ allow_ports = ["2381-2382"]
 [server.control]
 bind_addr = "127.0.0.1:2380"
 
-
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

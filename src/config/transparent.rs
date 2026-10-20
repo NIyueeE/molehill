@@ -18,14 +18,13 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use url::Url;
 
 use crate::common::constants::DEFAULT_CLAIM_LANES;
 #[cfg(feature = "multiplex")]
 use crate::config::parsing::ClientDataConfig;
 use crate::config::parsing::{
-    ClientConfig, ClientControlConfig, ClientServiceConfig, ClientServiceTransportConfig,
-    MaskedString, NoiseConfig, ServiceType, TransportConfig, TransportType, default_tun_name,
+    ClientConfig, ClientControlConfig, ClientNoiseConfig, ClientServiceConfig, MaskedString,
+    ServiceNoiseConfig, ServiceType, default_tun_name,
 };
 
 /// `[transparent]`: the whole configuration of an L3 client.
@@ -38,18 +37,28 @@ use crate::config::parsing::{
 pub struct TransparentClientConfig {
     /// Shared secret, must match `[server].default_token`. Required.
     pub default_token: MaskedString,
-    /// The TUN device this client attaches to. On Linux the operator creates
-    /// it and owns its addresses and routes. On macOS the daemon creates the
-    /// utun and assigns the claimed addresses, while the operator owns the pf
-    /// rule and routes. `auto` (the macOS default) picks a free `utunN`.
+    /// The TUN device this client attaches to. On Linux the daemon creates a
+    /// missing device and assigns each claimed address that is not already on
+    /// it; an existing device is used as it is, so pre-create it to choose its
+    /// MTU. The operator owns the policy rule and routes. On macOS the daemon
+    /// creates the utun and assigns the claimed addresses, while the operator
+    /// owns the pf rule and routes. `auto` (the macOS default) picks a free
+    /// `utunN`.
     #[serde(default = "default_tun_name")]
     pub tun: String,
     #[serde(default)]
     pub control: ClientControlConfig,
     #[serde(default)]
     pub data: TransparentDataConfig,
+    /// The KK key pair the control channel always uses, and the default for
+    /// the lanes: `[transparent.noise].data_enable` defaults to `false`, so
+    /// a lane carries the visitor's packets as they are unless asked otherwise.
+    pub noise: ClientNoiseConfig,
+    /// The optional read-only status API (`[transparent.status]`), the same
+    /// shape as `[client.status]`: absent means off, present needs a bind
+    /// address and a non-empty bearer token.
     #[serde(default)]
-    pub transport: TransparentTransportConfig,
+    pub status: Option<crate::config::parsing::StatusConfig>,
     /// The public addresses this client claims, one per named entry.
     pub claims: HashMap<String, TransparentClaimConfig>,
     /// The forwarding-shaped config this block lowers to, filled by
@@ -80,10 +89,11 @@ pub struct TransparentClaimConfig {
     /// only: the claim's control channel (and, by default, its data plane)
     /// dials this server instead of the client-wide one.
     pub remote_addr: Option<String>,
-    /// Override `[transparent.control].default_retry_interval` for this claim.
-    pub retry_interval: Option<u64>,
-    /// Override `[transparent.data].tunnels` for this claim only: its lanes.
-    pub tunnels: Option<u16>,
+    /// Override `[transparent.control].retry_backoff_max` for this claim.
+    pub retry_backoff_max: Option<u64>,
+    /// Per-claim Noise overrides: a claim may dial another server with its own
+    /// key pair, or flip its lanes' encryption without touching its siblings.
+    pub noise: Option<ServiceNoiseConfig>,
 }
 
 /// Data-plane knobs for a claim (`[transparent.data]`).
@@ -150,38 +160,6 @@ impl Default for TransparentDataConfig {
     }
 }
 
-/// How this client reaches its server (`[transparent.transport]`).
-///
-/// What an L3 client sends is whole IP packets whose content is the visitor's
-/// own, so a **lane** is plain unless the operator turns the crypto on — the
-/// visitor's TLS is the end-to-end protection, and per-packet encryption
-/// spends CPU the carried flows may not have asked for. The control channel
-/// is a different matter and not this table's to turn off: it always speaks
-/// Noise, because the session nonce it publishes is the credential every lane
-/// authenticates with.
-///
-/// `type = "noise"` encrypts the lanes with the **control channel's key pair
-/// and pattern** by default — one key pair per host, inherited, so a config
-/// that asks for encrypted lanes writes no key material of its own. A claim
-/// whose keys differ from the control channel's overrides with its own
-/// `[transparent.transport.noise]` block instead.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Default)]
-#[serde(deny_unknown_fields)]
-pub struct TransparentTransportConfig {
-    /// Proxy used to reach the server (`http` / `socks5`).
-    pub proxy: Option<Url>,
-    /// The lanes' transport. `plain` (the default) sends the visitor's
-    /// packets as they are; `noise` wraps every lane in the Noise session the
-    /// control channel's keys define. The *control* channel is always Noise
-    /// and is not configurable here.
-    #[serde(rename = "type")]
-    pub transport_type: Option<TransportType>,
-    /// Key material for `type = "noise"`. Absent, the control channel's keys
-    /// are inherited — the common case, one key pair per host. Present, these
-    /// keys define the lanes' Noise session instead.
-    pub noise: Option<NoiseConfig>,
-}
-
 impl TransparentClientConfig {
     /// How many claims share the lane budget.
     pub(crate) fn claims(&self) -> usize {
@@ -233,35 +211,13 @@ impl TransparentClientConfig {
     /// default but the only value this model has.
     #[must_use]
     pub fn lower(&self) -> ClientConfig {
-        // The wire stacks, from `[transparent.transport]`:
-        //
-        // - the **control** channel is Noise, always — the session nonce it
-        //   publishes is the credential every lane authenticates with, so a
-        //   plain control leg would hand that credential to the path. The
-        //   keys are this table's (`[transparent.transport.noise]`): one key
-        //   pair per host, and the mandatory-Noise rule is what makes them
-        //   required.
-        // - the **lanes** are plain unless the operator turned the crypto on
-        //   (`type = "noise"`); on, they inherit the control channel's keys
-        //   by default. The resolved pair travels per service, so the
-        //   engine's `effective_config` overlays it on the client-wide
-        //   transport and a lane dials with exactly what this table said.
-        let control_transport = TransportConfig {
-            transport_type: TransportType::Noise,
-            proxy: self.transport.proxy.clone(),
-            noise: self.transport.noise.clone(),
-        };
-        let lane_transport = TransportConfig {
-            transport_type: self
-                .transport
-                .transport_type
-                .unwrap_or(TransportType::Plain),
-            proxy: self.transport.proxy.clone(),
-            noise: match self.transport.transport_type {
-                Some(TransportType::Noise) => self.transport.noise.clone(),
-                _ => None,
-            },
-        };
+        // The control channel is always Noise with this table's KK pair; a
+        // lane defaults to plain because what it carries is the visitor's own
+        // packets (the visitor's TLS is the end-to-end protection). A claim's
+        // own noise block travels as an override on its service, so the engine
+        // resolves one pair and one switch per service without knowing this
+        // model exists.
+        let data_enable = self.noise.data_enable.unwrap_or(false);
 
         let services = self
             .claims
@@ -274,15 +230,10 @@ impl TransparentClientConfig {
                 service.transparent_tun.clone_from(&self.tun);
                 service.token.clone_from(&claim.token);
                 service.remote_addr.clone_from(&claim.remote_addr);
-                service.retry_interval = claim.retry_interval;
-                // The lanes' wire stack travels per service: the engine's
-                // `effective_config` overlays this on the client-wide
-                // transport, so a claim's lanes dial with exactly what this
-                // table said — plain or the inherited/overridden Noise.
-                service.transport = Some(ClientServiceTransportConfig {
-                    transport_type: Some(lane_transport.transport_type),
-                    noise: lane_transport.noise.clone(),
-                });
+                service.retry_backoff_max = claim.retry_backoff_max;
+                // The claim's own keys and encryption switch travel as an
+                // override; unset fields inherit the transparent client's.
+                service.noise.clone_from(&claim.noise);
                 // The claim's lane count, resolved here so the engine has one
                 // number to read: an equal share of the lane budget, never
                 // below the one connection every claim has. A claim's own
@@ -301,16 +252,20 @@ impl TransparentClientConfig {
             #[cfg(feature = "multiplex")]
             data: ClientDataConfig {
                 default_data_addr: self.data.default_data_addr.clone(),
-                // A claim never draws from a pool, so pool ownership has nothing
+                // A claim never draws from a pool, so pool width has nothing
                 // to select here, and the lane budget travels per claim
                 // (`transparent_lanes`): this block carries only the data
                 // endpoint.
-                shared_pool: false,
                 tunnels: None,
             },
             services,
-            status: None,
-            transport: control_transport,
+            // The L3 client runs the same status listener as a forwarding one:
+            // the answer already carries its claims and lanes.
+            status: self.status.clone(),
+            noise: ClientNoiseConfig {
+                keys: self.noise.keys.clone(),
+                data_enable: Some(data_enable),
+            },
         }
     }
 
@@ -337,8 +292,7 @@ mod tests {
     use super::TransparentClientConfig;
     use crate::common::constants::DEFAULT_CLAIM_LANES;
     use crate::config::parsing::Config;
-    use crate::config::parsing::{ServiceType, TransportType};
-    use url::Url;
+    use crate::config::parsing::{ServiceType, TEST_CLIENT_PRIVATE, TEST_SERVER_PUBLIC};
 
     /// The lowering is the whole of the model difference, so it is pinned key
     /// by key: a claim becomes a service whose *claimed* address stands in for
@@ -358,12 +312,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport]
-proxy = "socks5://127.0.0.1:1080"
-
-[transparent.transport.noise]
-local_private_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-remote_public_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -394,18 +345,21 @@ token = "claim-token"
             "lending is on unless the client turns it off: `[transparent.data].lend` defaults \
              to true, so a config that never mentions it gets the mechanism"
         );
-        // The control leg is Noise, always: its keys are the table's, and the
+        // The control leg is KK, always: its keys are the table's, and the
         // session nonce it publishes is what every lane authenticates with.
-        assert_eq!(client.transport.transport_type, TransportType::Noise);
-        assert!(client.transport.noise.is_some());
+        assert_eq!(client.noise.keys.public_key, TEST_SERVER_PUBLIC);
+        assert_eq!(&*client.noise.keys.private_key, TEST_CLIENT_PRIVATE);
         // The lanes default to plain: the visitor's packets go as they are.
-        let lanes = service.transport.as_ref().unwrap();
-        assert_eq!(lanes.transport_type, Some(TransportType::Plain));
-        assert!(lanes.noise.is_none());
         assert_eq!(
-            client.transport.proxy.as_ref().map(Url::as_str),
-            Some("socks5://127.0.0.1:1080")
+            client.noise.data_enable,
+            Some(false),
+            "a transparent client's lanes are plain unless asked otherwise"
         );
+        assert!(
+            service.noise.is_none(),
+            "a claim with no override inherits the client-wide pair and switch"
+        );
+        assert!(!service.data_enabled_with(false));
     }
 
     /// `type = "noise"` on the lanes: the table's keys are the control
@@ -423,12 +377,10 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport]
-type = "noise"
-
-[transparent.transport.noise]
-local_private_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-remote_public_key = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+[transparent.noise]
+data_enable = true
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -437,14 +389,13 @@ remote_bind_addr = "10.99.0.1:8443"
         .unwrap();
 
         let client = config.into_l3_client().unwrap().client.unwrap();
-        // Control: Noise with the table's keys (the same pair the lanes use).
-        assert_eq!(client.transport.transport_type, TransportType::Noise);
-        assert!(client.transport.noise.is_some());
-        // Lanes: Noise with the same keys, traveling per service.
+        // Control: KK with the table's keys (the same pair the lanes use).
+        assert_eq!(client.noise.keys.public_key, TEST_SERVER_PUBLIC);
+        assert_eq!(&*client.noise.keys.private_key, TEST_CLIENT_PRIVATE);
+        // Lanes: encryption is on for this client, inherited by the claim.
+        assert_eq!(client.noise.data_enable, Some(true));
         let service = client.services.get("web").unwrap();
-        let lanes = service.transport.as_ref().unwrap();
-        assert_eq!(lanes.transport_type, Some(TransportType::Noise));
-        assert_eq!(lanes.noise.clone(), client.transport.noise.clone());
+        assert!(service.data_enabled_with(true));
     }
 
     /// A claim's lanes are an equal share of its lane budget: two each when
@@ -462,8 +413,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.data]
 {budget}
@@ -528,10 +480,19 @@ remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
     /// the claim the runtime reads it from.
     #[test]
     fn lending_is_on_unless_the_client_turns_it_off() {
-        let base = "[transparent]\ndefault_token = \"t\"\ntun = \"l3test0\"\n\n\
-                    [transparent.control]\ndefault_remote_addr = \"example.com:2333\"\n\n\
-                    [transparent.transport.noise]\n\
-                    remote_public_key = \"{TEST_CLIENT_REMOTE_PUBLIC}\"\n\n";
+        let base = r#"
+[transparent]
+default_token = "t"
+tun = "l3test0"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
+"#;
         let claim = "[transparent.claims.web]\nremote_bind_addr = \"10.99.0.1:8443\"\n";
 
         let on = Config::from_str(&format!("{base}{claim}")).unwrap();
@@ -565,8 +526,9 @@ tun = "l3test0"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.data]
 tunnels = 1
@@ -598,8 +560,9 @@ remote_bind_addr = "10.99.0.1:2222"
 [transparent]
 default_token = "t"
 
-[transparent.transport.noise]
-remote_public_key = "{TEST_CLIENT_REMOTE_PUBLIC}"
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -626,8 +589,9 @@ default_token = "t"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -666,8 +630,9 @@ default_token = "t"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.claims.web]
 remote_bind_addr = "10.99.0.1:8443"
@@ -691,8 +656,9 @@ default_token = "t"
 [transparent.control]
 default_remote_addr = "example.com:2333"
 
-[transparent.transport.noise]
-remote_public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
 
 [transparent.data]
 tunnels = 2
@@ -723,6 +689,136 @@ remote_bind_addr = "10.99.0.1:8443"
         assert!(
             message.contains("default_carrier"),
             "the refusal must name the key the reader wrote, got: {message}"
+        );
+    }
+
+    /// A claim's lane count is its share of the client's budget, never its own
+    /// key: the budget belongs to the carrier the claims share. The key is
+    /// refused with the budget key to write instead.
+    #[test]
+    fn a_claim_cannot_size_its_own_lanes() {
+        let err = format!(
+            "{:#}",
+            Config::from_str(
+                r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+tunnels = 2
+"#
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("transparent.claims.*.tunnels")
+                && err.contains("[transparent.data].tunnels"),
+            "the refusal must name the removed key and the budget: {err}"
+        );
+    }
+
+    /// Both retry keys are named for what they are — a cap — so an old
+    /// `retry_interval` is refused with the key to write instead, at both
+    /// levels the L3 model has.
+    #[test]
+    fn retry_caps_are_named_for_what_they_do() {
+        let err = format!(
+            "{:#}",
+            Config::from_str(
+                r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+default_retry_interval = 3
+
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+retry_interval = 2
+"#
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("transparent.control.default_retry_interval")
+                && err.contains("transparent.claims.*.retry_interval")
+                && err.contains("retry_backoff_max"),
+            "the refusal must name both removed keys and the replacement: {err}"
+        );
+    }
+
+    /// The status API is part of the L3 model too: the same two keys under
+    /// `[transparent.status]`, lowered onto the client the L3 run executes.
+    #[test]
+    fn a_transparent_client_can_serve_the_status_api() {
+        let config = Config::from_str(
+            r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
+[transparent.status]
+bind_addr = "127.0.0.1:9091"
+token = "status-token"
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#,
+        )
+        .unwrap();
+        let client = config.into_l3_client().unwrap().client.unwrap();
+        let status = client.status.unwrap();
+        assert_eq!(status.bind_addr, "127.0.0.1:9091");
+        assert_eq!(&*status.token, "status-token");
+
+        // Half a credential is refused, and the message names the block the
+        // reader wrote.
+        let err = format!(
+            "{:#}",
+            Config::from_str(
+                r#"
+[transparent]
+default_token = "t"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+
+[transparent.status]
+bind_addr = "127.0.0.1:9091"
+token = ""
+
+[transparent.claims.web]
+remote_bind_addr = "10.99.0.1:8443"
+"#
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("[transparent].status.token"),
+            "the refusal must name the block the reader wrote: {err}"
         );
     }
 }

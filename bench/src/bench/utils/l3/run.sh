@@ -78,9 +78,9 @@ if [ ! -c /dev/net/tun ]; then
     exit 1
 fi
 
-# The topology under test. The daemon configures no network itself, so all of
-# this is the operator side of the contract (src/transparent/check.rs verifies
-# the parts it depends on).
+# The topology under test. The harness prepares every device itself, so the
+# daemons find them and only attach (src/transparent/check.rs verifies the
+# operator's side of the contract).
 NS_VIS=l3vis
 NS_SRV=l3srv
 NS_CLI=l3cli
@@ -103,7 +103,9 @@ ROUTE_TABLE=100
 # reproducing the run must get the same config. A deployment generates its own
 # with `molehill --genkey`.
 NOISE_SERVER_PRIVATE="kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
-NOISE_CLIENT_REMOTE_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_SERVER_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_CLIENT_PRIVATE="8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+NOISE_CLIENT_PUBLIC="zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="
 TUN_MTU="${TUN_MTU:-1400}"
 # The veth MTU, i.e. how large a segment the tunnel's own TCP may carry. Raising
 # it (with TUN_MTU) is the experiment that separates per-packet cost from
@@ -128,11 +130,12 @@ SMALL_BYTES="${SMALL_BYTES:-64}"
 # several lanes, which is what makes this run prove that a claim's flows are
 # spread over several carrier connections and still arrive byte-exact.
 CLAIM_LANES="${CLAIM_LANES:-}"
-# Optional cap on the carrier connections one client may hold, written into the
-# server (`[server.data].max_tunnels_per_client`). Empty writes nothing (the
-# product's unlimited default); a value below CLAIM_LANES makes the run prove
-# that the operator's valve counts a claim's lanes and refuses the surplus while
-# the claim keeps serving on what it got.
+# Optional cap on live carrier connections, written into the server
+# (`[server.data].max_tunnels`: server-wide, every multiplexed tunnel and every
+# transparent lane of every client counts). Empty writes nothing (the derived
+# default); a value below CLAIM_LANES makes the run prove that the operator's
+# valve counts a claim's lanes and refuses the surplus while the claim keeps
+# serving on what it got.
 CLAIM_LANE_CAP="${CLAIM_LANE_CAP:-}"
 # Add a second claim that carries no traffic at all (`idle`, on PUBLIC_PORT+1).
 # It exists so a run can prove the lane allocator's whole point — an idle claim's
@@ -327,8 +330,9 @@ topology_up() {
 
     ip -n "$NS_VIS" route add default via "$SRV_VIS_IP"
 
-    # The TUN devices exist before the daemons start: they attach to the name
-    # and refuse to create a device themselves (src/transparent/check.rs).
+    # The TUN devices exist before the daemons start: the daemons find them
+    # and attach, leaving the operator's device as it is
+    # (src/transparent/check.rs).
     ip -n "$NS_SRV" tuntap add dev "$TUN_SRV" mode tun
     ip -n "$NS_SRV" link set "$TUN_SRV" up mtu "$TUN_MTU"
     ip -n "$NS_SRV" route add "$PUBLIC_IP/32" dev "$TUN_SRV"
@@ -376,14 +380,15 @@ bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 [server.transparent]
 tun = "$TUN_SRV"
 
-[server.transport.noise]
-local_private_key = "$NOISE_SERVER_PRIVATE"
+[server.noise]
+private_key = "$NOISE_SERVER_PRIVATE"
+public_key = "$NOISE_CLIENT_PUBLIC"
 TOML
     # The operator's valve is a server-side policy, so it goes in the server's
     # own table — and it counts a claim's lanes, which is what a run with
     # CLAIM_LANE_CAP below CLAIM_LANES proves.
     if [ -n "$CLAIM_LANE_CAP" ]; then
-        printf '\n[server.data]\nmax_tunnels_per_client = %s\n' "$CLAIM_LANE_CAP" >>"$LOG/server.toml"
+        printf '\n[server.data]\nmax_tunnels = %s\n' "$CLAIM_LANE_CAP" >>"$LOG/server.toml"
     fi
 
     cat >"$LOG/client.toml" <<TOML
@@ -394,8 +399,9 @@ tun = "$TUN_CLI"
 [transparent.control]
 default_remote_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 
-[transparent.transport.noise]
-remote_public_key = "$NOISE_CLIENT_REMOTE_PUBLIC"
+[transparent.noise]
+private_key = "$NOISE_CLIENT_PRIVATE"
+public_key = "$NOISE_SERVER_PUBLIC"
 TOML
     # The claim's lane budget is the product's default (one connection per
     # claim) unless the run names one. The table has to precede the claim, or
@@ -448,8 +454,9 @@ allow_ports = ["$PUBLIC_PORT"]
 [server.control]
 bind_addr = "$SRV_VIS_IP:$CONTROL_PORT"
 
-[server.transport.noise]
-local_private_key = "$NOISE_SERVER_PRIVATE"
+[server.noise]
+private_key = "$NOISE_SERVER_PRIVATE"
+public_key = "$NOISE_CLIENT_PUBLIC"
 TOML
 }
 
@@ -811,13 +818,13 @@ grep "Lane allocator" "$LOG/nolend-client.log" || echo "(none)"
 
 echo
 echo "================= NEGATIVE: THE VALVE COUNTS LANES ================="
-# `[server.data].max_tunnels_per_client` is the server operator's cap on the
-# carrier connections ONE client may hold — and a claim's lane is one of them,
-# which is the half that used to be unbounded. With a cap of 1 against a claim
-# that asks for 2, the surplus lane must be refused with a line naming the cap,
-# and the claim must keep serving byte-exactly on the lane it got. The lane
-# budget is a client-side key and the cap is a server-side one, so this is the
-# only run where the two halves are proven to meet.
+# `[server.data].max_tunnels` is the server operator's global cap on live
+# carrier connections — and a claim's lane is one of them, which is the half
+# that used to be unbounded. With a cap of 1 against a claim that asks for 2
+# (the only client in this topology), the surplus lane must be refused with a
+# line naming the cap, and the claim must keep serving byte-exactly on the lane
+# it got. The lane budget is a client-side key and the cap is a server-side
+# one, so this is the only run where the two halves are proven to meet.
 kill "$SRV_PID" "$CLI_PID" 2>/dev/null || true
 kill "$LEND_SRV" "$LEND_CLI" 2>/dev/null || true
 kill "$NOLEND_SRV" "$NOLEND_CLI" 2>/dev/null || true

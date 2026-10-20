@@ -217,8 +217,8 @@ makes a server reach for `/dev/net/tun`.
 It is Linux-only (a TUN device) and root-only (`CAP_NET_ADMIN`) for its veth
 pairs, TUN devices, routes and `ip rule`, so it is **not** part of `just check`
 or CI. Without root it **skips loudly**: it prints `SKIP` with the exact `sudo`
-command and exits 77, never a silent pass. The daemon configures no network
-itself; the harness is the operator.
+command and exits 77, never a silent pass. The harness prepares every network
+step itself; the daemons' own device step is not exercised by this run.
 
 `sudo -n env MOLEHILL_L3_WIRE=ip just l3-accept` runs the same acceptance on the
 plain-IP wire, forcing the Linux devices through the same frame conversion a

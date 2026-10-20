@@ -1,5 +1,3 @@
-#[cfg(feature = "client")]
-use crate::common::helper::tcp_connect_with_proxy;
 use crate::config::TransportConfig;
 #[cfg(feature = "client")]
 use tokio::io::AsyncWriteExt;
@@ -14,14 +12,10 @@ use std::net::SocketAddr;
 #[cfg(feature = "server")]
 use tokio::net::ToSocketAddrs;
 use tokio::net::{TcpListener, TcpStream};
-#[cfg(feature = "client")]
-use url::Url;
 
 #[derive(Debug)]
 pub struct TcpTransport {
     socket_opts: SocketOpts,
-    #[cfg(feature = "client")]
-    proxy: Option<Url>,
 }
 
 #[async_trait]
@@ -30,15 +24,13 @@ impl Transport for TcpTransport {
     type Stream = TcpStream;
     type RawStream = TcpStream;
 
-    fn new(config: &TransportConfig) -> Result<Self> {
+    fn new(_config: &TransportConfig) -> Result<Self> {
         #[cfg(not(feature = "client"))]
-        let _ = config;
+        let _ = _config;
         Ok(TcpTransport {
             // Fixed latency-friendly defaults; every call site applies a
-            // `hint` right after connecting, so this is only the base.
-            socket_opts: SocketOpts::for_service(None),
-            #[cfg(feature = "client")]
-            proxy: config.proxy.clone(),
+            // hint right after connecting, so this is only the base.
+            socket_opts: SocketOpts::for_service(),
         })
     }
 
@@ -71,7 +63,10 @@ impl TcpTransport {
     /// before the handshake.
     #[cfg(feature = "client")]
     pub(crate) async fn connect_raw(&self, addr: &AddrMaybeCached) -> Result<TcpStream> {
-        let s = tcp_connect_with_proxy(addr, self.proxy.as_ref()).await?;
+        let s = match addr.socket_addr {
+            Some(s) => TcpStream::connect(s).await?,
+            None => TcpStream::connect(&addr.addr).await?,
+        };
         self.socket_opts.apply(&s);
         Ok(s)
     }

@@ -20,6 +20,7 @@ mod mux;
 mod protocol;
 #[cfg(feature = "client")]
 mod status;
+#[cfg(any(feature = "client", feature = "server"))]
 mod stripe;
 #[cfg(mh_l3)]
 mod transparent;
@@ -51,6 +52,15 @@ pub use core::control_sessions_accepted;
 #[doc(hidden)]
 pub use protocol::CURRENT_PROTO_VERSION;
 
+/// The wire types the session tests need to open a KK control connection by
+/// hand: they mirror the protocol independently, so they must build the same
+/// handshake the real client does.
+#[cfg(feature = "noise")]
+#[doc(hidden)]
+pub use config::{MaskedString, NoiseConfig, TransportConfig, TransportType};
+#[cfg(any(feature = "client", feature = "server"))]
+#[doc(hidden)]
+pub use stripe::set_initial_stripes;
 #[cfg(feature = "carrier")]
 #[doc(hidden)]
 pub use transport::carrier::Carrier;
@@ -60,6 +70,9 @@ pub use transport::carrier::Carrier;
 #[cfg(feature = "multiplex")]
 #[doc(hidden)]
 pub use transport::multiplex::live_pools;
+#[cfg(feature = "noise")]
+#[doc(hidden)]
+pub use transport::{AddrMaybeCached, NoiseStream, NoiseTransport, Transport};
 #[cfg(feature = "multiplex")]
 #[doc(hidden)]
 pub use transport::{PoolSnapshot, TunnelPool};

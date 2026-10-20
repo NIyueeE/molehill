@@ -54,7 +54,9 @@ TUN_SRV=l3srv6
 TUN_CLI=l3cli6
 ROUTE_TABLE=106
 NOISE_SERVER_PRIVATE="kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
-NOISE_CLIENT_REMOTE_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_SERVER_PUBLIC="mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+NOISE_CLIENT_PRIVATE="8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+NOISE_CLIENT_PUBLIC="zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="
 
 PIDS=()
 cleanup() {
@@ -118,8 +120,9 @@ bind_addr = "$SRV4:$CONTROL_PORT"
 [server.transparent]
 tun = "$TUN_SRV"
 
-[server.transport.noise]
-local_private_key = "$NOISE_SERVER_PRIVATE"
+[server.noise]
+private_key = "$NOISE_SERVER_PRIVATE"
+public_key = "$NOISE_CLIENT_PUBLIC"
 EOF
 
 cat >"$LOG/client.toml" <<EOF
@@ -130,8 +133,9 @@ tun = "$TUN_CLI"
 [transparent.control]
 default_remote_addr = "$SRV4:$CONTROL_PORT"
 
-[transparent.transport.noise]
-remote_public_key = "$NOISE_CLIENT_REMOTE_PUBLIC"
+[transparent.noise]
+private_key = "$NOISE_CLIENT_PRIVATE"
+public_key = "$NOISE_SERVER_PUBLIC"
 
 [transparent.claims.web]
 remote_bind_addr = "[$PUB6]:$PUBLIC_PORT"

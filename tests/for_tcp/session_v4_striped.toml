@@ -1,3 +1,4 @@
+
 [server]
 default_token = "session_test_default_token" # security-scan:allow dummy fixture token, same value as the sibling session fixtures
 allow_ports = ["2366"]
@@ -13,8 +14,9 @@ heartbeat_interval = 5
 # `CreateDataChannelForStripe` — the group and the stripe's place in it — so the
 # client can reserve one tunnel per stripe.
 
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="
 
 [server.data]
-stripe_count = 2

@@ -9,11 +9,9 @@ pub use parsing::{ClientConfig, ClientServiceConfig, StatusConfig};
 #[cfg(feature = "server")]
 pub use parsing::ServerConfig;
 pub use parsing::{Config, MaskedString, ServiceType, TransportConfig, TransportType};
-// Only used by the noise transport: it wraps the data-plane stream of any
-// build that has it, which is why this is gated on `noise` alone — the noise
-// transport itself compiles without `multiplex` (the `embedded` feature set
-// depends on that).
-#[cfg(feature = "noise")]
+// The key material is part of the configuration schema even in a build
+// without the `noise` feature (the client still has to parse a config that
+// names a pair); only the handshake itself is feature-gated.
 pub use parsing::NoiseConfig;
 
 pub use watcher::{ConfigChange, ConfigWatcherHandle};

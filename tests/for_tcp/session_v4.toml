@@ -1,3 +1,4 @@
+
 [server]
 default_token = "session_test_default_token" # security-scan:allow dummy fixture token; the v4 session test mirrors it and asserts the wrong-token paths
 allow_ports = ["2361-2363"]
@@ -8,6 +9,6 @@ bind_addr = "127.0.0.1:2360"
 # declared cadence is what the server actually sends.
 heartbeat_interval = 5
 
-
-[server.transport.noise]
-local_private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE=" # security-scan:allow fixture keypair, the shared test pair from noise_transport.toml
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

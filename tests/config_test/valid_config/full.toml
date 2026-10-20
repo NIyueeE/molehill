@@ -1,22 +1,17 @@
 # requires: multiplex
+
 [client]
 default_token = "default_token_if_not_specify" # Necessary. Must match `[server].default_token`
 
 [client.control]
 default_remote_addr = "example.com:2333" # Necessary. The address of the server
 default_heartbeat_timeout = 40 # Optional. Must be greater than `server.control.heartbeat_interval`. Default: 40 seconds
-default_retry_interval = 1 # Optional. Default: 1 second
+retry_backoff_max = 1 # Optional. Cap of the reconnect backoff; unset = adaptive
 
-[client.transport]
-type = "noise" # Required, and the only value the daemon accepts: the control channel carries the credential every data channel authenticates with
-proxy = "socks5://user:passwd@127.0.0.1:1080" # Optional. Connect through a proxy
-
-[client.transport.noise] # Noise protocol. See `docs/transport.md` for further explanation
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s" # Optional. Default value as shown
-local_private_key = "HD6lZirY3A1aqmNehuE/CrtKOnekqNbOVIXuqJcl0zE=" # Optional. This client's own key, needed only by a pattern that authenticates it # security-scan:allow documentation example key
-remote_public_key = "9PE8H+fhLSgk9xFyqEwoKuQtq3n2sdGYzgY8jBtctlw=" # Required: the server's public key # security-scan:allow documentation example key
-psk = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
+[client.noise]
+public_key = "mEnUEACy9UrTBmwoCJb6fcKWBRdvfD9XzuBVsroOLFg="
+private_key = "8JlJQXXN0lFqz5ghIjJRq3bfRiCDKJHuXxbfu5jIxWE="
+data_enable = true
 
 [client.data]
 tunnels = 6 # Optional. Tunnels the pool establishes at service start and keeps. Default: 4, raised to the UDP-derived floor of the services that share the pool. A transparent client writes the same key as its lane budget
@@ -25,18 +20,14 @@ tunnels = 6 # Optional. Tunnels the pool establishes at service start and keeps.
 protocol = "tcp" # Optional. Possible values: ["tcp", "udp"]. Default: "tcp"
 local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
 remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server
-nodelay = true # Optional. Override the default nodelay behavior per service
-retry_interval = 1 # Optional. Override the global `retry_interval` per service
+retry_backoff_max = 1 # Optional. Override the client-wide cap per service
 
 [client.services.service2]
 protocol = "udp"
 local_addr = "127.0.0.1:1082"
 remote_bind_addr = "0.0.0.0:8082"
-udp_workers = 2 # Optional. Data channels in this UDP service's worker set (UDP services only). Default: 2
-udp_forwarder_ipv6 = false # Optional. Prefer IPv6 for the UDP forwarder's connection to the local service (UDP services only). Default: false
+max_udp_workers = 2 # Optional. Data channels in this UDP service's worker set (UDP services only). Default: 2
 udp_buffer_size = 2048 # Optional. Receive buffer size for datagrams in bytes. Default: 2048, max 65535
-udp_idle_timeout = 60 # Optional. Seconds after which an idle UDP peer mapping is dropped. Default: 60
-udp_send_queue_size = 1024 # Optional. Queue size for outbound datagrams per data channel. Default: 1024
 
 [server]
 default_token = "default_token_if_not_specify" # Necessary. Must match `[client].default_token`
@@ -47,12 +38,8 @@ bind_addr = "0.0.0.0:2333" # Necessary. The address that the server listens for 
 heartbeat_interval = 30 # Optional. Default: 30 seconds
 
 [server.data]
-max_tunnels_per_client = 16 # Optional. Upper bound on the multiplexed data tunnels one client may hold (0 = unlimited). Default: 0
+max_tunnels = 16 # Optional. Upper bound on the multiplexed data tunnels one client may hold (0 = unlimited). Default: 0
 
-[server.transport.noise] # Same as `[client.transport.noise]`
-pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"
-local_private_key = "key_encoded_in_base64"
-remote_public_key = "key_encoded_in_base64"
-psk = "key_encoded_in_base64" # Optional. Pre-shared key (32 bytes, base64-encoded); the pattern must include a PSK modifier
-psk_location = 0 # Optional. The PSK slot index used in the pattern. Default: 0
-
+[server.noise]
+private_key = "kQiSRtS3bs8BoGCJYgFnl1FLrTG1lV53Dj8jSjmg8tE="
+public_key = "zDdpcSQP+7Y5Mr+7UdEZMkz3gO6NGbQ1hko8/yt5knE="

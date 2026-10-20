@@ -6,10 +6,10 @@
 - **Server**: the publicly accessible host running molehill in server mode
 - **Client**: the host behind NAT running molehill in client mode; it holds the services to be exposed
 - **Visitor**: someone who connects to a service through the server
-- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5.1). Two services share it when they declare the same endpoint and the same transport — a connection speaks one transport, so a service that overrides `transport` gets a session of its own
+- **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5.2). Two services share it when they declare the same endpoint and the same KK key pair — the control channel is always Noise, so a service that overrides `noise` (for another server, or with its own keys) gets a session of its own, while `data_enable` alone never splits one
 - **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel. It names the service it carries with a four-byte prologue (a transparent lane adds its lane id, making eight; see "Forwarding")
 - **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that belongs to a control session and carries many data channels as streams
-- **Tunnel pool**: the set of tunnels one client keeps for one key — the whole session, or one service, depending on `[client.data].shared_pool` (see "The tunnel pool")
+- **Tunnel pool**: the tunnels one control session keeps for its services — one pool per session, keyed by its data endpoint (see "The tunnel pool")
 - **Stripe group**: a set of `K` data channels that carry one visitor connection together (see "Data-channel striping")
 
 ## Startup and registration
@@ -31,9 +31,9 @@ A session uses two credentials, which is what lets one connection carry services
 ### Protocol versions
 
 The protocol version rides in every hello, and this build speaks and serves one
-dialect: **v5.1**. The version is two bytes (`major.minor`), so every hello is
+dialect: **v5.2**. The version is two bytes (`major.minor`), so every hello is
 one byte wider than v5.0's and the two dialects cannot be read as each other.
-v5.1 keeps v5's service type (`ServiceType::Transparent`) and adds the
+v5.2 keeps v5's service type (`ServiceType::Transparent`) and adds the
 transparent frame-format negotiation: a registration may declare whether its
 device produces vnet frames, and `DataChannelCmd::StartForwardTransparent`
 carries the format the channel will actually use — `Ip` for one bare IPv4 or IPv6
@@ -59,7 +59,7 @@ When a visitor connects to a registered service's endpoint, the server asks the 
 
 **The service prologue.** A data channel opens with the service's four-byte id before anything else: the session nonce identifies the *session*, not a service, so a channel has to say which one it is for. A direct channel writes it right after its hello; a stream of a multiplexed tunnel writes it right after the stream is opened, because a tunnel belongs to the session. Routing is per **stream**: one tunnel may carry streams of several services (which is what a shared pool produces), and each stream's prologue is what decides the queue it lands in. The server reads the prologue before routing, so a stream naming a service that is not registered on that session is dropped on its own, without touching the tunnel or the session.
 
-A registration carries no channel count, so the client owns its channels: a UDP service opens its configured `udp_workers` (default 2) as soon as the registration is accepted, a TCP service opens none, and either opens one more for every `CreateDataChannelFor` — or, for a striped visitor, for every `CreateDataChannelForStripe`, which names the stripe group and the stripe's place in it. New channels are also requested on demand: per visitor for TCP, and whenever a UDP channel dies so the worker set keeps its size (a replacement never grows the set past the configured count; see "The tunnel pool").
+A registration carries no channel count, so the client owns its channels: a UDP service opens **one** data channel as soon as the registration is accepted — its `max_udp_workers` (default 2, clamp 1..=64) is the ceiling, not a count, and the server asks for another only when its queues are under pressure — a TCP service opens none, and either opens one more for every `CreateDataChannelFor` — or, for a striped visitor, for every `CreateDataChannelForStripe`, which names the stripe group and the stripe's place in it. New channels are also requested on demand: per visitor for TCP, and for a UDP channel that dies, so the set keeps its size and never passes the ceiling (see "The tunnel pool").
 
 **Pairing is per visitor, never serial.** The server's accept loop hands every visitor to its own pairing task: one visitor's wait for a data channel therefore costs that visitor and nothing else, and the accept loop keeps accepting. The pairing wait is a budget that re-requests rather than giving up, and a visitor the client refuses for the whole budget is shed — its socket closed, one failed request — while the service and its other visitors keep going. The number of pairings in flight at once is bounded (`MAX_CONCURRENT_VISITORS`, 128), which is what keeps a wedged service from growing unbounded tasks: each in-flight pairing owns one visitor socket and one data channel, and the listeners' backlog keeps the rest. A visitor whose channel request the client cannot answer — the pool at its placement ceiling — used to hold the accept loop for the whole 25-second budget, so every visitor behind it queued unanswered and the k-th one was shed a full budget after the first; measured, that is a service parked behind one visitor (`tests/pool_test.rs`, `one_unanswerable_visitor_does_not_park_the_service`). A stripe group's gather is the one pairing that stays atomic: its K channels are consumed all-or-none under a lock, so concurrent visitors cannot interleave two gathers' channels.
 
@@ -69,11 +69,15 @@ For UDP, the server maintains a per-service **session-affinity table**: a single
 
 ### Data-channel striping
 
-With `[server.data].stripe_count = K` (default `1`), the server pairs every visitor connection with `K` data channels instead of one and labels each with a `StartForwardStripedTcp(group, index, K)` command. The pair then forwards the connection over the group (`src/stripe.rs`):
+Every TCP visitor is a stripe group. The server starts it at **one** data channel and labels it with `StartForwardStripedTcp(group, index, K)`; the server-wide target grows by one when a group reports **path backpressure**, up to `MAX_STRIPES` (64), and it never shrinks. A quiet path therefore pays one channel; a contended one spreads. The pair then forwards the connection over the group (`src/stripe.rs`):
 
 - Each direction numbers its chunks (`[u64 seq][u16 len][payload]` frames, 32 KiB payloads) and spreads them round-robin over the group's channels.
 - The receiving side reassembles by sequence number: out-of-order chunks wait in a bounded reorder map, contiguous ones are written to the destination. A frame always travels whole on one channel (a half-written frame cannot move — it would corrupt that channel's framing); a channel that refuses a frame *before* any byte of it is committed is skipped for that frame, so one backpressured channel does not stall the group.
 - A channel that ends mid-frame (not at a frame boundary) breaks the group instead of leaving the reassembler waiting for a sequence number that will never arrive.
+
+The backpressure signal is measured where the traffic waits, not on the pairing path. A group's send direction parks when it cannot move a frame — every stripe refusing it, or the one writable stripe parking mid-frame — and a contiguous wait of at least `STRIPE_BACKPRESSURE` (250 ms) that then makes progress is one group reporting that one more stripe would have added one more window. Short parks are ordinary window flow and are not reported; a dead peer never reports, because no frame completes. Growth is server-wide and gated: at most one step per `STRIPE_GROWTH_DWELL` (500 ms), so fifty stalled visitors meeting a saturated path say "wider" once rather than fifty times. The target is a decision for the *next* group; a group already forwarding keeps its width.
+
+A group the server abandons before forwarding it — the visitor gave up or the session ended inside the pairing budget, or a gathered channel broke — is **released on the client** (`ReleaseStripedGroup`). The stripes that arrived are already parked there, and their channels are pool capacity the server will never use; the release drops them at once instead of at the registry's TTL, and tombstones the group id so a stripe still in flight when the release was written does not park after it. On the group's own side, a direction that ends without seeing the peer close must take its reader tasks with it: they own the read halves, and a reader left parked on a peer that still holds its stream would keep the group's channels out of the pool for good (`tests/pool_test.rs`, `a_saturated_pool_still_serves_the_next_visitor`).
 
 The gather asks for its channels *before* its first wait, because a
 registration opens none itself: the tunnel pool's tunnels are established at
@@ -97,22 +101,15 @@ Three things follow from the arithmetic: the visitor's throughput ceiling is the
 
 ### The tunnel pool
 
-A pool is the client's unit of connection management. Its **ownership** is one setting:
-
-| `[client.data].shared_pool` | Pool key | Who uses it |
-|---|---|---|
-| `false` (default) | `service:<id>:<data-endpoint>` | one service alone — today's shape |
-| `true` | `session:<data-endpoint>` | every service of that session on that data endpoint |
-
-Both are the same code path; only the key differs, and the session owns the pools (a shared pool must outlive any single service). A service joins the pool its key names, creating it if this is the first service of that key to become active, and dropping a service never tears the pool down. The data endpoint is part of the key because two endpoints cannot share a tunnel; the **carrier is not**, because a pool has one carrier for its lifetime — chosen when it is established — so there is never a second pool on the same key to tell apart.
+A pool is the client's unit of connection management. One control session owns exactly one pool, keyed `session:<data-endpoint>`: every service of the session draws on the same connections. The session owns it, so dropping one service never tears the pool down. The data endpoint is part of the key because two endpoints cannot share a tunnel; the **carrier is not**, because a pool has one carrier for its lifetime — chosen when it is established — so there is never a second pool on the same key to tell apart.
 
 **Placement** is least-loaded-first: each open takes the tunnel with the fewest established streams plus reserved-but-unfinished opens, and the round-robin cursor only breaks ties. A stripe group's channels arrive as back-to-back requests that *name the group*: the client reserves, for each stripe, a tunnel the group does not already hold — a preference with a floor, so a group wider than the pool still forwards by sharing. A weighted score was deliberately not used: placement is a scheduling decision inside one client, and the S1 telemetry below is what would justify a smarter rule.
 
-**Size is a configuration decision; repair is the runtime one.** The pool establishes `[client.data.tcp|kcp].tunnels` connections when the service activates and keeps them. It is never resized for load and idle tunnels are never reaped, so the capacity a deployment offers is a function of its configuration rather than of what it happened to be doing a minute ago — which is also what makes a run's numbers comparable: an elastic pool's size is a *result*, and a result depends on history.
+**Size is a configuration decision; repair is the runtime one.** The pool establishes `[client.data].tunnels` connections when the session's first service activates and keeps them. It is never resized for load and idle tunnels are never reaped, so the capacity a deployment offers is a function of its configuration rather than of what it happened to be doing a minute ago — which is also what makes a run's numbers comparable: an elastic pool's size is a *result*, and a result depends on history.
 
-The count itself is the operator's: the default is 4, raised to a UDP service's declared worker set (`udp_workers`) when that is larger. The floor is `max over active UDP services of max(udp_workers, ceil(udp_workers / streams-per-tunnel))`, and it exists because a UDP worker set shards across tunnels — stacking its workers on fewer tunnels than they need would put two shards on one connection, which is the opposite of what the fan-out is for. An explicit `tunnels` below that floor is refused at configuration time, with the number to write in the message: the pool cannot grow to meet it any more.
+The count is the operator's: `[client.data].tunnels`, default 4. A UDP service's worker set no longer raises it — a worker is a stream and shares the pool's tunnels, so the fan-out costs streams rather than connections.
 
-**Repair** is the only establishment after startup: the 50 ms maintenance tick reaps dead tunnels and dials one replacement per tick while the pool is short of its count. It is deliberately not growth — a dead tunnel is replaced whether or not it was carrying streams, so a single failure cannot shrink a deployment permanently — and the number of *established* tunnels is what a reader watches: `size` below `count` in the pool-stats line is a pool whose repair is being refused. A refusal (the server's `[server.data].max_tunnels_per_client` valve, or a dial that cannot be established) holds repair back for a cooldown rather than letting a 50 ms tick become a dial storm; a tunnel's death releases that hold, because a retry is meaningful again exactly then.
+**Repair** is the only establishment after startup: the 50 ms maintenance tick reaps dead tunnels and dials one replacement per tick while the pool is short of its count. It is deliberately not growth — a dead tunnel is replaced whether or not it was carrying streams, so a single failure cannot shrink a deployment permanently — and the number of *established* tunnels is what a reader watches: `size` below `count` in the pool-stats line is a pool whose repair is being refused. A refusal (the server's `[server.data].max_tunnels` valve, or a dial that cannot be established) holds repair back for a cooldown rather than letting a 50 ms tick become a dial storm; a tunnel's death releases that hold, because a retry is meaningful again exactly then.
 
 **A per-tunnel carrier handover retires one tunnel at a time, without touching its streams** — the pool-level analogue of the lane drain above. The pool's replacement already rides whatever carrier the endpoint prefers (that is what repair dials), but a pool whose tunnels all still ride the *old* carrier keeps them for their whole lives: repair replaces only what dies. The handover makes the move possible while everything lives. Excluding a tunnel from new placements marks it draining — its established streams keep running to the end, a stream cannot move without reordering it — and only when it holds no stream and no pinned UDP peer is it removed, its slot refilled by the repair dial on the new carrier. At most one tunnel is in a handover at a time, and both of its waits are bounded, for the same reason the lane drain has a budget: a drain that waits for a long-lived flow past its budget is called off and the tunnel returns to service; a replacement that cannot be established (UDP blocked, server down) releases the handover so ordinary repair dials the live preference instead. A pool is never left one tunnel short for ever. Placement refusal during the window is short-lived pressure, not saturation, so it does not report the "raise `tunnels`" line. The mechanism has no trigger of its own: it exists for the diagnostic hatch (`MOLEHILL_TUNNEL_SWITCH_AT`, [configuration.md](configuration.md#diagnostics-switches-opt-in)) and for a quality rule to call, exactly as the lane machinery did before its policy landed.
 
@@ -129,12 +126,12 @@ The count itself is the operator's: the default is 4, raised to a UDP service's 
 Three UDP invariants ride along:
 
 - **A peer pins its tunnel.** The server's affinity table points a peer at one data channel; the client's own route table points the same peer at the channel its traffic arrives on, which is a stream of one tunnel. A pinned peer therefore keeps its channel for the session's life, so a live UDP session is never re-sharded onto another tunnel — which would change the local source port the service sees. A tunnel that dies anyway ends those peers' sessions, UDP semantics.
-- **A new source never creates a channel.** The worker set of a UDP service is exactly the channel count the client opened for it; a datagram from an address with no affinity entry is assigned to a live worker (or dropped when none is ready), never answered by dialing a new channel.
+- **A new source never creates a channel.** The worker set of a UDP service is the set of channels the client opened for it — one at start, more only on the server's request; a datagram from an address with no affinity entry is assigned to a live worker (or dropped when none is ready), never answered by dialing a new channel.
 - **A channel with live routes keeps its tunnel.** Repair replaces a *dead* tunnel, never a live one, so a UDP channel carrying peers is never moved.
 
 The **S1 observation** is opt-in and aggregated, so a normal run stays silent and a measured run stays readable:
 
-- `MOLEHILL_POOL_STATS=1` — one INFO line per live pool per second: the pool's key, carrier, size, configured count, UDP floor, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with their reason (`+repair`, `-dead`).
+- `MOLEHILL_POOL_STATS=1` — one INFO line per live pool per second: the pool's key, carrier, size, configured count, live streams, pinned peers, the per-tunnel `streams/pending/pinned` triple, and the timeline of size changes with their reason (`+repair`, `-dead`).
 - `MOLEHILL_PLACEMENT_STATS=1` — one INFO line per second per process aggregating that interval's placements: how many, how many fell back, the candidate and chosen load sums, `mean_spread` (the average gap between the best and the worst candidate — what a smarter rule could have won, and the number the S2 decision reads), and the open latency's mean and maximum. INFO like every other switch in the family: the switch is the consent, so no extra log level is needed.
 
 `MOLEHILL_MUX_STATS=1` (the framing counters) is unchanged and independent.
@@ -149,8 +146,8 @@ repaired back to the count. The shape is not a key: a forwarding service always
 multiplexes, and a [transparent claim](#transparent-l3-services) never does,
 because a claim's channels *are* its carrier connections. Data-channel opens
 take the least-loaded tunnel, and a dead tunnel is skipped transparently. The
-pool's width is `[client.data.tcp|kcp].tunnels` and its ownership depends on
-`[client.data].shared_pool`; both are described in "The tunnel pool" below. The
+pool's width is `[client.data].tunnels` and it belongs to the session; both are
+described in "The tunnel pool" below. The
 tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr`
 when set, else `[client.data].default_data_addr`, else the control endpoint) and
 are accepted by the server's data listener — the control listener itself when
@@ -165,7 +162,7 @@ the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
 A plain (unmultiplexed) data channel is a transport connection of its own: nothing
 is multiplexed and each visitor connection pays the full connection setup (TCP
-connect plus, with `noise`, the Noise handshake). That is a design trade-off, not
+connect plus, with `data_enable`, the fixed KK handshake). That is a design trade-off, not
 a performance claim — the measured comparison lives in
 [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
 Two things still open such channels: a transparent claim's lanes, and every
@@ -316,16 +313,23 @@ it is injected into the local kernel, so a compromised or buggy peer cannot
 steer traffic into an arbitrary local address. On the client that check doubles
 as an allow-list, because the client is the end that owns local addresses.
 
-**What the daemon does not do.** It installs no route, rule or firewall rule,
-and it has no netlink code or shell-out to `ip` on any platform. On Linux it
-attaches to the operator's persistent TUN device and verifies what it depends
-on: the device must exist on both ends; on the client, every claimed address
-must be one the host carries and `rp_filter` (the device's and `all`) must read
-0; on the server, a registration is rejected if its device is missing or
-`ip_forward` is off. On macOS and Windows there is no persistent
-operator-created device to attach to: the daemon creates the utun or Wintun
-adapter (and on macOS assigns the claimed `/32`/`/128` addresses), while the operator owns the
-pf rule, routes and forwarding. The recipes are in
+**What the daemon does not do.** It installs no route, policy rule or firewall
+rule on any platform. On Linux it creates a missing TUN device first and then
+attaches to it (an existing device is used as it is), verifying what it
+depends on: the device must exist on both ends; on the client, every claimed
+address must be one the host carries and `rp_filter` (the device's and `all`)
+must read 0; on the server, a registration is rejected if the device cannot
+be created or opened, or `ip_forward` is off. The interface check reads `/proc/net/dev`,
+not `/sys/class/net`: sysfs is not filtered by network namespace, so a daemon
+in its own namespace would see the host's devices and miss its own.
+
+The one host state the daemon creates is the device itself — and, on the
+client, the claimed addresses that are not already on it — which is exactly
+what macOS already does (a utun and its addresses) and what the Windows server
+does for its adapter. An existing device is left as it is (pre-create it to
+choose its MTU), and an address already assigned is left alone. Everything
+around them — the pf rule, the routes, the policy rules and forwarding — is the
+operator's on every platform. The recipes are in
 [Deployment](deployment.md#transparent-services).
 
 **Limits worth stating.** IPv4 and IPv6 are both carried. The IPv6 parser
@@ -355,15 +359,15 @@ stack.
 The visitor-facing socket has **one reader**: a single task takes one datagram per
 `recv_from` and the affinity table picks the channel, "so a single reader also
 means one slow worker can never stall other peers". Its capacity is therefore a
-property of the pool, not of the worker set — measured, `udp_workers` at 1, 2 and
-4 carried 1.14, 1.00 and 0.98 Gbit/s of 1400-byte datagrams, with 16 or 64
+property of the pool, not of the worker set — measured, the then-current
+`udp_workers` at 1, 2 and 4 carried 1.14, 1.00 and 0.98 Gbit/s of 1400-byte datagrams, with 16 or 64
 visitors alike, and the datagrams beyond that are dropped rather than queued
 without bound (`MOLEHILL_UDP_STATS` counts them; the measurement is recorded in
 HANDOFF.md, "D27's evidence, measured"). `transport::udp_batch`'s `recvmmsg`
 batching — used by KCP's socket loop — is the lever if that ceiling ever needs to
 move; this reader takes one datagram per syscall.
 
-UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. Idle forwarders are cleaned up after `udp_idle_timeout` seconds (default 60); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
+UDP services are forwarded over the same data channels, framed with a small header (source address + length). On the server side, each peer is pinned to one data channel by the session-affinity table above. On the client side, a per-service hub maps every peer address to exactly one local forwarder socket for the peer's whole session — the `(ip, port)` tuple the local service sees stays stable across channel re-sharding and channel loss — and pins the peer's outbound traffic to the channel its inbound traffic arrives on, falling back to any live channel when that one died. An idle forwarder is cleaned up after the mapping's lifetime, which follows the peer's own largest observed gap (four times it, clamped to 30-300 s); re-binding after that changes the local source port, which stateful protocols notice as a new session. Datagrams larger than the service's `udp_buffer_size` are dropped in-stream while the channel stays usable. All queues enqueue with `try_send` and drop on overflow: UDP semantics, and a single slow peer can never stall others sharing the channel.
 
 ### UDP drop counters (`MOLEHILL_UDP_STATS`)
 
@@ -413,18 +417,18 @@ Two limits worth knowing: the probe answers only on Linux, the one platform
 where the dependency it needs is declared — elsewhere a session keeps the
 previous behaviour and relies on kernel fragmentation, which is also what an
 oversized datagram does on any path whose MTU cannot be read; and the size is
-never *grown*, so `mtu` in the config's sense does not exist: the engine's
-1400-byte default is the ceiling.
+never *grown*, so there is no configurable MTU: the engine's 1400-byte default
+is the ceiling.
 
 ## Heartbeat
 
-The server **declares** its cadence: `Ack::SessionOk` carries `[server.control].heartbeat_interval` seconds, and it sends one `HeartBeat` command per session on that cadence (`0` means it sends none).
+The server **declares** its cadence: `Ack::SessionOk` carries the configured `[server.control].heartbeat_interval` seconds, or the adaptive tier when it is unset (30 s up to 8 sessions, 60 s up to 32, 120 s above), and it sends one `HeartBeat` command per session on that cadence (`0` means it sends none).
 
 The client **derives** its timeout from that number — `max(10 s, 2 × interval + 5 s)`, two missed beats plus slack — and there is one timer per session, not per service. A configured `[client.control].default_heartbeat_timeout` is an explicit constraint: a value at or above the derived floor is honored, a value below it is refused with both numbers, because it would declare a healthy server dead and reconnect on a loop. `0` disables the check; a session with neither a declared cadence nor a constraint has no timeout.
 
 ## Hot reload
 
-When the config file changes, the watcher compares the old and new configs: general changes (transport, addresses, tokens, data-plane settings) trigger a full restart of the instance. Client service-level changes are applied without restarting the session:
+When the config file changes, the watcher compares the old and new configs: general changes (Noise keys, addresses, tokens, data-plane settings) trigger a full restart of the instance. Client service-level changes are applied without restarting the session:
 
 - an **added** service (or one whose service block changed) is registered on the session that owns its endpoint — the session is created if this is the first service to dial it, and a re-registration on the same session keeps the service's id so the server takes the previous endpoint over;
 - a **removed** service is deregistered (`Deregister(service_id)`): the server drops that service's listener and releases its public port, while the session and its other services are untouched;
