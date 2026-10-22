@@ -315,18 +315,18 @@
   and the per-service `carrier` are gone, the carrier is chosen at runtime
   (KCP, TCP fallback), and a host that both forwards and claims runs two
   processes. No code change is implied by this decision.
-- **Recipe B's single-IP client side is a documentation gap (found
+- **Recipe B's single-IP client side is documented (2026-10-22; found
   2026-10-19).** With the claim on the server's own public address, the client
   assigns that address to its TUN, so the kernel treats it as local and the
-  client's control channel to `<server-ip>:2333` loops back to itself.
-  `docs/deployment.md` says the client side is "recipe A's, unchanged"; that is
-  not sufficient. Verified in a network namespace: demote the `local` table
-  (`ip rule add pref 200 lookup local; ip rule del pref 0`) and add
-  `ip rule add pref 100 iif lo to <server-ip> lookup main` — locally generated
-  traffic then leaves via the gateway while inbound visitor packets are still
-  delivered locally. Both language pages need the extra steps, and a single-IP
-  acceptance case would keep it from regressing. A documentation and
-  acceptance gap, not a data-path defect.
+  client's control channel to `<server-ip>:2333` loops back to itself. Both
+  deployment pages now carry the client half of the recipe: the demoted local
+  lookup (`ip rule add pref 200 lookup local; ip rule del pref 0`) and
+  `ip rule add pref 100 iif lo to <server-ip> lookup main`, which sends
+  locally generated traffic out by the gateway while the packets the server
+  delivers still reach the local lookup on the tunnel interface. The steps
+  were verified in a network namespace on 2026-10-19. Still open: a single-IP
+  acceptance case (the L3 harness has no such arm), so this stays a
+  documentation fix until one exists.
 - **Decision (2026-10-22): the key stays `[client.data].tunnels`; there is
   no rename to `default_tunnels`.** The question was raised on 2026-10-19,
   while the key was still the client-wide default for every service that did

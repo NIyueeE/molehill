@@ -432,10 +432,36 @@ sudo ip rule add pref 100 fwmark 0x1 lookup 100
 sudo ip route add default dev molehill0 table 100
 ```
 
-The client side is recipe A's, unchanged: it does not matter whose address the
-client claims — it carries it, and its application binds it. Afterwards,
-`ip route get <public-ip> mark 0x1` must name the TUN device, and `ip rule
-show` must list the mark rule above the local lookup.
+The client side is recipe A's **plus one rule**, because the address it claims
+is the server's own public IP: once the client assigns `<public-ip>` to its
+tunnel, the kernel treats that address as local — including the client's own
+control channel to `<server-ip>:2333`, which is the same address and would be
+delivered back to this host instead of leaving by the gateway.
+
+```bash
+# ---------- client ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo ip addr add <public-ip>/32 dev molehill0
+sudo ip rule add from <public-ip> lookup 100
+sudo ip route add default dev molehill0 table 100
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# The claimed address is the server's own, so the local table would answer
+# for it: demote that lookup and send this host's own traffic to the server
+# through the main table. Packets the server delivers arrive on the tunnel
+# (iif molehill0), so they still reach the demoted local lookup — only
+# locally generated traffic is redirected.
+sudo ip rule add pref 200 lookup local
+sudo ip rule del pref 0
+sudo ip rule add pref 100 iif lo to <server-ip> lookup main
+```
+
+Afterwards, the server's `ip route get <public-ip> mark 0x1` must name the TUN
+device and its `ip rule show` must list the mark rule above the local lookup;
+the client's `ip rule show` must list the `iif lo` rule above the demoted local
+lookup, and its control channel must connect.
 
 ### IPv6 claims
 

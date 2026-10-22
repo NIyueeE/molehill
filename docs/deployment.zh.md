@@ -403,9 +403,31 @@ sudo ip rule add pref 100 fwmark 0x1 lookup 100
 sudo ip route add default dev molehill0 table 100
 ```
 
-客户端一侧与配方 A 完全相同:客户端声明的是谁的地址并不重要——它承载该地址,
-应用绑定该地址。事后 `ip route get <public-ip> mark 0x1` 必须指向 TUN 设备,
-`ip rule show` 里 mark 规则必须排在 local 查询之前。
+客户端一侧是配方 A **再加一条规则**:它认领的是服务端自己的公网 IP。客户端把
+`<public-ip>` 配到自己的隧道上之后,内核就把它当成「本机地址」——客户端通往
+`<server-ip>:2333` 的控制通道正是这个地址,于是会被送回本机,而不是从网关出去。
+
+```bash
+# ---------- 客户端 ----------
+sudo ip tuntap add dev molehill0 mode tun
+sudo ip link set molehill0 up mtu 1400
+sudo ip addr add <public-ip>/32 dev molehill0
+sudo ip rule add from <public-ip> lookup 100
+sudo ip route add default dev molehill0 table 100
+sudo sysctl -w net.ipv4.conf.molehill0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+
+# 所认领的地址就是服务端自己的地址,因此 local 表会替它作答:把这个查询降级,
+# 并让本机自己发往服务端的流量走 main 表。服务端交回的包从隧道到达
+# (iif molehill0),仍会命中降级后的 local 查询——只有本机自己发出的流量被改道。
+sudo ip rule add pref 200 lookup local
+sudo ip rule del pref 0
+sudo ip rule add pref 100 iif lo to <server-ip> lookup main
+```
+
+事后:服务端上 `ip route get <public-ip> mark 0x1` 必须指向 TUN 设备,`ip rule
+show` 里 mark 规则必须排在 local 查询之前;客户端上 `ip rule show` 里 `iif lo`
+规则必须排在降级后的 local 查询之前,且控制通道必须能连上。
 
 ### IPv6 认领
 
