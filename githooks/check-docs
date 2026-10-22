@@ -242,6 +242,31 @@ else
   errors=$((errors + 1))
 fi
 
+# 9b) the docs-only paths are one contract in three places (githooks/docs-only,
+#     ci.yml's paths-ignore and docs.yml's paths). docs/checks.md states
+#     that they cannot disagree; this asserts it instead of trusting it.
+classifier_paths=$(sed -n 's/^[[:space:]]*\([^)]*\)) ;;$/\1/p' githooks/docs-only \
+  | tr '|' '\n' \
+  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e 's|^docs/\*$|docs/**|' -e 's|^assets/\*$|assets/**|' \
+        -e 's|^\*\.\([a-z]*\)$|**.\1|' \
+  | sed '/^$/d' | sort -u)
+workflow_paths() {
+  # The quoted path list under paths: / paths-ignore: (both triggers of a file).
+  sed -n 's/^[[:space:]]*-[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' "$1" | sort -u
+}
+ci_paths=$(workflow_paths .github/workflows/ci.yml)
+docs_paths=$(workflow_paths .github/workflows/docs.yml)
+if [ "$classifier_paths" = "$ci_paths" ] && [ "$ci_paths" = "$docs_paths" ]; then
+  echo "  ok    docs-only paths agree (classifier, ci.yml, docs.yml)"
+else
+  echo "  FAIL  docs-only paths disagree — update all three:" >&2
+  echo "        githooks/docs-only: $(printf '%s' "$classifier_paths" | tr '\n' ' ')" >&2
+  echo "        ci.yml            : $(printf '%s' "$ci_paths" | tr '\n' ' ')" >&2
+  echo "        docs.yml          : $(printf '%s' "$docs_paths" | tr '\n' ' ')" >&2
+  errors=$((errors + 1))
+fi
+
 # 10) release notes must be extracted from CHANGELOG.md
 if [ -f .github/workflows/release.yml ]; then
   expect "release notes extracted from CHANGELOG" .github/workflows/release.yml 'CHANGELOG.md'

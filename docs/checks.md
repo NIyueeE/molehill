@@ -72,7 +72,8 @@ Three properties make this safe rather than a bypass:
 - the classifier reads the **actual change set** — the staged paths for a
   commit, the pushed commit range for a push — and the three patterns are
   exactly `ci.yml`'s `paths-ignore` / `docs.yml`'s `paths`, so the hooks and CI
-  can never disagree about what "docs-only" means;
+  can never disagree about what "docs-only" means (`githooks/check-docs`
+  asserts the three agree);
 - the two gates a docs-only change *can* still break always run: the secret
   scan (a leaked key in a README is still a leaked key) and the docs-alignment
   check (which is what such a change moves);

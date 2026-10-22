@@ -156,9 +156,9 @@ is the voice contract for writing it.
   pages, both READMEs, and this file **in the same commit**.
 - The mechanical part is automated in `githooks/check-docs`, wired into the
   pre-commit chain. It only covers greppable invariants (hook commands ↔
-  docs/checks, lint names ↔ docs/lint-policy, edition, channel, just recipes,
-  README docs index, CI entry, CHANGELOG extraction, test-build entry,
-  secret-scan gate).
+  docs/checks, lint names ↔ docs/lint-policy, the docs-only paths ↔ the three
+  places that define them, edition, channel, just recipes, README docs index,
+  CI entry, CHANGELOG extraction, test-build entry, secret-scan gate).
   **Semantic alignment** (outdated prose, runnable examples, consistent tone)
   cannot be mechanized — it stays with the agent or a human reviewer.
 
