@@ -317,6 +317,55 @@
 
 ## Open threads for the next cycle
 
+- **The KCP sender now uses UDP GSO (2026-10-22, shipped), and it moved the
+  carrier's two numbers in opposite directions for a reason worth keeping.**
+  The shape: a batch already arrives as one iovec stream of equally sized
+  segments, so a run of two or more equal datagrams leaves in **one** `sendmsg`
+  with `UDP_SEGMENT` set — the kernel builds one skb and segments it at the
+  destination — while a mixed batch, a lone datagram, a run longer than
+  `GSO_MAX_SEGMENTS` (eight) or a kernel/path that refuses GSO
+  (`EINVAL`/`EMSGSIZE`/`EIO`/`EOPNOTSUPP`, remembered for the process) keeps
+  `sendmmsg`. Measured:
+  - the sender's own shape (loopback, 32 × 1472 B, receiver draining in the same
+    process): **0.153 s/Gbit with `sendmmsg`, 0.046 s/Gbit as one GSO
+    message** — 3.3×;
+  - the bench A/B on the forced-KCP carrier (`MOLEHILL_DATA_CARRIER=kcp`, six
+    rounds, the run's own A/A copy), twice with different caps:
+
+    | cell | no GSO | uncapped | cap 8 |
+    |---|---|---|---|
+    | throughput (Gbit/s) | 7.03 | 8.67 (+23 %) | 8.71 (+24 %) |
+    | cpu_s_per_gbit | 1.75 | 1.25 (−28 %) | 1.33 (−24 %) |
+    | rtt_p50 (ms) | 0.99 | 1.45 | 1.36 |
+    | rtt_p99 (ms) | 7.3 | 32.8 (4.5×) | 26.6 (4.8×) |
+    | peak RSS (MiB) | 84 | 213 (2.5×) | 193 (2.4×) |
+    | carried packet (KiB) | 1.3 | 20.0 | 8.8 |
+
+    Every round agreed on both directions (p 0.031 against alpha 0.05; the A/A
+    floors were 0.3 % for the CPU figure and 0.7 % for throughput), and a third
+    run at a different cap reproduced it.
+  **The mechanism, and why the trade is accepted rather than hidden**: before
+  this change the sender's own syscall rate paced the ARQ, so KCP's 8192-segment
+  send window (≈ 12 MB per session) never filled; with GSO the window does fill,
+  which is where the extra 23 % of throughput comes from — and the same bytes are
+  now *queue*, which is where the interactive tail and the +110 MiB peak RSS come
+  from. That makes the tail a **window-sizing** question, not a GSO one: the
+  carrier runs with `nodelay(1, 10 ms, fastresend=2, nc=1)` and a fixed window,
+  i.e. congestion control off. Closing it means sizing the window to the path (or
+  turning `nc` back on) — a measured decision of its own, recorded as the next
+  item below, and the reason this entry keeps both columns instead of claiming a
+  win.
+- **The bench model records a `--condition` the `cost` scenario does not
+  impose (found 2026-10-22).** Three `--profile screen` runs labelled `clean`,
+  `loss1` and `rate100` produced identical paths: throughput 7.03–7.08 Gbit/s,
+  zero qdisc drops, and the same retransmit count in all three. `--condition` is
+  written into `meta.method` but the staged `cost` scenario builds its stages
+  from its own timeline and never consults the campaign condition, so a run can
+  *label* itself shaped without being shaped — exactly the "measure the path you
+  claim" failure §10 exists for. The GSO numbers above are therefore **clean-path
+  numbers in all three runs**, and a shaped-path GSO comparison is still owed.
+  Fixing it is small (refuse or apply the condition in the staged runner) and it
+  belongs with the next bench-model change;
 - **The carrier policy is going peer-level (2026-10-22, in progress), and the
   first instrument is in.** The operator's direction: TCP and KCP are peers, and
   the pool should pick per path instead of shipping a fixed order. The signal

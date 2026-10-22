@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transparent `tun` name must be one the kernel can carry (1-15 bytes, no
   NUL), refused with the key named instead of at the first packet as a
   missing interface. Nothing that could serve before is refused now.
+- **The KCP carrier's batches are segmented by the kernel where they can be.**
+  A run of equally sized datagrams leaves in one `sendmsg` with `UDP_SEGMENT`
+  set, so the kernel builds one skb for the run and segments it at the
+  destination instead of building one per datagram; a mixed batch, a lone
+  datagram, or a kernel or path that refuses GSO keeps the old shape, and a
+  refusal is remembered for the process. The win is throughput and CPU per
+  byte; the cost is a fuller path queue (a higher interactive tail on a
+  saturated link) because the sender stops being the pacing bottleneck. Linux
+  only, no configuration key, no wire change: the datagrams and their order are
+  the same bytes either way.
 - **The striped data path no longer zeroes and reallocates every chunk.** A
   forwarded 32 KiB chunk used to arrive in a buffer that had just been zeroed
   and be sent from a freshly allocated frame; both are now one reusable buffer

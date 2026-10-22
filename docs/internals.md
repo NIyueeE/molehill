@@ -394,6 +394,34 @@ the UDP path with no KCP session in existence. The runner records whichever
 `MOLEHILL_*` switches a run inherited in its results meta (`instrumentation`),
 so an instrumented run is never mistaken for a clean one.
 
+### The KCP sender amortises its kernel cost with UDP GSO
+
+A userspace ARQ pays for every datagram in the kernel as well as in userspace:
+`sendmmsg` hands the kernel N segments and the kernel builds N skbs. A batch
+arrives here as one contiguous iovec stream of *equal* MSS-sized segments (the
+staging buffer plus the engine's own payload buffers, by reference), so the
+sender sets `UDP_SEGMENT` on a single `sendmsg` and the kernel builds **one**
+skb for the run, segmenting it at the destination. Measured on this host, the
+two shapes cost 0.153 s/Gbit of sender time against 0.046 for the same segments
+as one GSO message, and the whole carrier path gained 23-24 % throughput and
+lost 24-28 % of its CPU per Gbit at both a clean and a 1 %-loss path
+(HANDOFF.md).
+
+The shape decides it, so the rule is narrow on purpose: only a **run of at least
+two equally sized datagrams** takes the GSO path (a mixed batch — an ACK beside
+data, the short last segment of a window — has no single segment size, and one
+datagram is not a run), a run longer than eight segments leaves as several
+messages so one queue slot cannot hold an unbounded amount, everything else
+keeps the `sendmmsg` path, and a kernel or a path that refuses GSO is
+remembered for the process after the first refusal rather than paying a failed
+syscall per batch.
+
+The cost is visible where the path is: before this change the sender's own
+syscall rate was the pacer, and now the path's queue is. On a saturated link
+that means a shorter interactive tail on the *old* shape and a longer one here,
+which is why the benchmarks page quotes the carrier's throughput and its p99
+together.
+
 ### KCP datagram size follows the path MTU
 
 A KCP datagram is one UDP packet, and UDP does not negotiate a path MTU the way
