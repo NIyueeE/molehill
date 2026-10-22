@@ -31,6 +31,7 @@ jobs:
   plan:
     name: plan matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -60,6 +61,7 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     needs: plan
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
