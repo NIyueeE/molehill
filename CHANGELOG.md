@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transparent `tun` name must be one the kernel can carry (1-15 bytes, no
   NUL), refused with the key named instead of at the first packet as a
   missing interface. Nothing that could serve before is refused now.
+- **The striped data path no longer zeroes and reallocates every chunk.** A
+  forwarded 32 KiB chunk used to arrive in a buffer that had just been zeroed
+  and be sent from a freshly allocated frame; both are now one reusable buffer
+  per stripe, and a frame's 10-byte header no longer costs a small read of its
+  own. The wire format, the chunk size and every configuration key are
+  unchanged.
 
 ## [0.11.2] - 2026-10-20
 

@@ -378,10 +378,18 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     let mut seq = 0u64;
+    // One frame buffer for the whole direction, and its allocation is reused:
+    // `split` hands the frame to its stripe by ownership and `try_into_mut`
+    // takes the buffer back once the write is done. The stripe's writer copies
+    // into its own frame and keeps nothing, so the handle is unique again by
+    // the time the write returns; a buffer that cannot come back (a writer that
+    // ever does retain it) falls back to a fresh allocation, so the loop never
+    // depends on the refcount.
+    let mut frame = BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE);
     loop {
-        let mut frame = BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE);
         // Reserve the header room; the read appends behind it.
         frame.resize(STRIPE_HEADER_LEN, 0);
+        frame.reserve(STRIPE_CHUNK_SIZE);
         let n = match src.read_buf(&mut frame).await {
             Ok(0) => break,
             Ok(n) => n,
@@ -395,10 +403,19 @@ async fn send_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             n,
         )
         .map_err(|e| anyhow::anyhow!("stripe frame header: {e}"))?;
+        let handover = frame.split().freeze();
+        let recycle = handover.clone();
         sender
-            .send_owned(frame.freeze())
+            .send_owned(handover)
             .await
             .map_err(|e| anyhow::anyhow!("stripe write failed: {e}"))?;
+        frame = match recycle.try_into_mut() {
+            Ok(mut buffer) => {
+                buffer.clear();
+                buffer
+            }
+            Err(_) => BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE),
+        };
         activity.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
         seq += 1;
     }
@@ -415,52 +432,65 @@ enum StripeEvent {
 
 /// Read frames off one stripe and feed them to the group's reorder loop.
 ///
+/// One buffer per stripe, filled through `read_buf` — into spare capacity, never
+/// over zeroed memory — and split at frame boundaries: the payload travels to
+/// the reorder queue as a slice of the buffer it was read into, so a frame
+/// costs neither an allocation nor a memset, and a frame's header needs no
+/// separate small read on a stripe that is a socket.
+///
 /// A clean EOF at a frame boundary ends the stripe silently; anything else
 /// (a truncated frame, a read error) reports `Broken`, which makes the
 /// receive direction abandon the group instead of waiting forever for a
 /// sequence number that will never arrive.
 async fn stripe_reader<R: AsyncRead + Unpin>(mut r: R, tx: mpsc::Sender<StripeEvent>) {
-    let mut header = [0u8; STRIPE_HEADER_LEN];
+    let mut buf = BytesMut::with_capacity(STRIPE_HEADER_LEN + STRIPE_CHUNK_SIZE);
     loop {
-        // The first byte alone: a clean end between frames is a normal
-        // half-close, a partial header is a broken frame.
-        match r.read_u8().await {
-            Ok(b) => header[0] = b,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return,
+        // A whole frame in hand: split it off and queue its payload.
+        if buf.len() >= STRIPE_HEADER_LEN {
+            let header: [u8; STRIPE_HEADER_LEN] = buf[..STRIPE_HEADER_LEN]
+                .try_into()
+                .unwrap_or([0; STRIPE_HEADER_LEN]);
+            let (seq, len) = decode_header(&header);
+            let total = STRIPE_HEADER_LEN + len;
+            if buf.len() >= total {
+                let mut frame = buf.split_to(total);
+                let payload = frame.split_off(STRIPE_HEADER_LEN);
+                if tx
+                    .send(StripeEvent::Frame {
+                        seq,
+                        bytes: payload.freeze(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return; // the receive direction is gone; this stripe is over
+                }
+                continue;
+            }
+            buf.reserve(total - buf.len());
+        } else {
+            buf.reserve(STRIPE_HEADER_LEN - buf.len());
+        }
+        match r.read_buf(&mut buf).await {
+            Ok(0) => {
+                // Nothing was read: a clean end between frames is a normal
+                // half-close, bytes left in hand are a truncated frame.
+                if !buf.is_empty() {
+                    let _ = tx
+                        .send(StripeEvent::Broken(String::from(
+                            "stripe frame truncated: the stripe ended inside a frame",
+                        )))
+                        .await;
+                }
+                return;
+            }
+            Ok(_) => {}
             Err(e) => {
                 let _ = tx
                     .send(StripeEvent::Broken(format!("stripe read failed: {e}")))
                     .await;
                 return;
             }
-        }
-        if let Err(e) = r.read_exact(&mut header[1..]).await {
-            let _ = tx
-                .send(StripeEvent::Broken(format!(
-                    "stripe frame header truncated: {e}"
-                )))
-                .await;
-            return;
-        }
-        let (seq, len) = decode_header(&header);
-        let mut payload = BytesMut::zeroed(len);
-        if let Err(e) = r.read_exact(&mut payload).await {
-            let _ = tx
-                .send(StripeEvent::Broken(format!(
-                    "stripe frame payload truncated: {e}"
-                )))
-                .await;
-            return;
-        }
-        if tx
-            .send(StripeEvent::Frame {
-                seq,
-                bytes: payload.freeze(),
-            })
-            .await
-            .is_err()
-        {
-            return; // the receive direction is gone; this stripe is over
         }
     }
 }
