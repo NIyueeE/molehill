@@ -420,7 +420,22 @@ The cost is visible where the path is: before this change the sender's own
 syscall rate was the pacer, and now the path's queue is. On a saturated link
 that means a shorter interactive tail on the *old* shape and a longer one here,
 which is why the benchmarks page quotes the carrier's throughput and its p99
-together.
+together — and why the window itself had to stop being a constant:
+
+**The window follows the path.** A session re-estimates its bandwidth-delay
+product once a second — the bytes it emitted over the interval against the round
+trip its own ACKs measure — and sets both windows to twice that, clamped to
+128..8192 segments. The counters are its own (`SessionHealth::bytes_out`), so
+nothing above the carrier has to tell it what the path is doing. Two guards keep
+the estimate away from the cases where a wide window is the point. A session that
+is **re-sending** keeps the window it has: fast retransmit needs more in flight
+than the BDP, and a lossy leg lost two thirds of its throughput when a tighter
+bound was tried on the app-side queue cap. And a window already inside twice the
+estimate is left alone: growth is immediate, shrinking waits until the estimate
+is less than *half* the window in force, so the per-second scatter cannot make it
+flap. Measured against the fixed 8192-segment window, the effect that clears the
+run's own noise is memory — 36 % less peak RSS — with throughput, CPU per byte
+and the tail all inside the same run's scatter (HANDOFF.md, 2026-10-23).
 
 ### KCP datagram size follows the path MTU
 

@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transparent `tun` name must be one the kernel can carry (1-15 bytes, no
   NUL), refused with the key named instead of at the first packet as a
   missing interface. Nothing that could serve before is refused now.
+- **The KCP window follows the path instead of a fixed 8192 segments.** Once a
+  second, a session that is not re-sending estimates its bandwidth-delay product
+  from the bytes it emitted and the round trip its own ACKs measure, and sets
+  both windows to twice that, clamped to 128..8192 segments. A re-sending
+  session keeps the window it has — fast retransmit needs more in flight than
+  the product, and a lossy leg lost two thirds of its throughput when a tighter
+  bound was tried on the queue cap — and growth is immediate while shrinking
+  waits until the estimate is under half the window in force, so the per-second
+  estimate cannot make it flap. The effect that clears a run'"'"'s own noise is
+  memory: the window a short fast path earns is far smaller than 8192 segments,
+  and the pair'"'"'s peak RSS fell by a third with throughput, CPU per byte and the
+  interactive tail all inside the same run'"'"'s scatter.
 - **The KCP carrier's batches are segmented by the kernel where they can be.**
   A run of equally sized datagrams leaves in one `sendmsg` with `UDP_SEGMENT`
   set, so the kernel builds one skb for the run and segments it at the

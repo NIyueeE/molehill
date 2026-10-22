@@ -35,12 +35,23 @@ pub struct SessionHealth {
     /// the peer's later acks exposed). The share of these in `datagrams_out`
     /// is the degradation signal.
     pub retransmits: AtomicU64,
+    /// Bytes the engine emitted, headers included, cumulative.
+    ///
+    /// The *rate* half of a bandwidth-delay estimate: a window sized to a path
+    /// needs the rate the path is carrying, and a session is the only thing
+    /// that knows its own (see `kcp::retune_window`).
+    pub bytes_out: AtomicU64,
 }
 
 impl SessionHealth {
     /// A fresh pair of counters, shared with the engine that will bump them.
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    /// Cumulative bytes emitted, headers included.
+    pub fn bytes(&self) -> u64 {
+        self.bytes_out.load(Relaxed)
     }
 
     /// The cumulative `(datagrams_out, retransmits)` pair.

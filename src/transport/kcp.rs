@@ -102,6 +102,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
 use crate::transport::dgram::{BATCH, Span};
+use crate::transport::health::SessionHealth;
 
 /// KCP flush interval in ms (`nodelay` mode; also the pump's timer floor
 /// and the retransmit RTO base). 10 ms is the measured sweet spot:
@@ -130,6 +131,25 @@ const KCP_FAST_RESEND: i32 = 2;
 /// assumption.
 const KCP_SND_WND: u16 = 8192;
 const KCP_RCV_WND: u16 = 4096;
+/// How often a session re-estimates its path and retunes its window.
+const WND_RETUNE: Duration = Duration::from_secs(1);
+/// The window's floor, in segments: the engine's own receive-window constant,
+/// which is the smallest value the window setter will store.
+const KCP_WND_MIN: u16 = 128;
+/// How much of the estimated bandwidth-delay product a window holds: twice it,
+/// so a burst is not stopped for a window-update round trip.
+const WND_BDP_FACTOR: u64 = 2;
+/// The re-sent share, in percent, below which a window is judged *queue*
+/// rather than ARQ fuel.
+///
+/// Above it the session is re-sending, and a lossy path wants more in flight
+/// than its bandwidth-delay product - sizing to the BDP cost a lossy leg two
+/// thirds of its throughput when it was tried on the app-side queue cap (see
+/// the `SND_QUEUE_LIMIT` note above). The retune therefore only touches a
+/// session that is not re-sending, which is exactly the case the measured
+/// regression is about: a clean path whose window is pure standing queue
+/// (latency and memory no throughput measurement asked for).
+const WND_QUIET_SHARE_PCT: u64 = 1;
 /// The most a session may keep *parked* for the pacer, in bytes. Parking is
 /// bounded by the send window in practice (the engine cannot emit more than
 /// that ahead); this is the backstop that keeps a pathological rate from
@@ -768,6 +788,9 @@ impl io::Write for DatagramOut {
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            health
+                .bytes_out
+                .fetch_add(buf.len() as u64, Ordering::Relaxed);
         }
         if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
@@ -813,6 +836,9 @@ impl DatagramSink for DatagramOut {
         crate::kcp::KCP_DATAGRAMS_OUT.fetch_add(1, Ordering::Relaxed);
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
+            health
+                .bytes_out
+                .fetch_add((header.len() + payload.len()) as u64, Ordering::Relaxed);
         }
         if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
             self.emit();
@@ -1313,6 +1339,14 @@ struct PaceState {
     parked: std::collections::VecDeque<ParkedBatch>,
     /// Bytes in `parked`.
     parked_bytes: usize,
+    /// When the window was last retuned to the path, and the session's counters
+    /// at that moment: the retune diffs them for its bandwidth-delay estimate.
+    last_wnd_retune: Option<Instant>,
+    bytes_at_retune: u64,
+    datagrams_at_retune: u64,
+    retrans_at_retune: u64,
+    /// The window in force, in segments, as this side last set it.
+    wnd: u16,
 }
 
 /// One batch's worth of datagrams the pacer has not allowed yet, kept with the
@@ -1350,6 +1384,11 @@ impl PaceState {
             parked: std::collections::VecDeque::new(),
             parked_bytes: 0,
             last_mtu_check: None,
+            last_wnd_retune: None,
+            bytes_at_retune: 0,
+            datagrams_at_retune: 0,
+            retrans_at_retune: 0,
+            wnd: KCP_SND_WND,
         }
     }
 
@@ -1771,11 +1810,99 @@ async fn pump_head(
     pace: &mut PaceState,
     start: Instant,
     datagram_bytes: &AtomicUsize,
+    health: &SessionHealth,
 ) -> Option<u32> {
     let delay = update_due(kcp, start)?;
     maybe_ping(kcp, net, pace, start).await;
     maybe_path_mtu(kcp, net, pace, datagram_bytes);
+    retune_window(kcp, pace, health, Instant::now());
     Some(delay)
+}
+
+/// Size the window to the path's bandwidth-delay product, once a second, on a
+/// session that is not re-sending.
+///
+/// The window is a queue bound as much as a bandwidth one: a fixed 8192
+/// segments (about 12 MB per session) holds whatever the pipe cannot carry as
+/// standing queue, and that is measurable - a carrier whose sender stopped being
+/// the pacing bottleneck cost 26 ms of p99 and 110 MiB of peak RSS once it could
+/// fill that window (HANDOFF.md, 2026-10-22). Sizing it to the path takes the
+/// queue out while keeping the rate.
+///
+/// Two guards keep it away from the cases where a wide window is the point. A
+/// session that is *re-sending* keeps the window it has: fast retransmit needs
+/// more in flight than the BDP, and a lossy leg lost two thirds of its
+/// throughput when a tighter bound was tried on the queue cap. And a window
+/// already inside twice the estimate is left alone: growth is immediate,
+/// shrinking waits until the estimate is less than half the window in force, so
+/// the per-second scatter cannot make it flap.
+fn retune_window(
+    kcp: &mut Kcp<DatagramOut>,
+    pace: &mut PaceState,
+    health: &SessionHealth,
+    now: Instant,
+) {
+    let (datagrams, retrans) = health.counts();
+    let bytes = health.bytes();
+    let Some(last) = pace.last_wnd_retune else {
+        pace.last_wnd_retune = Some(now);
+        pace.bytes_at_retune = bytes;
+        pace.datagrams_at_retune = datagrams;
+        pace.retrans_at_retune = retrans;
+        return;
+    };
+    let elapsed = now.saturating_duration_since(last);
+    if elapsed < WND_RETUNE {
+        return;
+    }
+    let sent = bytes.saturating_sub(pace.bytes_at_retune);
+    let emitted = datagrams.saturating_sub(pace.datagrams_at_retune);
+    let resent = retrans.saturating_sub(pace.retrans_at_retune);
+    pace.last_wnd_retune = Some(now);
+    pace.bytes_at_retune = bytes;
+    pace.datagrams_at_retune = datagrams;
+    pace.retrans_at_retune = retrans;
+    // Nothing emitted, no round-trip sample, or a session that is re-sending:
+    // three reasons a window says nothing about this path's queue.
+    if sent == 0 || emitted == 0 || resent * 100 >= emitted * WND_QUIET_SHARE_PCT {
+        return;
+    }
+    let srtt_ms = kcp.rx_srtt_ms();
+    if srtt_ms == 0 {
+        return;
+    }
+    // A window's arithmetic, not a measurement: the byte and time counts are far
+    // below 2^53, and a BDP above a terabyte would clamp to the ceiling anyway.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a byte count far below 2^53, converted for a rate"
+    )]
+    let rate_bps = (sent as f64 * 8.0) / elapsed.as_secs_f64();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a bounded rate times a millisecond RTT; the window clamps the result"
+    )]
+    let bdp_bytes = (rate_bps * f64::from(srtt_ms) / 8.0 / 1000.0) as u64;
+    let want = window_for(bdp_bytes, kcp.mtu());
+    if want <= pace.wnd && want.saturating_mul(2) >= pace.wnd {
+        return;
+    }
+    pace.wnd = want;
+    kcp.set_wndsize(want, want);
+    debug!(
+        window = want,
+        bdp_bytes, srtt_ms, "KCP window retuned to the path"
+    );
+}
+
+/// The window, in segments, that covers `bdp_bytes` with `WND_BDP_FACTOR` of
+/// headroom, clamped to the carrier's floor and ceiling.
+fn window_for(bdp_bytes: u64, mss: usize) -> u16 {
+    let mss = u64::try_from(mss).unwrap_or(1).max(1);
+    let segments = bdp_bytes.saturating_mul(WND_BDP_FACTOR) / mss;
+    let clamped = segments.clamp(u64::from(KCP_WND_MIN), u64::from(KCP_SND_WND));
+    u16::try_from(clamped).unwrap_or(KCP_SND_WND)
 }
 
 /// How often a session re-reads the kernel's path MTU.
@@ -2067,6 +2194,7 @@ async fn intake(
 async fn run_session(
     mut kcp: Kcp<DatagramOut>,
     net: SessionNet,
+    health: Arc<SessionHealth>,
     mut pkt_rx: mpsc::Receiver<Bytes>,
     mut dgram_rx: mpsc::UnboundedReceiver<DgramBatch>,
     mut out_rx: mpsc::UnboundedReceiver<Bytes>,
@@ -2098,7 +2226,7 @@ async fn run_session(
     let mut last_sack_sent = Instant::now();
     while let Some(delay) = {
         let _t = PhaseTimer::new(&KCP_NS_UPDATE); // pump_head = update + keepalive
-        pump_head(&mut kcp, &net, &mut pace, start, &datagram_bytes).await
+        pump_head(&mut kcp, &net, &mut pace, start, &datagram_bytes, &health).await
     } {
         KCP_PUMP_ROUNDS.fetch_add(1, Ordering::Relaxed);
         let mut sent_any = false;
@@ -2342,6 +2470,7 @@ fn spawn_session(conv: u32, net: SessionNet) -> (KcpStream, mpsc::Sender<Bytes>)
     tokio::spawn(run_session(
         kcp,
         net,
+        Arc::clone(&health),
         pkt_rx,
         dgram_rx,
         out_rx,
@@ -3220,6 +3349,23 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The window a path's bandwidth-delay product earns, and the clamps that
+    /// keep it sane: the floor covers a gigabit path at a millisecond, the
+    /// ceiling is the carrier's widest window, and a nonsense MSS cannot divide
+    /// by zero.
+    #[test]
+    fn the_window_covers_the_path_within_its_clamps() {
+        // 7 Gbit/s at a 1 ms round trip is ~875 KiB, which is ~594 segments of
+        // 1472 B; the window carries twice that for headroom.
+        assert_eq!(window_for(875 * 1024, 1472), 1217);
+        // An unmeasured or empty path floors rather than closing the window.
+        assert_eq!(window_for(0, 1472), KCP_WND_MIN);
+        // A fat, long path caps at the carrier's ceiling.
+        assert_eq!(window_for(u64::MAX, 1472), KCP_SND_WND);
+        // A zero MSS is a bug elsewhere; it must not divide by zero here.
+        assert_eq!(window_for(875 * 1024, 0), KCP_SND_WND);
+    }
 
     /// Read exactly `n` bytes with a generous timeout (KCP is userspace ARQ
     /// ticking at a 10 ms interval even on loopback).

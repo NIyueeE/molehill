@@ -61,6 +61,22 @@
 
 ## Where this stands
 
+- **The KCP window follows the path (2026-10-23), and the only effect that
+  cleared the run's own noise is memory.** Fixed 8192 segments (about 12 MB per
+  session) became "twice the bandwidth-delay product, clamped to 128..8192,
+  retuned once a second on a session that is not re-sending". The A/B on the
+  forced KCP carrier (`--profile screen --ab-arm --aa --rounds 6`, the run's own
+  A/A copy): peak RSS 189.0 -> 147.5 MiB, **the one reading that cleared its
+  floor** (10 %, p 0.031 against alpha 0.05, 6/6 rounds); throughput 8.78 ->
+  9.06 Gbit/s, cpu_s_per_gbit 1.309 -> 1.383, p99 10.3 -> 18.0 ms — all three
+  inside this run's scatter, and the p99 cell's own A/A pair disagreed by 154 %
+  (10.3 against 27.2), so the tail is *not* a reading from this run. The
+  direction of the trade is worth keeping: a smaller window means smaller GSO
+  batches, so CPU per byte and the carried packet (8.8 -> 7.7 KiB) move against
+  the previous change while the bytes in flight — and with them the queue —
+  fall. Shipped as a *bound* (an arbitrary 8192 is not a design), not as a win;
+  the tail needs a run this model can resolve, which is the shaped campaign the
+  `--condition` hole above still blocks.
 - **The root dependencies are current (2026-10-23).** `cargo outdated
   --root-deps-only` is clean: `parking_lot` 0.13 (with `lock_api` 0.5,
   `parking_lot_core` 0.10), `tokio` 1.54.1, `libc` 0.2.191, `tun-rs` 2.8.13,
