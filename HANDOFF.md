@@ -61,6 +61,16 @@
 
 ## Where this stands
 
+- **The root dependencies are current (2026-10-23).** `cargo outdated
+  --root-deps-only` is clean: `parking_lot` 0.13 (with `lock_api` 0.5,
+  `parking_lot_core` 0.10), `tokio` 1.54.1, `libc` 0.2.191, `tun-rs` 2.8.13,
+  plus the transitive set. No code change was needed. One property moved without
+  a call site: parking_lot dropped **automatic eventual fairness**, so the mux
+  engine's `Mutex` no longer gets the thread-queue fairness it used to inherit —
+  nothing here uses a fair-unlock API, and the locks are held for a few
+  instructions, but a contention-heavy run is now the only thing that would show
+  it, which is why the next sweep's `rtt_p99` cells get a second look rather
+  than an assumption.
 - **The L4 data plane's cost was decomposed with the bench model (2026-10-22),
   and the carrier dominates every other term.** Three runs on this host, no
   claim beyond what each one supports: `--profile stage` (24 samples, the run's

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dependencies refreshed.** `parking_lot` moves to 0.13 (`lock_api` 0.5,
+  `parking_lot_core` 0.10): it defers waking parked threads until after the lock
+  is released, carries per-acquisition guard state, and **drops automatic
+  eventual fairness** (fair unlocking stays available through the explicit
+  APIs). `tokio` 1.54, `libc` 0.2.191 and `tun-rs` 2.8.13 take their patch
+  releases, and the transitive set moves with them. No code change was needed:
+  this crate uses `parking_lot`'s `Mutex` and nothing else (the `RwLock`s here
+  are tokio's), and its mux locks are held for a few instructions, so the
+  fairness change lands on the engine's contention behaviour rather than on a
+  call site — a sweep's tail figures are what would show it.
 - **A configuration that cannot serve is refused when it loads.** A
   forwarding service's `local_addr` must be `host:port` with a usable port:
   a missing, non-numeric or zero port used to load, register and fail at the
