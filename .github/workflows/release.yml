@@ -11,7 +11,9 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  # Least privilege: only the job that creates the Release writes; the check,
+  # build and publish jobs read (the docker job sets its own packages scope).
+  contents: read
 
 # A release is a deliberate, single act: two tag pushes (or a re-push while a
 # release is still running) must not race on the GitHub Release, the GHCR
@@ -260,6 +262,8 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
