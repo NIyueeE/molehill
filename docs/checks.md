@@ -147,7 +147,9 @@ the heavy gates are not re-run on the tag.
 | 17 | `Containerfile` + release.yml GHCR job / image tags / `--help` smoke test | container build review (mechanical part) |
 | 18 | advisory checklist: CHANGELOG & docs audit, container review, benchmark gate, deliberate-release confirm | human/agent review items |
 
-At tag creation (local mode only) it additionally requires a clean working
+Row 15's three rules are one extractor, `githooks/changelog-notes`, called by
+this review and by `release.yml` — the local verdict and the release cannot
+disagree. At tag creation (local mode only) it additionally requires a clean working
 tree and that the tag does not exist yet. On a tag push (evaluated against a
 commit), missing bench assets are a note instead of a failure — a historical
 tag legitimately predates the ritual, and re-pushing one to fix a failed

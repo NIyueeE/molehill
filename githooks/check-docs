@@ -270,7 +270,13 @@ fi
 # 10) release notes must be extracted from CHANGELOG.md
 if [ -f .github/workflows/release.yml ]; then
   expect "release notes extracted from CHANGELOG" .github/workflows/release.yml 'CHANGELOG.md'
+  expect "release workflow uses the changelog extractor" .github/workflows/release.yml 'githooks/changelog-notes'
+  expect "tag review uses the changelog extractor" githooks/pre-tag 'githooks/changelog-notes'
   expect "release docs mention CHANGELOG" docs/release.md 'CHANGELOG'
+  if [ ! -f githooks/changelog-notes ]; then
+    echo "  FAIL  githooks/changelog-notes missing (release notes have one extractor)" >&2
+    errors=$((errors + 1))
+  fi
 else
   echo "  FAIL  .github/workflows/release.yml missing (see docs/release.md)" >&2
   errors=$((errors + 1))

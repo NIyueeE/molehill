@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# The one changelog-to-release-notes extractor (AGENTS.md §5, docs/release.md).
+#
+# Usage: githooks/changelog-notes <version> < CHANGELOG.md
+#
+# Prints the body of the single dated `## [x.y.z] - YYYY-MM-DD` section for
+# <version> on stdout and exits 0. Otherwise explains the first violated rule
+# on stderr and exits 1:
+#   - exactly one dated section for that version (every consumer takes the
+#     first match, so a stray duplicate in front of the real one would
+#     publish empty notes);
+#   - the section carries prose, not headings alone;
+#   - `## [Unreleased]` is empty (its content belongs in the dated section).
+#
+# githooks/pre-tag and .github/workflows/release.yml both call this, so the
+# local review and the release cannot drift apart, and the heading is matched
+# by literal prefix, not by a regex built from the version: a version is data,
+# not a pattern.
+set -euo pipefail
+
+version="${1:-}"
+if [ -z "$version" ]; then
+  echo "usage: changelog-notes <version> < CHANGELOG.md" >&2
+  exit 2
+fi
+
+prefix="## [$version] - "
+content="$(cat)"
+
+# One dated section, counted by literal prefix plus a fixed date shape.
+sections="$(printf '%s\n' "$content" | awk -v prefix="$prefix" '
+  index($0, prefix) == 1 && substr($0, length(prefix) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { n++ }
+  END { print n + 0 }')"
+if [ "$sections" -ne 1 ]; then
+  printf "CHANGELOG.md needs exactly one dated '## [%s] - YYYY-MM-DD' section (found %s)\n" "$version" "$sections" >&2
+  exit 1
+fi
+
+notes="$(printf '%s\n' "$content" | awk -v prefix="$prefix" '
+  index($0, prefix) == 1 && substr($0, length(prefix) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { insec = 1; next }
+  insec && /^## / { exit }
+  insec { print }')"
+if ! printf '%s\n' "$notes" | grep -qE '^[^#[:space:]]'; then
+  printf "the '## [%s]' section has no prose (headings only)\n" "$version" >&2
+  exit 1
+fi
+
+if printf '%s\n' "$content" | awk '
+  /^## \[Unreleased\]/ { insec = 1; next }
+  insec && /^## / { exit }
+  insec { print }' | grep -qE '^[^[:space:]]'; then
+  echo "'## [Unreleased]' still has content; move it into the dated section before tagging" >&2
+  exit 1
+fi
+
+printf '%s\n' "$notes"

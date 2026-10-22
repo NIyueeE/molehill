@@ -74,30 +74,15 @@ else
 fi
 
 # --- changelog: single source of release notes ------------------------------
-# Three properties, because one weak check let a real defect through: a
-# *duplicated* section (every extractor takes the first match, so a stray empty
-# copy in front of the real one publishes empty notes), a section that is
-# headings only, and an [Unreleased] section still holding the release's own
-# content. The old check counted lines between the headings, so the empty
-# duplicate passed on its "### Changed".
+# The three properties (exactly one dated section, prose in it, an empty
+# [Unreleased]) live in one extractor, githooks/changelog-notes, which
+# .github/workflows/release.yml calls as well: a local review that disagreed
+# with the release would be worse than no review.
 echo "[changelog]"
-sections="$(at CHANGELOG.md | grep -cE "^## \\[$version\\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$" || true)"
-prose="$(at CHANGELOG.md | awk -v ver="$version" '
-  $0 ~ "^## \\[" ver "\\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$" {insec=1; next}
-  insec && /^## / {exit}
-  insec {print}' | grep -cE '^[^#[:space:]]' || true)"
-unreleased="$(at CHANGELOG.md | awk '
-  /^## \[Unreleased\]/ {insec=1; next}
-  insec && /^## / {exit}
-  insec {print}' | grep -cE '^[^[:space:]]' || true)"
-if [ "${sections:-0}" -ne 1 ]; then
-  fail "CHANGELOG.md needs exactly one dated '## [$version] - YYYY-MM-DD' section at $short, found ${sections:-0}"
-elif [ "${prose:-0}" -eq 0 ]; then
-  fail "the '## [$version]' section in CHANGELOG.md at $short has no prose — headings only"
-elif [ "${unreleased:-0}" -ne 0 ]; then
-  fail "'## [Unreleased]' still has content in CHANGELOG.md at $short — move it into the dated section before tagging"
-else
+if message="$(at CHANGELOG.md | githooks/changelog-notes "$version" 2>&1 >/dev/null)"; then
   echo "  ok    exactly one dated '## [$version]' section, with prose; [Unreleased] is empty"
+else
+  fail "$message"
 fi
 
 # --- release assets (benchmark ritual deliverables) -------------------------

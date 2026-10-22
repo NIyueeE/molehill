@@ -40,7 +40,8 @@ contract, not just a list). Deeper docs: [configuration](configuration.md),
 | `githooks/docs-only` | change-set classifier: all docs paths → pre-commit/pre-push take the two-gate docs-only path |
 | `githooks/benches-only` | change-set classifier: all paths under `bench/` or `benches/records/` → pre-commit skips the cargo gates, pre-push skips the heavy gates (runtime tooling, never compiled) |
 | `githooks/check-secrets` | staged-changes secret scan (`security-scan:allow` marker to waive a line) |
-| `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, feature-name registry, edition, channel, README index, CI entry) |
+| `githooks/check-docs` | docs ↔ code alignment (hook commands, lints, feature-name registry, docs-only paths ↔ the workflows, edition, channel, README index, CI entry) |
+| `githooks/changelog-notes` | the one extractor for a version's `CHANGELOG.md` section (single dated section, prose, empty `[Unreleased]`); called by `githooks/pre-tag` and `release.yml` |
 | `.github/workflows/ci.yml` | `just check` chain + feature powerset (plus test-target compilation for the transparent set) + per-feature test matrix + minimal-size check + musl checks (full set on x86_64 and native aarch64; `embedded` via cross) + native musl test jobs (x86_64 and aarch64) + 5-target builds/tests, including both macOS architectures on native runners (skipped for docs-only changes) |
 | `.github/workflows/docs.yml` | the docs-only half: `githooks/check-docs` for changes limited to markdown, `docs/`, `assets/` |
 | `.github/workflows/release.yml` | tag-driven release: version/changelog gates, 10-target matrix (each leg native on its architecture), direct release, GHCR, crates.io |

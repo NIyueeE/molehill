@@ -36,6 +36,9 @@ AGENTS.md §5; the wire consequences are in
 - A missing or empty changelog section **fails the release** — the workflow
   errors out before building anything. Fix: add the section, delete the tag,
   re-push. Never hand-edit release notes on GitHub.
+- The rules are implemented once, in `githooks/changelog-notes`, which the tag
+  review and `release.yml` both call: the local verdict and the published notes
+  cannot diverge.
 
 ## Tag-push policy: no casual release pushes
 
