@@ -78,7 +78,11 @@ Three properties make this safe rather than a bypass:
   branch with no remote to diff against, a **tag push that also carries a
   branch** (never docs-only; the release review runs first, then the branch's
   heavy gates), and a commit that mixes docs with code paths. A tag-only push
-  is not ambiguous: it runs the release review and stops there.
+  is not ambiguous: it runs the release review and stops there. A
+  **deletion-only push** is not ambiguous either: the refs it names carry no
+  commits, so there is nothing for audit, deny, outdated or the tests to
+  judge, and pre-push stops after classification. Deleting a `v*` tag is
+  excepted — that is a release act, so it takes the full chain.
 
 `githooks/docs-only` is the classifier itself: paths on stdin, exit 0 when all
 of them are docs. Deleting it makes both hooks run the full chain again, which

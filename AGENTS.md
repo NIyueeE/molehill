@@ -279,7 +279,9 @@ Details: [docs/release.md](docs/release.md).
   keeps only the docs check; and anything ambiguous — an empty change set, a
   new branch, a commit mixing docs or benches with code — falls back to the
   full chain. A tag-only push is not ambiguous: it runs the release review and
-  stops there. Deleting a classifier restores the full chain, which is the safe
+  stops there. A push that only deletes branches is not ambiguous either: it
+  carries no commits, so pre-push stops after classification (deleting a `v*`
+  tag still takes the full chain). Deleting a classifier restores the full chain, which is the safe
   direction. `main`
   is not branch-protected today — the
   `full check chain` check and the no-force-push rule are enforced by

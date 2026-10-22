@@ -13,11 +13,15 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 # Consume the pushed refs from stdin before running anything; `v*` tag pushes
-# get the release review ahead of the heavy gates. Deletions are skipped.
+# get the release review ahead of the heavy gates, and a push that only
+# deletes branches is not a change set at all — it carries no commits, so the
+# heavy gates have nothing to judge (a deleted `v*` tag is not that case).
 # (A manual run from a terminal reads nothing, like the hook always did.)
 pushed_any=0
 tag_pushed=0
+tag_deleted=0
 branch_pushed=0
+deletions=0
 docs_only=1
 benches_only=1
 if [ ! -t 0 ]; then
@@ -29,11 +33,18 @@ if [ ! -t 0 ]; then
           tag_pushed=1
           echo "==> release tag pushed: $local_ref"
           githooks/pre-tag --tag "${local_ref#refs/tags/}" --commit "$(git rev-parse --verify "$local_sha^{commit}")"
+        else
+          # Deleting a release tag is a release act too: it gets no shortcut.
+          tag_deleted=1
         fi
         ;;
       *)
         if [ "$local_sha" != "$zeros" ]; then
           branch_pushed=1
+        elif [ "$remote_sha" != "$zeros" ]; then
+          # A ref that existed on the remote and is going away: it carries no
+          # commits for the heavy gates to judge.
+          deletions=$((deletions + 1))
         fi
         ;;
     esac
@@ -65,6 +76,17 @@ fi
 # first.
 if [ "$tag_pushed" -eq 1 ] && [ "$branch_pushed" -eq 0 ]; then
   echo "==> tag-only push: release review passed; heavy gates already ran on the commit"
+  exit 0
+fi
+
+# A deletion is not a change set: the pushed refs name only commits that are
+# going away, so audit, deny, outdated and the test suite have nothing to
+# judge and the push stops after classification. A deleted `v*` tag is not
+# covered (see above): it falls through to the heavy chain rather than take a
+# shortcut on a release act.
+if [ "$deletions" -gt 0 ] && [ "$pushed_any" -eq 0 ] && [ "$tag_deleted" -eq 0 ]; then
+  echo "==> deletion-only push: no commits to gate; skipping audit / deny / outdated / test"
+  echo "pre-push checks passed (deletion-only)"
   exit 0
 fi
 
