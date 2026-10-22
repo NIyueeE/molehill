@@ -61,6 +61,28 @@
 
 ## Where this stands
 
+- **The L4 data plane's cost was decomposed with the bench model (2026-10-22),
+  and the carrier dominates every other term.** Three runs on this host, no
+  claim beyond what each one supports: `--profile stage` (24 samples, the run's
+  own `molehill~aa` copy as its noise floor) reads the clean cell as control
+  (no tool) 49.2 Gbit/s / p99 2.66 ms, molehill L4 7.06 Gbit/s (A/A 7.02) at
+  12.2 cores and 1.74 s/Gbit with p99 9.83 ms (A/A 13.22 — this cell's scatter
+  is ±35 %, so no p99 claim is available from one run), L3 5.85 Gbit/s at 7.13
+  cores with p99 2.10 ms. Two `--profile screen` runs on the same fingerprint
+  isolate the carrier by the documented diagnostic switch: **KCP (the default)
+  7.11 Gbit/s, 12.23 cores, 1.73 s/Gbit, p50 1.02 ms, p99 7.96 ms; TCP
+  12.31 Gbit/s, 7.74 cores, 0.64 s/Gbit, p50 0.84 ms, p99 1.59 ms** — +73 %
+  throughput, −63 % CPU and −80 % p99 for the same workload. `perf` on this
+  host (reconnaissance, no claim) puts the two daemons' CPU at ~50–65 % kernel
+  packet path, ~15 % the Noise AEAD and ~15 % libc memcpy/malloc, with the rest
+  spread over the layers, so neither framing nor allocation is where the cost
+  is. An ad-hoc topology (8 bulk streams + 8 interactive threads, not the model)
+  agrees: KCP 8.7 Gbit/s / p50 2.9 ms / p99 6.7 ms, TCP 15.7 / 0.84 / 2.4, KCP
+  with `data_enable = false` 9.5 / 1.99 / 4.74 — the data-plane AEAD is worth
+  ~9 % of throughput, the userspace ARQ ~45 %. Both are *product* decisions (a
+  carrier policy that prefers TCP on a clean path, or a cheaper AEAD), not
+  defects to patch. What was fixable in the framing is in `5632f66` (no memset
+  and no per-chunk allocation; measured at the noise floor, so no claim).
 - **v0.11.2 is released, and its sweep is the next baseline (2026-10-20).**
   The published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
   `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
@@ -263,6 +285,30 @@
 
 ## Open threads for the next cycle
 
+- **Decision needed (2026-10-22): the data plane's carrier policy is the
+  largest measured lever on L4 performance.** The numbers are in "Where this
+  stands": forcing TCP is +73 % throughput, −63 % CPU and −80 % p99 on a clean
+  cell against the shipped KCP-first policy, and the difference is the userspace
+  ARQ's per-datagram work at 1472-byte segments, not the framing above it. KCP
+  is the carrier the shaped stages are aimed at, so "prefer TCP" cannot be a
+  blind switch: it needs a campaign over the whole stage schedule (`timeline`
+  with each carrier, or a policy that measures loss and switches), and that is a
+  scope decision for this cycle rather than an optimization an agent takes on
+  its own. The related, smaller lever is the
+  data-plane AEAD at ~9 % of clean throughput: AES-256-GCM is only ~1.4×
+  ChaCha20-Poly1305 on this Haswell host (openssl speed: 2.40 against
+  1.70 GB/s), so it would buy little here and is a v5.3 wire change either way.
+- **A forced carrier is invisible to the comparability gate (found
+  2026-10-22).** `MOLEHILL_DATA_CARRIER` is recorded in `meta.molehill_switches`
+  by design ("the reader decides; the file has to say"), but `fingerprint`
+  hashes `meta.method` alone — so the two screen runs above carry the *same*
+  fingerprint while measuring different subjects, and `analysis.comparability`,
+  which is what the gate uses to accept a baseline, compares fingerprints. A
+  forced-carrier record could therefore stand in as a release baseline for a
+  default run. Folding the switches into the fingerprint changes every future
+  record's method identity and so needs a method re-baseline in a release
+  ritual, not a drive-by edit; until then, read `meta.molehill_switches` before
+  comparing two files and never publish a sweep taken with one set.
 - **Decision (2026-10-19): one top-level tunnel pool in both modes; the
   per-service/per-claim model is rejected, not renamed.** There is exactly one
   tunnel pool per control session (one per data endpoint), and every service
