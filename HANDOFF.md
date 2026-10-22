@@ -372,9 +372,18 @@
   parser-based check was blind: 24 documented examples, every bench arm's
   configs, both L3-acceptance ends and all three interop cases refused to start
   while `just check` stayed green. Two guards now exist (the doc-example test
-  and `from_str`; `just bench selfcheck` loads each arm's config). **The general
-  hole is open**: a rule enforced at runtime rather than parse time has no
-  check that names it; start the next one in `from_str`.
+  and `from_str`; `just bench selfcheck` loads each arm's config). **The
+  general hole is closed for the rules that were still late (2026-10-22):**
+  a config-intrinsic refusal belongs in `from_str`, and the two that were
+  still enforced later are there — a forwarding `local_addr` without a
+  usable port (refused with the service named, instead of failing at the
+  first visitor's dial) and, on Linux, a TUN name the kernel cannot carry
+  (refused with the key named, instead of `interface does not exist` at the
+  first packet). What stays at runtime is what `from_str` cannot judge: host
+  state (devices, routes, forwarding, privileges) and peer behaviour. The
+  macOS and Windows device-name rules stay at device creation, because the
+  deployment page shows every platform's names and the doc-example test
+  parses all of them on the running platform.
 - **Build times were decomposed (2026-10-13, 20 cores, rustc 1.99); the
   workspace split is measured and declined for now.** The inner loop is fast
   (check 1.3 s, clippy pass 1 9 s, the lib test binary 4.5 s); the felt

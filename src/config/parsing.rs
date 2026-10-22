@@ -1138,6 +1138,26 @@ impl Config {
             );
         }
 
+        // A device name this host can never create is a configuration that
+        // cannot serve, so it is refused here with the key named instead of
+        // at the first packet ("interface does not exist" would name the
+        // wrong cause). Linux-only on purpose: the deployment page shows
+        // every platform's device names, and the doc-example test parses all
+        // of them on the running platform, so a macOS `utunN` rule enforced
+        // at load would refuse the Linux recipes for a macOS reader.
+        // macOS and Windows keep the rule at device creation.
+        #[cfg(all(mh_l3, mh_linux))]
+        {
+            if let Some(transparent) = &config.transparent {
+                crate::transparent::tun::validate_device_name(&transparent.tun)
+                    .with_context(|| "`[transparent].tun`")?;
+            }
+            if let Some(transparent) = config.server.as_ref().and_then(|s| s.transparent.as_ref()) {
+                crate::transparent::tun::validate_device_name(&transparent.tun)
+                    .with_context(|| "`[server.transparent].tun`")?;
+            }
+        }
+
         if let Some(server) = config.server.as_mut() {
             Config::validate_server_config(server)?;
         }
@@ -1429,6 +1449,32 @@ impl Config {
                         "udp"
                     };
                     bail!("{entry} {name}: `local_addr` is required for a {protocol} service");
+                }
+                // `local_addr` is dialed, so it has to be a `host:port` the
+                // client can use. A value without a usable port used to load,
+                // register, and fail at the first visitor — a configuration
+                // that cannot serve is not a loaded configuration, the same
+                // rule the other addresses already follow.
+                let Some((host, port)) = s.local_addr.rsplit_once(':') else {
+                    bail!(
+                        "{entry} {name}: `local_addr` is missing the port: {}. It must be a \
+                         socket address like \"127.0.0.1:8080\"",
+                        s.local_addr
+                    );
+                };
+                if host.is_empty() {
+                    bail!(
+                        "{entry} {name}: `local_addr` is missing the host: {}",
+                        s.local_addr
+                    );
+                }
+                match port.parse::<u16>() {
+                    Ok(0) => bail!("{entry} {name}: `local_addr` port must not be 0"),
+                    Ok(_) => {}
+                    Err(_) => bail!(
+                        "{entry} {name}: `local_addr` has no usable port: {}",
+                        s.local_addr
+                    ),
                 }
             }
         }
@@ -2141,6 +2187,94 @@ udp_buffer_size = 65535
             cfg.client.unwrap().services["test"].max_udp_workers,
             Some(MAX_UDP_WORKERS_CAP)
         );
+    }
+
+    /// A forwarding service's `local_addr` is dialed, so a value without a
+    /// usable port is a configuration that cannot serve: it is refused when
+    /// the file loads, not when the first visitor arrives.
+    #[test]
+    fn a_local_addr_without_a_usable_port_is_refused_at_load() {
+        let config = |addr: &str| {
+            format!(
+                r#"
+[client]
+default_token = "t"
+
+[client.control]
+default_remote_addr = "example.com:2333"
+
+[client.services.web]
+protocol = "tcp"
+local_addr = "{addr}"
+remote_bind_addr = "0.0.0.0:8080"
+"#
+            )
+        };
+
+        for (addr, expected) in [
+            ("127.0.0.1", "`local_addr` is missing the port"),
+            ("127.0.0.1:", "`local_addr` has no usable port"),
+            ("127.0.0.1:http", "`local_addr` has no usable port"),
+            ("127.0.0.1:0", "`local_addr` port must not be 0"),
+            (":8080", "`local_addr` is missing the host"),
+        ] {
+            let err = format!(
+                "{:#}",
+                Config::from_str(&with_noise(config(addr))).unwrap_err()
+            );
+            assert!(err.contains(expected), "{addr}: {err}");
+        }
+
+        // A literal address and a hostname both load.
+        Config::from_str(&with_noise(config("127.0.0.1:8080"))).unwrap();
+        Config::from_str(&with_noise(config("backend.internal:8080"))).unwrap();
+    }
+
+    /// On Linux the TUN device name is a load-time rule: a name the host can
+    /// never create is refused with the key named, instead of loading and
+    /// failing at the first packet with "interface does not exist".
+    #[test]
+    #[cfg(all(mh_l3, mh_linux))]
+    fn a_device_name_the_host_cannot_create_is_refused_at_load() {
+        let config = |tun: &str| {
+            format!(
+                r#"
+[transparent]
+default_token = "t"
+tun = "{tun}"
+
+[transparent.control]
+default_remote_addr = "example.com:2333"
+
+[transparent.claims.web]
+remote_bind_addr = "10.0.0.1:8443"
+"#
+            )
+        };
+
+        for tun in ["", "a-very-long-device-name"] {
+            let err = format!(
+                "{:#}",
+                Config::from_str(&with_noise(config(tun))).unwrap_err()
+            );
+            assert!(err.contains("`[transparent].tun`"), "{tun:?}: {err}");
+        }
+
+        // The server side carries the same rule through its own key.
+        let server = r#"
+[server]
+default_token = "t"
+
+[server.control]
+bind_addr = "0.0.0.0:2333"
+
+[server.transparent]
+tun = ""
+"#;
+        let err = format!("{:#}", Config::from_str(&with_noise(server)).unwrap_err());
+        assert!(err.contains("`[server.transparent].tun`"), "{err}");
+
+        Config::from_str(&with_noise(config("l3test0"))).unwrap();
     }
 
     /// The UDP-only keys are refused on a TCP service instead of being

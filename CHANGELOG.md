@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A configuration that cannot serve is refused when it loads.** A
+  forwarding service's `local_addr` must be `host:port` with a usable port:
+  a missing, non-numeric or zero port used to load, register and fail at the
+  first visitor, and is now refused with the service named. On Linux a
+  transparent `tun` name must be one the kernel can carry (1-15 bytes, no
+  NUL), refused with the key named instead of at the first packet as a
+  missing interface. Nothing that could serve before is refused now.
+
 ## [0.11.2] - 2026-10-20
 
 ### Added

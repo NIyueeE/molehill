@@ -260,7 +260,7 @@ data_enable = true # 可选。加密该客户端的数据通道(隧道与 lane)�
 
 [client.services.service1]
 protocol = "tcp" # 可选。需要转发的协议。可选值:["tcp", "udp"]。默认:"tcp"。必须自己拥有公网 ip:port 的服务根本不是转发服务:它属于 `[transparent]` 表,那是一种独立的运行模式——见下文「透明(L3)服务」
-local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址
+local_addr = "127.0.0.1:1081" # 必填。需要被转发的本地服务地址;它是被拨号的一方,必须是 host:port,没有可用端口的取值会在加载配置时被拒绝
 remote_bind_addr = "0.0.0.0:8081" # 必填。该服务在服务端暴露的公网地址。必须被服务端的 `allow_ports` 覆盖
 retry_backoff_max = 30 # 可选。按服务的重连退避上限,语义与 `client.control.retry_backoff_max` 相同。默认:继承 `client.control.retry_backoff_max`,再回落到自适应默认值
 token = "service-specific-token" # 可选。仅对本服务覆盖 `client.default_token`——例如对使用独立 token 的服务端做鉴权 # security-scan:allow documentation placeholder

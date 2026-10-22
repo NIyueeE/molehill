@@ -286,7 +286,7 @@ data_enable = true # Optional. Encrypt this client data channels (tunnels and la
 
 [client.services.service1]
 protocol = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp". A service that must own its public ip:port instead is not a forwarding service at all: it belongs to a `[transparent]` block, which is its own run mode — see "Transparent (L3) services" below
-local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded
+local_addr = "127.0.0.1:1081" # Necessary. The address of the local service that needs to be forwarded; it is dialed, so it must be host:port, and a value without a usable port is refused when the config loads
 remote_bind_addr = "0.0.0.0:8081" # Necessary. The public address this service is exposed at on the server. Must be covered by the server's `allow_ports`
 retry_backoff_max = 30 # Optional. This service's cap of the reconnect backoff, with the same semantics as `client.control.retry_backoff_max`. Default: inherits `client.control.retry_backoff_max`, then the adaptive default
 token = "service-specific-token" # Optional. Override `client.default_token` for this service only — e.g. to authenticate against a server that has its own token # security-scan:allow documentation placeholder

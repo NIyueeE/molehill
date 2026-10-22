@@ -141,17 +141,56 @@ impl Tun {
     }
 }
 
+/// The device name this platform can create.
+///
+/// One rule for two callers: [`crate::config::Config::from_str`] runs it when
+/// the configuration loads, so a name the host can never create is refused
+/// with the key named, and [`build`] runs it again before touching the device,
+/// so a name that arrived another way cannot reach the kernel. Keeping it one
+/// function is what keeps the two answers the same.
+pub(crate) fn validate_device_name(name: &str) -> Result<()> {
+    #[cfg(mh_linux)]
+    {
+        if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+            bail!(
+                "TUN interface name {name:?} must be 1 to {} bytes",
+                libc::IFNAMSIZ - 1
+            );
+        }
+        if name.as_bytes().contains(&0) {
+            bail!("TUN interface name {name:?} contains a NUL byte");
+        }
+    }
+    #[cfg(mh_macos)]
+    {
+        if !(name == "auto"
+            || name.starts_with("utun") && name[4..].bytes().all(|b| b.is_ascii_digit()))
+        {
+            bail!(
+                "TUN interface name {name:?} is not valid on macOS: use `tun = \"auto\"` or an \
+                 explicit `utunN` (for example `utun7`); macOS creates the device when the daemon \
+                 starts"
+            );
+        }
+    }
+    #[cfg(mh_windows)]
+    {
+        if name.is_empty() {
+            bail!("TUN adapter name must not be empty");
+        }
+    }
+    // A platform without a transparent data path has no name rule; the device
+    // creation below refuses the run anyway.
+    #[cfg(not(any(mh_linux, mh_macos, mh_windows)))]
+    {
+        let _ = name;
+    }
+    Ok(())
+}
+
 #[cfg(mh_linux)]
 fn build(name: &str) -> Result<(AsyncDevice, FrameFormat)> {
-    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
-        bail!(
-            "TUN interface name {name:?} must be 1 to {} bytes",
-            libc::IFNAMSIZ - 1
-        );
-    }
-    if name.as_bytes().contains(&0) {
-        bail!("TUN interface name {name:?} contains a NUL byte");
-    }
+    validate_device_name(name)?;
 
     match DeviceBuilder::new().name(name).offload(true).build_async() {
         Ok(device) => Ok((device, FrameFormat::Vnet)),
@@ -181,16 +220,11 @@ fn build(name: &str) -> Result<(AsyncDevice, FrameFormat)> {
 
 #[cfg(mh_macos)]
 fn build(name: &str) -> Result<(AsyncDevice, FrameFormat)> {
+    validate_device_name(name)?;
     let candidates: Vec<String> = if name == "auto" {
         (0..16).map(|i| format!("utun{i}")).collect()
-    } else if name.starts_with("utun") && name[4..].bytes().all(|b| b.is_ascii_digit()) {
-        vec![name.to_owned()]
     } else {
-        bail!(
-            "TUN interface name {name:?} is not valid on macOS: use `tun = \"auto\"` or an \
-             explicit `utunN` (for example `utun7`); macOS creates the device when the daemon \
-             starts"
-        );
+        vec![name.to_owned()]
     };
 
     let mut last = None;
@@ -215,9 +249,7 @@ fn build(name: &str) -> Result<(AsyncDevice, FrameFormat)> {
 
 #[cfg(mh_windows)]
 fn build(name: &str) -> Result<(AsyncDevice, FrameFormat)> {
-    if name.is_empty() {
-        bail!("TUN adapter name must not be empty");
-    }
+    validate_device_name(name)?;
     let device = DeviceBuilder::new()
         .name(name)
         .build_async()
