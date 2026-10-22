@@ -1,7 +1,16 @@
 # HANDOFF: Working State & Future Work
 
-> **State as of 2026-10-20.** **v0.11.2 is released: the tag names `64d8ebc`,
-> the release commit on `main`.** The GitHub release is published (ten
+> **State as of 2026-10-22.** **The v1.0.0 development cycle is open on the
+> branch `feat/v1.0.0`; `main` stays at the released 0.11.2 while the
+> manifest moves to `1.0.0`.** A major number describes the product, not the
+> wire: `CURRENT_PROTO_VERSION` stays **5.2** unless a change lands under this
+> cycle, in which case it becomes 5.3 as its own dialect (AGENTS.md §5). No
+> scope is committed yet — the open threads below are the candidates — and
+> `[Unreleased]` already carries the configuration refusals that landed on
+> `main` after 0.11.2; they ride this release.
+>
+> **v0.11.2 is released: the tag names `64d8ebc`, the release commit on
+> `main`.** The GitHub release is published (ten
 > archives and `SHA256SUMS`), GHCR carries `:v0.11.2` and `:latest`, and
 > crates.io has `molehill-rathole 0.11.2`. v0.11.2 moves the wire to
 > **protocol v5.2** (dynamic striping; `StartForwardTcp` and

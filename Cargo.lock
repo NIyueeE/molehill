@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "molehill-rathole"
-version = "0.11.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
