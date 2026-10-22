@@ -125,7 +125,7 @@ pub struct TransparentDataConfig {
     ///
     /// The same key a forwarding client writes, because a lane is the same
     /// physical thing a pool's tunnel is — one carrier connection — and the
-    /// carrier itself is chosen at runtime (KCP, falling back to TCP).
+    /// carrier itself is chosen at runtime.
     pub tunnels: Option<u16>,
     /// Whether a claim's idle lanes may be lent to a sibling claim carrying more
     /// flows than lanes (`lend = false` keeps the equal split static).

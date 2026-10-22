@@ -367,9 +367,9 @@ class Topology:
     def set_udp_block(self, ns: str, dev: str, blocked: bool) -> None:
         """Drop UDP leaving one device, or stop dropping it.
 
-        The data plane tries KCP first, so a path that refuses UDP is what makes
-        the product fall back to TCP — there is no key to write for that, which
-        is exactly the point: the fallback is a path property. The rule is
+        The data plane dials TCP first, so a path that refuses UDP removes the
+        KCP fallback — the run then measures the data plane with nothing behind
+        it, which is what `udp_blocked` now says. The rule is
         `OUTPUT -o <dev> -p udp -j DROP` and it is checked before it is changed,
         so applying the same condition twice is a no-op and `clean` removes what
         an earlier stage added.

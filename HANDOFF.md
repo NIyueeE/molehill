@@ -83,6 +83,38 @@
   carrier policy that prefers TCP on a clean path, or a cheaper AEAD), not
   defects to patch. What was fixable in the framing is in `5632f66` (no memset
   and no per-chunk allocation; measured at the noise floor, so no claim).
+- **The carrier order was reversed on that evidence (2026-10-22): TCP first,
+  KCP as the fallback.** The A/B of the change itself (`--profile screen
+  --ab-arm molehill --aa --rounds 6`, the two binaries interleaved on one
+  fingerprint, `cost[clean]`, the run's own A/A copy as its noise floor): old
+  (KCP-first) 7.060 Gbit/s, 1.743 s/Gbit, 12.25 cores, p50 0.988 ms, p99
+  5.77 ms, 79.1 MiB peak RSS; the A/A copy 7.065 / 1.740 / 12.21 / 0.992 /
+  8.77 / 87.1; new (TCP-first) **12.518 Gbit/s, 0.626 s/Gbit, 7.77 cores, p50
+  0.823, p99 1.79, 49.2 MiB** — +77 % throughput, −64 % CPU per Gbit, −69 %
+  p99, −38 % peak RSS, and `wire_per_visitor_byte` 1.068 → 1.008, against an
+  A/A scatter of 0.07 % (throughput) and 0.2 % (CPU). All six rounds agreed and
+  the paired sign test reads p 0.031 against an alpha of 0.05; the model still
+  labels the comparison *directional*, because the run was not pre-registered
+  (`--primary` was not passed) — the floors themselves were cleared, with
+  `cpu_s_per_gbit`'s 0.66 % floor under an effect of 178 points of it.
+  `rtt_max_ms` is the one cell that got worse (23.9 → 39.2 ms, a single tail
+  event); the p99 and the median both improved.
+  The full stage schedule (`--profile sweep --scenarios timeline --scale 0.3`,
+  one round per stage) is where the trade shows: throughput clean 6.99 → 14.94
+  Gbit/s and loss1 6.90 → 12.97, equal on the shaper-limited cells (rate100
+  0.094, rate20 0.019, jitter 0.019 both ways), and CPU per Gbit down on every
+  stage (clean 1.73 → 0.65, loss1 1.71 → 0.58, loss5 1.43 → 0.49, rate100 4.66
+  → 2.78). The interactive tail is the price: that schedule's one round per cell
+  reads clean p99 8.2 → 81.7 ms and loss1 286 → 1076 ms, while loss5 improves
+  4023 → 2088 ms and the repeat clean stage 14.6 → 4.0 ms — the interleaved
+  A/B's median p99 (7.82 → 1.68 ms, five rounds) is the better-controlled
+  reading of the same cell, and the stage cells are one round each. This is the
+  documented "KCP wins interactive round trips on a lossy leg" case, now with
+  its throughput price beside it.
+  The records are `/home/dsh/tmp/t-new.json` (new default) and `t-kcp.json`
+  (KCP-first, forced by the switch); their fingerprints differ only because a
+  bench-model condition description changed in the same commit (the engine hash
+  covers those bytes), which is worth remembering before comparing them.
 - **v0.11.2 is released, and its sweep is the next baseline (2026-10-20).**
   The published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
   `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
@@ -285,19 +317,33 @@
 
 ## Open threads for the next cycle
 
-- **Decision needed (2026-10-22): the data plane's carrier policy is the
-  largest measured lever on L4 performance.** The numbers are in "Where this
-  stands": forcing TCP is +73 % throughput, −63 % CPU and −80 % p99 on a clean
-  cell against the shipped KCP-first policy, and the difference is the userspace
-  ARQ's per-datagram work at 1472-byte segments, not the framing above it. KCP
-  is the carrier the shaped stages are aimed at, so "prefer TCP" cannot be a
-  blind switch: it needs a campaign over the whole stage schedule (`timeline`
-  with each carrier, or a policy that measures loss and switches), and that is a
-  scope decision for this cycle rather than an optimization an agent takes on
-  its own. The related, smaller lever is the
-  data-plane AEAD at ~9 % of clean throughput: AES-256-GCM is only ~1.4×
-  ChaCha20-Poly1305 on this Haswell host (openssl speed: 2.40 against
-  1.70 GB/s), so it would buy little here and is a v5.3 wire change either way.
+- **Decided (2026-10-22): the data plane dials TCP first; KCP is its
+  fallback.** The measurement is in "Where this stands" (the A/B is +81 %
+  throughput, −64 % CPU per Gbit, −45 % p99 on the clean cell; the full stage
+  schedule did not reverse it). Three things about the shape are deliberate and
+  must not be undone by accident:
+  - the registration declares the client's **capability**, not its dial order
+    (`carrier::declared_carrier`), because the server opens its KCP UDP
+    listener only for a client that declared KCP — the first version of this
+    change declared the dial order and would have left a fallback with no
+    listener to fall back to;
+  - the fallback is remembered per endpoint and re-probed after 60 s
+    (`CarrierChoice::failed`/`succeeded`), and a quality decision is still
+    held for 120 s without a reachability event undoing it;
+  - the pool's KCP-evidence rule is untouched and still moves a KCP-carrying
+    pool to TCP; nothing moves a *TCP* pool to KCP on evidence yet, because a
+    TCP tunnel's retransmit state lives in the kernel (`TCP_INFO` would need a
+    production `unsafe` block or a parsed `/proc/net/tcp`, and the first is a
+    policy regression this repository has deliberately earned away). That is
+    the recorded next instrument if a deployment ever needs it.
+  Residuals: no bench condition can exercise the **TCP → KCP** fallback, because
+  the control channel shares the leg — `udp_blocked` now measures "TCP carries
+  it with no fallback available" instead of "the fallback works", and its
+  description in the model and in `docs/benchmarks.md` says so. The other,
+  smaller lever is the data-plane AEAD at ~9 % of clean throughput:
+  AES-256-GCM is only ~1.4× ChaCha20-Poly1305 on this Haswell host (openssl
+  speed: 2.40 against 1.70 GB/s), so it would buy little here and is a v5.3
+  wire change either way.
 - **A forced carrier is invisible to the comparability gate (found
   2026-10-22).** `MOLEHILL_DATA_CARRIER` is recorded in `meta.molehill_switches`
   by design ("the reader decides; the file has to say"), but `fingerprint`

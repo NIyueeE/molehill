@@ -4238,6 +4238,10 @@ mod tests {
     ) {
         // `CarrierChoice::new` already returns an `Arc<Self>`.
         let choice = crate::transport::carrier::CarrierChoice::new("probe-test:1");
+        // The fixture starts the endpoint on the carrier the pool rides: the
+        // product's first carrier is TCP, and a fixture that left the choice
+        // there would test a pool and a choice that disagree about the path.
+        choice.start_on(carrier);
         let (pool, rxs) = {
             let mut tunnels = Vec::new();
             let mut rxs = Vec::new();

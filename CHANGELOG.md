@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per stripe, and a frame's 10-byte header no longer costs a small read of its
   own. The wire format, the chunk size and every configuration key are
   unchanged.
+- **The data plane dials TCP first; KCP is now its fallback.** Which carrier
+  works is still the network's answer, and the client still decides at runtime,
+  but the order is the measured one: turning the two around on the same
+  workload is the largest single difference this project's own measurement has
+  found, and the release sweep's shaped stages do not reverse it (the numbers
+  and their method are in [Benchmarks](./docs/benchmarks.md)). So a data
+  channel is dialled over TCP, and a path that throttles or refuses TCP where
+  it passes UDP falls back to KCP — with the same remembered-per-endpoint
+  decision, 60 s re-probe and one-line notice the fallback always had, and the
+  pool's quality rule still able to move a KCP-carrying pool to TCP. No
+  configuration key changes: `MOLEHILL_DATA_CARRIER` still forces either
+  carrier apart for a measurement, and a build without the `kcp` feature
+  behaves exactly as it did.
 
 ## [0.11.2] - 2026-10-20
 

@@ -4,26 +4,37 @@
 //! server works is a property of the network between the two ends, and an
 //! operator cannot know it from a config file: UDP may be blocked, rate-limited,
 //! mangled by a middlebox, or perfectly fine and about to change. So the client
-//! tries **KCP** — the carrier that carries more on a lossy, long-haul or shaped
-//! path, and the one the product's data plane is built around — and falls back
-//! to **TCP**, which rides the control channel's own wire stack, when a session
-//! cannot be established at all.
+//! tries **TCP** first — measured on the bench model as the faster carrier on
+//! every stage of the release schedule, and the one whose wire the control
+//! channel already uses — and falls back to **KCP**, the userspace ARQ over UDP,
+//! when a TCP data channel cannot be established at all (a path that throttles
+//! or refuses TCP where it passes UDP).
+//!
+//! The order is a measurement, not a preference (HANDOFF.md, 2026-10-22): with the
+//! two binaries interleaved on one fingerprint, TCP carried 12.81 Gbit/s at
+//! 0.624 s per Gbit and 1.80 ms p99 against KCP's 7.065, 1.736 and 3.30, and the
+//! stage schedule does not reverse it (clean 6.99 → 14.94 Gbit/s, loss1 6.90 →
+//! 12.97, equal on the shaper-limited cells). KCP keeps the interactive tail on a
+//! lossy leg and its own evidence rule
+//! ([`crate::transport::multiplex`]) still moves a pool that *is* on KCP back to
+//! TCP when UDP is being policed.
 //!
 //! The fallback is deliberately small and stateful in exactly one place:
 //!
-//! - an attempt is **bounded** ([`KCP_ATTEMPT_BUDGET`]): a blocked UDP path must
-//!   cost a startup delay, not a hung service;
-//! - a fallback is **remembered for the endpoint** ([`KCP_RETRY_COOLDOWN`]), so
-//!   every later channel of that endpoint goes straight to TCP instead of paying
-//!   the timeout again — and it is **re-probed** when the cooldown elapses,
-//!   because a path that was blocked at 09:00 may not be at 09:05;
+//! - an attempt is **bounded** ([`KCP_ATTEMPT_BUDGET`]): a path where UDP goes
+//!   nowhere must cost a delayed channel, not a hung service;
+//! - a fallback is **remembered for the endpoint** ([`RETRY_COOLDOWN`]), so
+//!   every later channel of that endpoint goes straight to the carrier that
+//!   worked instead of paying the attempt again — and it is **re-probed** when
+//!   the cooldown elapses, because a path that was blocked at 09:00 may not be
+//!   at 09:05;
 //! - it is **one line, once** (`INFO`, then `DEBUG`): a fallback is a fact about
 //!   a network, worth telling the operator, and not worth repeating per channel.
 //!
 //! A build without the `kcp` feature has one carrier, TCP, and no attempt to
-//! make: the same code path answers "no" to `try_kcp` and everything else is
-//! unchanged, which is what keeps the feature gate from being a second data
-//! plane.
+//! make: the same code path answers "there is nothing to fall back to" and
+//! everything else is unchanged, which is what keeps the feature gate from being
+//! a second data plane.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -66,14 +77,22 @@ impl Carrier {
 #[cfg(feature = "multiplex")]
 pub const KCP_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 
-/// How long a client stays on the fallback before offering KCP another chance.
+/// How long a client stays on the fallback before offering the carrier that
+/// failed another chance.
 ///
-/// Long enough that a blocked path is not re-timed-out on every channel, short
-/// enough that a network which starts passing UDP again is picked up without a
-/// restart. The re-probe costs one bounded attempt, on the first channel or
-/// pool established after the cooldown.
-#[cfg(feature = "multiplex")]
-pub const KCP_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+/// Long enough that a blocked path is not re-attempted on every channel, short
+/// enough that a network which starts passing it again is picked up without a
+/// restart. The re-probe costs one attempt, on the first channel or pool
+/// established after the cooldown.
+pub const RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The carrier that is not `carrier`.
+const fn other(carrier: Carrier) -> Carrier {
+    match carrier {
+        Carrier::Tcp => Carrier::Kcp,
+        Carrier::Kcp => Carrier::Tcp,
+    }
+}
 
 /// How long one carrier is held after a **deliberate** switch.
 ///
@@ -96,8 +115,9 @@ pub struct CarrierChoice {
     endpoint: String,
     /// `0` = KCP, `1` = TCP (see [`Carrier`]'s order).
     chosen: AtomicU8,
-    /// When KCP may be tried again, in milliseconds since the Unix epoch;
-    /// `0` means now.
+    /// When the carrier that failed may be tried again, in milliseconds since
+    /// the Unix epoch; `0` means no fallback has happened yet (which is not the
+    /// same as "the cooldown elapsed" — see `retry_due`).
     retry_at_ms: AtomicU64,
     /// When the *other* carrier may be deliberately preferred, in milliseconds
     /// since the Unix epoch; `0` means now. Separate from `retry_at_ms`: a
@@ -132,21 +152,47 @@ impl CarrierChoice {
         })
     }
 
-    /// Whether a channel dialing now should try KCP.
+    /// The carrier a channel dialing now should try **first**.
     ///
-    /// `false` means "go straight to TCP": either this build has no KCP, or the
-    /// endpoint has fallen back and its cooldown has not elapsed. An elapsed
-    /// cooldown offers KCP again — that is the re-probe — while
-    /// [`Self::carrier`] keeps reporting TCP until a session actually comes up.
-    #[cfg(feature = "multiplex")]
+    /// The carrier in use, except after a fallback's cooldown has elapsed: then
+    /// the carrier that failed gets one attempt again (the re-probe), and a
+    /// failure through [`Self::failed`] re-arms the cooldown. [`Self::carrier`]
+    /// keeps reporting the carrier in use until the attempt actually comes up,
+    /// which is what makes the re-probe invisible to placement.
     #[must_use]
-    pub fn try_kcp(&self) -> bool {
+    pub fn preferred(&self) -> Carrier {
         if let Some(forced) = forced_carrier() {
-            return forced == Carrier::Kcp;
+            return forced;
         }
-        cfg!(feature = "kcp")
-            && (self.chosen.load(Ordering::Relaxed) == Carrier::Kcp as u8
-                || now_ms() >= self.retry_at_ms.load(Ordering::Relaxed))
+        if self.retry_due() {
+            return other(self.carrier());
+        }
+        self.carrier()
+    }
+
+    /// Put the choice on `carrier` with no decision and no cooldown.
+    ///
+    /// A test fixture's hook: the product's first carrier is TCP, so a test that
+    /// exercises the KCP side of a rule has to start there without pretending a
+    /// fallback or a measurement happened.
+    #[cfg(test)]
+    pub(crate) fn start_on(&self, carrier: Carrier) {
+        self.chosen.store(carrier as u8, Ordering::Relaxed);
+        self.retry_at_ms.store(0, Ordering::Relaxed);
+        self.switch_allowed_at_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the failed carrier's re-probe window has opened.
+    ///
+    /// Zero means "no fallback has happened", which is not a due re-probe:
+    /// without that distinction a channel dialed before any failure would read
+    /// a zero clock as "the cooldown elapsed" and offer the carrier that has
+    /// never been established.
+    fn retry_due(&self) -> bool {
+        match self.retry_at_ms.load(Ordering::Relaxed) {
+            0 => false,
+            at => now_ms() >= at,
+        }
     }
 
     /// The carrier in use right now, for keys and telemetry.
@@ -159,39 +205,38 @@ impl CarrierChoice {
         }
     }
 
-    /// KCP could not be established. Answers whether the caller should fall
-    /// back to TCP (and records the fallback when it should): a **forced** KCP
-    /// carrier does not fall back, because the run asked for KCP and a failure
-    /// is its answer.
-    #[cfg(feature = "multiplex")]
-    pub fn on_kcp_failure(&self, why: &str) -> bool {
-        if forced_carrier() == Some(Carrier::Kcp) {
-            return false;
+    /// `carrier` could not be established: record the fallback and answer the
+    /// carrier to try instead, or `None` when there is nothing to fall back to.
+    ///
+    /// A **forced** carrier does not fall back — the run asked for it, and its
+    /// failure is that run's answer — and a build with only TCP has no other
+    /// carrier to offer. The fallback is remembered for the endpoint and dated
+    /// ([`RETRY_COOLDOWN`]), so the next channel does not pay the attempt again.
+    pub fn failed(&self, carrier: Carrier, why: &str) -> Option<Carrier> {
+        if forced_carrier().is_some() || !cfg!(feature = "kcp") {
+            return None;
         }
-        self.fell_back(why);
-        true
-    }
-
-    /// Use TCP for this endpoint until the cooldown elapses, and say so once.
-    #[cfg(feature = "multiplex")]
-    fn fell_back(&self, why: &str) {
-        self.chosen.store(Carrier::Tcp as u8, Ordering::Relaxed);
-        let until = now_ms()
-            .saturating_add(u64::try_from(KCP_RETRY_COOLDOWN.as_millis()).unwrap_or(u64::MAX));
+        let next = other(carrier);
+        self.chosen.store(next as u8, Ordering::Relaxed);
+        let until =
+            now_ms().saturating_add(u64::try_from(RETRY_COOLDOWN.as_millis()).unwrap_or(u64::MAX));
         self.retry_at_ms.store(until, Ordering::Relaxed);
         let endpoint = &self.endpoint;
+        let from = carrier.as_str();
+        let to = next.as_str();
         self.notice.report(
             || {
                 tracing::info!(
-                    "KCP could not be established to {endpoint} ({why}); using TCP for it and \
-                     retrying KCP in {KCP_RETRY_COOLDOWN:?}. Further fallbacks for this endpoint \
+                    "{from} could not be established to {endpoint} ({why}); using {to} for it and \
+                     retrying {from} in {RETRY_COOLDOWN:?}. Further fallbacks for this endpoint \
                      are logged at debug level."
                 );
             },
             || {
-                tracing::debug!("KCP fell back to TCP for {endpoint} ({why})");
+                tracing::debug!("{from} fell back to {to} for {endpoint} ({why})");
             },
         );
+        Some(next)
     }
 
     /// Prefer the other carrier on **measured** evidence: the caller has seen
@@ -223,12 +268,12 @@ impl CarrierChoice {
         self.chosen.store(carrier as u8, Ordering::Relaxed);
         // Moving to KCP is its own re-probe; moving to TCP has to hold KCP off
         // until the *quality* decision has been held, which is the longer of
-        // the two: `KCP_RETRY_COOLDOWN` (60 s) is a reachability wait and
+        // the two: `RETRY_COOLDOWN` (60 s) is a reachability wait and
         // `SWITCH_COOLDOWN` (120 s) is how long this decision is to be kept.
-        // Taking the shorter one let a re-probe that only proved "KCP came up"
-        // switch the endpoint back inside the window the switch promised —
-        // and `reached_kcp` then cleared the cooldown with it (see
-        // [`Self::reached_kcp`], the other half of this rule).
+        // Taking the shorter one let a re-probe that only proved "the carrier
+        // came up" switch the endpoint back inside the window the switch
+        // promised — and `succeeded` then cleared the cooldown with it (see
+        // [`Self::succeeded`], the other half of this rule).
         if carrier == Carrier::Kcp {
             self.retry_at_ms.store(0, Ordering::Relaxed);
         } else {
@@ -259,32 +304,40 @@ impl CarrierChoice {
         true
     }
 
-    /// A KCP session came up after a fallback: the endpoint is back on the
-    /// carrier, which is worth one line because it is the opposite news.
+    /// `carrier` came up: remember it as the carrier in use, unless a quality
+    /// decision is being held.
     ///
     /// This is a **reachability** event, and it must not spend a *quality*
-    /// decision's permission: a session coming up says only that UDP now
-    /// connects, not that KCP carries more than the carrier a measurement
-    /// moved this endpoint to. So while a deliberate switch is being held
-    /// ([`SWITCH_COOLDOWN`]) the choice stays where it is — the re-probe is
-    /// still over (`retry_at_ms`), but only the quality policy can act on it.
-    #[cfg(feature = "multiplex")]
-    pub fn reached_kcp(&self) {
+    /// decision's permission: a session coming up says only that the carrier
+    /// connects, not that it carries more than the one a measurement moved this
+    /// endpoint to. So while a deliberate switch is being held
+    /// ([`SWITCH_COOLDOWN`]) the choice stays where it is — the re-probe is over
+    /// (`retry_at_ms`), but only the quality policy can act on it.
+    pub fn succeeded(&self, carrier: Carrier) {
+        if self.carrier() == carrier {
+            self.retry_at_ms.store(0, Ordering::Relaxed);
+            return;
+        }
         if now_ms() < self.switch_allowed_at_ms.load(Ordering::Relaxed) {
-            // A switch is being held: the news is that KCP connects, and that
-            // is all it is. The preference stands until the policy re-decides.
+            // A switch is being held: the news is that the carrier connects,
+            // and that is all it is. The preference stands until the policy
+            // re-decides.
             self.retry_at_ms.store(0, Ordering::Relaxed);
             tracing::debug!(
-                "KCP is reachable again at {}, but a carrier switch is being held; keeping {}",
+                "{} is reachable again at {}, but a carrier switch is being held; keeping {}",
+                carrier.as_str(),
                 self.endpoint,
                 self.carrier().as_str()
             );
             return;
         }
-        if self.chosen.swap(Carrier::Kcp as u8, Ordering::Relaxed) == Carrier::Tcp as u8 {
-            self.retry_at_ms.store(0, Ordering::Relaxed);
-            tracing::info!("KCP is reachable again at {}; using it", self.endpoint);
-        }
+        self.chosen.store(carrier as u8, Ordering::Relaxed);
+        self.retry_at_ms.store(0, Ordering::Relaxed);
+        tracing::info!(
+            "{} is carrying this endpoint again ({}); using it",
+            carrier.as_str(),
+            self.endpoint
+        );
     }
 }
 
@@ -319,14 +372,17 @@ pub fn forced_carrier() -> Option<Carrier> {
     })
 }
 
-/// The carrier a fresh choice starts with: the forced one when the diagnostic
-/// switch names it, else KCP where the feature is built in and TCP where it is
-/// not.
+/// The carrier the registration **declares**: the forced one when the
+/// diagnostic switch names it, else KCP where the feature is built in and TCP
+/// where it is not.
 ///
-/// Public because the registration declares it: the server opens the listener
-/// that carrier needs, and a channel arriving on the other one is still served.
+/// This is the server's half of the decision, and it is not the dial order: the
+/// server opens the listener a declared carrier needs, and it opens the KCP UDP
+/// listener only for a client that declared KCP. A client that dials TCP first
+/// but must be able to fall back declares KCP, so the fallback's listener is
+/// there before it is needed — the declaration says what the client *can* use.
 #[must_use]
-pub fn first_carrier() -> Carrier {
+pub fn declared_carrier() -> Carrier {
     if let Some(forced) = forced_carrier() {
         return forced;
     }
@@ -337,43 +393,80 @@ pub fn first_carrier() -> Carrier {
     }
 }
 
+/// The carrier a fresh choice starts with: the forced one when the diagnostic
+/// switch names it, else TCP.
+///
+/// TCP first is a **measurement**, not a preference (HANDOFF.md, 2026-10-22):
+/// with the two binaries interleaved on one fingerprint it carried 12.81 Gbit/s
+/// at 0.624 s per Gbit and 1.80 ms p99 against KCP's 7.065, 1.736 and 3.30, and
+/// the stage schedule does not reverse it. KCP stays the fallback for a path
+/// where TCP cannot be established at all, and its own evidence rule can still
+/// move a KCP-carrying pool back to TCP.
+///
+/// Public because the pool's repair asks it: the endpoint's choice decides what
+/// the next tunnel dials. The *registration* declares
+/// [`declared_carrier`] instead — the capability, not this order — because the
+/// server opens the KCP listener only for a client that declared KCP.
+#[must_use]
+pub fn first_carrier() -> Carrier {
+    forced_carrier().unwrap_or(Carrier::Tcp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The first carrier is the feature's: KCP when it is built in, TCP when it
-    /// is not (where there is nothing to fall back *from*).
-    #[cfg(feature = "multiplex")]
+    /// A fresh choice starts on TCP, which is where the registration says the
+    /// data plane will be.
     #[test]
-    fn a_fresh_choice_starts_at_the_first_carrier() {
+    fn a_fresh_choice_starts_on_tcp() {
         let choice = CarrierChoice::new("data.example:2343");
-        assert_eq!(choice.carrier(), first_carrier());
-        assert_eq!(choice.try_kcp(), cfg!(feature = "kcp"));
+        assert_eq!(first_carrier(), Carrier::Tcp);
+        assert_eq!(choice.carrier(), Carrier::Tcp);
+        assert_eq!(choice.preferred(), Carrier::Tcp);
     }
 
-    /// A fallback is remembered and dated: the endpoint goes straight to TCP
-    /// until the cooldown, and after it KCP is offered another chance.
-    #[cfg(feature = "multiplex")]
+    /// A failed carrier is remembered and dated: the endpoint goes straight to
+    /// the other carrier until the cooldown, and after it the failed one is
+    /// offered one attempt again.
+    #[cfg(feature = "kcp")]
     #[test]
-    fn a_fallback_holds_until_the_cooldown_and_then_re_probes() {
+    fn a_failed_carrier_falls_back_and_re_probes_after_the_cooldown() {
         let choice = CarrierChoice::new("data.example:2343");
-        assert!(
-            choice.on_kcp_failure("test"),
-            "an unforced failure falls back"
+        assert_eq!(
+            choice.failed(Carrier::Tcp, "test"),
+            Some(Carrier::Kcp),
+            "an unforced failure falls back to the other carrier"
         );
-        assert_eq!(choice.carrier(), Carrier::Tcp);
-        assert!(!choice.try_kcp(), "the cooldown is not over");
+        assert_eq!(choice.carrier(), Carrier::Kcp);
+        assert_eq!(choice.preferred(), Carrier::Kcp, "the cooldown is not over");
         assert!(choice.retry_at_ms.load(Ordering::Relaxed) > now_ms());
 
-        // The cooldown elapsing is what makes the next channel try KCP again.
+        // The cooldown elapsing is what offers TCP the next attempt.
         choice
             .retry_at_ms
             .store(now_ms().saturating_sub(1), Ordering::Relaxed);
         assert_eq!(
-            choice.try_kcp(),
-            cfg!(feature = "kcp"),
-            "an elapsed cooldown offers KCP again where the feature exists"
+            choice.preferred(),
+            Carrier::Tcp,
+            "an elapsed cooldown re-probes the carrier that failed"
         );
+
+        // And the fallback works in the other direction too: a KCP failure
+        // sends the endpoint back to TCP.
+        assert_eq!(choice.failed(Carrier::Kcp, "test"), Some(Carrier::Tcp));
+        assert_eq!(choice.carrier(), Carrier::Tcp);
+    }
+
+    /// A carrier that never failed is never "re-probed": the zero in
+    /// `retry_at_ms` means "no fallback has happened", not "the cooldown
+    /// elapsed", and reading it as the latter would dial a carrier that has
+    /// never carried anything.
+    #[test]
+    fn a_choice_without_a_fallback_does_not_re_probe() {
+        let choice = CarrierChoice::new("data.example:2343");
+        assert_eq!(choice.retry_at_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(choice.preferred(), choice.carrier());
     }
 
     /// A deliberate switch moves the carrier, is rate-limited, and holds the
@@ -395,9 +488,10 @@ mod tests {
         );
         assert_eq!(choice.carrier(), other);
         assert_eq!(
-            choice.try_kcp(),
-            other == Carrier::Kcp,
-            "moving to TCP must hold KCP off, and moving to KCP must offer it"
+            choice.preferred(),
+            other,
+            "a deliberate switch is what the next channel dials: no re-probe until \
+             the switch's hold is over"
         );
 
         // The cooldown refuses the way back, and the reason is the switch, not
@@ -426,35 +520,39 @@ mod tests {
         assert_eq!(choice.switch_allowed_at_ms.load(Ordering::Relaxed), 0);
     }
 
-    /// Coming back is a state change, not a log line every time: a choice that
-    /// already sits on KCP absorbs a success quietly.
-    #[cfg(feature = "multiplex")]
+    /// Coming back is a state change, not a log line every time: a carrier that
+    /// already carries the endpoint absorbs a success quietly.
+    #[cfg(feature = "kcp")]
     #[test]
-    fn reaching_kcp_again_clears_the_cooldown() {
+    fn coming_back_clears_the_cooldown() {
         let choice = CarrierChoice::new("data.example:2343");
-        choice.on_kcp_failure("test");
-        choice.reached_kcp();
+        choice.failed(Carrier::Tcp, "test");
+        assert_eq!(choice.carrier(), Carrier::Kcp);
+        assert!(choice.retry_at_ms.load(Ordering::Relaxed) > 0);
+        choice.succeeded(Carrier::Kcp);
         assert_eq!(choice.carrier(), Carrier::Kcp);
         assert_eq!(choice.retry_at_ms.load(Ordering::Relaxed), 0);
-        choice.reached_kcp();
+        choice.succeeded(Carrier::Kcp);
         assert_eq!(choice.carrier(), Carrier::Kcp);
     }
 
     /// **A re-probe must not spend a quality decision's permission.**
     ///
-    /// The defect this pins: moving to TCP set the KCP re-probe to
-    /// `KCP_RETRY_COOLDOWN` (60 s) while the switch promised to be held for
+    /// The defect this pins: moving a pool set the failed carrier's re-probe to
+    /// `RETRY_COOLDOWN` (60 s) while the switch promised to be held for
     /// `SWITCH_COOLDOWN` (120 s), so in between, a session that came up called
-    /// `reached_kcp` — which stores KCP and clears the cooldown. A decision
-    /// made on measured evidence was undone by an event that only ever said
-    /// "UDP connects now".
+    /// the reachability hook — which stored that carrier and cleared the
+    /// cooldown. A decision made on measured evidence was undone by an event
+    /// that only ever said "the carrier connects now".
     /// Needs both carriers: [`CarrierChoice::prefer`] is a no-op in a build
     /// without `kcp`, where there is only one carrier to be on.
     #[cfg(feature = "kcp")]
     #[test]
-    fn a_reachable_kcp_does_not_undo_a_held_switch() {
+    fn a_reachable_carrier_does_not_undo_a_held_switch() {
         let choice = CarrierChoice::new("data.example:2343");
-        // A quality decision moves the endpoint off KCP.
+        // The fixture starts the endpoint on KCP, the carrier a quality
+        // decision is about to leave.
+        choice.start_on(Carrier::Kcp);
         assert!(choice.prefer(Carrier::Tcp, "measured: carries twice as much"));
         assert_eq!(choice.carrier(), Carrier::Tcp);
 
@@ -469,8 +567,8 @@ mod tests {
             "the re-probe must wait at least as long as the switch is held"
         );
 
-        // And even if a session does come up, the choice stands.
-        choice.reached_kcp();
+        // And even if a KCP session does come up, the choice stands.
+        choice.succeeded(Carrier::Kcp);
         assert_eq!(
             choice.carrier(),
             Carrier::Tcp,
@@ -478,11 +576,31 @@ mod tests {
         );
 
         // Once the hold is over, the same event is the news it was: KCP is
-        // back, and the preference follows it.
+        // carrying, and the preference follows it.
         choice
             .switch_allowed_at_ms
             .store(now_ms().saturating_sub(1), Ordering::Relaxed);
-        choice.reached_kcp();
+        choice.succeeded(Carrier::Kcp);
         assert_eq!(choice.carrier(), Carrier::Kcp);
+    }
+
+    /// The dial order is the choice's, not the registration's: a client dials
+    /// TCP first while declaring that it can carry KCP, because the server
+    /// opens the KCP listener only for a client that declared it — a fallback
+    /// whose listener was never opened is not a fallback.
+    #[test]
+    fn the_declared_carrier_is_the_capability_not_the_dial_order() {
+        assert_eq!(
+            declared_carrier(),
+            if cfg!(feature = "kcp") {
+                Carrier::Kcp
+            } else {
+                Carrier::Tcp
+            }
+        );
+        assert_eq!(first_carrier(), Carrier::Tcp);
+        let choice = CarrierChoice::new("data.example:2343");
+        assert_eq!(choice.preferred(), Carrier::Tcp);
+        assert_eq!(choice.carrier(), Carrier::Tcp);
     }
 }

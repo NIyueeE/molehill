@@ -759,8 +759,8 @@ CONDITIONS: dict[str, Condition] = {
     ),
     "udp_blocked": Condition(
         "udp_blocked",
-        "a path that drops UDP: the data plane's first carrier cannot be "
-        "established, so it must fall back to TCP",
+        "a path that drops UDP: the KCP fallback cannot be established, so "
+        "the run measures the data plane with no fallback available",
         block_udp=True,
     ),
     "mtu1280": Condition("mtu1280", "a tunnel or an IPv6-minimum path", mtu=1280),
@@ -870,9 +870,9 @@ class Arm:
     an L3 arm may say so (a forwarding service has no lanes to move).
 
     The data plane's *carrier* is not an arm parameter: the product chooses it
-    at runtime (KCP, falling back to TCP, re-probing), so a run that needs the
-    paths apart says so with a **condition** — `udp_blocked` is the fallback, a
-    clean path carries KCP — or, to isolate one carrier, with the inherited
+    at runtime (TCP, falling back to KCP, re-probing), so a run that needs the
+    paths apart says so with a **condition** — `udp_blocked` removes the KCP
+    fallback, a clean path carries TCP — or, to isolate one carrier, with the inherited
     `MOLEHILL_DATA_CARRIER` switch, which the results record as instrumentation.
     The data plane's *shape* is not an arm parameter either: a forwarding
     service always multiplexes and a claim never does, which is what the product
@@ -920,10 +920,10 @@ class Arm:
     def data_carrier(self) -> str:
         """The carrier an arm can claim, which is none: the product chooses.
 
-        `auto` for a tool arm — the data plane tries KCP and falls back to TCP on
+        `auto` for a tool arm — the data plane tries TCP and falls back to KCP on
         its own, so an arm cannot name a carrier without describing a setting the
         product no longer has. A run that needs the paths apart uses the
-        `udp_blocked` condition (the fallback) or the inherited
+        `udp_blocked` condition (no fallback available) or the inherited
         `MOLEHILL_DATA_CARRIER` switch (one carrier alone, recorded as
         instrumentation). Empty for a control arm and for a peer, whose stacks
         are their own.
@@ -1030,8 +1030,8 @@ ARM_CATALOG: dict = {
     ),
     "l3-deep": Arm("l3-deep", "l3", txqueuelen=DEEP_TXQUEUELEN),
     # There is no carrier axis: the product chooses its carrier at runtime
-    # (KCP, falling back to TCP), so the contrast lives in the *path* — a run
-    # against `--condition udp_blocked` is the fallback, a clean run is KCP —
+    # (TCP, falling back to KCP), so the contrast lives in the *path* — a run
+    # against `--condition udp_blocked` has no fallback, a clean run has one —
     # while forcing one carrier for isolation is an experiment-wide environment
     # switch rather than an arm.
     # The reference tools. Their adapters live in `targets/peers/`; the arm is the
@@ -1168,11 +1168,11 @@ def refuse_lend_outside_l3(arm: Arm) -> None:
 def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
     """Refuse a condition imposed on a leg where it cannot mean anything.
 
-    `udp_blocked` is how a run asks for the data plane's *fallback*: it drops
-    UDP on the leg the carrier crosses. Imposed on the visitor's leg it would
-    block the payload instead and the carrier would come up as usual — a run
-    whose method says "the fallback" while every packet rode KCP. The refusal
-    names the leg to use rather than letting the number lie.
+    `udp_blocked` is how a run asks for a path where the KCP fallback cannot be
+    established: it drops UDP on the leg the carrier crosses. Imposed on the
+    visitor's leg it would block the payload instead and the fallback would come
+    up as usual — a run whose method says "no fallback" while every packet rode
+    KCP. The refusal names the leg to use rather than letting the number lie.
     """
     if (condition.block_udp or condition.udp_limit is not None) and leg != "tunnel":
         raise ValueError(
@@ -1185,8 +1185,8 @@ def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
 def refuse_carrier_arm(arm: Arm) -> None:
     """Refuse an arm that names a carrier.
 
-    The data plane's carrier is chosen at runtime (KCP, falling back to TCP), so
-    there is no key to write and no arm field to set: a run that means "the
+    The data plane's carrier is chosen at runtime (TCP, falling back to KCP), so
+    there is no key to write and no arm field to set: a run that means "no
     fallback" asks for the `udp_blocked` condition, and one that means "KCP
     alone" sets `MOLEHILL_DATA_CARRIER=kcp` in the environment it launches the
     bench from (the results record it as instrumentation). An arm that named a
@@ -1196,7 +1196,7 @@ def refuse_carrier_arm(arm: Arm) -> None:
     if arm.data_carrier not in ("", "auto"):
         raise ValueError(
             f"arm {arm.id!r}: the carrier is chosen at runtime; use the `udp_blocked` "
-            "condition for the fallback, not an arm field"
+            "condition (or MOLEHILL_DATA_CARRIER) for a carrier, not an arm field"
         )
 
 

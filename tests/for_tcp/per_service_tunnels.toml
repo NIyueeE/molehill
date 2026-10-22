@@ -2,9 +2,10 @@
 # width and `[client.services.*].tunnels` overrides it per service. Here echo
 # rides the default (four tunnels) and pingpong keeps two of its own — one
 # client, two pool widths, no server-side configuration beyond the usual
-# policy. The carrier is not part of it: every service tries KCP first and
-# falls back to TCP on its own, so the server opens its KCP listener on the
-# first registration that declares it.
+# policy. The carrier is not part of it: every service dials TCP first and
+# falls back to KCP on its own, while the registration declares that it can
+# carry KCP, so the server opens its KCP listener on the first such
+# registration.
 
 [client]
 default_token = "default_token_if_not_specify" # security-scan:allow dummy fixture token, same value as the sibling transport fixtures

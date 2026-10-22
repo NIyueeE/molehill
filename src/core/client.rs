@@ -33,7 +33,7 @@ use crate::transparent::lanes::{self, ClaimLoad, LaneLoad};
 #[cfg(any(feature = "multiplex", mh_l3_client))]
 use crate::transport::carrier::{Carrier, CarrierChoice};
 #[cfg(feature = "multiplex")]
-use crate::transport::carrier::{KCP_ATTEMPT_BUDGET, first_carrier};
+use crate::transport::carrier::{KCP_ATTEMPT_BUDGET, declared_carrier};
 use crate::transport::{AddrMaybeCached, SocketOpts, TcpTransport, Transport};
 use anyhow::{Context, Result, anyhow, bail};
 use backon::BackoffBuilder;
@@ -379,16 +379,17 @@ impl ServiceSlot {
                 name: self.service.name.clone(),
                 service_type: self.service.service_type,
                 bind_addr,
-                // The carrier the client will **try first** (KCP where the
-                // feature is built in, TCP otherwise). The server opens the
-                // listener that needs opening and validates nothing further: a
-                // channel that arrives on the other carrier is served exactly
-                // the same, which is what lets the fallback work without a
-                // second registration.
+                // The carrier the client **can** use (KCP where the feature is
+                // built in, TCP otherwise), which is what the server needs to
+                // know: it opens the listener that carrier needs and validates
+                // nothing further. It is deliberately *not* the dial order —
+                // the client dials TCP first and falls back to KCP — because a
+                // server that opened its UDP listener only for clients that
+                // declared it would leave a TCP-first client no fallback.
                 carrier: {
                     #[cfg(feature = "multiplex")]
                     {
-                        protocol::Carrier::from_data_carrier(first_carrier())
+                        protocol::Carrier::from_data_carrier(declared_carrier())
                     }
                     #[cfg(not(feature = "multiplex"))]
                     {
@@ -1139,12 +1140,14 @@ impl RunDataChannelArgs {
 /// socket stack — and its reliability makes the retry loop meaningless: a lost
 /// datagram is KCP's business, and there is no connect error to retry on.
 async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStream> {
-    // KCP first, where the endpoint's choice still allows it: an attempt is
-    // bounded, and a path that cannot bring a session up in that budget is one
-    // where UDP is going nowhere — the fallback turns that into a delay on this
-    // channel rather than a data plane that never comes up.
+    // KCP when this endpoint's choice names it — after a TCP failure put it
+    // there, or when its re-probe window has opened: an attempt is bounded, and
+    // a path that cannot bring a session up in that budget is one where UDP is
+    // going nowhere, so the fallback turns that into a delay on this channel
+    // rather than a data plane that never comes up. TCP, the first carrier,
+    // never enters this block.
     #[cfg(all(feature = "multiplex", feature = "kcp"))]
-    if args.carrier.try_kcp() {
+    if args.carrier.preferred() == Carrier::Kcp {
         let remote_addr = {
             let mut probe = args.remote_addr.clone();
             probe
@@ -1166,18 +1169,23 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
         .await
         {
             Ok(Ok(stream)) => {
-                args.carrier.reached_kcp();
+                args.carrier.succeeded(Carrier::Kcp);
                 return Ok(ClientStream::Kcp(stream));
             }
             Ok(Err(e)) => {
-                if !args.carrier.on_kcp_failure(&format!("{e:#}")) {
+                if args
+                    .carrier
+                    .failed(Carrier::Kcp, &format!("{e:#}"))
+                    .is_none()
+                {
                     return Err(e).context("the KCP session failed and the carrier is forced");
                 }
             }
             Err(_) => {
-                if !args
+                if args
                     .carrier
-                    .on_kcp_failure("the KCP session did not come up in time")
+                    .failed(Carrier::Kcp, "the KCP session did not come up in time")
+                    .is_none()
                 {
                     bail!("the KCP session did not come up in time, and the carrier is forced");
                 }
@@ -1203,6 +1211,12 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
         debug!("{:#}. Retry in {:?}", e, duration);
     })
     .await?;
+    // TCP carried it: a re-probe that came up here is the news the choice
+    // keeps, and a fallback's cooldown is over (see `CarrierChoice::succeeded`).
+    // The choice only exists where a second carrier could: a build with neither
+    // `multiplex` nor the L3 client has one carrier and no decision to record.
+    #[cfg(any(feature = "multiplex", mh_l3_client))]
+    args.carrier.succeeded(Carrier::Tcp);
     Ok(conn)
 }
 
@@ -1787,11 +1801,11 @@ async fn establish_tunnel(
 /// operator's `[client.data].tunnels` (or the default, `4`): every service of
 /// the session draws on it, and no service raises it.
 ///
-/// The carrier is chosen at runtime, not written: KCP first (feature `kcp`),
-/// TCP when a KCP session cannot be established within the attempt's budget,
-/// with the decision remembered per data endpoint and re-probed after a
-/// cooldown (see [`crate::transport::carrier`]). The pool's identity is `key`:
-/// `session` for a shared pool, `service:<name>` otherwise.
+/// The carrier is chosen at runtime, not written: TCP first, KCP when a TCP
+/// data channel cannot be established, with the decision remembered per data
+/// endpoint and re-probed after a cooldown, and the quality rule able to move a
+/// KCP-carrying pool back (see [`crate::transport::carrier`]). The pool's
+/// identity is `key`: `session` for a shared pool, `service:<name>` otherwise.
 ///
 /// The returned senders shut the tunnel drivers down when dropped; a tunnel
 /// the pool *grows* carries its own sender inside the pool, so a shrink can
@@ -1814,46 +1828,43 @@ async fn establish_tunnels(
     // endpoints's other channels: a pool that established on TCP keeps dialing
     // TCP (its repair included), because a pool whose tunnels rode two carriers
     // would be two pools wearing one name.
-    let (carrier, dialer, initial) = if choice.try_kcp() {
-        match dial.dialer().await {
-            Ok(dialer) => {
-                let attempt = tokio::time::timeout(
-                    KCP_ATTEMPT_BUDGET,
-                    establish_initial(&dialer, target, key, Carrier::Kcp),
-                )
-                .await;
-                match attempt {
-                    Ok(established) if !established.is_empty() => {
-                        choice.reached_kcp();
-                        (Carrier::Kcp, dialer, established)
-                    }
-                    Ok(_) => {
-                        if !choice.on_kcp_failure("no KCP session came up") {
-                            bail!("no KCP session came up, and the carrier is forced");
-                        }
-                        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
-                        (Carrier::Tcp, dialer, initial)
-                    }
-                    Err(_) => {
-                        if !choice.on_kcp_failure("KCP establishment timed out") {
-                            bail!("KCP establishment timed out, and the carrier is forced");
-                        }
-                        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
-                        (Carrier::Tcp, dialer, initial)
-                    }
-                }
+    let mut carrier = choice.preferred();
+    // One fallback, not a rotation: `failed` always answers the other carrier,
+    // so a loop that trusted it alone would pay both attempts for ever when
+    // neither can be established.
+    let mut fell_back = false;
+    let (dialer, initial) = loop {
+        let attempt = match carrier {
+            Carrier::Kcp => establish_kcp_pool(dial, target, key).await,
+            Carrier::Tcp => tcp_pool_start(dial, target, key).await,
+        };
+        let failure = match attempt {
+            Ok(started) => {
+                // Reached: the choice keeps this carrier (a re-probe that came
+                // up is the news; a held quality switch is not overridden —
+                // see `CarrierChoice::succeeded`).
+                choice.succeeded(carrier);
+                break started;
             }
-            Err(e) => {
-                if !choice.on_kcp_failure(&format!("{e:#}")) {
-                    return Err(e).context("the KCP dial failed and the carrier is forced");
-                }
-                let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
-                (Carrier::Tcp, dialer, initial)
+            Err(e) => e,
+        };
+        // Recorded for the endpoint and answered with the carrier to try
+        // instead; `None` means there is nothing left (a forced carrier, or a
+        // build with one), and the failure is the pool's.
+        match choice.failed(carrier, &format!("{failure:#}")) {
+            Some(next) if !fell_back => {
+                fell_back = true;
+                carrier = next;
+            }
+            _ => {
+                return Err(failure).with_context(|| {
+                    format!(
+                        "the {} data plane could not be established",
+                        carrier.as_str()
+                    )
+                });
             }
         }
-    } else {
-        let (dialer, initial) = tcp_pool_start(dial, target, key).await?;
-        (Carrier::Tcp, dialer, initial)
     };
     let established = initial.len();
     info!(
@@ -2010,7 +2021,7 @@ async fn tunnel_dialer(
                     // path that has since stopped carrying UDP is fine —
                     // and every other pool, lane and future session that
                     // dials that endpoint keeps paying for the attempt.
-                    choice.on_kcp_failure(e);
+                    choice.failed(Carrier::Kcp, e);
                 }
                 result
             })
@@ -2019,8 +2030,8 @@ async fn tunnel_dialer(
     Ok(Arc::new(move |wanted: Carrier| match wanted {
         Carrier::Tcp => tcp(),
         // A build without the feature has no way to be asked for KCP
-        // (`CarrierChoice::try_kcp` answers false), and TCP is then the only
-        // carrier there is.
+        // (`CarrierChoice::failed` has nowhere to fall back to), and TCP is
+        // then the only carrier there is.
         #[cfg(feature = "kcp")]
         Carrier::Kcp => kcp(),
         #[cfg(not(feature = "kcp"))]
@@ -2043,8 +2054,53 @@ struct PoolDial<'a> {
     choice: &'a Arc<CarrierChoice>,
 }
 
+/// A pool's start on KCP: its dialer plus the tunnels that came up inside the
+/// attempt budget.
+///
+/// A session that does not come up in [`KCP_ATTEMPT_BUDGET`] is a path where UDP
+/// is going nowhere, so the caller falls back instead of waiting: the budget is
+/// what keeps a blocked path a delay on the endpoint rather than a hung service.
+#[cfg(all(feature = "multiplex", feature = "kcp"))]
+async fn establish_kcp_pool(
+    dial: PoolDial<'_>,
+    target: usize,
+    key: &str,
+) -> Result<(
+    Dialer,
+    Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+)> {
+    let dialer = dial.dialer().await?;
+    match tokio::time::timeout(
+        KCP_ATTEMPT_BUDGET,
+        establish_initial(&dialer, target, key, Carrier::Kcp),
+    )
+    .await
+    {
+        Ok(established) if !established.is_empty() => Ok((dialer, established)),
+        Ok(_) => bail!("no KCP session came up"),
+        Err(_) => bail!("KCP establishment timed out"),
+    }
+}
+
+/// The same start in a build without `kcp`: the endpoint's choice can never
+/// name KCP there ([`crate::transport::carrier::first_carrier`] is TCP and
+/// [`CarrierChoice::failed`] has nowhere to fall back to), so this arm only
+/// keeps the match whole and reports the build rather than pretending.
+#[cfg(all(feature = "multiplex", not(feature = "kcp")))]
+async fn establish_kcp_pool(
+    dial: PoolDial<'_>,
+    target: usize,
+    key: &str,
+) -> Result<(
+    Dialer,
+    Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+)> {
+    let _ = (dial, target, key);
+    bail!("This build cannot carry the data plane over KCP (the `kcp` feature is off)")
+}
+
 /// A pool's start on TCP: its dialer (which repair keeps using) and the tunnels
-/// that came up. The fallback's own half, and the only half a build without the
+/// that came up. The first carrier's half, and the only half a build without the
 /// `kcp` feature ever runs.
 #[cfg(feature = "multiplex")]
 async fn tcp_pool_start(

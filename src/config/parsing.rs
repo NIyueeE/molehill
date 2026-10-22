@@ -43,7 +43,7 @@ impl From<&str> for MaskedString {
 /// Wire stack of the control channel: plain bytes or Noise.
 ///
 /// Only the control channel, which is always TCP. The data plane's own carrier
-/// is chosen at runtime (KCP, falling back to TCP) and is not a key.
+/// is chosen at runtime and is not a key.
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, PartialEq, Eq, Default)]
 #[doc(hidden)]
 pub enum TransportType {
@@ -401,8 +401,7 @@ pub struct ClientControlConfig {
 ///
 /// Neither the *shape* of the data plane nor its *carrier* is a key: a
 /// forwarding service always multiplexes ([`ClientServiceConfig::uses_pool`]), a
-/// transparent claim never does, and the carrier is chosen at runtime (KCP,
-/// falling back to TCP).
+/// transparent claim never does, and the carrier is chosen at runtime.
 #[cfg(feature = "multiplex")]
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -756,24 +755,24 @@ const REMOVED_KEYS: &[(&str, &str, &str)] = &[
     (
         "client.data.tcp",
         "the next release",
-        "the data plane's carrier is chosen at runtime now (KCP, falling back to TCP), so it is not \
+        "the data plane's carrier is chosen at runtime now, so it is not \
          a row to write: move its `tunnels` up into `[client.data].tunnels`",
     ),
     (
         "client.data.kcp",
         "the next release",
-        "the data plane's carrier is chosen at runtime now (KCP, falling back to TCP), so it is not \
+        "the data plane's carrier is chosen at runtime now, so it is not \
          a row to write: move its `tunnels` up into `[client.data].tunnels`",
     ),
     (
         "client.data.default_carrier",
         "the next release",
-        "the carrier is chosen at runtime (KCP, falling back to TCP); remove the key",
+        "the carrier is chosen at runtime; remove the key",
     ),
     (
         "client.services.*.carrier",
         "the next release",
-        "the carrier is chosen at runtime (KCP, falling back to TCP); a service's own \
+        "the carrier is chosen at runtime; a service's own \
          `tunnels` is the data-plane key it may still write",
     ),
     (
@@ -1023,22 +1022,21 @@ const UNRELEASED_KEYS: &[(&str, &str)] = &[
     ),
     (
         "transparent.data.tcp",
-        "a transparent client's carrier is chosen at runtime (KCP, falling back to TCP), so the \
+        "a transparent client's carrier is chosen at runtime, so the \
          lane budget is not a row per carrier: move its `tunnels` up into `[transparent.data]`",
     ),
     (
         "transparent.data.kcp",
-        "a transparent client's carrier is chosen at runtime (KCP, falling back to TCP), so the \
+        "a transparent client's carrier is chosen at runtime, so the \
          lane budget is not a row per carrier: move its `tunnels` up into `[transparent.data]`",
     ),
     (
         "transparent.data.default_carrier",
-        "the carrier is chosen at runtime (KCP, falling back to TCP); remove the key",
+        "the carrier is chosen at runtime; remove the key",
     ),
     (
         "transparent.claims.*.carrier",
-        "the carrier is chosen at runtime (KCP, falling back to TCP); a claim's own `tunnels` is \
-         the key it may still write",
+        "the carrier is chosen at runtime; a claim's own `tunnels` is the key it may still write",
     ),
     (
         "transparent.data.shared_pool",

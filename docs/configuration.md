@@ -174,14 +174,14 @@ round trips per second
 ### Migrating to 0.11: the carrier and the pool's clock
 
 Which carrier works is a property of the network, not of the deployment, so the
-data plane chooses it at runtime (KCP first, falling back to TCP) and the keys
+data plane chooses it at runtime (TCP first, falling back to KCP) and the keys
 that used to state it are gone. The pool is **pinned** too — it is established
 at service start and repaired, never grown on load or reaped for idleness — so
 there is no shrink clock to configure:
 
 | Removed key | Write instead |
 |---|---|
-| `[client.data].default_carrier` | Nothing: the data plane dials KCP and falls back to TCP when a session cannot be established. `MOLEHILL_DATA_CARRIER=tcp\|kcp` forces one apart, for a measurement or a test that needs the two paths separated |
+| `[client.data].default_carrier` | Nothing: the data plane dials TCP and falls back to KCP when a data channel cannot be established. `MOLEHILL_DATA_CARRIER=tcp\|kcp` forces one apart, for a measurement or a test that needs the two paths separated |
 | `[client.services.<name>].carrier` | Nothing — the same reason. A service's own `tunnels` is the data-plane key it may still write |
 | `[client.data.tcp]` | `[client.data].tunnels`: one pool and one width, whichever carrier it rides |
 | `[client.data.kcp]` | `[client.data].tunnels` — the same |
@@ -218,8 +218,8 @@ The first choice is the mode: `[client]` forwards to a local application,
 about the process, not about a service, so it comes before anything below.
 
 The defaults — a pinned pool of `tunnels = 4` multiplexed connections, a Noise
-control channel (required), and a data plane that tries KCP before falling back
-to TCP — are the right starting point for almost everyone. Deviate only when the tree says so, change one thing at a time, and
+control channel (required), and a data plane that tries TCP before falling back
+to KCP — are the right starting point for almost everyone. Deviate only when the tree says so, change one thing at a time, and
 measure the result on your own path: the published runs, their numbers and how
 to reproduce them are
 in [Benchmarks](benchmarks.md). This page owns **what each setting does**.
@@ -246,7 +246,7 @@ flowchart TD
 | `tunnels` | `1` | one tunnel for everything: no aggregation across flows, and one loss event stalls every stream sharing the retransmit domain. Measured as the worst configuration on every path |
 | `tunnels` | `4` (default) | aggregates beyond a single flow and isolates head-of-line blocking between tunnels; `4 × 64` concurrent connections |
 | `tunnels` | `8+` | more parallel tunnels (more NAT mappings) and a proportionally higher connection ceiling; measured worth +77 % throughput from one tunnel to eight on a clean fast path |
-| carrier | (no key) | the data plane dials KCP and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement. Measured, TCP is ahead in every unflagged cell and KCP's one win is UDP session quality at 100 ms RTT ([Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)) |
+| carrier | (no key) | the data plane dials TCP and falls back to KCP when a data channel cannot be established, because which one works is a property of the network and not of the deployment. `MOLEHILL_DATA_CARRIER` forces one apart for a measurement. Measured, TCP is ahead in every unflagged cell and KCP's one win is UDP session quality at 100 ms RTT — which is why TCP is the carrier it dials first ([Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements)) |
 | `data_enable` | `false` | data channels are plain; lowest per-byte cost. The control channel stays KK |
 | `data_enable` | `true` (default) | every data and lane channel is wrapped in KK, at a small CPU cost and no extra round trip |
 | pool establishment | (no key) | the pool's `tunnels` connections are dialed at service start, not on the first visitor: nothing is paid at request time, and the cost is `tunnels` idle connections (measured at 0.5–0.8 MiB RSS and 2.6 FDs each, no threads) |
@@ -273,9 +273,9 @@ default_remote_addr = "example.com:2333" # Necessary. The address of the server
 retry_backoff_max = 30 # Optional. Cap of the reconnect backoff, not a fixed interval: the delay grows by a factor of 3 with jitter and is capped at this value (jitter can make one sleep up to twice the cap). Unset = adaptive: 1, 2, 4, 8, 16, 32, then 60 s as consecutive failures grow. Set a value to pin the cap for every outage
 
 [client.data]
-# default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). The KCP sessions dial that address over UDP, so a TCP control channel and the KCP data plane can share one port (distinct protocols)
+# default_data_addr = "example.com:2343" # Optional. Data-plane endpoint; defaults to the service's control endpoint (`client.services.<name>.remote_addr` when set, else `client.control.default_remote_addr`). The KCP fallback's sessions dial that address over UDP, so a TCP control channel and a KCP data plane can share one port (distinct protocols)
 # tunnels = 4 # Optional. The session's single pool width: how many carrier connections the client holds for every service it carries. Default: 4. Must be `>= 1`; values above 64 are clamped
-# The carrier is deliberately **not** a key here: the data plane tries KCP (feature `kcp`) and falls back to TCP when a session cannot be established, because which one works is a property of the network and not of the deployment. A transparent claim goes further and moves a lane *while it runs*: each lane is measured (what the server offered it, what that lane's queue refused there, what the client injected off it), and a lane whose carrier is refusing a material share of what it is offered is handed over to the other one — the peer stops placing new flows in it, and it is retired once both ends agree it holds nothing, so a running flow finishes where it is and nothing is reordered. `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one, for a measurement or a test that needs the paths apart — it also disables the fallback and the automatic move
+# The carrier is deliberately **not** a key here: the data plane tries TCP and falls back to KCP (feature `kcp`) when a data channel cannot be established, because which one works is a property of the network and not of the deployment. A transparent claim goes further and moves a lane *while it runs*: each lane is measured (what the server offered it, what that lane's queue refused there, what the client injected off it), and a lane whose carrier is refusing a material share of what it is offered is handed over to the other one — the peer stops placing new flows in it, and it is retired once both ends agree it holds nothing, so a running flow finishes where it is and nothing is reordered. `MOLEHILL_DATA_CARRIER=tcp|kcp` forces one, for a measurement or a test that needs the paths apart — it also disables the fallback and the automatic move
 
 
 [client.noise]
@@ -392,8 +392,8 @@ service always multiplexes (there is no `mode` to write), and a
   stream to retire and is refused if none does. Size `tunnels` for the
   concurrency you expect; the measurements behind the sizing are in
   [Benchmarks](benchmarks.md#what-each-configuration-choice-costs-per-decision-measurements).
-- **The carrier is not a choice you write.** The data plane dials KCP
-  (feature `kcp`, in the default set) and falls back to TCP when a session
+- **The carrier is not a choice you write.** The data plane dials TCP and
+  falls back to KCP (feature `kcp`, in the default set) when a data channel
   cannot be established, because which of the two works is a property of the
   network between the two ends: UDP may be blocked, shaped, or fine today and
   blocked tomorrow. A fallback is announced once at `INFO`, is re-probed every
@@ -405,10 +405,12 @@ service always multiplexes (there is no `mode` to write), and a
   The crypto stack is unchanged — with
   data encryption on, the same Noise handshake wraps each KCP session — and
   yamux still carries the data channels, so `tunnels` applies as usual. The
-  server opens its UDP listener lazily — the first registration that
-  declares the `kcp` carrier triggers the bind, and a bind failure is a
-  precise registration rejection; servers whose clients never use KCP never
-  open the UDP socket. The listener binds on the data address
+  server opens its UDP listener lazily — the first registration from a client
+  that can carry KCP triggers the bind, and a bind failure is a precise
+  registration rejection; a client built without the `kcp` feature never
+  causes the UDP socket to be opened. A client dials TCP first and declares
+  that it *can* carry KCP, so the fallback's listener is there before it is
+  needed. The listener binds on the data address
   (`[server.data].bind_addr`, default = the control address) and each
   session authenticates with the control session's nonce exactly like a TCP
   tunnel. If neither side sets a data
@@ -482,8 +484,8 @@ remote_bind_addr = "0.0.0.0:5202"
 ```
 
 The server binds a second TCP listener on `[server.data].bind_addr` and opens
-the KCP UDP socket there on the first KCP registration; open **both** TCP and
-UDP on that port. A service with its own `remote_addr` follows that server for
+the KCP UDP socket there on the first registration from a client that can carry
+KCP; open **both** TCP and UDP on that port. A service with its own `remote_addr` follows that server for
 both planes, so the client-wide `default_data_addr` does not apply to it.
 
 **Per-service overrides.** `[client.data]` holds the defaults; each service can
@@ -660,7 +662,7 @@ pair and the lanes' switch:
 and `[transparent].tun` is where a device is named.
 
 A claim has no carrier key, and one fewer thing to get wrong: each lane rides
-whatever the data plane dials (KCP, falling back to TCP), and the carrier's
+whatever the data plane dials (TCP, falling back to KCP), and the carrier's
 session *is* the data channel, with no multiplexer above it. What a claim does
 choose is how many lanes it gets (`[transparent.data].tunnels`). A claim never
 multiplexes: its lanes are its carrier connections, and its throughput is the
@@ -820,7 +822,7 @@ anything:
 | `MOLEHILL_POOL_STATS=1` | one line per second per live pool | the pool's key, carrier, size, configured count, live streams, pinned peers, the per-tunnel `streams/pending/pinned/carrier/phase` entry, any handover in flight (`id/target:phase`), the per-tunnel cumulative KCP `datagrams_out/retransmits` pair the carrier rule judges (`-` where the tunnel does not ride KCP), and the timeline of size changes with the reason for each (`+repair:1->2`, `-dead:2->1`, `-handover:2->1`) — in a healthy run there are none, and a pool whose `size` sits below its `count` is a pool whose repair is being refused |
 | `MOLEHILL_PLACEMENT_STATS=1` | one line per second per process | that interval's placements: how many, how many fell back to another tunnel, the candidate and chosen load sums, `mean_spread` — the average gap in stream slots between the best and the worst candidate at the instant of a placement, i.e. what a smarter rule could have won — and the open latency's mean and maximum |
 | `MOLEHILL_UDP_STATS=1` | one line per second per process | the UDP affinity table's size, its evictions, and each worker's pinned peers |
-| `MOLEHILL_DATA_CARRIER=tcp\|kcp` | nothing (it changes behaviour) | forces the carrier the data plane dials, for a test or a measurement that needs the two paths apart: `kcp` makes a KCP failure final instead of falling back, `tcp` skips the attempt entirely. Not a deployment knob — the carrier is chosen at runtime because which one works is a property of the network — and a value that is neither is reported and ignored. To measure the *fallback* rather than force it, block UDP on the path instead: that is what the bench model's `udp_blocked` condition does, and it measures the product's own decision |
+| `MOLEHILL_DATA_CARRIER=tcp\|kcp` | nothing (it changes behaviour) | forces the carrier the data plane dials, for a test or a measurement that needs the two paths apart: `tcp` makes a TCP failure final instead of falling back, `kcp` skips the TCP attempt entirely. Not a deployment knob — the carrier is chosen at runtime because which one works is a property of the network — and a value that is neither is reported and ignored. To measure the *fallback* rather than force it, block UDP on the path instead: that is what the bench model's `udp_blocked` condition does, and it measures the product's own decision |
 | `MOLEHILL_CARRIER_SWITCH_AT=<seconds>` | one line when it fires, per claim | at that many seconds after the pool starts, moves every transparent claim of the client to the other carrier and asks the peer to drain its busiest lane, so the replacement is dialed on the new carrier. The drain is the same two-sided one the automatic policy uses: the lane stops taking new flows on **both** ends, keeps the flows already on it (so nothing is reordered), and is retired only once both agree it holds none — which means a lane still carrying a long-lived flow is not taken, and the switch's effect is the new flows that follow. It exists to **measure** what a carrier switch buys and what it costs — the production behaviour is a measured decision inside the client, not a knob — and a value that is not a whole number of seconds is reported and ignored |
 | `MOLEHILL_TUNNEL_SWITCH_AT=<seconds>` | one line when it fires, per pool | at that many seconds after a multiplexed pool starts, the L4 analogue of the switch above: the pool excludes one tunnel of the carrier its tunnels currently ride from new placements, keeps the flows already on it (so nothing is reordered), and retires it only once it holds no stream and no pinned UDP peer — the repair then dials the replacement on the other carrier. A tunnel that never quiets (a long-lived flow) returns to service after the drain budget, and a replacement that cannot be established releases the handover so ordinary repair takes over — a pool is never left one tunnel short for ever. It exists to **measure** what a per-tunnel handover costs and what its replacement captures, the same way the L3 hatch does for claims; it is not a deployment knob, and a value that is not a whole number of seconds is reported and ignored |
 | `MOLEHILL_TUNNEL_CARRIER_RULE=1` | one line per probe event or move, per pool | turns the multiplexed pool's carrier rule **on** for this process (off by default — see why below). The rule reads each KCP tunnel's retransmit share over a one-second window, and a tunnel carrying real traffic whose share clears 4 % **suspects** the carrier: it hands one tunnel to the other carrier through the same no-disruption handover the hatch drives, routes new streams to the probe while it runs, and compares the two carriers on carried bytes — materially more moves the endpoint's carrier decision (under the same switch cooldown), materially less gives the tunnel back and backs off ten minutes, and a probe that carried nothing in its window is held rather than judged. A tunnel that actually *stops* delivering (< 60 % of what the peer handed it) moves immediately, without a probe. The floors and the one-sided shape (KCP → TCP only; a TCP tunnel's retransmit state stays in the kernel) are in [internals.md](internals.md#the-tunnel-pool). **Why it is off by default**: the rule fires and compares honestly on the paths it was built for, but its Move path has not yet been demonstrated end to end on a bench workload — a UDP workload's channels open once at service activation, so a probe that starts mid-run cannot receive routed traffic, and no scenario both arms the suspicion and re-dials after it does (HANDOFF.md, "the sighting protocol"). Until a workload exists that closes that gap, arming the rule is an operator's decision, made knowing what the probe can and cannot see.

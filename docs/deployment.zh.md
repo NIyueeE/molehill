@@ -777,7 +777,7 @@ services:
 
 桥接网络变体(Docker Desktop,macOS/Windows):文件不变,两个服务都去掉
 `network_mode: host`,并给服务端加上 `ports:`——`"2333:2333"` 用于控制通道与
-TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(数据面会优先尝试的 carrier),
+TCP 数据面,`"2333:2333/udp"` 用于 KCP 数据面(回退 carrier,TCP 被限速的路径需要它),
 再加每个对外暴露的服务端口(如 `"5202:5202"`);
 客户端则通过 compose 的 DNS 名访问服务端,即
 `default_remote_addr = "molehill-server:2333"`。
@@ -817,7 +817,7 @@ WantedBy=multi-user.target
 - **服务端**必须能从互联网访问:`server.control.bind_addr`、
   `server.data.bind_addr`(设置时)和每个注册的 `remote_bind_addr` 都需要
   入站访问(在防火墙中开放端口,或在公网服务器上做端口转发)。服务使用
-  数据面会尝试 KCP,因此还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
+  数据面在 TCP 数据通道建立不起来时回退到 KCP,因此还要额外开放对应的 **UDP** 端口——KCP 监听器绑定
   `server.data.bind_addr`,默认就是控制端口,同一端口号上 TCP 与 UDP 并存。
 - **客户端**只需要到 `server.control.bind_addr` 的出站访问(数据端点不同时
   也包括它;TCP,数据面的 KCP 还包括 UDP);NAT 后不需要任何入站端口。

@@ -100,12 +100,12 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   `[client.data].tunnels` for a forwarding arm and a transparent claim's
   **lane budget** for an L3 one — one connection per lane, because a claim never
   multiplexes. The data plane's **carrier is not an arm axis either**: the
-  product chooses it at runtime (KCP, falling back to TCP), so there is no key
+  product chooses it at runtime (TCP, falling back to KCP), so there is no key
   to write and no arm field to set. The contrast lives in the *path* —
   `--condition udp_blocked --condition-leg tunnel` drops UDP on the leg the
-  carrier crosses, so the KCP attempt cannot be established and the run measures
-  the fallback, with the fallback line and `carrier="tcp"` in the pool's own
-  output as its evidence — while a clean run carries KCP. To isolate one carrier
+  carrier crosses, so the KCP fallback cannot be established and the run measures
+  the data plane with no fallback behind it, with the pool's own `carrier="tcp"`
+  output as its evidence — while a clean run keeps the fallback available. To isolate one carrier
   instead (a KCP-only run under loss, say), set `MOLEHILL_DATA_CARRIER=kcp` in
   the environment the bench is launched from: a run records the `MOLEHILL_*`
   switches it inherited as instrumentation, so the forcing is auditable. The shape itself is
@@ -401,7 +401,7 @@ same vocabulary without the schedule: one cell, one condition, one number.
 | `loss1_buf` | a lossy path with a large but finite buffer: deep enough that tail drops are not the story, shallow enough not to inflate RTT (10 000 packets ≈ 14.7 MB, ≈ 27 ms of standing queue at 545 Mbit/s) | 10 ms delay, 1 % loss, 10 000-packet queue | focused cell only |
 | `loss1_deep` | the same 1 % loss with a queue deep enough not to tail-drop — it tells a carrier's loss recovery apart from the shaper's own drops | 10 ms delay, 1 % loss, 100 000-packet queue | focused cell only |
 | `udp_throttled` | a path that **polices** UDP instead of refusing it: the carrier riding UDP still establishes, but only carries what the policer admits (10 000 packets/s ≈ 117 Mbit/s of 1472-byte datagrams) while a carrier that does not ride UDP is untouched | `iptables -m limit` accept-then-drop for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
-| `udp_blocked` | a path that drops UDP: the data plane's first carrier cannot be established, so the run measures the **TCP fallback** | `iptables -j DROP` for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
+| `udp_blocked` | a path that drops UDP: the KCP fallback cannot be established, so the run measures the data plane with **no fallback available** | `iptables -j DROP` for UDP on the leg (the `tunnel` leg only — the refusal says so) | focused cell only |
 | `clean` | recovery — is the tool still the tool it was? | nothing | 150 s |
 
 The schedule, the durations, the sample rates and the SLO are recorded in every

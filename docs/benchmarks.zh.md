@@ -84,11 +84,11 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 - **臂必须写明它测的宽度;数据面的形态根本不是臂的参数。** 转发臂的 `pool_cap`
   是池的 `[client.data.tcp|kcp].tunnels`,L3 臂的则是透明认领的**车道预算**——
   一条车道一条连接,因为认领永不multiplex。数据面的 **carrier 同样不是臂的一维**:
-  carrier 由产品在运行时决定(先试 KCP,建立不起来回退 TCP),既没有配置键可写,
+  carrier 由产品在运行时决定(先试 TCP,建立不起来回退 KCP),既没有配置键可写,
   也没有臂字段可设。对照关系落在**路径**上——`--condition udp_blocked
-  --condition-leg tunnel` 在 carrier 穿过的那条腿上丢弃 UDP,KCP 因此建立不起来,
-  这一次运行量的就是回退路径(证据是回退那行日志与池输出里的 `carrier="tcp"`),
-  而干净路径上的运行走的就是 KCP。如果目的是把某个 carrier 单独隔离出来测量
+  --condition-leg tunnel` 在 carrier 穿过的那条腿上丢弃 UDP,KCP 回退因此建立不起来,
+  这一次运行量的是没有回退可用的数据面(证据是池输出里的 `carrier="tcp"`),
+  而干净路径上的运行身后有一个可用的回退。如果目的是把某个 carrier 单独隔离出来测量
   (例如丢包条件下的纯 KCP 运行),就在启动 bench 的环境里设
   `MOLEHILL_DATA_CARRIER=kcp`:运行会把继承到的 `MOLEHILL_*` 开关记进
   instrumentation,所以这种强制是可审计的。形态本身由
@@ -333,7 +333,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
 | `loss1_buf` | 有损路径,缓冲区大但有限:深到足以让尾丢弃不再是主因,又浅到不会把 RTT 抬起来(10000 包 ≈ 14.7 MB,545 Mbit/s 下约 27 ms 常驻排队) | 10 ms 延迟、1% 丢包、10000 包队列 | 仅专注格 |
 | `loss1_deep` | 同样 1% 丢包,但队列足够深不会尾丢弃——用来把 carrier 的丢包恢复与整形器自身的丢弃区分开 | 10 ms 延迟、1% 丢包、100000 包队列 | 仅专注格 |
 | `udp_throttled` | **限速**而非拒绝 UDP 的路径:依赖 UDP 的 carrier 仍能建立,但只能承载限速器放行的部分(10000 包/秒 ≈ 1472 字节数据报的 117 Mbit/s),而不走 UDP 的 carrier 不受影响 | 在腿上对 UDP 下 `iptables -m limit`(先放行后丢弃;只允许 `tunnel` 腿——放错腿会被拒绝) | 仅专注格 |
-| `udp_blocked` | 丢弃 UDP 的路径:数据面的第一个 carrier 建立不起来,于是这次运行量的就是 **TCP 回退** | 在腿上对 UDP 下 `iptables -j DROP`(只允许 `tunnel` 腿——放错腿会被拒绝) | 仅专注格 |
+| `udp_blocked` | 丢弃 UDP 的路径:KCP 回退建立不起来,于是这次运行量的是**没有回退可用**时的数据面 | 在腿上对 UDP 下 `iptables -j DROP`(只允许 `tunnel` 腿——放错腿会被拒绝) | 仅专注格 |
 | `clean` | 恢复——工具还是原来那个工具吗? | 无 | 150 s |
 
 日程、时长、采样率与 SLO 都记录在每份结果文件里(`meta`),因此任何一张图总
