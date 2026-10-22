@@ -722,13 +722,14 @@ impl Client {
             .unwrap_or_else(|| self.config.default_token.clone());
         let data = DataOpts::for_service(&self.config, &cfg);
         // The client opens its configured channels itself: a v4 registration
-        // asks the server for none. UDP opens its worker set (they are the
-        // sharding targets and the pool's UDP floor); TCP opens none, because
-        // the server asks for one channel per visitor; a transparent service
-        // opens its **lanes** — one carrier connection per lane, from the
-        // carrier's budget — and keeps them, because the claim's inner flows are
-        // spread across them and the server asks for a replacement for each lane
-        // that ends.
+        // asks the server for none. A UDP service starts one worker — its
+        // sharding targets are streams inside the pool, so the pool's width
+        // does not have to cover them — and the server asks for more up to
+        // `max_udp_workers`; TCP opens none, because the server asks for one
+        // channel per visitor; a transparent service opens its **lanes** — one
+        // carrier connection per lane, from the carrier's budget — and keeps
+        // them, because the claim's inner flows are spread across them and the
+        // server asks for a replacement for each lane that ends.
         let channels = match cfg.service_type {
             ServiceType::Tcp => 0,
             // UDP starts one worker; the server asks for another when its
@@ -1306,7 +1307,7 @@ impl Tunnels {
     }
 
     /// The pool itself, for the session that owns it: sharing it with another
-    /// service, setting its UDP floor, or reading its state.
+    /// service, or reading its state.
     fn pool(&self) -> &TunnelPool {
         match self {
             Tunnels::Yamux(pool) => pool,
@@ -1783,8 +1784,8 @@ async fn establish_tunnel(
 /// All `tunnels` connections are dialed here, at service start, and kept for
 /// the service's lifetime; a tunnel that dies is replaced by the pool's repair
 /// tick, which is the only establishment after this point. The count is the
-/// operator's `[client.data].tunnels`, or the default raised to the
-/// UDP-derived floor (`floor`) of the services sharing the pool.
+/// operator's `[client.data].tunnels` (or the default, `4`): every service of
+/// the session draws on it, and no service raises it.
 ///
 /// The carrier is chosen at runtime, not written: KCP first (feature `kcp`),
 /// TCP when a KCP session cannot be established within the attempt's budget,
@@ -4443,8 +4444,8 @@ impl ClientSession {
     }
 
     /// Turn a registered service into a live one: resolve its data endpoint,
-    /// open (or join) its tunnel pool when it multiplexes, pre-open its
-    /// configured channels (D5), and refresh the pools' UDP-derived floors.
+    /// open (or join) its tunnel pool when it multiplexes, and pre-open its
+    /// configured channels (D5).
     async fn activate(&mut self, id: ServiceId, nonce: &Nonce) -> Result<()> {
         let Some(entry) = self.services.remove(&id) else {
             return Ok(());

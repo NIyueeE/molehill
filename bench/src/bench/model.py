@@ -1004,12 +1004,9 @@ ARM_CATALOG: dict = {
     "l4-mux8": Arm("l4-mux8", "l4", pool_cap=8),
     # `pool_cap` writes `[client.data].tunnels`, so these arms are the pool
     # *pinned* at 2 / 8 connections — the arm's width, not a cap it may grow to.
-    # There is no `l4-mux1`: the topology carries a UDP service with two workers,
-    # so `tunnels = 1` is below the UDP-derived floor and the client refuses to
-    # start (the degenerate L4 cell docs/benchmarks.md used to record without a
-    # cause). One stream on a multiplexed session is measured with `l4-mux2` in a
-    # single-flow scenario — the same shape, one stream on one session, with a
-    # legal pool.
+    # There is no `l4-mux1` arm: one stream on a multiplexed session is
+    # measured with `l4-mux2` in a single-flow scenario — the same shape, one
+    # stream on one session, over a two-tunnel pool.
     "l3": Arm("l3", "l3"),
     # The lane axis: the carrier's budget, so a claim's inner flows can be spread
     # over several connections instead of one. A claim never multiplexes, so the

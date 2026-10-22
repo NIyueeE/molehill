@@ -286,9 +286,12 @@
   - The proposed `default_tunnels` name no longer describes the key. With no
     per-service inheritance it is the pool's width, not a default; the name
     stays `tunnels` (decided 2026-10-22, see the naming entry below).
-  - The UDP-derived floor becomes the deepest demand across every UDP service
-    that draws on the pool, and validation and runtime must read the same
-    source; the first-service-width defect below disappears with the model.
+  - The UDP-derived floor this entry planned was **dropped in 0.11.2**
+    (correction 2026-10-22): a UDP service starts one worker and grows on
+    demand (`max_udp_workers`), and those workers are streams inside the pool,
+    so the width has nothing to cover. Validation and runtime still read one
+    source (`[client.data].tunnels`); the first-service-width defect below
+    disappears with the model either way.
   - Per-service `remote_addr` and `transport` still fragment the L4 pool today
     (the key is session + data endpoint, and the transport is the first
     service's), so the model needs a rule for them: refuse the override, or

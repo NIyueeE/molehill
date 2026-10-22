@@ -97,8 +97,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   `l3-mux`(池上一条流)、`l3-mux4`(四条流)或 `l3-raw4`(四条连接)的地方,现在的
   目录是 `l3`(产品默认,每条认领一条车道)与 `l3-budget10`(各认领共享的 carrier 预算
   ——L3 拓扑有五条认领,于是十条车道起始为每条两条,分配器会把空闲的那些集中到正在承
-  载流量的认领上);而 `l4-mux1` 已删除,因为拓扑里
-  UDP 的下限会拒绝只有一条隧道的池——"两条隧道池上的单条流"对应单流场景下的
+  载流量的认领上);而 `l4-mux1` 已不在目录中——"两条隧道池上的单条流"对应单流场景下的
   `l4-mux2`(见 [HANDOFF.md](../HANDOFF.md)「The mux×1 gap, measured before
   touching it」)。
 

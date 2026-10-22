@@ -342,7 +342,7 @@ FD 占用。形态不是键:转发服务永远走多路复用(没有 `mode` 可�
 - `tunnels = N` 是该 carrier 的池持有多少条 carrier 连接。独立 TCP 流
   隔离队头阻塞(丢段只停滞自己的隧道),并可超越单条流的拥塞窗口聚合吞吐。
   某条隧道死亡时,开启请求会透明地落到存活隧道,修复 tick 会拨一条替代。
-  默认:4(当某个 UDP 服务的 worker 数更大时提高到该数);`1` 恢复单隧道行为,
+  默认:4;`1` 恢复单隧道行为,
   但要付实测代价——在模型的各格子里,一条隧道是所有路径上最差的配置,因为
   此时每条流共享同一个拥塞窗口。
 - **负载超过池时**发生的是分担,不是增长:流会摊到现有的隧道上,每条隧道最多
@@ -702,7 +702,7 @@ carrier,还有两个用于安排诊断性的 carrier 切换(认领一个、隧�
 | `MOLEHILL_KCP_STATS=1` | 每进程每秒一行 |
 | `MOLEHILL_TUNNEL_STATS=1` | 每进程每秒一行 | 每条多路复用隧道承载的字节数,格式 `序号:已交付/已写入`,按 pool 的 tunnel 顺序编号(旁边的 pool-stats 行才有 tunnel 名)——车道计数在 L4 的对应物,用来判断不同 carrier 上的隧道速率是否有材料性差异。计数本身是每条隧道上每轮 IO 两次 relaxed 原子加;该开关只启动报告线程 |
  KCP 适配器的累计计数(`datagrams_in`/`out`、`retransmits`、`acks_out`、`sacks_sent`、`blobs_out`、pump 轮数、`datagram_b`——最后一个会话自适应到的数据报尺寸,回答尺寸问题就靠它)以及把单个 segment 的用户态开销拆成 intake、delivery、writer drain、wire drain(`ms_out_send`,批量发送)与 ARQ update 的粗粒度分相计时,并在其旁给出限速器在 wire drain 中的那一份(`ms_out_pace`)——这些**只在该开关打开时**采集,因此默认运行不会为它们读时钟 |
-| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、UDP floor、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned/carrier/phase`、进行中的切换(`id/target:phase`)、carrier 规则所判定的每条隧道累计 KCP `datagrams_out/retransmits`(非 KCP 隧道为 `-`),以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`、`-handover:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
+| `MOLEHILL_POOL_STATS=1` | 每个存活 pool 每秒一行 | pool 的 key、carrier、size、配置的 count、存活 stream 数、pinned peer 数、每个 tunnel 的 `streams/pending/pinned/carrier/phase`、进行中的切换(`id/target:phase`)、carrier 规则所判定的每条隧道累计 KCP `datagrams_out/retransmits`(非 KCP 隧道为 `-`),以及每次尺寸变化的理由时间线(`+repair:1->2`、`-dead:2->1`、`-handover:2->1`)——健康运行里一条都没有,而 `size` 低于 `count` 的 pool 就是修复正在被拒绝的 pool |
 | `MOLEHILL_PLACEMENT_STATS=1` | 每进程每秒一行 | 该区间的放置情况:次数、回退到其它 tunnel 的次数、候选与选中负载之和、`mean_spread`(做放置那一刻「最优候选」与「最差候选」之间平均相差多少个流槽位,也就是更聪明的规则本可以赢到多少),以及 open 延迟的均值与最大值 |
 | `MOLEHILL_UDP_STATS=1` | 每进程每秒一行 | UDP affinity 表的大小、淘汰次数,以及每个 worker 的 pinned peer 数 |
 | `MOLEHILL_DATA_CARRIER=tcp\|kcp` | 不打印(它改变行为) | 强制数据面拨号使用的 carrier,供需要把两条路径分开的测试或测量使用:`kcp` 让 KCP 失败即终结而不再回退,`tcp` 直接跳过那次尝试。它不是部署选项——carrier 在运行时决定,因为哪一种能用是网络的性质——取值不是这两个时会报告并忽略。要**测量回退**而不是强制它,应该在路径上封掉 UDP:基准模型里的 `udp_blocked` 条件做的就是这件事,量的正是产品自己的决策 |

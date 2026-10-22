@@ -116,8 +116,7 @@ pub const MAX_MUX_TUNNELS_CAP: u16 = 64;
 /// flow and for eight), two captures most of the lossy-path gain
 /// (8 flows: 3.34 → 5.92 Gbit/s on `loss1`), and more keeps paying on a clean
 /// fast path (12.85 → 22.81 Gbit/s from one tunnel to eight). An explicit
-/// `tunnels` overrides it, and a UDP service's declared worker set raises it
-/// (see `udp_floor`).
+/// `tunnels` replaces it; nothing raises it above the written value.
 #[cfg(feature = "multiplex")]
 pub const DEFAULT_MUX_TUNNELS: u16 = 4;
 

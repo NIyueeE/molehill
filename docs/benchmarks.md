@@ -117,8 +117,7 @@ just bench-selfcheck                   # the model's own checks (a fast gate)
   product's default lane count) and `l3-budget10` (a carrier budget the
   claims share — the L3 topology carries five claims, so ten lanes start at two
   each and the allocator concentrates the spare ones on whichever claim is
-  carrying flows), and `l4-mux1` is gone because
-  the topology's UDP floor refuses a one-tunnel pool — one stream on a
+  carrying flows), and there is no `l4-mux1` — one stream on a
   two-tunnel pool is `l4-mux2` in a single-flow scenario
   ([HANDOFF.md](../HANDOFF.md), "The mux×1 gap, measured before touching it").
 
