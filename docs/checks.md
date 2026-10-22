@@ -149,11 +149,11 @@ the heavy gates are not re-run on the tag.
 
 Row 15's three rules are one extractor, `githooks/changelog-notes`, called by
 this review and by `release.yml` — the local verdict and the release cannot
-disagree. At tag creation (local mode only) it additionally requires a clean working
-tree and that the tag does not exist yet. On a tag push (evaluated against a
-commit), missing bench assets are a note instead of a failure — a historical
-tag legitimately predates the ritual, and re-pushing one to fix a failed
-release must stay possible. The advisory checklist is printed but not
+disagree. At tag creation (local mode only) it additionally requires a clean
+working tree and that the tag does not exist yet. On a tag push (evaluated
+against a commit), missing bench assets are a note instead of a failure — a
+historical tag legitimately predates the ritual, and re-pushing one to fix a
+failed release must stay possible. The advisory checklist is printed but not
 enforced mechanically — no gate can review prose.
 
 ## One-shot run
