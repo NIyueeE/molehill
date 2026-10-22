@@ -1234,6 +1234,23 @@ def _check_comparability(c: Checker) -> None:
         len(analysis.comparability(meta(), meta(host_id="h2"))),
         1,
     )
+    # A declared treatment is not part of the method hash (a deliberate switch or
+    # a forced carrier has to stay visible as data), so the gate's reader has to
+    # refuse it by name: a forced-carrier record must never stand in as a
+    # default run's baseline.
+    forced = meta()
+    forced["molehill_switches"] = {"MOLEHILL_DATA_CARRIER": "tcp"}
+    blockers = analysis.comparability(meta(), forced)
+    c.check(
+        "a forced carrier is refused even when the method matches",
+        any("switch" in b for b in blockers),
+        str(blockers),
+    )
+    c.equal(
+        "the same switches compare",
+        analysis.comparability(forced, forced),
+        [],
+    )
     c.check(
         "a calibration drift beyond the tolerance is refused",
         bool(analysis.comparability(meta(calibration=100.0), meta(calibration=50.0))),

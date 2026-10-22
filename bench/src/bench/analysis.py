@@ -1085,7 +1085,34 @@ def comparability(meta_a: dict, meta_b: dict) -> list:
             blockers.append(f"{tag} is not a bench results file")
     if blockers:
         return blockers
-    return _method_blockers(meta_a, meta_b) + _host_blockers(meta_a, meta_b)
+    return (
+        _switch_blockers(meta_a, meta_b)
+        + _method_blockers(meta_a, meta_b)
+        + _host_blockers(meta_a, meta_b)
+    )
+
+
+def _switch_blockers(meta_a: dict, meta_b: dict) -> list:
+    """Different inherited switches are different subjects, not a method detail.
+
+    `molehill_switches` sits *beside* `method` on purpose — a declared treatment
+    is exactly what a between-file comparison contrasts, and the file has to say
+    it rather than hide it in a hash. But this function is the reader the gate
+    uses to decide whether one file may stand in as another's baseline, and a
+    forced carrier or a scheduled switch changes what the numbers *mean*, so two
+    runs whose switches differ are refused here even when their fingerprints
+    match (the fingerprint hashes `method`, which deliberately omits them).
+    """
+    switches_a = meta_a.get("molehill_switches") or {}
+    switches_b = meta_b.get("molehill_switches") or {}
+    if switches_a == switches_b:
+        return []
+    differing = [
+        f"{name}={switches_a.get(name, '-')} vs {switches_b.get(name, '-')}"
+        for name in sorted(set(switches_a) | set(switches_b))
+        if switches_a.get(name) != switches_b.get(name)
+    ]
+    return [f"different inherited switches: {', '.join(differing)}"]
 
 
 def _method_blockers(meta_a: dict, meta_b: dict) -> list:

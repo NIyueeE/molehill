@@ -1276,6 +1276,13 @@ your own host.
   disagrees beyond its tolerance (25 % for the CPU probe, 15 % for the loopback
   one; the same two probes the gate uses) — and a run with no A/A pair reports
   every between-file difference as `directional`, never as a claim.
+- **The `MOLEHILL_*` switches a run inherited are part of what its numbers
+  mean.** `MOLEHILL_DATA_CARRIER` and the scheduled-switch hatches are recorded
+  beside the method, not inside the fingerprint: a declared treatment is what a
+  comparison *contrasts*, and a hash must not hide it. Both the gate and
+  `just bench compare` therefore refuse two files whose switches differ — a
+  forced-carrier record is not a default run's baseline, even though its
+  fingerprint matches to the character.
 - **Within one campaign the arms are comparable by construction**: one
   topology, one backend, one binary per arm, one rotation, and a control in
   every round.

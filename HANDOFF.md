@@ -318,8 +318,8 @@
 ## Open threads for the next cycle
 
 - **Decided (2026-10-22): the data plane dials TCP first; KCP is its
-  fallback.** The measurement is in "Where this stands" (the A/B is +81 %
-  throughput, −64 % CPU per Gbit, −45 % p99 on the clean cell; the full stage
+  fallback.** The measurement is in "Where this stands" (the A/B is +77 %
+  throughput, −64 % CPU per Gbit, −69 % p99 on the clean cell; the full stage
   schedule did not reverse it). Three things about the shape are deliberate and
   must not be undone by accident:
   - the registration declares the client's **capability**, not its dial order
@@ -344,17 +344,17 @@
   AES-256-GCM is only ~1.4× ChaCha20-Poly1305 on this Haswell host (openssl
   speed: 2.40 against 1.70 GB/s), so it would buy little here and is a v5.3
   wire change either way.
-- **A forced carrier is invisible to the comparability gate (found
-  2026-10-22).** `MOLEHILL_DATA_CARRIER` is recorded in `meta.molehill_switches`
-  by design ("the reader decides; the file has to say"), but `fingerprint`
-  hashes `meta.method` alone — so the two screen runs above carry the *same*
-  fingerprint while measuring different subjects, and `analysis.comparability`,
-  which is what the gate uses to accept a baseline, compares fingerprints. A
-  forced-carrier record could therefore stand in as a release baseline for a
-  default run. Folding the switches into the fingerprint changes every future
-  record's method identity and so needs a method re-baseline in a release
-  ritual, not a drive-by edit; until then, read `meta.molehill_switches` before
-  comparing two files and never publish a sweep taken with one set.
+- **Closed (2026-10-22): a forced carrier is no longer invisible to the
+  comparability gate.** `MOLEHILL_DATA_CARRIER` (and the scheduled-switch
+  hatches) stay in `meta.molehill_switches`, beside the method rather than
+  inside the fingerprint — a declared treatment is what a comparison contrasts.
+  What was missing was the *reader*: `analysis.comparability` now refuses two
+  files whose switches differ (`_switch_blockers`), so the gate's
+  `_baseline` check and `just bench compare` both name it, and the model's
+  self-check asserts it (710 checks). This is deliberately *not* a fingerprint
+  change: folding the switches in would have re-identified every record ever
+  published and forced a method re-baseline in a release ritual, which the hole
+  did not warrant.
 - **Decision (2026-10-19): one top-level tunnel pool in both modes; the
   per-service/per-claim model is rejected, not renamed.** There is exactly one
   tunnel pool per control session (one per data endpoint), and every service
