@@ -284,8 +284,8 @@
     shape, so the key is removed (or kept as a no-op for one release — to be
     decided).
   - The proposed `default_tunnels` name no longer describes the key. With no
-    per-service inheritance it is the pool's width, not a default; the final
-    name is open (`tunnels` today).
+    per-service inheritance it is the pool's width, not a default; the name
+    stays `tunnels` (decided 2026-10-22, see the naming entry below).
   - The UDP-derived floor becomes the deepest demand across every UDP service
     that draws on the pool, and validation and runtime must read the same
     source; the first-service-width defect below disappears with the model.
@@ -327,24 +327,19 @@
   delivered locally. Both language pages need the extra steps, and a single-IP
   acceptance case would keep it from regressing. A documentation and
   acceptance gap, not a data-path defect.
-- **Naming decision pending: `[client.data].tunnels` vs `default_tunnels`
-  (raised 2026-10-19).** The key is the client-wide default for every service
-  that does not write its own `[client.services.<name>].tunnels`, which is
-  exactly what `default_token`, `default_remote_addr` and
-  `default_retry_interval` signal, so the unprefixed name reads as an
-  inconsistency. It is `tunnels` today because the per-service key has the same
-  name (the `default_` family is used where the child key is named
-  differently), and because 0.10 deliberately replaced `default_count` with
-  `tunnels` when the pool became pinned — the old "initial size" reading no
-  longer applied. Options: a sentence in the configuration page naming it the
-  default for services (cheap, preferred while the line is stabilizing), or a
-  rename to `default_tunnels` through the removed-keys migration (parser
-  refusal, the `githooks/check-docs` removed-key table, both language pages, an
-  invalid-config test and an `[Unreleased]` entry). A rename leaves the
-  per-service `tunnels` and `[transparent.data].tunnels` (a lane budget) alone.
-  Superseded (2026-10-19) by the one-pool decision above: with no per-service
-  inheritance the key is the pool's width, not a default, so `default_tunnels`
-  no longer describes it. The final name is open.
+- **Decision (2026-10-22): the key stays `[client.data].tunnels`; there is
+  no rename to `default_tunnels`.** The question was raised on 2026-10-19,
+  while the key was still the client-wide default for every service that did
+  not write its own `[client.services.<name>].tunnels` — the shape the
+  `default_token` / `default_remote_addr` / `default_retry_interval` family
+  names. The one-pool decision above removed the child key: the width belongs
+  to the session's pool, nothing inherits it, so `default_tunnels` would name
+  a relationship that no longer exists. Keeping `tunnels` also keeps 0.10's
+  deliberate replacement of `default_count` intact (the pinned pool ended the
+  "initial size" reading), avoids a removed-key migration for a name whose
+  meaning the configuration page already states, and leaves
+  `[transparent.data].tunnels` — a lane budget, a different quantity with its
+  own default — untouched. `[client.services.<name>].tunnels` stays removed.
 - **`shared_pool`'s width is decided by whichever service activates first
   (verified 2026-10-19).** With `[client.data].shared_pool = true`, the session
   pool is created by the first service to become active and uses *that
