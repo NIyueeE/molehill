@@ -30,7 +30,9 @@
 > **The v0.11.2 branch is merged and released (2026-10-20).** The tag names
 > the `chore(release)` commit `64d8ebc`; `main` carries it plus this record.
 > `[Unreleased]` is empty and the next cycle is not open yet. The merged
-> branch `feat/v0.11.2` can be retired.
+> branch `feat/v0.11.2` was retired locally and on `origin` on 2026-10-22;
+> the local `backup/v0.11.2-presquash` branch is the only non-`main` ref
+> left, and it is unmerged by design (the pre-squash history).
 >
 > **Operator decision (2026-10-19):** the maintainer's deployment stays on
 > forwarding (L4) until L3 is stable; the open threads record the gaps that
@@ -219,7 +221,10 @@
   `CHANGELOG.md` keeps the dated `## [0.11.2] - 2026-10-20` section and an
   empty `[Unreleased]`; the next cycle is not open yet. `v0.11.1` names
   `4874f05`, `v0.11.0` names `f3295e8`. The merged `feat/v0.11.2` branch
-  can be retired. The measured v0.11.2 revision is `69e8bd9` (`tree_clean`
+  was retired locally and on `origin` on 2026-10-22;
+  `backup/v0.11.2-presquash` (24 pre-squash commits, its tree superseded by
+  `main`) is the only local non-`main` branch left, kept as the squash's
+  recovery point. The measured v0.11.2 revision is `69e8bd9` (`tree_clean`
   true; the record commit is docs/assets only, so the tag review's drift check
   held). The previous cycle's branches
   (`feat/v0.11.1-builds`, `bench/v0.11.1-measured` and the four local
