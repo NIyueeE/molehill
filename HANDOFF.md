@@ -456,12 +456,14 @@
   support is implemented (Wintun + `wintun.dll` + route/forwarding recipe) but
   also needs a real-host acceptance run; that run is deferred for v0.11.1 (see
   the deferral note below).
-- **Deferred by operator decision for v0.11.1 (2026-10-18): macOS/Windows L3
-  real-host acceptance, the `tun-rs` screen A/B and the lending measurement.**
-  Linux `l3-accept` on both wire formats remains the only end-to-end L3
-  evidence; the macOS pf/utun and Windows Wintun/routing recipes are documented
-  but unvalidated on hardware. No tun-rs performance claim or lending claim is
-  made from this release. These are accepted gaps, not blockers.
+- **Deferred by operator decision (2026-10-18, re-affirmed 2026-10-22):
+  macOS/Windows L3 real-host acceptance, the `tun-rs` screen A/B and the
+  lending measurement.** Linux `l3-accept` on both wire formats remains the
+  only end-to-end L3 evidence; the macOS pf/utun and Windows Wintun/routing
+  recipes are documented but unvalidated on hardware. No tun-rs performance
+  claim or lending claim is made by any release so far. These are accepted
+  gaps, not blockers, and the next cycle does not pick them up unless the
+  operator asks: the 2026-10-22 decision was to leave them out of scope.
 - **The five test-only env-mutation `unsafe` blocks can be wrapped, but the
   trade was declined.** `temp-env` 0.3.6 (`async_closure`) makes
   `set_var`/`remove_var` scoped and safe at the call site; a worktree
