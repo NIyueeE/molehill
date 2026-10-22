@@ -317,43 +317,17 @@
 
 ## Open threads for the next cycle
 
-- **UDP GSO on the KCP sender was implemented, measured twice, and deferred to
-  the operator (2026-10-22).** The shape: a batch already arrives as one iovec
-  stream of equally sized segments, so a run of two or more equal datagrams can
-  leave in **one** `sendmsg` with `UDP_SEGMENT` set — the kernel builds one skb
-  and segments it at the destination — while a mixed batch, a lone datagram, or
-  a kernel/path that refuses GSO (`EINVAL`/`EMSGSIZE`/`EIO`/`EOPNOTSUPP`,
-  remembered for the process) keeps today's `sendmmsg`. Two measurements:
-  - the sender's own shape (loopback, 32 × 1472 B, receiver draining in the same
-    process): **0.153 s/Gbit with `sendmmsg`, 0.046 s/Gbit as one GSO
-    message** — 3.3×;
-  - the bench A/B on the forced-KCP carrier (`MOLEHILL_DATA_CARRIER=kcp`, six
-    rounds, the run's own A/A copy, `cost[clean]`), once uncapped and once
-    capped at eight segments per message:
-
-    | cell | no GSO | uncapped | cap 8 |
-    |---|---|---|---|
-    | throughput (Gbit/s) | 7.03 | 8.67 (+23 %) | 8.71 (+24 %) |
-    | cpu_s_per_gbit | 1.75 | 1.25 (−28 %) | 1.33 (−24 %) |
-    | rtt_p50 (ms) | 0.99 | 1.45 | 1.36 |
-    | rtt_p99 (ms) | 7.3 | 32.8 (4.5×) | 26.6 (4.8×) |
-    | peak RSS (MiB) | 84 | 213 (2.5×) | 193 (2.4×) |
-    | carried packet (KiB) | 1.3 | 20.0 | 8.8 |
-
-  Every round agreed on the CPU and throughput gain (p 0.031 against an alpha of
-  0.05, the run's own floors 0.3 % and 0.7 %), and every round agreed on the
-  tail and the memory going the other way. Capping the message at eight
-  segments did **not** remove either regression, so the obvious
-  bufferbloat-shaped explanation is incomplete: a GSO message is one skb and
-  the bench path's queue is counted in *slots*, which inflates the bytes a
-  queue can hold (the 20 KiB "packet" above is the GSO skb itself) — plausible
-  for the tail, and no explanation at all for the RSS. **Not shipped**: KCP is
-  now the fallback carrier, so this buys efficiency on the path most
-  deployments do not take while moving a headline latency metric on the one
-  they do, and the operator's call is a shaped-path campaign (`loss1` at
-  least) plus a mechanism for the memory half. The patch is one function in
-  `src/transport/udp_batch.rs` plus a capability flag and two unit tests; it
-  was reverted rather than left half-argued.
+- **The carrier policy is going peer-level (2026-10-22, in progress), and the
+  first instrument is in.** The operator's direction: TCP and KCP are peers, and
+  the pool should pick per path instead of shipping a fixed order. The signal
+  both carriers can produce is the **tunnel connection's own RTT**
+  (`Connection::rtt` → `TunnelCounters::rtt` → `PoolSnapshot::rtt`, in the
+  pool-stats snapshot): on TCP it is the kernel's, on KCP it also carries the
+  ARQ's queueing, so a carrier whose backlog grows shows up in it whatever the
+  cause. The rest of the design — equal-opportunity placement across carriers so
+  the offered load is comparable, a per-window per-carrier verdict, and the
+  existing `prefer`/`begin_handover` machinery under the 120 s hold — is the
+  next commit, and the window-sizing question above is its first input.
 - **Decided (2026-10-22): the data plane dials TCP first; KCP is its
   fallback.** The measurement is in "Where this stands" (the A/B is +77 %
   throughput, −64 % CPU per Gbit, −69 % p99 on the clean cell; the full stage

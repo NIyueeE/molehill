@@ -92,6 +92,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
         }
     }
 
+    /// The connection's own round-trip estimate, as its pings measure it.
+    ///
+    /// This is the **carrier's** view of the path, and the one latency signal
+    /// both carriers can produce: on a TCP tunnel it is the kernel's RTT, and on
+    /// a KCP one it also carries the ARQ's own queueing — which is exactly what
+    /// a policy comparing the two carriers has to see.
+    #[must_use]
+    pub fn rtt(&self) -> Option<std::time::Duration> {
+        match &self.inner {
+            ConnectionState::Active(active) => active.rtt.get(),
+            _ => None,
+        }
+    }
+
     /// Poll for a new outbound stream.
     ///
     /// This function will fail if the current state does not allow opening new outbound streams.

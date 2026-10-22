@@ -195,6 +195,14 @@ pub(crate) struct TunnelCounters {
     delivered: std::sync::atomic::AtomicU64,
     /// Bytes the forwarding code handed to this tunnel's streams.
     written: std::sync::atomic::AtomicU64,
+    /// The tunnel connection's own round-trip estimate, in microseconds, as its
+    /// yamux pings measure it; `0` until the first pong.
+    ///
+    /// This is the one latency signal both carriers produce, which is what a
+    /// policy that treats TCP and KCP as peers needs: on TCP it is the kernel's
+    /// RTT, on KCP it also carries the ARQ's queueing, so a carrier whose
+    /// backlog is growing shows up here whatever the reason.
+    rtt_us: std::sync::atomic::AtomicU32,
     /// The KCP session's own ARQ counters, when this tunnel rides KCP (see
     /// [`crate::transport::health::SessionHealth`]): the retransmit share of the pair is
     /// the per-tunnel signal a carrier policy judges. `None` on a TCP tunnel
@@ -236,9 +244,25 @@ impl TunnelCounters {
             pending: std::sync::atomic::AtomicUsize::new(0),
             delivered: std::sync::atomic::AtomicU64::new(0),
             written: std::sync::atomic::AtomicU64::new(0),
+            rtt_us: std::sync::atomic::AtomicU32::new(0),
             health,
             peer: std::sync::Mutex::new(PeerHealth::default()),
         })
+    }
+
+    /// This tunnel's carrier round-trip estimate, or `None` before the first
+    /// ping's pong (and on a connection that never gets one).
+    pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
+        match self.rtt_us.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            us => Some(std::time::Duration::from_micros(u64::from(us))),
+        }
+    }
+
+    /// Record the driver's latest round-trip estimate (`None` clears it).
+    pub(crate) fn note_rtt(&self, rtt: Option<std::time::Duration>) {
+        let us = rtt.map_or(0, |d| u32::try_from(d.as_micros()).unwrap_or(u32::MAX));
+        self.rtt_us.store(us, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bytes this end delivered off the tunnel to the forwarding code.
@@ -471,6 +495,11 @@ pub struct PoolSnapshot {
     /// degradation signal: a healthy session re-sends ~nothing, a carrier
     /// losing its traffic re-sends segments by the thousands (S1, round 37).
     pub kcp_health: Vec<Option<(u64, u64)>>,
+    /// Per-tunnel round-trip estimate, in the same order: the **carrier's own**
+    /// view of the path, which is the one latency signal every carrier
+    /// produces (on TCP the kernel's, on KCP the ARQ's, queueing included).
+    /// `None` before the connection's first ping has answered.
+    pub rtt: Vec<Option<std::time::Duration>>,
     /// Whether each entry in `tunnels` accepts new streams.
     pub draining: Vec<bool>,
     /// Active handover as `(old tunnel id, target carrier, phase)`.
@@ -1772,6 +1801,7 @@ impl TunnelPool {
             tunnels: Vec::new(),
             bytes: Vec::new(),
             kcp_health: Vec::new(),
+            rtt: Vec::new(),
             draining: Vec::new(),
             handover: None,
         })
@@ -1814,6 +1844,11 @@ impl TunnelPool {
                 .entries
                 .iter()
                 .map(|e| e.tunnel.counters.health_counts())
+                .collect(),
+            rtt: state
+                .entries
+                .iter()
+                .map(|e| e.tunnel.counters.rtt())
                 .collect(),
             draining: state
                 .entries
@@ -3245,8 +3280,13 @@ impl ClientTunnel {
 
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let guard = AliveGuard(std::sync::Arc::clone(&alive));
+        // The bookkeeping is created before the driver so the driver can keep the
+        // carrier's own round-trip estimate on it: it is the one latency signal
+        // every carrier produces, and the link a policy comparing carriers reads.
+        let counters = TunnelCounters::with_health(health);
 
         spawn_framing_stats();
+        let driver_counters = std::sync::Arc::clone(&counters);
         tokio::spawn(async move {
             let _guard = guard;
             let mut conn = Connection::new(io, config, Mode::Client);
@@ -3346,12 +3386,16 @@ impl ClientTunnel {
                         }
                     }
                 }
+                // Every wake-up is a chance to refresh the carrier's own RTT
+                // estimate: one relaxed store per frame batch is nothing, and a
+                // stale value would make a carrier look healthier than it is.
+                driver_counters.note_rtt(conn.rtt());
             }
         });
 
         ClientTunnel {
             id: next_tunnel_id(),
-            counters: TunnelCounters::with_health(health),
+            counters,
             alive,
             open_tx,
         }
@@ -3399,6 +3443,23 @@ mod tests {
     )]
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A tunnel's carrier RTT is absent until the driver measures one, and then
+    /// reads back what it stored — the value a peer-level carrier policy compares
+    /// across carriers.
+    #[test]
+    fn a_tunnels_carrier_rtt_is_reported_once_it_is_measured() {
+        let counters = TunnelCounters::with_health(None);
+        assert_eq!(counters.rtt(), None, "no pong yet is not a zero RTT");
+        counters.note_rtt(Some(std::time::Duration::from_millis(37)));
+        assert_eq!(counters.rtt(), Some(std::time::Duration::from_millis(37)));
+        counters.note_rtt(None);
+        assert_eq!(
+            counters.rtt(),
+            None,
+            "a cleared estimate reads as absent again"
+        );
+    }
 
     /// The carrier rule's verdict: a tunnel that delivered a fraction of what
     /// the peer handed it is named; a merely lossy-but-delivering window is not
