@@ -193,11 +193,14 @@ is the voice contract for writing it.
   dialect's release is still in development its commands may be extended **in
   place** under that number; once the tag exists, the next change is the next
   number. The line so far: 0.6 v1, 0.7 v2, 0.8–0.9 v3, 0.10 v4, 0.11.0 v5.0,
-  0.11.1 v5.1 — each read off its tag's `CURRENT_PROTO_VERSION`. v5.0 is
-  tagged, so its commands are fixed. v5.1 deliberately breaks the v5.0 wire in
-  a patch release (the two-byte version and the transparent frame-format
-  negotiation); `5.1` is a dialect label, not a SemVer-compatible minor. The
-  next wire change is 5.2; a redesign would be 6.0.
+  0.11.1 v5.1, 0.11.2 v5.2 — each read off its tag's
+  `CURRENT_PROTO_VERSION`. Every tagged dialect's commands are fixed. v5.1
+  deliberately breaks the v5.0 wire in a patch release (the two-byte version
+  and the transparent frame-format negotiation); `5.1` is a dialect label, not
+  a SemVer-compatible minor. v5.2 makes the striped command the only TCP
+  forward (`StartForwardTcp` and `[server.data].stripe_count` are gone) and
+  carries `max_udp_workers` in the registration. The next wire change is 5.3;
+  a redesign would be 6.0.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -466,7 +469,7 @@ pointers, not copies:
 - **Tests are serial** (`--test-threads=1`): integration tests spawn real
   server/client pairs on fixed ports. `cargo run -- server.toml|client.toml`;
   `cargo run -- --genkey` (noise keypair).
-- **Protocol**: v5.1, one control session per endpoint; the rule and the
+- **Protocol**: v5.2, one control session per endpoint; the rule and the
   release line are §5, the wire and the forwarding design are
   [docs/internals.md](docs/internals.md).
 - **Build profiles** (`release` with lto/strip/panic=abort, `minimal` at

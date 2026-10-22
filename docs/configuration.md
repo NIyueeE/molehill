@@ -1067,7 +1067,7 @@ the peer's public key beside your private key.
 |---|---|
 | `Server rejected service <name>: Port N rejected ... allow_ports` | The requested `remote_bind_addr` port is not whitelisted on the server, or the server has dynamic registration disabled. Fix `allow_ports`. |
 | `Port N is already in use` | Another service (or another program) holds that port on the server. Pick a different `remote_bind_addr` port. |
-| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5.1 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1), so an older client *or* an older server gets this; upgrade both ends together. |
+| `Protocol version mismatched ... Please update` | One side runs a molehill that does not speak protocol v5.2 (0.10 serves v4, 0.11.0 serves v5.0, 0.11.1 serves v5.1, 0.11.2 serves v5.2), so an older client *or* an older server gets this; upgrade both ends together. |
 | The client stops with `protocol v5.2` after a server's hello never arrives | The server is older than this build: it reads the version, fails its own check and closes that connection. Upgrade the server. |
 | `Authentication failed` on the client | `default_token` differs between client and server. |
 | `Failed to connect to <addr>: Connection refused` | Server not running, wrong `client.control.default_remote_addr` port, or `server.control.bind_addr` not reachable. |
