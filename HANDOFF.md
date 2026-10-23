@@ -649,6 +649,10 @@
   near 6.0 or near 7.9 whichever build runs — so its own floor is 16.4 % and it
   resolves nothing. The record says that rather than reading 0.8 % as a win: at
   3 rounds the cell would need ~11 to resolve its own scatter.
+  **Tooling note, paid for twice:** `just bench run` re-splits its arguments, so
+  `--hypothesis` must be one token — a value with spaces arrives as loose
+  arguments, and one with an apostrophe breaks the recipe's shell line before the
+  tool sees it.
   What the pair does say: the refactor added no throughput the harness can
   resolve, and one `Box` plus one dynamic dispatch per open are invisible next to
   a 12 Gbit/s copy path. This is a stage-profile spot check, not the release
