@@ -417,16 +417,13 @@ pub fn first_carrier() -> Carrier {
 /// The blanket impl means each carrier's own stream type goes in untouched:
 /// above this line nothing names yamux or QUIC, which is what makes the two
 /// carriers interchangeable.
-#[cfg(feature = "quic")]
 pub(crate) trait CarrierIo:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
 {
 }
-#[cfg(feature = "quic")]
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> CarrierIo for T {}
 
 /// One stream, whichever carrier produced it.
-#[cfg(feature = "quic")]
 pub(crate) type CarrierStream = Box<dyn CarrierIo>;
 
 /// Why a carrier could not produce a stream.

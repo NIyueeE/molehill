@@ -30,7 +30,7 @@ use tracing::{debug, info};
 use yamux::{Config, Connection, Mode};
 
 /// A multiplexed stream adapted to tokio's IO traits.
-pub type MuxStream = yamux::Stream;
+pub type MuxStream = super::carrier::CarrierStream;
 
 /// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
@@ -162,7 +162,7 @@ where
         match result {
             Ok(stream) => {
                 debug!("server tunnel accepted an inbound stream");
-                if tx.send(stream).await.is_err() {
+                if tx.send(Box::new(stream)).await.is_err() {
                     break;
                 }
             }
@@ -3604,7 +3604,7 @@ impl ClientTunnel {
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                                             Some(SynAnnounce {
-                                                stream: Some(stream),
+                                                stream: Some(Box::new(stream)),
                                                 reply: Some(reply),
                                             });
                                     }
@@ -3668,7 +3668,7 @@ impl ClientTunnel {
     }
 
     /// Open a new data channel as a multiplexed stream.
-    pub async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
+    pub(crate) async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
         let (tx, rx) = oneshot::channel();
         self.open_tx
             .send(tx)

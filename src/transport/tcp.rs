@@ -119,7 +119,7 @@ impl super::carrier::CarrierConn for MuxConn {
         &self,
     ) -> Result<super::carrier::CarrierStream, super::carrier::StreamError> {
         match self.tunnel.open_stream().await {
-            Ok(stream) => Ok(Box::new(stream)),
+            Ok(stream) => Ok(stream),
             Err(crate::transport::tcp::mux::ConnectionError::TooManyStreams) => {
                 Err(super::carrier::StreamError::Busy)
             }
