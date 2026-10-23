@@ -505,7 +505,11 @@ struct ServerShared {
     noise_keys: Option<NoiseKeys>,
     #[cfg(feature = "kcp")]
     kcp: Arc<KcpListenerState>,
-    #[cfg(feature = "kcp")]
+    /// The lazily-bound UDP carrier endpoint: same client-first rule as the KCP
+    /// acceptor above, so a server that never sees that client binds nothing.
+    #[cfg(feature = "quic")]
+    quic: Arc<UdpListenerState>,
+    #[cfg(any(feature = "kcp", feature = "quic"))]
     shutdown_tx: broadcast::Sender<bool>,
 }
 
@@ -570,6 +574,127 @@ async fn ensure_kcp_listener(
     Ok(())
 }
 
+/// Shared state for the lazily-bound UDP carrier endpoint: bound on the first
+/// registration that declares that carrier, once per server process, held weakly
+/// here because the listener task keeps the only strong handle.
+#[cfg(feature = "quic")]
+struct UdpListenerState {
+    endpoint:
+        tokio::sync::Mutex<Option<std::sync::Weak<crate::transport::quic::socket::EndpointHandle>>>,
+}
+
+#[cfg(feature = "quic")]
+impl Default for UdpListenerState {
+    fn default() -> Self {
+        Self {
+            endpoint: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// Ensure the UDP carrier's endpoint is bound.
+///
+/// A bind failure is a precise registration rejection, not a startup failure:
+/// the same client-first rule the KCP listener follows.
+#[cfg(feature = "quic")]
+async fn ensure_udp_listener(
+    shared: Arc<ServerShared>,
+    registry: Arc<Registry>,
+    server_config: Arc<ServerConfig>,
+) -> Result<()> {
+    let mut guard = shared.quic.endpoint.lock().await;
+    if guard.as_ref().is_some_and(|weak| weak.strong_count() > 0) {
+        return Ok(());
+    }
+    let keys = shared.noise_keys.clone().ok_or_else(|| {
+        anyhow!(
+            "The UDP carrier authenticates with the server's Noise keys, and this binary has none"
+        )
+    })?;
+    let socket = tokio::net::UdpSocket::bind(server_config.data_bind_addr())
+        .await
+        .with_context(|| "Failed to bind the UDP carrier's data listener")?;
+    let bound = socket.local_addr().with_context(|| {
+        format!(
+            "Failed to read the UDP carrier's socket address at {}",
+            server_config.data_bind_addr()
+        )
+    })?;
+    info!("Listening for UDP carrier connections at {bound}");
+    let (endpoint, streams) = crate::transport::quic::channel::spawn_server(socket, keys);
+    *guard = Some(std::sync::Arc::downgrade(&endpoint));
+    drop(guard);
+    let mut shutdown_rx = shared.shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        // The strong handle lives here: when this task ends, the socket does.
+        let _endpoint = endpoint;
+        tokio::select! {
+            _ = shutdown_rx.recv() => {}
+            _ = run_udp_listener(streams, registry, shared) => {}
+        }
+    });
+    Ok(())
+}
+
+/// Accept direct channels from the UDP carrier.
+///
+/// A direct channel is one connection carrying one stream, so this loop's whole
+/// job is to hand each accepted stream to the same prologue the other carriers
+/// read. Pool tunnels over this carrier are the next step, not this one.
+#[cfg(feature = "quic")]
+async fn run_udp_listener(
+    mut streams: tokio::sync::mpsc::UnboundedReceiver<crate::transport::quic::conn::QuicStream>,
+    registry: Arc<Registry>,
+    shared: Arc<ServerShared>,
+) {
+    while let Some(stream) = streams.recv().await {
+        let registry = Arc::clone(&registry);
+        let shared = Arc::clone(&shared);
+        tokio::spawn(async move {
+            if let Err(e) = handle_udp_stream(stream, registry, shared).await {
+                debug!("UDP carrier channel ended: {e:#}");
+            }
+        });
+    }
+    debug!("UDP carrier listener stopped");
+}
+
+/// Read one direct channel's hello and hand it to the service.
+///
+/// No selector is read here: the stream already applied its own record layer
+/// when the service asked for one, because the selector and the per-stream keys
+/// are the stream's own business (see the quic module's conn).
+#[cfg(feature = "quic")]
+async fn handle_udp_stream(
+    mut io: crate::transport::quic::conn::QuicStream,
+    registry: Arc<Registry>,
+    shared: Arc<ServerShared>,
+) -> Result<()> {
+    let _ = &shared;
+    let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
+    let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
+        .await
+        .with_context(|| "UDP carrier hello timed out")??;
+    match hello {
+        Hello::DataChannelHello(_, nonce) => {
+            let service_id = read_stream_prologue(&mut io).await?;
+            do_v4_data_channel(
+                DataChannel::RawUdp(Box::new(io)),
+                registry,
+                nonce,
+                service_id,
+            )
+            .await
+        }
+        other @ Hello::DataChannelTunnelHello(..) => {
+            bail!("A pool tunnel is not carried by the UDP carrier yet, and this one asked for it")
+        }
+        other @ Hello::ControlChannelHello(..) => {
+            bail!("Expected a data-plane hello on the UDP carrier, got {other:?}")
+        }
+    }
+}
+
 // Server holds all states of running a server
 struct Server {
     // `[server]` config
@@ -592,6 +717,8 @@ impl Server {
         )?);
         #[cfg(feature = "kcp")]
         let kcp = Arc::new(KcpListenerState::default());
+        #[cfg(feature = "quic")]
+        let quic = Arc::new(UdpListenerState::default());
         #[cfg(feature = "noise")]
         let noise_keys = Some(NoiseKeys::from_config(&config.noise)?);
         let max_tunnels = config.max_tunnels();
@@ -605,6 +732,8 @@ impl Server {
             noise_keys,
             #[cfg(feature = "kcp")]
             kcp,
+            #[cfg(feature = "quic")]
+            quic,
             #[cfg(feature = "kcp")]
             shutdown_tx: broadcast::channel(1).0,
         });
@@ -944,15 +1073,37 @@ async fn register_service(
     // listener on first use (client-first — no config-side opt-in), and a
     // failure is a precise rejection, like `allow_ports`.
     if reg.carrier == Carrier::Kcp {
-        #[cfg(feature = "kcp")]
+        #[cfg(feature = "quic")]
+        let result = ensure_udp_listener(
+            Arc::clone(shared),
+            Arc::clone(registry),
+            Arc::clone(server_config),
+        )
+        .await;
+        // A build with both carriers keeps the KCP listener alive for the pool
+        // path, which still rides it until the flip; the direct channels take the
+        // UDP one. A build with `quic` alone never builds the pool path.
+        #[cfg(all(feature = "kcp", feature = "quic"))]
+        let result = match result {
+            Ok(()) => {
+                ensure_kcp_listener(
+                    Arc::clone(shared),
+                    Arc::clone(registry),
+                    Arc::clone(server_config),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        #[cfg(all(feature = "kcp", not(feature = "quic")))]
         let result = ensure_kcp_listener(
             Arc::clone(shared),
             Arc::clone(registry),
             Arc::clone(server_config),
         )
         .await;
-        #[cfg(not(feature = "kcp"))]
-        let result: Result<()> = Err(anyhow!("This server was built without the `kcp` feature"));
+        #[cfg(not(any(feature = "kcp", feature = "quic")))]
+        let result: Result<()> = Err(anyhow!("This server was built without a UDP carrier"));
         if let Err(e) = result {
             let reason = format!("{e:#}");
             warn!(service = %reg.name, "Registration failed: {reason}");
@@ -1535,6 +1686,11 @@ enum DataChannel {
     /// multiplexer over it.
     #[cfg(feature = "kcp")]
     RawKcp(crate::transport::kcp::KcpTunnelStream),
+    /// A direct channel over the UDP carrier: the QUIC stream *is* the channel,
+    /// and the record layer, when the service asked for one, is already inside
+    /// it (the selector and the per-stream keys are the stream's own business).
+    #[cfg(feature = "quic")]
+    RawUdp(Box<dyn crate::transport::carrier::CarrierIo>),
     Mux(crate::transport::MuxStream),
 }
 
@@ -1560,6 +1716,8 @@ impl tokio::io::AsyncRead for DataChannel {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "kcp")]
             DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
+            DataChannel::RawUdp(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -1576,6 +1734,8 @@ impl tokio::io::AsyncWrite for DataChannel {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "kcp")]
             DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
+            DataChannel::RawUdp(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -1587,6 +1747,8 @@ impl tokio::io::AsyncWrite for DataChannel {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_flush(cx),
             #[cfg(feature = "kcp")]
             DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "quic")]
+            DataChannel::RawUdp(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
@@ -1598,6 +1760,8 @@ impl tokio::io::AsyncWrite for DataChannel {
             DataChannel::Raw(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "kcp")]
             DataChannel::RawKcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
+            DataChannel::RawUdp(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
             DataChannel::Mux(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }

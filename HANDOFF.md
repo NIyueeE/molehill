@@ -532,6 +532,19 @@
   that simulated a carrier (a pool labelled `kcp` over loopback yamux sessions)
   made the two disagree: the snapshot column is the pool's record, and the trait
   does not repeat it.
+- **A lane can ride the UDP carrier (2026-10-23, wired, not yet measured).** A
+  direct channel is one connection carrying one stream, so it is the first place
+  the UDP carrier can stand in for KCP: `connect_udp_carrier` dials a QUIC
+  connection with the service's own Noise pair (the data port keeps an identity
+  whether or not `data_enable` puts the record layer above it), and the server
+  accepts that stream on the endpoint it binds under the same client-first rule the
+  KCP listener follows. A build keeps exactly one implementation per carrier slot:
+  `quic` takes the direct path and leaves KCP the pool, a build without it
+  keeps KCP for both. A tunnel hello on that listener is refused rather than
+  half-served: a pool tunnel is one connection carrying many streams, which is the
+  next step. **The proof is still owed** — both suites are green (310 default, 325
+  with `quic`) but nothing yet drives a lane end to end, so this is wiring and
+  the carrier run (step 3) is what measures it.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;

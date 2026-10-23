@@ -17,10 +17,11 @@
 //! goes as it is. What that costs is written down in `docs/transport.md`
 //! ("The UDP carrier") and in `docs/internals.md`.
 
-mod conn;
+pub(crate) mod channel;
+pub(crate) mod conn;
 mod crypto;
 mod driver;
 mod record;
 mod seam;
-mod session;
-mod socket;
+pub(crate) mod session;
+pub(crate) mod socket;

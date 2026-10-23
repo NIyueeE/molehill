@@ -103,8 +103,13 @@ struct DataOpts {
     tunnels: usize,
     /// Noise key config, `Some` iff the control transport is `noise`; KCP
     /// tunnels wrap it on top (the crypto stack is kept).
-    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    #[cfg(all(feature = "multiplex", feature = "noise"))]
     noise: Option<NoiseConfig>,
+    /// The service's Noise key **pair**, always present when the deployment has
+    /// one: the UDP carrier's own handshake authenticates the data port whether or
+    /// not the record layer above it is on.
+    #[cfg(all(feature = "quic", feature = "noise"))]
+    identity: NoiseConfig,
 }
 
 /// Placeholder so the channel-opening code keeps one shape without the
@@ -141,6 +146,10 @@ enum ClientStream {
     Noise(Box<crate::transport::NoiseStream<TcpStream>>),
     #[cfg(feature = "kcp")]
     Kcp(crate::transport::kcp::KcpTunnelStream),
+    /// A direct channel on the UDP carrier: one QUIC connection, one stream,
+    /// and the endpoint that carries them (see `transport::quic::channel`).
+    #[cfg(feature = "quic")]
+    Udp(crate::transport::quic::channel::UdpChannel),
 }
 
 impl std::fmt::Debug for ClientStream {
@@ -151,6 +160,8 @@ impl std::fmt::Debug for ClientStream {
             ClientStream::Noise(_) => f.debug_tuple("Noise").finish(),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(s) => f.debug_tuple("Kcp").field(s).finish(),
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(_) => f.debug_tuple("Udp").finish(),
         }
     }
 }
@@ -168,6 +179,8 @@ impl ClientStream {
             ClientStream::Noise(s) => opts.apply(s.get_inner()),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(_) => {}
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(_) => {}
         }
     }
 }
@@ -184,6 +197,8 @@ impl tokio::io::AsyncRead for ClientStream {
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -200,6 +215,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -212,6 +229,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_flush(cx),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -224,6 +243,8 @@ impl tokio::io::AsyncWrite for ClientStream {
             ClientStream::Noise(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "kcp")]
             ClientStream::Kcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "quic")]
+            ClientStream::Udp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -320,10 +341,12 @@ impl DataOpts {
             addr: s.endpoint_with(c.data_addr()).to_owned(),
             #[cfg(feature = "multiplex")]
             tunnels: c.tunnels(),
-            #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+            #[cfg(all(feature = "multiplex", feature = "noise"))]
             noise: s
                 .data_enabled_with(c.noise.data_enable.unwrap_or(true))
                 .then(|| ClientTransport::noise_keys(c, s)),
+            #[cfg(all(feature = "quic", feature = "noise"))]
+            identity: ClientTransport::noise_keys(c, s),
         }
     }
 }
@@ -935,8 +958,17 @@ struct RunDataChannelArgs {
     /// The service's Noise keys, when its control transport is `noise`: a KCP
     /// data channel carries the same record stream a TCP one does, so it is
     /// wrapped under exactly the same rule.
-    #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+    #[cfg(all(feature = "multiplex", feature = "noise"))]
     noise: Option<NoiseConfig>,
+    /// The service's key **pair**, always present when the deployment has one.
+    ///
+    /// Not the same thing as `noise` above: that is the record-layer switch, and
+    /// the UDP carrier's own handshake runs whatever it says. The identity is
+    /// what gives the data port a name — a connection that cannot complete KK
+    /// never becomes a channel — so it is read from the control stack, which is
+    /// Noise by construction.
+    #[cfg(all(feature = "quic", feature = "noise"))]
+    identity: Option<NoiseConfig>,
     /// Stripe-group registry of the service session: stripes of one
     /// visitor connection arrive as independent data channels and park
     /// here until the group is complete (see [`crate::stripe`]).
@@ -1146,7 +1178,18 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
     // going nowhere, so the fallback turns that into a delay on this channel
     // rather than a data plane that never comes up. TCP, the first carrier,
     // never enters this block.
-    #[cfg(all(feature = "multiplex", feature = "kcp"))]
+    // The UDP carrier. A lane is one connection carrying one stream, and the
+    // handshake that names the data port is the same KK pair the control channel
+    // uses: data_enable decides whether the stream carries the record layer, never
+    // whether the connection is authenticated. A build with quic takes this
+    // branch; a build without it keeps the KCP implementation in the same carrier
+    // slot, so the two never race for it.
+    #[cfg(all(feature = "quic", feature = "noise"))]
+    if args.carrier.preferred() == Carrier::Kcp {
+        return connect_udp_carrier(args).await;
+    }
+
+    #[cfg(all(feature = "multiplex", feature = "kcp", not(feature = "quic")))]
     if args.carrier.preferred() == Carrier::Kcp {
         let remote_addr = {
             let mut probe = args.remote_addr.clone();
@@ -1218,6 +1261,58 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
     #[cfg(any(feature = "multiplex", mh_l3_client))]
     args.carrier.succeeded(Carrier::Tcp);
     Ok(conn)
+}
+
+/// Dial one direct channel through the UDP carrier.
+///
+/// Split out of connect_direct_channel so each carrier keeps its own
+/// bookkeeping and both bodies fit the lint room.
+#[cfg(all(feature = "quic", feature = "noise"))]
+async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<ClientStream> {
+    let remote_addr = {
+        let mut probe = args.remote_addr.clone();
+        probe
+            .resolve()
+            .await
+            .with_context(|| format!("Failed to resolve the data endpoint {}", probe.addr))?;
+        probe
+            .socket_addr
+            .ok_or_else(|| anyhow!("The data endpoint {} resolved to nothing", probe.addr))?
+    };
+    let identity = args
+        .identity
+        .as_ref()
+        .ok_or_else(|| anyhow!("The UDP carrier has no Noise identity for this service"))?;
+    let keys = crate::transport::NoiseKeys::from_config(identity)?;
+    match tokio::time::timeout(
+        KCP_ATTEMPT_BUDGET,
+        crate::transport::quic::channel::connect(remote_addr, keys, args.noise.is_some()),
+    )
+    .await
+    {
+        Ok(Ok(channel)) => {
+            args.carrier.succeeded(Carrier::Kcp);
+            return Ok(ClientStream::Udp(channel));
+        }
+        Ok(Err(e)) => {
+            if args
+                .carrier
+                .failed(Carrier::Kcp, &format!("{e:#}"))
+                .is_none()
+            {
+                return Err(e).context("the UDP carrier failed and the carrier is forced");
+            }
+        }
+        Err(_) => {
+            if args
+                .carrier
+                .failed(Carrier::Kcp, "the UDP carrier did not come up in time")
+                .is_none()
+            {
+                bail!("the UDP carrier did not come up in time, and the carrier is forced");
+            }
+        }
+    }
 }
 
 async fn do_data_channel_handshake(
@@ -4567,8 +4662,10 @@ impl ClientSession {
                 socket_opts: SocketOpts::for_service(),
                 service: slot.service.clone(),
                 udp: build_udp_hub(&slot.service, pins),
-                #[cfg(all(feature = "multiplex", feature = "kcp", feature = "noise"))]
+                #[cfg(all(feature = "multiplex", feature = "noise"))]
                 noise: slot.data.noise.clone(),
+                #[cfg(all(feature = "quic", feature = "noise"))]
+                identity: Some(slot.data.identity.clone()),
                 #[cfg(feature = "multiplex")]
                 channels: std::sync::atomic::AtomicU64::new(0),
                 stripes: Arc::new(crate::stripe::StripeGroups::new()),
