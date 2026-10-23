@@ -22,6 +22,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::conn::{self, QuicStream};
 use super::driver::Driver;
+use super::session::HandshakeData;
 
 /// A command from the carrier's async surface into the task.
 enum Command {
@@ -32,6 +33,9 @@ enum Command {
     },
     OpenStream {
         connection: ConnectionHandle,
+        /// Whether the stream carries the record layer, i.e. the service's
+        /// data_enable.
+        encrypt: bool,
         reply: oneshot::Sender<std::io::Result<QuicStream>>,
     },
 }
@@ -81,10 +85,18 @@ impl EndpointHandle {
     /// # Errors
     ///
     /// Fails when the peer's stream limit is exhausted, or the task is gone.
-    pub(crate) async fn open_stream(&self, connection: ConnectionHandle) -> Result<QuicStream> {
+    pub(crate) async fn open_stream(
+        &self,
+        connection: ConnectionHandle,
+        encrypt: bool,
+    ) -> Result<QuicStream> {
         let (reply, answer) = oneshot::channel();
         self.commands
-            .send(Command::OpenStream { connection, reply })
+            .send(Command::OpenStream {
+                connection,
+                encrypt,
+                reply,
+            })
             .await
             .map_err(|_| anyhow!("the endpoint task is gone"))?;
         answer
@@ -135,9 +147,13 @@ async fn run(
                             .map_err(|error| format!("{error}"));
                         let _ = reply.send(outcome);
                     }
-                    Command::OpenStream { connection, reply } => {
+                    Command::OpenStream {
+                        connection,
+                        encrypt,
+                        reply,
+                    } => {
                         let outcome = match driver.shared(connection) {
-                            Some(shared) => conn::open(&shared),
+                            Some(shared) => conn::open(&shared, encrypt),
                             None => Err(std::io::Error::new(
                                 std::io::ErrorKind::NotConnected,
                                 "the connection is gone",
@@ -224,6 +240,22 @@ async fn drain(socket: &UdpSocket, driver: &mut Driver, channels: &Channels) -> 
                 ) => {
                     if let Some(shared) = driver.shared(handle) {
                         shared.wake(*id);
+                    }
+                }
+                Event::HandshakeDataReady => {
+                    // The record layer derives from the handshake hash, and
+                    // this is the event that says it exists.
+                    if let Some(shared) = driver.shared(handle) {
+                        let hash = shared
+                            .connection
+                            .lock()
+                            .crypto_session()
+                            .handshake_data()
+                            .and_then(|data| data.downcast::<HandshakeData>().ok())
+                            .map(|data| data.hash.clone());
+                        if let Some(hash) = hash {
+                            shared.set_hash(hash);
+                        }
                     }
                 }
                 Event::ConnectionLost { .. } => {
@@ -359,39 +391,45 @@ mod tests {
             }
         }
 
-        // A stream, both ways: what the carrier's seam hands the pool.
+        // Both protection classes, one connection: the selector byte is what
+        // tells the accepting side which one a stream carries.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut client_stream = client.open_stream(handle).await.expect("a client stream");
-        client_stream
-            .write_all(b"the visitor's bytes")
-            .await
-            .expect("the client writes");
-        client_stream.flush().await.expect("the client flushes");
+        for (encrypt, payload) in [(false, &b"plain bytes"[..]), (true, &b"sealed bytes"[..])] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut client_stream = client
+                .open_stream(handle, encrypt)
+                .await
+                .expect("a client stream");
+            client_stream
+                .write_all(payload)
+                .await
+                .expect("the client writes");
+            client_stream.flush().await.expect("the client flushes");
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut server_stream = tokio::time::timeout_at(deadline, server_streams_rx.recv())
-            .await
-            .expect("the stream arrives")
-            .expect("the server task stopped");
+            let mut server_stream = tokio::time::timeout_at(deadline, server_streams_rx.recv())
+                .await
+                .expect("the stream arrives")
+                .expect("the server task stopped");
 
-        let mut payload = [0u8; 32];
-        let read = tokio::time::timeout_at(deadline, server_stream.read(&mut payload))
-            .await
-            .expect("the server reads")
-            .expect("the read succeeds");
-        assert_eq!(&payload[..read], b"the visitor's bytes");
+            let mut seen = [0u8; 32];
+            let read = tokio::time::timeout_at(deadline, server_stream.read(&mut seen))
+                .await
+                .expect("the server reads")
+                .expect("the read succeeds");
+            assert_eq!(&seen[..read], payload, "encrypt={encrypt}");
 
-        server_stream
-            .write_all(b"pong")
-            .await
-            .expect("the server answers");
-        server_stream.flush().await.expect("the server flushes");
+            server_stream
+                .write_all(b"pong")
+                .await
+                .expect("the server answers");
+            server_stream.flush().await.expect("the server flushes");
 
-        let mut answer = [0u8; 4];
-        let read = tokio::time::timeout_at(deadline, client_stream.read(&mut answer))
-            .await
-            .expect("the client reads")
-            .expect("the read succeeds");
-        assert_eq!(&answer[..read], b"pong");
+            let mut answer = [0u8; 4];
+            let read = tokio::time::timeout_at(deadline, client_stream.read(&mut answer))
+                .await
+                .expect("the client reads")
+                .expect("the read succeeds");
+            assert_eq!(&answer[..read], b"pong", "encrypt={encrypt}");
+        }
     }
 }
