@@ -1608,6 +1608,13 @@ impl ClientDataChannel {
             // only carrier this build has.
             #[cfg(feature = "kcp")]
             Self::Raw(ClientStream::Kcp(_)) => Some(Carrier::Kcp),
+            // The UDP carrier's stream is not yamux and not KCP, but it is the
+            // same *carrier slot*: the stats, the pin accounting and the
+            // carrier rule compare the alternate carrier by this value. Before
+            // this arm it fell into `Raw(_)` and every UDP lane was reported as
+            // TCP (found in a loss1 smoke's l3-stats).
+            #[cfg(feature = "quic")]
+            Self::Raw(ClientStream::Udp(_)) => Some(Carrier::Kcp),
             Self::Raw(_) => Some(Carrier::Tcp),
             #[cfg(feature = "multiplex")]
             Self::Mux(_) => None,

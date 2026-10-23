@@ -85,6 +85,30 @@
 
 ## Where this stands
 
+- **The UDP carrier's clean path improved 4x, and its `loss1` cell is now the
+  open failure (2026-10-23).** The sender was moved into its own task (a
+  `send_to` waiting on a full qdisc must not stop receive; that was the PTO
+  spiral) and the clean L3 cell read **4.26-4.42 Gbit/s at 1.13 s/Gbit, p99
+  3.8-5.2 ms** (from 3.39-3.63 at 0.95, p99 5.9-7.4). CPU per Gbit is 1.8x
+  TCP. Then `loss1` — the cell the whole design is argued on — failed: the
+  20 s, 4-stream iperf did not finish inside the harness's 86 s bound on
+  either arm, at `--scale 0.05` or `0.1`, on every build tried (the ordered
+  build, the receive-burst build, and the split build). It is not a dead
+  lane: the l3-stats kept counting (server `forwarded` ~200 pps, client
+  `injected` ~140 pps) with read gaps up to **774 ms**, and per-lane
+  `MOLEHILL_QUIC_STATS` read rtt **20-21 ms**, cwnd **240-300 KB**, 5-14
+  losses/s and ~1 000 datagrams/s sent — a few Mbit/s per lane, not zero, and
+  far below KCP's 0.41 Gbit/s on the same cell. The likely mechanism is the
+  bench's per-skb loss: with 8-datagram GSO a 1 % skb loss is an ~8 %
+  datagram loss, and the ordered stream's head-of-line block turns it into
+  the 774 ms read gaps; the engine's controller response then settles at a
+  few Mbit/s. That is a hypothesis, not a verdict: the next step is a
+  server-side stats reporter and a deterministic-loss unit test over two
+  in-memory drivers, before any more clean-path tuning. **Until loss1 is
+  understood and met, the gate's premise is unmet: no flip, KCP stays.**
+  The investigation also found that a UDP lane was reported as `carrier=tcp`
+  in l3-stats (the `ClientStream::Udp` arm fell through to `Raw(_)`); fixed
+  in the same arc.
 - **The datagram layer moved the UDP carrier 3.5×, and the clean gate is still
   missed (2026-10-23).** Two changes to the endpoint's socket loop, measured on
   the same L3 `cost`/`clean` cell, `--condition-leg tunnel`, `--scale 0.1`,

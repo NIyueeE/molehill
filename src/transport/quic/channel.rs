@@ -48,10 +48,40 @@ pub(crate) async fn connect(
     let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
     config.transport_config(super::params::transport_config());
     let stream = endpoint.connect_stream(remote, config, encrypt).await?;
+    spawn_stats_reporter(&stream);
     Ok(UdpChannel {
         _endpoint: endpoint,
         stream,
     })
+}
+
+/// Log one line per second per direct channel while
+/// `MOLEHILL_QUIC_STATS` is set: the engine's own view of the path, which is
+/// what tells a loss-collapse apart from a stalled reader.
+fn spawn_stats_reporter(stream: &super::conn::QuicStream) {
+    if std::env::var_os("MOLEHILL_QUIC_STATS").is_none() {
+        return;
+    }
+    let shared = stream.shared_weak();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            ticker.tick().await;
+            let Some(shared) = shared.upgrade() else {
+                break;
+            };
+            let (rtt, cwnd, lost, sent, streams) = shared.engine_stats();
+            tracing::info!(
+                target: "molehill::quic",
+                "quic-stats: rtt_ms={} cwnd={} lost={} sent={} streams={}",
+                rtt.as_millis(),
+                cwnd,
+                lost,
+                sent,
+                streams
+            );
+        }
+    });
 }
 
 /// Dial one **connection** to `remote`, for a carrier that will open many

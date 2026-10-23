@@ -23,7 +23,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use super::conn::{self, QuicStream, Wait};
-use super::driver::Driver;
+use super::driver::{Driver, Outgoing};
 use super::session::HandshakeData;
 
 /// A command from the carrier's async surface into the task.
@@ -83,6 +83,12 @@ pub(crate) struct Channels {
 /// the loop drains once. Bounded so a flood cannot starve commands, timers or
 /// the stream tasks the same loop serves.
 const RECV_BURST: usize = 32;
+
+/// How many engine transmissions may wait for the sender task. Bounded so a
+/// path that cannot drain them cannot grow the endpoint's memory without
+/// bound; an overflow is a dropped transmit, which QUIC's loss recovery
+/// already knows how to repair.
+const SEND_QUEUE: usize = 256;
 
 /// Set once a kernel or path has refused `UDP_SEGMENT`, so every later
 /// transmission goes out the per-datagram way without probing again.
@@ -290,6 +296,23 @@ async fn run(
     let mut waiting: HashMap<ConnectionHandle, Waiting> = HashMap::new();
     let mut waiters: HashMap<ConnectionHandle, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
+
+    // Sends live in their own task. A `send_to` that waits for a full qdisc
+    // must not stall the receive path: under loss the two would deadlock into
+    // a PTO spiral (measured: a 774 ms read gap and ~1.6 Mbit/s on a 1 % loss
+    // path). The queue is bounded; a transmit that does not fit is dropped and
+    // the engine's own loss recovery re-emits it, exactly as if the path had
+    // dropped it.
+    let socket = Arc::new(socket);
+    let (send, mut sends) = mpsc::channel::<Outgoing>(SEND_QUEUE);
+    let sender_socket = Arc::clone(&socket);
+    tokio::spawn(async move {
+        while let Some(outgoing) = sends.recv().await {
+            if let Err(error) = send_outgoing(&sender_socket, &outgoing).await {
+                tracing::debug!(%error, "the socket could not send");
+            }
+        }
+    });
     loop {
         let now = Instant::now();
         let deadline = driver.poll_timeout();
@@ -413,16 +436,14 @@ async fn run(
         }
 
         if !drain(
-            &socket,
+            &send,
             &mut driver,
             &channels,
             &mut waiting,
             &mut waiters,
             &live,
             &connected,
-        )
-        .await
-        {
+        ) {
             break;
         }
     }
@@ -431,8 +452,8 @@ async fn run(
 /// Move everything the driver wants to send, then report its events.
 ///
 /// Returns `false` when the socket is unusable, which ends the task.
-async fn drain(
-    socket: &UdpSocket,
+fn drain(
+    send: &mpsc::Sender<Outgoing>,
     driver: &mut Driver,
     channels: &Channels,
     waiting: &mut HashMap<ConnectionHandle, Waiting>,
@@ -443,9 +464,13 @@ async fn drain(
     let now = Instant::now();
     driver.handle_timeout(now);
     while let Some(outgoing) = driver.poll_transmit(now) {
-        if let Err(error) = send_outgoing(socket, &outgoing).await {
-            tracing::debug!(%error, "the socket could not send");
-            return false;
+        if send.try_send(outgoing).is_err() {
+            // The sender task is behind. The engine has marked this transmit
+            // as sent, so dropping it is a loss its recovery re-emits; waiting
+            // for the queue here would block receive, which is the spiral this
+            // split exists to prevent.
+            tracing::debug!("the send queue is full; dropped a transmit for loss recovery");
+            break;
         }
     }
     driver.pump_endpoint_events();
@@ -512,7 +537,11 @@ async fn drain(
                         let _ = waiting.reply.send(outcome);
                     }
                 }
-                Event::ConnectionLost { .. } => {
+                Event::ConnectionLost { reason } => {
+                    // The reason is the only place a dead carrier says why;
+                    // the pool's repair treats every reason the same, but a
+                    // silent close leaves "the lane stalls" undiagnosable.
+                    tracing::debug!(?reason, "the UDP carrier connection was lost");
                     live.lock().remove(&handle);
                     connected.lock().remove(&handle);
                     waiters.remove(&handle);

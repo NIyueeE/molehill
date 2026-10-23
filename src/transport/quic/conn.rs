@@ -76,6 +76,21 @@ impl Shared {
         })
     }
 
+    /// What the engine says about this connection, for the
+    /// `MOLEHILL_QUIC_STATS` line: `(rtt, cwnd, lost, sent, streams)`.
+    pub(crate) fn engine_stats(&self) -> (std::time::Duration, u64, u64, u64, usize) {
+        let mut connection = self.connection.lock();
+        let stats = connection.stats();
+        let streams = connection.streams().send_streams();
+        (
+            stats.path.rtt,
+            stats.path.cwnd,
+            stats.path.lost_packets,
+            stats.path.sent_packets,
+            streams,
+        )
+    }
+
     /// Record the handshake hash the record layer derives from.
     pub(crate) fn set_hash(&self, hash: Vec<u8>) {
         *self.hash.lock() = Some(hash);
@@ -240,6 +255,12 @@ impl QuicStream {
     /// The endpoint's id for the connection this stream rides.
     pub(crate) fn connection_key(&self) -> u64 {
         self.shared.key
+    }
+
+    /// The connection's shared state, weakly: a reporter must not keep a dead
+    /// connection alive just to print its numbers.
+    pub(crate) fn shared_weak(&self) -> std::sync::Weak<Shared> {
+        Arc::downgrade(&self.shared)
     }
 
     fn selector(&self) -> u8 {
