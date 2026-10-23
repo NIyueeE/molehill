@@ -601,11 +601,12 @@
   timeout is a real bug in the new path (client dial or server accept), not a starved
   pool. The pool reading stays in the record, with what disproved it, because it looks
   plausible and the next reader will meet it again.
-  **The harness has no log lever, measured (2026-10-23).** A run with
-  RUST_LOG=debug in the harness environment produced the same single INFO line
-  ("Listening for UDP carrier connections at ...") and no debug output at all, so
-  the level is not read from the environment and the accept loop and hello reader
-  stay invisible. The next step is therefore one of two changes, not a rerun:
+  **Where the debug lines go missing, corrected the same day (2026-10-23).** A run
+  with RUST_LOG=debug produced the same single INFO line and no debug output, which
+  first read as "the level is not read from the environment" — wrong: src/logging.rs:115-120
+  says RUST_LOG wins when set (EnvFilter::try_from_default_env). The subject does
+  honour it, so what drops the debug lines is the harness's own capture. The lever
+  is therefore in the harness's log filter, not in the binary. The next step is therefore one of two changes, not a rerun:
   pass a log level through the bench adapter (a method-level change, so it belongs
   in the fingerprint) or hand-start a pair outside the harness — a transparent
   claim needs TUN and root, both available here.
