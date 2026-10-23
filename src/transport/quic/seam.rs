@@ -62,6 +62,10 @@ impl CarrierConn for UdpConn {
     fn is_alive(&self) -> bool {
         self.endpoint.is_alive(self.handle)
     }
+
+    async fn stats(&self) -> crate::transport::carrier::CarrierStats {
+        self.endpoint.stats(self.handle).await.unwrap_or_default()
+    }
 }
 
 #[cfg(all(test, feature = "multiplex"))]
@@ -116,7 +120,7 @@ mod tests {
     async fn a_stream_carries(
         conn: Arc<dyn CarrierConn>,
         mut inbound: mpsc::UnboundedReceiver<CarrierStream>,
-    ) {
+    ) -> crate::transport::carrier::CarrierStats {
         let mut out = conn.open_stream().await.expect("a stream");
         out.write_all(b"through the seam").await.expect("the write");
         out.flush().await.expect("the flush");
@@ -142,6 +146,7 @@ mod tests {
             .expect("the read succeeds");
         assert_eq!(&answer[..read], b"back");
         assert!(conn.is_alive(), "the connection should still be alive");
+        conn.stats().await
     }
 
     #[tokio::test]
@@ -163,7 +168,11 @@ mod tests {
         });
         let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
         let conn = crate::transport::tcp::TcpConn::new(client_io, shutdown);
-        a_stream_carries(Arc::new(conn), streams_rx).await;
+        let stats = a_stream_carries(Arc::new(conn), streams_rx).await;
+        assert_eq!(
+            stats.lost_packets, 0,
+            "the kernel keeps its losses where userspace cannot read them"
+        );
     }
 
     #[tokio::test]
@@ -230,6 +239,14 @@ mod tests {
             .expect("the client connects");
 
         let conn = UdpConn::new(Arc::clone(&client), handle, true);
-        a_stream_carries(Arc::new(conn), streams_rx).await;
+        let stats = a_stream_carries(Arc::new(conn), streams_rx).await;
+        assert!(
+            stats.rtt.is_some(),
+            "the engine reports the path's round trip"
+        );
+        assert!(
+            stats.streams >= 1,
+            "the engine counts the stream that carried the bytes"
+        );
     }
 }

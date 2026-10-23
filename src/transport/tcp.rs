@@ -126,6 +126,17 @@ impl super::carrier::CarrierConn for TcpConn {
     fn is_alive(&self) -> bool {
         self.tunnel.is_alive()
     }
+
+    async fn stats(&self) -> super::carrier::CarrierStats {
+        // yamux counts the streams; the kernel keeps the losses and has no
+        // round-trip estimate to offer, so the carrier reports none rather
+        // than inventing one.
+        super::carrier::CarrierStats {
+            streams: self.tunnel.counters.streams(),
+            rtt: self.tunnel.counters.rtt(),
+            lost_packets: 0,
+        }
+    }
 }
 
 #[cfg(all(test, feature = "multiplex"))]

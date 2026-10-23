@@ -452,6 +452,18 @@ impl std::fmt::Display for StreamError {
 #[cfg(feature = "quic")]
 impl std::error::Error for StreamError {}
 
+/// What a carrier can say about one connection.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg(feature = "quic")]
+pub(crate) struct CarrierStats {
+    /// Streams open on this connection, which is what placement spreads.
+    pub(crate) streams: usize,
+    /// The carrier's own round-trip estimate, when it has one.
+    pub(crate) rtt: Option<std::time::Duration>,
+    /// Packets the carrier itself lost on this path, when it can see them.
+    pub(crate) lost_packets: u64,
+}
+
 /// One carrier connection, as the pool and the lanes see it.
 ///
 /// What a carrier has to answer is deliberately small: hand out a stream,
@@ -474,6 +486,9 @@ pub(crate) trait CarrierConn: Send + Sync {
 
     /// Whether the connection still carries anything.
     fn is_alive(&self) -> bool;
+
+    /// What this connection can report about itself.
+    async fn stats(&self) -> CarrierStats;
 }
 
 #[cfg(test)]

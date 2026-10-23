@@ -40,6 +40,11 @@ enum Command {
         encrypt: bool,
         reply: oneshot::Sender<std::io::Result<QuicStream>>,
     },
+    /// Read one connection's numbers.
+    Stats {
+        connection: ConnectionHandle,
+        reply: oneshot::Sender<crate::transport::carrier::CarrierStats>,
+    },
     /// Wait for a connection's handshake.
     AwaitConnected {
         connection: ConnectionHandle,
@@ -138,6 +143,26 @@ impl EndpointHandle {
             .await
             .map_err(|_| anyhow!("the endpoint task is gone"))?
             .map_err(|error| anyhow!(error))
+    }
+
+    /// What the engine says about one connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the task is gone; a connection the task no longer holds
+    /// answers with zeroes, which is what a dead tunnel looks like.
+    pub(crate) async fn stats(
+        &self,
+        connection: ConnectionHandle,
+    ) -> Result<crate::transport::carrier::CarrierStats> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Stats { connection, reply })
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?;
+        answer
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))
     }
 
     /// Whether the task still holds this connection.
@@ -243,6 +268,22 @@ async fn run(
                             live.lock().insert(*handle);
                         }
                         let _ = reply.send(outcome);
+                    }
+                    Command::Stats { connection, reply } => {
+                        let stats = match driver.shared(connection) {
+                            Some(shared) => {
+                                let mut connection = shared.connection.lock();
+                                let engine = connection.stats();
+                                let streams = connection.streams().send_streams();
+                                crate::transport::carrier::CarrierStats {
+                                    streams,
+                                    rtt: Some(engine.path.rtt),
+                                    lost_packets: engine.path.lost_packets,
+                                }
+                            }
+                            None => crate::transport::carrier::CarrierStats::default(),
+                        };
+                        let _ = reply.send(stats);
                     }
                     Command::AwaitConnected { connection, reply } => {
                         if connected.lock().contains(&connection) {

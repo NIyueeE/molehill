@@ -255,6 +255,12 @@ impl TunnelCounters {
 
     /// This tunnel's carrier round-trip estimate, or `None` before the first
     /// ping's pong (and on a connection that never gets one).
+    /// Streams currently charged to this tunnel.
+    #[cfg(feature = "quic")]
+    pub(crate) fn streams(&self) -> usize {
+        self.load().streams
+    }
+
     pub(crate) fn rtt(&self) -> Option<std::time::Duration> {
         match self.rtt_us.load(std::sync::atomic::Ordering::Relaxed) {
             0 => None,
