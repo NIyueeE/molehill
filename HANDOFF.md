@@ -103,6 +103,12 @@
     not arrive**, 29.5 Mbit/s received. A reliable stream behind an
     offered-rate blast is a queue question rather than a network one (the hub's
     batch queue sheds first), and it is the second cell to understand.
+  - **Two of the mix's three series are healthy on their own**: `churn-16`
+    reads 338 connections/s at a 20 ms setup p50 and a 45 ms rtt p99, and
+    `rr-1` reads 45.6 request/s at 88 ms p99 — one round trip per request on a
+    20 ms path, not a collapse. That leaves the datagram series and the
+    *concurrency* of the four workloads as the untested parts of `cost`; the
+    blast's 82.6 % points at the datagram flow first.
 - **The receiver's 212 KiB socket buffer was reading as 34 % packet loss
   (2026-10-23).** No QUIC endpoint set `SO_RCVBUF`/`SO_SNDBUF`, so every
   carrier socket kept the kernel default; KCP asks for 32 MiB in
