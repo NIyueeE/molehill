@@ -82,9 +82,21 @@
   handover gets **5 s** to put a tunnel on the other carrier, and a carrier that
   does not establish inside that is the verdict (give the tunnel back, back off
   for 10 minutes) — a carrier the path cannot reach is a result, not a wait.
-  The re-measurement (same command, the same two builds) is owed before the rule
-  leaves opt-in; the numbers above are the reason it stays off by default until
-  it exists.
+  **The re-measurement with both fixes ran** (same command, two fresh builds at
+  `ba4c9c5`): the probe is given back after 6 s with `reason="the probed carrier
+  did not establish"`, and `MOLEHILL_POOL_STATS=1` shows the drain for **5 s
+  instead of the rest of the arm** (`handover=0/kcp:draining` for five samples,
+  then `-`). The tail came down with it: p99 39.5-45.0 ms in three of the four
+  rule-on cells and 3.1 in the fourth, against 63.6-77.0 before the cancel and
+  2.17-2.27 with the rule off; throughput is unmoved (12.371-12.590 against
+  12.409-12.439 Gbit/s). So the remaining cost is **the probe's own 5 s
+  establish window**, not a stuck handover — and because the backoff is ten
+  minutes, a deployment pays that window roughly once per ten minutes rather
+  than once per 60 s stage, which is why the arm-to-arm number overstates it.
+  Still not a claim (n=2, and this cell's p99 resolution is 41 %), and the rule
+  stays opt-in: the next lever, if it is ever to be on by default, is for the
+  probe to **dial an extra tunnel** on the other carrier and close it rather than
+  drain a serving one, so the comparison costs no width at all.
 - **The carrier rule can now ask its question on either carrier (2026-10-23).**
   It had exactly one suspicion — a sender's re-sent share — and that counter
   exists only on KCP, so a TCP-carrying pool could never probe the other
@@ -488,17 +500,17 @@
   files: the three `screen` runs quoted for GSO were **clean-path numbers in all
   three**, so the GSO comparison they carry is a clean-path comparison; a shaped
   one is owed, and it is the next measurement this file records.
-- **The carrier rule's re-measurement is owed (2026-10-23).** The first one
-  ran (record in "Where this stands"): the rule fires, costs nothing in
-  throughput, and cost 30x the interactive tail because its handover never
-  landed — fixed by bounding that handover to 5 s. The same command re-run is
-  what closes it: the two builds (rule default-on / default-off, the GSO A/B's
-  trick, so one fingerprint holds both arms), `--profile stage --condition
-  udp_throttled --condition-leg tunnel --scale 1.0 --rounds 2`, with
-  `MOLEHILL_POOL_STATS=1`. What it must show now: the `giving the probe's
-  tunnel back` line inside 5 s, `handover=` clearing from the pool-stats line,
-  and the tail back at the rule-off arm's level. Until then the rule stays off
-  by default — a policy nobody has watched act correctly is a hypothesis.
+- **The probe should dial rather than drain (2026-10-23, design).** The rule's
+  two live measurements agree on the shape of its cost: the probe takes a
+  *serving* tunnel out of the pool for the length of its establish window (5 s),
+  and that window is visible in the interactive tail (p99 39-45 ms against 2.2
+  with the rule off). The comparison itself does not need the pool's width: the
+  cheapest probe is an **extra** tunnel dialled on the other carrier, carrying
+  whatever placement sends it, closed when the verdict lands. That costs no
+  serving capacity, makes the establish bound a dial timeout rather than a
+  drain budget, and removes the one state (`handover=`) the first probe could
+  get stuck in. It is a design, not a measurement — nothing has been built or
+  timed — and it is the shape to build if the rule is ever to leave opt-in.
 - **The carrier policy is going peer-level (2026-10-22, in progress), and the
   first instrument is in.** The operator's direction: TCP and KCP are peers, and
   the pool should pick per path instead of shipping a fixed order. The signal
