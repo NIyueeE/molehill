@@ -424,9 +424,15 @@ together — and why the window itself had to stop being a constant:
 
 **The window follows the path.** A session re-estimates its bandwidth-delay
 product once a second — the bytes it emitted over the interval against the round
-trip its own ACKs measure — and sets both windows to twice that, clamped to
-128..8192 segments. The counters are its own (`SessionHealth::bytes_out`), so
-nothing above the carrier has to tell it what the path is doing. Two guards keep
+trip its own ACKs measure — and sets its **send** window to twice that, clamped
+to 128..8192 segments. The receive window is not touched: it is the peer's
+allowance, so sizing it from our own sending rate caps a bulk *receiver* at the
+bandwidth-delay product of its acknowledgements — a 20 ms lossy leg advertised
+128 segments (188 KB) and carried 0.25 Gbit/s where the same code carried 9 on a
+clean path, with the sending end's queue full and blocked on that window
+(measured 2026-10-23, HANDOFF.md). The counters are the session's own
+(`SessionHealth::bytes_out`), so nothing above the carrier has to tell it what
+the path is doing. Two guards keep
 the estimate away from the cases where a wide window is the point. A session that
 is **re-sending** keeps the window it has: fast retransmit needs more in flight
 than the BDP, and a lossy leg lost two thirds of its throughput when a tighter

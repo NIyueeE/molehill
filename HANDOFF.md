@@ -61,6 +61,40 @@
 
 ## Where this stands
 
+- **The shaped carrier campaign ran (2026-10-23), and its first finding was a
+  regression of my own: the KCP window retune also narrowed the *receive*
+  window.** `set_wndsize(want, want)` sized both from the session's own send
+  rate, and a bulk *receiver* sends almost nothing — so it advertised the
+  floor (128 segments, 188 KB) to the peer that was sending it data. On a clean
+  100 ms carrier path (`--condition rtt100 --condition-leg tunnel`, KCP pinned,
+  4 streams, two rounds, `--ab-arm` against the previous build, the run's own
+  A/A copy): **0.613 / 0.824 Gbit/s against 0.022 / 0.030** — a 28× loss, claim
+  +2679.5 %, CPU per Gbit 1.158/0.995 against 1.767/1.873, and the A/A twin
+  (0.614 / 0.620, 1 % apart) says it is not scatter. On the lossy leg the same
+  comparison reads +36.05 % (0.322 against 0.190-0.256) because that cell is
+  dominated by the ARQ collapse below. The counter that named it was
+  `MOLEHILL_KCP_STATS`: the sending end's `wait_snd_peak` stood at 11 399
+  segments against `peer_wnd` 128, with its own `snd_wnd` never the constraint.
+  Fixed in `apply_window` (the send window follows the path, the receive window
+  stays at its configured bound — it is the peer's allowance, not our sending),
+  with a unit test that fails against the old rule, and the window in force is
+  now read from the engine instead of a copy kept in the pacer.
+- **GSO's win survives a lossy carrier path, so it needs no guard.** The same
+  campaign's A/B (GSO build against the same commit with `gso_allowed()` forced
+  false): on `loss1` over the carrier leg **+18.24 % throughput** (claim,
+  0.252/0.193 against 0.188/0.189) with CPU per Gbit −32 % and p50 −50 %
+  (directional), and on `clean` **+14.15 %** (8.99/8.74 against 8.40/7.13)
+  with p99 and RSS worse by direction (83.9/16.6 ms against 50.1/4.2; 159/128
+  MiB against 114/85). The mechanism held: the leg's own qdisc drops were
+  1.006 % of 484 880 offered **frames**, and those frames are 64 KiB with
+  segmentation offload on — the loss arrives in bursts and still pays. What
+  `loss1` costs on this path is not GSO but the ARQ: the same code carries 9
+  Gbit/s clean and 0.2-0.3 under 1 % frame loss, which is the documented
+  congestion collapse (docs/benchmarks.md, "Loss on the carrier's own leg"),
+  unchanged by anything in this cycle. The consequence for the carrier policy is
+  the operator's own direction: KCP is the carrier for the paths where TCP is
+  *refused*, not the carrier for lossy paths, and the peer-level selection has
+  to weigh reachability before quality.
 - **A campaign's `--condition` is now imposed or refused, so a shaped cell is a
   shaped cell (2026-10-23).** The staged runner took the *scenario's* own
   condition (`cost` walks the `single` timeline → `clean`) and imposed it
@@ -86,8 +120,11 @@
   as "can still send". Both are on `docs/benchmarks.md`.
 - **The KCP window follows the path (2026-10-23), and the only effect that
   cleared the run's own noise is memory.** Fixed 8192 segments (about 12 MB per
-  session) became "twice the bandwidth-delay product, clamped to 128..8192,
-  retuned once a second on a session that is not re-sending". The A/B on the
+  session) became "**the send window** sized to twice the bandwidth-delay
+  product, clamped to 128..8192, retuned once a second on a session that is not
+  re-sending" (the receive window is the peer's allowance and stays at its
+  configured bound — see the entry above for the 28× loss that rule cost on a
+  long path when it did not). The A/B on the
   forced KCP carrier (`--profile screen --ab-arm --aa --rounds 6`, the run's own
   A/A copy): peak RSS 189.0 -> 147.5 MiB, **the one reading that cleared its
   floor** (10 %, p 0.031 against alpha 0.05, 6/6 rounds); throughput 8.78 ->

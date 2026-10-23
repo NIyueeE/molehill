@@ -28,8 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   missing interface. Nothing that could serve before is refused now.
 - **The KCP window follows the path instead of a fixed 8192 segments.** Once a
   second, a session that is not re-sending estimates its bandwidth-delay product
-  from the bytes it emitted and the round trip its own ACKs measure, and sets
-  both windows to twice that, clamped to 128..8192 segments. A re-sending
+  from the bytes it emitted and the round trip its own ACKs measure, and sets its
+  **send** window to twice that, clamped to 128..8192 segments. The receive
+  window stays at its configured bound: it is the peer's allowance, so sizing it
+  from our own sending caps a bulk receiver at the bandwidth-delay product of its
+  acknowledgements (a 20 ms lossy leg advertised 128 segments and carried
+  0.25 Gbit/s where the same code carried 9 on a clean path). A re-sending
   session keeps the window it has — fast retransmit needs more in flight than
   the product, and a lossy leg lost two thirds of its throughput when a tighter
   bound was tried on the queue cap — and growth is immediate while shrinking

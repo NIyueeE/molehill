@@ -1345,8 +1345,6 @@ struct PaceState {
     bytes_at_retune: u64,
     datagrams_at_retune: u64,
     retrans_at_retune: u64,
-    /// The window in force, in segments, as this side last set it.
-    wnd: u16,
 }
 
 /// One batch's worth of datagrams the pacer has not allowed yet, kept with the
@@ -1388,7 +1386,6 @@ impl PaceState {
             bytes_at_retune: 0,
             datagrams_at_retune: 0,
             retrans_at_retune: 0,
-            wnd: KCP_SND_WND,
         }
     }
 
@@ -1885,15 +1882,34 @@ fn retune_window(
     )]
     let bdp_bytes = (rate_bps * f64::from(srtt_ms) / 8.0 / 1000.0) as u64;
     let want = window_for(bdp_bytes, kcp.mtu());
-    if want <= pace.wnd && want.saturating_mul(2) >= pace.wnd {
+    // The window in force is the engine's, not a copy kept here: one owner for
+    // the value means a retune cannot disagree with the ARQ about it.
+    let current = kcp.snd_wnd();
+    if want <= current && want.saturating_mul(2) >= current {
         return;
     }
-    pace.wnd = want;
-    kcp.set_wndsize(want, want);
+    apply_window(kcp, want);
     debug!(
         window = want,
         bdp_bytes, srtt_ms, "KCP window retuned to the path"
     );
+}
+
+/// Apply a retuned window: the **send** window follows the path, the receive
+/// window does not.
+///
+/// The receive window is the peer's allowance — how much it may keep in flight
+/// *toward us* — so it is a property of our buffering, not of our sending. The
+/// first version set both from the send-side estimate (`set_wndsize(want, want)`),
+/// which caps a bulk *receiver* at the bandwidth-delay product of its own
+/// acknowledgements: on a 20 ms lossy carrier leg the receiving end advertised
+/// 128 segments (188 KB), the sending end's queue stood full at 11 399 segments,
+/// and the leg carried 0.25 Gbit/s where the same code carried 9 on a clean path
+/// (measured 2026-10-23 with `MOLEHILL_KCP_STATS`: the sending side's queue stood
+/// full at 11 399 segments against a peer window of 128, and its own send window
+/// was never the constraint).
+fn apply_window(kcp: &mut Kcp<DatagramOut>, want: u16) {
+    kcp.set_wndsize(want, KCP_RCV_WND);
 }
 
 /// The window, in segments, that covers `bdp_bytes` with `WND_BDP_FACTOR` of
@@ -3365,6 +3381,26 @@ mod tests {
         assert_eq!(window_for(u64::MAX, 1472), KCP_SND_WND);
         // A zero MSS is a bug elsewhere; it must not divide by zero here.
         assert_eq!(window_for(875 * 1024, 0), KCP_SND_WND);
+    }
+
+    /// A retune moves the *send* window only; the receive window is the peer's
+    /// allowance and stays at its configured bound.
+    ///
+    /// The first version set both from the send-side estimate
+    /// (`set_wndsize(want, want)`). A bulk *receiver* sends little, so its
+    /// estimate is the acknowledgement rate's bandwidth-delay product: on a
+    /// 20 ms lossy carrier leg the receiving end advertised 128 segments
+    /// (188 KB), the sending end's queue stood full at 11 399 segments waiting
+    /// on it, and the leg carried 0.25 Gbit/s where the same code carried 9 on a
+    /// clean path (measured 2026-10-23 with `MOLEHILL_KCP_STATS`).
+    #[test]
+    fn a_retune_never_narrows_the_receive_window() {
+        let (dgram_tx, _dgram_rx) = mpsc::unbounded_channel();
+        let mut kcp = Kcp::new_stream(0x5EED_5EED, DatagramOut::new(dgram_tx));
+        kcp.set_wndsize(KCP_SND_WND, KCP_RCV_WND);
+        apply_window(&mut kcp, KCP_WND_MIN);
+        assert_eq!(kcp.snd_wnd(), KCP_WND_MIN);
+        assert_eq!(kcp.advertised_wnd(), KCP_RCV_WND);
     }
 
     /// Read exactly `n` bytes with a generous timeout (KCP is userspace ARQ

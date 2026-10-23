@@ -1281,6 +1281,16 @@ impl<Output> Kcp<Output> {
         self.snd_una
     }
 
+    /// The send window in force, in segments.
+    ///
+    /// Read by the carrier's retune, which is the only thing that changes it:
+    /// the window is a queue bound, not a congestion control, so a caller that
+    /// wants to check what the path earned for it asks here.
+    #[inline]
+    pub fn snd_wnd(&self) -> u16 {
+        self.snd_wnd
+    }
+
     /// The retransmission timeout this side is currently using, in
     /// milliseconds, and the smoothed round-trip estimate behind it. Together
     /// they say whether a spurious-retransmission rate is the path's or the
