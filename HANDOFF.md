@@ -577,6 +577,16 @@
   subject at debug, because the accept loop and the hello reader both report there
   and the harness captures WARN and INFO only: a silent timeout cannot otherwise
   tell "no connection arrived" from "the server is waiting for bytes".
+  **A hypothesis worth one check before any debugging (2026-10-23): the lanes may
+  not be direct channels after all.** A claim's lanes are documented as the
+  client's *carrier-connection budget* (`[transparent.data].tunnels`), and the
+  transparent path draws them from the pool — so a build whose KCP listener was
+  switched off (the port fix above) would fail to bring the *pool* up over KCP and
+  starve the claims, which produces exactly the observed `visitor timed out` with a
+  successfully bound UDP endpoint. Check before changing code: does the lane for a
+  claim come from `TunnelPool` or from `connect_direct_channel`? If it is the pool,
+  then the UDP carrier must first serve *pool tunnels* (one connection, many
+  streams) and the direct-channel wiring above is the wrong end of the problem.
   run's own record is `/home/dsh/tmp/udp-lane-smoke2.json`.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
