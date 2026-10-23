@@ -412,6 +412,70 @@ pub fn first_carrier() -> Carrier {
     forced_carrier().unwrap_or(Carrier::Tcp)
 }
 
+/// A stream a carrier connection yields: bytes, and nothing else.
+///
+/// The blanket impl means each carrier's own stream type goes in untouched:
+/// above this line nothing names yamux or QUIC, which is what makes the two
+/// carriers interchangeable.
+#[cfg(feature = "quic")]
+pub(crate) trait CarrierIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static
+{
+}
+#[cfg(feature = "quic")]
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static> CarrierIo for T {}
+
+/// One stream, whichever carrier produced it.
+#[cfg(feature = "quic")]
+pub(crate) type CarrierStream = Box<dyn CarrierIo>;
+
+/// Why a carrier could not produce a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "quic")]
+pub(crate) enum StreamError {
+    /// The connection is gone; the pool repairs it.
+    Closed,
+    /// The peer's stream limit (or our own) is exhausted right now.
+    Busy,
+}
+
+#[cfg(feature = "quic")]
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Closed => f.write_str("the carrier connection is gone"),
+            StreamError::Busy => f.write_str("the carrier has no stream available"),
+        }
+    }
+}
+
+#[cfg(feature = "quic")]
+impl std::error::Error for StreamError {}
+
+/// One carrier connection, as the pool and the lanes see it.
+///
+/// What a carrier has to answer is deliberately small: hand out a stream,
+/// say which carrier it is, and say whether it is still alive. Everything
+/// else — how many streams are open, which one is idle, how its round trip
+/// looks — is the carrier's own bookkeeping behind this line.
+#[async_trait::async_trait]
+#[cfg(feature = "quic")]
+pub(crate) trait CarrierConn: Send + Sync {
+    /// A new stream on this connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails with StreamError::Closed when the connection is gone and
+    /// StreamError::Busy when the peer's limit is reached for now.
+    async fn open_stream(&self) -> Result<CarrierStream, StreamError>;
+
+    /// Which carrier this connection is.
+    fn carrier(&self) -> Carrier;
+
+    /// Whether the connection still carries anything.
+    fn is_alive(&self) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

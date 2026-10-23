@@ -71,3 +71,96 @@ impl TcpTransport {
         Ok(s)
     }
 }
+
+/// The TCP carrier's connection: one yamux session over one socket.
+///
+/// This is the seam's TCP side. Once the pool and the lanes hold this type
+/// behind CarrierConn, nothing above them names yamux.
+#[cfg(feature = "multiplex")]
+#[cfg(feature = "quic")]
+pub(crate) struct TcpConn {
+    tunnel: super::multiplex::ClientTunnel,
+}
+
+#[cfg(feature = "multiplex")]
+#[cfg(feature = "quic")]
+impl TcpConn {
+    /// Start the session over an established byte stream.
+    pub(crate) fn new<I>(io: I, shutdown: tokio::sync::watch::Receiver<bool>) -> Self
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        Self {
+            tunnel: super::multiplex::ClientTunnel::start(
+                io,
+                super::multiplex::mux_config(),
+                shutdown,
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "multiplex")]
+#[async_trait::async_trait]
+#[cfg(feature = "quic")]
+impl super::carrier::CarrierConn for TcpConn {
+    async fn open_stream(
+        &self,
+    ) -> Result<super::carrier::CarrierStream, super::carrier::StreamError> {
+        match self.tunnel.open_stream().await {
+            Ok(stream) => Ok(Box::new(stream)),
+            Err(crate::mux::ConnectionError::TooManyStreams) => {
+                Err(super::carrier::StreamError::Busy)
+            }
+            Err(_) => Err(super::carrier::StreamError::Closed),
+        }
+    }
+
+    fn carrier(&self) -> super::carrier::Carrier {
+        super::carrier::Carrier::Tcp
+    }
+
+    fn is_alive(&self) -> bool {
+        self.tunnel.is_alive()
+    }
+}
+
+#[cfg(all(test, feature = "multiplex"))]
+#[cfg(feature = "quic")]
+mod seam_tests {
+    use super::*;
+    use crate::transport::carrier::CarrierConn as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn the_tcp_carrier_yields_a_stream_through_the_seam() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(super::super::multiplex::run_server_tunnel(
+            server_io,
+            super::super::multiplex::mux_config(),
+            tx,
+        ));
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let conn = TcpConn::new(client_io, shutdown_rx);
+
+        let mut stream = conn.open_stream().await.expect("a stream");
+        stream.write_all(b"hello").await.expect("the write");
+        stream.flush().await.expect("the flush");
+
+        let deadline = std::time::Duration::from_secs(5);
+        let mut inbound = tokio::time::timeout(deadline, rx.recv())
+            .await
+            .expect("a stream arrives")
+            .expect("the server task is alive");
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(deadline, inbound.read_exact(&mut buf))
+            .await
+            .expect("the read completes")
+            .expect("the read succeeds");
+        assert_eq!(&buf, b"hello");
+
+        assert_eq!(conn.carrier(), super::super::carrier::Carrier::Tcp);
+        assert!(conn.is_alive());
+    }
+}

@@ -486,6 +486,12 @@
   are still KCP's would be a lie in the other direction. The direct-channel
   primitive (`connect_stream`) is in place and tested, so wiring it into
   `ClientStream` can wait for the seam instead of landing twice.
+  **The seam's types are landed and gated on the `quic` feature** (`CarrierIo`,
+  `CarrierStream`, `CarrierConn`, and the TCP adapter `TcpConn`): nothing in
+  the default build holds them yet, and the gate denies dead-code warnings.
+  They un-gate in the commit that makes the pool hold a `CarrierConn` — that
+  is the point of the seam, and gating is the honest way to keep both builds
+  clean until then.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
