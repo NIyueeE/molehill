@@ -19,7 +19,7 @@ use crate::transport::carrier::{CarrierConn, CarrierStream, StreamError};
 pub(crate) struct UdpConn {
     endpoint: Arc<EndpointHandle>,
     handle: ConnectionHandle,
-    /// Whether the streams carry the record layer (the service's data_enable).
+    /// Whether the streams carry the record layer (the service's `data_enable`).
     encrypt: bool,
 }
 
@@ -69,6 +69,11 @@ impl CarrierConn for UdpConn {
 
 #[cfg(all(test, feature = "multiplex"))]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use std::sync::Arc;
     use std::time::Duration;
 

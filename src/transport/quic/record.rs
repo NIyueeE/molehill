@@ -1,4 +1,4 @@
-//! The per-stream record layer: what data_enable means on this carrier.
+//! The per-stream record layer: what `data_enable` means on this carrier.
 //!
 //! On the TCP carrier the switch wraps the connection's byte stream in the
 //! Noise record stream, because one connection carries one byte stream. A
@@ -34,6 +34,10 @@ impl RecordKey {
     /// flag names the *sender* of that direction, not the caller: both ends
     /// derive the same key for the same direction, and the opposite one for
     /// the other.
+    #[expect(
+        clippy::expect_used,
+        reason = "HKDF-SHA256 produces any requested length up to 8160 bytes; 32 is always valid"
+    )]
     pub(crate) fn derive(handshake_hash: &[u8], stream: u64, initiator: bool) -> Self {
         let hkdf = Hkdf::<Sha256>::new(None, handshake_hash);
         let mut info = Vec::with_capacity(16 + 8 + 1);
@@ -59,8 +63,14 @@ impl RecordKey {
     ///
     /// # Panics
     ///
-    /// Panics when the plaintext is longer than MAX_PLAINTEXT; callers chunk
+    /// Panics when the plaintext is longer than `MAX_PLAINTEXT`; callers chunk
     /// their writes, so that is a bug rather than a network condition.
+    #[expect(
+        clippy::expect_used,
+        clippy::cast_possible_truncation,
+        reason = "ChaCha20-Poly1305 fails only on inputs over 2^38 bytes, and the assert above \
+                  bounds the ciphertext at u16::MAX"
+    )]
     pub(crate) fn seal(&mut self, plaintext: &[u8]) -> Vec<u8> {
         assert!(
             plaintext.len() <= MAX_PLAINTEXT,
@@ -92,6 +102,11 @@ impl RecordKey {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use super::*;
 
     const HASH: [u8; 32] = [7u8; 32];

@@ -1267,7 +1267,7 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
 
 /// Dial one direct channel through the UDP carrier.
 ///
-/// Split out of connect_direct_channel so each carrier keeps its own
+/// Split out of `connect_direct_channel` so each carrier keeps its own
 /// bookkeeping and both bodies fit the lint room.
 #[cfg(all(feature = "quic", feature = "noise"))]
 async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<Option<ClientStream>> {

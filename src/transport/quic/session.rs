@@ -356,6 +356,11 @@ impl ServerConfig for NoiseServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
     use base64::Engine as _;
@@ -490,7 +495,7 @@ mod tests {
             .downcast::<HandshakeData>()
             .expect("the server's data is ours");
         assert_eq!(a.hash, b.hash, "both ends derive the same handshake hash");
-        assert!(!a.hash.is_empty());
+        assert_ne!(a.hash, [] as [u8; 0], "the handshake hash is not empty");
     }
 
     #[test]

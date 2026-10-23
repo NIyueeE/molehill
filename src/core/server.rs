@@ -630,7 +630,7 @@ async fn ensure_udp_listener(
         let _endpoint = endpoint;
         tokio::select! {
             _ = shutdown_rx.recv() => {}
-            _ = run_udp_listener(streams, registry, shared) => {}
+            () = run_udp_listener(streams, registry, shared) => {}
         }
     });
     Ok(())

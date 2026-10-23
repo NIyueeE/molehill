@@ -87,6 +87,11 @@ impl HeaderKey for PlainHeaderKey {
 pub(crate) struct ResetHmac(hmac::Key);
 
 impl ResetHmac {
+    #[expect(
+        clippy::expect_used,
+        reason = "a stateless-reset key that cannot be keyed is not an endpoint this carrier can \
+                  offer; the system random source is the only safe source and its failure is fatal"
+    )]
     pub(crate) fn new() -> Arc<Self> {
         // Per process: a reset token only has to be unforgeable for the life
         // of the endpoint that issues it.
@@ -124,6 +129,11 @@ pub(crate) struct TokenKeys {
 }
 
 impl TokenKeys {
+    #[expect(
+        clippy::expect_used,
+        reason = "the system random source is the only safe source for a token key, and an endpoint \
+                  without one cannot validate a Retry it might be asked to issue"
+    )]
     pub(crate) fn new() -> Arc<Self> {
         let master = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
             .expect("the system random source is available");
@@ -132,6 +142,11 @@ impl TokenKeys {
 }
 
 impl HandshakeTokenKey for TokenKeys {
+    #[expect(
+        clippy::expect_used,
+        reason = "HMAC-SHA256 yields exactly the 32 bytes AES-256 takes, and the key was just \
+                  derived from it"
+    )]
     fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey> {
         let derived = hmac::sign(&self.master, random_bytes);
         let key = aead::UnboundKey::new(&aead::AES_256_GCM, derived.as_ref())
@@ -178,6 +193,11 @@ pub(crate) fn plain_keys() -> Keys {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use super::*;
 
     #[test]
