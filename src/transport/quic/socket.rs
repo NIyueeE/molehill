@@ -10,6 +10,7 @@
 //! driver already reports a GSO segment size, and the only change is which
 //! syscall carries the bytes.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +39,20 @@ enum Command {
         encrypt: bool,
         reply: oneshot::Sender<std::io::Result<QuicStream>>,
     },
+    /// Connect and open one stream, answering only once the handshake is up:
+    /// the shape a direct data channel has.
+    ConnectStream {
+        remote: SocketAddr,
+        config: ClientConfig,
+        encrypt: bool,
+        reply: oneshot::Sender<std::io::Result<QuicStream>>,
+    },
+}
+
+/// A connection that still owes its caller a stream.
+struct Waiting {
+    reply: oneshot::Sender<std::io::Result<QuicStream>>,
+    encrypt: bool,
 }
 
 /// What the task needs to report upward: a connection the peer opened, and
@@ -85,6 +100,34 @@ impl EndpointHandle {
     /// # Errors
     ///
     /// Fails when the peer's stream limit is exhausted, or the task is gone.
+    /// Connect and hand back one stream, once the handshake allows it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection cannot be established, the handshake has no
+    /// record keys for a stream that asked for them, or the task is gone.
+    pub(crate) async fn connect_stream(
+        &self,
+        remote: SocketAddr,
+        config: ClientConfig,
+        encrypt: bool,
+    ) -> Result<QuicStream> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::ConnectStream {
+                remote,
+                config,
+                encrypt,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?;
+        answer
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?
+            .map_err(|error| anyhow!(error))
+    }
+
     pub(crate) async fn open_stream(
         &self,
         connection: ConnectionHandle,
@@ -128,6 +171,7 @@ async fn run(
 ) {
     let notify = Arc::new(Notify::new());
     let mut driver = Driver::new(server_config, allow_mtud, Arc::clone(&notify));
+    let mut waiting: HashMap<ConnectionHandle, Waiting> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let now = Instant::now();
@@ -147,6 +191,19 @@ async fn run(
                             .map_err(|error| format!("{error}"));
                         let _ = reply.send(outcome);
                     }
+                    Command::ConnectStream {
+                        remote,
+                        config,
+                        encrypt,
+                        reply,
+                    } => match driver.connect(Instant::now(), config, remote) {
+                        Ok(handle) => {
+                            waiting.insert(handle, Waiting { reply, encrypt });
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(std::io::Error::other(format!("{error}"))));
+                        }
+                    },
                     Command::OpenStream {
                         connection,
                         encrypt,
@@ -192,7 +249,7 @@ async fn run(
             }
         }
 
-        if !drain(&socket, &mut driver, &channels).await {
+        if !drain(&socket, &mut driver, &channels, &mut waiting).await {
             break;
         }
     }
@@ -201,7 +258,12 @@ async fn run(
 /// Move everything the driver wants to send, then report its events.
 ///
 /// Returns `false` when the socket is unusable, which ends the task.
-async fn drain(socket: &UdpSocket, driver: &mut Driver, channels: &Channels) -> bool {
+async fn drain(
+    socket: &UdpSocket,
+    driver: &mut Driver,
+    channels: &Channels,
+    waiting: &mut HashMap<ConnectionHandle, Waiting>,
+) -> bool {
     let now = Instant::now();
     driver.handle_timeout(now);
     while let Some(outgoing) = driver.poll_transmit(now) {
@@ -258,9 +320,28 @@ async fn drain(socket: &UdpSocket, driver: &mut Driver, channels: &Channels) -> 
                         }
                     }
                 }
+                Event::Connected => {
+                    // A caller asking for a stream waits for exactly this.
+                    if let Some(waiting) = waiting.remove(&handle) {
+                        let outcome = match driver.shared(handle) {
+                            Some(shared) => conn::open(&shared, waiting.encrypt),
+                            None => Err(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "the connection is gone",
+                            )),
+                        };
+                        let _ = waiting.reply.send(outcome);
+                    }
+                }
                 Event::ConnectionLost { .. } => {
                     if let Some(shared) = driver.shared(handle) {
                         shared.close();
+                    }
+                    if let Some(waiting) = waiting.remove(&handle) {
+                        let _ = waiting.reply.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionAborted,
+                            "the connection was lost before it carried a stream",
+                        )));
                     }
                 }
                 _ => {}
@@ -431,5 +512,90 @@ mod tests {
                 .expect("the read succeeds");
             assert_eq!(&answer[..read], b"pong", "encrypt={encrypt}");
         }
+    }
+    #[tokio::test]
+    async fn a_direct_channel_is_one_stream_over_udp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+
+        // One call: connect, complete the handshake, open one stream.
+        let mut channel = client
+            .connect_stream(
+                server_addr,
+                ClientConfig::new(Arc::new(NoiseClientConfig::new(
+                    NoiseKeys::from_config(&client_cfg).expect("client keys"),
+                ))),
+                true,
+            )
+            .await
+            .expect("the direct channel comes up");
+
+        channel
+            .write_all(b"the visitor's bytes")
+            .await
+            .expect("the client writes");
+        channel.flush().await.expect("the client flushes");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut served = tokio::time::timeout_at(deadline, streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let mut seen = [0u8; 32];
+        let read = tokio::time::timeout_at(deadline, served.read(&mut seen))
+            .await
+            .expect("the server reads")
+            .expect("the read succeeds");
+        assert_eq!(&seen[..read], b"the visitor's bytes");
+
+        served.write_all(b"pong").await.expect("the server answers");
+        served.flush().await.expect("the server flushes");
+
+        let mut answer = [0u8; 4];
+        let read = tokio::time::timeout_at(deadline, channel.read(&mut answer))
+            .await
+            .expect("the client reads")
+            .expect("the read succeeds");
+        assert_eq!(&answer[..read], b"pong");
     }
 }
