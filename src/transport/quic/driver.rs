@@ -181,6 +181,11 @@ impl Driver {
         self.connections.get_mut(&handle)
     }
 
+    /// Every live connection, for a driver that routes events by handle.
+    pub(crate) fn handles(&self) -> Vec<ConnectionHandle> {
+        self.connections.keys().copied().collect()
+    }
+
     pub(crate) fn remove(&mut self, handle: ConnectionHandle) {
         self.connections.remove(&handle);
     }

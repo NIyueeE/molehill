@@ -20,7 +20,9 @@
 mod crypto;
 mod driver;
 mod session;
+mod socket;
 
 pub(crate) use crypto::{PlainHeaderKey, PlainPacketKey, ResetHmac, TokenKeys, plain_keys};
 pub(crate) use driver::{Driver, MAX_DATAGRAMS, Outgoing};
 pub(crate) use session::{HandshakeData, NoiseClientConfig, NoiseServerConfig};
+pub(crate) use socket::{Channels, EndpointHandle, spawn};
