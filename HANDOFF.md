@@ -634,6 +634,16 @@
   successful dispatch nor a channel-end line appears, so the accepted streams never
   reach run_udp_listener. The next line to add is at its top: one INFO per received
   stream, which separates "the listener never started" from "the streams never
+  **They do arrive: 41 of them (2026-10-23).** With a line at the top of
+  run_udp_listener, the same smoke reports 41 "an accepted stream reached the
+  listener" and 41 client-side "Direct data channel came up" — and still no
+  channel-end line, so handle_udp_stream reads the hello, reads the prologue and
+  dispatches successfully every time. The carrier, the accept loop and the prologue
+  are therefore all proven, and the failure has moved past them into the claim's own
+  plumbing. **The number is the clue**: 41 establishments for a handful of lanes means
+  the client is re-dialing, i.e. a lane is dropped right after it comes up (or the
+  claim never adopts it). Next: log one line when a lane is handed to, or retired
+  by, the claim's lane bookkeeping.
   arrive".
   (succeeded or fell back, with the reason) at info in connect_udp_carrier.
   pass a log level through the bench adapter (a method-level change, so it belongs

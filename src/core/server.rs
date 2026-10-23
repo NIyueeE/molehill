@@ -648,6 +648,7 @@ async fn run_udp_listener(
     shared: Arc<ServerShared>,
 ) {
     while let Some(stream) = streams.recv().await {
+        info!("UDP carrier: an accepted stream reached the listener");
         let registry = Arc::clone(&registry);
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
