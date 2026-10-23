@@ -59,10 +59,13 @@ struct Inner {
     state: snow::HandshakeState,
     /// Handshake bytes produced by the last read, waiting to be flushed.
     pending: Vec<u8>,
+    /// Whether the keys have been handed over. The engine upgrades one packet
+    /// space per handover (Initial → Handshake); the 1-RTT upgrade is asked
+    /// for again, and one handover is what the engine's own tests exercise.
+    keys_handed: u8,
     /// The peer's transport parameters, exactly as they arrived.
     theirs: Option<Vec<u8>>,
     complete: bool,
-    keys_handed: bool,
     hash: Vec<u8>,
 }
 
@@ -86,7 +89,7 @@ impl NoiseSession {
                 pending: Vec::new(),
                 theirs: None,
                 complete: false,
-                keys_handed: false,
+                keys_handed: 0,
                 hash: Vec::new(),
             }),
             Err(error) => {
@@ -240,12 +243,14 @@ impl Session for NoiseSession {
         buf.extend_from_slice(&state.pending);
         state.pending.clear();
 
-        if state.complete && !state.keys_handed {
-            state.keys_handed = true;
-            // The marker is queued for the *next* call: only after the engine
-            // has installed these keys is a packet encoded in the Handshake
-            // space, which is where the peer needs to see it.
-            state.pending.push(HANDSHAKE_DONE);
+        if state.complete && state.keys_handed < 1 {
+            state.keys_handed += 1;
+            if state.keys_handed == 1 {
+                // Queued for the *next* call, when the engine will encode it
+                // in the Handshake space. KK has no third message, and the
+                // engine promotes a connection only on a Handshake packet.
+                state.pending.push(HANDSHAKE_DONE);
+            }
             return Some(plain_keys());
         }
         None

@@ -455,6 +455,25 @@
 
 ## Open threads for the next cycle
 
+- **QUIC carrier, in progress: the engine wants one key handover per packet
+  space, and our adapter gives it one in total (2026-10-23).** Where it
+  stands: `src/transport/quic/` holds the socketless driver, the socket
+  task, the stream handles and a Noise-driven `Session`; the handshake
+  completes over a real loopback socket and both sides report `Connected`.
+  The stream round-trip is the open piece, and the symptom localises the
+  cause: a connected connection acknowledges nothing and retransmits its last
+  handshake packet forever (an endless 45-byte datagram), which is what a
+  connection with no 1-RTT keys looks like. The engine upgrades one space per
+  handover (`Initial → Handshake → 1-RTT`) and asks `write_handshake`
+  again each time; returning the keys a second time instead panics inside the
+  engine (`connection/mod.rs:2197`, "handshake should be complete"). Next
+  step is a synchronous repro — two `Driver`s, no tokio — to find the shape
+  the engine accepts before the record layer lands.
+- **The engine requires `handle_timeout` for every due timer** (2026-10-23,
+  fixed in the same arc): skipping it leaves an expired timer in the set, so
+  `poll_timeout` reports "now" forever and the driver spins without sending;
+  a PTO never fires either.
+
 - **The KCP sender now uses UDP GSO (2026-10-22, shipped), and it moved the
   carrier's two numbers in opposite directions for a reason worth keeping.**
   The shape: a batch already arrives as one iovec stream of equally sized

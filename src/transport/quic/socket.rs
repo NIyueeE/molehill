@@ -14,12 +14,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use bytes::BytesMut;
-use quinn_proto::{ClientConfig, ConnectionHandle, Event, ServerConfig};
+use quinn_proto::{ClientConfig, ConnectionHandle, Dir, Event, ServerConfig, StreamEvent};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
+use super::conn::{self, QuicStream};
 use super::driver::Driver;
 
 /// A command from the carrier's async surface into the task.
@@ -29,6 +30,10 @@ enum Command {
         config: ClientConfig,
         reply: oneshot::Sender<Result<ConnectionHandle, String>>,
     },
+    OpenStream {
+        connection: ConnectionHandle,
+        reply: oneshot::Sender<std::io::Result<QuicStream>>,
+    },
 }
 
 /// What the task needs to report upward: a connection the peer opened, and
@@ -36,6 +41,8 @@ enum Command {
 pub(crate) struct Channels {
     pub(crate) accepted: mpsc::UnboundedSender<ConnectionHandle>,
     pub(crate) events: mpsc::UnboundedSender<(ConnectionHandle, Event)>,
+    /// Every stream the peer opens, as soon as the engine reports it.
+    pub(crate) streams: mpsc::UnboundedSender<QuicStream>,
 }
 
 pub(crate) struct EndpointHandle {
@@ -68,6 +75,23 @@ impl EndpointHandle {
             .map_err(|_| anyhow!("the endpoint task is gone"))?
             .map_err(|reason| anyhow!(reason))
     }
+
+    /// Open a bidirectional stream on a live connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the peer's stream limit is exhausted, or the task is gone.
+    pub(crate) async fn open_stream(&self, connection: ConnectionHandle) -> Result<QuicStream> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::OpenStream { connection, reply })
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?;
+        answer
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?
+            .map_err(|error| anyhow!(error))
+    }
 }
 
 /// Spawn the task and return the handle the carrier talks to.
@@ -90,7 +114,8 @@ async fn run(
     channels: Channels,
     mut commands: mpsc::Receiver<Command>,
 ) {
-    let mut driver = Driver::new(server_config, allow_mtud);
+    let notify = Arc::new(Notify::new());
+    let mut driver = Driver::new(server_config, allow_mtud, Arc::clone(&notify));
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let now = Instant::now();
@@ -108,6 +133,16 @@ async fn run(
                         let outcome = driver
                             .connect(Instant::now(), config, remote)
                             .map_err(|error| format!("{error}"));
+                        let _ = reply.send(outcome);
+                    }
+                    Command::OpenStream { connection, reply } => {
+                        let outcome = match driver.shared(connection) {
+                            Some(shared) => conn::open(&shared),
+                            None => Err(std::io::Error::new(
+                                std::io::ErrorKind::NotConnected,
+                                "the connection is gone",
+                            )),
+                        };
                         let _ = reply.send(outcome);
                     }
                 }
@@ -132,6 +167,10 @@ async fn run(
                     }
                 }
             }
+            () = notify.notified() => {
+                // A stream wrote into the engine: `poll_transmit` below has
+                // something to send.
+            }
             () = &mut sleep => {
                 // A timer fired: `poll_transmit` below observes it.
             }
@@ -148,6 +187,7 @@ async fn run(
 /// Returns `false` when the socket is unusable, which ends the task.
 async fn drain(socket: &UdpSocket, driver: &mut Driver, channels: &Channels) -> bool {
     let now = Instant::now();
+    driver.handle_timeout(now);
     while let Some(outgoing) = driver.poll_transmit(now) {
         // Without GSO a coalesced buffer is one datagram, which is exactly
         // what a plain `send_to` does; segmentation only changes how the
@@ -163,6 +203,36 @@ async fn drain(socket: &UdpSocket, driver: &mut Driver, channels: &Channels) -> 
     driver.pump_endpoint_events();
     for handle in driver.handles() {
         while let Some(event) = driver.poll_event(handle) {
+            match &event {
+                Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
+                    // The engine reports "one or more"; hand each new stream
+                    // to the carrier, which decides what to do with it.
+                    if let Some(shared) = driver.shared(handle) {
+                        while let Some(stream) = conn::accept(&shared) {
+                            if channels.streams.send(stream).is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                // A stream handle parked one waker; this is what releases it.
+                Event::Stream(
+                    StreamEvent::Readable { id }
+                    | StreamEvent::Writable { id }
+                    | StreamEvent::Finished { id }
+                    | StreamEvent::Stopped { id, .. },
+                ) => {
+                    if let Some(shared) = driver.shared(handle) {
+                        shared.wake(*id);
+                    }
+                }
+                Event::ConnectionLost { .. } => {
+                    if let Some(shared) = driver.shared(handle) {
+                        shared.close();
+                    }
+                }
+                _ => {}
+            }
             if channels.events.send((handle, event)).is_err() {
                 return false;
             }
@@ -176,7 +246,8 @@ mod tests {
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
     use crate::transport::NoiseKeys;
-    use crate::transport::quic::{NoiseClientConfig, NoiseServerConfig, TokenKeys};
+    use crate::transport::quic::crypto::TokenKeys;
+    use crate::transport::quic::session::{NoiseClientConfig, NoiseServerConfig};
     use base64::Engine as _;
     use snow::params::NoiseParams;
     use std::time::Duration;
@@ -217,6 +288,8 @@ mod tests {
         let server_addr = server_socket.local_addr().expect("an address");
         let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
         let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
+        // Kept alive: a dropped receiver would make the task stop sending.
+        let (server_streams_tx, _server_streams_rx) = mpsc::unbounded_channel();
         let server_config = ServerConfig::new(
             Arc::new(NoiseServerConfig::new(
                 NoiseKeys::from_config(&server_cfg).expect("server keys"),
@@ -230,6 +303,7 @@ mod tests {
             Channels {
                 accepted: accepted_tx,
                 events: server_events_tx,
+                streams: server_streams_tx,
             },
         );
 
@@ -237,6 +311,7 @@ mod tests {
             .await
             .expect("a client socket");
         let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
         let (client_events_tx, mut client_events_rx) = mpsc::unbounded_channel();
         let (client, _client_task) = spawn(
             client_socket,
@@ -245,6 +320,7 @@ mod tests {
             Channels {
                 accepted: unused_tx,
                 events: client_events_tx,
+                streams: unused_streams_tx,
             },
         );
         let handle = client

@@ -15,9 +15,13 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use quinn_proto::{
-    AcceptError, ClientConfig, ConnectError, Connection, ConnectionHandle, DatagramEvent, Endpoint,
+    AcceptError, ClientConfig, ConnectError, ConnectionHandle, DatagramEvent, Endpoint,
     EndpointConfig, Event, Incoming, ServerConfig,
 };
+
+use tokio::sync::Notify;
+
+use super::conn::Shared;
 
 /// How many datagrams one `poll_transmit` may coalesce into a single send.
 ///
@@ -35,16 +39,22 @@ pub(crate) struct Outgoing {
 
 pub(crate) struct Driver {
     endpoint: Endpoint,
-    connections: BTreeMap<ConnectionHandle, Connection>,
+    connections: BTreeMap<ConnectionHandle, Arc<Shared>>,
     /// The server's handshake configuration, reused for every `accept`.
     server_config: Option<Arc<ServerConfig>>,
     /// A transmit the endpoint produced itself (version negotiation,
     /// stateless reset): it belongs to no connection, so it waits here.
     pending: Vec<Outgoing>,
+    /// Told whenever a stream puts bytes into the engine.
+    notify: Arc<Notify>,
 }
 
 impl Driver {
-    pub(crate) fn new(server_config: Option<Arc<ServerConfig>>, allow_mtud: bool) -> Self {
+    pub(crate) fn new(
+        server_config: Option<Arc<ServerConfig>>,
+        allow_mtud: bool,
+        notify: Arc<Notify>,
+    ) -> Self {
         Driver {
             endpoint: Endpoint::new(
                 Arc::new(EndpointConfig::new(super::crypto::ResetHmac::new())),
@@ -55,6 +65,7 @@ impl Driver {
             connections: BTreeMap::new(),
             server_config,
             pending: Vec::new(),
+            notify,
         }
     }
 
@@ -69,7 +80,8 @@ impl Driver {
         remote: SocketAddr,
     ) -> Result<ConnectionHandle, ConnectError> {
         let (handle, connection) = self.endpoint.connect(now, config, remote, "molehill")?;
-        self.connections.insert(handle, connection);
+        self.connections
+            .insert(handle, Shared::new(connection, Arc::clone(&self.notify)));
         Ok(handle)
     }
 
@@ -83,7 +95,8 @@ impl Driver {
         let (handle, connection) =
             self.endpoint
                 .accept(incoming, now, &mut scratch, self.server_config.clone())?;
-        self.connections.insert(handle, connection);
+        self.connections
+            .insert(handle, Shared::new(connection, Arc::clone(&self.notify)));
         Ok(handle)
     }
 
@@ -102,8 +115,8 @@ impl Driver {
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => Some(incoming),
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                if let Some(connection) = self.connections.get_mut(&handle) {
-                    connection.handle_event(event);
+                if let Some(shared) = self.connections.get(&handle) {
+                    shared.connection.lock().handle_event(event);
                 }
                 None
             }
@@ -125,7 +138,9 @@ impl Driver {
             return Some(self.pending.remove(0));
         }
         let mut scratch = Vec::new();
-        for connection in self.connections.values_mut() {
+        for shared in self.connections.values() {
+            scratch.clear();
+            let mut connection = shared.connection.lock();
             if let Some(transmit) = connection.poll_transmit(now, MAX_DATAGRAMS, &mut scratch) {
                 return Some(Outgoing {
                     destination: transmit.destination,
@@ -137,11 +152,29 @@ impl Driver {
         None
     }
 
+    /// Consume every timer that has come due.
+    ///
+    /// The engine keeps an expired timer in its set until the driver says so:
+    /// without this call `poll_timeout` reports "now" forever and the loop
+    /// spins, and a PTO never fires.
+    pub(crate) fn handle_timeout(&mut self, now: Instant) {
+        for shared in self.connections.values() {
+            let mut connection = shared.connection.lock();
+            if connection
+                .poll_timeout()
+                .is_some_and(|deadline| deadline <= now)
+            {
+                connection.handle_timeout(now);
+            }
+        }
+    }
+
     /// When the driver next has work to do, whichever connection is earliest.
     pub(crate) fn poll_timeout(&mut self) -> Option<Instant> {
         self.connections
-            .values_mut()
-            .filter_map(Connection::poll_timeout)
+            .values()
+            .map(|shared| shared.connection.lock())
+            .filter_map(|mut connection| connection.poll_timeout())
             .min()
     }
 
@@ -155,17 +188,17 @@ impl Driver {
         let handles: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
         for handle in handles {
             loop {
-                let Some(event) = self
+                let event = self
                     .connections
-                    .get_mut(&handle)
-                    .and_then(Connection::poll_endpoint_events)
-                else {
+                    .get(&handle)
+                    .and_then(|shared| shared.connection.lock().poll_endpoint_events());
+                let Some(event) = event else {
                     break;
                 };
                 let reply = self.endpoint.handle_event(handle, event);
                 if let Some(reply) = reply {
-                    if let Some(connection) = self.connections.get_mut(&handle) {
-                        connection.handle_event(reply);
+                    if let Some(shared) = self.connections.get(&handle) {
+                        shared.connection.lock().handle_event(reply);
                     }
                 }
             }
@@ -174,20 +207,18 @@ impl Driver {
 
     /// The next event this connection has for its owner.
     pub(crate) fn poll_event(&mut self, handle: ConnectionHandle) -> Option<Event> {
-        self.connections.get_mut(&handle)?.poll()
+        self.connections.get(&handle)?.connection.lock().poll()
     }
 
-    pub(crate) fn connection_mut(&mut self, handle: ConnectionHandle) -> Option<&mut Connection> {
-        self.connections.get_mut(&handle)
+    /// The connection's shared state, for a task that opens or accepts
+    /// streams on it.
+    pub(crate) fn shared(&self, handle: ConnectionHandle) -> Option<Arc<Shared>> {
+        self.connections.get(&handle).cloned()
     }
 
     /// Every live connection, for a driver that routes events by handle.
     pub(crate) fn handles(&self) -> Vec<ConnectionHandle> {
         self.connections.keys().copied().collect()
-    }
-
-    pub(crate) fn remove(&mut self, handle: ConnectionHandle) {
-        self.connections.remove(&handle);
     }
 }
 
@@ -196,7 +227,7 @@ mod tests {
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
     use crate::transport::NoiseKeys;
-    use crate::transport::quic::TokenKeys;
+    use crate::transport::quic::crypto::TokenKeys;
     use crate::transport::quic::session::{NoiseClientConfig, NoiseServerConfig};
     use base64::Engine as _;
     use snow::params::NoiseParams;
@@ -260,8 +291,12 @@ mod tests {
             )),
             TokenKeys::new(),
         );
-        let mut server = Driver::new(Some(Arc::new(server_config)), false);
-        let mut client = Driver::new(None, false);
+        let mut server = Driver::new(
+            Some(Arc::new(server_config)),
+            false,
+            Arc::new(Notify::new()),
+        );
+        let mut client = Driver::new(None, false, Arc::new(Notify::new()));
         let mut clock = Instant::now();
         let handle = client
             .connect(

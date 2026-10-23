@@ -17,12 +17,8 @@
 //! goes as it is. What that costs is written down in `docs/transport.md`
 //! ("The UDP carrier") and in `docs/internals.md`.
 
+mod conn;
 mod crypto;
 mod driver;
 mod session;
 mod socket;
-
-pub(crate) use crypto::{PlainHeaderKey, PlainPacketKey, ResetHmac, TokenKeys, plain_keys};
-pub(crate) use driver::{Driver, MAX_DATAGRAMS, Outgoing};
-pub(crate) use session::{HandshakeData, NoiseClientConfig, NoiseServerConfig};
-pub(crate) use socket::{Channels, EndpointHandle, spawn};
