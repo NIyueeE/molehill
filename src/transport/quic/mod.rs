@@ -21,5 +21,6 @@ mod conn;
 mod crypto;
 mod driver;
 mod record;
+mod seam;
 mod session;
 mod socket;

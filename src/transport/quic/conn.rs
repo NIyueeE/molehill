@@ -343,7 +343,7 @@ impl AsyncRead for QuicStream {
                 Err(ReadableError::IllegalOrderedRead) => return Poll::Ready(Err(gone())),
                 Err(ReadableError::ClosedStream) => return Poll::Ready(Err(gone())),
             };
-            let mut scratch = vec![0u8; MAX_PLAINTEXT + 2 + super::record::TAG_LEN];
+            let scratch = vec![0u8; MAX_PLAINTEXT + 2 + super::record::TAG_LEN];
             loop {
                 match chunks.next(scratch.len()) {
                     Ok(Some(chunk)) => this.read.raw.extend_from_slice(&chunk.bytes),

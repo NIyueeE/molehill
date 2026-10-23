@@ -10,13 +10,14 @@
 //! driver already reports a GSO segment size, and the only change is which
 //! syscall carries the bytes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use bytes::BytesMut;
+use parking_lot::Mutex;
 use quinn_proto::{ClientConfig, ConnectionHandle, Dir, Event, ServerConfig, StreamEvent};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -38,6 +39,11 @@ enum Command {
         /// data_enable.
         encrypt: bool,
         reply: oneshot::Sender<std::io::Result<QuicStream>>,
+    },
+    /// Wait for a connection's handshake.
+    AwaitConnected {
+        connection: ConnectionHandle,
+        reply: oneshot::Sender<()>,
     },
     /// Connect and open one stream, answering only once the handshake is up:
     /// the shape a direct data channel has.
@@ -66,6 +72,12 @@ pub(crate) struct Channels {
 
 pub(crate) struct EndpointHandle {
     commands: mpsc::Sender<Command>,
+    /// Every connection the task still holds, so a carrier can answer
+    /// "is this one alive" without guessing.
+    live: Arc<Mutex<HashSet<ConnectionHandle>>>,
+    /// The ones whose handshake is done: a stream cannot be opened before
+    /// that, so the seam waits on this instead of failing.
+    connected: Arc<Mutex<HashSet<ConnectionHandle>>>,
 }
 
 impl EndpointHandle {
@@ -128,6 +140,27 @@ impl EndpointHandle {
             .map_err(|error| anyhow!(error))
     }
 
+    /// Whether the task still holds this connection.
+    pub(crate) fn is_alive(&self, connection: ConnectionHandle) -> bool {
+        self.live.lock().contains(&connection)
+    }
+
+    /// Wait until the handshake allows a stream on this connection.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the connection is gone, or the task is gone.
+    pub(crate) async fn await_connected(&self, connection: ConnectionHandle) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::AwaitConnected { connection, reply })
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))?;
+        answer
+            .await
+            .map_err(|_| anyhow!("the endpoint task is gone"))
+    }
+
     pub(crate) async fn open_stream(
         &self,
         connection: ConnectionHandle,
@@ -157,8 +190,22 @@ pub(crate) fn spawn(
     channels: Channels,
 ) -> (EndpointHandle, tokio::task::JoinHandle<()>) {
     let (commands, inbox) = mpsc::channel(16);
-    let handle = EndpointHandle { commands };
-    let task = tokio::spawn(run(socket, server_config, allow_mtud, channels, inbox));
+    let live = Arc::new(Mutex::new(HashSet::new()));
+    let connected = Arc::new(Mutex::new(HashSet::new()));
+    let handle = EndpointHandle {
+        commands,
+        live: Arc::clone(&live),
+        connected: Arc::clone(&connected),
+    };
+    let task = tokio::spawn(run(
+        socket,
+        server_config,
+        allow_mtud,
+        channels,
+        inbox,
+        live,
+        connected,
+    ));
     (handle, task)
 }
 
@@ -168,10 +215,13 @@ async fn run(
     allow_mtud: bool,
     channels: Channels,
     mut commands: mpsc::Receiver<Command>,
+    live: Arc<Mutex<HashSet<ConnectionHandle>>>,
+    connected: Arc<Mutex<HashSet<ConnectionHandle>>>,
 ) {
     let notify = Arc::new(Notify::new());
     let mut driver = Driver::new(server_config, allow_mtud, Arc::clone(&notify));
     let mut waiting: HashMap<ConnectionHandle, Waiting> = HashMap::new();
+    let mut waiters: HashMap<ConnectionHandle, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let now = Instant::now();
@@ -189,7 +239,20 @@ async fn run(
                         let outcome = driver
                             .connect(Instant::now(), config, remote)
                             .map_err(|error| format!("{error}"));
+                        if let Ok(handle) = &outcome {
+                            live.lock().insert(*handle);
+                        }
                         let _ = reply.send(outcome);
+                    }
+                    Command::AwaitConnected { connection, reply } => {
+                        if connected.lock().contains(&connection) {
+                            let _ = reply.send(());
+                        } else if live.lock().contains(&connection) {
+                            waiters.entry(connection).or_default().push(reply);
+                        } else {
+                            // Gone: let the caller's next call report it.
+                            let _ = reply.send(());
+                        }
                     }
                     Command::ConnectStream {
                         remote,
@@ -198,6 +261,7 @@ async fn run(
                         reply,
                     } => match driver.connect(Instant::now(), config, remote) {
                         Ok(handle) => {
+                            live.lock().insert(handle);
                             waiting.insert(handle, Waiting { reply, encrypt });
                         }
                         Err(error) => {
@@ -227,6 +291,7 @@ async fn run(
                         if let Some(incoming) = driver.on_datagram(Instant::now(), remote, data) {
                             match driver.accept(Instant::now(), incoming) {
                                 Ok(handle) => {
+                                    live.lock().insert(handle);
                                     let _ = channels.accepted.send(handle);
                                 }
                                 Err(error) => {
@@ -249,7 +314,17 @@ async fn run(
             }
         }
 
-        if !drain(&socket, &mut driver, &channels, &mut waiting).await {
+        if !drain(
+            &socket,
+            &mut driver,
+            &channels,
+            &mut waiting,
+            &mut waiters,
+            &live,
+            &connected,
+        )
+        .await
+        {
             break;
         }
     }
@@ -263,6 +338,9 @@ async fn drain(
     driver: &mut Driver,
     channels: &Channels,
     waiting: &mut HashMap<ConnectionHandle, Waiting>,
+    waiters: &mut HashMap<ConnectionHandle, Vec<oneshot::Sender<()>>>,
+    live: &Arc<Mutex<HashSet<ConnectionHandle>>>,
+    connected: &Arc<Mutex<HashSet<ConnectionHandle>>>,
 ) -> bool {
     let now = Instant::now();
     driver.handle_timeout(now);
@@ -321,6 +399,12 @@ async fn drain(
                     }
                 }
                 Event::Connected => {
+                    connected.lock().insert(handle);
+                    if let Some(waiters) = waiters.remove(&handle) {
+                        for waiter in waiters {
+                            let _ = waiter.send(());
+                        }
+                    }
                     // A caller asking for a stream waits for exactly this.
                     if let Some(waiting) = waiting.remove(&handle) {
                         let outcome = match driver.shared(handle) {
@@ -334,6 +418,9 @@ async fn drain(
                     }
                 }
                 Event::ConnectionLost { .. } => {
+                    live.lock().remove(&handle);
+                    connected.lock().remove(&handle);
+                    waiters.remove(&handle);
                     if let Some(shared) = driver.shared(handle) {
                         shared.close();
                     }
