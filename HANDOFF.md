@@ -504,39 +504,34 @@
   hands out a stream *factory*. That asymmetry is why the seam sits at the
   stream level and why each carrier owns its connection type; a seam at the
   byte-stream level cannot express the UDP carrier at all.
-  **The remaining order, each step green on its own:** (1) the pool holds
-  `Arc<dyn CarrierConn>` beside its counters — placement keeps reading the
-  counters, repair reads `is_alive()`, and the yamux-only calls
-  (`note_peer_health`, snapshot, drain) stay where the carrier fills them;
-  (2) un-gate the seam, in the same commit as (1) because a trait nothing
-  calls is dead code; (3) the lanes dial through the UDP carrier — a lane *is*
+  **The remaining order, each step green on its own:** (1) the pool holds the
+  seam — done (below); (2) the lanes dial through the UDP carrier — a lane *is*
   a direct channel, so this is `connect_direct_channel`'s QUIC branch plus the
-  server's UDP accept, and it is what makes the L3 arm measurable; (4) the
-  gates in one run; (5) the
-  rename to `Udp` with the implementation swap, KCP's deletion, the four
-  feature lists, the status JSON, the bench vocabulary and the wire's move
-  to 6.0 — the constant, which is what refuses a 5.2 peer; (6) the release
-  ritual.
-  **The pool's stream-type switch, measured (2026-10-23).** Two of the three
-  coupled edits have landed, and the third ran into an obstacle worth recording.
-  Landed in `e57716d`: `MuxStream` **is** `CarrierStream` (a yamux stream boxes
-  into it at the two places one leaves the driver), and `CarrierIo`/
-  `CarrierStream` are no longer behind the `quic` feature, so every build
-  carries the carrier-neutral stream type; `ClientTunnel::open_stream` is
-  `pub(crate)` for the same reason. What remains is the handle: `PoolEntry`
-  and `Reservation` carry `Arc<dyn CarrierConn>`, `complete()` opens through
-  it, `OpenError::Refused` takes `StreamError` instead of
-  `yamux::ConnectionError`, `impl CarrierConn for ClientTunnel` carries the
-  carrier the pool already knows (a field set at `start_with_health`, `Tcp`
-  for `start`), and `MuxConn` with `tcp.rs`'s seam test go away — all in one
-  commit with the un-gate, because `-D warnings` refuses a trait nothing calls.
-  **The obstacle: `CarrierConn::stats` is `async` and has no production
-  caller.** Placement and the status snapshot are synchronous, and yamux reads
-  its counters directly, so un-gating as it stands puts an unused trait method
-  into every default build. Two ways out, both real work: make `stats`
-  synchronous and read it from the status snapshot — which forces `UdpConn` to
-  cache what the socket task learns — or land it with step (3), when a lane
-  calls it and a test is no longer the only caller.
+  server's UDP accept, and it is what makes the L3 arm measurable; (3) the gates
+  in one run; (4) the rename to `Udp` with the implementation swap, KCP's
+  deletion, the four feature lists, the status JSON, the bench vocabulary and
+  the wire's move to 6.0 — the constant, which is what refuses a 5.2 peer;
+  (5) the release ritual.
+  **The pool's stream-type switch, landed (2026-10-23).** `MuxStream` **is**
+  `CarrierStream` (`e57716d`: a yamux stream boxes into it at the two places
+  one leaves the driver, and `CarrierIo`/`CarrierStream` left the `quic`
+  feature). The pool now holds the seam: `PoolEntry`/`Reservation` carry
+  `Arc<dyn CarrierConn>`, `complete()` opens through the trait and classifies
+  its two errors (`Busy` is a refusal the open falls through on, `Closed` a
+  death it repairs), repair reads `is_alive()`, `OpenError::Refused` carries
+  `StreamError`, and `CarrierConn`/`StreamError` are un-gated. `MuxConn` is
+  gone; `impl CarrierConn for ClientTunnel` is the TCP carrier's whole side.
+  `ClientTunnel::start_with_health` keeps its signature because the carrier
+  turned out not to belong on it (below).
+  **Two trait items were dropped rather than invented**, and the reasons are the
+  design. `stats` had no production caller — placement and the status snapshot
+  are synchronous and non-blocking, and a synchronous reading has nothing to read
+  until the UDP carrier caches what its engine reports — so it stays an inherent
+  method on `UdpConn` until the lanes need it. `carrier()` made a second source
+  of truth for a fact the pool already records per entry, and the first fixture
+  that simulated a carrier (a pool labelled `kcp` over loopback yamux sessions)
+  made the two disagree: the snapshot column is the pool's record, and the trait
+  does not repeat it.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;

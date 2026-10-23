@@ -75,83 +75,14 @@ impl TcpTransport {
     }
 }
 
-/// One yamux session over one connection, seen through the seam.
-///
-/// The session is the same whether its bytes travel over TCP or over the KCP
-/// carrier, so the carrier is a field rather than the type's name: the pool
-/// knows which one it dialed, and this handle repeats that instead of
-/// guessing it from the code path.
-#[cfg(feature = "multiplex")]
-#[cfg(feature = "quic")]
-pub(crate) struct MuxConn {
-    tunnel: super::multiplex::ClientTunnel,
-    carrier: super::carrier::Carrier,
-}
-
-#[cfg(feature = "multiplex")]
-#[cfg(feature = "quic")]
-impl MuxConn {
-    /// Start the session over an established byte stream.
-    pub(crate) fn new<I>(
-        io: I,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-        carrier: super::carrier::Carrier,
-    ) -> Self
-    where
-        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        Self {
-            tunnel: super::multiplex::ClientTunnel::start(
-                io,
-                super::multiplex::mux_config(),
-                shutdown,
-            ),
-            carrier,
-        }
-    }
-}
-
-#[cfg(feature = "multiplex")]
-#[async_trait::async_trait]
-#[cfg(feature = "quic")]
-impl super::carrier::CarrierConn for MuxConn {
-    async fn open_stream(
-        &self,
-    ) -> Result<super::carrier::CarrierStream, super::carrier::StreamError> {
-        match self.tunnel.open_stream().await {
-            Ok(stream) => Ok(stream),
-            Err(crate::transport::tcp::mux::ConnectionError::TooManyStreams) => {
-                Err(super::carrier::StreamError::Busy)
-            }
-            Err(_) => Err(super::carrier::StreamError::Closed),
-        }
-    }
-
-    fn carrier(&self) -> super::carrier::Carrier {
-        self.carrier
-    }
-
-    fn is_alive(&self) -> bool {
-        self.tunnel.is_alive()
-    }
-
-    async fn stats(&self) -> super::carrier::CarrierStats {
-        // yamux counts the streams; the kernel keeps the losses and has no
-        // round-trip estimate to offer, so the carrier reports none rather
-        // than inventing one.
-        super::carrier::CarrierStats {
-            streams: self.tunnel.counters.streams(),
-            rtt: self.tunnel.counters.rtt(),
-            lost_packets: 0,
-        }
-    }
-}
-
 #[cfg(all(test, feature = "multiplex"))]
-#[cfg(feature = "quic")]
 mod seam_tests {
-    use super::*;
-    use crate::transport::carrier::CarrierConn as _;
+    #![expect(
+        clippy::expect_used,
+        reason = "tests unwrap values they just constructed"
+    )]
+    use super::super::multiplex::{ClientTunnel, mux_config};
+    use crate::transport::carrier::CarrierConn;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -164,9 +95,9 @@ mod seam_tests {
             tx,
         ));
         let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let conn = MuxConn::new(client_io, shutdown_rx, super::super::carrier::Carrier::Tcp);
+        let conn = ClientTunnel::start(client_io, mux_config(), shutdown_rx);
 
-        let mut stream = conn.open_stream().await.expect("a stream");
+        let mut stream = CarrierConn::open_stream(&conn).await.expect("a stream");
         stream.write_all(b"hello").await.expect("the write");
         stream.flush().await.expect("the flush");
 
@@ -182,7 +113,6 @@ mod seam_tests {
             .expect("the read succeeds");
         assert_eq!(&buf, b"hello");
 
-        assert_eq!(conn.carrier(), super::super::carrier::Carrier::Tcp);
-        assert!(conn.is_alive());
+        assert!(CarrierConn::is_alive(&conn));
     }
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use quinn_proto::ConnectionHandle;
 
 use super::socket::EndpointHandle;
-use crate::transport::carrier::{Carrier, CarrierConn, CarrierStream, StreamError};
+use crate::transport::carrier::{CarrierConn, CarrierStream, StreamError};
 
 pub(crate) struct UdpConn {
     endpoint: Arc<EndpointHandle>,
@@ -35,6 +35,15 @@ impl UdpConn {
             encrypt,
         }
     }
+
+    /// What the engine says about this connection.
+    ///
+    /// Deliberately not on the seam: nothing above it reads a carrier's
+    /// counters yet, and the readers that will (placement, the status
+    /// snapshot) are synchronous, so the shape has to wait for them.
+    pub(crate) async fn stats(&self) -> crate::transport::carrier::CarrierStats {
+        self.endpoint.stats(self.handle).await.unwrap_or_default()
+    }
 }
 
 #[async_trait::async_trait]
@@ -53,18 +62,8 @@ impl CarrierConn for UdpConn {
         }
     }
 
-    fn carrier(&self) -> Carrier {
-        // The UDP carrier's slot. It keeps the name of the implementation that
-        // fills it today; the rename and the swap land in the same commit.
-        Carrier::Kcp
-    }
-
     fn is_alive(&self) -> bool {
         self.endpoint.is_alive(self.handle)
-    }
-
-    async fn stats(&self) -> crate::transport::carrier::CarrierStats {
-        self.endpoint.stats(self.handle).await.unwrap_or_default()
     }
 }
 
@@ -120,7 +119,7 @@ mod tests {
     async fn a_stream_carries(
         conn: Arc<dyn CarrierConn>,
         mut inbound: mpsc::UnboundedReceiver<CarrierStream>,
-    ) -> crate::transport::carrier::CarrierStats {
+    ) {
         let mut out = conn.open_stream().await.expect("a stream");
         out.write_all(b"through the seam").await.expect("the write");
         out.flush().await.expect("the flush");
@@ -146,7 +145,6 @@ mod tests {
             .expect("the read succeeds");
         assert_eq!(&answer[..read], b"back");
         assert!(conn.is_alive(), "the connection should still be alive");
-        conn.stats().await
     }
 
     #[tokio::test]
@@ -167,16 +165,12 @@ mod tests {
             }
         });
         let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
-        let conn = crate::transport::tcp::MuxConn::new(
+        let conn = crate::transport::multiplex::ClientTunnel::start(
             client_io,
+            crate::transport::multiplex::mux_config(),
             shutdown,
-            crate::transport::carrier::Carrier::Tcp,
         );
-        let stats = a_stream_carries(Arc::new(conn), streams_rx).await;
-        assert_eq!(
-            stats.lost_packets, 0,
-            "the kernel keeps its losses where userspace cannot read them"
-        );
+        a_stream_carries(Arc::new(conn), streams_rx).await;
     }
 
     #[tokio::test]
@@ -242,8 +236,9 @@ mod tests {
             .await
             .expect("the client connects");
 
-        let conn = UdpConn::new(Arc::clone(&client), handle, true);
-        let stats = a_stream_carries(Arc::new(conn), streams_rx).await;
+        let conn = Arc::new(UdpConn::new(Arc::clone(&client), handle, true));
+        a_stream_carries(conn.clone(), streams_rx).await;
+        let stats = conn.stats().await;
         assert!(
             stats.rtt.is_some(),
             "the engine reports the path's round trip"

@@ -21,7 +21,7 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::Poll;
 
-use crate::transport::carrier::Carrier;
+use crate::transport::carrier::{Carrier, StreamError};
 // The pool still drives the engine directly; the alias keeps that visible
 // (and the signatures short) until the seam rewrite removes it.
 use crate::transport::tcp::mux as yamux;
@@ -573,6 +573,9 @@ struct PoolEntry {
     /// Draining entries keep established streams but receive no new opens.
     phase: TunnelPhase,
     tunnel: ClientTunnel,
+    /// The same connection through the carrier seam: the pool opens streams and
+    /// asks about liveness here, so no placement or repair path names an engine.
+    conn: std::sync::Arc<dyn crate::transport::carrier::CarrierConn>,
     /// Dropping this ends the driver; the pool holds it for the tunnel's whole
     /// life, so removal actually releases the connection.
     _shutdown: tokio::sync::watch::Sender<bool>,
@@ -594,6 +597,9 @@ struct Reservation {
     pool: std::sync::Weak<PoolShared>,
     placement: Placement,
     tunnel: ClientTunnel,
+    /// The reserved tunnel's seam handle, so the open itself goes through the
+    /// trait the pool holds rather than through a carrier's concrete type.
+    conn: std::sync::Arc<dyn crate::transport::carrier::CarrierConn>,
 }
 
 /// What one pool needs to create a new tunnel: the dialer, plus the shutdown
@@ -623,7 +629,7 @@ pub(crate) enum OpenError {
     /// The pool has no tunnel at all (nothing established, no dialer).
     NoTunnel,
     /// Every candidate tunnel refused the stream.
-    Refused(yamux::ConnectionError),
+    Refused(crate::transport::carrier::StreamError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
     /// the pool could not reach its count (its own `tunnels`, or the server's
     /// `max_tunnels` valve), or the carrier's dial failed.
@@ -1012,10 +1018,12 @@ impl TunnelPool {
             handover: None,
         };
         for (tunnel, shutdown) in initial {
+            let conn = std::sync::Arc::new(tunnel.clone());
             state.entries.push(PoolEntry {
                 carrier,
                 phase: TunnelPhase::Serving,
                 tunnel,
+                conn,
                 _shutdown: shutdown,
             });
         }
@@ -1880,7 +1888,7 @@ impl TunnelPool {
             state.handover = None;
             return;
         };
-        if !state.entries[index].tunnel.is_alive() {
+        if !state.entries[index].conn.is_alive() {
             state.entries.remove(index);
             state.handover = None;
             drop(state);
@@ -2328,6 +2336,7 @@ impl TunnelPool {
                 fallback,
             },
             tunnel: entry.tunnel.clone(),
+            conn: std::sync::Arc::clone(&entry.conn),
         })
     }
 
@@ -2355,9 +2364,10 @@ impl TunnelPool {
             pool,
             mut placement,
             tunnel,
+            conn,
         } = reservation;
         let counters = std::sync::Arc::clone(&tunnel.counters);
-        match tunnel.open_stream().await {
+        match conn.open_stream().await {
             Ok(stream) => {
                 counters.charge();
                 // `chosen_load` is what the tunnel looks like *after* its open;
@@ -2381,20 +2391,20 @@ impl TunnelPool {
                     tunnel = index,
                     "pool-stats: tunnel refused an open: {e}"
                 );
-                let note = if matches!(e, yamux::ConnectionError::TooManyStreams) {
+                let note = if matches!(e, StreamError::Busy) {
                     // A cap hit is a refusal of this open, never a death:
                     // record it and report it back to the caller.
                     PlacementStats::record(placement, started.elapsed(), Some("too_many_streams"));
                     return Err(OpenError::Refused(e));
                 } else {
-                    if matches!(e, yamux::ConnectionError::Closed) {
+                    if matches!(e, StreamError::Closed) {
                         // A tunnel died, so a retried growth is meaningful
                         // again: cut the failed-growth hold short (D14). The
                         // tunnel itself is marked dead here rather than left
                         // for the maintenance tick: the driver task may be
                         // parked on a socket that will never wake, and until
                         // the reap runs, placement keeps choosing it.
-                        tunnel.mark_dead();
+                        conn.mark_dead();
                         self.release_growth_hold();
                     }
                     "fallback"
@@ -2407,7 +2417,7 @@ impl TunnelPool {
                 while let Some(mut next) = self.reserve(&tried, avoid, ceiling) {
                     tried.push(next.index);
                     next.placement.fallback = true;
-                    match next.tunnel.open_stream().await {
+                    match next.conn.open_stream().await {
                         Ok(stream) => {
                             let counters = std::sync::Arc::clone(&next.tunnel.counters);
                             counters.charge();
@@ -2426,9 +2436,9 @@ impl TunnelPool {
                         }
                         Err(e) => {
                             next.tunnel.counters.release();
-                            if matches!(e, yamux::ConnectionError::Closed) {
+                            if matches!(e, StreamError::Closed) {
                                 // Another dead tunnel: same as above (D14).
-                                next.tunnel.mark_dead();
+                                next.conn.mark_dead();
                                 self.release_growth_hold();
                             }
                             last = e;
@@ -2527,10 +2537,12 @@ impl TunnelPool {
             return Err("the pool reached its configured tunnel count while dialing".to_owned());
         }
         let from = state.entries.len();
+        let conn = std::sync::Arc::new(tunnel.clone());
         state.entries.push(PoolEntry {
             carrier: wanted,
             phase: TunnelPhase::Serving,
             tunnel,
+            conn,
             _shutdown: shutdown,
         });
         if state.handover.as_ref().is_some_and(|handover| {
@@ -3659,14 +3671,6 @@ impl ClientTunnel {
         self.alive.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Mark the tunnel dead from the pool's side. An open that already saw
-    /// `Closed` is proof the connection is gone, and waiting for the driver
-    /// task to notice would leave the corpse placeable for a whole tick.
-    pub(crate) fn mark_dead(&self) {
-        self.alive
-            .store(false, std::sync::atomic::Ordering::Release);
-    }
-
     /// Open a new data channel as a multiplexed stream.
     pub(crate) async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
         let (tx, rx) = oneshot::channel();
@@ -3675,6 +3679,40 @@ impl ClientTunnel {
             .await
             .map_err(|_| yamux::ConnectionError::Closed)?;
         rx.await.map_err(|_| yamux::ConnectionError::Closed)?
+    }
+}
+
+/// The TCP carrier's side of the seam.
+///
+/// The only thing the seam needs that yamux does not already have is its two
+/// error classes: "this tunnel is full" is a refusal the pool retries
+/// elsewhere, and "this tunnel is gone" is a death it repairs. Collapsing them
+/// would either repair a healthy tunnel or place work on a corpse.
+#[async_trait::async_trait]
+impl crate::transport::carrier::CarrierConn for ClientTunnel {
+    async fn open_stream(
+        &self,
+    ) -> Result<crate::transport::carrier::CarrierStream, crate::transport::carrier::StreamError>
+    {
+        match self.open_stream().await {
+            Ok(stream) => Ok(stream),
+            Err(yamux::ConnectionError::TooManyStreams) => {
+                Err(crate::transport::carrier::StreamError::Busy)
+            }
+            Err(_) => Err(crate::transport::carrier::StreamError::Closed),
+        }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.is_alive()
+    }
+
+    /// Mark the tunnel dead from the pool's side. An open that already saw
+    /// `Closed` is proof the connection is gone, and waiting for the driver
+    /// task to notice would leave the corpse placeable for a whole tick.
+    fn mark_dead(&self) {
+        self.alive
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -5758,7 +5796,7 @@ mod tests {
             .first()
             .map(|e| e.tunnel.clone())
             .expect("two tunnels");
-        victim.mark_dead();
+        crate::transport::carrier::CarrierConn::mark_dead(&victim);
 
         // The tick reaps it and dials one replacement, up to the count.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

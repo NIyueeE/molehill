@@ -428,7 +428,6 @@ pub(crate) type CarrierStream = Box<dyn CarrierIo>;
 
 /// Why a carrier could not produce a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(feature = "quic")]
 pub(crate) enum StreamError {
     /// The connection is gone; the pool repairs it.
     Closed,
@@ -436,7 +435,6 @@ pub(crate) enum StreamError {
     Busy,
 }
 
-#[cfg(feature = "quic")]
 impl std::fmt::Display for StreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -446,7 +444,6 @@ impl std::fmt::Display for StreamError {
     }
 }
 
-#[cfg(feature = "quic")]
 impl std::error::Error for StreamError {}
 
 /// What a carrier can say about one connection.
@@ -463,29 +460,37 @@ pub(crate) struct CarrierStats {
 
 /// One carrier connection, as the pool and the lanes see it.
 ///
-/// What a carrier has to answer is deliberately small: hand out a stream,
-/// say which carrier it is, and say whether it is still alive. Everything
-/// else — how many streams are open, which one is idle, how its round trip
-/// looks — is the carrier's own bookkeeping behind this line.
+/// What a carrier has to answer is deliberately small: hand out a stream, say
+/// whether it is still alive, and treat itself as gone when the pool has proved
+/// it. Which carrier it is stays the *pool's* record, per entry: asking the
+/// connection to repeat it would be a second source of truth for one fact, and
+/// the first fixture that simulated a carrier made the two disagree.
+///
+/// There is deliberately no `stats` here yet. Its two consumers, placement and
+/// the status snapshot, are synchronous and non-blocking by design, so an
+/// `async` reading has the wrong shape and a synchronous one has nothing to
+/// read until the UDP carrier caches what its engine reports. It arrives with
+/// its first caller: a method nothing calls is dead code, and the gate says so.
 #[async_trait::async_trait]
-#[cfg(feature = "quic")]
 pub(crate) trait CarrierConn: Send + Sync {
     /// A new stream on this connection.
     ///
     /// # Errors
     ///
-    /// Fails with StreamError::Closed when the connection is gone and
-    /// StreamError::Busy when the peer's limit is reached for now.
+    /// Fails with [`StreamError::Closed`] when the connection is gone and
+    /// [`StreamError::Busy`] when the peer's limit is reached for now.
     async fn open_stream(&self) -> Result<CarrierStream, StreamError>;
-
-    /// Which carrier this connection is.
-    fn carrier(&self) -> Carrier;
 
     /// Whether the connection still carries anything.
     fn is_alive(&self) -> bool;
 
-    /// What this connection can report about itself.
-    async fn stats(&self) -> CarrierStats;
+    /// Treat the connection as dead.
+    ///
+    /// The pool calls this when an open already proved the peer is gone: waiting
+    /// for the driver task to notice would leave the corpse placeable for a
+    /// whole maintenance tick. A carrier whose state is its engine's has nothing
+    /// to do here — the engine reports the close and [`Self::is_alive`] follows.
+    fn mark_dead(&self) {}
 }
 
 #[cfg(test)]
