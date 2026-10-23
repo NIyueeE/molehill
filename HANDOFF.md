@@ -617,6 +617,16 @@
   in order: whether connect_udp_carrier runs at all for a transparent claim (and
   whether its failure falls back to TCP, which would have made the visitor work),
   then whether the address the client dials is the one the server's endpoint bound.
+  **Both of those checks answer cleanly (2026-10-23):** parsing.rs:204 says a
+  transparent service does *not* uses_pool, so its channels are direct channels and
+  connect_udp_carrier does run; and the run's own configs show the client's
+  default_remote_addr equal to the server's data bind_addr (10.10.0.254:2400 both),
+  so the dial target is the socket the server bound. A client that dials the right
+  address and a server that accepts nothing, with no fallback visible in the
+  visitor's behaviour, leaves two candidates: the handshake packets are lost before
+  the endpoint sees them, or the dial never returns and the lane is blocked behind
+  its budget. The next observation is on the client: log the carrier outcome
+  (succeeded or fell back, with the reason) at info in connect_udp_carrier.
   pass a log level through the bench adapter (a method-level change, so it belongs
   in the fingerprint) or hand-start a pair outside the harness — a transparent
   claim needs TUN and root, both available here.
