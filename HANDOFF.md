@@ -626,6 +626,15 @@
   visitor's behaviour, leaves two candidates: the handshake packets are lost before
   the endpoint sees them, or the dial never returns and the lane is blocked behind
   its budget. The next observation is on the client: log the carrier outcome
+  **The handshake works — 31 times (2026-10-23).** With the client logging its
+  carrier outcome, one arm of the same smoke reports 31 lines of "Direct data
+  channel came up on the UDP carrier". So the client's QUIC handshake completes and
+  the server's endpoint answers it: the engine, the Noise session and the pass-through
+  keys are all fine. What is still silent is the server's own handler — neither a
+  successful dispatch nor a channel-end line appears, so the accepted streams never
+  reach run_udp_listener. The next line to add is at its top: one INFO per received
+  stream, which separates "the listener never started" from "the streams never
+  arrive".
   (succeeded or fell back, with the reason) at info in connect_udp_carrier.
   pass a log level through the bench adapter (a method-level change, so it belongs
   in the fingerprint) or hand-start a pair outside the harness — a transparent

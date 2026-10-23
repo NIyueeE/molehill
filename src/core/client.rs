@@ -1293,6 +1293,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<Option<ClientS
     .await
     {
         Ok(Ok(channel)) => {
+            info!("Direct data channel came up on the UDP carrier");
             args.carrier.succeeded(Carrier::Kcp);
             Ok(Some(ClientStream::Udp(channel)))
         }
@@ -1304,6 +1305,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<Option<ClientS
             {
                 return Err(e).context("the UDP carrier failed and the carrier is forced");
             }
+            info!("The UDP carrier failed ({e:#}); falling back to TCP");
             Ok(None)
         }
         Err(_) => {
@@ -1314,6 +1316,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<Option<ClientS
             {
                 bail!("the UDP carrier did not come up in time, and the carrier is forced");
             }
+            info!("The UDP carrier did not come up within the budget; falling back to TCP");
             Ok(None)
         }
     }
