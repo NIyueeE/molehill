@@ -652,7 +652,10 @@ async fn run_udp_listener(
         let shared = Arc::clone(&shared);
         tokio::spawn(async move {
             if let Err(e) = handle_udp_stream(stream, registry, shared).await {
-                debug!("UDP carrier channel ended: {e:#}");
+                // INFO, not DEBUG: a direct channel that dies before its hello is a
+                // lifecycle event an operator can act on, and it was invisible at debug
+                // while this carrier was being brought up.
+                info!("UDP carrier channel ended: {e:#}");
             }
         });
     }

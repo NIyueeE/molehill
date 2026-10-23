@@ -607,6 +607,16 @@
   says RUST_LOG wins when set (EnvFilter::try_from_default_env). The subject does
   honour it, so what drops the debug lines is the harness's own capture. The lever
   is therefore in the harness's log filter, not in the binary. The next step is therefore one of two changes, not a rerun:
+  **And with the log raised to INFO: no stream is ever accepted (2026-10-23).**
+  handle_udp_stream's failure line moved from debug to info, the binary was
+  rebuilt and the same smoke ran (86 s per arm). The run shows the endpoint
+  binding twice and **no channel-end line at all** — and a channel that had been
+  accepted would have hit its 20 s hello timeout and logged. So the server never
+  sees a stream: the bug is on the client's dial side or in the packets never
+  reaching the server's endpoint, not in the hello the server reads. Next to check,
+  in order: whether connect_udp_carrier runs at all for a transparent claim (and
+  whether its failure falls back to TCP, which would have made the visitor work),
+  then whether the address the client dials is the one the server's endpoint bound.
   pass a log level through the bench adapter (a method-level change, so it belongs
   in the fingerprint) or hand-start a pair outside the harness — a transparent
   claim needs TUN and root, both available here.
