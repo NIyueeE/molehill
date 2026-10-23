@@ -54,6 +54,14 @@
   lane does not. That also explains the 41 re-dials: each attempt comes up, moves a
   few frames and stalls. The fix is the map's key — (StreamId, Dir) — with park and
   wake carrying the direction; quinn_proto::Dir is already imported next door.
+  **Fix landed, lane still stalled (2026-10-23).** The waker map is now keyed by
+  (StreamId, Wait), with Wait::Read and Wait::Write carried through park and wake;
+  the code builds, the quic suite stays at 325 passed. It is a real bug and a real
+  fix — but the lane still does not carry: the same smoke still ends in the client
+  timing out after 86 s. So the two-waker stall was A bug, not THE bug, or it was
+  one of several. What has not been ruled out yet: the write half's credit path
+  (whether a write that the engine refuses with Blocked is retried once the task
+  drains), and whether the claim's read loop ever polls the lane after the hello.
 > the local `backup/v0.11.2-presquash` branch is the only non-`main` ref
 > left, and it is unmerged by design (the pre-squash history).
 >

@@ -22,7 +22,7 @@ use quinn_proto::{ClientConfig, ConnectionHandle, Dir, Event, ServerConfig, Stre
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use super::conn::{self, QuicStream};
+use super::conn::{self, QuicStream, Wait};
 use super::driver::Driver;
 use super::session::HandshakeData;
 
@@ -413,14 +413,17 @@ async fn drain(
                     }
                 }
                 // A stream handle parked one waker; this is what releases it.
-                Event::Stream(
-                    StreamEvent::Readable { id }
-                    | StreamEvent::Writable { id }
-                    | StreamEvent::Finished { id }
-                    | StreamEvent::Stopped { id, .. },
-                ) => {
+                Event::Stream(StreamEvent::Readable { id } | StreamEvent::Finished { id }) => {
                     if let Some(shared) = driver.shared(handle) {
-                        shared.wake(*id);
+                        shared.wake(*id, Wait::Read);
+                    }
+                }
+                Event::Stream(StreamEvent::Writable { id } | StreamEvent::Stopped { id, .. }) => {
+                    if let Some(shared) = driver.shared(handle) {
+                        shared.wake(*id, Wait::Write);
+                        // A stopped stream releases both ends: the reader must
+                        // see the error rather than park forever.
+                        shared.wake(*id, Wait::Read);
                     }
                 }
                 Event::HandshakeDataReady => {

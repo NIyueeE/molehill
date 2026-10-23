@@ -33,6 +33,17 @@ pub(crate) enum Role {
     Acceptor,
 }
 
+/// Which end of a stream is waiting, so one stream can park two wakers.
+///
+/// A direct channel reads and writes at the same time; with a single slot per
+/// stream the reader's park overwrites the writer's and the writer is never
+/// woken again, which stalls the channel after its first exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Wait {
+    Read,
+    Write,
+}
+
 /// The connection a task and its stream handles share.
 pub(crate) struct Shared {
     pub(crate) connection: Mutex<Connection>,
@@ -41,7 +52,10 @@ pub(crate) struct Shared {
     hash: Mutex<Option<Vec<u8>>>,
     /// At most one waker per stream: a writer waiting for credit, or a reader
     /// waiting for bytes.
-    wakers: Mutex<HashMap<StreamId, Waker>>,
+    /// One waker per stream **and direction**: a direct channel reads and writes
+    /// at the same time, so a single slot per stream lets the reader's park
+    /// overwrite the writer's and the writer is never woken again.
+    wakers: Mutex<HashMap<(StreamId, Wait), Waker>>,
     /// Set once the connection is gone, so every pending call reports it.
     closed: Mutex<bool>,
     /// Told whenever a write put bytes into the engine: the task owns the
@@ -70,8 +84,8 @@ impl Shared {
     }
 
     /// Wake whatever was waiting on this stream.
-    pub(crate) fn wake(&self, id: StreamId) {
-        if let Some(waker) = self.wakers.lock().remove(&id) {
+    pub(crate) fn wake(&self, id: StreamId, wait: Wait) {
+        if let Some(waker) = self.wakers.lock().remove(&(id, wait)) {
             waker.wake();
         }
     }
@@ -85,8 +99,8 @@ impl Shared {
         }
     }
 
-    fn park(&self, id: StreamId, waker: &Waker) {
-        self.wakers.lock().insert(id, waker.clone());
+    fn park(&self, id: StreamId, wait: Wait, waker: &Waker) {
+        self.wakers.lock().insert((id, wait), waker.clone());
     }
 
     fn is_closed(&self) -> bool {
@@ -243,7 +257,7 @@ impl AsyncWrite for QuicStream {
             match flush(&mut connection, this.id, &mut this.write.pending) {
                 Ok(_) if this.write.pending.is_empty() => {}
                 Ok(_) => {
-                    this.shared.park(this.id, cx.waker());
+                    this.shared.park(this.id, Wait::Write, cx.waker());
                     return Poll::Pending;
                 }
                 Err(error) => return Poll::Ready(Err(error)),
@@ -363,7 +377,7 @@ impl AsyncRead for QuicStream {
                 if eof {
                     return Poll::Ready(Ok(()));
                 }
-                this.shared.park(this.id, cx.waker());
+                this.shared.park(this.id, Wait::Read, cx.waker());
                 return Poll::Pending;
             }
             let selector = this.read.raw.remove(0);
@@ -410,7 +424,7 @@ impl AsyncRead for QuicStream {
         if eof {
             return Poll::Ready(Ok(()));
         }
-        this.shared.park(this.id, cx.waker());
+        this.shared.park(this.id, Wait::Read, cx.waker());
         Poll::Pending
     }
 }
