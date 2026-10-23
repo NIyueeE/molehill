@@ -45,7 +45,8 @@ pub(crate) async fn connect(
     encrypt: bool,
 ) -> Result<UdpChannel> {
     let endpoint = dial_endpoint(remote).await?;
-    let config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    config.transport_config(super::params::transport_config());
     let stream = endpoint.connect_stream(remote, config, encrypt).await?;
     Ok(UdpChannel {
         _endpoint: endpoint,
@@ -71,7 +72,8 @@ pub(crate) async fn connect_connection(
     encrypt: bool,
 ) -> Result<Arc<dyn crate::transport::carrier::CarrierConn>> {
     let endpoint = dial_endpoint(remote).await?;
-    let config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    config.transport_config(super::params::transport_config());
     let handle = endpoint.connect(remote, config).await?;
     Ok(Arc::new(super::seam::UdpConn::new(
         endpoint, handle, encrypt,
@@ -188,10 +190,11 @@ pub(crate) fn spawn_server(
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (streams_tx, streams_rx) = mpsc::unbounded_channel();
     let (lost_tx, lost_rx) = mpsc::unbounded_channel();
-    let config = quinn_proto::ServerConfig::new(
+    let mut config = quinn_proto::ServerConfig::new(
         Arc::new(NoiseServerConfig::new(keys)),
         super::crypto::TokenKeys::new(),
     );
+    config.transport_config(super::params::transport_config());
     let (endpoint, _task) = socket::spawn(
         socket,
         Some(Arc::new(config)),

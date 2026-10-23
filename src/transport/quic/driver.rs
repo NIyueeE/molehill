@@ -259,9 +259,8 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     #![expect(
-        clippy::unwrap_used,
         clippy::expect_used,
-        reason = "tests unwrap and expect on values they just constructed"
+        reason = "tests expect on values they just constructed"
     )]
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};

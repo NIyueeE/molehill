@@ -79,6 +79,16 @@ pub(crate) struct Channels {
     pub(crate) lost: mpsc::UnboundedSender<u64>,
 }
 
+/// How many already-queued datagrams one readiness wake may consume before
+/// the loop drains once. Bounded so a flood cannot starve commands, timers or
+/// the stream tasks the same loop serves.
+const RECV_BURST: usize = 32;
+
+/// Set once a kernel or path has refused `UDP_SEGMENT`, so every later
+/// transmission goes out the per-datagram way without probing again.
+#[cfg(target_os = "linux")]
+static GSO_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) struct EndpointHandle {
     commands: mpsc::Sender<Command>,
     /// Every connection the task still holds, so a carrier can answer
@@ -238,6 +248,29 @@ pub(crate) fn spawn(
     (handle, task)
 }
 
+/// Feed one received datagram to the engine, accepting the connection it may
+/// have opened. A refused connection is the peer's problem, not this task's:
+/// it is logged at debug and the socket keeps receiving.
+fn feed_datagram(
+    driver: &mut Driver,
+    channels: &Channels,
+    live: &Arc<Mutex<HashSet<ConnectionHandle>>>,
+    remote: SocketAddr,
+    data: BytesMut,
+) {
+    if let Some(incoming) = driver.on_datagram(Instant::now(), remote, data) {
+        match driver.accept(Instant::now(), incoming) {
+            Ok(handle) => {
+                live.lock().insert(handle);
+                let _ = channels.accepted.send(handle);
+            }
+            Err(error) => {
+                tracing::debug!(?error, "the engine refused an incoming connection");
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the endpoint task is one select/drain state machine: every select arm has to leave the \
@@ -337,15 +370,30 @@ async fn run(
             received = socket.recv_from(&mut buf) => {
                 match received {
                     Ok((len, remote)) => {
-                        let data = BytesMut::from(&buf[..len]);
-                        if let Some(incoming) = driver.on_datagram(Instant::now(), remote, data) {
-                            match driver.accept(Instant::now(), incoming) {
-                                Ok(handle) => {
-                                    live.lock().insert(handle);
-                                    let _ = channels.accepted.send(handle);
-                                }
+                        feed_datagram(
+                            &mut driver,
+                            &channels,
+                            &live,
+                            remote,
+                            BytesMut::from(&buf[..len]),
+                        );
+                        // The kernel often holds a burst behind the datagram
+                        // that woke us. Eating it here lets one `drain` — one
+                        // timer, one transmit sweep, one event pass — serve the
+                        // whole burst instead of one per datagram.
+                        for _ in 0..RECV_BURST {
+                            match socket.try_recv_from(&mut buf) {
+                                Ok((len, remote)) => feed_datagram(
+                                    &mut driver,
+                                    &channels,
+                                    &live,
+                                    remote,
+                                    BytesMut::from(&buf[..len]),
+                                ),
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                                 Err(error) => {
-                                    tracing::debug!(?error, "the engine refused an incoming connection");
+                                    tracing::debug!(%error, "the socket could not receive");
+                                    break;
                                 }
                             }
                         }
@@ -395,17 +443,9 @@ async fn drain(
     let now = Instant::now();
     driver.handle_timeout(now);
     while let Some(outgoing) = driver.poll_transmit(now) {
-        // The engine may hand back several datagrams in one buffer, marked by
-        // a segment size. Each one is its own datagram on the wire: a 1-RTT
-        // packet has no length field, so a concatenation of them is not a
-        // sequence a peer can split. The GSO sender replaces this loop with
-        // one `UDP_SEGMENT` call; until then, one `send_to` per segment is the
-        // only correct framing.
-        for datagram in outgoing.datagrams() {
-            if let Err(error) = socket.send_to(datagram, outgoing.destination).await {
-                tracing::debug!(%error, "the socket could not send");
-                return false;
-            }
+        if let Err(error) = send_outgoing(socket, &outgoing).await {
+            tracing::debug!(%error, "the socket could not send");
+            return false;
         }
     }
     driver.pump_endpoint_events();
@@ -497,12 +537,85 @@ async fn drain(
     true
 }
 
+/// Send one engine transmission.
+///
+/// A transmission that carries several datagrams goes out as one
+/// `UDP_SEGMENT` message on Linux — the kernel builds one skb and segments it
+/// — and as one `send_to` per datagram everywhere else, or after the kernel
+/// has refused GSO once. The wire is identical either way; only the syscall
+/// count differs.
+async fn send_outgoing(
+    socket: &UdpSocket,
+    outgoing: &crate::transport::quic::driver::Outgoing,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(segment) = outgoing.segment_size
+        && !GSO_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        match socket.try_io(tokio::io::Interest::WRITABLE, || {
+            gso_sendmsg(socket, outgoing, segment)
+        }) {
+            Ok(()) => return Ok(()),
+            Err(error) if gso_refused(&error) => {
+                GSO_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(%error, "UDP GSO refused; sending datagrams one at a time");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for datagram in outgoing.datagrams() {
+        socket.send_to(datagram, outgoing.destination).await?;
+    }
+    Ok(())
+}
+
+/// One `UDP_SEGMENT` message for a multi-datagram transmission.
+#[cfg(target_os = "linux")]
+fn gso_sendmsg(
+    socket: &UdpSocket,
+    outgoing: &crate::transport::quic::driver::Outgoing,
+    segment: usize,
+) -> std::io::Result<()> {
+    use std::io::IoSlice;
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage, sendmsg};
+
+    let segment = u16::try_from(segment).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a datagram too large for UDP GSO",
+        )
+    })?;
+    let iov = [IoSlice::new(&outgoing.contents)];
+    let control = [ControlMessage::UdpGsoSegments(&segment)];
+    let address = SockaddrStorage::from(outgoing.destination);
+    sendmsg(
+        socket.as_raw_fd(),
+        &iov,
+        &control,
+        MsgFlags::MSG_DONTWAIT,
+        Some(&address),
+    )?;
+    Ok(())
+}
+
+/// Errors that mean "this kernel or path will not take GSO", as opposed to a
+/// full send buffer (`WouldBlock`, retried) or a real fault.
+#[cfg(target_os = "linux")]
+fn gso_refused(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::EMSGSIZE | libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
-        clippy::unwrap_used,
         clippy::expect_used,
-        reason = "tests unwrap and expect on values they just constructed"
+        reason = "tests expect on values they just constructed"
     )]
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
@@ -680,10 +793,6 @@ mod tests {
     }
     /// The one-way half of the lane test: does a long encrypted write arrive
     /// intact when nobody writes back?
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one test is one scenario: connect, then push more than a window and check every frame"
-    )]
     #[tokio::test]
     async fn a_long_encrypted_write_arrives_in_order() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -102,11 +102,6 @@ impl RecordKey {
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        reason = "tests unwrap and expect on values they just constructed"
-    )]
     use super::*;
 
     const HASH: [u8; 32] = [7u8; 32];

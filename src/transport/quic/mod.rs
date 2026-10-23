@@ -21,6 +21,7 @@ pub(crate) mod channel;
 pub(crate) mod conn;
 mod crypto;
 mod driver;
+mod params;
 mod record;
 pub(crate) mod seam;
 pub(crate) mod session;

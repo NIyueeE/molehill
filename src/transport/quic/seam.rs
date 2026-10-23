@@ -70,9 +70,8 @@ impl CarrierConn for UdpConn {
 #[cfg(all(test, feature = "multiplex"))]
 mod tests {
     #![expect(
-        clippy::unwrap_used,
         clippy::expect_used,
-        reason = "tests unwrap and expect on values they just constructed"
+        reason = "tests expect on values they just constructed"
     )]
     use std::sync::Arc;
     use std::time::Duration;

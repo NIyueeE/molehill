@@ -85,6 +85,28 @@
 
 ## Where this stands
 
+- **The datagram layer moved the UDP carrier 3.5×, and the clean gate is still
+  missed (2026-10-23).** Two changes to the endpoint's socket loop, measured on
+  the same L3 `cost`/`clean` cell, `--condition-leg tunnel`, `--scale 0.1`,
+  forced UDP carrier, with the run's A/A copy:
+  - **One wake serves a burst.** After the datagram that wakes the endpoint,
+    up to 32 already-queued datagrams are taken with `try_recv_from` before the
+    loop's single `drain` (one timer, one transmit sweep, one event pass):
+    1.04 Gbit/s at 3.25 s/Gbit became **1.65-1.71 at 1.91-1.95**.
+  - **A multi-datagram transmit goes out as one `UDP_SEGMENT` message**
+    (Linux; `sendmmsg`/per-datagram fallback, remembered after a refusal):
+    **3.33-3.68 Gbit/s at 0.93-0.98 s/Gbit**, p99 **6.7-7.7 ms** (from 187-222
+    with the receive burst alone — the sender's queue was the tail).
+  - **BBR and an 8 MiB stream / 16 MiB connection window** (`params.rs`, the
+    engine configuration both ends now use) read **3.39-3.63 at 0.95-0.97**,
+    p99 5.9-7.4: no throughput change beyond the A/A floor, so they are kept as
+    the design's declared bound, not claimed as a win.
+  Against the TCP pool's ~12 Gbit/s at ~0.62 s/Gbit on the same model and host,
+  the CPU per Gbit is now **1.53× TCP** (the gate's line is 1.5×) and the clean
+  throughput is still **~3.4× short** of the 15 % window. The gap is not the
+  flow-control window any more (doubling it did nothing); the next levers are
+  the stream/connection lock contention and `recvmmsg` (one syscall per receive
+  burst), not more window. The gate remains unmet; nothing flips.
 - **The pool rides the UDP carrier, and its clean-path number says do not
   flip the order (2026-10-23).** The L4 pool now has a second implementation:
   a tunnel is one QUIC connection and every data channel is a stream on it

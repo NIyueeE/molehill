@@ -440,9 +440,8 @@ impl AsyncRead for QuicStream {
             // `next` takes a maximum length, not a buffer: the chunk borrows
             // the engine's own storage. Allocating a scratch vector here (the
             // first version did, 65 KiB per poll) bought nothing.
-            const MAX_CHUNK: usize = MAX_PLAINTEXT + 2 + super::record::TAG_LEN;
             loop {
-                match chunks.next(MAX_CHUNK) {
+                match chunks.next(MAX_PLAINTEXT + 2 + super::record::TAG_LEN) {
                     Ok(Some(chunk)) => this.read.raw.extend_from_slice(&chunk.bytes),
                     Ok(None) => {
                         eof = true;
