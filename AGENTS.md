@@ -199,8 +199,10 @@ is the voice contract for writing it.
   and the transparent frame-format negotiation); `5.1` is a dialect label, not
   a SemVer-compatible minor. v5.2 makes the striped command the only TCP
   forward (`StartForwardTcp` and `[server.data].stripe_count` are gone) and
-  carries `max_udp_workers` in the registration. The next wire change is 5.3;
-  a redesign would be 6.0.
+  carries `max_udp_workers` in the registration. The next wire change is
+  **6.0**: the carrier redesign replaces KCP with a QUIC-derived UDP carrier,
+  and a redesign is a new dialect rather than the next `minor` of the old one.
+  There is no 5.3.
 - `CHANGELOG.md` is the **single source of release notes**, maintained in
   [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format and
   following [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

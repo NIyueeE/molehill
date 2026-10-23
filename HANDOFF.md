@@ -3,9 +3,13 @@
 > **State as of 2026-10-22.** **The v1.0.0 development cycle is open on the
 > branch `feat/v1.0.0`; `main` stays at the released 0.11.2 while the
 > manifest moves to `1.0.0`.** A major number describes the product, not the
-> wire: `CURRENT_PROTO_VERSION` stays **5.2** unless a change lands under this
-> cycle, in which case it becomes 5.3 as its own dialect (AGENTS.md §5). No
-> scope is committed yet — the open threads below are the candidates — and
+> wire: `CURRENT_PROTO_VERSION` is still **5.2**, and the one wire change this
+> cycle has committed to is the carrier redesign — **6.0**, a new dialect
+> rather than an extension of 5.2 (AGENTS.md §5). There is no 5.3. 6.0 keeps
+> no backward compatibility, and none is expressible: a 5.2 peer drives KCP
+> over UDP and yamux over TCP, a 6.0 peer drives neither, so each end refuses
+> the other on the connection it happens on and both upgrade together. The
+> constant flips in the commit that swaps the carrier, not before.
 > `[Unreleased]` already carries the configuration refusals that landed on
 > `main` after 0.11.2; they ride this release.
 >
@@ -508,8 +512,9 @@
   is `connect_direct_channel`'s QUIC branch plus the server's UDP accept, and
   it is what makes the L3 arm measurable; (4) the gates in one run; (5) the
   rename to `Udp` with the implementation swap, KCP's deletion, the four
-  feature lists, the status JSON, the bench vocabulary and dialect 5.3;
-  (6) the release ritual.
+  feature lists, the status JSON, the bench vocabulary and the wire's move
+  to 6.0 — the constant, which is what refuses a 5.2 peer; (6) the release
+  ritual.
   **What blocks the pool's stream-type switch, measured (2026-10-23).** The
   change is small — `MuxStream` aliases `CarrierStream`, 14 sites inside
   `multiplex.rs` and 3 outside — but three things have to move in **one**
@@ -620,8 +625,9 @@
   description in the model and in `docs/benchmarks.md` says so. The other,
   smaller lever is the data-plane AEAD at ~9 % of clean throughput:
   AES-256-GCM is only ~1.4× ChaCha20-Poly1305 on this Haswell host (openssl
-  speed: 2.40 against 1.70 GB/s), so it would buy little here and is a v5.3
-  wire change either way.
+  speed: 2.40 against 1.70 GB/s), so it would buy little here. The UDP
+  record layer's cipher sits inside the 6.0 dialect from the start, so the
+  question reopens without a second wire break.
 - **Closed (2026-10-22): a forced carrier is no longer invisible to the
   comparability gate.** `MOLEHILL_DATA_CARRIER` (and the scheduled-switch
   hatches) stay in `meta.molehill_switches`, beside the method rather than
