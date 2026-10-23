@@ -44,6 +44,16 @@
 > the `chore(release)` commit `64d8ebc`; `main` carries it plus this record.
 > `[Unreleased]` is empty and the next cycle is not open yet. The merged
 > branch `feat/v0.11.2` was retired locally and on `origin` on 2026-10-22;
+  **Found it, in my own code (2026-10-23): one waker per stream, two directions.**
+  transport/quic/conn.rs:44 keeps 'wakers: Mutex<HashMap<StreamId, Waker>>' and
+  park() inserts by stream id alone. A direct channel is the one place that reads
+  and writes **at the same time** on one stream: the writer parks, the reader parks
+  and overwrites it, and when the write becomes possible wake() wakes only the
+  reader — so the writer never wakes and the lane stalls after its first exchange.
+  The seam test missed it because it strictly alternates (write, read, write); a
+  lane does not. That also explains the 41 re-dials: each attempt comes up, moves a
+  few frames and stalls. The fix is the map's key — (StreamId, Dir) — with park and
+  wake carrying the direction; quinn_proto::Dir is already imported next door.
 > the local `backup/v0.11.2-presquash` branch is the only non-`main` ref
 > left, and it is unmerged by design (the pre-squash history).
 >
