@@ -632,6 +632,27 @@
   speed: 2.40 against 1.70 GB/s), so it would buy little here. The UDP
   record layer's cipher sits inside the 6.0 dialect from the start, so the
   question reopens without a second wire break.
+- **The carrier seam did not move the TCP hot path (2026-10-23, P2's proof).**
+  The three commits that moved the pool onto `CarrierConn` (`MuxStream` →
+  `CarrierStream`, the pool's `Arc<dyn CarrierConn>`, yamux private to TCP) were
+  measured against the build immediately before them: one fingerprint, the same
+  method, `--profile stage --ab-arm molehill --binary <seam> --binary-b
+  <pre-seam> --condition clean|loss1 --condition-leg tunnel` with
+  `MOLEHILL_DATA_CARRIER=tcp`, both binaries built from committed trees and told
+  apart by build timestamp.
+  `clean`, 2 rounds at `--scale 0.2` (141 s, 12 samples): **12.16 Gbit/s**
+  (12.11–12.21) against **12.22** (12.08–12.35) — 0.45 %, inside the run's 1.39 %
+  floor and *smaller* than the 1.41 % by which the seam build differs from a
+  second copy of itself (12.33). No claim cleared the floors.
+  `loss1`, 3 rounds at full length with a warmup: medians **7.76** against
+  **7.82 Gbit/s** (0.8 %), and the cell is bimodal for *every* arm — rounds land
+  near 6.0 or near 7.9 whichever build runs — so its own floor is 16.4 % and it
+  resolves nothing. The record says that rather than reading 0.8 % as a win: at
+  3 rounds the cell would need ~11 to resolve its own scatter.
+  What the pair does say: the refactor added no throughput the harness can
+  resolve, and one `Box` plus one dynamic dispatch per open are invisible next to
+  a 12 Gbit/s copy path. This is a stage-profile spot check, not the release
+  sweep; the sweep re-measures it on the release method.
 - **Closed (2026-10-22): a forced carrier is no longer invisible to the
   comparability gate.** `MOLEHILL_DATA_CARRIER` (and the scheduled-switch
   hatches) stay in `meta.molehill_switches`, beside the method rather than
