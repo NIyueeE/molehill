@@ -419,7 +419,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that leaves, not whichever member happened to be idle. Still opt-in
   (`MOLEHILL_TUNNEL_CARRIER_RULE=1`), because the wiring run measured its
   trigger as rate-dependent; a probe whose window carried nothing is held
-  rather than judged.
+  rather than judged. The trigger is no longer only the sender's share: the pool
+  also suspects its **own median round trip** against a floor it keeps, so a
+  path degrading under a TCP carrier can be questioned too, and a probe whose
+  carried bytes are level is decided by the round trip — the one signal both
+  carriers produce, and the one a byte counter cannot see.
 
 - **The bench model's verdicts are statistics, not a silent heuristic.** An
   exact sign test with its p-value beside the level the run's own length can
