@@ -12,7 +12,7 @@ use super::{
     Frame,
     header::{self, HeaderDecodeError},
 };
-use crate::mux::connection::Id;
+use crate::transport::tcp::mux::connection::Id;
 use std::{
     fmt, io,
     pin::Pin,
@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// buffer (see [`Io::start_frame`]).
 pub(crate) const COALESCE_BODY_MAX: usize = 512;
 
-const MAX_FRAME_BODY_LEN: usize = crate::mux::MIB;
+const MAX_FRAME_BODY_LEN: usize = crate::transport::tcp::mux::MIB;
 
 /// A [`Stream`] and writer of [`Frame`] values.
 #[derive(Debug)]
@@ -96,8 +96,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
     /// and drives the writer with [`Io::poll_flush`] afterwards.
     pub(crate) fn start_frame(&mut self, f: Frame<()>) {
         use std::sync::atomic::Ordering::Relaxed;
-        crate::mux::FRAMES_WRITTEN.fetch_add(1, Relaxed);
-        crate::mux::FRAME_BYTES.fetch_add(f.body.len() as u64, Relaxed);
+        crate::transport::tcp::mux::FRAMES_WRITTEN.fetch_add(1, Relaxed);
+        crate::transport::tcp::mux::FRAME_BYTES.fetch_add(f.body.len() as u64, Relaxed);
         let header = header::encode(&f.header);
         let buffer = f.body;
         self.write_state = if buffer.len() <= COALESCE_BODY_MAX {
@@ -298,8 +298,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
                         let h = header.clone();
                         let v = std::mem::take(buffer);
                         this.read_state = ReadState::Init;
-                        crate::mux::FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        crate::mux::FRAME_BYTES
+                        crate::transport::tcp::mux::FRAMES_READ
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::transport::tcp::mux::FRAME_BYTES
                             .fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         return Poll::Ready(Some(Ok(Frame { header: h, body: v })));
                     }

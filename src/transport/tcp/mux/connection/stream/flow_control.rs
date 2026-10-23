@@ -3,7 +3,7 @@ use std::{cmp, sync::Arc};
 use parking_lot::Mutex;
 use std::time::Instant;
 
-use crate::mux::{Config, ConnectionError, DEFAULT_CREDIT, connection::rtt::Rtt};
+use crate::transport::tcp::mux::{Config, ConnectionError, DEFAULT_CREDIT, connection::rtt::Rtt};
 
 #[derive(Debug)]
 pub(crate) struct FlowController {
@@ -55,9 +55,9 @@ impl FlowController {
 
         tracing::trace!(
             "received {} mb in {} seconds ({} mbit/s)",
-            f64::from(next_window_update) / crate::mux::MIB_F64,
+            f64::from(next_window_update) / crate::transport::tcp::mux::MIB_F64,
             self.last_window_update.elapsed().as_secs_f64(),
-            f64::from(next_window_update) / crate::mux::MIB_F64 * 8.0
+            f64::from(next_window_update) / crate::transport::tcp::mux::MIB_F64 * 8.0
                 / self.last_window_update.elapsed().as_secs_f64()
         );
 
@@ -108,8 +108,8 @@ impl FlowController {
 
             tracing::debug!(
                 "old window_max: {} mb, new window_max: {} mb",
-                f64::from(self.max_receive_window) / crate::mux::MIB_F64,
-                f64::from(new_max) / crate::mux::MIB_F64
+                f64::from(self.max_receive_window) / crate::transport::tcp::mux::MIB_F64,
+                f64::from(new_max) / crate::transport::tcp::mux::MIB_F64
             );
 
             self.max_receive_window = new_max;

@@ -26,7 +26,7 @@
 //! `static_assertions` are replaced by `std` equivalents; the upstream
 //! property tests (their `quickcheck` dev-dependency) are dropped in
 //! favour of molehill's e2e suite; internal paths are rebased under
-//! `crate::mux`.
+//! `crate::transport::tcp::mux`.
 //!
 //! The two primary objects the transport layer interacts with are:
 //!
@@ -46,9 +46,9 @@ mod frame;
 pub(crate) mod connection;
 mod tagged_stream;
 
-pub use crate::mux::connection::{Connection, Mode, Stream};
-pub use crate::mux::error::ConnectionError;
-pub use crate::mux::frame::header::StreamId;
+pub use crate::transport::tcp::mux::connection::{Connection, Mode, Stream};
+pub use crate::transport::tcp::mux::error::ConnectionError;
+pub use crate::transport::tcp::mux::frame::header::StreamId;
 
 const KIB: usize = 1024;
 const MIB: usize = KIB * 1024;

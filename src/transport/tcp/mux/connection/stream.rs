@@ -8,10 +8,10 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
-use crate::mux::ConnectionError;
-use crate::mux::connection::rtt::Rtt;
-use crate::mux::frame::header::ACK;
-use crate::mux::{
+use crate::transport::tcp::mux::ConnectionError;
+use crate::transport::tcp::mux::connection::rtt::Rtt;
+use crate::transport::tcp::mux::frame::header::ACK;
+use crate::transport::tcp::mux::{
     Config, DEFAULT_CREDIT,
     chunks::Chunks,
     connection::{self, StreamCommand, rtt},
@@ -82,8 +82,8 @@ pub(crate) enum Flag {
 
 /// A multiplexed Yamux stream.
 ///
-/// Streams are created either outbound via [`crate::mux::Connection::poll_new_outbound`]
-/// or inbound via [`crate::mux::Connection::poll_next_inbound`].
+/// Streams are created either outbound via [`crate::transport::tcp::mux::Connection::poll_new_outbound`]
+/// or inbound via [`crate::transport::tcp::mux::Connection::poll_next_inbound`].
 ///
 /// `Stream` implements [`AsyncRead`] and [`AsyncWrite`] and also
 /// [`futures::stream::Stream`].

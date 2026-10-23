@@ -19,14 +19,14 @@ mod stream;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::mux::tagged_stream::TaggedStream;
-use crate::mux::{
+use crate::transport::tcp::mux::tagged_stream::TaggedStream;
+use crate::transport::tcp::mux::{
     Config, DEFAULT_CREDIT,
     error::ConnectionError,
     frame::header::{self, CONNECTION_ID, Data, GoAway, Header, Ping, StreamId, Tag, WindowUpdate},
     frame::{self, Either, Frame},
 };
-use crate::mux::{MAX_ACK_BACKLOG, Result};
+use crate::transport::tcp::mux::{MAX_ACK_BACKLOG, Result};
 use cleanup::Cleanup;
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
@@ -1069,7 +1069,7 @@ mod tests {
     )]
 
     use super::*;
-    use crate::mux::frame::header::Header;
+    use crate::transport::tcp::mux::frame::header::Header;
 
     /// A full connection refuses the stream that would cross its cap, and keeps
     /// the connection.

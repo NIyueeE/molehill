@@ -21,13 +21,16 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::Poll;
 
-use crate::mux::{Config, Connection, Mode};
 use crate::transport::carrier::Carrier;
+// The pool still drives the engine directly; the alias keeps that visible
+// (and the signatures short) until the seam rewrite removes it.
+use crate::transport::tcp::mux as yamux;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info};
+use yamux::{Config, Connection, Mode};
 
 /// A multiplexed stream adapted to tokio's IO traits.
-pub type MuxStream = crate::mux::Stream;
+pub type MuxStream = yamux::Stream;
 
 /// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
@@ -44,7 +47,7 @@ pub type MuxStream = crate::mux::Stream;
 /// writable without ever stalling the tunnel's inbound processing.
 struct SynAnnounce {
     stream: Option<MuxStream>,
-    reply: Option<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>,
+    reply: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
 }
 
 impl std::future::Future for SynAnnounce {
@@ -67,7 +70,7 @@ impl std::future::Future for SynAnnounce {
             Poll::Ready(Err(e)) => {
                 debug!(error = %e, "Failed to announce outbound multiplexed stream");
                 if let Some(reply) = this.reply.take() {
-                    let _ = reply.send(Err(crate::mux::ConnectionError::Closed));
+                    let _ = reply.send(Err(yamux::ConnectionError::Closed));
                 }
                 Poll::Ready(())
             }
@@ -124,7 +127,7 @@ fn spawn_framing_stats() {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let (written, read, bytes) = crate::mux::framing_stats();
+            let (written, read, bytes) = yamux::framing_stats();
             info!(
                 written,
                 read, bytes, "mux-stats: cumulative framing counters"
@@ -614,7 +617,7 @@ pub(crate) enum OpenError {
     /// The pool has no tunnel at all (nothing established, no dialer).
     NoTunnel,
     /// Every candidate tunnel refused the stream.
-    Refused(crate::mux::ConnectionError),
+    Refused(yamux::ConnectionError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
     /// the pool could not reach its count (its own `tunnels`, or the server's
     /// `max_tunnels` valve), or the carrier's dial failed.
@@ -2372,13 +2375,13 @@ impl TunnelPool {
                     tunnel = index,
                     "pool-stats: tunnel refused an open: {e}"
                 );
-                let note = if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
+                let note = if matches!(e, yamux::ConnectionError::TooManyStreams) {
                     // A cap hit is a refusal of this open, never a death:
                     // record it and report it back to the caller.
                     PlacementStats::record(placement, started.elapsed(), Some("too_many_streams"));
                     return Err(OpenError::Refused(e));
                 } else {
-                    if matches!(e, crate::mux::ConnectionError::Closed) {
+                    if matches!(e, yamux::ConnectionError::Closed) {
                         // A tunnel died, so a retried growth is meaningful
                         // again: cut the failed-growth hold short (D14). The
                         // tunnel itself is marked dead here rather than left
@@ -2417,7 +2420,7 @@ impl TunnelPool {
                         }
                         Err(e) => {
                             next.tunnel.counters.release();
-                            if matches!(e, crate::mux::ConnectionError::Closed) {
+                            if matches!(e, yamux::ConnectionError::Closed) {
                                 // Another dead tunnel: same as above (D14).
                                 next.tunnel.mark_dead();
                                 self.release_growth_hold();
@@ -3477,7 +3480,7 @@ pub struct ClientTunnel {
     /// tunnel whose connection died must leave the pool even if it still
     /// "holds" streams, or every later placement lands on a corpse.
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>,
+    open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
 }
 
 impl ClientTunnel {
@@ -3512,7 +3515,7 @@ impl ClientTunnel {
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (open_tx, mut open_rx) =
-            mpsc::channel::<oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>>(16);
+            mpsc::channel::<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>(16);
 
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let guard = AliveGuard(std::sync::Arc::clone(&alive));
@@ -3526,9 +3529,8 @@ impl ClientTunnel {
         tokio::spawn(async move {
             let _guard = guard;
             let mut conn = Connection::new(io, config, Mode::Client);
-            let mut waiting: Option<
-                oneshot::Sender<Result<MuxStream, crate::mux::ConnectionError>>,
-            > = None;
+            let mut waiting: Option<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>> =
+                None;
             // A freshly opened stream whose SYN announcement is in flight.
             // The announcement is driven inside the poll closure (via the
             // shared mutex, so the closure never captures it mutably),
@@ -3543,8 +3545,8 @@ impl ClientTunnel {
                     /// The pending announcement settled; its reply was
                     /// already delivered to the waiting caller.
                     Announced,
-                    Opened(Result<crate::mux::Stream, crate::mux::ConnectionError>),
-                    Inbound(Option<Result<crate::mux::Stream, crate::mux::ConnectionError>>),
+                    Opened(Result<yamux::Stream, yamux::ConnectionError>),
+                    Inbound(Option<Result<yamux::Stream, yamux::ConnectionError>>),
                 }
 
                 let step = poll_fn(|cx| {
@@ -3660,13 +3662,13 @@ impl ClientTunnel {
     }
 
     /// Open a new data channel as a multiplexed stream.
-    pub async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError> {
+    pub async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
         let (tx, rx) = oneshot::channel();
         self.open_tx
             .send(tx)
             .await
-            .map_err(|_| crate::mux::ConnectionError::Closed)?;
-        rx.await.map_err(|_| crate::mux::ConnectionError::Closed)?
+            .map_err(|_| yamux::ConnectionError::Closed)?;
+        rx.await.map_err(|_| yamux::ConnectionError::Closed)?
     }
 }
 

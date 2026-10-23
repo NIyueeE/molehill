@@ -13,6 +13,9 @@ use std::net::SocketAddr;
 use tokio::net::ToSocketAddrs;
 use tokio::net::{TcpListener, TcpStream};
 
+#[cfg(feature = "multiplex")]
+pub(crate) mod mux;
+
 #[derive(Debug)]
 pub struct TcpTransport {
     socket_opts: SocketOpts,
@@ -109,7 +112,7 @@ impl super::carrier::CarrierConn for TcpConn {
     ) -> Result<super::carrier::CarrierStream, super::carrier::StreamError> {
         match self.tunnel.open_stream().await {
             Ok(stream) => Ok(Box::new(stream)),
-            Err(crate::mux::ConnectionError::TooManyStreams) => {
+            Err(crate::transport::tcp::mux::ConnectionError::TooManyStreams) => {
                 Err(super::carrier::StreamError::Busy)
             }
             Err(_) => Err(super::carrier::StreamError::Closed),

@@ -1,6 +1,6 @@
-use crate::mux::connection::StreamCommand;
-use crate::mux::tagged_stream::TaggedStream;
-use crate::mux::{ConnectionError, StreamId};
+use crate::transport::tcp::mux::connection::StreamCommand;
+use crate::transport::tcp::mux::tagged_stream::TaggedStream;
+use crate::transport::tcp::mux::{ConnectionError, StreamId};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};

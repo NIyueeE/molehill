@@ -71,7 +71,7 @@ per item, with `#[expect(unsafe_code, reason = "...")]` plus a
   edition 2024 and have no safe replacement. A `temp-env` wrapper works, but
   it adds a dev-dependency and re-resolves the lockfile for five sanctioned
   test-only calls; the trade was tried and declined.
-- `src/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
+- `src/transport/tcp/mux.rs` carries `#![forbid(unsafe_code)]` outright — `forbid` cannot be
   relaxed by an expectation, which is the point.
 
 `tun-rs` is in because the transparent data path is cross-platform now: one

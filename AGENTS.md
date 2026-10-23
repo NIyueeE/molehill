@@ -476,7 +476,7 @@ pointers, not copies:
   `opt-level = "z"`, `bench`) and the scratch container image are
   [docs/build-guide.md](docs/build-guide.md).
 - **Unsafe** is denied crate-wide; the modules that opt in per item, the
-  `src/mux.rs` forbid and the single surviving `#[allow]` are
+  `src/transport/tcp/mux.rs` forbid and the single surviving `#[allow]` are
   [docs/lint-policy.md](docs/lint-policy.md) ("Unsafe").
 - **The bench model is the `bench/` uv project**: one console script
   (`just bench <verb>`), ruff and pyright configured in

@@ -18,8 +18,8 @@ use std::sync::{
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::mux::connection::Action;
-use crate::mux::frame::{Frame, header::Ping};
+use crate::transport::tcp::mux::connection::Action;
+use crate::transport::tcp::mux::frame::{Frame, header::Ping};
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 
