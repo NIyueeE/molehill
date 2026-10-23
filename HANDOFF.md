@@ -85,6 +85,46 @@
 
 ## Where this stands
 
+- **The `loss1` cell is a mixed-workload defect, not a bulk-path one
+  (2026-10-23).** Three measurements on the `l3` arm at `loss1`
+  (`--condition-leg tunnel`), forced to the UDP carrier
+  (`MOLEHILL_DATA_CARRIER=kcp` on a `quic` build):
+  - `--scenarios bulk-1`: **0.454 Gbit/s** measured (warm-up 1.44) — KCP's
+    recorded 0.41 at the same condition.
+  - `--scenarios bulk-n` (eight streams): **2.73 / 2.78 Gbit/s**.
+  - `--scenarios cost --scale 0.02`: still the 86 s timeout, every round — the
+    4-stream iperf never finishes. **The control settles it**: the same cell on a
+    KCP-only build of the same commit passes in 83 s at **0.148 s/Gbit
+    (6.75 Gbit/s)**. So bulk alone is at or above KCP and the failure is
+    specific to the QUIC carrier under the `cost` mix (four iperf streams plus
+    the interactive, datagram and churn series). That mix is where the next
+    hour goes; it is the gate's own cell.
+  - `--scenarios udp-blast` at `loss1`: **82.6 % of the offered datagrams do
+    not arrive**, 29.5 Mbit/s received. A reliable stream behind an
+    offered-rate blast is a queue question rather than a network one (the hub's
+    batch queue sheds first), and it is the second cell to understand.
+- **The receiver's 212 KiB socket buffer was reading as 34 % packet loss
+  (2026-10-23).** No QUIC endpoint set `SO_RCVBUF`/`SO_SNDBUF`, so every
+  carrier socket kept the kernel default; KCP asks for 32 MiB in
+  `KCP_SOCKET_BUF_BYTES`. On the `loss1` cell with `MOLEHILL_QUIC_STATS=1`
+  the busiest lane reported `sent` 2.2 M, `lost` 757 k (**34 %** of what it
+  sent), a cwnd inflated to 281 MB, and an app-level read gap of **677 ms**,
+  while the app only offered ~200 pps. `socket::spawn` now requests 8 MiB each
+  way (`SOCKET_BUF_BYTES`, clamped by `net.core.{r,w}mem_max`): `lost`
+  **1.3 %**, read gap **129 ms** on the same cells, and the per-lane loss the
+  earlier entry blamed GSO for is gone. GSO was not the mechanism: the
+  in-process harness below carries 8 MiB in ~0.39 s (**173 Mbit/s**) with the
+  same 1 % loss whether a drop costs one datagram or a burst of eight.
+  - **A lossy path you can run in a test**:
+    `transport::quic::socket::tests::a_stream_carries_over_a_lossy_link`
+    (`--ignored --nocapture`, `--release`) puts two engines on real sockets
+    with a 10 ms, 1-in-100 relay between them and asserts a 50 Mbit/s floor.
+    `MOLEHILL_TEST_LOSS_BURST=8` makes one drop cost a segment batch. The
+    relay is the test's own ceiling, so the number is a floor, not a
+    measurement of the carrier.
+  - The `MOLEHILL_QUIC_STATS` line now carries a per-connection `id` (the
+    engine key is only unique per endpoint) and the **server** endpoint reports
+    one per connection too, which is what made the 34 % attributable.
 - **The UDP carrier's clean path improved 4x, and its `loss1` cell is now the
   open failure (2026-10-23).** The sender was moved into its own task (a
   `send_to` waiting on a full qdisc must not stop receive; that was the PTO

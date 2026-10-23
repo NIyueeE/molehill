@@ -227,6 +227,33 @@ impl EndpointHandle {
     }
 }
 
+/// What the kernel may hold for one carrier socket, in each direction.
+///
+/// The kernel default is 212 KiB, under two milliseconds of a gigabit path, so
+/// one scheduling hiccup on the receiving side becomes a burst of drops the
+/// engine reads as congestion. The bench's `loss1` cell showed the cost: a
+/// lane declared a third of everything it sent lost while its peer's queue was
+/// full, and the connection never recovered. KCP asks for the same thing on
+/// its socket (`KCP_SOCKET_BUF_BYTES`); a QUIC endpoint needs it for the same
+/// reason, and this is the one place every endpoint's socket passes through.
+const SOCKET_BUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ask the kernel for a carrier-sized socket buffer.
+///
+/// Best effort: `net.core.{r,w}mem_max` caps the request, and a socket that
+/// keeps its default still works — it just recovers less gracefully under a
+/// burst. A refusal is not the connection's problem, so it is a debug line
+/// rather than a warning.
+fn tune_socket_buffers(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    if let Err(error) = sock.set_recv_buffer_size(SOCKET_BUF_BYTES) {
+        tracing::debug!(%error, "the kernel refused a larger receive buffer");
+    }
+    if let Err(error) = sock.set_send_buffer_size(SOCKET_BUF_BYTES) {
+        tracing::debug!(%error, "the kernel refused a larger send buffer");
+    }
+}
+
 /// Spawn the task and return the handle the carrier talks to.
 pub(crate) fn spawn(
     socket: UdpSocket,
@@ -234,6 +261,7 @@ pub(crate) fn spawn(
     allow_mtud: bool,
     channels: Channels,
 ) -> (EndpointHandle, tokio::task::JoinHandle<()>) {
+    tune_socket_buffers(&socket);
     let (commands, inbox) = mpsc::channel(16);
     let live = Arc::new(Mutex::new(HashSet::new()));
     let connected = Arc::new(Mutex::new(HashSet::new()));
@@ -1239,5 +1267,320 @@ mod tests {
             .expect("the client reads")
             .expect("the read succeeds");
         assert_eq!(&answer[..read], b"pong");
+    }
+
+    /// One direction's loss pattern: one skb in `one_in` is dropped, and a
+    /// dropped skb takes `burst` datagrams with it.
+    ///
+    /// netem drops a *segment batch* as one skb, so a carrier that fills the
+    /// path with eight-datagram batches pays eight consecutive losses for one
+    /// netem drop — the difference between a 1 % path and an 8 % one, in the
+    /// worst shape for a packet-threshold loss detector.
+    struct Loss {
+        rng: u64,
+        one_in: u64,
+        burst: usize,
+        skip: usize,
+        drops: u64,
+    }
+
+    impl Loss {
+        fn new(one_in: u64, burst: usize) -> Self {
+            Self {
+                rng: 0x9E37_79B9_7F4A_7C15,
+                one_in,
+                burst: burst.max(1),
+                skip: 0,
+                drops: 0,
+            }
+        }
+
+        /// Whether this datagram survives.
+        fn keep(&mut self) -> bool {
+            if self.skip > 0 {
+                self.skip -= 1;
+                self.drops += 1;
+                return false;
+            }
+            self.rng = self
+                .rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            if (self.rng >> 33) % self.one_in == 0 {
+                self.skip = self.burst - 1;
+                self.drops += 1;
+                return false;
+            }
+            true
+        }
+    }
+
+    /// A link that delays every datagram and drops one in a hundred.
+    ///
+    /// The bench imposes the same shape with netem and two namespaces, which
+    /// takes minutes and moves the loss into the kernel. This one is a fifth of
+    /// a millisecond away from a panic message: two engines, real sockets, and
+    /// the path in the middle, so a transport stall is reproducible without the
+    /// harness.
+    async fn lossy_relay(
+        front: UdpSocket,
+        back: UdpSocket,
+        server: SocketAddr,
+        delay: Duration,
+        drop_one_in: u64,
+        burst: usize,
+        dropped: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::collections::VecDeque;
+        use std::sync::atomic::Ordering;
+
+        // Two buffers: `select!` holds both arms' borrows at once.
+        let mut from_client = vec![0u8; 64 * 1024];
+        let mut from_server = vec![0u8; 64 * 1024];
+        let mut client: Option<SocketAddr> = None;
+        let mut to_server: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
+        let mut to_client: VecDeque<(std::time::Instant, Vec<u8>)> = VecDeque::new();
+        // The batch a bulk sender fills the path with is on the way to the
+        // server; the acknowledgements come back one small datagram at a time.
+        let mut towards_server = Loss::new(drop_one_in, burst);
+        let mut towards_client = Loss::new(drop_one_in, 1);
+        loop {
+            let now = std::time::Instant::now();
+            loop {
+                let Some((due, _)) = to_server.front() else {
+                    break;
+                };
+                if *due > now {
+                    break;
+                }
+                let Some((_, bytes)) = to_server.pop_front() else {
+                    break;
+                };
+                let _ = back.send_to(&bytes, server).await;
+            }
+            loop {
+                let Some((due, _)) = to_client.front() else {
+                    break;
+                };
+                if *due > now {
+                    break;
+                }
+                let Some((_, bytes)) = to_client.pop_front() else {
+                    break;
+                };
+                if let Some(client) = client {
+                    let _ = front.send_to(&bytes, client).await;
+                }
+            }
+            let next = to_server
+                .front()
+                .map(|(due, _)| *due)
+                .into_iter()
+                .chain(to_client.front().map(|(due, _)| *due))
+                .min()
+                .unwrap_or_else(|| now + Duration::from_millis(1));
+            let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(next));
+            tokio::pin!(sleep);
+            tokio::select! {
+                received = front.recv_from(&mut from_client) => {
+                    if let Ok((len, from)) = received {
+                        client = Some(from);
+                        if towards_server.keep() {
+                            to_server.push_back((
+                                std::time::Instant::now() + delay,
+                                from_client[..len].to_vec(),
+                            ));
+                        }
+                    }
+                }
+                received = back.recv_from(&mut from_server) => {
+                    if let Ok((len, _)) = received {
+                        if towards_client.keep() {
+                            to_client.push_back((
+                                std::time::Instant::now() + delay,
+                                from_server[..len].to_vec(),
+                            ));
+                        }
+                    }
+                }
+                () = &mut sleep => {}
+            }
+            dropped.store(
+                towards_server.drops + towards_client.drops,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// The loss1 cell in one process: one bulk stream, two engines, and a
+    /// 10 ms path that loses one datagram in a hundred.
+    ///
+    /// Ignored by default because it *measures*: the floor below is a budget
+    /// for a carrier that has to replace KCP, and a machine under load says
+    /// nothing about the code. Run it with `--ignored --nocapture`:
+    /// `cargo test --features quic --lib
+    /// transport::quic::socket::tests::a_stream_carries_over_a_lossy_link`
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one measurement: the relay, the transfer and the report belong together"
+    )]
+    #[ignore = "measures throughput over a lossy path; run with --ignored --nocapture"]
+    #[tokio::test]
+    async fn a_stream_carries_over_a_lossy_link() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // What the stream must carry, one way.
+        const TOTAL: usize = 8 * 1024 * 1024;
+        // The write size an IP frame's worth of bytes would be.
+        const CHUNK: usize = 8 * 1024;
+        // A floor no carrier that replaces KCP may fall under on this path.
+        const FLOOR_MBIT: u128 = 50;
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let mut server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        // The same transport parameters the carrier ships with: a test that
+        // measured the crate's defaults would measure the wrong controller.
+        server_config.transport_config(crate::transport::quic::params::transport_config());
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        // The path: the client dials front, whose datagrams leave from back,
+        // so the server's peer is the relay and the relay knows where to send
+        // the answers.
+        let front = UdpSocket::bind("127.0.0.1:0").await.expect("the front");
+        let relay_addr = front.local_addr().expect("an address");
+        let back = UdpSocket::bind("127.0.0.1:0").await.expect("the back");
+        // `burst` is the number of datagrams one netem drop costs. On the
+        // bench that is the sender's segment batch, which is what a 1 % skb
+        // loss becomes on the wire; here it is a knob so the two shapes can be
+        // compared without re-running the harness.
+        let burst: usize = std::env::var("MOLEHILL_TEST_LOSS_BURST")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        tokio::spawn(lossy_relay(
+            front,
+            back,
+            server_addr,
+            Duration::from_millis(10),
+            100,
+            burst,
+            Arc::clone(&dropped),
+        ));
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(
+            NoiseKeys::from_config(&client_cfg).expect("client keys"),
+        )));
+        config.transport_config(crate::transport::quic::params::transport_config());
+        let mut channel = client
+            .connect_stream(relay_addr, config, true)
+            .await
+            .expect("the direct channel comes up over the lossy path");
+
+        let started = std::time::Instant::now();
+        let shared = channel.shared_weak();
+        let reporter = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                let Some(shared) = shared.upgrade() else {
+                    break;
+                };
+                let (rtt, cwnd, lost, sent, streams) = shared.engine_stats();
+                println!(
+                    "  stats rtt={}ms cwnd={} lost={} sent={} streams={streams}",
+                    rtt.as_millis(),
+                    cwnd,
+                    lost,
+                    sent
+                );
+            }
+        });
+        let writer = tokio::spawn(async move {
+            let buf = vec![0x5Au8; CHUNK];
+            for _ in 0..TOTAL / CHUNK {
+                channel.write_all(&buf).await.expect("the write");
+            }
+            channel.shutdown().await.expect("the shutdown");
+        });
+
+        let mut served = tokio::time::timeout(Duration::from_secs(5), streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let got = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&got);
+        let read = tokio::time::timeout(Duration::from_secs(20), async move {
+            let mut seen = vec![0u8; 64 * 1024];
+            while counter.load(Ordering::Relaxed) < TOTAL {
+                let read = served.read(&mut seen).await.expect("the read");
+                if read == 0 {
+                    break;
+                }
+                counter.fetch_add(read, Ordering::Relaxed);
+            }
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let received = got.load(Ordering::Relaxed);
+        // Mbit/s without a float: bits over microseconds is already the unit.
+        let mbit = u128::try_from(received).expect("a byte count") * 8 / elapsed.as_micros().max(1);
+        println!(
+            "lossy carrier (burst={burst}): {received} of {TOTAL} bytes in {elapsed:?} = {mbit} Mbit/s, {} datagrams dropped, read finished={}",
+            dropped.load(Ordering::Relaxed),
+            read.is_ok()
+        );
+        writer.abort();
+        reporter.abort();
+        assert!(
+            mbit >= FLOOR_MBIT,
+            "the carrier carried {mbit} Mbit/s over a 1 % loss path, below the {FLOOR_MBIT} Mbit/s a KCP replacement has to keep"
+        );
     }
 }

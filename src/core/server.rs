@@ -719,6 +719,7 @@ async fn run_udp_listener(
                         );
                     }
                     None => {
+                        crate::transport::quic::channel::spawn_stats_reporter(&stream);
                         connections
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)

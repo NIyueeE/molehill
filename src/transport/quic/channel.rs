@@ -55,14 +55,21 @@ pub(crate) async fn connect(
     })
 }
 
-/// Log one line per second per direct channel while
-/// `MOLEHILL_QUIC_STATS` is set: the engine's own view of the path, which is
-/// what tells a loss-collapse apart from a stalled reader.
-fn spawn_stats_reporter(stream: &super::conn::QuicStream) {
+/// Log one line per second per connection while `MOLEHILL_QUIC_STATS` is set:
+/// the engine's own view of the path, which is what tells a loss-collapse
+/// apart from a stalled reader. Both ends start one for a connection they
+/// accept or dial, because a collapse shows on the side that is *not* sending
+/// as much as on the one that is.
+pub(crate) fn spawn_stats_reporter(stream: &super::conn::QuicStream) {
     if std::env::var_os("MOLEHILL_QUIC_STATS").is_none() {
         return;
     }
+    let key = stream.connection_key();
     let shared = stream.shared_weak();
+    // The key is only unique inside one driver, and a process has one driver
+    // per socket: the connection's own address is what tells two lanes apart
+    // in a merged log.
+    let id = std::sync::Weak::as_ptr(&shared) as usize;
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -73,7 +80,7 @@ fn spawn_stats_reporter(stream: &super::conn::QuicStream) {
             let (rtt, cwnd, lost, sent, streams) = shared.engine_stats();
             tracing::info!(
                 target: "molehill::quic",
-                "quic-stats: rtt_ms={} cwnd={} lost={} sent={} streams={}",
+                "quic-stats: id={id:x} key={key} rtt_ms={} cwnd={} lost={} sent={} streams={}",
                 rtt.as_millis(),
                 cwnd,
                 lost,
