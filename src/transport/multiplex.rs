@@ -1162,9 +1162,11 @@ impl TunnelPool {
     /// endpoint's [`crate::transport::carrier::CarrierChoice::prefer`] is the
     /// authority: the pool itself only moves a tunnel, the *choice* moves
     /// when the policy says so, under the same 120 s cooldown every other
-    /// switch respects. `MOLEHILL_TUNNEL_CARRIER_RULE=0` switches the whole
-    /// rule off (the hatch's `MOLEHILL_TUNNEL_SWITCH_AT` stays independent of
-    /// it — one is a measurement instrument, the other a policy).
+    /// switch respects. The rule is **off by default**; `MOLEHILL_TUNNEL_CARRIER_RULE=1`
+    /// turns it on for the process (see `carrier_rule_enabled` for why the
+    /// default is off, and the bench records the switch beside the method so a
+    /// run that set it says so). The hatch's `MOLEHILL_TUNNEL_SWITCH_AT` stays
+    /// independent of it — one is a measurement instrument, the other a policy.
     #[cfg(feature = "client")]
     fn carrier_rule_step(&self) {
         if !self.inner.shared.rule_enabled {

@@ -685,6 +685,7 @@ def build_results(camp: Campaign, pre: dict, provenance: dict, started: str) -> 
                     {
                         "MOLEHILL_DATA_CARRIER",
                         "MOLEHILL_CARRIER_SWITCH_AT",
+                        "MOLEHILL_TUNNEL_CARRIER_RULE",
                         "MOLEHILL_TUNNEL_SWITCH_AT",
                         "MOLEHILL_L3_STATS",
                         "MOLEHILL_KCP_STATS",
