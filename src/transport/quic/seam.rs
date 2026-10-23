@@ -150,7 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_tcp_carrier_satisfies_the_seam() {
+    async fn a_yamux_session_satisfies_the_seam() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mux_tx, mut mux_rx) = mpsc::channel(8);
         tokio::spawn(crate::transport::multiplex::run_server_tunnel(
@@ -167,7 +167,11 @@ mod tests {
             }
         });
         let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
-        let conn = crate::transport::tcp::TcpConn::new(client_io, shutdown);
+        let conn = crate::transport::tcp::MuxConn::new(
+            client_io,
+            shutdown,
+            crate::transport::carrier::Carrier::Tcp,
+        );
         let stats = a_stream_carries(Arc::new(conn), streams_rx).await;
         assert_eq!(
             stats.lost_packets, 0,

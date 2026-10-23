@@ -75,21 +75,28 @@ impl TcpTransport {
     }
 }
 
-/// The TCP carrier's connection: one yamux session over one socket.
+/// One yamux session over one connection, seen through the seam.
 ///
-/// This is the seam's TCP side. Once the pool and the lanes hold this type
-/// behind CarrierConn, nothing above them names yamux.
+/// The session is the same whether its bytes travel over TCP or over the KCP
+/// carrier, so the carrier is a field rather than the type's name: the pool
+/// knows which one it dialed, and this handle repeats that instead of
+/// guessing it from the code path.
 #[cfg(feature = "multiplex")]
 #[cfg(feature = "quic")]
-pub(crate) struct TcpConn {
+pub(crate) struct MuxConn {
     tunnel: super::multiplex::ClientTunnel,
+    carrier: super::carrier::Carrier,
 }
 
 #[cfg(feature = "multiplex")]
 #[cfg(feature = "quic")]
-impl TcpConn {
+impl MuxConn {
     /// Start the session over an established byte stream.
-    pub(crate) fn new<I>(io: I, shutdown: tokio::sync::watch::Receiver<bool>) -> Self
+    pub(crate) fn new<I>(
+        io: I,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        carrier: super::carrier::Carrier,
+    ) -> Self
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -99,6 +106,7 @@ impl TcpConn {
                 super::multiplex::mux_config(),
                 shutdown,
             ),
+            carrier,
         }
     }
 }
@@ -106,7 +114,7 @@ impl TcpConn {
 #[cfg(feature = "multiplex")]
 #[async_trait::async_trait]
 #[cfg(feature = "quic")]
-impl super::carrier::CarrierConn for TcpConn {
+impl super::carrier::CarrierConn for MuxConn {
     async fn open_stream(
         &self,
     ) -> Result<super::carrier::CarrierStream, super::carrier::StreamError> {
@@ -120,7 +128,7 @@ impl super::carrier::CarrierConn for TcpConn {
     }
 
     fn carrier(&self) -> super::carrier::Carrier {
-        super::carrier::Carrier::Tcp
+        self.carrier
     }
 
     fn is_alive(&self) -> bool {
@@ -156,7 +164,7 @@ mod seam_tests {
             tx,
         ));
         let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
-        let conn = TcpConn::new(client_io, shutdown_rx);
+        let conn = MuxConn::new(client_io, shutdown_rx, super::super::carrier::Carrier::Tcp);
 
         let mut stream = conn.open_stream().await.expect("a stream");
         stream.write_all(b"hello").await.expect("the write");
