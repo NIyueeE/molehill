@@ -486,12 +486,30 @@
   are still KCP's would be a lie in the other direction. The direct-channel
   primitive (`connect_stream`) is in place and tested, so wiring it into
   `ClientStream` can wait for the seam instead of landing twice.
-  **The seam's types are landed and gated on the `quic` feature** (`CarrierIo`,
-  `CarrierStream`, `CarrierConn`, and the TCP adapter `TcpConn`): nothing in
-  the default build holds them yet, and the gate denies dead-code warnings.
-  They un-gate in the commit that makes the pool hold a `CarrierConn` — that
-  is the point of the seam, and gating is the honest way to keep both builds
-  clean until then.
+  **The seam is landed, tested, and gated on the `quic` feature.** It carries
+  `CarrierIo`/`CarrierStream` (one boxed stream type above the line),
+  `CarrierConn` (open a stream, name the carrier, say whether it is alive,
+  report `CarrierStats`), and two implementations: `MuxConn` for the yamux
+  session (which rides either TCP or the KCP carrier, so the carrier is a
+  field, not the type's name) and `UdpConn` for a QUIC connection. One
+  contract function — write, echo, read back, still alive, report stats — runs
+  against both. Nothing in the default build holds a `CarrierConn` yet and
+  the gate denies dead-code warnings, so the types un-gate in the commit that
+  makes the pool hold one.
+  **The structural fact worth keeping:** yamux needs a byte stream, while QUIC
+  hands out a stream *factory*. That asymmetry is why the seam sits at the
+  stream level and why each carrier owns its connection type; a seam at the
+  byte-stream level cannot express the UDP carrier at all.
+  **The remaining order, each step green on its own:** (1) the pool holds
+  `Arc<dyn CarrierConn>` beside its counters — placement reads `stats()`,
+  repair reads `is_alive()`, and the yamux-only calls (`note_peer_health`,
+  snapshot, drain) move behind the carrier; (2) un-gate the seam; (3) the
+  lanes dial through the UDP carrier — a lane *is* a direct channel, so this
+  is `connect_direct_channel`'s QUIC branch plus the server's UDP accept, and
+  it is what makes the L3 arm measurable; (4) the gates in one run; (5) the
+  rename to `Udp` with the implementation swap, KCP's deletion, the four
+  feature lists, the status JSON, the bench vocabulary and dialect 5.3;
+  (6) the release ritual.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
