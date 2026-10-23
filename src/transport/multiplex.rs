@@ -734,6 +734,11 @@ struct PoolShared {
     /// [`CARRIER_RULE_WINDOW_TICKS`] rather than once per tick.
     #[cfg(feature = "client")]
     rule_tick: std::sync::atomic::AtomicU32,
+    /// The round-trip floor the pool's median is measured against, in
+    /// microseconds (`0` until the first reading): the rule's one signal that
+    /// does not need a probe on the other carrier to exist.
+    #[cfg(feature = "client")]
+    rtt_floor_us: std::sync::atomic::AtomicU32,
     /// Whether this pool's carrier rule runs at all, read from the
     /// environment **at pool creation** (the hatch's pattern): a test builds
     /// the rule on without touching process state.
@@ -985,6 +990,8 @@ impl TunnelPool {
             #[cfg(feature = "client")]
             rule_tick: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "client")]
+            rtt_floor_us: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "client")]
             rule_enabled,
             #[cfg(feature = "client")]
             carrier_choice,
@@ -1220,10 +1227,13 @@ impl TunnelPool {
         let Some((tunnel_id, share_pct)) = verdict else {
             // No delivery verdict: the streak resets (one clean tick is
             // enough — the confirm ticks exist to ride out bursts, not to
-            // require a unanimous history). A share suspicion starts a probe
+            // require a unanimous history). A suspicion starts a probe
             // directly: it needs no confirm streak, because nothing moves on
-            // it — the probe measures and the comparison decides.
-            if share.is_some() && self.probe_step() {
+            // it — the probe measures and the comparison decides. Two
+            // suspicions exist: the sender's re-send share (KCP only — TCP has
+            // no such counter) and the pool's own round trip against its
+            // drifting floor, which is the one both carriers produce.
+            if (share.is_some() || self.rtt_suspicion()) && self.probe_step() {
                 return;
             }
             *self
@@ -1512,7 +1522,10 @@ impl TunnelPool {
         if probe_per_s < CARRIER_RULE_PROBE_MIN_BYTES_PER_S {
             return;
         }
-        match probe_verdict(chosen_per_s, probe_per_s) {
+        // The round trips are the tie-breaker: read once, here, so both sides
+        // are the same instant's reading (a gauge, not a window counter).
+        let (chosen_rtt, probe_rtt) = self.probe_round_trips(probe_id);
+        match probe_verdict(chosen_per_s, probe_per_s, chosen_rtt, probe_rtt) {
             ProbeVerdict::Hold => {}
             ProbeVerdict::Move => {
                 if !self.probe_conclude(probe_tunnel) {
@@ -1612,6 +1625,79 @@ impl TunnelPool {
             // settle rather than read two tunnels as one probe.
             _ => None,
         }
+    }
+
+    /// The two sides' round trips at this instant: the probe tunnel's, and the
+    /// median of the pool carrier's other tunnels'.
+    ///
+    /// A gauge rather than a window counter — a round trip is a property of the
+    /// path now, not an amount — so it is read once, at the same moment, for
+    /// both sides. The median over the incumbent tunnels is what makes one
+    /// probe comparable to several: a mean would let one busy tunnel speak for
+    /// the carrier. A tunnel that has not measured one yet contributes nothing
+    /// (its `None` is not a zero: an unmeasured carrier is not a fast one).
+    #[cfg(feature = "client")]
+    fn probe_round_trips(
+        &self,
+        probe_id: usize,
+    ) -> (Option<std::time::Duration>, Option<std::time::Duration>) {
+        let state = self.inner.state.lock();
+        let mut probe = None;
+        let mut chosen: Vec<u32> = Vec::new();
+        for entry in &state.entries {
+            let Some(rtt) = entry.tunnel.counters.rtt() else {
+                continue;
+            };
+            let us = u32::try_from(rtt.as_micros()).unwrap_or(u32::MAX);
+            if entry.tunnel.id() == probe_id {
+                probe = Some(us);
+            } else {
+                chosen.push(us);
+            }
+        }
+        (
+            median_us(&mut chosen).map(|us| std::time::Duration::from_micros(u64::from(us))),
+            probe.map(|us| std::time::Duration::from_micros(u64::from(us))),
+        )
+    }
+
+    /// The pool's own median tunnel round trip in microseconds: the signal the
+    /// rule can read before any probe exists.
+    #[cfg(feature = "client")]
+    fn pool_median_rtt_us(&self) -> Option<u32> {
+        let state = self.inner.state.lock();
+        let mut rtts: Vec<u32> = state
+            .entries
+            .iter()
+            .filter_map(|entry| entry.tunnel.counters.rtt())
+            .map(|rtt| u32::try_from(rtt.as_micros()).unwrap_or(u32::MAX))
+            .collect();
+        median_us(&mut rtts)
+    }
+
+    /// Whether the pool's median round trip has risen far enough above its own
+    /// drifting floor to be worth a probe, updating that floor.
+    ///
+    /// The floor is the *minimum* the median has been recently: a queue that
+    /// builds and stays built raises the floor within a minute
+    /// (`CARRIER_RULE_RTT_FLOOR_DRIFT`), so what fires is the *transition* —
+    /// the moment the path behind the pool gets worse — not steady saturation.
+    /// That is the question the probe can answer and a byte counter cannot: is
+    /// the other carrier any better *now*?
+    #[cfg(feature = "client")]
+    fn rtt_suspicion(&self) -> bool {
+        let Some(median) = self.pool_median_rtt_us() else {
+            return false;
+        };
+        let shared = &self.inner.shared;
+        let floor = shared
+            .rtt_floor_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (next, suspicious) = rtt_suspicion_step(floor, median);
+        shared
+            .rtt_floor_us
+            .store(next, std::sync::atomic::Ordering::Relaxed);
+        suspicious
     }
 
     /// Begin a no-disruption carrier handover: exclude one unpinned tunnel of
@@ -2865,6 +2951,35 @@ const CARRIER_RULE_CONFIRM_TICKS: u32 = 3;
 /// 1.0.
 const CARRIER_RULE_PROBE_EDGE: f64 = 1.5;
 
+/// How much lower the probe carrier's round trip must be before it decides a
+/// comparison the bytes could not.
+///
+/// The round trip is the one signal **both** carriers produce: on TCP it is the
+/// kernel's own estimate, on KCP the ARQ's (which therefore also carries the
+/// ARQ's queueing). It decides only when neither side won on carried bytes — a
+/// carrier that carries materially less is not redeemed by answering faster,
+/// because the pool exists to carry — and it needs a 2x separation, the same
+/// order as the byte edge, so scatter cannot move a pool.
+const CARRIER_RULE_PROBE_RTT_EDGE: u32 = 2;
+
+/// How far above the floor it has drifted the pool's median round trip must be
+/// before the rule spends a probe on it.
+///
+/// The bytes verdict cannot ask this question: it needs a probe to exist. The
+/// round trip is the one gauge **both** carriers produce without traffic on the
+/// other one — TCP's is the kernel's, KCP's the ARQ's — so a queue building on
+/// the pool's own path is visible before anything is measured anywhere else.
+/// Twice the floor is a queue worth asking about; the floor itself drifts up
+/// (see `rtt_suspicion_step`), so a path that is simply always busy settles at
+/// its own new floor instead of probing forever.
+const CARRIER_RULE_RTT_SUSPICION_EDGE: u32 = 2;
+
+/// How fast the round-trip floor forgets: 1/64 per window (~44 s to double).
+///
+/// Slow enough that one burst does not raise it, fast enough that a path which
+/// genuinely got slower stops being suspicious within a minute.
+const CARRIER_RULE_RTT_FLOOR_DRIFT: u32 = 64;
+
 /// How long a probe runs before it is given back if the comparison stays
 /// inconclusive.
 ///
@@ -2986,19 +3101,74 @@ pub enum ProbeVerdict {
 /// the incumbent is several, and a raw byte total would let the incumbent win
 /// by counting, not by carrying.
 #[must_use]
-pub fn probe_verdict(chosen_bytes_per_s: f64, probe_bytes_per_s: f64) -> ProbeVerdict {
+pub fn probe_verdict(
+    chosen_bytes_per_s: f64,
+    probe_bytes_per_s: f64,
+    chosen_rtt: Option<std::time::Duration>,
+    probe_rtt: Option<std::time::Duration>,
+) -> ProbeVerdict {
     if chosen_bytes_per_s <= 0.0 && probe_bytes_per_s <= 0.0 {
         // Nothing moved through either side: there is nothing to compare, and
         // calling it here is how a probe would flunk an idle path.
         return ProbeVerdict::Hold;
     }
     if probe_bytes_per_s > chosen_bytes_per_s * CARRIER_RULE_PROBE_EDGE {
-        ProbeVerdict::Move
-    } else if chosen_bytes_per_s > probe_bytes_per_s * CARRIER_RULE_PROBE_EDGE {
-        ProbeVerdict::Revert
-    } else {
-        ProbeVerdict::Hold
+        return ProbeVerdict::Move;
     }
+    if chosen_bytes_per_s > probe_bytes_per_s * CARRIER_RULE_PROBE_EDGE {
+        return ProbeVerdict::Revert;
+    }
+    // The bytes are level, so the round trip decides — and it is the only
+    // signal both carriers produce (TCP's is the kernel's, KCP's the ARQ's,
+    // which also carries the ARQ's queueing). A missing measurement decides
+    // nothing: an unmeasured carrier is not a slow one.
+    match (chosen_rtt, probe_rtt) {
+        (Some(chosen), Some(probe))
+            if probe.saturating_mul(CARRIER_RULE_PROBE_RTT_EDGE) < chosen =>
+        {
+            ProbeVerdict::Move
+        }
+        (Some(chosen), Some(probe))
+            if chosen.saturating_mul(CARRIER_RULE_PROBE_RTT_EDGE) < probe =>
+        {
+            ProbeVerdict::Revert
+        }
+        _ => ProbeVerdict::Hold,
+    }
+}
+
+/// The lower-middle median of a set of values, `None` when the set is empty.
+///
+/// `(n - 1) / 2` is the middle for an odd count and the lower of the two
+/// middles for an even one — the conservative side for whichever value the
+/// caller is defending (a carrier's round trip, a group's carried bytes).
+fn median_us(values: &mut [u32]) -> Option<u32> {
+    values.sort_unstable();
+    let last = values.len().checked_sub(1)?;
+    Some(values[last / 2])
+}
+
+/// One window of the round-trip suspicion: the floor to keep, and whether the
+/// reading is far enough above it to spend a probe.
+///
+/// The floor **drifts up** by 1/[`CARRIER_RULE_RTT_FLOOR_DRIFT`] per window and
+/// is lowered immediately by a smaller reading, so it tracks the best the path
+/// has been recently (~44 s to double). A queue that builds and stays built
+/// therefore becomes the new floor within a minute and the rule goes quiet:
+/// what fires is the transition, not steady saturation. Zero readings are "not
+/// measured", never "instant".
+fn rtt_suspicion_step(floor_us: u32, median_us: u32) -> (u32, bool) {
+    if median_us == 0 {
+        return (floor_us, false);
+    }
+    if floor_us == 0 {
+        // The first reading is the floor itself, not a suspicion about it.
+        return (median_us, false);
+    }
+    let drifted = floor_us.saturating_add((floor_us / CARRIER_RULE_RTT_FLOOR_DRIFT).max(1));
+    let next = median_us.min(drifted);
+    let suspicious = median_us >= floor_us.saturating_mul(CARRIER_RULE_RTT_SUSPICION_EDGE);
+    (next, suspicious)
 }
 
 /// The bytes the two sides carried in one window: the pool carrier's tunnels
@@ -3871,33 +4041,114 @@ mod tests {
     }
 
     /// The probe's verdict: the two carriers' carried bytes per second per
-    /// tunnel, separated by the same 1.5x edge the lane policy uses. An idle
-    /// path is held, not failed — calling it is how a probe would flunk a
-    /// quiet tunnel.
+    /// tunnel, separated by the same 1.5x edge the lane policy uses, and — when
+    /// the bytes are level — the round trip, at a 2x edge. An idle path is
+    /// held, not failed: calling it is how a probe would flunk a quiet tunnel.
     #[test]
     fn the_probe_verdict_separates_the_carriers() {
         use ProbeVerdict::{Hold, Move, Revert};
+        use std::time::Duration;
+
+        // Nothing measured on either side: hold whatever the round trips say.
+        let (fast, slow) = (
+            Some(Duration::from_millis(5)),
+            Some(Duration::from_millis(80)),
+        );
 
         // Level: within the edge either way — hold, and look again.
-        assert_eq!(probe_verdict(100.0, 120.0), Hold);
-        assert_eq!(probe_verdict(100.0, 150.0), Hold, "1.5x is the edge itself");
-        assert_eq!(probe_verdict(150.0, 100.0), Hold);
+        assert_eq!(probe_verdict(100.0, 120.0, None, None), Hold);
+        assert_eq!(
+            probe_verdict(100.0, 150.0, fast, slow),
+            Revert,
+            "1.5x is the edge itself, so the bytes decide nothing and the clock does"
+        );
+        assert_eq!(probe_verdict(150.0, 100.0, fast, slow), Revert);
 
         // The measured separation on the divergent cells is 1.9x and up, so
         // the probe has room: a probed carrier carrying half again or more
         // than the incumbent's average tunnel moves the pool, and carrying
         // clearly less gives the tunnel back.
-        assert_eq!(probe_verdict(100.0, 151.0), Move);
-        assert_eq!(probe_verdict(100.0, 20.0), Revert);
+        assert_eq!(probe_verdict(100.0, 151.0, slow, fast), Move);
+        assert_eq!(probe_verdict(100.0, 20.0, fast, slow), Revert);
         assert_eq!(
-            probe_verdict(0.0, 1.0),
+            probe_verdict(0.0, 1.0, None, None),
             Move,
             "an idle incumbent loses to anything"
         );
 
         // Nothing moved through either side: nothing to compare, and a probe
         // that called it here would flunk an idle path.
-        assert_eq!(probe_verdict(0.0, 0.0), Hold);
+        assert_eq!(probe_verdict(0.0, 0.0, fast, slow), Hold);
+
+        // Level bytes, separated round trips: the carrier that answers in a
+        // quarter of the time wins the pool — and loses it by the same rule.
+        assert_eq!(probe_verdict(100.0, 100.0, slow, fast), Move);
+        assert_eq!(probe_verdict(100.0, 100.0, fast, slow), Revert);
+        // A 2x separation is the edge itself: not a move.
+        assert_eq!(
+            probe_verdict(
+                100.0,
+                100.0,
+                Some(Duration::from_millis(20)),
+                Some(Duration::from_millis(10))
+            ),
+            Hold
+        );
+        // An unmeasured round trip decides nothing, in either direction.
+        assert_eq!(probe_verdict(100.0, 100.0, None, fast), Hold);
+        assert_eq!(probe_verdict(100.0, 100.0, slow, None), Hold);
+        // A carrier that carries less is not redeemed by answering faster.
+        assert_eq!(probe_verdict(200.0, 100.0, slow, fast), Revert);
+    }
+
+    /// The round-trip suspicion: a transition above the pool's own drifting
+    /// floor, never a steady state and never an unmeasured path.
+    #[test]
+    fn the_round_trip_suspicion_fires_on_a_transition_only() {
+        // The first reading establishes the floor; it is not a suspicion.
+        let (floor, suspicious) = rtt_suspicion_step(0, 20_000);
+        assert_eq!((floor, suspicious), (20_000, false));
+
+        // A queue that doubles the round trip is worth a probe.
+        let (next, suspicious) = rtt_suspicion_step(20_000, 45_000);
+        assert!(suspicious);
+        assert_eq!(next, 20_312, "the floor drifts up by 1/64 per window");
+
+        // The same reading left standing becomes the floor within a minute, so
+        // a path that is simply always busy stops asking for probes: it fires
+        // on the transition, then goes quiet for good.
+        let mut floor = 20_000u32;
+        let mut fired = 0;
+        let mut late = 0;
+        for window in 0..90 {
+            let (next, suspicious) = rtt_suspicion_step(floor, 45_000);
+            floor = next;
+            fired += u32::from(suspicious);
+            if window >= 50 {
+                late += u32::from(suspicious);
+            }
+        }
+        assert!(fired > 0, "the transition never fired");
+        assert_eq!(late, 0, "a steady queue kept probing after it settled");
+
+        // A faster reading lowers the floor at once: the best of the recent
+        // path is what the next transition is measured against.
+        let (next, suspicious) = rtt_suspicion_step(45_000, 20_000);
+        assert_eq!((next, suspicious), (20_000, false));
+
+        // Unmeasured is not instant, and it never raises a suspicion.
+        assert_eq!(rtt_suspicion_step(20_000, 0), (20_000, false));
+        assert_eq!(rtt_suspicion_step(0, 0), (0, false));
+    }
+
+    /// The median both the probe and the suspicion read: the lower middle for
+    /// an even count (the conservative value), the middle for an odd one.
+    #[test]
+    fn the_median_is_the_lower_middle() {
+        assert_eq!(median_us(&mut []), None);
+        assert_eq!(median_us(&mut [7]), Some(7));
+        assert_eq!(median_us(&mut [30, 10, 20]), Some(20));
+        assert_eq!(median_us(&mut [40, 10, 30, 20]), Some(20));
     }
 
     /// The probe's window arithmetic: the pool carrier's tunnels average

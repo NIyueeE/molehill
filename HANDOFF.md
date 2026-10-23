@@ -61,6 +61,22 @@
 
 ## Where this stands
 
+- **The carrier rule can now ask its question on either carrier (2026-10-23).**
+  It had exactly one suspicion — a sender's re-sent share — and that counter
+  exists only on KCP, so a TCP-carrying pool could never probe the other
+  carrier: the peer-level choice was one-way by construction. It now has a
+  second suspicion the *path* answers: the pool's median tunnel round trip
+  against a floor it keeps (drifting up 1/64 per window, ~44 s to double, and
+  lowered at once by a faster reading), so what fires is the transition — the
+  path getting worse — while a path that is merely always busy settles at its
+  own floor and stops asking. The probe's verdict gained the round trip as its
+  tie-breaker: when the carried bytes are level (the 1.5x edge) the carrier that
+  answers in half the time wins the pool, at a 2x edge, and a missing
+  measurement decides nothing. Both signals read the counters `f8288da` added,
+  and both decisions are pure functions with tests (a steady queue must stop
+  probing; a carrier that carries less is not redeemed by answering faster).
+  Still off by default behind `MOLEHILL_TUNNEL_CARRIER_RULE=1`; its end-to-end
+  measurement is the open thread below.
 - **The shaped carrier campaign ran (2026-10-23), and its first finding was a
   regression of my own: the KCP window retune also narrowed the *receive*
   window.** `set_wndsize(want, want)` sized both from the session's own send
@@ -448,6 +464,17 @@
   files: the three `screen` runs quoted for GSO were **clean-path numbers in all
   three**, so the GSO comparison they carry is a clean-path comparison; a shaped
   one is owed, and it is the next measurement this file records.
+- **The carrier rule's end-to-end measurement is owed (2026-10-23).** The
+  plumbing, both signals and the verdict are in ("Where this stands"), and every
+  decision in them is unit-tested — but no run has yet watched the rule *act*.
+  The shape it needs: two builds, rule default-on and default-off (the same
+  trick the GSO A/B used, so one fingerprint holds both arms), on
+  `--profile stage --condition udp_throttled --condition-leg tunnel`, where the
+  carriers diverge 10-13x, with `MOLEHILL_POOL_STATS=1` to read the rule's own
+  log lines. What it must show: a probe starting on one of the two suspicions,
+  the verdict either moving the pool or giving the probe back, and no tunnel
+  left draining afterwards. Until that exists the rule stays off by default,
+  which is the honest state: a policy nobody has watched is a hypothesis.
 - **The carrier policy is going peer-level (2026-10-22, in progress), and the
   first instrument is in.** The operator's direction: TCP and KCP are peers, and
   the pool should pick per path instead of shipping a fixed order. The signal
