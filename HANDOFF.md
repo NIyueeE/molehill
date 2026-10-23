@@ -61,6 +61,30 @@
 
 ## Where this stands
 
+- **The carrier rule's first live measurement: it fires, it costs the tail, and
+  its handover was the reason (2026-10-23).** Two builds of the same commit,
+  differing only in the rule's default (on against off — the trick the GSO A/B
+  used, so one fingerprint holds both), on `--profile stage --condition
+  udp_throttled --condition-leg tunnel` at 60 s stages, two rounds plus the
+  run's own A/A copy. What it did: **one probe per rule-on arm** (`carrier rule:
+  suspicion confirmed; probing the other carrier with one tunnel probe="kcp"`)
+  and none in the rule-off arms; throughput and CPU per Gbit did not move
+  (12.414/12.432 against 12.221/12.568 Gbit/s, 0.636/0.634 against
+  0.641/0.633 s/Gbit). What it cost: the interactive tail — p99 **72.9 and 2.0**
+  ms on the two rule-on cells, **72.3 and 63.6** on its A/A twin, against
+  **2.01 and 2.33** with the rule off, i.e. 30x on three of the four rule-on
+  cells with the twin agreeing (the model labels it directional at n=2 and
+  cannot resolve p99 by rounds at this scatter). Why: the probe's handover never
+  landed. `MOLEHILL_POOL_STATS=1` shows `handover=2/kcp:draining` for the rest
+  of the arm — the UDP policer starves the KCP dial, so the drained tunnel stays
+  drained, the pool runs a tunnel short, and `probe_judge` waited out its whole
+  30 s budget with nothing to compare. Fixed in the same commit: the probe's
+  handover gets **5 s** to put a tunnel on the other carrier, and a carrier that
+  does not establish inside that is the verdict (give the tunnel back, back off
+  for 10 minutes) — a carrier the path cannot reach is a result, not a wait.
+  The re-measurement (same command, the same two builds) is owed before the rule
+  leaves opt-in; the numbers above are the reason it stays off by default until
+  it exists.
 - **The carrier rule can now ask its question on either carrier (2026-10-23).**
   It had exactly one suspicion — a sender's re-sent share — and that counter
   exists only on KCP, so a TCP-carrying pool could never probe the other
@@ -464,17 +488,17 @@
   files: the three `screen` runs quoted for GSO were **clean-path numbers in all
   three**, so the GSO comparison they carry is a clean-path comparison; a shaped
   one is owed, and it is the next measurement this file records.
-- **The carrier rule's end-to-end measurement is owed (2026-10-23).** The
-  plumbing, both signals and the verdict are in ("Where this stands"), and every
-  decision in them is unit-tested — but no run has yet watched the rule *act*.
-  The shape it needs: two builds, rule default-on and default-off (the same
-  trick the GSO A/B used, so one fingerprint holds both arms), on
-  `--profile stage --condition udp_throttled --condition-leg tunnel`, where the
-  carriers diverge 10-13x, with `MOLEHILL_POOL_STATS=1` to read the rule's own
-  log lines. What it must show: a probe starting on one of the two suspicions,
-  the verdict either moving the pool or giving the probe back, and no tunnel
-  left draining afterwards. Until that exists the rule stays off by default,
-  which is the honest state: a policy nobody has watched is a hypothesis.
+- **The carrier rule's re-measurement is owed (2026-10-23).** The first one
+  ran (record in "Where this stands"): the rule fires, costs nothing in
+  throughput, and cost 30x the interactive tail because its handover never
+  landed — fixed by bounding that handover to 5 s. The same command re-run is
+  what closes it: the two builds (rule default-on / default-off, the GSO A/B's
+  trick, so one fingerprint holds both arms), `--profile stage --condition
+  udp_throttled --condition-leg tunnel --scale 1.0 --rounds 2`, with
+  `MOLEHILL_POOL_STATS=1`. What it must show now: the `giving the probe's
+  tunnel back` line inside 5 s, `handover=` clearing from the pool-stats line,
+  and the tail back at the rule-off arm's level. Until then the rule stays off
+  by default — a policy nobody has watched act correctly is a hypothesis.
 - **The carrier policy is going peer-level (2026-10-22, in progress), and the
   first instrument is in.** The operator's direction: TCP and KCP are peers, and
   the pool should pick per path instead of shipping a fixed order. The signal

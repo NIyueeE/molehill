@@ -1454,6 +1454,36 @@ impl TunnelPool {
         }
     }
 
+    /// Give a probe back: it ends here, the pool pays its backoff before
+    /// suspecting again, and the tunnel the probe was dialling returns to the
+    /// pool's carrier.
+    ///
+    /// Two ways in — the budget expiring with no verdict, and the probed
+    /// carrier not establishing at all — and both mean the same thing to the
+    /// pool: the probe is over, and a drained tunnel must not outlive it.
+    #[cfg(feature = "client")]
+    fn probe_give_back(&self, probed: Carrier, why: &str) {
+        let mut probe = self
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if probe.active.is_none() {
+            return;
+        }
+        probe.active = None;
+        probe.backoff_until = Some(std::time::Instant::now() + CARRIER_RULE_PROBE_BACKOFF);
+        drop(probe);
+        info!(
+            pool = %self.inner.shared.key,
+            probe = probed.as_str(),
+            reason = why,
+            "carrier rule: giving the probe's tunnel back and backing off"
+        );
+        self.begin_handover(probed, self.inner.shared.carrier);
+    }
+
     /// Judge the running probe on one window: the pool carrier's per-tunnel
     /// carried bytes against the probe tunnel's, acted on when they separate.
     ///
@@ -1464,44 +1494,33 @@ impl TunnelPool {
     #[cfg(feature = "client")]
     fn probe_judge(&self, last: &HealthSample, now: &HealthSample) {
         let seconds = f64::from(CARRIER_RULE_WINDOW_TICKS) * 0.05;
-        let probe_tunnel = {
-            let probe = self
-                .inner
-                .shared
-                .probe
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match probe.active {
-                Some((probed, started)) if started.elapsed() <= CARRIER_RULE_PROBE_MAX => probed,
-                Some((probed, _)) => {
-                    // Inconclusive for the whole budget: the probe comes back
-                    // and the pool pays its backoff before suspecting again.
-                    let mut probe = self
-                        .inner
-                        .shared
-                        .probe
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if probe.active.is_some() {
-                        probe.active = None;
-                        probe.backoff_until =
-                            Some(std::time::Instant::now() + CARRIER_RULE_PROBE_BACKOFF);
-                        drop(probe);
-                        info!(
-                            pool = %self.inner.shared.key,
-                            "carrier rule: probe inconclusive for its whole budget; \
-                             giving the tunnel back and backing off"
-                        );
-                        self.begin_handover(probed, self.inner.shared.carrier);
-                    }
-                    return;
-                }
-                None => return,
-            }
+        let Some((probe_tunnel, started)) = self
+            .inner
+            .shared
+            .probe
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+        else {
+            return;
         };
+        if started.elapsed() > CARRIER_RULE_PROBE_MAX {
+            // Inconclusive for the whole budget: the probe comes back and the
+            // pool pays its backoff before suspecting again.
+            self.probe_give_back(probe_tunnel, "probe inconclusive for its whole budget");
+            return;
+        }
         let Some(probe_id) = self.probe_tunnel_of(probe_tunnel) else {
-            // The probe's tunnel is gone (a repair removed it, or the handover
-            // that dialled it has not completed): there is nothing to compare.
+            // The handover that dials the probe's tunnel has not landed yet. A
+            // carrier the path cannot establish on is a verdict, not a wait:
+            // on a UDP-policed leg the KCP dial starves, the drained tunnel
+            // stays draining, and the pool runs a tunnel short — the rule's
+            // first live measurement read exactly that (p99 63-73 ms against
+            // 2.0-2.3 with the rule off, HANDOFF.md 2026-10-23). Waiting the
+            // full probe budget would spend 30 s paying it.
+            if started.elapsed() > CARRIER_RULE_PROBE_ESTABLISH_MAX {
+                self.probe_give_back(probe_tunnel, "the probed carrier did not establish");
+            }
             return;
         };
         let (chosen_bytes, probe_bytes) = probe_carried_bytes(last, now, probe_id);
@@ -2988,6 +3007,16 @@ const CARRIER_RULE_RTT_FLOOR_DRIFT: u32 = 64;
 /// divergent cell needs to separate and short enough not to hold a split for
 /// a whole run.
 const CARRIER_RULE_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the probe's handover may take to put a tunnel on the other carrier
+/// before the probe is called on it.
+///
+/// The probe's *judgement* needs 30 s of comparing two tunnels; its *setup*
+/// needs only a dial. A carrier that cannot be reached is a result — it is the
+/// carrier the path refuses — and waiting the full budget for it costs the pool
+/// a drained tunnel and the workload its tail (measured: p99 63-73 ms against
+/// 2.0-2.3 with the rule off, on a UDP-policed leg where the KCP dial starves).
+const CARRIER_RULE_PROBE_ESTABLISH_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a pool waits before probing again after one came back empty.
 ///
