@@ -291,20 +291,25 @@ impl AsyncWrite for QuicStream {
 
         // The selector byte rides with the first payload, so a caller never
         // sees a zero-length write.
-        let mut frame = Vec::new();
+        // The frame is built in the buffer that will hand it over: the top
+        // flush above guarantees it is empty, so this is one allocation for
+        // the stream's whole life instead of one per write.
+        this.write.pending.clear();
         if this.write.selector_pending {
-            frame.push(this.selector());
+            this.write.pending.push(this.selector());
             this.write.selector_pending = false;
         }
         let take = buf.len().min(MAX_PLAINTEXT);
         if take > 0 {
             let chunk = &buf[..take];
             match this.write.key.as_mut() {
-                Some(key) => frame.extend_from_slice(&key.seal(chunk)),
-                None => frame.extend_from_slice(chunk),
+                Some(key) => {
+                    let sealed = key.seal(chunk);
+                    this.write.pending.extend_from_slice(&sealed);
+                }
+                None => this.write.pending.extend_from_slice(chunk),
             }
         }
-        this.write.pending = frame;
         let consumed = take;
 
         match flush(&mut connection, this.id, &mut this.write.pending) {
@@ -432,9 +437,12 @@ impl AsyncRead for QuicStream {
                     return Poll::Ready(Err(gone()));
                 }
             };
-            let scratch = vec![0u8; MAX_PLAINTEXT + 2 + super::record::TAG_LEN];
+            // `next` takes a maximum length, not a buffer: the chunk borrows
+            // the engine's own storage. Allocating a scratch vector here (the
+            // first version did, 65 KiB per poll) bought nothing.
+            const MAX_CHUNK: usize = MAX_PLAINTEXT + 2 + super::record::TAG_LEN;
             loop {
-                match chunks.next(scratch.len()) {
+                match chunks.next(MAX_CHUNK) {
                     Ok(Some(chunk)) => this.read.raw.extend_from_slice(&chunk.bytes),
                     Ok(None) => {
                         eof = true;

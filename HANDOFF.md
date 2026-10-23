@@ -5,11 +5,13 @@
 > manifest moves to `1.0.0`.** A major number describes the product, not the
 > wire: `CURRENT_PROTO_VERSION` is still **5.2**, and the one wire change this
 > cycle has committed to is the carrier redesign — **6.0**, a new dialect
-> rather than an extension of 5.2 (AGENTS.md §5). There is no 5.3. 6.0 keeps
-> no backward compatibility, and none is expressible: a 5.2 peer drives KCP
-> over UDP and yamux over TCP, a 6.0 peer drives neither, so each end refuses
-> the other on the connection it happens on and both upgrade together. The
-> constant flips in the commit that swaps the carrier, not before.
+> rather than an extension of 5.2 (AGENTS.md §5). There is no 5.3. **Maintainer
+> decision (2026-10-23): 6.0 is the target dialect; the plan text's
+> 5.2 -> 5.3 is superseded.** 6.0 keeps no backward compatibility, and none is
+> expressible: a 5.2 peer drives KCP over UDP and yamux over TCP, a 6.0 peer
+> drives neither, so each end refuses the other on the connection it happens on
+> and both upgrade together. The constant flips in the commit that swaps the
+> carrier, not before.
 > `[Unreleased]` already carries the configuration refusals that landed on
 > `main` after 0.11.2; they ride this release.
 >
@@ -102,13 +104,18 @@
   scatter: **the `clean` cell of the plan's gate is missed by an order of
   magnitude, and Gate 2 is not met. Per the gate's own rule, nothing flips and
   KCP stays.** The gap is CPU, not loss: the path moves 2.1 M small datagrams
-  for 2.6 GB, one `send_to` per engine datagram, with a 65 KiB scratch buffer
-  allocated per stream read and the record layer's seal/open on every write.
-  The next lever is the plan's own datagram layer — `udp_batch`/`UDP_SEGMENT`
-  batching, a reusable read buffer, and the measured transport parameters — not
-  a carrier decision. The formal `--ab-arm` gate (two builds, one fingerprint,
-  `loss1`/`rtt100`/`clean`) is still owed; this cell is a smoke, not the
-  record.
+  for 2.6 GB, one `send_to` per engine datagram, and the record layer's
+  seal/open on every write. **A buffer-reuse pass did not move the number**:
+  the per-read 65 KiB scratch (only its length was ever used, so the allocator
+  had already elided it) is gone, the write frame is built in its pending
+  buffer, and the driver's engine scratch is reused — the lane cell then read
+  1.03-1.07 Gbit/s at 3.20-3.31 s/Gbit against 1.03-1.09 at 3.21-3.30 before
+  it (`/home/dsh/tmp/udp-alloc-l3.json`). The next lever is the plan's own
+  datagram layer — `udp_batch`/`UDP_SEGMENT` on send and `recvmmsg` on receive,
+  so one syscall and one wake cover a burst — plus the measured transport
+  parameters, not more allocation work and not a carrier decision. The formal
+  `--ab-arm` gate (two builds, one fingerprint, `loss1`/`rtt100`/`clean`) is
+  still owed; this cell is a smoke, not the record.
 - **The UDP carrier's lane carries end to end, and the two bugs were
   ordering (2026-10-23).** The first working smoke of a transparent claim over
   the QUIC-shaped carrier: the same `stage` run, `--condition clean`,

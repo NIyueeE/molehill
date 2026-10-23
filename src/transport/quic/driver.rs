@@ -70,6 +70,9 @@ pub(crate) struct Driver {
     /// The next connection key, handed to `Shared` so a listener can group the
     /// streams of one connection without naming an engine type.
     next_key: u64,
+    /// The engine's scratch buffer, reused by every call that takes one: it
+    /// was allocated per datagram and per transmit, which is the hot path.
+    scratch: Vec<u8>,
 }
 
 impl Driver {
@@ -90,6 +93,7 @@ impl Driver {
             pending: Vec::new(),
             notify,
             next_key: 1,
+            scratch: Vec::new(),
         }
     }
 
@@ -119,10 +123,9 @@ impl Driver {
         now: Instant,
         incoming: Incoming,
     ) -> Result<ConnectionHandle, AcceptError> {
-        let mut scratch = Vec::new();
         let (handle, connection) =
             self.endpoint
-                .accept(incoming, now, &mut scratch, self.server_config.clone())?;
+                .accept(incoming, now, &mut self.scratch, self.server_config.clone())?;
         let key = self.next_key;
         self.next_key += 1;
         self.connections.insert(
@@ -140,10 +143,9 @@ impl Driver {
         remote: SocketAddr,
         data: BytesMut,
     ) -> Option<Incoming> {
-        let mut scratch = Vec::new();
         let event = self
             .endpoint
-            .handle(now, remote, None, None, data, &mut scratch);
+            .handle(now, remote, None, None, data, &mut self.scratch);
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => Some(incoming),
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
@@ -155,7 +157,7 @@ impl Driver {
             Some(DatagramEvent::Response(transmit)) => {
                 self.pending.push(Outgoing {
                     destination: transmit.destination,
-                    contents: scratch[..transmit.size].to_vec(),
+                    contents: self.scratch[..transmit.size].to_vec(),
                     segment_size: transmit.segment_size,
                 });
                 None
@@ -169,11 +171,11 @@ impl Driver {
         if !self.pending.is_empty() {
             return Some(self.pending.remove(0));
         }
-        let mut scratch = Vec::new();
+        let scratch = &mut self.scratch;
         for shared in self.connections.values() {
             scratch.clear();
             let mut connection = shared.connection.lock();
-            if let Some(transmit) = connection.poll_transmit(now, MAX_DATAGRAMS, &mut scratch) {
+            if let Some(transmit) = connection.poll_transmit(now, MAX_DATAGRAMS, scratch) {
                 return Some(Outgoing {
                     destination: transmit.destination,
                     contents: scratch[..transmit.size].to_vec(),
