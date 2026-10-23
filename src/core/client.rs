@@ -1185,8 +1185,10 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
     // branch; a build without it keeps the KCP implementation in the same carrier
     // slot, so the two never race for it.
     #[cfg(all(feature = "quic", feature = "noise"))]
-    if args.carrier.preferred() == Carrier::Kcp {
-        return connect_udp_carrier(args).await;
+    if args.carrier.preferred() == Carrier::Kcp
+        && let Some(stream) = connect_udp_carrier(args).await?
+    {
+        return Ok(stream);
     }
 
     #[cfg(all(feature = "multiplex", feature = "kcp", not(feature = "quic")))]
@@ -1268,7 +1270,7 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
 /// Split out of connect_direct_channel so each carrier keeps its own
 /// bookkeeping and both bodies fit the lint room.
 #[cfg(all(feature = "quic", feature = "noise"))]
-async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<ClientStream> {
+async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<Option<ClientStream>> {
     let remote_addr = {
         let mut probe = args.remote_addr.clone();
         probe
@@ -1292,7 +1294,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<ClientStream> 
     {
         Ok(Ok(channel)) => {
             args.carrier.succeeded(Carrier::Kcp);
-            return Ok(ClientStream::Udp(channel));
+            Ok(Some(ClientStream::Udp(channel)))
         }
         Ok(Err(e)) => {
             if args
@@ -1302,6 +1304,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<ClientStream> 
             {
                 return Err(e).context("the UDP carrier failed and the carrier is forced");
             }
+            Ok(None)
         }
         Err(_) => {
             if args
@@ -1311,6 +1314,7 @@ async fn connect_udp_carrier(args: &RunDataChannelArgs) -> Result<ClientStream> 
             {
                 bail!("the UDP carrier did not come up in time, and the carrier is forced");
             }
+            Ok(None)
         }
     }
 }

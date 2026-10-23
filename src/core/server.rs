@@ -686,7 +686,7 @@ async fn handle_udp_stream(
             )
             .await
         }
-        other @ Hello::DataChannelTunnelHello(..) => {
+        Hello::DataChannelTunnelHello(..) => {
             bail!("A pool tunnel is not carried by the UDP carrier yet, and this one asked for it")
         }
         other @ Hello::ControlChannelHello(..) => {

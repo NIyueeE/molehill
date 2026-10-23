@@ -545,6 +545,18 @@
   next step. **The proof is still owed** — both suites are green (310 default, 325
   with `quic`) but nothing yet drives a lane end to end, so this is wiring and
   the carrier run (step 3) is what measures it.
+- **The gate does not compile the `quic` feature, and a release build found it the
+  hard way (2026-10-23).** The direct-channel slice passed `just check` and both
+  suites, then failed `cargo build --release --features quic`: the extracted
+  helper ended in a match whose arms had no value, which is an error only where that
+  code is compiled at all — the default and minimal passes strip it. Two rules follow.
+  **Build the feature you touched**: `--features quic` is not in the gate, so a
+  slice that lands behind it is not proven by a green check chain. **Provenance is a
+  marker, not a timestamp**: `build.rs` does not re-run when only sources change,
+  so `--version`'s `Build Timestamp` can describe an older tree than the
+  binary carries. A string only the new code contains is the signal that survives
+  (`strings <binary> | grep -c 'UDP carrier'` is 8 in the build that has it, 0 in the
+  one that does not).
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
