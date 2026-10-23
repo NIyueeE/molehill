@@ -35,6 +35,17 @@ const MAX_HANDSHAKE: usize = 4096;
 /// The peer's payload buffer on read.
 const MAX_PAYLOAD: usize = 1024;
 
+/// The one byte each side sends in the Handshake packet space once Noise is
+/// done.
+///
+/// `quinn-proto` promotes a connection to "established" only while handling a
+/// *Handshake* packet (it mirrors TLS, where both peers exchange Finished).
+/// Noise KK is two messages, so after them neither peer would ever send a
+/// Handshake packet again and both would wait forever. This marker is that
+/// missing flight: one byte, sent after the keys are installed, which the peer
+/// consumes without touching the Noise state.
+const HANDSHAKE_DONE: u8 = 0xa5;
+
 /// What a completed handshake publishes to the connection.
 ///
 /// The handshake hash is the seed the per-stream record layer derives from
@@ -175,6 +186,11 @@ impl Session for NoiseSession {
         let Some(state) = inner.as_mut() else {
             return Err(handshake_failure());
         };
+        // The peer's completion marker: not Noise bytes, just the packet the
+        // engine needs to see in the Handshake space.
+        if state.complete && buf == [HANDSHAKE_DONE] {
+            return Ok(true);
+        }
         let mut payload = vec![0u8; MAX_PAYLOAD];
         let read = state
             .state
@@ -219,10 +235,17 @@ impl Session for NoiseSession {
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
         let mut inner = self.inner.lock();
         let state = inner.as_mut()?;
+        // Whatever was queued for *this* call goes first: bytes a read
+        // produced, or a marker queued when the keys were handed over.
         buf.extend_from_slice(&state.pending);
         state.pending.clear();
+
         if state.complete && !state.keys_handed {
             state.keys_handed = true;
+            // The marker is queued for the *next* call: only after the engine
+            // has installed these keys is a packet encoded in the Handshake
+            // space, which is where the peer needs to see it.
+            state.pending.push(HANDSHAKE_DONE);
             return Some(plain_keys());
         }
         None
@@ -400,9 +423,20 @@ mod tests {
         );
         assert!(
             wire.is_empty(),
-            "KK has nothing left for the client to send"
+            "KK has nothing left for the client to send with its keys"
         );
         assert!(!client.is_handshaking(), "the client is done");
+
+        // The completion marker: one byte, queued for the next call so the
+        // engine encodes it in the Handshake space. The engine promotes a
+        // connection only on a Handshake packet, and KK has no third message,
+        // so both sides send this one.
+        wire.clear();
+        assert!(client.write_handshake(&mut wire).is_none());
+        assert_eq!(wire, vec![HANDSHAKE_DONE], "the client's marker");
+        server
+            .read_handshake(&wire)
+            .expect("the server accepts the marker without touching Noise");
 
         // The parameter fields are private to the crate, so the value is
         // asserted through the encoding: what we sent must survive the round

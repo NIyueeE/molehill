@@ -14,8 +14,13 @@
 //! number arithmetic, its sampling budget and its frame layout are untouched,
 //! which is exactly why no fork of the crate is needed.
 
+use std::sync::Arc;
+
 use bytes::BytesMut;
-use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, Keys, PacketKey};
+use quinn_proto::crypto::{
+    AeadKey, CryptoError, HandshakeTokenKey, HeaderKey, HmacKey, KeyPair, Keys, PacketKey,
+};
+use ring::{aead, hmac};
 
 /// The RFC 9001 §5.4 sample size.
 ///
@@ -69,6 +74,91 @@ impl HeaderKey for PlainHeaderKey {
 
     fn sample_size(&self) -> usize {
         SAMPLE_SIZE
+    }
+}
+
+/// The endpoint's stateless-reset key.
+///
+/// `EndpointConfig::new` requires one, and a weak one would be worse than
+/// none: every connection advertises a reset token derived from it, so an
+/// unkeyed tag would let an off-path attacker tear down connections it has
+/// merely observed. This is the only real cryptography the carrier keeps
+/// outside Noise, and it protects the endpoint rather than the payload.
+pub(crate) struct ResetHmac(hmac::Key);
+
+impl ResetHmac {
+    pub(crate) fn new() -> Arc<Self> {
+        // Per process: a reset token only has to be unforgeable for the life
+        // of the endpoint that issues it.
+        let key = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+            .expect("the system random source is available");
+        Arc::new(ResetHmac(key))
+    }
+}
+
+impl HmacKey for ResetHmac {
+    fn sign(&self, data: &[u8], signature_out: &mut [u8]) {
+        let tag = hmac::sign(&self.0, data);
+        let len = signature_out.len().min(tag.as_ref().len());
+        signature_out[..len].copy_from_slice(&tag.as_ref()[..len]);
+    }
+
+    fn signature_len(&self) -> usize {
+        hmac::HMAC_SHA256.digest_algorithm().output_len()
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+        hmac::verify(&self.0, data, signature).map_err(|_| CryptoError)
+    }
+}
+
+/// The endpoint's handshake-token keys.
+///
+/// `ServerConfig::new` requires one. It seals Retry and address-validation
+/// tokens, and this carrier never sends a Retry, so in practice it is never
+/// handed a token — but a weak one would be a hole the day that changes, and
+/// the derivation is four lines. Each key is derived from fresh randomness and
+/// used once, which is why the nonce is a constant.
+pub(crate) struct TokenKeys {
+    master: hmac::Key,
+}
+
+impl TokenKeys {
+    pub(crate) fn new() -> Arc<Self> {
+        let master = hmac::Key::generate(hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+            .expect("the system random source is available");
+        Arc::new(TokenKeys { master })
+    }
+}
+
+impl HandshakeTokenKey for TokenKeys {
+    fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn AeadKey> {
+        let derived = hmac::sign(&self.master, random_bytes);
+        let key = aead::UnboundKey::new(&aead::AES_256_GCM, derived.as_ref())
+            .expect("HMAC-SHA256 yields the 32 bytes AES-256 needs");
+        Box::new(TokenAead(aead::LessSafeKey::new(key)))
+    }
+}
+
+struct TokenAead(aead::LessSafeKey);
+
+impl AeadKey for TokenAead {
+    fn seal(&self, data: &mut Vec<u8>, additional_data: &[u8]) -> Result<(), CryptoError> {
+        let nonce = aead::Nonce::assume_unique_for_key([0u8; aead::NONCE_LEN]);
+        self.0
+            .seal_in_place_append_tag(nonce, aead::Aad::from(additional_data), data)
+            .map_err(|_| CryptoError)
+    }
+
+    fn open<'a>(
+        &self,
+        data: &'a mut [u8],
+        additional_data: &[u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        let nonce = aead::Nonce::assume_unique_for_key([0u8; aead::NONCE_LEN]);
+        self.0
+            .open_in_place(nonce, aead::Aad::from(additional_data), data)
+            .map_err(|_| CryptoError)
     }
 }
 

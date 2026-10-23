@@ -18,7 +18,9 @@
 //! ("The UDP carrier") and in `docs/internals.md`.
 
 mod crypto;
+mod driver;
 mod session;
 
-pub(crate) use crypto::{PlainHeaderKey, PlainPacketKey, plain_keys};
+pub(crate) use crypto::{PlainHeaderKey, PlainPacketKey, ResetHmac, TokenKeys, plain_keys};
+pub(crate) use driver::{Driver, MAX_DATAGRAMS, Outgoing};
 pub(crate) use session::{HandshakeData, NoiseClientConfig, NoiseServerConfig};
