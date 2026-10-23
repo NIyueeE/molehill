@@ -510,6 +510,19 @@
   rename to `Udp` with the implementation swap, KCP's deletion, the four
   feature lists, the status JSON, the bench vocabulary and dialect 5.3;
   (6) the release ritual.
+  **What blocks the pool's stream-type switch, measured (2026-10-23).** The
+  change is small — `MuxStream` aliases `CarrierStream`, 14 sites inside
+  `multiplex.rs` and 3 outside — but three things have to move in **one**
+  commit or the gate's `-D warnings` refuses it: `ClientTunnel::open_stream`
+  is `pub` and would return crate-private types, so it must become
+  `pub(crate)`; a `MuxConn` wrapper cannot own a `ClientTunnel` while the
+  tunnel also needs the carrier field it takes to implement the seam, so
+  implement `CarrierConn` for `ClientTunnel` itself and give it the carrier
+  the pool already knows; and `CarrierConn`/`CarrierStats` stay dead code
+  until something calls *through* the trait, so the same commit must store
+  `Arc<dyn CarrierConn>` in the pool and open through it. Attempted as three
+  separate edits and reverted: a half-migrated pool is worse than an unmigrated
+  one, and the trap is worth more to the next reader than the partial diff.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
