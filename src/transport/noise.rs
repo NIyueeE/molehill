@@ -67,6 +67,22 @@ impl NoiseKeys {
             .remote_public_key(&self.remote_public_key)?)
     }
 
+    /// The same handshake, driven by hand.
+    ///
+    /// The QUIC carrier's `Session` feeds it CRYPTO frames instead of a
+    /// socket, so it needs the state itself rather than a `NoiseStream`. The
+    /// pattern and the key material are shared with every other carrier on
+    /// purpose: one identity, one handshake, whichever way the bytes travel.
+    #[cfg(feature = "quic")]
+    pub(crate) fn handshake_state(&self, initiator: bool) -> Result<snow::HandshakeState> {
+        let builder = self.builder()?;
+        Ok(if initiator {
+            builder.build_initiator()?
+        } else {
+            builder.build_responder()?
+        })
+    }
+
     /// Run the initiator's side of the KK handshake over any byte stream.
     pub(crate) async fn wrap_initiator<S>(&self, mut stream: S) -> Result<NoiseStream<S>>
     where

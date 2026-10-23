@@ -40,15 +40,21 @@ The feature graph is additive:
   it; `transparent` also implies `noise` for its control channel.
 - `multiplex` — the yamux tunnel pool; implies `carrier`.
 - `kcp` — KCP-over-UDP tunnels; implies `multiplex`.
+- `quic` — the UDP carrier's engine: QUIC's framing, recovery, pacing and
+  streams from `quinn-proto`, with the packet crypto subtracted (Noise is the
+  identity, the record layer the confidentiality); implies `multiplex` and
+  `noise`. **Not in the default set yet** — it replaces `kcp` only once the
+  bench gate recorded in HANDOFF passes, and until then `kcp` keeps its slot.
 
 Dependency features are scoped to the feature that uses them: `noise` enables
 `snow`, `chacha20poly1305`, `base64` and `pin-project`; `kcp` enables `log` and
-`thiserror`; `client` enables the proxy and status dependencies; `multiplex`
+`thiserror`; `quic` enables `quinn-proto` (with its TLS implementation
+disabled — rustls is never compiled); `client` enables the proxy and status dependencies; `multiplex`
 enables `parking_lot` and `nohash-hasher`. Tokio is built with only
 `rt-multi-thread`, `macros`, `net`, `io-util`, `sync`, `time`, `signal` and
 `fs`; an API from another Tokio feature needs that feature added here.
 
-Two names exist outside the default set:
+Two release variants exist outside the default set:
 
 - `embedded` — the embedded-device release set: `server`, `client`,
   `hot-reload` and `noise`, without `multiplex`, `kcp` or `transparent`;

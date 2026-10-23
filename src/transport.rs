@@ -110,6 +110,13 @@ pub(crate) use noise::NoiseKeys;
 #[cfg(all(feature = "kcp", any(feature = "client", feature = "server")))]
 pub(crate) mod kcp;
 
+// The QUIC-shaped UDP carrier's engine adapter: the crypto seam (a Noise
+// handshake behind a pass-through packet cipher), the transport parameters it
+// exchanges, and the stream type the carrier seam exposes. Replaces `kcp` at
+// the end of the migration (HANDOFF records the phase gate).
+#[cfg(feature = "quic")]
+pub(crate) mod quic;
+
 /// The portable half of an outbound datagram batch: the batch's shape, which
 /// every platform shares, as opposed to the syscall that sends it. Gated with
 /// `kcp` and not with the platform, because the non-Linux send path uses it.
