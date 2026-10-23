@@ -21,7 +21,7 @@ use quinn_proto::crypto::{ClientConfig, ExportKeyingMaterialError, Keys, ServerC
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectError, ConnectionId, Side, TransportError};
 
-use super::crypto::plain_keys;
+use super::crypto::{PlainPacketKey, plain_keys};
 use crate::transport::NoiseKeys;
 
 /// The alert code reported when the handshake itself fails: RFC 9001 §4.8
@@ -59,9 +59,11 @@ struct Inner {
     state: snow::HandshakeState,
     /// Handshake bytes produced by the last read, waiting to be flushed.
     pending: Vec<u8>,
-    /// Whether the keys have been handed over. The engine upgrades one packet
-    /// space per handover (Initial → Handshake); the 1-RTT upgrade is asked
-    /// for again, and one handover is what the engine's own tests exercise.
+    /// How many key handovers have happened. The engine upgrades one packet
+    /// space per handover — `Initial → Handshake` on the first and
+    /// `Handshake → 1-RTT` on the second — and asks `write_handshake` again
+    /// for each. With pass-through keys all the sets are identical, but the
+    /// engine only installs a space when it is handed one.
     keys_handed: u8,
     /// The peer's transport parameters, exactly as they arrived.
     theirs: Option<Vec<u8>>,
@@ -243,7 +245,7 @@ impl Session for NoiseSession {
         buf.extend_from_slice(&state.pending);
         state.pending.clear();
 
-        if state.complete && state.keys_handed < 1 {
+        if state.complete && state.keys_handed < 2 {
             state.keys_handed += 1;
             if state.keys_handed == 1 {
                 // Queued for the *next* call, when the engine will encode it
@@ -256,11 +258,18 @@ impl Session for NoiseSession {
         None
     }
 
-    /// No key update: there is no packet key to rotate.
+    /// The key a packet-space upgrade precomputes for the first key update.
+    ///
+    /// The engine requires `Some` here when it installs the 1-RTT space, and
+    /// a pass-through key has nothing to rotate: handing back the same shape
+    /// keeps a peer-initiated update working (it "updates" to the same keys).
     fn next_1rtt_keys(
         &mut self,
     ) -> Option<quinn_proto::crypto::KeyPair<Box<dyn quinn_proto::crypto::PacketKey>>> {
-        None
+        Some(quinn_proto::crypto::KeyPair {
+            local: Box::new(PlainPacketKey),
+            remote: Box::new(PlainPacketKey),
+        })
     }
 
     /// Retry is never sent, so no tag can ever validate.
@@ -432,16 +441,24 @@ mod tests {
         );
         assert!(!client.is_handshaking(), "the client is done");
 
-        // The completion marker: one byte, queued for the next call so the
-        // engine encodes it in the Handshake space. The engine promotes a
-        // connection only on a Handshake packet, and KK has no third message,
-        // so both sides send this one.
+        // The second handover: the completion marker goes out in the Handshake
+        // space and the same call upgrades the engine to 1-RTT. The marker
+        // exists because the engine promotes a connection only on a Handshake
+        // packet, and KK has no third message — so both sides send this byte.
         wire.clear();
-        assert!(client.write_handshake(&mut wire).is_none());
+        assert!(
+            client.write_handshake(&mut wire).is_some(),
+            "the second handover upgrades the engine to 1-RTT"
+        );
         assert_eq!(wire, vec![HANDSHAKE_DONE], "the client's marker");
         server
             .read_handshake(&wire)
             .expect("the server accepts the marker without touching Noise");
+        wire.clear();
+        assert!(
+            client.write_handshake(&mut wire).is_none(),
+            "a third call has nothing left"
+        );
 
         // The parameter fields are private to the crate, so the value is
         // asserted through the encoding: what we sent must survive the round

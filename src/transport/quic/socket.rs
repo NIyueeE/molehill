@@ -288,8 +288,7 @@ mod tests {
         let server_addr = server_socket.local_addr().expect("an address");
         let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
         let (server_events_tx, mut server_events_rx) = mpsc::unbounded_channel();
-        // Kept alive: a dropped receiver would make the task stop sending.
-        let (server_streams_tx, _server_streams_rx) = mpsc::unbounded_channel();
+        let (server_streams_tx, mut server_streams_rx) = mpsc::unbounded_channel();
         let server_config = ServerConfig::new(
             Arc::new(NoiseServerConfig::new(
                 NoiseKeys::from_config(&server_cfg).expect("server keys"),
@@ -359,5 +358,40 @@ mod tests {
                 }
             }
         }
+
+        // A stream, both ways: what the carrier's seam hands the pool.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut client_stream = client.open_stream(handle).await.expect("a client stream");
+        client_stream
+            .write_all(b"the visitor's bytes")
+            .await
+            .expect("the client writes");
+        client_stream.flush().await.expect("the client flushes");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut server_stream = tokio::time::timeout_at(deadline, server_streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+
+        let mut payload = [0u8; 32];
+        let read = tokio::time::timeout_at(deadline, server_stream.read(&mut payload))
+            .await
+            .expect("the server reads")
+            .expect("the read succeeds");
+        assert_eq!(&payload[..read], b"the visitor's bytes");
+
+        server_stream
+            .write_all(b"pong")
+            .await
+            .expect("the server answers");
+        server_stream.flush().await.expect("the server flushes");
+
+        let mut answer = [0u8; 4];
+        let read = tokio::time::timeout_at(deadline, client_stream.read(&mut answer))
+            .await
+            .expect("the client reads")
+            .expect("the read succeeds");
+        assert_eq!(&answer[..read], b"pong");
     }
 }

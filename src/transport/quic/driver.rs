@@ -33,8 +33,6 @@ pub(crate) const MAX_DATAGRAMS: usize = 8;
 pub(crate) struct Outgoing {
     pub(crate) destination: SocketAddr,
     pub(crate) contents: Vec<u8>,
-    /// The GSO segment size, when the engine coalesced several datagrams.
-    pub(crate) segment_size: Option<usize>,
 }
 
 pub(crate) struct Driver {
@@ -124,7 +122,6 @@ impl Driver {
                 self.pending.push(Outgoing {
                     destination: transmit.destination,
                     contents: scratch[..transmit.size].to_vec(),
-                    segment_size: transmit.segment_size,
                 });
                 None
             }
@@ -145,7 +142,6 @@ impl Driver {
                 return Some(Outgoing {
                     destination: transmit.destination,
                     contents: scratch[..transmit.size].to_vec(),
-                    segment_size: transmit.segment_size,
                 });
             }
         }

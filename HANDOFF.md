@@ -456,19 +456,25 @@
 ## Open threads for the next cycle
 
 - **QUIC carrier, in progress: the engine wants one key handover per packet
-  space, and our adapter gives it one in total (2026-10-23).** Where it
-  stands: `src/transport/quic/` holds the socketless driver, the socket
-  task, the stream handles and a Noise-driven `Session`; the handshake
-  completes over a real loopback socket and both sides report `Connected`.
-  The stream round-trip is the open piece, and the symptom localises the
-  cause: a connected connection acknowledges nothing and retransmits its last
-  handshake packet forever (an endless 45-byte datagram), which is what a
-  connection with no 1-RTT keys looks like. The engine upgrades one space per
-  handover (`Initial → Handshake → 1-RTT`) and asks `write_handshake`
-  again each time; returning the keys a second time instead panics inside the
-  engine (`connection/mod.rs:2197`, "handshake should be complete"). Next
-  step is a synchronous repro — two `Driver`s, no tokio — to find the shape
-  the engine accepts before the record layer lands.
+  space, and the 1-RTT upgrade additionally precomputes a key update
+  (2026-10-23, understood).** Where it stands: `src/transport/quic/` holds
+  the socketless driver, the socket task, the stream handles and a
+  Noise-driven `Session`; the handshake completes over a real loopback
+  socket and a stream now carries bytes both ways through it. The two
+  requirements that cost the most to find, both now in the code:
+  - **One handover per space.** The engine upgrades `Initial → Handshake →
+    1-RTT` and asks `write_handshake` again for each; a session that hands
+    its keys once leaves a connected connection with no 1-RTT keys, so it
+    acknowledges nothing and retransmits its last handshake packet forever
+    (an endless 45-byte datagram was the tell).
+  - **`next_1rtt_keys()` must answer.** Installing the 1-RTT space calls it
+    and `.expect("handshake should be complete")`s on the result
+    (`connection/mod.rs:2197`); returning `None` panicked there. A
+    pass-through pair is the answer — a peer-initiated update then "updates"
+    to the same keys.
+  The marker byte each side sends in the Handshake space stays: the engine
+  promotes a connection to established only while handling a Handshake packet,
+  and KK has no third message.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
