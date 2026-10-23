@@ -340,7 +340,9 @@ class Topology:
         the device, and `clean` removes it. A `block_udp` condition is imposed
         the same way, as a firewall rule that is added when the condition asks
         for it and deleted when it does not — the netns goes away with the run,
-        so a rule can never outlive it.
+        so a rule can never outlive it. An `mtu` class is undone by a condition
+        that does not name one, for the same reason: the path a stage stands on
+        is the path it declares.
         """
         for ns, dev in LEGS[leg]:
             if condition.netem:
@@ -361,8 +363,13 @@ class Topology:
                 self.ns_run(ns, ["tc", "qdisc", "del", "dev", dev, "root"], check=False)
             self.set_udp_block(ns, dev, condition.block_udp)
             self.set_udp_limit(ns, dev, condition.udp_limit)
+            # An MTU class is an interface property, so it has to be undone by
+            # the condition that follows: a stage after `mtu1280` would
+            # otherwise still be fragmenting while its schedule named `clean`.
             if condition.mtu is not None:
                 self.set_link_mtu(ns, dev, condition.mtu)
+            elif (ns, dev) in self._mtu_saved:
+                self.set_link_mtu(ns, dev, self._mtu_saved[(ns, dev)])
 
     def set_udp_block(self, ns: str, dev: str, blocked: bool) -> None:
         """Drop UDP leaving one device, or stop dropping it.
@@ -467,6 +474,14 @@ class Topology:
             with contextlib.suppress(ValueError):
                 self._mtu_saved[(ns, dev)] = int(r.stdout.strip())
         self._ip("link", "set", dev, "mtu", str(mtu), ns=ns)
+
+    def saved_mtus(self) -> dict:
+        """The interface MTUs this run changed, as `ns/dev -> mtu`.
+
+        Read into the results meta before teardown: the restore record is what
+        makes "the harness put the host back" checkable rather than promised.
+        """
+        return {f"{ns}/{dev}": mtu for (ns, dev), mtu in self._mtu_saved.items()}
 
     def restore_mtus(self) -> list:
         """Put every MTU this run changed back, and report the failures."""

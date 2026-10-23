@@ -385,8 +385,17 @@ applied to its holds.
 same shape answers a question in two minutes or in forty; the scale travels in
 the fingerprint, because a run that used it measured a different method.
 
-A **single-condition** run (`--condition NAME`, on every other scenario) is the
-same vocabulary without the schedule: one cell, one condition, one number.
+`--condition NAME` is the path **every cell** of a run is measured on. For a
+scenario that imposes no condition of its own (`bulk-*`, `rr-*`, `udp-*`,
+`reconnect`) it is simply the path the run started on. For one whose own
+condition is a single one — the `single` timeline a `cost` run walks, the
+capacity ramp's declared condition — it **replaces** that condition, which is
+how a fixed operating point is measured on a shaped path (`--profile stage
+--condition loss1`), and the campaign's condition is put back afterwards so the
+arm's next scenario is measured on the path the file names. A scenario that
+scripts a *schedule* of several conditions refuses it: nothing single stands for
+`clean → rtt100 → loss1 → …`, so such a run is an argument error before the
+first namespace exists rather than a file labelled with a path it never crossed.
 
 | Stage | What it emulates | Applied to the path | `sweep` hold |
 |---|---|---|---|
@@ -425,6 +434,15 @@ queue"; a class that *means* to tail-drop states its own smaller limit, and
 drops and standing backlog travel in its evidence beside the devices'
 counters.
 
+**A loss class's percentage applies to frames, not to wire packets.** netem sits
+in the qdisc, so it sees whatever the stack submitted: with segmentation offload
+on, that is a GSO frame rather than a 1500-byte packet. Measured on a `loss1`
+stage: 478 818 frames carried 30.8 GB and the qdisc dropped 4 819 of them
+(1.006 %), i.e. 1 % of the bytes — but arriving as ~64 KiB bursts rather than as
+isolated losses. The stage's own evidence is the reading: its `qdisc` block
+holds the drop count beside the frame count, so a reader can check the percentage
+that was actually imposed instead of trusting the class name.
+
 ### The MTU classes
 
 Two further classes carry the **fragmentation** axis and are deliberately not in
@@ -441,7 +459,9 @@ peers', the harness's and the tool's control plane included — which is why the
 stay out of the default timelines and are run as focused cells
 (`--condition loss1_mtu1280`, or `--profile screen` on it to A/B two builds). `meta.mtu_restore_to` records the interface's MTU at the start of
 the run and the harness restores it on teardown, failing loudly if it cannot —
-a leftover 1280 would poison every later run on the host. The reason the axis
+a leftover 1280 would poison every later run on the host, and a stage whose
+condition names no MTU class puts the recorded value back — an `mtu1280` stage
+cannot leak its fragmenting path into the `clean` stage after it. The reason the axis
 exists at all: `lo` is MTU 65536, so without it every datagram fits in one
 fragment and the cost of a lost fragment is unmeasurable. Read the two classes
 together with the `carrier = "kcp"` row below.

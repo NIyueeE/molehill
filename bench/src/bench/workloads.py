@@ -150,6 +150,11 @@ class Ctx:
     #: changes conditions *within* a run and must put this one back.
     leg: str = "visitor"
     condition: model.Condition | None = None
+    #: The conditions *this* scenario imposes, in order — its own schedule or
+    #: ramp condition, already reconciled with the campaign's by
+    #: `model.effective_conditions`. Empty for a scenario that imposes none: the
+    #: topology is already shaped with the campaign's condition when it runs.
+    conditions: tuple = ()
     #: Restart the arm's daemons and return the seconds until the service
     #: answers — the reconnect scenario's instrument (the runner owns the
     #: processes, the workload owns the measurement).
@@ -858,13 +863,26 @@ def _gap_p99(points: list):
     return inst.pct(gaps, 0.99)
 
 
-def _stages_of(params: dict) -> list:
-    """The timeline with its holds scaled, floored, and numbered per condition."""
+def _stages_of(params: dict, conditions: tuple = ()) -> list:
+    """The timeline with its holds scaled, floored, and numbered per condition.
+
+    `conditions` is what this stage will actually impose — the campaign's,
+    reconciled with the timeline by `model.effective_conditions`. When it names
+    one, it *replaces* the timeline's own: a run measured on one path has to
+    impose that path in every stage, and the labels follow what was imposed
+    rather than what the schedule asked for (a `single` timeline walked under
+    `--condition loss1` is one `loss1` stage, not one `clean` stage wearing a
+    `loss1` label).
+    """
     holds = model.timeline_for(params["timeline"], params.get("scale", 1.0))
     floor = params.get("min_hold_s", 0.0)
+    imposed = [
+        conditions[at] if at < len(conditions) else condition
+        for at, (condition, _) in enumerate(holds)
+    ]
     seen: dict = {}
     stages = []
-    for condition, secs in holds:
+    for (_, secs), condition in zip(holds, imposed, strict=True):
         seen[condition] = seen.get(condition, 0) + 1
         occurrence = seen[condition]
         label = condition if occurrence == 1 else f"{condition}#{occurrence}"
@@ -882,7 +900,7 @@ def run_staged(ctx: Ctx, params: dict) -> list:
     samples; the bulk spine is re-dialed per stage after the leg has gone quiet,
     because a killed client keeps delivering what its kernel still holds.
     """
-    stages = _stages_of(params)
+    stages = _stages_of(params, tuple(ctx.conditions))
     cells: list = []
     probes = [
         # 0 = run until this workload kills them: a stage's drain cost is not
@@ -1036,40 +1054,54 @@ def run_capacity(ctx: Ctx, params: dict) -> list:
     instrument is a fresh interactive connection per ping *during* the load:
     the slow visitor's own rate is not the number, the arriving visitor's tail
     latency is.
+
+    The ramp states the condition its levels are climbed on — the campaign's
+    condition replaces that one when a run gave one — and it puts the campaign's
+    back afterwards. The restore is not tidiness: the next scenario of the same
+    arm is measured on that path, so a leftover clean leg would be a cell
+    labelled with a path it never crossed (measured 2026-10-22: every scenario
+    after a ramp ran on the ramp's condition while the file said otherwise).
     """
-    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[params["condition"]])
-    settle = params["settle_s"]
+    condition = ctx.conditions[0] if ctx.conditions else params["condition"]
+    ctx.topo.set_condition(ctx.leg, model.CONDITIONS[condition])
     cells: list = []
     sustainable = 0
     level = 0
-    for level in range(1, params["streams_max"] + 1):
-        cell = _capacity_level(ctx, level, settle, params)
-        cells.append(cell)
-        if not cell.ok or cell.metrics.get("slo_broken"):
-            break
-        sustainable = level
-    cells.append(
-        Cell(
-            "ramp",
-            ok=True,
-            metrics={
-                "capacity_streams": sustainable,
-                "capacity_headroom_pct": round(
-                    100.0 * (1 - sustainable / params["streams_max"]), 2
-                ),
-            },
-            evidence={
-                "streams_max": params["streams_max"],
-                "levels_run": level,
-                "condition": params["condition"],
-                "slo": {
-                    "rtt_p99_ms": model.SLO_RTT_P99_MS,
-                    "error_rate_pct": model.SLO_ERROR_RATE_PCT,
-                },
-            },
-        )
-    )
+    try:
+        for level in range(1, params["streams_max"] + 1):
+            cell = _capacity_level(ctx, level, params["settle_s"], params)
+            cells.append(cell)
+            if not cell.ok or cell.metrics.get("slo_broken"):
+                break
+            sustainable = level
+        cells.append(_ramp_cell(params, condition, level, sustainable))
+    finally:
+        if ctx.condition is not None:
+            ctx.topo.set_condition(ctx.leg, ctx.condition)
     return cells
+
+
+def _ramp_cell(params: dict, condition: str, levels: int, sustainable: int) -> Cell:
+    """The ramp's verdict: how many streams ran clean, and the headroom left."""
+    return Cell(
+        "ramp",
+        ok=True,
+        metrics={
+            "capacity_streams": sustainable,
+            "capacity_headroom_pct": round(
+                100.0 * (1 - sustainable / params["streams_max"]), 2
+            ),
+        },
+        evidence={
+            "streams_max": params["streams_max"],
+            "levels_run": levels,
+            "condition": condition,
+            "slo": {
+                "rtt_p99_ms": model.SLO_RTT_P99_MS,
+                "error_rate_pct": model.SLO_ERROR_RATE_PCT,
+            },
+        },
+    )
 
 
 def _capacity_level(ctx: Ctx, level: int, settle: float, params: dict) -> Cell:

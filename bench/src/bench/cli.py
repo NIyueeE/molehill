@@ -1527,6 +1527,62 @@ def _check_socket_query(c: Checker) -> None:
     )
 
 
+def _check_conditions(c: Checker) -> None:
+    """A campaign's condition reaches every cell, or the run is refused.
+
+    This is the check for a failure that produced three plausible-looking
+    results files: the `cost` scenario walks a one-stage `single` timeline,
+    which imposed `clean` *after* the campaign had imposed its own condition —
+    so runs labelled clean, loss1 and rate100 came back with the same path
+    (7.03-7.08 Gbit/s, zero qdisc drops) while their method record said
+    "loss1". A condition the run cannot impose is refused now, and one it can
+    is the condition the stages impose.
+    """
+    stage, sweep = model.PROFILES["stage"], model.PROFILES["sweep"]
+    cost, timeline = model.SCENARIOS["cost"], model.SCENARIOS["timeline"]
+    c.equal(
+        "a campaign condition replaces a single-stage timeline's",
+        model.effective_conditions(cost, stage, "loss1"),
+        ["loss1"],
+    )
+    c.equal(
+        "a clean campaign leaves a single-stage timeline alone",
+        model.effective_conditions(cost, stage, "clean"),
+        ["clean"],
+    )
+    c.equal(
+        "a clean campaign leaves a scripted schedule alone",
+        model.effective_conditions(timeline, sweep, "clean"),
+        [name for name, _ in model.timeline_for("sweep")],
+    )
+    c.check(
+        "a scripted schedule refuses a campaign condition",
+        _refused(model.effective_conditions, timeline, sweep, "loss1"),
+        "the sweep accepted one --condition for its whole schedule",
+    )
+    c.equal(
+        "a campaign condition reaches the capacity ramp",
+        model.effective_conditions(model.SCENARIOS["capacity"], sweep, "loss1"),
+        ["loss1"],
+    )
+    c.equal(
+        "a scenario that scripts nothing imposes nothing",
+        model.effective_conditions(model.SCENARIOS["bulk-1"], sweep, "loss1"),
+        [],
+    )
+    imposed = workloads._stages_of({"timeline": "single"}, ("loss1",))
+    c.equal(
+        "an imposed condition names the stage and its label",
+        (imposed[0][0], imposed[0][1]),
+        ("loss1", "loss1"),
+    )
+    c.equal(
+        "a repeated condition is numbered",
+        [stage[0] for stage in workloads._stages_of({"timeline": "soak"})][-2:],
+        ["loss5", "clean#2"],
+    )
+
+
 def _check_topology(c: Checker) -> None:
     c.check(
         "every shape is a netem argument list",
@@ -1634,6 +1690,7 @@ def cmd_selfcheck(args) -> int:
     _check_wedges(c)
     _check_provenance(c)
     _check_socket_query(c)
+    _check_conditions(c)
     _check_topology(c)
     return c.report()
 
@@ -1685,7 +1742,11 @@ def _add_model_parsers(sub: argparse._SubParsersAction) -> None:
         "--condition",
         default="clean",
         choices=sorted(model.CONDITIONS),
-        help="the path condition the whole campaign runs under",
+        help=(
+            "the path condition every cell of the campaign is measured on "
+            "(replaces a scenario's single own condition; a scenario that "
+            "scripts a schedule of them refuses it)"
+        ),
     )
     run.add_argument(
         "--condition-leg", default="visitor", choices=sorted(topology.LEGS)

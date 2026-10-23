@@ -61,6 +61,29 @@
 
 ## Where this stands
 
+- **A campaign's `--condition` is now imposed or refused, so a shaped cell is a
+  shaped cell (2026-10-23).** The staged runner took the *scenario's* own
+  condition (`cost` walks the `single` timeline → `clean`) and imposed it
+  *after* `_open_topology` had imposed the campaign's, so a run labelled
+  `loss1` measured a clean path while its method record claimed otherwise —
+  three such runs came back at 7.03–7.08 Gbit/s with zero qdisc drops. Now:
+  a scenario whose own condition is a *single* one has it replaced by the
+  campaign's (`model.effective_conditions`); a scenario that scripts a
+  *schedule* of several refuses `--condition` with an argument error before the
+  first namespace exists; the capacity ramp takes the campaign's condition and
+  puts it back afterwards (it used to leave its own on the leg for every later
+  scenario of the arm); and an MTU class is undone by a condition that names
+  none, with `meta.mtu_restore_to` written for the first time (the page had
+  claimed it since the class was added). Proof on `cost` (4 streams, 20 s,
+  `--profile stage --scale 0.2`, one arm plus the run's own A/A copy):
+  `clean` 12.01 / 11.77 Gbit/s, qdisc drops 0, p50 0.80 ms, p99 1.6 ms, UDP
+  loss 0 %; `loss1` 11.27 / 10.94 Gbit/s, **6 062 qdisc drops = 1.0 % of
+  484 880 offered frames**, p50 41 ms, p99 1 074 ms, UDP loss 4.0 / 1.8 %.
+  Two method facts came out of the reading: a loss class is **per frame** (with
+  segmentation offload the frames were 64 KiB, so `loss1` is 1 % of the bytes in
+  ~64 KiB bursts), and the drain predicate can burn its whole 60 s budget
+  (one of the four drains above did) because a probe's standing socket counts
+  as "can still send". Both are on `docs/benchmarks.md`.
 - **The KCP window follows the path (2026-10-23), and the only effect that
   cleared the run's own noise is memory.** Fixed 8192 segments (about 12 MB per
   session) became "twice the bandwidth-delay product, clamped to 128..8192,
@@ -75,8 +98,8 @@
   batches, so CPU per byte and the carried packet (8.8 -> 7.7 KiB) move against
   the previous change while the bytes in flight — and with them the queue —
   fall. Shipped as a *bound* (an arbitrary 8192 is not a design), not as a win;
-  the tail needs a run this model can resolve, which is the shaped campaign the
-  `--condition` hole above still blocks.
+  the tail needs a run this model can resolve, which the shaped campaign below
+  makes possible for the first time.
 - **The root dependencies are current (2026-10-23).** `cargo outdated
   --root-deps-only` is clean: `parking_lot` 0.13 (with `lock_api` 0.5,
   `parking_lot_core` 0.10), `tokio` 1.54.1, `libc` 0.2.191, `tun-rs` 2.8.13,
@@ -381,17 +404,13 @@
   turning `nc` back on) — a measured decision of its own, recorded as the next
   item below, and the reason this entry keeps both columns instead of claiming a
   win.
-- **The bench model records a `--condition` the `cost` scenario does not
-  impose (found 2026-10-22).** Three `--profile screen` runs labelled `clean`,
-  `loss1` and `rate100` produced identical paths: throughput 7.03–7.08 Gbit/s,
-  zero qdisc drops, and the same retransmit count in all three. `--condition` is
-  written into `meta.method` but the staged `cost` scenario builds its stages
-  from its own timeline and never consults the campaign condition, so a run can
-  *label* itself shaped without being shaped — exactly the "measure the path you
-  claim" failure §10 exists for. The GSO numbers above are therefore **clean-path
-  numbers in all three runs**, and a shaped-path GSO comparison is still owed.
-  Fixing it is small (refuse or apply the condition in the staged runner) and it
-  belongs with the next bench-model change;
+- **Closed (2026-10-23): the bench model recorded a `--condition` the staged
+  runner did not impose.** A condition a run cannot impose is now an argument
+  error, and one it can impose is what every stage imposes — the record, with
+  the clean/loss1 proof pair, is "Where this stands". The consequence for older
+  files: the three `screen` runs quoted for GSO were **clean-path numbers in all
+  three**, so the GSO comparison they carry is a clean-path comparison; a shaped
+  one is owed, and it is the next measurement this file records.
 - **The carrier policy is going peer-level (2026-10-22, in progress), and the
   first instrument is in.** The operator's direction: TCP and KCP are peers, and
   the pool should pick per path instead of shipping a fixed order. The signal

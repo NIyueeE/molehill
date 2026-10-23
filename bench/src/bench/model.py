@@ -1182,6 +1182,55 @@ def refuse_misplaced_condition(condition: Condition, leg: str) -> None:
         )
 
 
+def own_conditions(scenario: Scenario, profile: dict) -> list:
+    """The conditions a scenario imposes on the path itself, in order.
+
+    A scenario may script its own path: a staged one walks its timeline, a
+    capacity ramp states the condition its levels are climbed on. Everything
+    else imposes nothing and inherits whatever the campaign set when the
+    topology came up.
+    """
+    params = scenario.params_for(profile)
+    if scenario.kind == Kind.STAGED:
+        return [
+            name
+            for name, _ in timeline_for(params["timeline"], params.get("scale", 1.0))
+        ]
+    if scenario.kind == Kind.CAPACITY:
+        return [params["condition"]]
+    return []
+
+
+def effective_conditions(scenario: Scenario, profile: dict, campaign: str) -> list:
+    """The conditions a scenario will actually impose, given the campaign's.
+
+    `--condition` is the path the whole run is measured on, so it has to be the
+    path every cell is measured on. A scenario whose own condition is *one*
+    condition — the `single` timeline a `cost` run walks, the ramp's declared
+    condition — has it replaced by the campaign's, which is how a fixed
+    operating point is measured on a shaped path. A scenario that scripts a
+    *schedule* of several conditions cannot be replaced by one (nothing single
+    stands for `clean -> rtt100 -> loss1 -> ...`), so such a run is refused
+    instead of being labelled with a path it never had.
+
+    Both halves of that are the point: the condition is in the fingerprint, so
+    a run labelled `loss1` that quietly walked a clean schedule produced a file
+    claiming a shaped path while every packet crossed an unshaped leg —
+    measured 2026-10-22, three `cost` runs at clean/loss1/rate100 came back
+    identical (7.03-7.08 Gbit/s, zero qdisc drops).
+    """
+    own = own_conditions(scenario, profile)
+    if not own or campaign == "clean":
+        return own
+    if len(set(own)) > 1:
+        raise ValueError(
+            f"--condition {campaign}: the {scenario.id} scenario scripts its own "
+            f"schedule ({' -> '.join(own)}), and a single condition cannot stand in "
+            "for it; drop --condition, or drop that scenario from the run"
+        )
+    return [campaign for _ in own]
+
+
 def refuse_carrier_arm(arm: Arm) -> None:
     """Refuse an arm that names a carrier.
 

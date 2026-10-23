@@ -375,6 +375,11 @@ class Campaign:
     results: dict = field(default_factory=dict)
     topo: topology.Topology | None = None
     backend: workloads.Backend | None = None
+    #: scenario id -> the conditions that scenario will impose, resolved from
+    #: `model.effective_conditions` before the first namespace exists. A
+    #: campaign's condition that cannot reach every cell is an argument error,
+    #: never a cell that quietly measured something else.
+    conditions: dict = field(default_factory=dict)
 
     def save(self) -> None:
         self.results["meta"]["updated"] = _now()
@@ -549,6 +554,7 @@ def arm_turn(camp: Campaign, arm: model.Arm, rnd: int, warmup: bool) -> list:
                 peers_of=_cell_peers(camp.backend),
                 leg=camp.args.condition_leg,
                 condition=model.CONDITIONS[camp.args.condition],
+                conditions=camp.conditions.get(scenario.id, ()),
                 restart_arm=turn.restart,
             )
             t0 = time.perf_counter()
@@ -720,6 +726,17 @@ def _prepare(args) -> Campaign:
     aa = profile.get("aa", False) if args.aa is None else args.aa
     arms = with_aa(resolve_arms(args, profile), aa)
     scenarios = resolve_scenarios(args, profile)
+    # What each scenario will impose on the path, reconciled with the campaign's
+    # condition now rather than at the first stage: a condition that cannot mean
+    # what the run says it means is an argument error, and finding it here costs
+    # nothing instead of costing a campaign whose file is already labelled.
+    try:
+        conditions = {
+            s.id: tuple(model.effective_conditions(s, profile, args.condition))
+            for s in scenarios
+        }
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
     pre = preflight(
         args.binary, need_iperf=any(s.kind != model.Kind.RR for s in scenarios)
     )
@@ -743,6 +760,7 @@ def _prepare(args) -> Campaign:
         work=work,
         out=out,
         method=method,
+        conditions=conditions,
     )
     _log(f"bench: work {work}")
     _log(f"bench: results {out}")
@@ -841,6 +859,7 @@ def _finish(camp: Campaign, topo: topology.Topology, t0: float) -> None:
     """Teardown and the final write, whatever happened above."""
     if camp.backend is not None:
         camp.backend.stop()
+    camp.results["meta"]["mtu_restore_to"] = topo.saved_mtus()
     with contextlib.suppress(Exception):
         topo.down()
     meta = camp.results["meta"]
