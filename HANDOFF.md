@@ -570,6 +570,13 @@
   server logs an accept or nothing), the stream's first-byte selector against
   `data_enable = false`, and the hello the server reads (a timeout there is
   logged as a debug line, not a WARN). **Do not build a claim on this slice**; the
+  **First narrowing, from that run**s own logs:** the server *does* bind —
+  `Listening for UDP carrier connections at 10.10.0.254:2400` appears once per
+  arm — so the carrier declaration, the client-first bind rule and the registration
+  path all work; what fails is everything after the socket. The next run needs the
+  subject at debug, because the accept loop and the hello reader both report there
+  and the harness captures WARN and INFO only: a silent timeout cannot otherwise
+  tell "no connection arrived" from "the server is waiting for bytes".
   run's own record is `/home/dsh/tmp/udp-lane-smoke2.json`.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
