@@ -475,6 +475,17 @@
   The marker byte each side sends in the Handshake space stays: the engine
   promotes a connection to established only while handling a Handshake packet,
   and KK has no third message.
+  **The phase order moved, and the plan's Gate 1 with it.** The plan put the
+  direct-channel wiring and "Gate 1 on the L3 arm" before the carrier seam.
+  That cannot hold: a transparent lane rides the *carrier*, so the L3 arm
+  cannot run on QUIC until the seam exists and the UDP carrier implements it.
+  The order is therefore the seam (P2), then the UDP implementation behind it
+  (P3), then the gates — Gate 1's cells are measured as part of Gate 2's run
+  rather than before it. The carrier's name stays `Kcp` until the seam makes
+  the carrier choose an implementation: renaming it to `Udp` while the bytes
+  are still KCP's would be a lie in the other direction. The direct-channel
+  primitive (`connect_stream`) is in place and tested, so wiring it into
+  `ClientStream` can wait for the seam instead of landing twice.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
