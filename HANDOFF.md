@@ -593,6 +593,14 @@
   path returns) is a separate enum with its own `Plain/Noise/Kcp/Udp` variants. So the two
   paths coexist rather than nest, and which one a claim's lane takes is still the
   open question: grep the transparent path for the acquisition call, not the type.
+  **Answered (2026-10-23), and it reverses the pool reading.** src/core/client.rs:753-756
+  says a transparent service "opens its **lanes** — one carrier connection per lane,
+  from the carrier's budget — and keeps them", and channels = cfg.lanes() at :762
+  counts exactly those lanes. So a lane **is** one carrier connection opened by the
+  client: the direct-channel path. The wiring is at the right end after all, and the
+  timeout is a real bug in the new path (client dial or server accept), not a starved
+  pool. The pool reading stays in the record, with what disproved it, because it looks
+  plausible and the next reader will meet it again.
   run's own record is `/home/dsh/tmp/udp-lane-smoke2.json`.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
