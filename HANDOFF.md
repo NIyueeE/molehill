@@ -505,29 +505,38 @@
   stream level and why each carrier owns its connection type; a seam at the
   byte-stream level cannot express the UDP carrier at all.
   **The remaining order, each step green on its own:** (1) the pool holds
-  `Arc<dyn CarrierConn>` beside its counters — placement reads `stats()`,
-  repair reads `is_alive()`, and the yamux-only calls (`note_peer_health`,
-  snapshot, drain) move behind the carrier; (2) un-gate the seam; (3) the
-  lanes dial through the UDP carrier — a lane *is* a direct channel, so this
-  is `connect_direct_channel`'s QUIC branch plus the server's UDP accept, and
-  it is what makes the L3 arm measurable; (4) the gates in one run; (5) the
+  `Arc<dyn CarrierConn>` beside its counters — placement keeps reading the
+  counters, repair reads `is_alive()`, and the yamux-only calls
+  (`note_peer_health`, snapshot, drain) stay where the carrier fills them;
+  (2) un-gate the seam, in the same commit as (1) because a trait nothing
+  calls is dead code; (3) the lanes dial through the UDP carrier — a lane *is*
+  a direct channel, so this is `connect_direct_channel`'s QUIC branch plus the
+  server's UDP accept, and it is what makes the L3 arm measurable; (4) the
+  gates in one run; (5) the
   rename to `Udp` with the implementation swap, KCP's deletion, the four
   feature lists, the status JSON, the bench vocabulary and the wire's move
   to 6.0 — the constant, which is what refuses a 5.2 peer; (6) the release
   ritual.
-  **What blocks the pool's stream-type switch, measured (2026-10-23).** The
-  change is small — `MuxStream` aliases `CarrierStream`, 14 sites inside
-  `multiplex.rs` and 3 outside — but three things have to move in **one**
-  commit or the gate's `-D warnings` refuses it: `ClientTunnel::open_stream`
-  is `pub` and would return crate-private types, so it must become
-  `pub(crate)`; a `MuxConn` wrapper cannot own a `ClientTunnel` while the
-  tunnel also needs the carrier field it takes to implement the seam, so
-  implement `CarrierConn` for `ClientTunnel` itself and give it the carrier
-  the pool already knows; and `CarrierConn`/`CarrierStats` stay dead code
-  until something calls *through* the trait, so the same commit must store
-  `Arc<dyn CarrierConn>` in the pool and open through it. Attempted as three
-  separate edits and reverted: a half-migrated pool is worse than an unmigrated
-  one, and the trap is worth more to the next reader than the partial diff.
+  **The pool's stream-type switch, measured (2026-10-23).** Two of the three
+  coupled edits have landed, and the third ran into an obstacle worth recording.
+  Landed in `e57716d`: `MuxStream` **is** `CarrierStream` (a yamux stream boxes
+  into it at the two places one leaves the driver), and `CarrierIo`/
+  `CarrierStream` are no longer behind the `quic` feature, so every build
+  carries the carrier-neutral stream type; `ClientTunnel::open_stream` is
+  `pub(crate)` for the same reason. What remains is the handle: `PoolEntry`
+  and `Reservation` carry `Arc<dyn CarrierConn>`, `complete()` opens through
+  it, `OpenError::Refused` takes `StreamError` instead of
+  `yamux::ConnectionError`, `impl CarrierConn for ClientTunnel` carries the
+  carrier the pool already knows (a field set at `start_with_health`, `Tcp`
+  for `start`), and `MuxConn` with `tcp.rs`'s seam test go away — all in one
+  commit with the un-gate, because `-D warnings` refuses a trait nothing calls.
+  **The obstacle: `CarrierConn::stats` is `async` and has no production
+  caller.** Placement and the status snapshot are synchronous, and yamux reads
+  its counters directly, so un-gating as it stands puts an unused trait method
+  into every default build. Two ways out, both real work: make `stats`
+  synchronous and read it from the status snapshot — which forces `UdpConn` to
+  cache what the socket task learns — or land it with step (3), when a lane
+  calls it and a test is no longer the only caller.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
