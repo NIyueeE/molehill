@@ -1481,7 +1481,14 @@ impl TunnelPool {
             reason = why,
             "carrier rule: giving the probe's tunnel back and backing off"
         );
-        self.begin_handover(probed, self.inner.shared.carrier);
+        // Two shapes: the probe established a tunnel on the other carrier (hand
+        // *that* one back), or it never did and the drain toward it is still
+        // pending (call it off). Only the second needs the cancel — and it is
+        // the common one on a path that refuses the carrier, where waiting out
+        // the handover's own budget would keep the pool short for two minutes.
+        if !self.handover_cancel_to(probed) {
+            self.begin_handover(probed, self.inner.shared.carrier);
+        }
     }
 
     /// Judge the running probe on one window: the pool carrier's per-tunnel
@@ -1780,6 +1787,34 @@ impl TunnelPool {
             phase_since: now,
         });
         Some(tunnel_id)
+    }
+
+    /// Call off a handover that is still waiting to drain **toward** `target`:
+    /// the tunnel returns to service and the pool keeps its width.
+    ///
+    /// The probe needs this because its own bound (5 s) sits far inside the
+    /// handover's drain budget (the switch cooldown, 120 s): a probe that ended
+    /// with the drain still pending would leave the pool a tunnel short for two
+    /// minutes — measured as 30x the interactive tail on a leg whose UDP
+    /// policer starves the other carrier's dial (HANDOFF.md 2026-10-23).
+    fn handover_cancel_to(&self, target: Carrier) -> bool {
+        let mut state = self.inner.state.lock();
+        let Some(handover) = state.handover.as_ref() else {
+            return false;
+        };
+        if handover.target != target || handover.phase != HandoverPhase::Draining {
+            return false;
+        }
+        let tunnel_id = handover.tunnel_id;
+        state.handover = None;
+        if let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.tunnel.id() == tunnel_id)
+        {
+            entry.phase = TunnelPhase::Serving;
+        }
+        true
     }
 
     fn handover_step(&self) {
@@ -5406,6 +5441,45 @@ mod tests {
         drop(lease_elsewhere);
         drop(replacement_stream);
         drop(pool);
+    }
+
+    /// A probe that ends before its handover lands calls the drain off.
+    ///
+    /// The handover's own drain budget is the switch cooldown (120 s), while a
+    /// probe's bound is 5 s: without the cancel, a probe on a path that refuses
+    /// the other carrier leaves the pool a tunnel short for two minutes, which
+    /// is 30x the interactive tail (measured, HANDOFF.md 2026-10-23).
+    #[tokio::test]
+    async fn a_cancelled_handover_returns_the_tunnel_to_service() {
+        let (pool, _dials) = handover_pool("cancel");
+        let moved = pool
+            .begin_handover_on(Carrier::Kcp, Carrier::Tcp, None)
+            .expect("the fixture has a tunnel to drain");
+        {
+            let state = pool.inner.state.lock();
+            assert!(state.handover.is_some(), "the handover is recorded");
+        }
+        // A handover toward a *different* carrier is not this probe's to cancel.
+        assert!(!pool.handover_cancel_to(Carrier::Kcp));
+        assert!(pool.handover_cancel_to(Carrier::Tcp));
+        {
+            let state = pool.inner.state.lock();
+            assert!(state.handover.is_none(), "the record is cleared");
+            let entry = state
+                .entries
+                .iter()
+                .find(|entry| entry.tunnel.id() == moved)
+                .expect("the tunnel is still a pool member");
+            assert_eq!(
+                entry.phase,
+                TunnelPhase::Serving,
+                "the tunnel returns to service rather than staying drained"
+            );
+        }
+        assert!(
+            !pool.handover_cancel_to(Carrier::Tcp),
+            "nothing is left to cancel"
+        );
     }
 
     /// A rule move drains the tunnel its evidence convicted, even when another
