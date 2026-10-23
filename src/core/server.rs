@@ -1083,18 +1083,6 @@ async fn register_service(
         // A build with both carriers keeps the KCP listener alive for the pool
         // path, which still rides it until the flip; the direct channels take the
         // UDP one. A build with `quic` alone never builds the pool path.
-        #[cfg(all(feature = "kcp", feature = "quic"))]
-        let result = match result {
-            Ok(()) => {
-                ensure_kcp_listener(
-                    Arc::clone(shared),
-                    Arc::clone(registry),
-                    Arc::clone(server_config),
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        };
         #[cfg(all(feature = "kcp", not(feature = "quic")))]
         let result = ensure_kcp_listener(
             Arc::clone(shared),

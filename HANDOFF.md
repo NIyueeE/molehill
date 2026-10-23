@@ -557,6 +557,20 @@
   binary carries. A string only the new code contains is the signal that survives
   (`strings <binary> | grep -c 'UDP carrier'` is 8 in the build that has it, 0 in the
   one that does not).
+- **The data port is one UDP socket, and a lane does not carry yet (2026-10-23).**
+  KCP's listener and the QUIC endpoint are both UDP on `[server.data].bind_addr` and
+  cannot coexist: the first quic build to serve a registration died with
+  `EADDRINUSE` on the KCP bind, which is the structural reason the two
+  implementations must *swap* in the carrier slot rather than stand side by side.
+  A `quic` build therefore no longer starts the KCP listener, and the conflict is
+  gone — but the lane still does not carry: registration succeeds, the visitor
+  then times out (86 s, both arms). So the direct-channel path is wired and its
+  port handling is right, and the bytes are not flowing yet. What to look at next,
+  in order: whether the client's dial reaches the server's endpoint at all (the
+  server logs an accept or nothing), the stream's first-byte selector against
+  `data_enable = false`, and the hello the server reads (a timeout there is
+  logged as a debug line, not a WARN). **Do not build a claim on this slice**; the
+  run's own record is `/home/dsh/tmp/udp-lane-smoke2.json`.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
   `poll_timeout` reports "now" forever and the driver spins without sending;
