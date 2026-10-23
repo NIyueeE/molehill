@@ -587,6 +587,12 @@
   claim come from `TunnelPool` or from `connect_direct_channel`? If it is the pool,
   then the UDP carrier must first serve *pool tunnels* (one connection, many
   streams) and the direct-channel wiring above is the wrong end of the problem.
+  **Evidence for the pool reading (2026-10-23):** the client's data channel on the
+  main path is built from a tunnel stream — `ClientDataChannel::Mux(TunnelStream)` at
+  `src/core/client.rs:1534` — while `ClientStream` (the type the direct-channel
+  path returns) is a separate enum with its own `Plain/Noise/Kcp/Udp` variants. So the two
+  paths coexist rather than nest, and which one a claim's lane takes is still the
+  open question: grep the transparent path for the acquisition call, not the type.
   run's own record is `/home/dsh/tmp/udp-lane-smoke2.json`.
 - **The engine requires `handle_timeout` for every due timer** (2026-10-23,
   fixed in the same arc): skipping it leaves an expired timer in the set, so
