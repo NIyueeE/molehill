@@ -33,6 +33,28 @@ pub(crate) const MAX_DATAGRAMS: usize = 8;
 pub(crate) struct Outgoing {
     pub(crate) destination: SocketAddr,
     pub(crate) contents: Vec<u8>,
+    /// The segment size when `contents` holds more than one datagram that the
+    /// engine built for one `poll_transmit`.
+    ///
+    /// `quinn-proto` batches up to `MAX_DATAGRAMS` datagrams in one buffer and
+    /// marks it with this value: the socket must send each segment as its own
+    /// datagram (or as one `UDP_SEGMENT` message), never the whole buffer as
+    /// one. A concatenation of 1-RTT packets has no framing the peer could
+    /// split — a short header extends to the end of the datagram — so sending
+    /// it whole is what made a peer answer "invalid frame ID".
+    pub(crate) segment_size: Option<usize>,
+}
+
+impl Outgoing {
+    /// The datagrams this transmission carries, in wire order.
+    pub(crate) fn datagrams(&self) -> std::slice::Chunks<'_, u8> {
+        // A segment size is only ever present when it is a positive datagram
+        // length; treating a malformed zero as "one datagram" keeps `chunks`
+        // from panicking on a value the engine should never produce.
+        let size = self.segment_size.filter(|size| *size > 0);
+        self.contents
+            .chunks(size.unwrap_or(self.contents.len().max(1)))
+    }
 }
 
 pub(crate) struct Driver {
@@ -122,6 +144,7 @@ impl Driver {
                 self.pending.push(Outgoing {
                     destination: transmit.destination,
                     contents: scratch[..transmit.size].to_vec(),
+                    segment_size: transmit.segment_size,
                 });
                 None
             }
@@ -142,6 +165,7 @@ impl Driver {
                 return Some(Outgoing {
                     destination: transmit.destination,
                     contents: scratch[..transmit.size].to_vec(),
+                    segment_size: transmit.segment_size,
                 });
             }
         }
@@ -220,6 +244,11 @@ impl Driver {
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
     use crate::transport::NoiseKeys;
@@ -265,14 +294,38 @@ mod tests {
         let mut accepted = None;
         while let Some(outgoing) = from.poll_transmit(now) {
             from.pump_endpoint_events();
-            if let Some(incoming) =
-                to.on_datagram(now, from_addr, BytesMut::from(&outgoing.contents[..]))
-            {
-                accepted = Some(to.accept(now, incoming).expect("the server accepts"));
+            for datagram in outgoing.datagrams() {
+                if let Some(incoming) = to.on_datagram(now, from_addr, BytesMut::from(datagram)) {
+                    accepted = Some(to.accept(now, incoming).expect("the server accepts"));
+                }
             }
         }
         from.pump_endpoint_events();
         accepted
+    }
+
+    /// A transmission with a segment size carries several datagrams, and each
+    /// must leave as its own datagram. Feeding the concatenation to a peer is
+    /// what produced "received a frame that was badly formatted".
+    #[test]
+    fn a_multi_datagram_transmit_is_split_at_its_segment_size() {
+        let outgoing = Outgoing {
+            destination: "127.0.0.1:4433".parse().expect("an address"),
+            contents: (0u8..10).collect(),
+            segment_size: Some(4),
+        };
+        let segments: Vec<&[u8]> = outgoing.datagrams().collect();
+        assert_eq!(
+            segments,
+            [&[0u8, 1, 2, 3][..], &[4, 5, 6, 7][..], &[8, 9][..]]
+        );
+
+        let single = Outgoing {
+            destination: outgoing.destination,
+            contents: (0u8..10).collect(),
+            segment_size: None,
+        };
+        assert_eq!(single.datagrams().count(), 1);
     }
 
     #[test]

@@ -3,13 +3,13 @@
 //! quinn-proto hands out send/recv handles that borrow the connection and has
 //! no async at all: it reports readable/writable events and expects the owner
 //! to poll. So the connection lives behind a mutex, a stream handle is an
-//! (Arc<Shared>, StreamId) pair, and a blocked direction leaves one waker that
+//! (`Arc<Shared>`, `StreamId`) pair, and a blocked direction leaves one waker that
 //! the task fires when the engine reports the stream readable, writable or
 //! finished.
 //!
 //! Every stream opens with a selector byte, exactly like a TCP data channel:
-//! PLAIN_SELECTOR for bytes as they are, NOISE_SELECTOR when the stream is
-//! wrapped in the per-stream record layer (record.rs). The key comes from the
+//! `PLAIN_SELECTOR` for bytes as they are, `NOISE_SELECTOR` when the stream is
+//! wrapped in the per-stream record layer (`record.rs`). The key comes from the
 //! connection's handshake hash, so the selector is what tells the accepting
 //! side which one it is looking at.
 
@@ -91,15 +91,33 @@ impl Shared {
     }
 
     /// Mark the connection gone and release everyone waiting on it.
+    ///
+    /// `closed` is held across the drain so a parker cannot slip its waker in
+    /// after the drain: `park` takes the same lock and reports the connection
+    /// gone to a caller that arrives too late.
     pub(crate) fn close(&self) {
-        *self.closed.lock() = true;
+        let mut closed = self.closed.lock();
+        *closed = true;
         let wakers: Vec<Waker> = self.wakers.lock().drain().map(|(_, waker)| waker).collect();
+        drop(closed);
         for waker in wakers {
             waker.wake();
         }
     }
 
+    /// Register a waker for one direction of one stream.
+    ///
+    /// Callers hold the connection lock across this, which is what closes the
+    /// lost-wakeup window: the task that fires the waker needs that lock to
+    /// observe the engine's event, so it cannot fire between the failed poll
+    /// and this registration.
     fn park(&self, id: StreamId, wait: Wait, waker: &Waker) {
+        let closed = self.closed.lock();
+        if *closed {
+            drop(closed);
+            waker.wake_by_ref();
+            return;
+        }
         self.wakers.lock().insert((id, wait), waker.clone());
     }
 
@@ -292,16 +310,56 @@ impl AsyncWrite for QuicStream {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    /// Push whatever a previous write left behind into the engine.
+    ///
+    /// A short write can leave bytes in `pending` after `poll_write` has told
+    /// its caller they were consumed. Without this, a caller that writes once
+    /// and then waits for an answer (a lane's request/response traffic) would
+    /// hold those bytes until its next write, which may never come.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.write.pending.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        if this.shared.is_closed() {
+            return Poll::Ready(Err(gone()));
+        }
+        let mut connection = this.shared.connection.lock();
+        match flush(&mut connection, this.id, &mut this.write.pending) {
+            Ok(_) if this.write.pending.is_empty() => {
+                drop(connection);
+                this.shared.poke();
+                Poll::Ready(Ok(()))
+            }
+            Ok(_) => {
+                this.shared.park(this.id, Wait::Write, cx.waker());
+                Poll::Pending
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.finished {
             return Poll::Ready(Ok(()));
         }
+        if this.shared.is_closed() {
+            return Poll::Ready(Err(gone()));
+        }
         let mut connection = this.shared.connection.lock();
+        // FIN after the bytes: finishing a stream with an unsent tail would
+        // discard exactly the last frame a lane wrote.
+        if !this.write.pending.is_empty() {
+            match flush(&mut connection, this.id, &mut this.write.pending) {
+                Ok(_) if this.write.pending.is_empty() => {}
+                Ok(_) => {
+                    this.shared.park(this.id, Wait::Write, cx.waker());
+                    return Poll::Pending;
+                }
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
         match connection.send_stream(this.id).finish() {
             Ok(()) | Err(quinn_proto::FinishError::ClosedStream) => {
                 this.finished = true;
@@ -348,14 +406,24 @@ impl AsyncRead for QuicStream {
             return Poll::Ready(Ok(()));
         }
 
+        // The connection lock is held until this call has either produced
+        // bytes or parked its reader. That is not a micro-optimisation: the
+        // task that raises `Readable` needs this lock, so holding it across
+        // the park closes the window in which a wakeup could be delivered to
+        // nobody between the failed read and the registration.
+        let mut connection = this.shared.connection.lock();
         let mut eof = false;
         {
-            let mut connection = this.shared.connection.lock();
             let mut recv = connection.recv_stream(this.id);
-            let mut chunks = match recv.read(false) {
+            // Ordered, always: this handle exposes a byte stream, and an
+            // unordered read hands back segments whose offsets the caller would
+            // have to reassemble. Appending them in arrival order is what
+            // corrupted a lane as soon as a packet overtook a retransmission.
+            let mut chunks = match recv.read(true) {
                 Ok(chunks) => chunks,
-                Err(ReadableError::IllegalOrderedRead) => return Poll::Ready(Err(gone())),
-                Err(ReadableError::ClosedStream) => return Poll::Ready(Err(gone())),
+                Err(ReadableError::IllegalOrderedRead | ReadableError::ClosedStream) => {
+                    return Poll::Ready(Err(gone()));
+                }
             };
             let scratch = vec![0u8; MAX_PLAINTEXT + 2 + super::record::TAG_LEN];
             loop {

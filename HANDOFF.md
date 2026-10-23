@@ -83,6 +83,39 @@
 
 ## Where this stands
 
+- **The UDP carrier's lane carries end to end, and the two bugs were
+  ordering (2026-10-23).** The first working smoke of a transparent claim over
+  the QUIC-shaped carrier: the same `stage` run, `--condition clean`,
+  `--condition-leg tunnel`, `--scale 0.2`, forced to the UDP carrier, two
+  rounds plus its own A/A copy — **8/8 samples ok, 93.4 s** against the
+  profile's 150 s budget (`/home/dsh/tmp/udp-ordered.json`). The lane had been
+  silently dead in two independent ways, and both were in the stream handle,
+  not the engine:
+  - **A multi-datagram `poll_transmit` was sent as one datagram.** `quinn-proto`
+    fills one buffer with up to `MAX_DATAGRAMS` datagrams and marks it with
+    `Transmit::segment_size`; the driver ignored the marker and the socket sent
+    the whole buffer in one `send_to`. A 1-RTT packet has no length field — a
+    short header extends to the end of the datagram — so the peer parsed the
+    next packet's first byte as a frame type and closed the connection with
+    `invalid frame ID`. `Outgoing::datagrams()` now splits at the segment size,
+    and one test pins the split.
+  - **Stream reads were unordered.** `RecvStream::read(false)` returns segments
+    in arrival order with their offsets; the handle appended them as if
+    contiguous. Under any retransmission a later segment arrived first and the
+    byte stream shifted. The first 32 frames of a 1.6 MiB write arrived intact
+    and the rest were a frame ahead. `read(true)` is the fix; the record layer's
+    framing cannot reassemble by offset.
+  Two robustness fixes landed with them because the same tests exercise the
+  shapes: the connection lock is held across a reader's park (so a `Readable`
+  event cannot fire into the gap between the failed read and the registration),
+  `park` refuses to register after `close` (no lost `ConnectionLost`), and
+  `poll_flush`/`poll_shutdown` drain a short write's tail instead of dropping
+  the last frame. Proof: two new tests in `transport::quic::socket` — 1.6 MiB
+  one way, and 1.6 MiB each way concurrently past the first stream window. The
+  carrier's own smoke also stopped re-dialing: no `carrier connection is gone`
+  in either end's log. The lane is the first thing on this branch that carries
+  visitor traffic over UDP; the pool (one QUIC connection, many streams) is
+  still TCP/yamux.
 - **The carrier rule's first live measurement: it fires, it costs the tail, and
   its handover was the reason (2026-10-23).** Two builds of the same commit,
   differing only in the rule's default (on against off — the trick the GSO A/B
@@ -575,7 +608,7 @@
   binary carries. A string only the new code contains is the signal that survives
   (`strings <binary> | grep -c 'UDP carrier'` is 8 in the build that has it, 0 in the
   one that does not).
-- **The data port is one UDP socket, and a lane does not carry yet (2026-10-23).**
+- **The data port is one UDP socket, and a lane does not carry yet (2026-10-23; superseded the same day — the lane carries, see "Where this stands": a multi-datagram transmit was sent whole and stream reads were unordered).**
   KCP's listener and the QUIC endpoint are both UDP on `[server.data].bind_addr` and
   cannot coexist: the first quic build to serve a registration died with
   `EADDRINUSE` on the KCP bind, which is the structural reason the two

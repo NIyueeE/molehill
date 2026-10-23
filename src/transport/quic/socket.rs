@@ -36,7 +36,7 @@ enum Command {
     OpenStream {
         connection: ConnectionHandle,
         /// Whether the stream carries the record layer, i.e. the service's
-        /// data_enable.
+        /// `data_enable`.
         encrypt: bool,
         reply: oneshot::Sender<std::io::Result<QuicStream>>,
     },
@@ -234,6 +234,11 @@ pub(crate) fn spawn(
     (handle, task)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the endpoint task is one select/drain state machine: every select arm has to leave the \
+              same loop state for the drain below, and splitting it hides that invariant"
+)]
 async fn run(
     socket: UdpSocket,
     server_config: Option<Arc<ServerConfig>>,
@@ -386,15 +391,17 @@ async fn drain(
     let now = Instant::now();
     driver.handle_timeout(now);
     while let Some(outgoing) = driver.poll_transmit(now) {
-        // Without GSO a coalesced buffer is one datagram, which is exactly
-        // what a plain `send_to` does; segmentation only changes how the
-        // batch is framed on the wire, not what it contains.
-        if let Err(error) = socket
-            .send_to(&outgoing.contents, outgoing.destination)
-            .await
-        {
-            tracing::debug!(%error, "the socket could not send");
-            return false;
+        // The engine may hand back several datagrams in one buffer, marked by
+        // a segment size. Each one is its own datagram on the wire: a 1-RTT
+        // packet has no length field, so a concatenation of them is not a
+        // sequence a peer can split. The GSO sender replaces this loop with
+        // one `UDP_SEGMENT` call; until then, one `send_to` per segment is the
+        // only correct framing.
+        for datagram in outgoing.datagrams() {
+            if let Err(error) = socket.send_to(datagram, outgoing.destination).await {
+                tracing::debug!(%error, "the socket could not send");
+                return false;
+            }
         }
     }
     driver.pump_endpoint_events();
@@ -487,6 +494,11 @@ async fn drain(
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "tests unwrap and expect on values they just constructed"
+    )]
     use super::*;
     use crate::config::{MaskedString, NoiseConfig};
     use crate::transport::NoiseKeys;
@@ -522,8 +534,18 @@ mod tests {
         )
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "the deadline arm panics with the test's failure, which is what an assertion is"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one handshake test covers both protection classes and the event contract"
+    )]
     #[tokio::test]
     async fn two_endpoints_complete_the_handshake_over_a_real_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let (client_cfg, server_cfg) = pair();
 
         let server_socket = UdpSocket::bind("127.0.0.1:0")
@@ -605,7 +627,6 @@ mod tests {
 
         // Both protection classes, one connection: the selector byte is what
         // tells the accepting side which one a stream carries.
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for (encrypt, payload) in [(false, &b"plain bytes"[..]), (true, &b"sealed bytes"[..])] {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let mut client_stream = client
@@ -644,6 +665,232 @@ mod tests {
             assert_eq!(&answer[..read], b"pong", "encrypt={encrypt}");
         }
     }
+    /// The one-way half of the lane test: does a long encrypted write arrive
+    /// intact when nobody writes back?
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test is one scenario: connect, then push more than a window and check every frame"
+    )]
+    #[tokio::test]
+    async fn a_long_encrypted_write_arrives_in_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const FRAME: usize = 8 * 1024;
+        const COUNT: usize = 200;
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let mut channel = client
+            .connect_stream(
+                server_addr,
+                ClientConfig::new(Arc::new(NoiseClientConfig::new(
+                    NoiseKeys::from_config(&client_cfg).expect("client keys"),
+                ))),
+                true,
+            )
+            .await
+            .expect("the direct channel comes up");
+
+        let writer = tokio::spawn(async move {
+            for i in 0..COUNT {
+                let buf = vec![u8::try_from(i).expect("frame indices fit in a byte"); FRAME];
+                channel.write_all(&buf).await.expect("the write");
+                channel.flush().await.expect("the flush");
+            }
+            channel.shutdown().await.expect("the shutdown");
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut served = tokio::time::timeout_at(deadline, streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let reader = tokio::spawn(async move {
+            let mut seen = vec![0u8; FRAME];
+            for i in 0..COUNT {
+                served.read_exact(&mut seen).await.expect("the read");
+                assert!(
+                    seen.iter()
+                        .all(|byte| *byte == u8::try_from(i).expect("frame indices fit in a byte")),
+                    "frame {i} arrived corrupted at byte {:?}",
+                    seen.iter().position(
+                        |byte| *byte != u8::try_from(i).expect("frame indices fit in a byte")
+                    )
+                );
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            writer.await.expect("the writer task");
+            reader.await.expect("the reader task");
+        })
+        .await
+        .expect("a long encrypted write must arrive in order");
+    }
+
+    /// A lane does not alternate: it reads and writes on the same stream at
+    /// the same time, and it keeps writing past the stream's first flow-control
+    /// window. That is the shape that parked a writer behind a reader's waker
+    /// and the shape a short write leaves pending bytes in, so the test sends
+    /// more than one window each way and requires every byte back.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one test is one scenario: connect, then push more than a window and check every frame"
+    )]
+    #[tokio::test]
+    async fn a_stream_carries_while_it_is_also_writing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const FRAME: usize = 8 * 1024;
+        const COUNT: usize = 200; // 1.6 MiB, beyond one stream window
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let channel = client
+            .connect_stream(
+                server_addr,
+                ClientConfig::new(Arc::new(NoiseClientConfig::new(
+                    NoiseKeys::from_config(&client_cfg).expect("client keys"),
+                ))),
+                true,
+            )
+            .await
+            .expect("the direct channel comes up");
+
+        let (mut client_read, mut client_write) = tokio::io::split(channel);
+        // Opening a QUIC stream is lazy: the peer learns of it from the first
+        // STREAM frame, so the writer starts before the server awaits the
+        // accept. A lane does the same — its hello is what opens it.
+        let writer = tokio::spawn(async move {
+            for i in 0..COUNT {
+                let buf = vec![u8::try_from(i).expect("frame indices fit in a byte"); FRAME];
+                client_write.write_all(&buf).await.expect("the write");
+                client_write.flush().await.expect("the flush");
+            }
+            client_write.shutdown().await.expect("the shutdown");
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let served = tokio::time::timeout_at(deadline, streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let (mut server_read, mut server_write) = tokio::io::split(served);
+        let reader = tokio::spawn(async move {
+            let mut seen = vec![0u8; FRAME];
+            for i in 0..COUNT {
+                server_read.read_exact(&mut seen).await.expect("the read");
+                assert!(
+                    seen.iter()
+                        .all(|byte| *byte == u8::try_from(i).expect("frame indices fit in a byte")),
+                    "frame {i} arrived corrupted"
+                );
+                server_write.write_all(&seen).await.expect("the echo");
+                server_write.flush().await.expect("the echo flush");
+            }
+            server_write.shutdown().await.expect("the echo shutdown");
+        });
+        let answers = tokio::spawn(async move {
+            let mut answer = vec![0u8; FRAME];
+            for i in 0..COUNT {
+                client_read
+                    .read_exact(&mut answer)
+                    .await
+                    .expect("the answer");
+                assert!(
+                    answer
+                        .iter()
+                        .all(|byte| *byte == u8::try_from(i).expect("frame indices fit in a byte")),
+                    "answer {i} arrived corrupted"
+                );
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            writer.await.expect("the writer task");
+            reader.await.expect("the echo task");
+            answers.await.expect("the answer task");
+        })
+        .await
+        .expect("a stream must carry in both directions at once");
+    }
+
     #[tokio::test]
     async fn a_direct_channel_is_one_stream_over_udp() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
