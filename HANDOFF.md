@@ -83,6 +83,32 @@
 
 ## Where this stands
 
+- **The pool rides the UDP carrier, and its clean-path number says do not
+  flip the order (2026-10-23).** The L4 pool now has a second implementation:
+  a tunnel is one QUIC connection and every data channel is a stream on it
+  (`ClientTunnel::from_carrier`, `channel::connect_connection`). The server's
+  first stream on a connection decides what the connection is — a direct
+  channel (the lane path, unchanged) or a pool tunnel, whose later streams are
+  routed by the 8-byte service prologue — and a connection-loss notice releases
+  the tunnel's `max_tunnels` slot instead of waiting for a session teardown.
+  Proof, on the stage `cost` scenario with the carrier forced
+  (`MOLEHILL_DATA_CARRIER=kcp`, recorded in the run's `molehill_switches`),
+  `--condition clean --condition-leg tunnel --scale 0.1 --rounds 1 --arms
+  molehill` plus the run's own A/A copy: **4 tunnels established on the
+  carrier, 8/8 samples ok**, throughput **0.87-0.96 Gbit/s**, CPU
+  **3.77-3.91 s/Gbit**, p99 68-96 ms. The TCP pool on the same model and host
+  carries about **12 Gbit/s at ~0.62 s/Gbit** (the 2026-10-22 first-carrier
+  measurement). The A/A pair agreed on throughput within 4 %, so this is not
+  scatter: **the `clean` cell of the plan's gate is missed by an order of
+  magnitude, and Gate 2 is not met. Per the gate's own rule, nothing flips and
+  KCP stays.** The gap is CPU, not loss: the path moves 2.1 M small datagrams
+  for 2.6 GB, one `send_to` per engine datagram, with a 65 KiB scratch buffer
+  allocated per stream read and the record layer's seal/open on every write.
+  The next lever is the plan's own datagram layer — `udp_batch`/`UDP_SEGMENT`
+  batching, a reusable read buffer, and the measured transport parameters — not
+  a carrier decision. The formal `--ab-arm` gate (two builds, one fingerprint,
+  `loss1`/`rtt100`/`clean`) is still owed; this cell is a smoke, not the
+  record.
 - **The UDP carrier's lane carries end to end, and the two bugs were
   ordering (2026-10-23).** The first working smoke of a transparent claim over
   the QUIC-shaped carrier: the same `stage` run, `--condition clean`,
@@ -114,8 +140,8 @@
   one way, and 1.6 MiB each way concurrently past the first stream window. The
   carrier's own smoke also stopped re-dialing: no `carrier connection is gone`
   in either end's log. The lane is the first thing on this branch that carries
-  visitor traffic over UDP; the pool (one QUIC connection, many streams) is
-  still TCP/yamux.
+  visitor traffic over UDP; the pool followed (see the entry above), and its
+  clean-path measurement is what keeps the carrier order TCP-first.
 - **The carrier rule's first live measurement: it fires, it costs the tail, and
   its handover was the reason (2026-10-23).** Two builds of the same commit,
   differing only in the rule's default (on against off — the trick the GSO A/B

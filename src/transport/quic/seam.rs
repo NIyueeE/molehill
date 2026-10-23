@@ -200,6 +200,10 @@ mod tests {
             Some(Arc::new(server_config)),
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: accepted_tx,
                 events: events_tx,
                 streams: server_streams_tx,
@@ -225,6 +229,10 @@ mod tests {
             None,
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: unused_tx,
                 events: unused_events_tx,
                 streams: unused_streams_tx,

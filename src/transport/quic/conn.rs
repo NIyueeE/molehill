@@ -47,11 +47,12 @@ pub(crate) enum Wait {
 /// The connection a task and its stream handles share.
 pub(crate) struct Shared {
     pub(crate) connection: Mutex<Connection>,
+    /// The endpoint's own id for this connection: a listener groups the
+    /// streams of one connection by it without naming an engine type.
+    pub(crate) key: u64,
     /// The handshake hash the record keys derive from, once the engine
     /// reports the handshake is done.
     hash: Mutex<Option<Vec<u8>>>,
-    /// At most one waker per stream: a writer waiting for credit, or a reader
-    /// waiting for bytes.
     /// One waker per stream **and direction**: a direct channel reads and writes
     /// at the same time, so a single slot per stream lets the reader's park
     /// overwrite the writer's and the writer is never woken again.
@@ -64,9 +65,10 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new(connection: Connection, notify: Arc<Notify>) -> Arc<Self> {
+    pub(crate) fn new(connection: Connection, notify: Arc<Notify>, key: u64) -> Arc<Self> {
         Arc::new(Shared {
             connection: Mutex::new(connection),
+            key,
             hash: Mutex::new(None),
             wakers: Mutex::new(HashMap::new()),
             closed: Mutex::new(false),
@@ -233,6 +235,11 @@ impl QuicStream {
             u64::from(id.index()),
             sender == Role::Initiator,
         ))
+    }
+
+    /// The endpoint's id for the connection this stream rides.
+    pub(crate) fn connection_key(&self) -> u64 {
+        self.shared.key
     }
 
     fn selector(&self) -> u8 {

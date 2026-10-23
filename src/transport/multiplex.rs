@@ -3485,8 +3485,12 @@ impl Drop for AliveGuard {
     }
 }
 
-/// Handle to a client-side tunnel: opens data channels as streams of one
-/// yamux session, and carries the tunnel's own bookkeeping.
+/// Handle to a client-side tunnel: one carrier connection, opening data
+/// channels as its streams, plus the tunnel's own bookkeeping.
+///
+/// The TCP carrier's connection is a yamux session, driven by this type; any
+/// other carrier arrives as a [`CarrierConn`](crate::transport::carrier::CarrierConn)
+/// and is opened through the seam. The pool holds both the same way.
 #[derive(Clone)]
 pub struct ClientTunnel {
     /// The tunnel's process-unique id: the key of the client's pin accounting
@@ -3499,6 +3503,10 @@ pub struct ClientTunnel {
     /// "holds" streams, or every later placement lands on a corpse.
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     open_tx: mpsc::Sender<oneshot::Sender<Result<MuxStream, yamux::ConnectionError>>>,
+    /// A carrier whose streams do not come from yamux (the QUIC-shaped UDP
+    /// carrier): opens and liveness go through the seam, and there is no yamux
+    /// driver to start. `None` on a yamux tunnel.
+    carrier: Option<std::sync::Arc<dyn crate::transport::carrier::CarrierConn>>,
 }
 
 impl ClientTunnel {
@@ -3654,7 +3662,34 @@ impl ClientTunnel {
             counters,
             alive,
             open_tx,
+            carrier: None,
         }
+    }
+
+    /// A tunnel whose streams come from a carrier seam rather than yamux.
+    ///
+    /// The caller has already established the connection; this only gives it
+    /// the pool's identity and counters. The first stream (the tunnel hello)
+    /// is the caller's business.
+    #[cfg(feature = "quic")]
+    pub(crate) fn from_carrier(
+        conn: std::sync::Arc<dyn crate::transport::carrier::CarrierConn>,
+        counters: std::sync::Arc<TunnelCounters>,
+    ) -> ClientTunnel {
+        let (open_tx, _open_rx) = mpsc::channel(1);
+        ClientTunnel {
+            id: next_tunnel_id(),
+            counters,
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            open_tx,
+            carrier: Some(conn),
+        }
+    }
+
+    /// The tunnel's counters, for a caller that has to create the handle.
+    #[cfg(feature = "quic")]
+    pub(crate) fn counters_for_carrier() -> std::sync::Arc<TunnelCounters> {
+        TunnelCounters::with_health(None)
     }
 
     /// The tunnel's process-unique id (the client's pin accounting key).
@@ -3668,11 +3703,20 @@ impl ClientTunnel {
     /// removed by `TunnelPool::reap_dead`; this is what "died" means, as
     /// opposed to "has no streams right now".
     pub(crate) fn is_alive(&self) -> bool {
-        self.alive.load(std::sync::atomic::Ordering::Acquire)
+        self.carrier.as_ref().map_or_else(
+            || self.alive.load(std::sync::atomic::Ordering::Acquire),
+            |carrier| carrier.is_alive(),
+        )
     }
 
     /// Open a new data channel as a multiplexed stream.
     pub(crate) async fn open_stream(&self) -> Result<MuxStream, yamux::ConnectionError> {
+        if let Some(carrier) = &self.carrier {
+            return carrier
+                .open_stream()
+                .await
+                .map_err(|_| yamux::ConnectionError::Closed);
+        }
         let (tx, rx) = oneshot::channel();
         self.open_tx
             .send(tx)
@@ -3694,6 +3738,9 @@ impl crate::transport::carrier::CarrierConn for ClientTunnel {
         &self,
     ) -> Result<crate::transport::carrier::CarrierStream, crate::transport::carrier::StreamError>
     {
+        if let Some(carrier) = &self.carrier {
+            return carrier.open_stream().await;
+        }
         match self.open_stream().await {
             Ok(stream) => Ok(stream),
             Err(yamux::ConnectionError::TooManyStreams) => {
@@ -3711,8 +3758,10 @@ impl crate::transport::carrier::CarrierConn for ClientTunnel {
     /// `Closed` is proof the connection is gone, and waiting for the driver
     /// task to notice would leave the corpse placeable for a whole tick.
     fn mark_dead(&self) {
-        self.alive
-            .store(false, std::sync::atomic::Ordering::Release);
+        if self.carrier.is_none() {
+            self.alive
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 

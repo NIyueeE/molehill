@@ -67,6 +67,9 @@ pub(crate) struct Driver {
     pending: Vec<Outgoing>,
     /// Told whenever a stream puts bytes into the engine.
     notify: Arc<Notify>,
+    /// The next connection key, handed to `Shared` so a listener can group the
+    /// streams of one connection without naming an engine type.
+    next_key: u64,
 }
 
 impl Driver {
@@ -86,6 +89,7 @@ impl Driver {
             server_config,
             pending: Vec::new(),
             notify,
+            next_key: 1,
         }
     }
 
@@ -100,8 +104,12 @@ impl Driver {
         remote: SocketAddr,
     ) -> Result<ConnectionHandle, ConnectError> {
         let (handle, connection) = self.endpoint.connect(now, config, remote, "molehill")?;
-        self.connections
-            .insert(handle, Shared::new(connection, Arc::clone(&self.notify)));
+        let key = self.next_key;
+        self.next_key += 1;
+        self.connections.insert(
+            handle,
+            Shared::new(connection, Arc::clone(&self.notify), key),
+        );
         Ok(handle)
     }
 
@@ -115,8 +123,12 @@ impl Driver {
         let (handle, connection) =
             self.endpoint
                 .accept(incoming, now, &mut scratch, self.server_config.clone())?;
-        self.connections
-            .insert(handle, Shared::new(connection, Arc::clone(&self.notify)));
+        let key = self.next_key;
+        self.next_key += 1;
+        self.connections.insert(
+            handle,
+            Shared::new(connection, Arc::clone(&self.notify), key),
+        );
         Ok(handle)
     }
 

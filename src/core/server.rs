@@ -621,7 +621,7 @@ async fn ensure_udp_listener(
         )
     })?;
     info!("Listening for UDP carrier connections at {bound}");
-    let (endpoint, streams) = crate::transport::quic::channel::spawn_server(socket, keys);
+    let (endpoint, streams, lost) = crate::transport::quic::channel::spawn_server(socket, keys);
     *guard = Some(std::sync::Arc::downgrade(&endpoint));
     drop(guard);
     let mut shutdown_rx = shared.shutdown_tx.subscribe();
@@ -630,57 +630,150 @@ async fn ensure_udp_listener(
         let _endpoint = endpoint;
         tokio::select! {
             _ = shutdown_rx.recv() => {}
-            () = run_udp_listener(streams, registry, shared) => {}
+            () = run_udp_listener(streams, lost, registry, shared) => {}
         }
     });
     Ok(())
 }
 
-/// Accept direct channels from the UDP carrier.
+/// The per-connection state of the UDP carrier's listener.
 ///
-/// A direct channel is one connection carrying one stream, so this loop's whole
-/// job is to hand each accepted stream to the same prologue the other carriers
-/// read. Pool tunnels over this carrier are the next step, not this one.
+/// A QUIC connection is either a direct channel (one stream, the lane path) or
+/// a pool tunnel (the first stream carries the tunnel hello, every later one a
+/// service prologue). The state is keyed by the opaque id the stream carries
+/// (`QuicStream::connection_key`), so the listener groups streams without
+/// naming an engine type.
+#[cfg(feature = "quic")]
+#[derive(Clone)]
+enum UdpConnection {
+    /// The first stream is still handshaking; later streams are dropped.
+    Connecting,
+    /// A direct channel: no later stream on this connection is expected.
+    Direct,
+    /// A pool tunnel: its reservation and owner live here for the connection.
+    Tunnel(Arc<UdpTunnel>),
+}
+
+#[cfg(feature = "quic")]
+struct UdpTunnel {
+    owner: TunnelOwner,
+    /// The operator's `max_tunnels` slot, held for the tunnel's whole life.
+    _slot: SessionTunnel,
+    /// The service/tunnel pair a stream named first, for per-tunnel reports.
+    id: std::sync::OnceLock<(ServiceId, crate::protocol::TunnelId)>,
+}
+
+/// Accept UDP-carrier connections: direct channels and pool tunnels.
+///
+/// A tunnel's connection is the pool's unit, so the first stream decides what
+/// the whole connection is; every later stream on it is a data channel and is
+/// routed by the service prologue it carries. Direct channels keep the shape
+/// they had: one connection, one stream.
 #[cfg(feature = "quic")]
 async fn run_udp_listener(
     mut streams: tokio::sync::mpsc::UnboundedReceiver<crate::transport::quic::conn::QuicStream>,
+    mut lost: tokio::sync::mpsc::UnboundedReceiver<u64>,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
 ) {
-    while let Some(stream) = streams.recv().await {
-        info!("UDP carrier: an accepted stream reached the listener");
-        let registry = Arc::clone(&registry);
-        let shared = Arc::clone(&shared);
-        tokio::spawn(async move {
-            if let Err(e) = handle_udp_stream(stream, registry, shared).await {
-                // INFO, not DEBUG: a direct channel that dies before its hello is a
-                // lifecycle event an operator can act on, and it was invisible at debug
-                // while this carrier was being brought up.
-                info!("UDP carrier channel ended: {e:#}");
+    let connections: Arc<Mutex<HashMap<u64, UdpConnection>>> = Arc::new(Mutex::new(HashMap::new()));
+    loop {
+        tokio::select! {
+            lost_key = lost.recv() => {
+                let Some(key) = lost_key else { break };
+                connections
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
             }
-        });
+            stream = streams.recv() => {
+                let Some(stream) = stream else { break };
+                let key = stream.connection_key();
+                let state = connections
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&key)
+                    .cloned();
+                match state {
+                    Some(UdpConnection::Tunnel(tunnel)) => {
+                        tokio::spawn(async move {
+                            let mut stream = stream;
+                            let Some(queue) = route_tunnel_stream(
+                                &mut stream,
+                                &tunnel.owner.sessions,
+                                &tunnel.owner.nonce,
+                                &tunnel.id,
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            let _ = queue
+                                .send(DataChannel::RawUdp(Box::new(stream)))
+                                .await;
+                        });
+                    }
+                    Some(UdpConnection::Direct | UdpConnection::Connecting) => {
+                        debug!(
+                            "Dropped a UDP-carrier stream on a connection that carries no tunnel"
+                        );
+                    }
+                    None => {
+                        connections
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key, UdpConnection::Connecting);
+                        let registry = Arc::clone(&registry);
+                        let shared = Arc::clone(&shared);
+                        let connections = Arc::clone(&connections);
+                        tokio::spawn(async move {
+                            let result = handle_udp_first_stream(
+                                stream,
+                                key,
+                                registry,
+                                shared,
+                                Arc::clone(&connections),
+                            )
+                            .await;
+                            if let Err(e) = result {
+                                connections
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .remove(&key);
+                                info!("UDP carrier connection ended: {e:#}");
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
     debug!("UDP carrier listener stopped");
 }
 
-/// Read one direct channel's hello and hand it to the service.
-///
-/// No selector is read here: the stream already applied its own record layer
-/// when the service asked for one, because the selector and the per-stream keys
-/// are the stream's own business (see the quic module's conn).
+/// Read the first stream of a UDP-carrier connection and decide what the
+/// connection is: a direct channel, or a pool tunnel whose later streams are
+/// data channels.
 #[cfg(feature = "quic")]
-async fn handle_udp_stream(
+async fn handle_udp_first_stream(
     mut io: crate::transport::quic::conn::QuicStream,
+    key: u64,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
+    connections: Arc<Mutex<HashMap<u64, UdpConnection>>>,
 ) -> Result<()> {
-    let _ = &shared;
     let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
     let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
         .await
         .with_context(|| "UDP carrier hello timed out")??;
     match hello {
         Hello::DataChannelHello(_, nonce) => {
+            // A direct channel owns its whole connection: a second stream on it
+            // is not this protocol's shape.
+            connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, UdpConnection::Direct);
             let service_id = read_stream_prologue(&mut io).await?;
             do_v4_data_channel(
                 DataChannel::RawUdp(Box::new(io)),
@@ -690,8 +783,38 @@ async fn handle_udp_stream(
             )
             .await
         }
-        Hello::DataChannelTunnelHello(..) => {
-            bail!("A pool tunnel is not carried by the UDP carrier yet, and this one asked for it")
+        Hello::DataChannelTunnelHello(_, nonce) => {
+            let owner = tunnel_owner(&registry, nonce, "UDP").await?;
+            let session = match reserve_tunnel(&registry, &nonce, shared.max_tunnels).await {
+                TunnelSlot::Held(session) => session,
+                TunnelSlot::NoSession => {
+                    bail!("UDP tunnel hello carried an incorrect nonce")
+                }
+                TunnelSlot::OverCap { held } => {
+                    debug!(
+                        "Refused a UDP data tunnel for a session that already holds {held} \
+                         tunnel(s), and `[server.data].max_tunnels` is {}",
+                        shared.max_tunnels
+                    );
+                    refuse_tunnel(&mut io).await?;
+                    return Ok(());
+                }
+            };
+            // The ack is what tells the client the connection is a tunnel and
+            // that its slot is held; it goes out only after the reservation.
+            write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
+            connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    key,
+                    UdpConnection::Tunnel(Arc::new(UdpTunnel {
+                        owner,
+                        _slot: session,
+                        id: std::sync::OnceLock::new(),
+                    })),
+                );
+            Ok(())
         }
         other @ Hello::ControlChannelHello(..) => {
             bail!("Expected a data-plane hello on the UDP carrier, got {other:?}")
@@ -1966,6 +2089,7 @@ fn report_lane_refusal(held: usize, cap: usize) {
 /// which is exactly what a shared pool (`[client.data].shared_pool`) produces,
 /// and what a per-service pool produces only by accident.
 #[cfg(feature = "multiplex")]
+#[derive(Clone)]
 struct TunnelOwner {
     sessions: Arc<RwLock<SessionMap>>,
     nonce: Nonce,

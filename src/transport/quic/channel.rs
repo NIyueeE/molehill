@@ -1,4 +1,4 @@
-//! A direct data channel on the UDP carrier.
+//! A direct data channel, and a pool tunnel's connection, on the UDP carrier.
 //!
 //! A direct channel is one connection carrying one stream — the same shape a
 //! KCP session has today — so this owns the endpoint that carries it: the
@@ -44,6 +44,44 @@ pub(crate) async fn connect(
     keys: NoiseKeys,
     encrypt: bool,
 ) -> Result<UdpChannel> {
+    let endpoint = dial_endpoint(remote).await?;
+    let config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    let stream = endpoint.connect_stream(remote, config, encrypt).await?;
+    Ok(UdpChannel {
+        _endpoint: endpoint,
+        stream,
+    })
+}
+
+/// Dial one **connection** to `remote`, for a carrier that will open many
+/// streams over it (the pool's tunnels).
+///
+/// The connection is not handed back as a concrete stream: the caller keeps
+/// the seam handle and opens streams through it, which is the same shape the
+/// pool uses for every carrier.
+///
+/// # Errors
+///
+/// Fails when the socket cannot be bound or the endpoint cannot start the
+/// connection. The handshake completes lazily, on the first open, exactly as
+/// it does for a direct channel.
+pub(crate) async fn connect_connection(
+    remote: SocketAddr,
+    keys: NoiseKeys,
+    encrypt: bool,
+) -> Result<Arc<dyn crate::transport::carrier::CarrierConn>> {
+    let endpoint = dial_endpoint(remote).await?;
+    let config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
+    let handle = endpoint.connect(remote, config).await?;
+    Ok(Arc::new(super::seam::UdpConn::new(
+        endpoint, handle, encrypt,
+    )))
+}
+
+/// One client endpoint on a fresh socket, with its task's receive channels
+/// drained: a client accepts nothing, and a send that fails because a receiver
+/// is gone would end the task.
+async fn dial_endpoint(remote: SocketAddr) -> Result<Arc<EndpointHandle>> {
     let bind = if remote.is_ipv4() {
         SocketAddr::from(([0, 0, 0, 0], 0))
     } else {
@@ -55,6 +93,7 @@ pub(crate) async fn connect(
     let (accepted, mut accepted_rx) = mpsc::unbounded_channel();
     let (events, mut events_rx) = mpsc::unbounded_channel();
     let (streams, mut streams_rx) = mpsc::unbounded_channel();
+    let (lost, mut lost_rx) = mpsc::unbounded_channel();
     let (endpoint, _task) = socket::spawn(
         socket,
         None,
@@ -63,6 +102,7 @@ pub(crate) async fn connect(
             accepted,
             events,
             streams,
+            lost,
         },
     );
     // A client endpoint accepts nothing: the server opens neither connections
@@ -86,16 +126,15 @@ pub(crate) async fn connect(
                         break;
                     }
                 }
+                lost = lost_rx.recv() => {
+                    if lost.is_none() {
+                        break;
+                    }
+                }
             }
         }
     });
-    let endpoint = Arc::new(endpoint);
-    let config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
-    let stream = endpoint.connect_stream(remote, config, encrypt).await?;
-    Ok(UdpChannel {
-        _endpoint: endpoint,
-        stream,
-    })
+    Ok(Arc::new(endpoint))
 }
 
 impl tokio::io::AsyncRead for UdpChannel {
@@ -140,10 +179,15 @@ impl tokio::io::AsyncWrite for UdpChannel {
 pub(crate) fn spawn_server(
     socket: UdpSocket,
     keys: NoiseKeys,
-) -> (Arc<EndpointHandle>, mpsc::UnboundedReceiver<QuicStream>) {
+) -> (
+    Arc<EndpointHandle>,
+    mpsc::UnboundedReceiver<QuicStream>,
+    mpsc::UnboundedReceiver<u64>,
+) {
     let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let (streams_tx, streams_rx) = mpsc::unbounded_channel();
+    let (lost_tx, lost_rx) = mpsc::unbounded_channel();
     let config = quinn_proto::ServerConfig::new(
         Arc::new(NoiseServerConfig::new(keys)),
         super::crypto::TokenKeys::new(),
@@ -153,6 +197,7 @@ pub(crate) fn spawn_server(
         Some(Arc::new(config)),
         false,
         Channels {
+            lost: lost_tx,
             accepted: accepted_tx,
             events: events_tx,
             streams: streams_tx,
@@ -177,5 +222,5 @@ pub(crate) fn spawn_server(
             }
         }
     });
-    (Arc::new(endpoint), streams_rx)
+    (Arc::new(endpoint), streams_rx, lost_rx)
 }

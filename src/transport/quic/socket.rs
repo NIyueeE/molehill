@@ -73,6 +73,10 @@ pub(crate) struct Channels {
     pub(crate) events: mpsc::UnboundedSender<(ConnectionHandle, Event)>,
     /// Every stream the peer opens, as soon as the engine reports it.
     pub(crate) streams: mpsc::UnboundedSender<QuicStream>,
+    /// A connection the engine let go, by the opaque key its streams carry
+    /// (`QuicStream::connection_key`): the listener's per-connection state
+    /// (a pool tunnel's reservation) is released on this, not on a poll.
+    pub(crate) lost: mpsc::UnboundedSender<u64>,
 }
 
 pub(crate) struct EndpointHandle {
@@ -474,6 +478,7 @@ async fn drain(
                     waiters.remove(&handle);
                     if let Some(shared) = driver.shared(handle) {
                         shared.close();
+                        let _ = channels.lost.send(shared.key);
                     }
                     if let Some(waiting) = waiting.remove(&handle) {
                         let _ = waiting.reply.send(Err(std::io::Error::new(
@@ -566,6 +571,10 @@ mod tests {
             Some(Arc::new(server_config)),
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: accepted_tx,
                 events: server_events_tx,
                 streams: server_streams_tx,
@@ -583,6 +592,10 @@ mod tests {
             None,
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: unused_tx,
                 events: client_events_tx,
                 streams: unused_streams_tx,
@@ -697,6 +710,10 @@ mod tests {
             Some(Arc::new(server_config)),
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: accepted_tx,
                 events: events_tx,
                 streams: streams_tx,
@@ -713,6 +730,10 @@ mod tests {
             None,
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: unused_tx,
                 events: client_events_tx,
                 streams: unused_streams_tx,
@@ -800,6 +821,10 @@ mod tests {
             Some(Arc::new(server_config)),
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: accepted_tx,
                 events: events_tx,
                 streams: streams_tx,
@@ -817,6 +842,10 @@ mod tests {
             None,
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: unused_tx,
                 events: client_events_tx,
                 streams: unused_streams_tx,
@@ -891,6 +920,95 @@ mod tests {
         .expect("a stream must carry in both directions at once");
     }
 
+    /// A pool tunnel is one connection carrying many streams: opening three
+    /// must produce three independent streams on the peer, not three
+    /// connections.
+    #[tokio::test]
+    async fn one_connection_carries_several_streams() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let handle = client
+            .connect(
+                server_addr,
+                ClientConfig::new(Arc::new(NoiseClientConfig::new(
+                    NoiseKeys::from_config(&client_cfg).expect("client keys"),
+                ))),
+            )
+            .await
+            .expect("the client connects");
+        client
+            .await_connected(handle)
+            .await
+            .expect("the handshake completes");
+
+        for i in 0..3u8 {
+            let mut stream = client.open_stream(handle, false).await.expect("a stream");
+            stream.write_all(&[i; 64]).await.expect("the write");
+            stream.flush().await.expect("the flush");
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for expected in 0..3u8 {
+            let mut stream = tokio::time::timeout_at(deadline, streams_rx.recv())
+                .await
+                .expect("the stream arrives")
+                .expect("the server task stopped");
+            let mut seen = [0u8; 64];
+            tokio::time::timeout_at(deadline, stream.read_exact(&mut seen))
+                .await
+                .expect("the read completes")
+                .expect("the read succeeds");
+            assert_eq!(seen, [expected; 64]);
+        }
+    }
+
     #[tokio::test]
     async fn a_direct_channel_is_one_stream_over_udp() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -913,6 +1031,10 @@ mod tests {
             Some(Arc::new(server_config)),
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: accepted_tx,
                 events: events_tx,
                 streams: streams_tx,
@@ -930,6 +1052,10 @@ mod tests {
             None,
             false,
             Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
                 accepted: unused_tx,
                 events: client_events_tx,
                 streams: unused_streams_tx,

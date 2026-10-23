@@ -22,6 +22,6 @@ pub(crate) mod conn;
 mod crypto;
 mod driver;
 mod record;
-mod seam;
+pub(crate) mod seam;
 pub(crate) mod session;
 pub(crate) mod socket;

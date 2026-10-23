@@ -2087,7 +2087,46 @@ async fn tunnel_dialer(
             })
         }
     };
-    #[cfg(feature = "kcp")]
+    // The UDP carrier: one connection, many streams. The pool's tunnel is the
+    // connection, and each data channel is a stream — the same shape the
+    // direct-channel path uses, with the pool's bookkeeping wrapped around it.
+    #[cfg(all(feature = "quic", feature = "noise"))]
+    let kcp: OneDialer = {
+        // Resolved once, at pool creation: a growth must not block on DNS
+        // inside the placement path.
+        let remote_addr = {
+            let mut probe = AddrMaybeCached::new(&opts.addr);
+            probe.resolve().await.with_context(|| {
+                format!("Failed to resolve the UDP data endpoint {}", opts.addr)
+            })?;
+            probe
+                .socket_addr
+                .ok_or_else(|| anyhow!("The UDP data endpoint {} resolved to nothing", opts.addr))?
+        };
+        let opts = opts.clone();
+        let choice = Arc::clone(choice);
+        Arc::new(move || {
+            let opts = opts.clone();
+            let choice = Arc::clone(&choice);
+            Box::pin(async move {
+                let attempt = tokio::time::timeout(
+                    KCP_ATTEMPT_BUDGET,
+                    establish_one_udp_tunnel(remote_addr, session_nonce, &opts, "pool"),
+                )
+                .await;
+                let result = attempt
+                    .map_err(|_| "UDP tunnel establishment timed out".to_owned())?
+                    .map_err(|e| format!("{e:#}"));
+                if let Err(e) = &result {
+                    // The same news the KCP arm reports: a carrier that cannot
+                    // come up is the endpoint's business, not this pool's only.
+                    choice.failed(Carrier::Kcp, e);
+                }
+                result
+            })
+        })
+    };
+    #[cfg(all(feature = "kcp", not(feature = "quic")))]
     let kcp: OneDialer = {
         // Resolved once, at pool creation: a KCP growth must not block on
         // DNS inside the placement path.
@@ -2131,12 +2170,12 @@ async fn tunnel_dialer(
     };
     Ok(Arc::new(move |wanted: Carrier| match wanted {
         Carrier::Tcp => tcp(),
-        // A build without the feature has no way to be asked for KCP
-        // (`CarrierChoice::failed` has nowhere to fall back to), and TCP is
-        // then the only carrier there is.
-        #[cfg(feature = "kcp")]
+        // A build with neither carrier implementation has no way to be asked
+        // for the second slot (`CarrierChoice::failed` has nowhere to fall
+        // back to), and TCP is then the only carrier there is.
+        #[cfg(any(feature = "kcp", feature = "quic"))]
         Carrier::Kcp => kcp(),
-        #[cfg(not(feature = "kcp"))]
+        #[cfg(not(any(feature = "kcp", feature = "quic")))]
         Carrier::Kcp => tcp(),
     }))
 }
@@ -2276,6 +2315,47 @@ async fn establish_one_kcp_tunnel(
         ClientTunnel::start_with_health(io, Some(health), config, shutdown_rx),
         shutdown_tx,
     ))
+}
+
+/// Open one QUIC connection, exchange the tunnel hello/ack on its first
+/// stream, and wrap the connection as a pool tunnel.
+///
+/// The connection is the tunnel: every data channel the pool opens is one
+/// stream on it. The first stream carries only the hello and the server's ack;
+/// it is dropped once the tunnel is up, `data_enable` decides whether the
+/// streams carry the record layer, and the Noise identity is the service's own
+/// pair — the same one the control channel uses, never a shared token.
+#[cfg(all(feature = "quic", feature = "noise"))]
+async fn establish_one_udp_tunnel(
+    remote_addr: SocketAddr,
+    session_nonce: Nonce,
+    opts: &DataOpts,
+    service_name: &str,
+) -> Result<(ClientTunnel, watch::Sender<bool>)> {
+    let keys = crate::transport::NoiseKeys::from_config(&opts.identity)?;
+    let conn = crate::transport::quic::channel::connect_connection(
+        remote_addr,
+        keys,
+        opts.noise.is_some(),
+    )
+    .await?;
+    let mut hello_stream = conn
+        .open_stream()
+        .await
+        .map_err(|e| anyhow!("the UDP tunnel could not open its hello stream: {e}"))?;
+    let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_nonce);
+    hello_stream
+        .write_all(&postcard::to_stdvec(&hello)?)
+        .await?;
+    hello_stream.flush().await?;
+    match read_ack(&mut hello_stream).await? {
+        Ack::Ok => {}
+        v => bail!("Service {service_name}: the server refused the UDP data tunnel: {v}"),
+    }
+    drop(hello_stream);
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let counters = ClientTunnel::counters_for_carrier();
+    Ok((ClientTunnel::from_carrier(conn, counters), shutdown_tx))
 }
 
 // Runtime-resolved per-service UDP options. Validation fills the defaults;
