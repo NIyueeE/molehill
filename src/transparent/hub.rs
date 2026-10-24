@@ -336,6 +336,20 @@ impl TunHub {
         self.routes.cancel_drain(endpoint, lane)
     }
 
+    /// Record what a lane's pump handed to the carrier, or that it failed.
+    ///
+    /// Called by the pump itself, once per batch: it is the only place that
+    /// knows a frame left the queue, and the difference between this and
+    /// `enqueued` is what tells a swallowing carrier from an idle lane.
+    pub fn note_written(&self, endpoint: &Endpoint, slot: usize, bytes: u64) {
+        self.routes.note_written(endpoint, slot, bytes, false);
+    }
+
+    /// Record that the carrier refused a write, which ends the pump early.
+    pub fn note_write_error(&self, endpoint: &Endpoint, slot: usize) {
+        self.routes.note_written(endpoint, slot, 0, true);
+    }
+
     /// The reader loop: device to service queues. Runs until the device is
     /// gone.
     ///
@@ -550,6 +564,15 @@ pub struct LaneCounters {
     /// Packets this end injected into its device, delivered by this lane.
     pub injected_packets: u64,
     pub injected_bytes: u64,
+    /// Bytes this end's pump actually handed to the carrier.
+    ///
+    /// `enqueued` says what the queue accepted; this says what left it. A lane
+    /// whose queue fills while this number stops is a lane whose *carrier* is
+    /// swallowing frames, and without it that lane looks exactly like an idle
+    /// one — which is how a half-dead lane hid in the `cost` cell.
+    pub written_bytes: u64,
+    /// Writes the carrier refused, which end the pump early.
+    pub write_errors: u64,
 }
 
 impl LaneCounters {
@@ -568,6 +591,11 @@ impl LaneCounters {
             self.overflow_packets += packets;
             self.overflow_bytes += bytes;
         }
+    }
+
+    /// Count bytes the pump handed to the carrier.
+    fn wrote(&mut self, bytes: u64) {
+        self.written_bytes += bytes;
     }
 
     /// Count packets this lane delivered into the local device.
@@ -1026,6 +1054,24 @@ impl Routes {
     /// routing to answer, and the packets for it are counted as having no
     /// channel, exactly as the single-channel path counted them when its channel
     /// ended.
+    /// Count bytes a lane's pump wrote, or a write the carrier refused.
+    fn note_written(&self, endpoint: &Endpoint, slot: usize, bytes: u64, error: bool) {
+        let Ok(mut table) = self.table.lock() else {
+            return;
+        };
+        let Some(claim) = table.lookup_endpoint_mut(endpoint) else {
+            return;
+        };
+        let Some(entry) = claim.slots.get_mut(slot) else {
+            return;
+        };
+        if error {
+            entry.counters.write_errors += 1;
+        } else {
+            entry.counters.wrote(bytes);
+        }
+    }
+
     fn vacate(&self, endpoint: &Endpoint, slot: usize) {
         let Ok(mut table) = self.table.lock() else {
             return;
@@ -1588,11 +1634,21 @@ where
     // packet, so a batch of N packets costs one syscall and one carrier
     // segment run instead of N of each.
     let pump_stats = Arc::clone(&stats);
+    let pump_hub = Arc::clone(&hub);
+    let pump_endpoint = endpoint;
     let pump = tokio::spawn(async move {
         while let Some(batch) = rx.recv().await {
             if writer.write_all(&batch).await.is_err() {
+                // The carrier is gone as a carrier: say so on the lane's own
+                // counters before the pump ends, or the slot looks idle.
+                pump_hub.note_write_error(&pump_endpoint, slot);
                 break;
             }
+            pump_hub.note_written(
+                &pump_endpoint,
+                slot,
+                u64::try_from(batch.len()).unwrap_or(0),
+            );
             pump_stats.note_carrier_write();
         }
     });
@@ -1753,8 +1809,8 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                     target: "molehill::transparent",
                     "l3-stats: role={role} claim={} member={} live={} lane={} carrier={} flows={} \
                      forwarded={} no_channel={} offered={} enqueued={} overflow={} \
-                     disconnected={} injected={} peer_offered={} peer_refused={} \
-                     draining={} peer_draining={}",
+                     disconnected={} injected={} written_bytes={} write_errors={} \
+                     peer_offered={} peer_refused={} draining={} peer_draining={}",
                     member.endpoint,
                     member.slot,
                     member.live,
@@ -1773,6 +1829,8 @@ fn spawn_stats_reporter(hub: Arc<TunHub>) {
                     member.counters.overflow_packets,
                     member.counters.disconnected_packets,
                     member.counters.injected_packets,
+                    member.counters.written_bytes,
+                    member.counters.write_errors,
                     // What the *peer* says it offered this lane and what this
                     // lane's queue refused there: the half of the story this
                     // end cannot see, and the one a carrier has to be judged

@@ -136,6 +136,15 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **The lane now reports what its pump wrote (2026-10-24).** `LaneCounters`
+    gained `written_bytes` (what the pump handed to the carrier, as opposed to
+    what the queue accepted) and `write_errors`, printed in the per-member
+    `l3-stats` line. The re-run sharpened the picture rather than settling it:
+    on that run claim `2402` never placed a flow at all (`flows=0`,
+    `offered=0` on both ends), so the `cost` cell fails in two different ways —
+    a lane that accepts frames and delivers none, and a connection whose flows
+    are never placed — and the counters are what will tell them apart once a
+    run catches either in the act.
   - **The `cost` cell has a mechanism now: a lane that accepts frames and
     delivers none (2026-10-24).** With `RUST_LOG=debug` and `MOLEHILL_L3_STATS`
     on the failing cell, claim `2402` (the iperf service) has **one** lane with
