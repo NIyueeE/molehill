@@ -82,7 +82,7 @@ pub(crate) struct Channels {
 /// How many already-queued datagrams one readiness wake may consume before
 /// the loop drains once. Bounded so a flood cannot starve commands, timers or
 /// the stream tasks the same loop serves.
-const RECV_BURST: usize = 32;
+const RECV_BURST: usize = 128;
 
 /// How many engine transmissions may wait for the sender task. Bounded so a
 /// path that cannot drain them cannot grow the endpoint's memory without

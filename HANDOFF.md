@@ -136,6 +136,18 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **A 128-datagram receive burst is the biggest single win so far
+    (2026-10-24).** The loop took 32 already-queued datagrams per readiness
+    wake; at these rates a wake carries more than that, so the endpoint was
+    paying a timer sweep, a transmit sweep and an event pass every 32 packets.
+    128 moves the loopback ceiling 2726 -> 2817 Mbit/s and the cells to
+    `bulk-1` 3.198 (KCP 3.26 — parity inside this run's noise), `bulk-n` 6.099,
+    and clean 0.70 s/Gbit (7.7 Gbit/s, KCP 12.81 at 0.624). Per byte the clean
+    path is now within 13 % of KCP; the remaining clean gap is that KCP spreads
+    over 8 cores where this build uses 5.4.
+  - **40 datagrams per transmit measured the same as 32** (2809 against 2817),
+    so 32 stays; the earlier 64-datagram trap was a 76 KiB `UDP_SEGMENT`
+    message over the kernel's limit, not the batch itself.
   - **A 1452-byte datagram instead of 1200 is worth 4-14 % (2026-10-24).**
     QUIC's 1200 is a guaranteed minimum, not a choice, and this carrier's cost
     is per packet: the loopback ceiling moved 2386 -> 2726 Mbit/s, `bulk-1`
