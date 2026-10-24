@@ -152,6 +152,17 @@
     cell is not measuring the carrier's throughput at all on this build: it is
     measuring a cold-start race between the stage's iperf dial and the claim's
     first lane, and the 86 s bound expires while iperf3 backs off.
+  - **Lane starvation is not the cause either (2026-10-24).** The per-second lane
+    picture is identical in the failing and the passing run: claim `2401` grows
+    to 6-9 live lanes in both, every other claim settles at one live and one
+    dead member, and `2402` has one live lane throughout both. KCP carries 9.4M
+    frames through that same one lane; the UDP carrier's run offers none, so the
+    difference is upstream of the tunnel — the visitor's packets for `2402`
+    never reach the tool's device on that build. The remaining suspect in reach
+    is the harness: `wait_listener` dials the tool's exposed address before the
+    iperf test, and the sink behind it is a one-shot `iperf3 -s -1`, so a probe
+    connection can consume the only test the sink will serve. That is a method
+    question, and it is read from `bench/src/bench/` next, not guessed at.
   - That supersedes the "half-dead lane" reading of the previous round: the
     five frames seen then were one run's partial placement, not the mechanism.
     The `written_bytes`/`write_errors` counters stay (they are what showed the
