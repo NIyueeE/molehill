@@ -136,6 +136,17 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **The lost-lane lead is dead (2026-10-24).** With both stats on
+    `MOLEHILL_QUIC_STATS` and `MOLEHILL_L3_STATS`, `bulk-n` shows three
+    connections carrying >1k packets on each side and three hub lanes carrying
+    frames: the counts match, so no lane is silently down. It is a **download**
+    (server sends 1.47M packets per lane, client sends 18k), and each lane runs
+    at 1.9 Gbit/s against the 2.82 single-stream ceiling — a 33 % concurrency
+    loss that both carriers pay, ours with a higher per-packet cost underneath.
+    Two knobs were tried against this and rejected on measurement: an MTU of
+    1472 (ceiling 2680 against 2817 at 1452) and `packet_threshold(2)`
+    (`bulk-n` 5.86 -> 5.25/3.43, `bulk-1` 3.198 -> 2.71/2.81). Neither is the
+    missing 33 %, and the conservative value of each stays.
   - **A probe that will not run, and what it suggests (2026-10-24).** An
     in-process version of the many-lane cell (four client endpoints, one
     server endpoint, no hub) never gets its fourth stream: three arrive, the
