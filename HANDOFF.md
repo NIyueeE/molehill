@@ -136,6 +136,27 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **The `cost` failure is upstream of the carrier: the iperf workload's traffic
+    never enters the tunnel at all (2026-10-24).** The same cell on both builds
+    with `MOLEHILL_L3_STATS=1`, counting claim `2402` (the iperf service):
+
+    | | client flows / offered | server offered / forwarded |
+    |---|---|---|
+    | UDP carrier (fails) | **0 / 0** | **0 / 0** |
+    | KCP (passes) | 5 / 133 971 | 9 451 455 / 8 849 274 |
+
+    Zero frames offered on *both* ends means the visitor's device never produced
+    a packet for that service — iperf3 never got a SYN out, or its SYN was
+    dropped before any lane existed for the claim — while the three probe
+    series on the neighbouring claims ran normally throughout. So the `cost`
+    cell is not measuring the carrier's throughput at all on this build: it is
+    measuring a cold-start race between the stage's iperf dial and the claim's
+    first lane, and the 86 s bound expires while iperf3 backs off.
+  - That supersedes the "half-dead lane" reading of the previous round: the
+    five frames seen then were one run's partial placement, not the mechanism.
+    The `written_bytes`/`write_errors` counters stay (they are what showed the
+    difference), and the next step is to watch claim `2402`'s `live=` lane count
+    against the probes' claims from the first second of the stage.
   - **The lane now reports what its pump wrote (2026-10-24).** `LaneCounters`
     gained `written_bytes` (what the pump handed to the carrier, as opposed to
     what the queue accepted) and `write_errors`, printed in the per-member
