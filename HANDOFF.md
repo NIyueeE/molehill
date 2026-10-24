@@ -136,6 +136,15 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **An in-process multi-endpoint probe stalls, and that is suspicious in itself
+    (2026-10-24).** Three lanes, each with its own server socket, one flow each:
+    1.09 MB in 120 s. Three flows each: 2.7 MB in 120 s. The bench carries ten
+    lanes in one process at 5.8 Gbit/s, so the probe is wrong somewhere — but
+    the shape of the failure (nothing flows once more than one endpoint exists,
+    while one endpoint is healthy) is the same one that produced 41 re-dials in
+    the first session. Until it is either reproduced on the bench or explained,
+    it is a lead and not a finding, and the in-process harness is not a number
+    this file will quote.
   - **The controller is ruled out a second time, at the current best (2026-10-24).**
     Re-running the fixed-window pipe (12 MiB, no loss response) on top of the
     MTU and 128-datagram-burst changes gives `bulk-1` 3.10/2.89 and `bulk-n`
