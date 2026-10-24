@@ -152,6 +152,17 @@
     cell is not measuring the carrier's throughput at all on this build: it is
     measuring a cold-start race between the stage's iperf dial and the claim's
     first lane, and the 86 s bound expires while iperf3 backs off.
+  - **Both carriers make the same lane moves, so the difference is whether the
+    packets ever reach the hub (2026-10-24).** Per run: identical lends (5 in
+    both, each claim giving an idle lane to `2401`), and every retired lane for
+    `2402` reads `offered=0` in both. Over TCP the surviving member then carries
+    121 669 frames and 8.65M injected; over UDP both members read zero. The UDP
+    pool dialled 22 lanes overall (two of them for `2401`) and never one for
+    `2402`, which is consistent with the allocator's rule — a claim dials when
+    it has more *placed flows* than lanes, and no flow is ever placed. The one
+    measurement that would close it is a count of packets the device reader saw
+    *before* placement, which is five lines in the hub and the next round's
+    first change.
   - **The `cost` cell passes over the TCP carrier on the same binary (2026-10-24).**
     Run with no `MOLEHILL_DATA_CARRIER` on the very build that fails over UDP:
     83 s per round, 0.1466-0.1555 s/Gbit, three rounds. So the cell *is*
