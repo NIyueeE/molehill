@@ -85,6 +85,41 @@
 
 ## Where this stands
 
+- **VERDICT (2026-10-24): the UDP carrier cannot beat KCP on this bench, and
+  the flip is not justified.** After fifteen rounds and ~fifteen measured
+  levers the numbers are stable enough to decide on:
+
+  | cell | UDP carrier | KCP | per lane | ratio |
+  |---|---|---|---|---|
+  | `bulk-1` (loss1) | 3.198 Gbit/s | 3.26 | 3.20 / 3.26 | **0.98** |
+  | `bulk-pair` (loss1) | 4.11 | 6.15 | 2.06 / 3.08 | 0.67 |
+  | `bulk-n` (loss1) | 5.86 | 12.00 | 1.95 / 4.00 | 0.49 |
+  | `clean` (`cost`) | 7.7 | 12.81 | 0.77 / 1.28 | 0.60 |
+
+  The decisive number is the carrier's own ceiling: **2.82-2.87 Gbit/s on one
+  stream**, measured in-process over loopback with no loss (`a_stream_carries_at_full_speed`),
+  which is where the bench's one-lane cell also lands (3.198). `bulk-n` needs
+  **4.0 Gbit/s per lane** to match KCP's 12.0, and three lanes at the ceiling
+  would give 9.59 — **0.80 of KCP** — before any multi-flow penalty. So per-flow
+  streams (the last structural lever considered) cannot reach the objective
+  either, and the remaining deficit is quinn-proto's per-packet cost, not a
+  knob: the levers already measured and rejected are windows and initial
+  window, BBR against a fixed-window pipe (twice), MTU 1200/1452/1472, ACK
+  frequency, packet threshold, transmit batch 8/32/40/64, receive burst, both
+  zero-copy directions, buffer recycling, and a four-thread runtime.
+
+  So the plan's own rule applies: **a failed cell stops the flip — KCP stays,
+  nothing is deleted, and the dialect stays 5.2.** The UDP carrier remains what
+  it is today: an option behind `--features quic`, at parity on one stream and
+  behind on the rest. What would change the answer is not another tuning pass
+  but a cheaper per-packet data path than this engine offers — our own ARQ in
+  KCP's shape, or an engine that does not parse and build a full packet per
+  1 452 bytes — which is a different project and needs the maintainer's call.
+
+  The `cost` cell is a separate, real defect (same binary carries it over TCP
+  lanes and not over UDP ones) and is recorded below with everything measured
+  about it; it does not change this verdict, because `bulk-n` blocks a flip on
+  its own.
 - **Pass-through, bigger windows and a 32-datagram batch moved the carrier
   2-3x (2026-10-24).** The plaintext path no longer copies each byte twice (a
   framed buffer on the way out, `raw`/`plain` on the way in); the selector byte
