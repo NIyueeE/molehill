@@ -1693,4 +1693,119 @@ mod tests {
             .expect("the read succeeds");
         assert!(seen.iter().all(|byte| *byte == 0xA5));
     }
+
+    /// The carrier's own ceiling: one stream, one bulk writer, loopback, no
+    /// relay and no loss.
+    ///
+    /// The bench's numbers are per-byte *path* numbers, hub and TUN included;
+    /// this is the carrier alone, so a per-byte cost that shows up here is the
+    /// carrier's and one that does not is the L3 path's.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one measurement: harness, transfer and report belong together"
+    )]
+    #[ignore = "measures the carrier's own throughput; run with --ignored --nocapture"]
+    #[tokio::test]
+    async fn a_stream_carries_at_full_speed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = 256 * 1024 * 1024;
+        const CHUNK: usize = 64 * 1024;
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let mut server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        server_config.transport_config(crate::transport::quic::params::transport_config());
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(
+            NoiseKeys::from_config(&client_cfg).expect("client keys"),
+        )));
+        config.transport_config(crate::transport::quic::params::transport_config());
+        let mut channel = client
+            .connect_stream(server_addr, config, false)
+            .await
+            .expect("the direct channel comes up");
+
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn(async move {
+            let buf = vec![0x5Au8; CHUNK];
+            for _ in 0..TOTAL / CHUNK {
+                channel.write_all(&buf).await.expect("the write");
+            }
+            channel.shutdown().await.expect("the shutdown");
+        });
+
+        let mut served = tokio::time::timeout(Duration::from_secs(10), streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let got = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&got);
+        let read = tokio::time::timeout(Duration::from_secs(30), async move {
+            let mut seen = vec![0u8; CHUNK];
+            while counter.load(Ordering::Relaxed) < TOTAL {
+                let read = served.read(&mut seen).await.expect("the read");
+                if read == 0 {
+                    break;
+                }
+                counter.fetch_add(read, Ordering::Relaxed);
+            }
+        })
+        .await;
+        let elapsed = started.elapsed();
+        let received = got.load(Ordering::Relaxed);
+        let mbit = u128::try_from(received).expect("a byte count") * 8 / elapsed.as_micros().max(1);
+        println!(
+            "carrier ceiling: {received} of {TOTAL} bytes in {elapsed:?} = {mbit} Mbit/s, read finished={}",
+            read.is_ok()
+        );
+        writer.abort();
+        assert!(read.is_ok(), "the transfer did not finish");
+    }
 }

@@ -129,6 +129,19 @@
     writes, so the difference is inside the carrier's own datagram path and
     needs a profile (`perf` on the tool's processes during a `clean` run),
     not another window.
+  - **The carrier's own ceiling is 2.39 Gbit/s per stream, so the bench cells
+    are carrier-bound, not path-bound (2026-10-24).** A new ignored test
+    (`transport::quic::socket::tests::a_stream_carries_at_full_speed`) moves
+    256 MiB through one stream over loopback, no relay and no loss: 268 MB in
+    0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
+    gives for `bulk-1` (2.7), which rules out the path, the windows and the
+    controller and puts the cost inside the carrier's own datagram path.
+  - **The next lever is the send path's ownership, not a knob**: quinn copies
+    each write into its stream buffer and again into the packet it builds,
+    because our seam is `AsyncWrite` and hands it a `&[u8]`. The hub already
+    builds `Bytes` batches, and KCP's carrier takes them by reference
+    (`send_owned`); a `send_owned`-shaped method on the carrier seam would let
+    the UDP carrier take the same `Bytes` and drop one of the two copies.
   - **Where the rest has to come from**: per-byte cost is still 1.5x KCP's
     (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse than
     KCP's (three lanes give us 1.9x where KCP gets 3.7x), which points at the
