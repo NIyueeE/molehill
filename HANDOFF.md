@@ -136,6 +136,21 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **The controller is ruled out a second time, at the current best (2026-10-24).**
+    Re-running the fixed-window pipe (12 MiB, no loss response) on top of the
+    MTU and 128-datagram-burst changes gives `bulk-1` 3.10/2.89 and `bulk-n`
+    5.76/5.18 against BBR's 3.198 and 5.815/5.864: no difference outside the
+    noise, reverted again. Also measured this round: the loopback ceiling on a
+    four-thread runtime is 2866 Mbit/s against 2817 on one thread, so a single
+    stream is not serialised by the runtime — its ceiling is per-packet CPU in
+    the engine, and `perf` is not installed in this image.
+  - **What is left is the flows-per-lane question.** One flow on one lane
+    reaches 3.198 Gbit/s at 1 % loss (KCP 3.26, parity); eight flows on three
+    lanes reach 5.86 (KCP 12.0). Since the lane count is the same, the deficit
+    is in carrying *several flows* per lane: KCP holds 3.6 Gbit/s per lane with
+    8/3 flows on it, this carrier 1.95. The next round measures it in-process
+    with one server socket per lane (the earlier probe lost a stream because
+    four clients shared one server endpoint).
   - **The lost-lane lead is dead (2026-10-24).** With both stats on
     `MOLEHILL_QUIC_STATS` and `MOLEHILL_L3_STATS`, `bulk-n` shows three
     connections carrying >1k packets on each side and three hub lanes carrying
