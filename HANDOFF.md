@@ -113,6 +113,11 @@
     `bulk-n` 4.19-4.99, `bulk-1` 2.62, clean 0.937-0.952 s/Gbit — all inside
     the noise of the numbers above. Kept because it removes work and costs
     none, but the remaining gap is **not** in the copies.
+  - **Two claims scale 1.6x, where KCP's scale 1.9x**: `bulk-pair` reads
+    4.04-4.17 Gbit/s against KCP's 6.07-6.24, so the per-claim path is 1.5x
+    behind on its own and the eight-stream cell (3-4 flows on a lane) loses
+    more than that again — multiplexing several flows onto one ordered stream
+    is where the rest of the gap lives.
   - **Where the rest has to come from**: per-byte cost is still 1.5x KCP's
     (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse than
     KCP's (three lanes give us 1.9x where KCP gets 3.7x), which points at the
