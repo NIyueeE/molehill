@@ -356,9 +356,11 @@ impl AsyncWrite for QuicStream {
             let mut written = 0;
             while written < buf.len() {
                 match connection.send_stream(this.id).write(&buf[written..]) {
-                    Ok(0) => break,
+                    // Nothing taken: no room, and the engine will report the
+                    // stream writable again — the same stop as an explicit
+                    // `Blocked`.
+                    Ok(0) | Err(WriteError::Blocked) => break,
                     Ok(taken) => written += taken,
-                    Err(WriteError::Blocked) => break,
                     Err(WriteError::Stopped(code)) => return Poll::Ready(Err(reset(code))),
                     Err(WriteError::ClosedStream) => return Poll::Ready(Err(gone())),
                 }
@@ -497,18 +499,67 @@ fn flush(connection: &mut Connection, id: StreamId, pending: &mut Vec<u8>) -> io
     while !pending.is_empty() {
         match connection.send_stream(id).write(pending) {
             // Nothing taken and no refusal: the engine has no room it will
-            // report, so stop rather than spin.
-            Ok(0) => break,
+            // report, so stop rather than spin — the same stop as `Blocked`.
+            Ok(0) | Err(WriteError::Blocked) => break,
             Ok(written) => {
                 pending.drain(..written);
                 total += written;
             }
-            Err(WriteError::Blocked) => break,
             Err(WriteError::Stopped(code)) => return Err(reset(code)),
             Err(WriteError::ClosedStream) => return Err(gone()),
         }
     }
     Ok(total)
+}
+
+impl QuicStream {
+    /// Read a plaintext stream straight into the caller's buffer.
+    ///
+    /// The de-framing path exists for the record layer and the selector byte;
+    /// an L3 lane past its selector byte needs neither, and copying through
+    /// `raw` and `plain` first would cost a byte per byte on a carrier whose
+    /// whole job is to move them.
+    fn poll_read_plain(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let mut connection = self.shared.connection.lock();
+        let mut eof = false;
+        {
+            let mut recv = connection.recv_stream(self.id);
+            let mut chunks = match recv.read(true) {
+                Ok(chunks) => chunks,
+                Err(ReadableError::IllegalOrderedRead | ReadableError::ClosedStream) => {
+                    return Poll::Ready(Err(gone()));
+                }
+            };
+            loop {
+                let room = buf.remaining();
+                if room == 0 {
+                    break;
+                }
+                match chunks.next(room) {
+                    Ok(Some(chunk)) => {
+                        let take = chunk.bytes.len().min(buf.remaining());
+                        buf.put_slice(&chunk.bytes[..take]);
+                    }
+                    Ok(None) => {
+                        eof = true;
+                        break;
+                    }
+                    Err(ReadError::Blocked) => break,
+                    Err(ReadError::Reset(code)) => return Poll::Ready(Err(reset(code))),
+                }
+            }
+        }
+        if buf.filled().len() == before && !eof {
+            self.shared.park(self.id, Wait::Read, cx.waker());
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl AsyncRead for QuicStream {
@@ -529,47 +580,9 @@ impl AsyncRead for QuicStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Plaintext with nothing buffered: read straight into the caller's
-        // buffer. The slow path below exists to de-frame and decrypt, and an L3
-        // lane past its selector byte needs neither — it is the hot path, and
-        // copying through raw and plain first costs a byte per byte on a
-        // carrier whose whole job is to move them.
+        // Plaintext with nothing buffered is the hot path and takes it.
         if this.read.key.is_none() && !this.read.selector_pending && this.read.raw.is_empty() {
-            let before = buf.filled().len();
-            let mut connection = this.shared.connection.lock();
-            let mut eof = false;
-            {
-                let mut recv = connection.recv_stream(this.id);
-                let mut chunks = match recv.read(true) {
-                    Ok(chunks) => chunks,
-                    Err(ReadableError::IllegalOrderedRead | ReadableError::ClosedStream) => {
-                        return Poll::Ready(Err(gone()));
-                    }
-                };
-                loop {
-                    let room = buf.remaining();
-                    if room == 0 {
-                        break;
-                    }
-                    match chunks.next(room) {
-                        Ok(Some(chunk)) => {
-                            let take = chunk.bytes.len().min(buf.remaining());
-                            buf.put_slice(&chunk.bytes[..take]);
-                        }
-                        Ok(None) => {
-                            eof = true;
-                            break;
-                        }
-                        Err(ReadError::Blocked) => break,
-                        Err(ReadError::Reset(code)) => return Poll::Ready(Err(reset(code))),
-                    }
-                }
-            }
-            if buf.filled().len() == before && !eof {
-                this.shared.park(this.id, Wait::Read, cx.waker());
-                return Poll::Pending;
-            }
-            return Poll::Ready(Ok(()));
+            return this.poll_read_plain(cx, buf);
         }
 
         // The connection lock is held until this call has either produced

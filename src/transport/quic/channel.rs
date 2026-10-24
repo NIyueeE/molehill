@@ -26,8 +26,9 @@ use crate::transport::NoiseKeys;
 
 /// One direct data channel: the stream, and the endpoint that carries it.
 pub(crate) struct UdpChannel {
-    /// Kept for the channel's whole life: it owns the socket and its task.
-    _endpoint: Arc<EndpointHandle>,
+    /// Kept for the channel's whole life: it owns the socket and its task,
+    /// and it is what the drop asks for the close.
+    endpoint: Arc<EndpointHandle>,
     /// The connection this channel *is*, so dropping the channel can tell the
     /// peer rather than leave it to the idle timeout.
     connection: ConnectionHandle,
@@ -43,7 +44,7 @@ impl Drop for UdpChannel {
     /// away from — the peer forwarded packets into it for a minute and every
     /// one of them was lost.
     fn drop(&mut self) {
-        self._endpoint.close(self.connection);
+        self.endpoint.close(self.connection);
     }
 }
 
@@ -68,7 +69,7 @@ pub(crate) async fn connect(
     let (connection, stream) = endpoint.connect_channel(remote, config, encrypt).await?;
     spawn_stats_reporter(&stream);
     Ok(UdpChannel {
-        _endpoint: endpoint,
+        endpoint,
         connection,
         stream,
     })
