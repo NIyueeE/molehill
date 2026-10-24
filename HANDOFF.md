@@ -85,9 +85,81 @@
 
 ## Where this stands
 
-- **VERDICT (2026-10-24): the UDP carrier cannot beat KCP on this bench, and
-  the flip is not justified.** After fifteen rounds and ~fifteen measured
-  levers the numbers are stable enough to decide on:
+- **VERDICT, corrected (2026-10-24 evening): the UDP carrier beats KCP on the
+  path a UDP fallback exists for, is level with it on a clean bulk path, and
+  loses to it on the mixed and interactive cells; it loses to TCP
+  everywhere, so the flip stays blocked.** The verdict below this block called
+  the **TCP carrier** "KCP": `molehill-kcp` was a default-features build run
+  with no forced carrier, and `first_carrier()` is `Carrier::Tcp`, so those
+  runs drove yamux over TCP — their own `l3-stats` line says `carrier=tcp`
+  and their per-byte cost is TCP's (0.15-0.23 s/Gbit, not KCP's 0.6-0.9).
+  Re-measured as an A/B on one commit (`7a59573`), two builds, the carriers
+  forced apart with `MOLEHILL_DATA_CARRIER=kcp` — real KCP on the default
+  build, this carrier on a `quic` build — rounds interleaved, `l3` arm,
+  `tunnel` leg:
+
+  | cell | UDP carrier | KCP | TCP carrier | UDP/KCP |
+  |---|---|---|---|---|
+  | `bulk-1` `loss1` | 2.90 Gbit/s | 1.26 | 3.26 | **2.3x** |
+  | `bulk-n` `loss1` (8) | 5.23 (1 of 3 rounds failed) | 1.35 | 11.99 | **3.9x** |
+  | `bulk-pair` `loss1` | 4.81 (1 of 3) | 0.15 | 6.24 | 32x |
+  | `rr-1` p99 `loss1` | 88.1 ms | 51.5 | — | 0.58x |
+  | `bulk-1` `clean` | 4.92 (A/A twin 4.69) | 5.67 | — | 0.87x |
+  | `bulk-n` `clean` (8) | 8.37 (A/A twin 7.75) | 7.93 | — | 1.06x |
+  | `bulk-pair` `clean` | failed 2 of 2 | 9.43 | — | — |
+  | `rr-1` p99 `clean` | 0.2 ms | 0.1 | — | 0.57x |
+  | `cost` `clean` | wedged 2 of 2 (best ever 7.42 at 0.700 s/Gbit) | 12.07 at 0.891 | 12.31-12.81 at 0.624 | — |
+
+  - **Where a UDP carrier is used, this one is two to four times KCP.**
+    KCP is the *fallback*: it carries an endpoint whose path refuses TCP, and
+    on such a path (1 % loss, 10 ms) it collapses to 1.3 Gbit/s while this
+    carrier holds 5.2. That is the same KCP weakness `docs/benchmarks.md`
+    recorded on 2026-10-10 (five to six times behind TCP on a lossy leg,
+    `KCP session dead link`): the mechanism measured there is a standing
+    queue that holds acknowledgements past KCP's RTO, and with congestion
+    control off (`nc=1`) nothing keeps that queue short — the loss it causes
+    is the loss it then retransmits. This carrier's BBR paces, so 1 % loss
+    costs it rate rather than control.
+  - **On a clean path KCP wins one stream and the two are level on eight.**
+    `bulk-1` 4.92 against 5.67 (KCP by 13 %, and its twin's 4.69 does not
+    close that), `bulk-n` 8.37 against 7.93 — a tie inside this run's own A/A
+    spread (7.75-8.37). `bulk-pair` and the mixed `cost` cell are not level:
+    KCP carries them at 9.43 and 12.07 Gbit/s, this carrier never brings the
+    second claim up and wedges the cell. Interactive p99 goes to KCP on both
+    paths (0.1 against 0.2 ms clean, 51 against 88 ms at `loss1`): QUIC
+    acknowledges on a timer, tens of milliseconds per round trip, and a
+    request/response probe reads exactly that.
+  - **Per byte the carrier is cheaper, not dearer.** Clean `bulk-n` costs
+    0.694 s/Gbit against KCP's 0.759, at 55 against 127 MiB RSS. The "1.5x
+    KCP's per-byte cost" this file quoted was 0.93 against the **TCP**
+    carrier's 0.62; today it reads 0.66-0.69 against TCP's 0.62-0.64 (3-11 %
+    dearer per byte than TCP, cheaper than KCP).
+  - **Two defects are the carrier's own and gate adoption whatever the
+    table says**: the `cost` cell wedges to its 106 s harness bound (2 of 2
+    clean rounds), and `bulk-pair`'s second claim never establishes (port
+    2403, 2 of 3 `loss1` rounds and 2 of 2 clean). KCP does neither, and the
+    same claim-failure shape is the one the pool showed in its first session
+    (the 41 re-dials).
+  - **Against TCP nothing changed**: 7.4 against 12.3-12.8 on the clean
+    `cost` cell, 5.2 against 12.0 on `bulk-n` at `loss1` (1.1-2.3x on the
+    cells a flip would move). Its single-stream
+    ceiling is 2.82-2.87 Gbit/s in-process, and TCP's in-kernel, batched path
+    is simply above that.
+
+  So the plan's two bundled decisions separate: **replacing KCP with this
+  carrier is supported** — 2.3-3.9x on the lossy path a fallback exists for,
+  level on clean bulk, cheaper per byte — **once the two defects are fixed**;
+  **flipping the first carrier to UDP is not** (TCP is 1.6-2.3x ahead on the
+  cells a flip would move). Deleting KCP does not follow from the flip
+  failing: the flip is compared against TCP, the replacement against KCP.
+  That call is the maintainer's. The published form of this comparison — the
+  table with its method — belongs on `docs/benchmarks.md` in the commit that
+  makes the decision, not before it.
+
+- **SUPERSEDED (2026-10-24 morning; read the corrected verdict above — its
+  "KCP" column is the TCP carrier): the UDP carrier cannot beat KCP on this
+  bench, and the flip is not justified.** After fifteen rounds and ~fifteen
+  measured levers the numbers are stable enough to decide on:
 
   | cell | UDP carrier | KCP | per lane | ratio |
   |---|---|---|---|---|
@@ -126,7 +198,7 @@
   is the only thing that still needs a buffer. With the same commit's window
   changes the same cells now read:
 
-  | cell | UDP carrier | KCP (same commit) |
+  | cell | UDP carrier | TCP carrier (same commit) |
   |---|---|---|
   | `bulk-1` (`loss1`) | **2.42-2.61** Gbit/s | 3.26-3.45 |
   | `bulk-n` (`loss1`, 8 streams) | **4.686** | 11.99-12.38 |
@@ -134,9 +206,10 @@
 
   The eight-stream cell moved most (2.57 -> 4.686), which says its earlier gap
   was per-byte cost rather than bytes in flight: engine plus adapter were
-  burning 2.5 cores to move 2.7 Gbit/s where KCP spends the same cores on 12.
+  burning 2.5 cores to move 2.7 Gbit/s where the TCP carrier spends the same
+  cores on 12.
   What is left is 1.3x on one stream, 2.6x on eight and 2.2x on a clean path,
-  with per-byte cost now 0.934 against KCP's 0.624.
+  with per-byte cost now 0.934 against the TCP carrier's 0.624.
   - **A 64-datagram transmit batch is a trap**: the cells fell to
     0.80-0.83 Gbit/s (a 76 KiB `UDP_SEGMENT` message is not something this path
     takes), so 32 stays. 8 MiB and 32 MiB of socket buffer measure the same at
@@ -148,8 +221,9 @@
     `bulk-n` 4.19-4.99, `bulk-1` 2.62, clean 0.937-0.952 s/Gbit — all inside
     the noise of the numbers above. Kept because it removes work and costs
     none, but the remaining gap is **not** in the copies.
-  - **Two claims scale 1.6x, where KCP's scale 1.9x**: `bulk-pair` reads
-    4.04-4.17 Gbit/s against KCP's 6.07-6.24, so the per-claim path is 1.5x
+  - **Two claims scale 1.6x, where the TCP carrier's scale 1.9x**: `bulk-pair`
+    reads 4.04-4.17 Gbit/s against the TCP carrier's 6.07-6.24, so the per-claim
+    path is 1.5x
     behind on its own and the eight-stream cell (3-4 flows on a lane) loses
     more than that again — multiplexing several flows onto one ordered stream
     is where the rest of the gap lives.
@@ -160,7 +234,8 @@
     was reverted rather than kept. An 8 MiB initial window instead of 2 is
     actively harmful — `bulk-n` stops finishing at all (26 s harness bound)
     — so 2 MiB is at the edge of what this path absorbs. What is left is not
-    a knob: per-byte cost is 1.5x KCP's with the same hub and the same TUN
+    a knob: per-byte cost is 1.5x the TCP carrier's with the same hub and the
+    same TUN
     writes, so the difference is inside the carrier's own datagram path and
     needs a profile (`perf` on the tool's processes during a `clean` run),
     not another window.
@@ -299,8 +374,9 @@
     stream is not serialised by the runtime — its ceiling is per-packet CPU in
     the engine, and `perf` is not installed in this image.
   - **What is left is the flows-per-lane question.** One flow on one lane
-    reaches 3.198 Gbit/s at 1 % loss (KCP 3.26, parity); eight flows on three
-    lanes reach 5.86 (KCP 12.0). Since the lane count is the same, the deficit
+    reaches 3.198 Gbit/s at 1 % loss (TCP carrier 3.26, parity); eight flows on
+    three lanes reach 5.86 (TCP carrier 12.0). Since the lane count is the same,
+    the deficit
     is in carrying *several flows* per lane: KCP holds 3.6 Gbit/s per lane with
     8/3 flows on it, this carrier 1.95. The next round measures it in-process
     with one server socket per lane (the earlier probe lost a stream because
@@ -326,9 +402,10 @@
     confirms it on the bench instead: `MOLEHILL_QUIC_STATS=1` on `bulk-n`,
     count how many connections carry data against how many lanes the hub
     reports.
-  - **KCP's eight-stream cell uses the same three lanes and gets 3.6 Gbit/s
-    per lane (2026-10-24).** `bulk-n` with `MOLEHILL_L3_STATS=1` on a KCP-only
-    build: 10.73-10.86 Gbit/s over three members (2.92M + 2.80M + 2.02M
+  - **The TCP carrier's eight-stream cell uses the same three lanes and gets
+    3.6 Gbit/s per lane (2026-10-24).** `bulk-n` with `MOLEHILL_L3_STATS=1` on a
+    default build with no forced carrier (so TCP — its own stats line says
+    `carrier=tcp`): 10.73-10.86 Gbit/s over three members (2.92M + 2.80M + 2.02M
     frames), i.e. **3.6 Gbit/s per lane** against this carrier's 2.03 — and our
     own single-lane ceiling is 2.82, so the deficit is two things: per-lane
     cost (1.28x, the carrier's packet path) and a 28 % loss of per-lane
@@ -346,8 +423,9 @@
     wake; at these rates a wake carries more than that, so the endpoint was
     paying a timer sweep, a transmit sweep and an event pass every 32 packets.
     128 moves the loopback ceiling 2726 -> 2817 Mbit/s and the cells to
-    `bulk-1` 3.198 (KCP 3.26 — parity inside this run's noise), `bulk-n` 6.099,
-    and clean 0.70 s/Gbit (7.7 Gbit/s, KCP 12.81 at 0.624). Per byte the clean
+    `bulk-1` 3.198 (TCP carrier 3.26 — parity inside this run's noise),
+    `bulk-n` 6.099, and clean 0.70 s/Gbit (7.7 Gbit/s, TCP carrier 12.81 at
+    0.624). Per byte the clean
     path is now within 13 % of KCP; the remaining clean gap is that KCP spreads
     over 8 cores where this build uses 5.4.
   - **40 datagrams per transmit measured the same as 32** (2809 against 2817),
@@ -365,9 +443,9 @@
     builds `Bytes` batches, and KCP's carrier takes them by reference
     (`send_owned`); a `send_owned`-shaped method on the carrier seam would let
     the UDP carrier take the same `Bytes` and drop one of the two copies.
-  - **Where the rest has to come from**: per-byte cost is still 1.5x KCP's
-    (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse than
-    KCP's (three lanes give us 1.9x where KCP gets 3.7x), which points at the
+  - **Where the rest has to come from**: per-byte cost is still 1.5x the TCP
+    carrier's (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse
+    than it (three lanes give us 1.9x where it gets 3.7x), which points at the
     per-connection receive task — one core each, no batching across lanes —
     rather than at the socket path. Profiling the receive side is the next
     step, not another knob.
@@ -399,12 +477,14 @@
   (2026-10-23).** Three measurements on the `l3` arm at `loss1`
   (`--condition-leg tunnel`), forced to the UDP carrier
   (`MOLEHILL_DATA_CARRIER=kcp` on a `quic` build):
-  **Corrected 2026-10-24: KCP was measured live on the same cells, and the
-  carrier is behind it everywhere — the "0.41 Gbit/s" this file used to quote
-  was a stale figure from an older code state.** One KCP-only build of the same
-  commit, same arm, same conditions:
+  **Superseded 2026-10-24 evening: the column this block called "KCP" is the
+  TCP carrier (a default-features build with no forced carrier). The live KCP
+  comparison, forced apart on one commit, is the verdict table at the top of
+  this section; the "0.41 Gbit/s" this file used to quote was a stale figure
+  from an older code state.** One default build of the same commit, same arm,
+  same conditions — TCP unless the switch says otherwise:
 
-  | cell (`loss1`) | UDP carrier | KCP | ratio |
+  | cell (`loss1`) | UDP carrier | TCP carrier | ratio |
   |---|---|---|---|
   | `bulk-1` | 0.454 Gbit/s (1.049 s/Gbit, 0.57 cores) | **3.26-3.45** (0.146, 0.41) | 7.2x |
   | `bulk-n` (8) | 2.73-2.78 (0.985, 2.49) | **11.99-12.38** (0.232, 2.51) | 4.4x |
@@ -413,7 +493,8 @@
 
   **Updated 2026-10-24, after the controller's initial window, the transmit
   batch and the flow-control windows were raised: `bulk-1` reads **2.405
-  Gbit/s** (from 0.454; KCP 3.26) and `bulk-n` **2.57** (KCP 12.0).** The
+  Gbit/s** (from 0.454; TCP carrier 3.26) and `bulk-n` **2.57** (TCP carrier
+  12.0).** The
   single-stream cell was a window problem end to end — ten segments of initial
   window, 8 datagrams per paced wake and an 8 MiB stream window against a 7.5 MB
   bandwidth-delay product kept both ends idle — and the eight-stream cell did
