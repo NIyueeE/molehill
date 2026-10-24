@@ -85,6 +85,31 @@
 
 ## Where this stands
 
+- **Pass-through, bigger windows and a 32-datagram batch moved the carrier
+  2-3x (2026-10-24).** The plaintext path no longer copies each byte twice (a
+  framed buffer on the way out, `raw`/`plain` on the way in); the selector byte
+  is the only thing that still needs a buffer. With the same commit's window
+  changes the same cells now read:
+
+  | cell | UDP carrier | KCP (same commit) |
+  |---|---|---|
+  | `bulk-1` (`loss1`) | **2.42-2.61** Gbit/s | 3.26-3.45 |
+  | `bulk-n` (`loss1`, 8 streams) | **4.686** | 11.99-12.38 |
+  | `cost` (`clean`) | **5.849** at 0.934 s/Gbit | 12.81 at 0.624 |
+
+  The eight-stream cell moved most (2.57 -> 4.686), which says its earlier gap
+  was per-byte cost rather than bytes in flight: engine plus adapter were
+  burning 2.5 cores to move 2.7 Gbit/s where KCP spends the same cores on 12.
+  What is left is 1.3x on one stream, 2.6x on eight and 2.2x on a clean path,
+  with per-byte cost now 0.934 against KCP's 0.624.
+  - **A 64-datagram transmit batch is a trap**: the cells fell to
+    0.80-0.83 Gbit/s (a 76 KiB `UDP_SEGMENT` message is not something this path
+    takes), so 32 stays. 8 MiB and 32 MiB of socket buffer measure the same at
+    these rates; 32 MiB stays because it is what KCP asks for.
+  - **Where the rest has to come from**: one more copy remains — the driver
+    copies every transmit into a fresh `Vec` before handing it to the sender
+    task — and each connection's receive path is a single task, where KCP's
+    equivalent hands the app's own buffer over with no copy at all.
 - **The write path could strand a frame, and never told the engine it was
   blocked (2026-10-24).** Two defects in `transport/quic/conn.rs`, both proved by
   one test: `poll_write` handed the engine a whole framed chunk and reported the
