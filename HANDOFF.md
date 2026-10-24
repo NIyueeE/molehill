@@ -125,6 +125,15 @@
   | `cost` | 86 s timeout | **4.36** (0.148, 0.67) | — |
   | `clean` `cost` (control) | 4.85 (1.072, 5.12) | **12.81** (0.624, 8.0) | 2.6x |
 
+  **Updated 2026-10-24, after the controller's initial window, the transmit
+  batch and the flow-control windows were raised: `bulk-1` reads **2.405
+  Gbit/s** (from 0.454; KCP 3.26) and `bulk-n` **2.57** (KCP 12.0).** The
+  single-stream cell was a window problem end to end — ten segments of initial
+  window, 8 datagrams per paced wake and an 8 MiB stream window against a 7.5 MB
+  bandwidth-delay product kept both ends idle — and the eight-stream cell did
+  not move with the same change, so its gap is somewhere else (per-stream
+  fairness across eight connections, or the hub's batch schedule) and is the
+  next lever.
   Two facts fall out of the pairs. The loss1 gap is **not CPU** — 0.454 Gbit/s
   costs 0.57 cores where KCP's 3.26 costs 0.41 — it is bytes in flight: KCP holds
   a bandwidth-delay product (8.5 MB at 4 Gbit/s and a 20 ms leg, inside its
