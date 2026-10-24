@@ -58,6 +58,17 @@ pub(crate) fn transport_config() -> Arc<TransportConfig> {
         // path gets: it is safe under a 1500-byte link MTU, which is what the
         // bench and every tunnel this carrier rides on carries.
         .initial_mtu(1452)
+        // Ask the peer to acknowledge *sooner*: every ack-eliciting packet, and
+        // within a millisecond rather than its own 25 ms. The sender's window
+        // grows on the ACK, and on a 10 ms path a 25 ms ACK delay is two rounds
+        // with no feedback. (The opposite direction — fewer ACKs — measured
+        // 2817 -> 2561 Mbit/s on the ceiling; this is the untried half.)
+        .ack_frequency_config(Some({
+            let mut acks = quinn_proto::AckFrequencyConfig::default();
+            acks.ack_eliciting_threshold(VarInt::from_u32(0))
+                .max_ack_delay(Some(std::time::Duration::from_millis(1)));
+            acks
+        }))
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
         .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
         .send_window(u64::from(CONNECTION_WINDOW))
