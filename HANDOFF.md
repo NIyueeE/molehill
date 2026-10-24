@@ -152,6 +152,21 @@
     cell is not measuring the carrier's throughput at all on this build: it is
     measuring a cold-start race between the stage's iperf dial and the claim's
     first lane, and the 86 s bound expires while iperf3 backs off.
+  - **The `cost` cell passes over the TCP carrier on the same binary (2026-10-24).**
+    Run with no `MOLEHILL_DATA_CARRIER` on the very build that fails over UDP:
+    83 s per round, 0.1466-0.1555 s/Gbit, three rounds. So the cell *is*
+    measurable, and the failure is carrier-specific after all — this supersedes
+    the "upstream of the tunnel" reading. What differs, from the same lane
+    counters: over TCP claim `2402` has **two live members** and carries
+    (offered 121 669, injected 8.65M); over UDP it has **one live and one dead**
+    member and offers nothing. Also: `wait_listener` only inspects listening
+    sockets (`ss -Htln`), so the one-shot sink is not being consumed by it.
+  - **So the two UDP-lane symptoms seen in this cell are the same defect**: a
+    lane that is marked dead and never replaced inside the stage, and a lane
+    that accepts frames and delivers none. Both leave a claim unable to carry
+    while its neighbours are healthy. The next step is the client's lane
+    lifetime over the UDP carrier — every dial, retirement and re-dial for claim
+    `2402` in one failing run, next to the same lines from the TCP run.
   - **Lane starvation is not the cause either (2026-10-24).** The per-second lane
     picture is identical in the failing and the passing run: claim `2401` grows
     to 6-9 live lanes in both, every other claim settles at one live and one
