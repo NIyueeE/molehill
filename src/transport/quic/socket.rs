@@ -296,6 +296,29 @@ fn tune_socket_buffers(socket: &UdpSocket) {
     }
 }
 
+/// Ask the kernel to hand a run of segments back in one `recvmsg`.
+///
+/// The send path already puts up to 32 datagrams on the wire per `sendmsg`
+/// (`UDP_SEGMENT`); without this the receive side pays one syscall per
+/// datagram, which on a 4.9 Gbit/s lane is 422 000 a second. With GRO the
+/// kernel coalesces the run and the segment size arrives in a control message,
+/// so the same bytes cost one call — the engine still takes one datagram per
+/// `handle`, because that is its API.
+///
+/// Best effort: a kernel without `UDP_GRO` keeps the per-datagram path, and
+/// the receiver cannot tell the difference beyond the syscall count.
+fn enable_gro(socket: &UdpSocket) {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::sys::socket::{setsockopt, sockopt::UdpGroSegment};
+        if let Err(error) = setsockopt(socket, UdpGroSegment, &true) {
+            tracing::debug!(%error, "the kernel refused UDP GRO; receiving datagram by datagram");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = socket;
+}
+
 /// Spawn the task and return the handle the carrier talks to.
 pub(crate) fn spawn(
     socket: UdpSocket,
@@ -304,6 +327,7 @@ pub(crate) fn spawn(
     channels: Channels,
 ) -> (EndpointHandle, tokio::task::JoinHandle<()>) {
     tune_socket_buffers(&socket);
+    enable_gro(&socket);
     let (commands, inbox) = mpsc::channel(16);
     let live = Arc::new(Mutex::new(HashSet::new()));
     let connected = Arc::new(Mutex::new(HashSet::new()));
@@ -481,39 +505,35 @@ async fn run(
                     }
                 }
             }
-            received = socket.recv_from(&mut buf) => {
-                match received {
-                    Ok((len, remote)) => {
-                        feed_datagram(
-                            &mut driver,
-                            &channels,
-                            &live,
-                            remote,
-                            BytesMut::from(&buf[..len]),
-                        );
-                        // The kernel often holds a burst behind the datagram
-                        // that woke us. Eating it here lets one `drain` — one
-                        // timer, one transmit sweep, one event pass — serve the
-                        // whole burst instead of one per datagram.
-                        for _ in 0..RECV_BURST {
-                            match socket.try_recv_from(&mut buf) {
-                                Ok((len, remote)) => feed_datagram(
-                                    &mut driver,
-                                    &channels,
-                                    &live,
-                                    remote,
-                                    BytesMut::from(&buf[..len]),
-                                ),
-                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                                Err(error) => {
-                                    tracing::debug!(%error, "the socket could not receive");
-                                    break;
+            ready = socket.readable() => {
+                if ready.is_ok() {
+                    // The kernel often holds a burst behind the datagram that
+                    // woke us, and a `UDP_SEGMENT` send arrives as a run even
+                    // with GRO off. Eating the burst here lets one `drain` —
+                    // one timer, one transmit sweep, one event pass — serve it
+                    // all, and with GRO one `recvmsg` takes a whole run.
+                    for _ in 0..RECV_BURST {
+                        let received = socket.try_io(tokio::io::Interest::READABLE, || {
+                            recv_run(&socket, &mut buf)
+                        });
+                        match received {
+                            Ok((len, segment, remote)) => {
+                                for piece in split_run(&buf[..len], segment) {
+                                    feed_datagram(
+                                        &mut driver,
+                                        &channels,
+                                        &live,
+                                        remote,
+                                        BytesMut::from(piece),
+                                    );
                                 }
                             }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => {
+                                tracing::debug!(%error, "the socket could not receive");
+                                break;
+                            }
                         }
-                    }
-                    Err(error) => {
-                        tracing::debug!(%error, "the socket could not receive");
                     }
                 }
             }
@@ -657,6 +677,84 @@ fn drain(
         }
     }
     true
+}
+
+/// One receive call: the bytes, the size of one segment when the kernel
+/// coalesced a run, and the peer.
+///
+/// A GRO run is a `UDP_SEGMENT` send played back: N datagrams of the same size
+/// back to back in one buffer, with the size in a control message. Everything
+/// else — no GRO, a kernel that refused it, a single datagram — arrives with no
+/// control message at all and is split as one piece.
+#[cfg(target_os = "linux")]
+fn recv_run(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<usize>, std::net::SocketAddr)> {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
+
+    let mut iov = [std::io::IoSliceMut::new(buf)];
+    let mut control = nix::cmsg_space!(i32);
+    let message = recvmsg::<SockaddrStorage>(
+        socket.as_raw_fd(),
+        &mut iov,
+        Some(&mut control),
+        MsgFlags::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let remote = message
+        .address
+        .as_ref()
+        .and_then(socket_addr)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no peer address"))?;
+    let mut segment = None;
+    for message in message.cmsgs().map_err(std::io::Error::from)? {
+        if let ControlMessageOwned::UdpGroSegments(size) = message
+            && size > 0
+        {
+            segment = Some(size.unsigned_abs() as usize);
+        }
+    }
+    Ok((message.bytes, segment, remote))
+}
+
+/// One receive call, one datagram at a time: every other platform.
+#[cfg(not(target_os = "linux"))]
+fn recv_run(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, Option<usize>, std::net::SocketAddr)> {
+    socket
+        .try_recv_from(buf)
+        .map(|(len, remote)| (len, None, remote))
+}
+
+/// The peer's address, out of the socket layer's union.
+#[cfg(target_os = "linux")]
+fn socket_addr(address: &nix::sys::socket::SockaddrStorage) -> Option<std::net::SocketAddr> {
+    use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    if let Some(v4) = address.as_sockaddr_in() {
+        return Some(SocketAddr::V4(SocketAddrV4::new(v4.ip(), v4.port())));
+    }
+    address.as_sockaddr_in6().map(|v6| {
+        SocketAddr::V6(SocketAddrV6::new(
+            v6.ip(),
+            v6.port(),
+            v6.flowinfo(),
+            v6.scope_id(),
+        ))
+    })
+}
+
+/// The datagrams a receive call carried.
+fn split_run(buf: &[u8], segment: Option<usize>) -> std::slice::Chunks<'_, u8> {
+    match segment {
+        Some(size) if size > 0 && size < buf.len() => buf.chunks(size),
+        _ => buf.chunks(buf.len().max(1)),
+    }
 }
 
 /// Send one engine transmission.
@@ -1750,6 +1848,27 @@ mod tests {
             .expect("the peer never saw the tail of a frame the engine took in part")
             .expect("the read succeeds");
         assert!(seen.iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// A GRO run splits at the segment size the control message names.
+    #[test]
+    fn a_gro_run_splits_at_the_segment_size() {
+        let run = vec![0u8; 3 * 1400];
+        let sizes =
+            |buf: &[u8], segment| split_run(buf, segment).map(<[u8]>::len).collect::<Vec<_>>();
+
+        assert_eq!(sizes(&run, Some(1400)), vec![1400, 1400, 1400]);
+        // The last segment of a run is short whenever the sender's last write
+        // was: the engine's parser handles the tail as it always has.
+        assert_eq!(
+            sizes(&vec![0u8; 2 * 1400 + 10], Some(1400)),
+            vec![1400, 1400, 10]
+        );
+        // No control message, or one this code cannot use: one datagram.
+        assert_eq!(sizes(&run[..1400], None), vec![1400]);
+        assert_eq!(sizes(&run, Some(0)), vec![run.len()]);
+        assert_eq!(sizes(&run, Some(run.len())), vec![run.len()]);
+        assert_eq!(sizes(&run, Some(run.len() + 1)), vec![run.len()]);
     }
 
     /// A channel that ends says so, instead of leaving the peer's stream open
