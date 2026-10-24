@@ -339,6 +339,39 @@ impl AsyncWrite for QuicStream {
             }
         }
 
+        // Plaintext: hand the engine the caller's bytes instead of copying them
+        // into a frame buffer first. Only the selector byte, while it is still
+        // owed, needs the buffer at all — and what the engine took is exactly
+        // what gets reported, so there is no tail to strand.
+        if this.write.key.is_none() {
+            if this.write.selector_pending {
+                this.write.pending.push(this.selector());
+                let _ = flush(&mut connection, this.id, &mut this.write.pending)?;
+                if !this.write.pending.is_empty() {
+                    this.shared.park(this.id, Wait::Write, cx.waker());
+                    return Poll::Pending;
+                }
+                this.write.selector_pending = false;
+            }
+            let mut written = 0;
+            while written < buf.len() {
+                match connection.send_stream(this.id).write(&buf[written..]) {
+                    Ok(0) => break,
+                    Ok(taken) => written += taken,
+                    Err(WriteError::Blocked) => break,
+                    Err(WriteError::Stopped(code)) => return Poll::Ready(Err(reset(code))),
+                    Err(WriteError::ClosedStream) => return Poll::Ready(Err(gone())),
+                }
+            }
+            if written == 0 && !buf.is_empty() {
+                this.shared.park(this.id, Wait::Write, cx.waker());
+                return Poll::Pending;
+            }
+            drop(connection);
+            this.shared.poke();
+            return Poll::Ready(Ok(written));
+        }
+
         // The selector byte rides with the first payload, so a caller never
         // sees a zero-length write.
         // The frame is built in the buffer that will hand it over: the top
@@ -493,6 +526,49 @@ impl AsyncRead for QuicStream {
             let take = buf.remaining().min(this.read.plain.len());
             buf.put_slice(&this.read.plain[..take]);
             this.read.plain.drain(..take);
+            return Poll::Ready(Ok(()));
+        }
+
+        // Plaintext with nothing buffered: read straight into the caller's
+        // buffer. The slow path below exists to de-frame and decrypt, and an L3
+        // lane past its selector byte needs neither — it is the hot path, and
+        // copying through raw and plain first costs a byte per byte on a
+        // carrier whose whole job is to move them.
+        if this.read.key.is_none() && !this.read.selector_pending && this.read.raw.is_empty() {
+            let before = buf.filled().len();
+            let mut connection = this.shared.connection.lock();
+            let mut eof = false;
+            {
+                let mut recv = connection.recv_stream(this.id);
+                let mut chunks = match recv.read(true) {
+                    Ok(chunks) => chunks,
+                    Err(ReadableError::IllegalOrderedRead | ReadableError::ClosedStream) => {
+                        return Poll::Ready(Err(gone()));
+                    }
+                };
+                loop {
+                    let room = buf.remaining();
+                    if room == 0 {
+                        break;
+                    }
+                    match chunks.next(room) {
+                        Ok(Some(chunk)) => {
+                            let take = chunk.bytes.len().min(buf.remaining());
+                            buf.put_slice(&chunk.bytes[..take]);
+                        }
+                        Ok(None) => {
+                            eof = true;
+                            break;
+                        }
+                        Err(ReadError::Blocked) => break,
+                        Err(ReadError::Reset(code)) => return Poll::Ready(Err(reset(code))),
+                    }
+                }
+            }
+            if buf.filled().len() == before && !eof {
+                this.shared.park(this.id, Wait::Read, cx.waker());
+                return Poll::Pending;
+            }
             return Poll::Ready(Ok(()));
         }
 

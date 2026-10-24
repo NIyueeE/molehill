@@ -236,7 +236,10 @@ impl EndpointHandle {
 /// full, and the connection never recovered. KCP asks for the same thing on
 /// its socket (`KCP_SOCKET_BUF_BYTES`); a QUIC endpoint needs it for the same
 /// reason, and this is the one place every endpoint's socket passes through.
-const SOCKET_BUF_BYTES: usize = 8 * 1024 * 1024;
+/// It is the same 32 MiB KCP asks for: at 5 Gbit/s a burst the receive task is
+/// busy for 10 ms is 6 MB, and anything smaller turns a scheduling hiccup into
+/// a loss event the engine reads as congestion.
+const SOCKET_BUF_BYTES: usize = 32 * 1024 * 1024;
 
 /// Ask the kernel for a carrier-sized socket buffer.
 ///
