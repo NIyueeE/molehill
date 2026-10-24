@@ -250,6 +250,21 @@
       So that cell's deficit is cores, not per-byte cost: this carrier does
       1.77 Gbit/s per core to KCP's 1.13, and KCP wins the aggregate by using
       two cores per lane where a QUIC connection is one task.
+    - **The carrier beats KCP and cannot touch TCP, and that is the answer to
+      the flip (2026-10-24, fourth round).** The same build, the same cells,
+      the same leg, the TCP carrier forced instead: `bulk-1` **10.57-11.51**
+      Gbit/s at 0.185 s/Gbit on 1.9-2.0 cores, `bulk-n` **22.73-23.15** at
+      0.200 on 4.4 cores. That is **5.2 Gbit/s per core**: the kernel's path
+      is 2.3-2.9x this engine's per-core rate (the engine does 1.77-2.3), and
+      no transport parameter reaches that — it is the userspace/Kernel
+      boundary, not a knob. At 1 % loss the same ordering holds with a
+      narrower gap (TCP 3.26 and 11.99 against the carrier's 3.05 and 5.3).
+    - **So the plan's two halves get different answers, and both are measured**:
+      **replace KCP with this carrier — supported** (ahead of it on clean bulk,
+      2.4-3.9x ahead at 1 % loss, cheaper per byte on every cell, 4.9 cores
+      against 10.7 on the mixed one); **flip `first_carrier()` to UDP —
+      refuted** (1.9-2.9x behind TCP on clean, which is what a flip would
+      demote). KCP stays until that decision is taken deliberately.
   - **Where the clean gap is, then**: one connection to one lane, 8 flows over
     the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
     gets. Closing it is a placement/stream-shape question (per-flow streams in
