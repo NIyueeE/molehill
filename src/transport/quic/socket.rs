@@ -52,17 +52,28 @@ enum Command {
     },
     /// Connect and open one stream, answering only once the handshake is up:
     /// the shape a direct data channel has.
+    ///
+    /// The handle comes back with the stream because closing a connection is
+    /// an application decision: a channel that owns both can tell the peer it
+    /// is gone instead of leaving it to the idle timeout.
     ConnectStream {
         remote: SocketAddr,
         config: ClientConfig,
         encrypt: bool,
-        reply: oneshot::Sender<std::io::Result<QuicStream>>,
+        reply: oneshot::Sender<std::io::Result<(ConnectionHandle, QuicStream)>>,
     },
+    /// Tell the peer this connection is over.
+    ///
+    /// Dropping the handles is *not* a close: quinn-proto puts nothing on the
+    /// wire until the application asks, so a lane that was retired by the
+    /// allocator used to stay alive at the peer until its 60 s idle timeout —
+    /// and the peer kept placing flows in a lane whose other end was gone.
+    Close { connection: ConnectionHandle },
 }
 
 /// A connection that still owes its caller a stream.
 struct Waiting {
-    reply: oneshot::Sender<std::io::Result<QuicStream>>,
+    reply: oneshot::Sender<std::io::Result<(ConnectionHandle, QuicStream)>>,
     encrypt: bool,
 }
 
@@ -149,6 +160,26 @@ impl EndpointHandle {
         config: ClientConfig,
         encrypt: bool,
     ) -> Result<QuicStream> {
+        self.connect_channel(remote, config, encrypt)
+            .await
+            .map(|(_connection, stream)| stream)
+    }
+
+    /// Connect and open one stream, keeping the connection handle.
+    ///
+    /// A direct channel is one connection, so whoever holds the stream holds
+    /// the connection's fate: it needs the handle to close it (see
+    /// [`Command::Close`]).
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Self::connect_stream`].
+    pub(crate) async fn connect_channel(
+        &self,
+        remote: SocketAddr,
+        config: ClientConfig,
+        encrypt: bool,
+    ) -> Result<(ConnectionHandle, QuicStream)> {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::ConnectStream {
@@ -163,6 +194,14 @@ impl EndpointHandle {
             .await
             .map_err(|_| anyhow!("the endpoint task is gone"))?
             .map_err(|error| anyhow!(error))
+    }
+
+    /// Tell the peer this connection is over, and let the engine say so.
+    ///
+    /// Best effort by design: a queue that is full or gone means the endpoint
+    /// is going away, and the connection with it.
+    pub(crate) fn close(&self, connection: ConnectionHandle) {
+        let _ = self.commands.try_send(Command::Close { connection });
     }
 
     /// What the engine says about one connection.
@@ -409,6 +448,23 @@ async fn run(
                             let _ = reply.send(Err(std::io::Error::other(format!("{error}"))));
                         }
                     },
+                    Command::Close { connection } => {
+                        // One shot: the engine emits the CONNECTION_CLOSE on the
+                        // next transmit sweep, and the peer's stream ends the
+                        // moment it arrives.
+                        if let Some(shared) = driver.shared(connection) {
+                            shared
+                                .connection
+                                .lock()
+                                .close(
+                                    Instant::now(),
+                                    0u32.into(),
+                                    bytes::Bytes::from_static(b"the channel closed"),
+                                );
+                        }
+                        live.lock().remove(&connection);
+                        connected.lock().remove(&connection);
+                    }
                     Command::OpenStream {
                         connection,
                         encrypt,
@@ -563,7 +619,9 @@ fn drain(
                     // A caller asking for a stream waits for exactly this.
                     if let Some(waiting) = waiting.remove(&handle) {
                         let outcome = match driver.shared(handle) {
-                            Some(shared) => conn::open(&shared, waiting.encrypt),
+                            Some(shared) => {
+                                conn::open(&shared, waiting.encrypt).map(|stream| (handle, stream))
+                            }
                             None => Err(std::io::Error::new(
                                 std::io::ErrorKind::NotConnected,
                                 "the connection is gone",
@@ -1692,6 +1750,82 @@ mod tests {
             .expect("the peer never saw the tail of a frame the engine took in part")
             .expect("the read succeeds");
         assert!(seen.iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// A channel that ends says so, instead of leaving the peer's stream open
+    /// until the connection's idle timeout.
+    ///
+    /// This is a retired lane's shape: the allocator takes a lane away from an
+    /// idle claim, the lane's channel is dropped, and until `Command::Close`
+    /// existed the far end held the member for a minute and kept forwarding
+    /// traffic into it. On the bench that was `bulk-pair`'s second claim
+    /// timing out: the visitor's SYN went into a lane whose other end was gone.
+    #[tokio::test]
+    async fn a_dropped_channel_ends_the_peers_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let mut server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        server_config.transport_config(super::super::params::transport_config());
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                lost: mpsc::unbounded_channel().0,
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        // The channel type itself, because its `Drop` is what has to close
+        // the connection — a bare stream handle has no way to.
+        let mut channel = super::super::channel::connect(
+            server_addr,
+            NoiseKeys::from_config(&client_cfg).expect("client keys"),
+            false,
+        )
+        .await
+        .expect("the direct channel comes up");
+
+        channel.write_all(b"hi").await.expect("the write");
+        let mut served = tokio::time::timeout(Duration::from_secs(5), streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let mut hello = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), served.read_exact(&mut hello))
+            .await
+            .expect("the peer sees the first bytes")
+            .expect("the read succeeds");
+        assert_eq!(&hello, b"hi");
+
+        drop(channel);
+
+        // Without the close this waits out the idle timeout (60 s) and the
+        // assertion never runs; three seconds is far past the one round trip a
+        // CONNECTION_CLOSE costs on loopback.
+        let mut sink = [0u8; 1];
+        let ended = tokio::time::timeout(Duration::from_secs(3), served.read(&mut sink))
+            .await
+            .expect("the peer was never told the channel ended");
+        assert!(
+            !matches!(ended, Ok(n) if n > 0),
+            "the peer read a byte from a channel that ended: {ended:?}"
+        );
     }
 
     /// The carrier's own ceiling: one stream, one bulk writer, loopback, no

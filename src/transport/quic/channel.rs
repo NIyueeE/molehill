@@ -17,6 +17,8 @@ use quinn_proto::ClientConfig;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+use quinn_proto::ConnectionHandle;
+
 use super::conn::QuicStream;
 use super::session::{NoiseClientConfig, NoiseServerConfig};
 use super::socket::{self, Channels, EndpointHandle};
@@ -26,7 +28,23 @@ use crate::transport::NoiseKeys;
 pub(crate) struct UdpChannel {
     /// Kept for the channel's whole life: it owns the socket and its task.
     _endpoint: Arc<EndpointHandle>,
+    /// The connection this channel *is*, so dropping the channel can tell the
+    /// peer rather than leave it to the idle timeout.
+    connection: ConnectionHandle,
     stream: QuicStream,
+}
+
+impl Drop for UdpChannel {
+    /// Close the connection, not just this end of it.
+    ///
+    /// Forgetting the socket is not a close: the peer's stream stays open until
+    /// its 60 s idle timeout, and it keeps placing traffic in a lane whose far
+    /// end is gone. That is what a retired lane did to the claim it was lent
+    /// away from — the peer forwarded packets into it for a minute and every
+    /// one of them was lost.
+    fn drop(&mut self) {
+        self._endpoint.close(self.connection);
+    }
 }
 
 /// Dial one direct data channel to `remote`.
@@ -47,10 +65,11 @@ pub(crate) async fn connect(
     let endpoint = dial_endpoint(remote).await?;
     let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(keys)));
     config.transport_config(super::params::transport_config());
-    let stream = endpoint.connect_stream(remote, config, encrypt).await?;
+    let (connection, stream) = endpoint.connect_channel(remote, config, encrypt).await?;
     spawn_stats_reporter(&stream);
     Ok(UdpChannel {
         _endpoint: endpoint,
+        connection,
         stream,
     })
 }
