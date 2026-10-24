@@ -152,6 +152,23 @@
     cell is not measuring the carrier's throughput at all on this build: it is
     measuring a cold-start race between the stage's iperf dial and the claim's
     first lane, and the 86 s bound expires while iperf3 backs off.
+  - **What the bench actually builds, which rules out "the claim address is missing"
+    (2026-10-24).** `CLI_NS` is `mhbcli`, where the tool's client *and* the iperf
+    sink both live: the sink binds the very address the client's device claims
+    (`backend_bind` = `10.99.0.1:2402`), so the path is visitor → server device →
+    tunnel → client device → sink. The claim address is per-IP and shared by all
+    five claims, so a missing address cannot single out `2402`. Both devices are
+    demonstrably up (the same server device carries `2401` at ~3 200 frames per
+    lane), and the server's device sees ~204 pps — the probes — during the
+    failing window. So the SYN never reaches the server's device at all.
+  - **That is six rounds on one cell, so the plan's rule applies: stop and
+    record.** The `cost` cell is a real defect (TCP lanes carry the same
+    workload on the same binary) but it is not the carrier's throughput, and it
+    is not what the flip is blocked on: `bulk-n` at 0.49 of KCP would block a
+    flip on its own. The next rounds go back to the throughput cell, where the
+    one structural lever left is per-flow streams instead of per-lane ones —
+    three flows on one ordered stream is where the eight-flow cell loses its
+    33 % per lane, and KCP does not pay it.
   - **The device reader already counts what it saw, and it saw only the probes
     (2026-10-24).** `offered_per_s` on the failing stage sits at ~200, which is
     the three series; the per-claim path counts a single packet as unclaimed in
