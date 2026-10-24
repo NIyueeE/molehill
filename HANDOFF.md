@@ -180,6 +180,28 @@
     nothing to carry — the budget is not what `bulk-n` is short of.
   - **Prompt ACKs closed a third of the interactive gap** (`rr-1` p99 at 1 %
     loss 88.1 -> 64.1 ms; KCP 51.5), with bulk and `cost` unchanged.
+  - **The clean gap is per-lane multi-flow, not lane count (2026-10-24).**
+    Both carriers ran the same cells in the same order on one commit, and the
+    hub gave claim `2402` **five carrying lanes on each**: KCP 11.25 Gbit/s
+    over them (3.25 + 3.15 + 3.16 + 0.84 + 0.85), the UDP carrier 7.92
+    (2.48 + 2.80 + 1.16 + 0.74 + 0.75). Per lane that is 2.25 against 1.58,
+    and the busy lanes 3.2 against 2.6. The same carrier gets **4.7-4.9
+    Gbit/s from a lane with one flow on it** (`bulk-1`, `bulk-pair`) and 2.6
+    with three, so the deficit is the cross-flow head-of-line blocking of one
+    ordered stream carrying several flows — KCP pays the same shape (5.8 with
+    one flow, ~3.2 with several) from a higher base.
+    - Whole-cell medians, same run: `bulk-1` 4.73 against 5.81 (-19 %),
+      `bulk-n` 7.76 against 8.85 (-12 %), `cost` 7.76 against 10.63 (-27 %,
+      improved from -63 % once the close fix stopped the wedges).
+    - Per byte the carrier is now cheaper than KCP on two of the three cells
+      (`bulk-n` 0.693 against 0.826 s/Gbit, `cost` 0.705 against 0.848) and
+      dearer on `bulk-1` (0.710 against 0.683); it does the work on 5.1-5.4
+      cores against KCP's 7.0-9.0.
+    - **So the next lever is stream-per-flow inside one lane connection**: the
+      hub pins a flow to a lane and a lane is one ordered stream, which is what
+      costs the 35-45 % once three flows share it. QUIC's streams are
+      independent by design; that is the change that would take a lane from
+      2.6 to its 4.7-4.9 single-flow rate, i.e. above KCP's 3.2.
   - **Where the clean gap is, then**: one connection to one lane, 8 flows over
     the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
     gets. Closing it is a placement/stream-shape question (per-flow streams in
