@@ -156,6 +156,37 @@
   table with its method — belongs on `docs/benchmarks.md` in the commit that
   makes the decision, not before it.
 
+- **Two defects were one bug, and it is fixed (2026-10-24, later).** A
+  dropped channel dropped its endpoint's socket, which is not a close:
+  quinn-proto puts nothing on the wire until the application asks, so the peer
+  kept the stream (and the hub member) open until the 60 s idle timeout and
+  went on placing flows into a lane whose far end was gone. Every observed
+  "claim never comes up" was that: the lane allocator lends an idle lane away,
+  and the next claim's traffic is routed into the retired one.
+  `Command::Close` closes the engine connection, `UdpChannel::drop` calls it,
+  and `socket::tests::a_dropped_channel_ends_the_peers_stream` fails in 3 s
+  without it. After, same cells and the same order that used to fail:
+  `bulk-pair` clean **7.58 Gbit/s in 3 of 3** (was: 26 s timeout, 2 of 2),
+  `cost` clean **7.41 at 0.699 s/Gbit in 4 of 4** (was: 106 s wedge, 2 of 2).
+  - **The ceiling this file quoted was the test's, not the carrier's.** The
+    in-process transfer (`a_stream_carries_at_full_speed`) reads 2767-2817
+    Mbit/s, but one connection on the bench's own path carries **4.88 Gbit/s**
+    (`bulk-1`, clean) and one `cost` lane carried **4.16**. The 2.82-2.87
+    figure is one writer and one reader in one process; the "three lanes at
+    the ceiling = 0.80 of KCP" arithmetic built on it is withdrawn.
+  - **More lane budget does not buy throughput** (`pool_cap=12` against the
+    default 10, clean, `bulk-n`: 7.89-8.06 against 7.84-7.94). Placement pins
+    a flow to a lane when the flow starts, so a lane dialed a second later has
+    nothing to carry — the budget is not what `bulk-n` is short of.
+  - **Prompt ACKs closed a third of the interactive gap** (`rr-1` p99 at 1 %
+    loss 88.1 -> 64.1 ms; KCP 51.5), with bulk and `cost` unchanged.
+  - **Where the clean gap is, then**: one connection to one lane, 8 flows over
+    the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
+    gets. Closing it is a placement/stream-shape question (per-flow streams in
+    one connection, or re-placing a burst over lanes as they join), not a
+    tuning knob — the lane budget and the transport parameters were measured
+    and neither is the limit.
+
 - **SUPERSEDED (2026-10-24 morning; read the corrected verdict above — its
   "KCP" column is the TCP carrier): the UDP carrier cannot beat KCP on this
   bench, and the flip is not justified.** After fifteen rounds and ~fifteen
