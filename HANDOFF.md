@@ -118,6 +118,17 @@
     behind on its own and the eight-stream cell (3-4 flows on a lane) loses
     more than that again — multiplexing several flows onto one ordered stream
     is where the rest of the gap lives.
+  - **Congestion control is not the limiter, and the window is already past
+    its knee (2026-10-24).** Two controls settled it. A fixed-window pipe
+    controller (12 MiB, no loss response — KCP's own bargain) measured
+    2.66-2.70 / 4.47-5.04 / 0.94 s/Gbit: the same as BBR within noise, so it
+    was reverted rather than kept. An 8 MiB initial window instead of 2 is
+    actively harmful — `bulk-n` stops finishing at all (26 s harness bound)
+    — so 2 MiB is at the edge of what this path absorbs. What is left is not
+    a knob: per-byte cost is 1.5x KCP's with the same hub and the same TUN
+    writes, so the difference is inside the carrier's own datagram path and
+    needs a profile (`perf` on the tool's processes during a `clean` run),
+    not another window.
   - **Where the rest has to come from**: per-byte cost is still 1.5x KCP's
     (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse than
     KCP's (three lanes give us 1.9x where KCP gets 3.7x), which points at the
