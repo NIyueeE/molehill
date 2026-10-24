@@ -228,9 +228,28 @@
       the segment size in a cmsg; the engine still takes one datagram per
       `handle`, so the saving is the syscalls, not the parse. At ~1.5 µs per
       call that is 0.6 of the 3.2 cores a lane uses — the right size to be
-      the missing 19 %. It needs `recvmsg` with control messages, which tokio's
-      `UdpSocket` does not expose: `AsyncFd` plus a per-item `unsafe` opt-in
-      (docs/lint-policy.md), which is why it is a hypothesis and not a number.
+      the missing 19 %. It needed `recvmsg` with control messages, which tokio's
+      `UdpSocket` does not expose — but nix does (`recvmsg`, `UdpGroSegment`,
+      `ControlMessageOwned::UdpGroSegments`), so no `unsafe` was needed at all.
+    - **Measured, and it is the win (2026-10-24, third round).** Same arm, same
+      leg, two rounds, against the build immediately before it:
+
+      | cell (clean) | before | after | |
+      |---|---|---|---|
+      | `bulk-1` | 4.73 Gbit/s at 0.710 s/Gbit | **6.79** at **0.477** | +43 % on 3.0 cores instead of 3.2 |
+      | `bulk-n` | 7.76 | 7.70 | flat — that cell is not syscall-bound |
+      | `cost` | 7.76 at 0.705 | **8.22** at **0.554** | -21 % per byte; p99 8.1 -> 17.2 ms, the batching it buys |
+
+      At 1 % loss nothing moves (`bulk-1` 3.05, `bulk-n` 5.29-5.56, `rr-1`
+      p99 64 ms): a lossy path is window-bound, not syscall-bound.
+    - **Against KCP on clean, the carrier is now ahead where one flow or eight
+      fill the lanes** — `bulk-1` **6.50 against 5.65** (+15 %, and 0.474
+      against 0.666 s/Gbit), `bulk-n` **7.73 against 6.99** (+11 %, 0.562
+      against 0.718) — and still behind on the mixed `cost` cell: 8.78 against
+      12.00, at 0.570 against 0.890 s/Gbit and **4.95 cores against 10.65**.
+      So that cell's deficit is cores, not per-byte cost: this carrier does
+      1.77 Gbit/s per core to KCP's 1.13, and KCP wins the aggregate by using
+      two cores per lane where a QUIC connection is one task.
   - **Where the clean gap is, then**: one connection to one lane, 8 flows over
     the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
     gets. Closing it is a placement/stream-shape question (per-flow streams in
