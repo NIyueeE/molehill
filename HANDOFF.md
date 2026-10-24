@@ -220,6 +220,17 @@
       each carry no more than three lanes with three. The clean deficit is
       simply per-connection cost (4.73 against KCP's 5.81 with one flow, 2.6
       against 3.2 with several: -19 % in both regimes), i.e. the engine.
+    - **The one lever left unmeasured is the receive syscall (2026-10-24).**
+      The endpoint reads one 1452-byte datagram per `recv` — 422 000 a second
+      on a 4.9 Gbit/s lane — while the sender already hands 32 of them to the
+      kernel per `sendmsg` (`UDP_SEGMENT`). `UDP_GRO` on the socket would let
+      the kernel coalesce them back and a `recvmsg` would return the run, with
+      the segment size in a cmsg; the engine still takes one datagram per
+      `handle`, so the saving is the syscalls, not the parse. At ~1.5 µs per
+      call that is 0.6 of the 3.2 cores a lane uses — the right size to be
+      the missing 19 %. It needs `recvmsg` with control messages, which tokio's
+      `UdpSocket` does not expose: `AsyncFd` plus a per-item `unsafe` opt-in
+      (docs/lint-policy.md), which is why it is a hypothesis and not a number.
   - **Where the clean gap is, then**: one connection to one lane, 8 flows over
     the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
     gets. Closing it is a placement/stream-shape question (per-flow streams in
