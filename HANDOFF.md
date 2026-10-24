@@ -136,6 +136,21 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **KCP's eight-stream cell uses the same three lanes and gets 3.6 Gbit/s
+    per lane (2026-10-24).** `bulk-n` with `MOLEHILL_L3_STATS=1` on a KCP-only
+    build: 10.73-10.86 Gbit/s over three members (2.92M + 2.80M + 2.02M
+    frames), i.e. **3.6 Gbit/s per lane** against this carrier's 2.03 — and our
+    own single-lane ceiling is 2.82, so the deficit is two things: per-lane
+    cost (1.28x, the carrier's packet path) and a 28 % loss of per-lane
+    throughput once three lanes run at once. The lane count is not the
+    difference; both carriers got three.
+  - **Fewer acknowledgements are slower, not faster (2026-10-24).** The
+    ACK_FREQUENCY extension at one ACK per eight ack-eliciting packets (5 ms
+    cap, immediate ACK on reordering) moved the loopback ceiling 2817 -> 2561
+    Mbit/s and was reverted. The reasoning it was tried on — that a one-way
+    transfer spends half its packets on ACK frames — is true by count and
+    false by cost: ACK packets are ~60 bytes, and the sender's growth depends
+    on them arriving often.
   - **A 128-datagram receive burst is the biggest single win so far
     (2026-10-24).** The loop took 32 already-queued datagrams per readiness
     wake; at these rates a wake carries more than that, so the endpoint was
