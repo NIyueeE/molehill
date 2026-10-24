@@ -21,15 +21,17 @@ use quinn_proto::congestion::BbrConfig;
 
 /// What one stream may have in flight, in each direction.
 ///
-/// The BDP of a 4 Gbit/s path at a 10 ms tail is about 5 MB; 8 MiB leaves room
-/// without letting one stream hold an unbounded amount of the receiver's
-/// memory.
-pub(crate) const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+/// A stream can only carry what fits in its window per round trip: 3 Gbit/s
+/// over a 20 ms leg is 7.5 MB, and the bench's `bulk-1` cell at 1 % loss moved
+/// from 0.454 to 2.405 Gbit/s once the window (and the controller's initial
+/// window below) stopped capping it below the path's bandwidth-delay product.
+pub(crate) const STREAM_WINDOW: u32 = 32 * 1024 * 1024;
 
-/// What the whole connection may have in flight. Two streams may each fill
-/// their own window; the connection ceiling keeps a lazy reader from pinning
-/// an unbounded buffer.
-pub(crate) const CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+/// What the whole connection may have in flight. Streams may each fill their
+/// own window, and the ceiling is the sum a path's round trip has to hold:
+/// eight streams at 12 Gbit/s over 20 ms is 30 MB, which is the `bulk-n` cell
+/// this number exists for. It still bounds a lazy reader's pinned memory.
+pub(crate) const CONNECTION_WINDOW: u32 = 64 * 1024 * 1024;
 
 /// The engine's configuration for one endpoint, client or server.
 pub(crate) fn transport_config() -> Arc<TransportConfig> {
@@ -39,7 +41,16 @@ pub(crate) fn transport_config() -> Arc<TransportConfig> {
         // read the clean path's tail as loss, and it is the one the fingerprint
         // records. Cubic stays the crate's default for a reason; this is a
         // choice, and the bench gate prices it.
-        .congestion_controller_factory(Arc::new(BbrConfig::default()))
+        .congestion_controller_factory(Arc::new({
+            // A BDP-sized initial window: the engine's own default is ten
+            // segments, and on a 20 ms path this carrier has to fill megabytes
+            // before the controller can measure anything. Starting at 2 MiB is
+            // what lets the first round carry a link's worth instead of
+            // crawling up from 12 KiB while the path keeps dropping packets.
+            let mut bbr = BbrConfig::default();
+            bbr.initial_window(2 * 1024 * 1024);
+            bbr
+        }))
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
         .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
         .send_window(u64::from(CONNECTION_WINDOW))

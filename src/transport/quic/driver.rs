@@ -27,7 +27,7 @@ use super::conn::Shared;
 ///
 /// The same cap the batching sender uses (`udp_batch`), so a `UDP_SEGMENT`
 /// batch is never wider than the syscall's own limit.
-pub(crate) const MAX_DATAGRAMS: usize = 8;
+pub(crate) const MAX_DATAGRAMS: usize = 32;
 
 /// One datagram the driver wants sent.
 pub(crate) struct Outgoing {
