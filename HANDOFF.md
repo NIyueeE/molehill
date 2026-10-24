@@ -106,10 +106,19 @@
     0.80-0.83 Gbit/s (a 76 KiB `UDP_SEGMENT` message is not something this path
     takes), so 32 stays. 8 MiB and 32 MiB of socket buffer measure the same at
     these rates; 32 MiB stays because it is what KCP asks for.
-  - **Where the rest has to come from**: one more copy remains — the driver
-    copies every transmit into a fresh `Vec` before handing it to the sender
-    task — and each connection's receive path is a single task, where KCP's
-    equivalent hands the app's own buffer over with no copy at all.
+  - **The last copy is gone and it was worth nothing measurable**: the driver
+    now hands its transmit buffer to the sender task and takes it back (a
+    recycled channel), so the engine writes into the buffer that leaves
+    instead of a scratch buffer that gets copied out. Measured after:
+    `bulk-n` 4.19-4.99, `bulk-1` 2.62, clean 0.937-0.952 s/Gbit — all inside
+    the noise of the numbers above. Kept because it removes work and costs
+    none, but the remaining gap is **not** in the copies.
+  - **Where the rest has to come from**: per-byte cost is still 1.5x KCP's
+    (0.93 against 0.62 s/Gbit), and the multi-lane cell scales worse than
+    KCP's (three lanes give us 1.9x where KCP gets 3.7x), which points at the
+    per-connection receive task — one core each, no batching across lanes —
+    rather than at the socket path. Profiling the receive side is the next
+    step, not another knob.
 - **The write path could strand a frame, and never told the engine it was
   blocked (2026-10-24).** Two defects in `transport/quic/conn.rs`, both proved by
   one test: `poll_write` handed the engine a whole framed chunk and reported the

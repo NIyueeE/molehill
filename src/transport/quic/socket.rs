@@ -323,7 +323,8 @@ async fn run(
     connected: Arc<Mutex<HashSet<ConnectionHandle>>>,
 ) {
     let notify = Arc::new(Notify::new());
-    let mut driver = Driver::new(server_config, allow_mtud, Arc::clone(&notify));
+    let (recycled, recycled_rx) = mpsc::channel::<Vec<u8>>(SEND_QUEUE);
+    let mut driver = Driver::new(server_config, allow_mtud, Arc::clone(&notify), recycled_rx);
     let mut waiting: HashMap<ConnectionHandle, Waiting> = HashMap::new();
     let mut waiters: HashMap<ConnectionHandle, Vec<oneshot::Sender<()>>> = HashMap::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -342,6 +343,9 @@ async fn run(
             if let Err(error) = send_outgoing(&sender_socket, &outgoing).await {
                 tracing::debug!(%error, "the socket could not send");
             }
+            // Hand the buffer back so the engine writes into it again: the
+            // send path then copies nothing at all.
+            let _ = recycled.send(outgoing.contents).await;
         }
     });
     loop {

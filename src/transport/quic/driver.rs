@@ -73,6 +73,12 @@ pub(crate) struct Driver {
     /// The engine's scratch buffer, reused by every call that takes one: it
     /// was allocated per datagram and per transmit, which is the hot path.
     scratch: Vec<u8>,
+    /// Buffers the sender task has finished with, waiting to be written into
+    /// again. The engine writes straight into the buffer that leaves, so a
+    /// transmit costs no copy; without the return path it would allocate one
+    /// per transmit instead.
+    spare: Vec<Vec<u8>>,
+    recycled: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl Driver {
@@ -80,6 +86,7 @@ impl Driver {
         server_config: Option<Arc<ServerConfig>>,
         allow_mtud: bool,
         notify: Arc<Notify>,
+        recycled: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         Driver {
             endpoint: Endpoint::new(
@@ -94,6 +101,8 @@ impl Driver {
             notify,
             next_key: 1,
             scratch: Vec::new(),
+            spare: Vec::new(),
+            recycled,
         }
     }
 
@@ -171,17 +180,25 @@ impl Driver {
         if !self.pending.is_empty() {
             return Some(self.pending.remove(0));
         }
-        let scratch = &mut self.scratch;
+        // Take back whatever the sender task has finished with before asking
+        // the engine for more: the buffer it writes into is the one that leaves.
+        while let Ok(buffer) = self.recycled.try_recv() {
+            self.spare.push(buffer);
+        }
         for shared in self.connections.values() {
-            scratch.clear();
+            let mut buffer = self.spare.pop().unwrap_or_default();
+            buffer.clear();
             let mut connection = shared.connection.lock();
-            if let Some(transmit) = connection.poll_transmit(now, MAX_DATAGRAMS, scratch) {
-                return Some(Outgoing {
-                    destination: transmit.destination,
-                    contents: scratch[..transmit.size].to_vec(),
-                    segment_size: transmit.segment_size,
-                });
-            }
+            let Some(transmit) = connection.poll_transmit(now, MAX_DATAGRAMS, &mut buffer) else {
+                self.spare.push(buffer);
+                continue;
+            };
+            buffer.truncate(transmit.size);
+            return Some(Outgoing {
+                destination: transmit.destination,
+                contents: buffer,
+                segment_size: transmit.segment_size,
+            });
         }
         None
     }
@@ -353,12 +370,15 @@ mod tests {
             )),
             TokenKeys::new(),
         );
+        let (_returned, server_recycled) = tokio::sync::mpsc::channel(1);
         let mut server = Driver::new(
             Some(Arc::new(server_config)),
             false,
             Arc::new(Notify::new()),
+            server_recycled,
         );
-        let mut client = Driver::new(None, false, Arc::new(Notify::new()));
+        let (_returned_client, client_recycled) = tokio::sync::mpsc::channel(1);
+        let mut client = Driver::new(None, false, Arc::new(Notify::new()), client_recycled);
         let mut clock = Instant::now();
         let handle = client
             .connect(
