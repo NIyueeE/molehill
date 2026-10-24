@@ -202,6 +202,24 @@
       costs the 35-45 % once three flows share it. QUIC's streams are
       independent by design; that is the change that would take a lane from
       2.6 to its 4.7-4.9 single-flow rate, i.e. above KCP's 3.2.
+    - **That lever does not pay, and neither does the controller
+      (2026-10-24, next round).** The prediction was testable without the
+      refactor by giving every flow its own lane: with `[transparent.data].tunnels`
+      at 40 (eight per claim) the 8 flows spread over six lanes at 1-2 flows
+      each, and `bulk-n` read **8.5 Gbit/s** against 7.9 at the default ten
+      lanes — a tenth, not the 14.7 the per-lane rate predicted, and per lane
+      it `fell` to 1.9. At 40 lanes the `cost` cell also stopped finishing
+      (one pass on an iperf3 control-socket error, one on the 106 s bound), so
+      more connections is not a safe direction either. Cubic in place of BBR —
+      the one controller never measured on this carrier — is indistinguishable
+      on clean (`bulk-1` 4.69-4.77, `bulk-n` 7.75-7.93, `cost` 0.690-0.718
+      against BBR's 4.73, 7.76, 0.705), and BBR is the one that wins at 1 %
+      loss, so it stays.
+      **What that rules out**: the multi-flow penalty is not head-of-line
+      blocking that more independent pipes can remove — six lanes with one flow
+      each carry no more than three lanes with three. The clean deficit is
+      simply per-connection cost (4.73 against KCP's 5.81 with one flow, 2.6
+      against 3.2 with several: -19 % in both regimes), i.e. the engine.
   - **Where the clean gap is, then**: one connection to one lane, 8 flows over
     the 3 lanes a claim gets, so per-lane 2.6 against the 4.9 a single flow
     gets. Closing it is a placement/stream-shape question (per-flow streams in
