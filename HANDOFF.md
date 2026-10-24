@@ -152,6 +152,16 @@
     cell is not measuring the carrier's throughput at all on this build: it is
     measuring a cold-start race between the stage's iperf dial and the claim's
     first lane, and the 86 s bound expires while iperf3 backs off.
+  - **The device reader already counts what it saw, and it saw only the probes
+    (2026-10-24).** `offered_per_s` on the failing stage sits at ~200, which is
+    the three series; the per-claim path counts a single packet as unclaimed in
+    the whole stage. On the same binary over TCP lanes that claim carries
+    121 669 frames. So the iperf claim's packets never reach the device on the
+    UDP build, and the single hypothesis left standing is that the claim's
+    address is not installed on the client's device in those runs — which would
+    explain zero device traffic, zero placement, no dial and no error. Next:
+    log the claim set the client installs (one line at startup and on change)
+    and compare it between the two carriers.
   - **Both carriers make the same lane moves, so the difference is whether the
     packets ever reach the hub (2026-10-24).** Per run: identical lends (5 in
     both, each claim giving an idle lane to `2401`), and every retired lane for
