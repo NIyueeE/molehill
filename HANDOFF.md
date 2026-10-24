@@ -85,20 +85,59 @@
 
 ## Where this stands
 
+- **The write path could strand a frame, and never told the engine it was
+  blocked (2026-10-24).** Two defects in `transport/quic/conn.rs`, both proved by
+  one test: `poll_write` handed the engine a whole framed chunk and reported the
+  caller's bytes as written even when the engine took only part of it — so
+  `write_all` returned, no further write came, and the peer waited for ever for
+  the rest of a frame that never left. `flush` had the matching fault: it
+  stopped after the first short write, and the engine only publishes a stream as
+  writable again after a call returned `Blocked`, so the waker a blocked writer
+  parked was never fired. A lane is exactly this shape — write a batch, then
+  wait for the answer — and the symptom is a carrier that carries nothing while
+  both engines sit idle.
+  - `flush` now loops until the buffer is empty or the engine refuses outright
+    (that last call is what registers the blocked stream);
+  - `poll_write` claims only bytes that are all in the engine, parks otherwise,
+    and remembers the claim (`pending_from`, `owed`) so the retried buffer is
+    reported instead of written twice;
+  - `transport::quic::socket::tests::a_partially_accepted_frame_still_reaches_the_peer`
+    is the reproducer: 8 KiB of send credit against a 10 KiB write, no flush,
+    and the peer must still see all ten. It failed before the fix (5 s timeout,
+    nothing past the window) and passes now.
+  **This did not fix the `cost` cell** — that run still times out, with the
+  series probes answering at 20-42 ms throughout, so the stall is upstream of
+  the carrier. The bug is real and worth its commit regardless: it is the
+  failure shape of any lane whose batch does not fit the window.
 - **The `loss1` cell is a mixed-workload defect, not a bulk-path one
   (2026-10-23).** Three measurements on the `l3` arm at `loss1`
   (`--condition-leg tunnel`), forced to the UDP carrier
   (`MOLEHILL_DATA_CARRIER=kcp` on a `quic` build):
-  - `--scenarios bulk-1`: **0.454 Gbit/s** measured (warm-up 1.44) — KCP's
-    recorded 0.41 at the same condition.
-  - `--scenarios bulk-n` (eight streams): **2.73 / 2.78 Gbit/s**.
-  - `--scenarios cost --scale 0.02`: still the 86 s timeout, every round — the
-    4-stream iperf never finishes. **The control settles it**: the same cell on a
-    KCP-only build of the same commit passes in 83 s at **0.148 s/Gbit
-    (6.75 Gbit/s)**. So bulk alone is at or above KCP and the failure is
-    specific to the QUIC carrier under the `cost` mix (four iperf streams plus
-    the interactive, datagram and churn series). That mix is where the next
-    hour goes; it is the gate's own cell.
+  **Corrected 2026-10-24: KCP was measured live on the same cells, and the
+  carrier is behind it everywhere — the "0.41 Gbit/s" this file used to quote
+  was a stale figure from an older code state.** One KCP-only build of the same
+  commit, same arm, same conditions:
+
+  | cell (`loss1`) | UDP carrier | KCP | ratio |
+  |---|---|---|---|
+  | `bulk-1` | 0.454 Gbit/s (1.049 s/Gbit, 0.57 cores) | **3.26-3.45** (0.146, 0.41) | 7.2x |
+  | `bulk-n` (8) | 2.73-2.78 (0.985, 2.49) | **11.99-12.38** (0.232, 2.51) | 4.4x |
+  | `cost` | 86 s timeout | **4.36** (0.148, 0.67) | — |
+  | `clean` `cost` (control) | 4.85 (1.072, 5.12) | **12.81** (0.624, 8.0) | 2.6x |
+
+  Two facts fall out of the pairs. The loss1 gap is **not CPU** — 0.454 Gbit/s
+  costs 0.57 cores where KCP's 3.26 costs 0.41 — it is bytes in flight: KCP holds
+  a bandwidth-delay product (8.5 MB at 4 Gbit/s and a 20 ms leg, inside its
+  8192-segment window), while the engine's own counters read a cwnd under 1 MB
+  and both ends idle. The clean gap *is* per-byte cost: 1.072 s/Gbit against
+  KCP's 0.624, so the frame copy, the record seal and the lock per 16 KiB chunk
+  are all still on the table.
+  - The `cost` cell is a separate defect: the 4-stream iperf never finishes
+    there (86 s timeout, every round) while `bulk-n` carries eight streams at
+    2.7 Gbit/s, and the three series probes keep answering at 20-42 ms through
+    the whole stall — so the tunnel is healthy and *iperf3 itself* never gets a
+    transfer going on that service. It is not a bulk-path failure and it is not
+    the gate's only cell; it is queued behind the two gaps above.
   - `--scenarios udp-blast` at `loss1`: **82.6 % of the offered datagrams do
     not arrive**, 29.5 Mbit/s received. A reliable stream behind an
     offered-rate blast is a queue question rather than a network one (the hub's

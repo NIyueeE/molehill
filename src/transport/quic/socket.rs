@@ -1583,4 +1583,107 @@ mod tests {
             "the carrier carried {mbit} Mbit/s over a 1 % loss path, below the {FLOOR_MBIT} Mbit/s a KCP replacement has to keep"
         );
     }
+
+    /// A frame the engine accepts only in part must still reach the peer
+    /// without a second write.
+    ///
+    /// `poll_write` hands the engine one framed chunk, and the engine takes
+    /// only what its send window allows; the rest waits in the handle. If the
+    /// call reports the caller's bytes as written at that point, the tail is
+    /// stranded: `write_all` returns, no further write comes, and the peer
+    /// waits for the rest of a frame that never leaves. A lane does exactly
+    /// this — write a batch, then wait for the answer — so the failure shows up
+    /// as a carrier that carries nothing while both engines are idle.
+    #[tokio::test]
+    async fn a_partially_accepted_frame_still_reaches_the_peer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const TOTAL: usize = 10 * 1024;
+
+        // 8 KiB of send credit against a 10 KiB write: the engine has to take
+        // the frame in two bites.
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport
+            .send_window(8 * 1024)
+            .stream_receive_window(quinn_proto::VarInt::from_u32(64 * 1024))
+            .receive_window(quinn_proto::VarInt::from_u32(128 * 1024));
+        let transport = Arc::new(transport);
+
+        let (client_cfg, server_cfg) = pair();
+        let server_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a server socket");
+        let server_addr = server_socket.local_addr().expect("an address");
+        let (accepted_tx, _accepted_rx) = mpsc::unbounded_channel();
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (streams_tx, mut streams_rx) = mpsc::unbounded_channel();
+        let mut server_config = ServerConfig::new(
+            Arc::new(NoiseServerConfig::new(
+                NoiseKeys::from_config(&server_cfg).expect("server keys"),
+            )),
+            TokenKeys::new(),
+        );
+        server_config.transport_config(Arc::clone(&transport));
+        let (_server, _server_task) = spawn(
+            server_socket,
+            Some(Arc::new(server_config)),
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: accepted_tx,
+                events: events_tx,
+                streams: streams_tx,
+            },
+        );
+
+        let client_socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a client socket");
+        let (unused_tx, _unused_rx) = mpsc::unbounded_channel();
+        let (unused_streams_tx, _unused_streams_rx) = mpsc::unbounded_channel();
+        let (client_events_tx, _client_events_rx) = mpsc::unbounded_channel();
+        let (client, _client_task) = spawn(
+            client_socket,
+            None,
+            false,
+            Channels {
+                lost: {
+                    let (lost, _) = mpsc::unbounded_channel();
+                    lost
+                },
+                accepted: unused_tx,
+                events: client_events_tx,
+                streams: unused_streams_tx,
+            },
+        );
+        let mut config = ClientConfig::new(Arc::new(NoiseClientConfig::new(
+            NoiseKeys::from_config(&client_cfg).expect("client keys"),
+        )));
+        config.transport_config(transport);
+        let mut channel = client
+            .connect_stream(server_addr, config, false)
+            .await
+            .expect("the direct channel comes up");
+
+        channel
+            .write_all(&vec![0xA5u8; TOTAL])
+            .await
+            .expect("the write");
+        // Deliberately no flush: `write_all` has reported every byte as
+        // written, so the caller has nothing left to ask for.
+
+        let mut served = tokio::time::timeout(Duration::from_secs(5), streams_rx.recv())
+            .await
+            .expect("the stream arrives")
+            .expect("the server task stopped");
+        let mut seen = vec![0u8; TOTAL];
+        tokio::time::timeout(Duration::from_secs(5), served.read_exact(&mut seen))
+            .await
+            .expect("the peer never saw the tail of a frame the engine took in part")
+            .expect("the read succeeds");
+        assert!(seen.iter().all(|byte| *byte == 0xA5));
+    }
 }

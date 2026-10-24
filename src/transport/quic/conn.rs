@@ -152,6 +152,16 @@ impl Shared {
 struct WriteHalf {
     key: Option<RecordKey>,
     pending: Vec<u8>,
+    /// How many bytes of the *caller's* buffer `pending` holds. A frame the
+    /// engine takes in part stays here, and those bytes are only reported as
+    /// written once all of them have reached the engine: claiming them early
+    /// strands the tail, because `write_all` then returns and no further write
+    /// ever flushes it. That is a dead lane, not a slow one: the peer waits for
+    /// the rest of a frame that never leaves while both engines sit idle.
+    pending_from: usize,
+    /// Bytes a `poll_flush` delivered on the caller's behalf, owed back to the
+    /// next `poll_write` because that call was told to wait.
+    owed: usize,
     selector_pending: bool,
 }
 
@@ -207,6 +217,8 @@ impl QuicStream {
             write: WriteHalf {
                 key: write_key,
                 pending: Vec::new(),
+                pending_from: 0,
+                owed: 0,
                 selector_pending: true,
             },
             read: ReadHalf {
@@ -229,6 +241,8 @@ impl QuicStream {
             write: WriteHalf {
                 key: None,
                 pending: Vec::new(),
+                pending_from: 0,
+                owed: 0,
                 selector_pending: false,
             },
             read: ReadHalf {
@@ -298,10 +312,25 @@ impl AsyncWrite for QuicStream {
         }
         let mut connection = this.shared.connection.lock();
 
-        // Flush whatever a previous call could not hand over.
+        // A flush may have delivered a frame this caller was told to wait for.
+        // Reporting it here is what keeps the byte count honest: those bytes
+        // are gone, and the caller is about to hand over the same ones again.
+        if this.write.owed > 0 {
+            let owed = std::mem::take(&mut this.write.owed);
+            drop(connection);
+            return Poll::Ready(Ok(owed));
+        }
+
+        // Flush whatever a previous call could not hand over, and report it.
         if !this.write.pending.is_empty() {
+            let claim = this.write.pending_from;
             match flush(&mut connection, this.id, &mut this.write.pending) {
-                Ok(_) if this.write.pending.is_empty() => {}
+                Ok(_) if this.write.pending.is_empty() => {
+                    this.write.pending_from = 0;
+                    drop(connection);
+                    this.shared.poke();
+                    return Poll::Ready(Ok(claim));
+                }
                 Ok(_) => {
                     this.shared.park(this.id, Wait::Write, cx.waker());
                     return Poll::Pending;
@@ -331,13 +360,21 @@ impl AsyncWrite for QuicStream {
                 None => this.write.pending.extend_from_slice(chunk),
             }
         }
-        let consumed = take;
 
         match flush(&mut connection, this.id, &mut this.write.pending) {
-            Ok(_) => {
+            Ok(_) if this.write.pending.is_empty() => {
                 drop(connection);
                 this.shared.poke();
-                Poll::Ready(Ok(consumed))
+                Poll::Ready(Ok(take))
+            }
+            // The engine took only part of the frame. Claiming this write now
+            // would strand the rest: `write_all` would return and nothing would
+            // ever flush it. Wait instead, and report the bytes from the next
+            // call once they are all in.
+            Ok(_) => {
+                this.write.pending_from = take;
+                this.shared.park(this.id, Wait::Write, cx.waker());
+                Poll::Pending
             }
             Err(error) => Poll::Ready(Err(error)),
         }
@@ -345,10 +382,12 @@ impl AsyncWrite for QuicStream {
 
     /// Push whatever a previous write left behind into the engine.
     ///
-    /// A short write can leave bytes in `pending` after `poll_write` has told
-    /// its caller they were consumed. Without this, a caller that writes once
-    /// and then waits for an answer (a lane's request/response traffic) would
-    /// hold those bytes until its next write, which may never come.
+    /// A frame the engine took in part waits in `pending` while its caller is
+    /// told to wait, so a caller that wants those bytes out *now* — a lane's
+    /// request/response traffic, which writes and then waits for the answer —
+    /// needs this. What it delivers on the caller's behalf is remembered in
+    /// `owed`: the next `poll_write` reports it, and the caller's retried
+    /// buffer is not written twice.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.write.pending.is_empty() {
@@ -360,6 +399,7 @@ impl AsyncWrite for QuicStream {
         let mut connection = this.shared.connection.lock();
         match flush(&mut connection, this.id, &mut this.write.pending) {
             Ok(_) if this.write.pending.is_empty() => {
+                this.write.owed += std::mem::take(&mut this.write.pending_from);
                 drop(connection);
                 this.shared.poke();
                 Poll::Ready(Ok(()))
@@ -385,7 +425,12 @@ impl AsyncWrite for QuicStream {
         // discard exactly the last frame a lane wrote.
         if !this.write.pending.is_empty() {
             match flush(&mut connection, this.id, &mut this.write.pending) {
-                Ok(_) if this.write.pending.is_empty() => {}
+                Ok(_) if this.write.pending.is_empty() => {
+                    // The bytes are in and the FIN closes the stream: there is
+                    // no caller left to owe them to.
+                    this.write.pending_from = 0;
+                    this.write.owed = 0;
+                }
                 Ok(_) => {
                     this.shared.park(this.id, Wait::Write, cx.waker());
                     return Poll::Pending;
@@ -406,19 +451,31 @@ impl AsyncWrite for QuicStream {
 }
 
 /// Push as much of the pending buffer into the engine as it will take.
+///
+/// It keeps going until the buffer is empty or the engine refuses *outright*,
+/// and that last attempt is the point: the engine reports a stream as writable
+/// again only after a call returned `Blocked`. Stopping at a short write leaves
+/// the stream invisible to the engine's writable list, so the waker this handle
+/// parks is never fired — a lane that wrote one batch then waited for the
+/// answer would wait for ever, with both engines idle. (Measured: the
+/// `cost`/`loss1` cell carried ~200 pps of probes and no bulk at all.)
 fn flush(connection: &mut Connection, id: StreamId, pending: &mut Vec<u8>) -> io::Result<usize> {
-    if pending.is_empty() {
-        return Ok(0);
-    }
-    match connection.send_stream(id).write(pending) {
-        Ok(written) => {
-            pending.drain(..written);
-            Ok(written)
+    let mut total = 0;
+    while !pending.is_empty() {
+        match connection.send_stream(id).write(pending) {
+            // Nothing taken and no refusal: the engine has no room it will
+            // report, so stop rather than spin.
+            Ok(0) => break,
+            Ok(written) => {
+                pending.drain(..written);
+                total += written;
+            }
+            Err(WriteError::Blocked) => break,
+            Err(WriteError::Stopped(code)) => return Err(reset(code)),
+            Err(WriteError::ClosedStream) => return Err(gone()),
         }
-        Err(WriteError::Blocked) => Ok(0),
-        Err(WriteError::Stopped(code)) => Err(reset(code)),
-        Err(WriteError::ClosedStream) => Err(gone()),
     }
+    Ok(total)
 }
 
 impl AsyncRead for QuicStream {
