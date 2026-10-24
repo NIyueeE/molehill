@@ -136,6 +136,12 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **A 1452-byte datagram instead of 1200 is worth 4-14 % (2026-10-24).**
+    QUIC's 1200 is a guaranteed minimum, not a choice, and this carrier's cost
+    is per packet: the loopback ceiling moved 2386 -> 2726 Mbit/s, `bulk-1`
+    2.70 -> 2.80, `bulk-n` 5.04 -> 5.64, and the clean cell 0.94 -> 0.82 s/Gbit
+    (5.7 -> 6.6 Gbit/s). Path MTU discovery stays off; 1452 is safe under a
+    1500-byte link, which is what every path this carrier rides on carries.
   - **The next lever is the send path's ownership, not a knob**: quinn copies
     each write into its stream buffer and again into the packet it builds,
     because our seam is `AsyncWrite` and hands it a `&[u8]`. The hub already

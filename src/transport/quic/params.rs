@@ -51,6 +51,13 @@ pub(crate) fn transport_config() -> Arc<TransportConfig> {
             bbr.initial_window(2 * 1024 * 1024);
             bbr
         }))
+        // A 1200-byte datagram is QUIC's guaranteed minimum, not a choice: on a
+        // 1500-byte path it buys 20 % more packets per byte than the path
+        // allows, and the carrier's cost is per packet. Discovery stays off
+        // (`allow_mtud` is false at every call site), so this is the size every
+        // path gets: it is safe under a 1500-byte link MTU, which is what the
+        // bench and every tunnel this carrier rides on carries.
+        .initial_mtu(1452)
         .stream_receive_window(VarInt::from_u32(STREAM_WINDOW))
         .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
         .send_window(u64::from(CONNECTION_WINDOW))
