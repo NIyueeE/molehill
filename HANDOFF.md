@@ -136,6 +136,22 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **The `cost` cell has a mechanism now: a lane that accepts frames and
+    delivers none (2026-10-24).** With `RUST_LOG=debug` and `MOLEHILL_L3_STATS`
+    on the failing cell, claim `2402` (the iperf service) has **one** lane with
+    **one** flow and the client counts `forwarded=5 enqueued=5 overflow=0
+    no_channel=0`, while the server counts `injected=0` for the same member:
+    five frames were accepted by the hub and never arrived. The reverse
+    direction on that lane works (server `forwarded=10`, client `injected=7`),
+    so the lane is half-dead, and iperf3's control connection stalls on the
+    first exchange — which is exactly the observed 86 s timeout. The probes'
+    claim (`2401`) meanwhile has seven lanes with ~294 flows each and carries
+    everything it offers, so this is not load. `MemberGuard::drop` does call
+    `vacate`, so the queue has a consumer: the frames reach a pump that writes
+    them into a carrier stream that delivers nothing, without an error the
+    hub counts. The next step is to make that visible — a per-lane count of
+    frames the pump actually wrote, and of write errors — so a quiet pump
+    stops looking like a healthy lane.
   - **An in-process multi-endpoint probe stalls, and that is suspicious in itself
     (2026-10-24).** Three lanes, each with its own server socket, one flow each:
     1.09 MB in 120 s. Three flows each: 2.7 MB in 120 s. The bench carries ten
