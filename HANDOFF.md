@@ -136,6 +136,16 @@
     0.90 s = 2386 Mbit/s (300 MB/s). That is the same number the 1 % loss leg
     gives for `bulk-1` (2.7), which rules out the path, the windows and the
     controller and puts the cost inside the carrier's own datagram path.
+  - **A probe that will not run, and what it suggests (2026-10-24).** An
+    in-process version of the many-lane cell (four client endpoints, one
+    server endpoint, no hub) never gets its fourth stream: three arrive, the
+    fourth times out even when nothing is writing yet. It could be the test's
+    own shape, but it is worth chasing because the same symptom — a lane that
+    never carries — is what made the pool re-dial 41 times in the first
+    session, and it would depress every many-lane cell. The next round
+    confirms it on the bench instead: `MOLEHILL_QUIC_STATS=1` on `bulk-n`,
+    count how many connections carry data against how many lanes the hub
+    reports.
   - **KCP's eight-stream cell uses the same three lanes and gets 3.6 Gbit/s
     per lane (2026-10-24).** `bulk-n` with `MOLEHILL_L3_STATS=1` on a KCP-only
     build: 10.73-10.86 Gbit/s over three members (2.92M + 2.80M + 2.02M
