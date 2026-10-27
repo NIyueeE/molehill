@@ -23,6 +23,10 @@ pub(crate) struct SendBuf {
     base: u64,
     /// The offset the writer finished at, once it has.
     fin_at: Option<u64>,
+    /// How far the wire has already been given these bytes. Without it a sender
+    /// would re-send the first unacknowledged range on every pass, which is a
+    /// retransmission storm rather than a stream.
+    sent: u64,
 }
 
 impl SendBuf {
@@ -46,6 +50,7 @@ impl SendBuf {
         let drop = usize::try_from(upto - self.base).unwrap_or(self.data.len());
         self.data.drain(..drop);
         self.base = upto;
+        self.sent = self.sent.max(self.base);
     }
 
     /// Finish the stream: no byte past this offset will be written.
@@ -58,9 +63,26 @@ impl SendBuf {
         self.fin_at.is_some()
     }
 
-    /// The offset of the first byte the peer does not have.
+    /// The offset the next packet should carry: the first byte neither
+    /// acknowledged nor already on the wire.
     pub(crate) fn next_offset(&self) -> u64 {
-        self.base
+        self.sent.max(self.base)
+    }
+
+    /// Record that a range starting here has been handed to the socket.
+    pub(crate) fn mark_sent(&mut self, len: usize) {
+        self.sent = self.next_offset().saturating_add(len as u64);
+    }
+
+    /// Rewind the send point to a range the peer never acknowledged, so the next
+    /// pass carries it again.
+    pub(crate) fn rewind_to(&mut self, offset: u64) {
+        self.sent = offset.max(self.base);
+    }
+
+    /// Whether any queued byte has not been on the wire yet.
+    pub(crate) fn has_unsent(&self) -> bool {
+        self.next_offset() < self.base + self.data.len() as u64
     }
 
     /// Unacknowledged bytes, which is what a credit window is spent on.

@@ -73,6 +73,18 @@ anywhere. The run that would answer it is
 interleaved on one host; until it exists, phases 3-5 proceed on the plan's
 reasoning and not on evidence.
 
+**Open in the new engine (P3a, in progress).** The wire format, the stream
+buffers, the recovery rules and the connection state machine are in the tree and
+unit-tested, and bytes written on one connection are read on the other through
+the in-memory link. What is *not* wired is the retransmission path: a range the
+recovery declares lost is rewound in the send buffer, but the connection only
+re-sends a stream that still reports unsent bytes, and after a rewind the
+range sits behind the already-sent watermark. Two tests state the intent and are
+ignored with that reason rather than deleted:
+a_dropped_datagram_is_recovered_without_losing_a_stream and
+a_lost_datagram_holds_one_stream_and_not_the_other. Fixing it is the first thing
+P3a-4 does next; nothing in the product runs this engine yet.
+
 Two defects were found by the phases themselves, both worth remembering:
 losing the receive region on the first `EAGAIN` (a batch that can never receive
 again) and parking an oversize datagram instead of shrinking (a retry loop that
