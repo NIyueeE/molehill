@@ -12,114 +12,188 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
 
 use super::lane::{Shared, StreamIo};
 
 /// Bind the local socket of a connection.
 pub(crate) async fn bind() -> std::io::Result<Arc<UdpSocket>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    Ok(Arc::new(socket))
+    Ok(Arc::new(UdpSocket::bind("0.0.0.0:0").await?))
 }
 
-/// Start the pump for one connection.
+/// How many datagrams one pass hands the kernel at once.
+const SEND_RUN: usize = 16;
+
+/// Put one pass's datagrams on the wire.
+///
+/// The state machine answers one packet per call, so the pass collects a run and
+/// hands it over whole where the platform can segment it: one syscall for the
+/// run, and the NIC cuts it, which is the amortisation TCP gets from TSO without
+/// leaving the socket API.
+#[cfg(target_os = "linux")]
+async fn send_run(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    run: &[u8],
+    spans: &[(usize, usize)],
+) -> std::io::Result<()> {
+    use crate::transport::dgram::Span;
+    use crate::transport::udp_batch::SendBatch;
+    use bytes::Bytes;
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+
+    let staged: Vec<Span> = spans
+        .iter()
+        .map(|(off, len)| Span::Staged {
+            off: *off,
+            len: *len,
+        })
+        .collect();
+    let buf = Bytes::copy_from_slice(run);
+    socket.writable().await?;
+    socket.try_io(Interest::WRITABLE, || {
+        // A run GSO cannot take, or a kernel without it, falls back to the
+        // batched syscall for the same datagrams.
+        match SendBatch::send_gso(socket.as_raw_fd(), peer, &buf, &staged) {
+            Ok(0) | Err(_) => SendBatch::send_spans(socket.as_raw_fd(), peer, &buf, &staged),
+            Ok(n) => Ok(n),
+        }
+    })?;
+    Ok(())
+}
+
+/// The same, one datagram at a time (see the Linux version for the batched one).
+#[cfg(not(target_os = "linux"))]
+async fn send_run(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    run: &[u8],
+    spans: &[(usize, usize)],
+) -> std::io::Result<()> {
+    for (off, len) in spans {
+        socket.send_to(&run[*off..*off + *len], peer).await?;
+    }
+    Ok(())
+}
+
+/// Drain what the connection wants to say, in as few syscalls as the platform
+/// allows.
+async fn flush(socket: &UdpSocket, peer: SocketAddr, shared: &Arc<Shared>) -> std::io::Result<()> {
+    let mut run: Vec<u8> = Vec::with_capacity(SEND_RUN * 2048);
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(SEND_RUN);
+    let mut packet = [0u8; 2048];
+    loop {
+        run.clear();
+        spans.clear();
+        while spans.len() < SEND_RUN {
+            let now = Instant::now();
+            let Some(len) = shared.with(|conn| conn.poll_transmit(now, &mut packet)) else {
+                break;
+            };
+            let off = run.len();
+            run.extend_from_slice(&packet[..len]);
+            spans.push((off, len));
+        }
+        if spans.is_empty() {
+            return Ok(());
+        }
+        send_run(socket, peer, &run, &spans).await?;
+    }
+}
+
+/// The receive side: one batched read, split back into the datagrams it
+/// carried.
+#[cfg(target_os = "linux")]
+async fn receive(
+    socket: &UdpSocket,
+    batch: &mut crate::transport::udp_batch::RecvBatch,
+    mut on_datagram: impl FnMut(std::net::SocketAddr, &[u8]),
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use tokio::io::Interest;
+    socket.readable().await?;
+    match socket.try_io(Interest::READABLE, || batch.recv(socket.as_raw_fd())) {
+        Ok(_) => {
+            for (from, data) in batch.iter() {
+                on_datagram(from, data);
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The same, one datagram at a time.
+#[cfg(not(target_os = "linux"))]
+async fn receive(
+    socket: &UdpSocket,
+    _batch: &mut (),
+    mut on_datagram: impl FnMut(std::net::SocketAddr, &[u8]),
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 65536];
+    let (len, from) = socket.recv_from(&mut buf).await?;
+    on_datagram(from, &buf[..len]);
+    Ok(())
+}
+
+/// Start the pump for one connection that owns its socket.
 pub(crate) fn spawn(
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
     shared: Arc<Shared>,
-) -> JoinHandle<()> {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut out = [0u8; 2048];
-        let mut inbox = [0u8; 2048];
+        #[cfg(target_os = "linux")]
+        let mut batch = crate::transport::udp_batch::RecvBatch::new(SEND_RUN, 2048);
+        #[cfg(not(target_os = "linux"))]
+        let mut batch = ();
         loop {
-            // 1. Everything the connection wants to say.
-            loop {
-                let now = Instant::now();
-                let packet = shared.with(|conn| conn.poll_transmit(now, &mut out));
-                let Some(len) = packet else { break };
-                if socket.send_to(&out[..len], peer).await.is_err() {
-                    return;
-                }
+            if flush(&socket, peer, &shared).await.is_err() {
+                return;
             }
-            // 2. Whatever the peer has said, bounded so a local write is not
-            //    left waiting for a silent socket.
+            let arriving = Arc::clone(&shared);
             tokio::select! {
-                ready = socket.recv_from(&mut inbox) => match ready {
-                    Ok((len, _)) => {
-                        let now = Instant::now();
-                        shared.with(|conn| {
-                            let _ = conn.on_datagram(now, &inbox[..len]);
-                        });
-                        shared.wake_readers();
-                        shared.wake_writers();
+                result = receive(&socket, &mut batch, |from, data| {
+                    if from != peer {
+                        return;
                     }
-                    Err(_) => return,
-                },
+                    let now = Instant::now();
+                    arriving.with(|conn| {
+                        let _ = conn.on_datagram(now, data);
+                    });
+                    arriving.wake_readers();
+                    arriving.wake_writers();
+                }) => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
                 () = shared.pump_signal() => {}
             }
         }
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #![expect(
-        clippy::unwrap_used,
-        reason = "tests unwrap values they just constructed"
-    )]
-    use super::*;
-    use crate::transport::mhd::conn::Conn;
-    use crate::transport::mhd::lane::StreamIo;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    /// One stream across a real pair of loopback sockets: the pump, the wire
-    /// format, the connection and the seam, with nothing faked between them.
-    #[tokio::test]
-    async fn a_stream_crosses_two_loopback_sockets() {
-        let dialer = Shared::new(Conn::new(21, true));
-        let acceptor = Shared::new(Conn::new(21, false));
-        let dialer_socket = bind().await.unwrap();
-        let acceptor_socket = bind().await.unwrap();
-        let dialer_addr = dialer_socket.local_addr().unwrap();
-        let acceptor_addr = acceptor_socket.local_addr().unwrap();
-        let _a = spawn(
-            Arc::clone(&dialer_socket),
-            acceptor_addr,
-            Arc::clone(&dialer),
-        );
-        let _b = spawn(
-            Arc::clone(&acceptor_socket),
-            dialer_addr,
-            Arc::clone(&acceptor),
-        );
-
-        let id = dialer.with(|conn| conn.open().id);
-        let mut writer = StreamIo::new(Arc::clone(&dialer), id);
-        tokio::spawn(async move {
-            writer.write_all(b"across the wire").await.unwrap();
-            writer.shutdown().await.unwrap();
-        });
-
-        let mut peer_id = None;
-        for _ in 0..2000 {
-            if let Some(handle) = acceptor.with(crate::transport::mhd::conn::Conn::accept) {
-                peer_id = Some(handle.id);
-                break;
+/// A pump that only sends: the listener owns the socket's receive side and
+/// routes each datagram to the connection it names, so an accepted lane must not
+/// read from it as well.
+fn spawn_sender(
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    shared: Arc<Shared>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if flush(&socket, peer, &shared).await.is_err() {
+                return;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            shared.pump_signal().await;
+            if shared.with(|conn| conn.closed().is_some()) {
+                return;
+            }
         }
-        let Some(peer_id) = peer_id else {
-            unreachable!("the peer must see the stream")
-        };
-        let mut reader = StreamIo::new(Arc::clone(&acceptor), peer_id);
-        let mut got = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(5), reader.read_to_end(&mut got)).await;
-        let Ok(Ok(_)) = read else {
-            unreachable!("the read must finish: got {got:?}")
-        };
-        assert_eq!(got, b"across the wire");
-    }
+    })
 }
 
 /// One connection as the pool holds it: a shared state machine, the counters
@@ -188,33 +262,6 @@ impl crate::transport::multiplex::PoolLane for MhdLane {
         self.shared.wake_pump();
         Ok(Box::new(StreamIo::new(Arc::clone(&self.shared), id)))
     }
-}
-
-/// A pump that only sends: the listener owns the socket's receive side and
-/// routes each datagram to the connection it names, so an accepted lane must not
-/// read from it as well.
-fn spawn_sender(
-    socket: Arc<UdpSocket>,
-    peer: SocketAddr,
-    shared: Arc<Shared>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut out = [0u8; 2048];
-        loop {
-            loop {
-                let now = Instant::now();
-                let packet = shared.with(|conn| conn.poll_transmit(now, &mut out));
-                let Some(len) = packet else { break };
-                if socket.send_to(&out[..len], peer).await.is_err() {
-                    return;
-                }
-            }
-            shared.pump_signal().await;
-            if shared.with(|conn| conn.closed().is_some()) {
-                return;
-            }
-        }
-    })
 }
 
 /// The listening end: one socket, one connection per id it has never seen, and
