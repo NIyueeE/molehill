@@ -29,6 +29,47 @@ use tracing::{debug, info};
 /// A multiplexed stream adapted to tokio's IO traits.
 pub type MuxStream = crate::mux::Stream;
 
+/// One carrier stream, whichever carrier produced it.
+///
+/// The pool places streams and charges them to a lane; what a stream *is* —
+/// a yamux stream over TCP, or the datagram carrier's own — is the lane's
+/// business. Boxing is what keeps that sentence true in the type system.
+pub(crate) trait CarrierIo:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+{
+}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> CarrierIo for T {}
+
+pub(crate) type CarrierStream = Box<dyn CarrierIo>;
+
+/// Why a lane refused to open a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneError {
+    /// The lane is gone; the pool repairs it.
+    Closed,
+    /// The lane is at its stream ceiling right now.
+    Busy,
+}
+
+impl From<crate::mux::ConnectionError> for LaneError {
+    fn from(error: crate::mux::ConnectionError) -> Self {
+        match error {
+            crate::mux::ConnectionError::TooManyStreams => Self::Busy,
+            _ => Self::Closed,
+        }
+    }
+}
+
+impl std::fmt::Display for LaneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Closed => f.write_str("the lane is gone"),
+            Self::Busy => f.write_str("the lane is at its stream ceiling"),
+        }
+    }
+}
+
 /// Announce a freshly opened outbound stream, then deliver it to the caller.
 ///
 /// rust-yamux opens outbound streams lazily: the SYN flag is piggybacked on
@@ -351,7 +392,7 @@ impl TunnelCounters {
 /// implements both IO traits), so the charge lives exactly as long as the data
 /// channel does.
 pub(crate) struct StreamLease {
-    stream: MuxStream,
+    stream: CarrierStream,
     /// The id of the tunnel this stream is charged to (unique per process).
     tunnel_id: usize,
     counters: std::sync::Arc<TunnelCounters>,
@@ -547,7 +588,7 @@ pub(crate) trait PoolLane: Send + Sync {
     /// Stop placing anything on this lane: its connection is gone.
     fn mark_dead(&self);
     /// Open one stream, charged to this lane.
-    async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError>;
+    async fn open_stream(&self) -> Result<CarrierStream, LaneError>;
 }
 
 /// One live tunnel of a pool.
@@ -623,7 +664,7 @@ pub(crate) enum OpenError {
     /// The pool has no tunnel at all (nothing established, no dialer).
     NoTunnel,
     /// Every candidate tunnel refused the stream.
-    Refused(crate::mux::ConnectionError),
+    Refused(LaneError),
     /// Every tunnel is at [`crate::transport::pool::TUNNEL_STREAM_CEILING`] and
     /// the pool could not reach its count (its own `tunnels`, or the server's
     /// `max_tunnels` valve), or the carrier's dial failed.
@@ -2248,13 +2289,13 @@ impl TunnelPool {
                     tunnel = index,
                     "pool-stats: tunnel refused an open: {e}"
                 );
-                let note = if matches!(e, crate::mux::ConnectionError::TooManyStreams) {
+                let note = if matches!(e, LaneError::Busy) {
                     // A cap hit is a refusal of this open, never a death:
                     // record it and report it back to the caller.
                     PlacementStats::record(placement, started.elapsed(), Some("too_many_streams"));
                     return Err(OpenError::Refused(e));
                 } else {
-                    if matches!(e, crate::mux::ConnectionError::Closed) {
+                    if matches!(e, LaneError::Closed) {
                         // A tunnel died, so a retried growth is meaningful
                         // again: cut the failed-growth hold short (D14). The
                         // tunnel itself is marked dead here rather than left
@@ -2293,7 +2334,7 @@ impl TunnelPool {
                         }
                         Err(e) => {
                             next.tunnel.counters().release();
-                            if matches!(e, crate::mux::ConnectionError::Closed) {
+                            if matches!(e, LaneError::Closed) {
                                 // Another dead tunnel: same as above (D14).
                                 next.tunnel.mark_dead();
                                 self.release_growth_hold();
@@ -3461,8 +3502,9 @@ impl PoolLane for ClientTunnel {
         Self::mark_dead(self);
     }
 
-    async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError> {
-        Self::open_stream(self).await
+    async fn open_stream(&self) -> Result<CarrierStream, LaneError> {
+        let stream = Self::open_stream(self).await.map_err(LaneError::from)?;
+        Ok(Box::new(stream))
     }
 }
 
