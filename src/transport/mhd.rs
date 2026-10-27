@@ -1,4 +1,4 @@
-//! Thin tokio adapter around the in-house mhd state machine (`mhd` feature,
+//! Thin tokio adapter around the in-house state machine (`mhd` feature,
 //! arm 2 of the transport comparison).
 //!
 //! The `mhd` module (`src/mhd/`) is a pure state machine implementing the
@@ -81,6 +81,12 @@
 //! arm-2 stack Noise rides **on top** of `MhdStream`
 //! (`NoiseStream<MhdStream>`), replacing only the plaintext TCP leg of a
 //! tunnel; the tunnel hello/ack and yamux layers are unchanged.
+
+#[expect(
+    dead_code,
+    reason = "the multi-stream engine is built under its own tests; the connection that consumes it lands next"
+)]
+pub(crate) mod wire;
 
 use std::collections::HashMap;
 use std::io;
