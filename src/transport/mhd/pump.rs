@@ -9,17 +9,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use super::lane::{Shared, StreamIo};
-
-/// How long one pass waits for a datagram before re-checking what it owes the
-/// peer.
-const IDLE_WAIT: Duration = Duration::from_millis(2);
 
 /// Bind the local socket of a connection.
 pub(crate) async fn bind() -> std::io::Result<Arc<UdpSocket>> {
@@ -48,19 +43,20 @@ pub(crate) fn spawn(
             }
             // 2. Whatever the peer has said, bounded so a local write is not
             //    left waiting for a silent socket.
-            match tokio::time::timeout(IDLE_WAIT, socket.recv_from(&mut inbox)).await {
-                Ok(Ok((len, _))) => {
-                    let now = Instant::now();
-                    shared.with(|conn| {
-                        let _ = conn.on_datagram(now, &inbox[..len]);
-                    });
-                    shared.wake_readers();
-                    shared.wake_writers();
-                }
-                Ok(Err(_)) => return,
-                Err(_elapsed) => {}
+            tokio::select! {
+                ready = socket.recv_from(&mut inbox) => match ready {
+                    Ok((len, _)) => {
+                        let now = Instant::now();
+                        shared.with(|conn| {
+                            let _ = conn.on_datagram(now, &inbox[..len]);
+                        });
+                        shared.wake_readers();
+                        shared.wake_writers();
+                    }
+                    Err(_) => return,
+                },
+                () = shared.pump_signal() => {}
             }
-            shared.wake_pump();
         }
     })
 }
@@ -74,6 +70,7 @@ mod tests {
     use super::*;
     use crate::transport::mhd::conn::Conn;
     use crate::transport::mhd::lane::StreamIo;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// One stream across a real pair of loopback sockets: the pump, the wire
@@ -212,7 +209,7 @@ fn spawn_sender(
                     return;
                 }
             }
-            tokio::time::sleep(IDLE_WAIT).await;
+            shared.pump_signal().await;
             if shared.with(|conn| conn.closed().is_some()) {
                 return;
             }
@@ -301,6 +298,7 @@ mod lane_tests {
     )]
     use super::*;
     use crate::transport::multiplex::PoolLane;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The pool's own view: a dialing lane and a listening lane, one stream

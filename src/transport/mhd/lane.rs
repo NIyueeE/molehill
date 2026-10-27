@@ -23,8 +23,6 @@ struct Wakers {
     readers: Vec<Waker>,
     /// Writers the peer's credit is holding back.
     writers: Vec<Waker>,
-    /// The task that moves datagrams onto the socket.
-    pump: Option<Waker>,
 }
 
 /// One connection, shared by its streams and its pump.
@@ -32,6 +30,12 @@ struct Wakers {
 pub(crate) struct Shared {
     conn: Mutex<Conn>,
     wakers: Mutex<Wakers>,
+    /// Tells the pump there is something new to send.
+    ///
+    /// A notification rather than a stored waker: the pump waits on a select
+    /// between the socket and this, so one signal is all it needs and a wake-up
+    /// that arrives between two passes is not lost.
+    signal: tokio::sync::Notify,
 }
 
 impl Shared {
@@ -40,6 +44,7 @@ impl Shared {
         Arc::new(Self {
             conn: Mutex::new(conn),
             wakers: Mutex::new(Wakers::default()),
+            signal: tokio::sync::Notify::new(),
         })
     }
 
@@ -49,16 +54,14 @@ impl Shared {
         f(&mut conn)
     }
 
-    /// Wake everyone the pump should notice.
+    /// Tell the pump there is something new to send.
     pub(crate) fn wake_pump(&self) {
-        if let Some(waker) = self.wakers.lock().pump.take() {
-            waker.wake();
-        }
+        self.signal.notify_one();
     }
 
-    /// Register the pump, so a write wakes it.
-    pub(crate) fn register_pump(&self, waker: &Waker) {
-        self.wakers.lock().pump = Some(waker.clone());
+    /// Wait until someone says there is something to send.
+    pub(crate) async fn pump_signal(&self) {
+        self.signal.notified().await;
     }
 
     /// Wake readers: bytes arrived, or the stream ended.
