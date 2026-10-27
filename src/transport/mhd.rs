@@ -297,6 +297,26 @@ const PONG_TIMEOUT: Duration = Duration::from_millis(2500);
 const SACK_COOLDOWN: Duration = Duration::from_millis(10);
 const SACK_PILEUP_SEGMENTS: usize = 16;
 
+/// The token bucket that spaces one session's datagrams.
+///
+/// ## Why the pacer is here and not in the kernel
+///
+/// Linux can pace a UDP socket from the qdisc (`SO_MAX_PACING_RATE` against an
+/// fq qdisc), and this project does not use it. Two reasons, both independent:
+///
+/// - **Nothing to gain at this granularity.** Kernel pacing exists to space
+///   individual datagrams. This adapter already hands the kernel one batch per
+///   wakeup (GSO, or sendmmsg on a kernel without it), so the timing a qdisc
+///   would add is one decision per batch rather than one per packet — the same
+///   order as the token bucket's own arithmetic.
+/// - **It is not reachable under the unsafe ban.** nix has no binding for
+///   `SO_MAX_PACING_RATE`, and reaching past nix for one setsockopt would put an
+///   unsafe block in the send path for a no-gain timing change. The same
+///   reasoning already governs `IP_MTU_DISCOVER` in the pump.
+///
+/// What the pacer is *told* to run at is a separate question, and the crude
+/// answer here (PONG round trips, multiplicative down/up) is what the
+/// rate-estimating congestion control replaces.
 struct Pacer {
     tokens: f64,
     last: Instant,
@@ -968,6 +988,62 @@ type SessionKey = (SocketAddr, u32);
 
 /// How a session's pump reaches its UDP socket. `gone_tx` is `Some` for
 /// server sessions, so the dispatcher can forget them when the pump exits.
+/// How many listener sockets one acceptor binds.
+///
+/// One per core would over-subscribe: every dispatcher is a task on the same
+/// runtime and the accepted channel is one contention point. Four is where the
+/// kernel's own hashing stops paying for the extra tables.
+fn listener_socket_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 4)
+}
+
+/// Bind the listener sockets the acceptor dispatches from.
+///
+/// With `SO_REUSEPORT` the kernel spreads arriving 4-tuples over the sockets, so
+/// receive work lands on more than one core instead of one. Without it the same
+/// address cannot be bound twice and the fallback is a single socket, which is
+/// what this carrier did before. A port-0 or wildcard bind takes its concrete
+/// address from the first socket, so the rest share exactly that port.
+async fn bind_listener_sockets<A: tokio::net::ToSocketAddrs + Send>(
+    addr: A,
+) -> Result<Vec<Arc<UdpSocket>>> {
+    let resolved = tokio::net::lookup_host(addr)
+        .await
+        .context("Failed to resolve the mhd listener address")?
+        .next()
+        .context("The mhd listener address resolved to nothing")?;
+    let first = shared_socket(resolved)?;
+    let bound = first.local_addr()?;
+    let want = listener_socket_count();
+    let mut sockets = vec![Arc::new(first)];
+    for _ in 1..want {
+        match shared_socket(bound) {
+            Ok(socket) => sockets.push(Arc::new(socket)),
+            Err(e) => {
+                debug!("Only one mhd listener socket: {e}");
+                break;
+            }
+        }
+    }
+    Ok(sockets)
+}
+
+/// One non-blocking UDP socket bound with `SO_REUSEPORT`.
+fn shared_socket_for(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+fn shared_socket(addr: SocketAddr) -> io::Result<UdpSocket> {
+    UdpSocket::from_std(shared_socket_for(addr)?)
+}
+
 struct SessionNet {
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
@@ -2998,16 +3074,27 @@ impl std::fmt::Debug for MhdAcceptor {
 impl MhdAcceptor {
     /// Bind the listener socket and start the dispatcher task.
     pub async fn bind<A: tokio::net::ToSocketAddrs + Send>(addr: A) -> Result<MhdAcceptor> {
-        let socket = UdpSocket::bind(&addr)
+        let sockets = bind_listener_sockets(addr)
             .await
             .with_context(|| "Failed to bind the mhd listener socket")?;
+        let socket = Arc::clone(&sockets[0]);
         let bound = socket.local_addr()?;
-        tune_socket_buffers(&socket);
-        let socket = Arc::new(socket);
+        for socket in &sockets {
+            tune_socket_buffers(socket);
+        }
 
         let (accepted_tx, accepted_rx) = mpsc::channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        tokio::spawn(dispatch(Arc::clone(&socket), accepted_tx, shutdown_rx));
+        // One dispatcher per socket. The kernel hashes the 4-tuple, so a
+        // session always reaches the same socket and that socket's table is the
+        // whole truth for the sessions it sees; the accepted channel is shared.
+        for socket in &sockets {
+            tokio::spawn(dispatch(
+                Arc::clone(socket),
+                accepted_tx.clone(),
+                shutdown_rx.clone(),
+            ));
+        }
 
         debug!(
             %bound,
