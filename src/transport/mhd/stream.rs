@@ -27,6 +27,13 @@ pub(crate) struct SendBuf {
     /// would re-send the first unacknowledged range on every pass, which is a
     /// retransmission storm rather than a stream.
     sent: u64,
+    /// Ranges the peer acknowledged, keyed by their start offset.
+    ///
+    /// Acknowledgements arrive per packet and out of order, so the base may only
+    /// advance over the contiguous run that starts at it. Advancing to the
+    /// highest acknowledged offset instead walks the base over a hole and
+    /// destroys the bytes behind it.
+    acked: BTreeMap<u64, u64>,
 }
 
 impl SendBuf {
@@ -41,16 +48,23 @@ impl SendBuf {
     ///
     /// An acknowledgement past what was written is a peer mistake and is
     /// clamped, never trusted: it would otherwise drop bytes nobody sent.
-    pub(crate) fn ack(&mut self, upto: u64) {
+    pub(crate) fn ack(&mut self, offset: u64, len: usize) {
         let written = self.base + self.data.len() as u64;
-        let upto = upto.min(written);
-        if upto <= self.base {
+        let start = offset.max(self.base).min(written);
+        let end = offset.saturating_add(len as u64).min(written);
+        if end <= start {
             return;
         }
-        let drop = usize::try_from(upto - self.base).unwrap_or(self.data.len());
-        self.data.drain(..drop);
-        self.base = upto;
-        self.sent = self.sent.max(self.base);
+        self.acked.insert(start, end);
+        // Advance only over the run that starts at the base: a hole above it is
+        // exactly what a retransmission is for, and stepping past it would drop
+        // bytes the peer never acknowledged.
+        while let Some(end) = self.acked.remove(&self.base) {
+            let drop = usize::try_from(end - self.base).unwrap_or(self.data.len());
+            self.data.drain(..drop.min(self.data.len()));
+            self.base = end;
+            self.sent = self.sent.max(self.base);
+        }
     }
 
     /// Finish the stream: no byte past this offset will be written.
@@ -255,10 +269,10 @@ mod tests {
         let mut send = SendBuf::default();
         assert_eq!(send.write(b"hello world"), 0);
         assert_eq!(send.next_offset(), 0);
-        send.ack(6);
+        send.ack(0, 6);
         assert_eq!(send.next_offset(), 6);
         assert_eq!(send.unacked(), 5);
-        send.ack(1_000_000);
+        send.ack(0, 1_000_000);
         assert_eq!(send.next_offset(), 11, "an ack past the end is clamped");
         assert_eq!(send.unacked(), 0);
         assert!(send.range(0, 4).is_none(), "acknowledged bytes are gone");

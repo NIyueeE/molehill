@@ -317,7 +317,7 @@ impl Conn {
                 if let Some(range) = sent.range
                     && let Some(state) = self.streams.get_mut(&range.stream)
                 {
-                    state.send.ack(range.offset + u64::from(range.len));
+                    state.send.ack(range.offset, usize::from(range.len));
                 }
             }
             // A loss only rewinds the send point: the bytes are still in the
@@ -505,7 +505,6 @@ mod tests {
     /// A dropped datagram costs a round trip and nothing else: the timer puts
     /// the missing range back in the queue and the reader still gets the stream.
     #[test]
-    #[ignore = "retransmission is not wired end to end yet; see HANDOFF"]
     fn a_dropped_datagram_is_recovered_without_losing_a_stream() {
         let now = Instant::now();
         let mut link = Link::new();
@@ -545,7 +544,6 @@ mod tests {
     /// Two streams share one connection, and a loss on one of them is not a
     /// stall on the other: that is the property the whole engine exists for.
     #[test]
-    #[ignore = "retransmission is not wired end to end yet; see HANDOFF"]
     fn a_lost_datagram_holds_one_stream_and_not_the_other() {
         let now = Instant::now();
         let mut link = Link::new();
