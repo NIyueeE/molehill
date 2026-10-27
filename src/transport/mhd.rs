@@ -1535,6 +1535,29 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
     // very first batch. After an EAGAIN, `try_io` clears the cached flag, so
     // this await parks until the kernel send buffer drains — no spinning.
     net.socket.writable().await?;
+    // One super-packet first: the kernel segments it, so a batch of N datagrams
+    // costs one syscall instead of N, and the NIC segments instead of the host.
+    // A batch GSO cannot take (an interleaved short control frame) answers
+    // Ok(0) and falls through; a kernel without UDP_SEGMENT answers an error
+    // once and is not asked again.
+    if gso_available() {
+        let gso = net.socket.try_io(Interest::WRITABLE, || {
+            crate::transport::udp_batch::SendBatch::send_gso(
+                net.socket.as_raw_fd(),
+                net.peer,
+                buf,
+                spans,
+            )
+        });
+        match gso {
+            Ok(0) => {}
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(e),
+            Err(_) => {
+                GSO_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     // The send half is stateless: `nix` builds its descriptors per call.
     net.socket.try_io(Interest::WRITABLE, || {
         crate::transport::udp_batch::SendBatch::send_spans(
@@ -1544,6 +1567,19 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
             spans,
         )
     })
+}
+
+/// Whether this socket path takes GSO, learned from the first attempt.
+///
+/// The kernel reports an unusable `UDP_SEGMENT` as an error on the send rather
+/// than as a capability to query, so the answer is learned once: after one
+/// failed attempt every batch goes straight to the batched syscall.
+#[cfg(target_os = "linux")]
+static GSO_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(target_os = "linux")]
+fn gso_available() -> bool {
+    GSO_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Put one batch's spans on the wire, one datagram at a time (see the Linux

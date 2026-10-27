@@ -26,7 +26,7 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 
 use nix::sys::socket::{
-    ControlMessage, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg, sendmmsg,
+    ControlMessage, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg, sendmmsg, sendmsg,
 };
 
 use crate::mhd::MHD_OVERHEAD;
@@ -192,6 +192,54 @@ impl SendBatch {
         .map_err(io::Error::from)?;
         Ok(results.count())
     }
+
+    /// Send one batch's spans as **one GSO super-packet**.
+    ///
+    /// The kernel cuts the buffer at the `UDP_SEGMENT` size and the NIC emits the
+    /// pieces, so a batch of N datagrams costs one syscall and one skb per
+    /// segment instead of one per datagram — the amortisation TCP gets from
+    /// TSO. The kernel's rule is that every piece but the last is exactly one
+    /// segment long, so a batch that interleaves a short control frame is not
+    /// eligible: this answers Ok(0) for one and the caller falls back to
+    /// `send_spans`.
+    ///
+    /// The segment size is the first span's length, which is what the engine's
+    /// MTU-sized segments all share; the trailing piece may be shorter.
+    pub fn send_gso(fd: RawFd, peer: SocketAddr, buf: &Bytes, spans: &[Span]) -> io::Result<usize> {
+        let limit = spans.len().min(BATCH);
+        let Some(segment) = spans.first().map(Span::len).filter(|n| *n > 0) else {
+            return Ok(0);
+        };
+        let Ok(size) = u16::try_from(segment) else {
+            return Ok(0);
+        };
+        let mut n = 0;
+        while n < limit && spans[n].len() == segment {
+            n += 1;
+        }
+        if n < limit {
+            // The one shorter piece GSO allows, and only at the end.
+            n += 1;
+        }
+        if n < 2 {
+            return Ok(0);
+        }
+        let mut iovs: Vec<IoSlice<'_>> = Vec::with_capacity(n * 2);
+        for span in &spans[..n] {
+            match span {
+                Span::Staged { off, len } => iovs.push(IoSlice::new(&buf[*off..*off + *len])),
+                Span::Split { hdr_off, payload } => {
+                    iovs.push(IoSlice::new(&buf[*hdr_off..*hdr_off + MHD_OVERHEAD]));
+                    iovs.push(IoSlice::new(payload));
+                }
+            }
+        }
+        let address = SockaddrStorage::from(peer);
+        let cmsgs = [ControlMessage::UdpGsoSegments(&size)];
+        sendmsg(fd, &iovs, &cmsgs, MsgFlags::MSG_DONTWAIT, Some(&address))
+            .map_err(io::Error::from)?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +298,55 @@ mod tests {
             &expected[..],
             "the split datagram must be header + payload"
         );
+    }
+
+    /// A GSO batch reaches the peer as the individual datagrams it was built
+    /// from: the kernel cuts the buffer at the segment size, so nothing about
+    /// the wire changes — only the number of syscalls and skbs.
+    #[test]
+    fn a_gso_batch_arrives_as_individual_datagrams() {
+        /// Three equal segments: the shape GSO accepts.
+        const SEG: usize = 64;
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = receiver.local_addr().unwrap();
+
+        let mut staging = vec![0u8; SEG * 3];
+        for (index, chunk) in staging.chunks_mut(SEG).enumerate() {
+            chunk.fill(u8::try_from(index).unwrap());
+        }
+        let buf = Bytes::from(staging);
+        let spans: Vec<Span> = (0..3)
+            .map(|index| Span::Staged {
+                off: index * SEG,
+                len: SEG,
+            })
+            .collect();
+
+        match SendBatch::send_gso(sender.as_raw_fd(), peer, &buf, &spans) {
+            Ok(n) => {
+                assert_ne!(n, 0, "three equal segments are a GSO batch");
+                assert_eq!(n, 3, "all three segments travel as one super-packet");
+            }
+            Err(error) => {
+                // A kernel without UDP_SEGMENT answers an error on the send;
+                // the batched path covers that case, and this test cannot.
+                eprintln!("GSO is not available here: {error}");
+                return;
+            }
+        }
+
+        let mut got = [0u8; 256];
+        for index in 0..3 {
+            let (n, _) = receiver.recv_from(&mut got).unwrap();
+            assert_eq!(n, SEG, "segment {index} keeps its length");
+            assert!(
+                got[..n].iter().all(|b| *b == u8::try_from(index).unwrap()),
+                "segment {index} keeps its bytes"
+            );
+        }
     }
 }
