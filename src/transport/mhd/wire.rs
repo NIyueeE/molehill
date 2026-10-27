@@ -533,8 +533,18 @@ mod tests {
         assert_eq!(block.largest, 10);
         assert!(set.insert(70), "a jump folds the window forward");
         assert!(set.contains(70));
-        // The old window falls out of a 64-deep bitmap after a jump this size.
-        assert!(!set.contains(10), "the old window falls out");
+        assert!(
+            set.contains(10),
+            "a jump of sixty keeps the old window inside the bitmap"
+        );
+        assert!(
+            set.insert(200),
+            "a jump past the window drops what was below"
+        );
+        assert!(
+            !set.contains(70),
+            "the old window falls out of a 64-deep map"
+        );
     }
 
     /// Anything this carrier did not write is rejected, never guessed at.
