@@ -272,65 +272,114 @@ pub(crate) struct MhdListener {
     incoming: tokio::sync::mpsc::UnboundedReceiver<Arc<MhdLane>>,
 }
 
+/// How many listening sockets one acceptor binds.
+fn listener_socket_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, 4)
+}
+
+/// One non-blocking UDP socket bound with `SO_REUSEPORT`, so the kernel can spread
+/// arriving 4-tuples over several sockets instead of one.
+fn shared_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+/// Bind the sockets this listener dispatches from: the first takes the port, the
+/// rest share it. Without `SO_REUSEPORT` the address cannot be bound twice and the
+/// fallback is one socket, which is what the carrier had before.
+fn bind_listener_sockets(addr: SocketAddr) -> std::io::Result<Vec<Arc<UdpSocket>>> {
+    let first = shared_socket(addr)?;
+    let bound = first.local_addr()?;
+    let want = listener_socket_count();
+    let mut sockets = vec![Arc::new(first)];
+    for _ in 1..want {
+        match shared_socket(bound) {
+            Ok(socket) => sockets.push(Arc::new(socket)),
+            Err(_) => break,
+        }
+    }
+    Ok(sockets)
+}
+
+/// One socket's dispatcher: read a run, route what it carried.
+fn spawn_dispatcher(
+    socket: Arc<UdpSocket>,
+    registry: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Arc<Shared>>>>,
+    tx: tokio::sync::mpsc::UnboundedSender<Arc<MhdLane>>,
+    next_id: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    #[cfg(target_os = "linux")]
+    let mut batch = crate::transport::udp_batch::RecvBatch::new(16, 2048);
+    #[cfg(not(target_os = "linux"))]
+    let mut batch = ();
+    tokio::spawn(async move {
+        loop {
+            let mut arriving: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+            let read = receive(&socket, &mut batch, |from, data| {
+                arriving.push((from, data.to_vec()));
+            })
+            .await;
+            if read.is_err() {
+                return;
+            }
+            for (from, datagram) in arriving {
+                let buf = &datagram[..];
+                let Ok(packet) = crate::transport::mhd::wire::decode(buf) else {
+                    continue;
+                };
+                let now = Instant::now();
+                if let Some(shared) = registry.lock().get(&packet.id).cloned() {
+                    shared.with(|conn| {
+                        let _ = conn.on_datagram(now, buf);
+                    });
+                    shared.wake_readers();
+                    shared.wake_writers();
+                    continue;
+                }
+                let shared = Shared::new(crate::transport::mhd::conn::Conn::new(packet.id, false));
+                shared.with(|conn| {
+                    let _ = conn.on_datagram(now, buf);
+                });
+                registry.lock().insert(packet.id, Arc::clone(&shared));
+                let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
+                let lane = Arc::new(MhdLane {
+                    id,
+                    shared,
+                    counters: crate::transport::multiplex::TunnelCounters::for_lane(),
+                    _task: task,
+                });
+                if tx.send(lane).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+}
 impl MhdListener {
-    /// Bind the listener and start its dispatcher.
-    pub(crate) async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
-        let bound = socket.local_addr()?;
+    /// Bind the listener and start one dispatcher per socket.
+    pub(crate) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+        let sockets = bind_listener_sockets(addr)?;
+        let bound = sockets[0].local_addr()?;
         let (tx, incoming) = tokio::sync::mpsc::unbounded_channel();
         let registry: Arc<parking_lot::Mutex<std::collections::HashMap<u32, Arc<Shared>>>> =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let next_id = Arc::new(std::sync::atomic::AtomicUsize::new(1));
-        #[cfg(target_os = "linux")]
-        let mut batch = crate::transport::udp_batch::RecvBatch::new(16, 2048);
-        #[cfg(not(target_os = "linux"))]
-        let mut batch = ();
-        tokio::spawn(async move {
-            loop {
-                // One batched read, then route what it carried: a coalesced
-                // GRO run arrives here as the datagrams it was made of.
-                let mut arriving: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
-                let read = receive(&socket, &mut batch, |from, data| {
-                    arriving.push((from, data.to_vec()));
-                })
-                .await;
-                if read.is_err() {
-                    return;
-                }
-                for (from, datagram) in arriving {
-                    let buf = &datagram[..];
-                    let Ok(packet) = crate::transport::mhd::wire::decode(buf) else {
-                        continue;
-                    };
-                    let now = Instant::now();
-                    if let Some(shared) = registry.lock().get(&packet.id).cloned() {
-                        shared.with(|conn| {
-                            let _ = conn.on_datagram(now, buf);
-                        });
-                        shared.wake_readers();
-                        shared.wake_writers();
-                        continue;
-                    }
-                    let shared =
-                        Shared::new(crate::transport::mhd::conn::Conn::new(packet.id, false));
-                    shared.with(|conn| {
-                        let _ = conn.on_datagram(now, buf);
-                    });
-                    registry.lock().insert(packet.id, Arc::clone(&shared));
-                    let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
-                    let lane = Arc::new(MhdLane {
-                        id,
-                        shared,
-                        counters: crate::transport::multiplex::TunnelCounters::for_lane(),
-                        _task: task,
-                    });
-                    if tx.send(lane).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
+        for socket in sockets {
+            spawn_dispatcher(
+                socket,
+                Arc::clone(&registry),
+                tx.clone(),
+                Arc::clone(&next_id),
+            );
+        }
         Ok(Self {
             addr: bound,
             incoming,
@@ -367,7 +416,7 @@ mod lane_tests {
     #[tokio::test]
     async fn a_lane_opens_a_stream_the_listener_accepts() {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut listener = MhdListener::bind(addr).await.unwrap();
+        let mut listener = MhdListener::bind(addr).unwrap();
         let bound = listener.local_addr();
         let dialer = MhdLane::connect(bound, 3).await.unwrap();
 
