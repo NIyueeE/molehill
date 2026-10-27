@@ -47,6 +47,19 @@
 
 ## Where this stands
 
+**The swap that remains (P3a-6), and why it is one commit.** The new engine is
+complete and tested on its own: wire, stream buffers, recovery, connection,
+async seam, pump, lane and listener, each with unit tests, and the lane test runs
+the pool's real call path over a real socket. What is not done is pointing the
+product at it, and that cannot be done in halves: the old adapter speaks KCP's
+wire, so a client on the new engine cannot talk to a server on the old one. The
+swap is therefore: drop the engine module (the KCP state machine, 2096 lines),
+reduce the adapter file to the module root that declares the new ones, make
+MhdTunnelStream hold a boxed carrier stream instead of the KCP stream type, make
+the server's per-stream handler generic over its IO, replace MhdAcceptor with
+MhdListener on both ends, and delete connect_stream. The integration suite then
+exercises the new carrier by default, because the client tries mhd first.
+
 ### 1.0.0: the KCP carrier becomes `mhd` (branch `feat/v1.0.0`, from tag v0.11.2)
 
 The carrier is being rebuilt on its own code rather than another project's
