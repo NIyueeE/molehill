@@ -47,6 +47,38 @@
 
 ## Where this stands
 
+### 1.0.0: the KCP carrier becomes `mhd` (branch `feat/v1.0.0`, from tag v0.11.2)
+
+The carrier is being rebuilt on its own code rather than another project's
+name, in six gated phases. Landed so far, each green through the fast gates
+and the full serial suite:
+
+| Commit | What |
+|---|---|
+| `52cb6e6` | rename the carrier to `mhd`: engine module, adapter, feature, runtime enum, stats switch, status counters; the wire dialect moves 5.2 → **6.0** because the registration carries the carrier name |
+| `9b26073` | the pool holds `Arc<dyn PoolLane>` instead of a concrete yamux handle, so a second carrier can hand it lanes |
+| `28686e5` | GSO: a batch of equal-size datagrams leaves as one `sendmsg` with `UDP_SEGMENT`; the kernel segments, the NIC emits |
+| `1291c42` | GRO: the receive batch holds one region per run and splits it on the segment size the kernel reports |
+| `3de5953` | path MTU from the kernel's own `EMSGSIZE`: halve to the engine floor; no ICMP dependency |
+| `3dde835` | one listener socket per core under `SO_REUSEPORT`, and the recorded decision that pacing stays in userspace |
+| `1f191ee` | stage a session's batch for the datagram it runs at (45 KiB, not 256 KiB), with the bound pinned by a test |
+
+**The P2 gate is unmeasured, and that is the one open question.** The bench
+model refuses to start here: its topology is three network namespaces and two
+TUN devices, so it needs root, and this container has no working `sudo`
+(`sudo: unable to send audit message`). `cpu_s_per_gbit` for mhd against TCP
+is therefore **not** known, and no claim about the carrier's cost is made
+anywhere. The run that would answer it is
+`MOLEHILL_DATA_CARRIER=tcp|mhd sudo -n just bench --profile screen --aa`,
+interleaved on one host; until it exists, phases 3-5 proceed on the plan's
+reasoning and not on evidence.
+
+Two defects were found by the phases themselves, both worth remembering:
+losing the receive region on the first `EAGAIN` (a batch that can never receive
+again) and parking an oversize datagram instead of shrinking (a retry loop that
+never terminates).
+
+
 - **The release sweep is done and the PR is ready (2026-10-19).** The
   published run is the second one: 19:19–21:04 UTC (6265.5 s, 90 samples) at
   `69e8bd9` with `tree_clean: true`, host `86ab43dd4d4010c3` (the same
