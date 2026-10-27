@@ -89,6 +89,11 @@
 pub(crate) mod conn;
 #[expect(
     dead_code,
+    reason = "the seam is exercised by its own tests; the socket pump and the pool attach next"
+)]
+pub(crate) mod lane;
+#[expect(
+    dead_code,
     reason = "the multi-stream engine is built under its own tests; the connection that consumes it lands next"
 )]
 pub(crate) mod recovery;
