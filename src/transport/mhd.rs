@@ -2858,36 +2858,63 @@ impl AsyncWrite for MhdStream {
 /// the control transport is `noise` — arm 2 keeps the crypto stack and only
 /// replaces the TCP leg. The tunnel hello/ack and the yamux session ride on
 /// this.
-pub enum MhdTunnelStream {
-    /// Plain mhd (control transport is `tcp`).
+pub struct MhdTunnelStream {
+    /// The bytes, whichever shape they take.
+    io: MhdTunnelIo,
+    /// This session's own ARQ counters, carried rather than asked for: a stream
+    /// does not know its carrier's health, and the layer above needs it to judge
+    /// the tunnel.
+    health: Arc<crate::transport::health::SessionHealth>,
+}
+
+/// The two shapes one tunnel stream takes.
+enum MhdTunnelIo {
+    /// Plain mhd, no record layer.
     Plain(MhdStream),
-    /// Noise over mhd (control transport is `noise`). Boxed: the noise
-    /// state machine dwarfs the plain variant, and this enum lives on the
-    /// stack of every tunnel task.
+    /// The record layer over the same session. Boxed: the noise state machine
+    /// dwarfs the plain variant, and this lives on the stack of every tunnel
+    /// task.
     #[cfg(feature = "noise")]
     Noise(Box<crate::transport::NoiseStream<MhdStream>>),
 }
 
-impl std::fmt::Debug for MhdTunnelStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MhdTunnelStream::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
-            #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(_) => f.debug_tuple("Noise").finish(),
+impl MhdTunnelStream {
+    /// A plain tunnel stream over one session.
+    pub(crate) fn plain(
+        stream: MhdStream,
+        health: Arc<crate::transport::health::SessionHealth>,
+    ) -> Self {
+        Self {
+            io: MhdTunnelIo::Plain(stream),
+            health,
         }
+    }
+
+    /// The same, wrapped in the record layer.
+    #[cfg(feature = "noise")]
+    pub(crate) fn noise(
+        stream: Box<crate::transport::NoiseStream<MhdStream>>,
+        health: Arc<crate::transport::health::SessionHealth>,
+    ) -> Self {
+        Self {
+            io: MhdTunnelIo::Noise(stream),
+            health,
+        }
+    }
+
+    /// This session's own ARQ counters: the per-tunnel degradation signal a
+    /// carrier policy reads.
+    pub(crate) fn health(&self) -> Arc<crate::transport::health::SessionHealth> {
+        Arc::clone(&self.health)
     }
 }
 
-impl MhdTunnelStream {
-    /// This session's own ARQ counters, cumulative (see
-    /// [`crate::transport::health::SessionHealth`]): the per-tunnel degradation signal a
-    /// carrier policy reads. The same pair under both shapes — the Noise
-    /// wrapper exposes the session it wraps.
-    pub(crate) fn health(&self) -> Arc<crate::transport::health::SessionHealth> {
-        match self {
-            MhdTunnelStream::Plain(s) => s.health(),
+impl std::fmt::Debug for MhdTunnelStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.io {
+            MhdTunnelIo::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
             #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(s) => s.get_inner().health(),
+            MhdTunnelIo::Noise(_) => f.debug_tuple("Noise").finish(),
         }
     }
 }
@@ -2898,10 +2925,10 @@ impl AsyncRead for MhdTunnelStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MhdTunnelStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+        match &mut self.get_mut().io {
+            MhdTunnelIo::Plain(s) => Pin::new(s).poll_read(cx, buf),
             #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(s) => Pin::new(s).poll_read(cx, buf),
+            MhdTunnelIo::Noise(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -2912,26 +2939,26 @@ impl AsyncWrite for MhdTunnelStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            MhdTunnelStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+        match &mut self.get_mut().io {
+            MhdTunnelIo::Plain(s) => Pin::new(s).poll_write(cx, buf),
             #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(s) => Pin::new(s).poll_write(cx, buf),
+            MhdTunnelIo::Noise(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MhdTunnelStream::Plain(s) => Pin::new(s).poll_flush(cx),
+        match &mut self.get_mut().io {
+            MhdTunnelIo::Plain(s) => Pin::new(s).poll_flush(cx),
             #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(s) => Pin::new(s).poll_flush(cx),
+            MhdTunnelIo::Noise(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MhdTunnelStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+        match &mut self.get_mut().io {
+            MhdTunnelIo::Plain(s) => Pin::new(s).poll_shutdown(cx),
             #[cfg(feature = "noise")]
-            MhdTunnelStream::Noise(s) => Pin::new(s).poll_shutdown(cx),
+            MhdTunnelIo::Noise(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -2972,16 +2999,16 @@ pub async fn connect_stream(
     let conv = u32::from_le_bytes(conv_bytes);
 
     let stream = connect(remote, conv).await?;
+    let health = stream.health();
     #[cfg(feature = "noise")]
     if let Some(cfg) = noise {
         let keys = crate::transport::NoiseKeys::from_config(cfg)?;
-        return Ok(MhdTunnelStream::Noise(Box::new(
-            keys.wrap_initiator(stream).await?,
-        )));
+        let wrapped = keys.wrap_initiator(stream).await?;
+        return Ok(MhdTunnelStream::noise(Box::new(wrapped), health));
     }
     let mut stream = stream;
     stream.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
-    Ok(MhdTunnelStream::Plain(stream))
+    Ok(MhdTunnelStream::plain(stream, health))
 }
 
 /// Client side: open one mhd session to `remote` under `conv`.

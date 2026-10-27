@@ -2210,19 +2210,19 @@ async fn handle_mhd_session(
     let selector = tokio::time::timeout(deadline, session.stream.read_u8())
         .await
         .with_context(|| "mhd transport selector timed out")??;
+    let health = session.stream.health();
     let mut io = match selector {
-        PLAIN_SELECTOR => MhdTunnelStream::Plain(session.stream),
+        PLAIN_SELECTOR => MhdTunnelStream::plain(session.stream, health),
         NOISE_SELECTOR => {
             #[cfg(feature = "noise")]
             {
                 let keys = shared.noise_keys.as_ref().ok_or_else(|| {
                     anyhow!("Client requested Noise, but the server has no Noise keys")
                 })?;
-                MhdTunnelStream::Noise(Box::new(
-                    tokio::time::timeout(deadline, keys.wrap_responder(session.stream))
-                        .await
-                        .with_context(|| "mhd session noise handshake timed out")??,
-                ))
+                let wrapped = tokio::time::timeout(deadline, keys.wrap_responder(session.stream))
+                    .await
+                    .with_context(|| "mhd session noise handshake timed out")??;
+                MhdTunnelStream::noise(Box::new(wrapped), health)
             }
             #[cfg(not(feature = "noise"))]
             {
