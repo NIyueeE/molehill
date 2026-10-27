@@ -282,6 +282,14 @@ impl TunnelCounters {
         })
     }
 
+    /// The counters a lane that is not a yamux session owns.
+    ///
+    /// Same bookkeeping, built by the carrier rather than by the yamux driver:
+    /// the pool charges streams and bytes to a lane whoever produced them.
+    pub(crate) fn for_lane() -> std::sync::Arc<Self> {
+        Self::with_health(None)
+    }
+
     /// Bytes this end delivered off the tunnel to the forwarding code.
     pub(crate) fn received(&self) -> u64 {
         self.delivered.load(std::sync::atomic::Ordering::Relaxed)
