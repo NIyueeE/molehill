@@ -224,6 +224,19 @@ impl MhdLane {
         }))
     }
 
+    /// Wait for a stream the peer opens.
+    ///
+    /// The dispatcher signals the connection when a datagram opens a stream, so
+    /// this parks on that signal rather than polling the queue.
+    pub(crate) async fn wait_stream(&self) -> StreamIo {
+        loop {
+            if let Some(stream) = self.accept_stream() {
+                return stream;
+            }
+            self.shared.pump_signal().await;
+        }
+    }
+
     /// Take a stream the peer opened, if one is waiting.
     pub(crate) fn accept_stream(&self) -> Option<StreamIo> {
         let id = self
@@ -341,6 +354,7 @@ fn spawn_dispatcher(
                     });
                     shared.wake_readers();
                     shared.wake_writers();
+                    shared.wake_pump();
                     continue;
                 }
                 let shared = Shared::new(crate::transport::mhd::conn::Conn::new(packet.id, false));
@@ -430,15 +444,8 @@ mod lane_tests {
             .await
             .unwrap()
             .unwrap();
-        let mut inbound = None;
-        for _ in 0..2000 {
-            if let Some(stream) = accepted.accept_stream() {
-                inbound = Some(stream);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        let Some(mut inbound) = inbound else {
+        let waiting = tokio::time::timeout(Duration::from_secs(5), accepted.wait_stream()).await;
+        let Ok(mut inbound) = waiting else {
             unreachable!("the listener must accept the stream")
         };
         let mut got = Vec::new();
