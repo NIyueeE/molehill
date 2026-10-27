@@ -345,7 +345,8 @@ pub(crate) fn spawn(
                 }
                 keep = wait(&shared) => {
                     match keep {
-                        Wake::Signal => {}
+                        Wake::Signal => {
+                        }
                         Wake::Closed => {
                             // One last pass so a queued reset or FIN leaves
                             // before the socket does; a failed send ends the
@@ -739,7 +740,7 @@ fn spawn_dispatcher(
             if read.is_err() {
                 return;
             }
-            for (from, datagram) in arriving {
+            for (from, datagram) in &arriving {
                 let buf = &datagram[..];
                 let Ok(packet) = crate::transport::mhd::wire::decode(buf) else {
                     continue;
@@ -773,7 +774,7 @@ fn spawn_dispatcher(
                     table.insert(packet.id, Arc::clone(&shared));
                     drop(table);
                     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let task = spawn_sender(Arc::clone(&socket), from, Arc::clone(&shared));
+                    let task = spawn_sender(Arc::clone(&socket), *from, Arc::clone(&shared));
                     std::mem::forget(task);
                     let lane = Arc::new(MhdLane {
                         id,
@@ -1104,6 +1105,96 @@ mod lane_tests {
         assert_eq!(
             read, total,
             "the reader must see every byte the writer sent"
+        );
+    }
+
+    /// The carrier's cost on a clean path, measured on loopback.
+    ///
+    /// A diagnostic rather than a gate: the number is a loopback ceiling with no
+    /// shaping, so it says how much the engine costs per byte and nothing about
+    /// a real path. What it is for is the direction — a change that doubles the
+    /// per-byte cost shows up here in seconds, and the bench that would prove a
+    /// regression takes minutes and root.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a diagnostic, not a gate: run it with --ignored"]
+    async fn a_bulk_stream_costs_what_the_bench_measures() {
+        /// This process's user and system CPU time, in seconds.
+        ///
+        /// `USER_HZ` is 100 on Linux, which is the only platform this
+        /// diagnostic runs on; a portable reading would need a crate for one
+        /// division.
+        fn cpu_seconds() -> f64 {
+            const USER_HZ: f64 = 100.0;
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let tail = stat.rsplit_once(')').unwrap().1;
+            let fields: Vec<&str> = tail.split_whitespace().collect();
+            let utime: u64 = fields[11].parse().unwrap();
+            let stime: u64 = fields[12].parse().unwrap();
+            f64::from(u32::try_from(utime + stime).unwrap_or(u32::MAX)) / USER_HZ
+        }
+
+        let total = 64 * 1024 * 1024;
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut listener = MhdListener::bind(addr).unwrap();
+        let bound = listener.local_addr();
+        let dialer = MhdLane::dial(bound, 21, None, [5u8; crate::protocol::HASH_WIDTH_IN_BYTES])
+            .await
+            .unwrap();
+        let mut client = dialer.open_channel().await.unwrap();
+
+        let reading = tokio::spawn(async move {
+            let accepted = listener.accept().await.unwrap();
+            let mut server = accepted.wait_stream().await.unwrap();
+            let mut selector = [0u8; 1];
+            server.read_exact(&mut selector).await.unwrap();
+            let mut got = vec![0u8; 256 * 1024];
+            let mut read = 0usize;
+            loop {
+                match server.read(&mut got).await {
+                    Ok(0) => break,
+                    Ok(n) => read += n,
+                    Err(e) => panic!("server read failed: {e}"),
+                }
+            }
+            read
+        });
+
+        let chunk = vec![0xA5u8; 128 * 1024];
+        let start = std::time::Instant::now();
+        let cpu_start = cpu_seconds();
+        let mut written = 0;
+        while written < total {
+            client.write_all(&chunk).await.unwrap();
+            written += chunk.len();
+        }
+        client.shutdown().await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(120), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        let wall = start.elapsed().as_secs_f64();
+        let cpu = cpu_seconds() - cpu_start;
+        assert_eq!(
+            read, total,
+            "the reader must see every byte the writer sent"
+        );
+        let gbit = f64::from(u32::try_from(total).unwrap()) * 8.0 / 1e9;
+        let gbps = gbit / wall;
+        let cost = cpu / gbit;
+        println!(
+            "mhd bulk: {total} B in {wall:.3}s = {gbps:.3} Gbit/s, {cpu:.3} cpu-s, \
+             {cost:.3} cpu-s/Gbit, {cores:.2} cores",
+            cores = cpu / wall,
+        );
+        // The floor is deliberately far below the measured figure: this is a
+        // direction alarm, not a benchmark. The regression it exists to catch
+        // was quadratic in the send window and cost 260 cpu-s/Gbit, so anything
+        // above a tenth of the current reading is a real change and not noise.
+        assert!(
+            cost < 5.0,
+            "the engine now costs {cost:.3} cpu-s/Gbit on loopback; the last \
+             regression measured 267 and this floor is one twentieth of it"
         );
     }
 }

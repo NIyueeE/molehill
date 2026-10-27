@@ -227,15 +227,20 @@ impl Recovery {
     /// Fold one acknowledgement block in.
     pub(crate) fn on_ack(&mut self, now: Instant, ack: Ack) -> Acked {
         let mut result = Acked::default();
+        // The block covers `largest` and the 64 numbers below it, so nothing
+        // outside that range can be acknowledged or declared lost by it. Bounding
+        // the scan to the window is what keeps an acknowledgement O(window)
+        // instead of O(flight): a wide window holds thousands of packets, and
+        // scanning all of them per acknowledgement is quadratic in the window.
+        let oldest = ack.largest.saturating_sub(64);
+        let window = self.in_flight.range(oldest..=ack.largest);
         // A packet that had never been acknowledged and is at or below the
         // largest this block names is the only one that can sample the round
         // trip: sampling every acknowledgement would fold the peer's delayed
         // ack timer into the estimate. The sample is taken from the newest
         // packet this block covers, not from whatever happens to sit at the end
         // of the flight (a probe has no useful trip time).
-        let sample = self
-            .in_flight
-            .iter()
+        let sample = window
             .filter(|(number, _)| ack.contains(**number))
             .map(|(number, sent)| (*number, sent.time))
             .max_by_key(|(number, _)| *number);
@@ -249,9 +254,9 @@ impl Recovery {
         // Delivered: everything the block covers and we still hold.
         let acked: Vec<u32> = self
             .in_flight
-            .keys()
-            .copied()
-            .filter(|number| ack.contains(*number))
+            .range(oldest..=ack.largest)
+            .filter(|(number, _)| ack.contains(**number))
+            .map(|(number, _)| *number)
             .collect();
         for number in acked {
             if let Some(sent) = self.in_flight.remove(&number) {
@@ -268,14 +273,11 @@ impl Recovery {
         // window would be declared lost and re-sent. Such packets stay in
         // flight; the retransmission timer below recovers them, at the cost of
         // one round trip instead of a retransmission storm.
-        let oldest_visible = ack.largest.saturating_sub(64);
         let lost: Vec<u32> = self
             .in_flight
-            .iter()
+            .range(oldest..=ack.largest)
             .filter(|(number, _)| {
-                **number < ack.largest
-                    && **number >= oldest_visible
-                    && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
+                **number < ack.largest && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
             })
             .map(|(number, _)| *number)
             .collect();

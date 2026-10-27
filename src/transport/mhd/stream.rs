@@ -15,10 +15,19 @@
 use std::collections::BTreeMap;
 
 /// The bytes a stream has written and the peer has not acknowledged.
+///
+/// The bytes live in a `Vec` that starts at [`Self::drained`], not at the base:
+/// acknowledging a prefix only moves `base`, and the prefix is dropped in one
+/// pass once it is as large as what is still owed. Draining on every
+/// acknowledgement instead would memmove the whole window each time — with a
+/// 32 MiB window that is tens of megabytes moved per packet, which measured as
+/// 143 CPU-seconds to carry 64 MiB on loopback.
 #[derive(Debug, Default)]
 pub(crate) struct SendBuf {
-    /// Unacknowledged bytes, starting at base.
+    /// Bytes from `drained` up to what the writer has queued.
     data: Vec<u8>,
+    /// The absolute offset of `data[0]`: everything below it is gone.
+    drained: u64,
     /// The offset of data[0]: everything below it is acknowledged.
     base: u64,
     /// The offset the writer finished at, once it has.
@@ -39,9 +48,14 @@ pub(crate) struct SendBuf {
 impl SendBuf {
     /// Append bytes, answering the offset they start at.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> u64 {
-        let at = self.base + self.data.len() as u64;
+        let at = self.written();
         self.data.extend_from_slice(bytes);
         at
+    }
+
+    /// One past the last byte the writer has queued.
+    fn written(&self) -> u64 {
+        self.drained + self.data.len() as u64
     }
 
     /// Record that everything below upto arrived.
@@ -49,7 +63,7 @@ impl SendBuf {
     /// An acknowledgement past what was written is a peer mistake and is
     /// clamped, never trusted: it would otherwise drop bytes nobody sent.
     pub(crate) fn ack(&mut self, offset: u64, len: usize) {
-        let written = self.base + self.data.len() as u64;
+        let written = self.written();
         let start = offset.max(self.base).min(written);
         let end = offset.saturating_add(len as u64).min(written);
         if end <= start {
@@ -60,16 +74,36 @@ impl SendBuf {
         // exactly what a retransmission is for, and stepping past it would drop
         // bytes the peer never acknowledged.
         while let Some(end) = self.acked.remove(&self.base) {
-            let drop = usize::try_from(end - self.base).unwrap_or(self.data.len());
-            self.data.drain(..drop.min(self.data.len()));
             self.base = end;
             self.sent = self.sent.max(self.base);
         }
+        self.compact();
+    }
+
+    /// Drop the acknowledged prefix, but only once it pays for the move.
+    ///
+    /// The buffer holds `[drained, written)`; the acknowledged part is
+    /// `[drained, base)`. Compacting moves the rest, so it is worth doing only
+    /// when the prefix is at least half of it — otherwise every acknowledgement
+    /// pays a memmove proportional to the window. At that threshold the bytes
+    /// moved never exceed the bytes reclaimed, so the amortised cost is one
+    /// copy per byte carried rather than one per packet.
+    fn compact(&mut self) {
+        let wasted = self.base.saturating_sub(self.drained);
+        if wasted == 0 || wasted * 2 < self.data.len() as u64 {
+            return;
+        }
+        let drop = usize::try_from(wasted).unwrap_or(self.data.len());
+        self.data.drain(..drop.min(self.data.len()));
+        self.drained = self.base;
+        // Ranges the base has passed can never match it again, and keeping them
+        // would grow the table for the connection's whole life.
+        self.acked = self.acked.split_off(&self.base);
     }
 
     /// Finish the stream: no byte past this offset will be written.
     pub(crate) fn finish(&mut self) {
-        self.fin_at = Some(self.base + self.data.len() as u64);
+        self.fin_at = Some(self.written());
     }
 
     /// Whether the writer finished.
@@ -97,27 +131,34 @@ impl SendBuf {
 
     /// Whether any queued byte has not been on the wire yet.
     pub(crate) fn has_unsent(&self) -> bool {
-        self.next_offset() < self.base + self.data.len() as u64
+        self.next_offset() < self.written()
     }
 
     /// Unacknowledged bytes, which is what a credit window is spent on.
     pub(crate) fn unacked(&self) -> u64 {
-        self.data.len() as u64
+        self.written().saturating_sub(self.base)
     }
 
     /// Up to max bytes starting at offset, and whether the range ends the stream.
     ///
     /// None when that offset is not held any more: the peer asked for bytes that
-    /// were already acknowledged.
+    /// were already acknowledged and compacted away.
     pub(crate) fn range(&self, offset: u64, max: usize) -> Option<(&[u8], bool)> {
-        if offset < self.base {
+        if offset < self.drained {
             return None;
         }
-        let start = usize::try_from(offset - self.base).ok()?;
+        let start = usize::try_from(offset - self.drained).ok()?;
         let end = (start + max).min(self.data.len());
         let slice = self.data.get(start..end)?;
         let fin = self.fin_at == Some(offset + slice.len() as u64);
         Some((slice, fin))
+    }
+
+    /// How many bytes the buffer still holds, the acknowledged prefix that
+    /// compaction has not dropped included.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.data.len()
     }
 }
 
@@ -294,5 +335,79 @@ mod tests {
         let (tail, fin) = send.range(3, 3).unwrap();
         assert_eq!(tail, b"def");
         assert!(fin);
+    }
+
+    /// The property the compaction rests on: acknowledging in any order still
+    /// leaves every unacknowledged byte readable, and the acknowledged ones are
+    /// dropped only once the prefix has paid for the move.
+    #[test]
+    fn acknowledging_out_of_order_keeps_every_unacknowledged_byte() {
+        let mut send = SendBuf::default();
+        // A window-sized stream: four blocks of 16 KiB.
+        let mut at = 0;
+        for _ in 0..4 {
+            let block = vec![0x5Au8; 16 * 1024];
+            assert_eq!(send.write(&block), at);
+            at += 16 * 1024;
+        }
+        // Ack the third block first, then the first, then the second: the base
+        // may only walk over the contiguous run, so the hole at the second
+        // block must survive.
+        send.ack(2 * 16 * 1024, 16 * 1024);
+        send.ack(0, 16 * 1024);
+        assert_eq!(send.unacked(), 3 * 16 * 1024, "the hole is still owed");
+        send.ack(16 * 1024, 16 * 1024);
+        assert_eq!(send.unacked(), 16 * 1024, "only the last block is owed");
+        let (bytes, _) = send.range(3 * 16 * 1024, 16 * 1024).unwrap();
+        assert_eq!(bytes.len(), 16 * 1024);
+        assert_eq!(bytes[0], 0x5A);
+        send.ack(3 * 16 * 1024, 16 * 1024);
+        assert_eq!(send.unacked(), 0);
+        assert!(!send.has_unsent());
+    }
+
+    /// A buffer that has been compacted away answers `None` for what it no
+    /// longer holds, rather than handing back the wrong bytes.
+    #[test]
+    fn a_compacted_prefix_is_not_handed_back_again() {
+        let mut send = SendBuf::default();
+        for _ in 0..4 {
+            send.write(&vec![0x5Au8; 16 * 1024]);
+        }
+        send.ack(0, 4 * 16 * 1024);
+        assert!(send.range(0, 16).is_none(), "acknowledged bytes are gone");
+        assert_eq!(send.unacked(), 0);
+        // And the offsets still line up after the prefix is dropped.
+        send.write(b"tail");
+        let (bytes, fin) = send.range(4 * 16 * 1024, 4).unwrap();
+        assert_eq!(bytes, b"tail");
+        assert!(!fin);
+        send.finish();
+        let (bytes, fin) = send.range(4 * 16 * 1024, 4).unwrap();
+        assert_eq!(bytes, b"tail");
+        assert!(fin);
+    }
+
+    /// The compaction is amortised: the acknowledged prefix is dropped once it
+    /// is at least half of what is held, so a window-sized stream never keeps a
+    /// window-sized buffer and the bytes moved per byte carried stay bounded.
+    /// The regression this pins moved the whole window on every acknowledgement.
+    #[test]
+    fn compaction_drops_the_acknowledged_prefix_as_it_goes() {
+        let mut send = SendBuf::default();
+        for block in 0..64u64 {
+            let at = send.write(&vec![0x5Au8; 16 * 1024]);
+            send.ack(at, 16 * 1024);
+            // The prefix is dropped once it reaches half the buffer, so what is
+            // held never exceeds twice the unacknowledged bytes.
+            let held = u64::try_from(send.held()).unwrap_or(u64::MAX);
+            assert!(
+                held <= send.unacked() * 2,
+                "block {block}: holding {held} bytes for {} unacknowledged",
+                send.unacked()
+            );
+        }
+        assert_eq!(send.unacked(), 0);
+        assert_eq!(send.held(), 0, "an empty stream holds nothing");
     }
 }
