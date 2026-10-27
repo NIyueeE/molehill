@@ -57,7 +57,9 @@ use tokio::time::{self, Duration, Instant};
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
 #[cfg(feature = "multiplex")]
-use crate::transport::multiplex::{ClientTunnel, Dialer, StreamLease, TunnelPool};
+use crate::transport::multiplex::{
+    ClientTunnel, Dialer, PoolLane, StreamLease, TunnelPool, as_lane,
+};
 
 use crate::common::constants::{
     DEFAULT_MAX_UDP_WORKERS, DEFAULT_UDP_BUFFER_SIZE, UDP_CODEL_TARGET, UDP_QUEUE_SIZE,
@@ -1751,7 +1753,7 @@ async fn establish_tunnel(
     remote_addr: &AddrMaybeCached,
     session_nonce: Nonce,
     service_name: &str,
-) -> Result<(ClientTunnel, watch::Sender<bool>)> {
+) -> Result<(std::sync::Arc<dyn PoolLane>, watch::Sender<bool>)> {
     let mut conn = transport
         .connect(remote_addr)
         .await
@@ -1774,7 +1776,7 @@ async fn establish_tunnel(
     // adapter's own stats task: no entry point has to know about it, and a
     // run that never multiplexes pays nothing.
     spawn_tunnel_stats();
-    Ok((tunnel, shutdown_tx))
+    Ok((as_lane(tunnel), shutdown_tx))
 }
 
 /// Establish one service's tunnel pool: its configured count, plus the dialer
@@ -1893,7 +1895,10 @@ async fn establish_initial(
     target: usize,
     key: &str,
     carrier: Carrier,
-) -> Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> {
+) -> Vec<(
+    std::sync::Arc<dyn PoolLane>,
+    tokio::sync::watch::Sender<bool>,
+)> {
     let mut dials = tokio::task::JoinSet::new();
     for _ in 0..target {
         let dial = Arc::clone(dialer);
@@ -2052,7 +2057,10 @@ async fn tcp_pool_start(
     key: &str,
 ) -> Result<(
     Dialer,
-    Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+    Vec<(
+        std::sync::Arc<dyn PoolLane>,
+        tokio::sync::watch::Sender<bool>,
+    )>,
 )> {
     let dialer = dial.dialer().await?;
     let initial = establish_initial(&dialer, target, key, Carrier::Tcp).await;
@@ -2089,7 +2097,7 @@ async fn establish_one_mhd_tunnel(
     session_nonce: Nonce,
     opts: &DataOpts,
     service_name: &str,
-) -> Result<(ClientTunnel, watch::Sender<bool>)> {
+) -> Result<(std::sync::Arc<dyn PoolLane>, watch::Sender<bool>)> {
     // Full Noise handshake + v3 selector byte (the wrapper owns the selector):
     // mhd tunnels establish once per control session, so a resume attempt has
     // nothing cached yet and would only add a round trip.
@@ -2114,7 +2122,12 @@ async fn establish_one_mhd_tunnel(
     let config = crate::transport::multiplex::mux_config();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     Ok((
-        ClientTunnel::start_with_health(io, Some(health), config, shutdown_rx),
+        as_lane(ClientTunnel::start_with_health(
+            io,
+            Some(health),
+            config,
+            shutdown_rx,
+        )),
         shutdown_tx,
     ))
 }

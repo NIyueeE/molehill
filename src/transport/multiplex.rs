@@ -526,6 +526,30 @@ struct PoolHandover {
     phase_since: std::time::Instant,
 }
 
+/// What the pool needs from one carrier connection, whichever carrier it
+/// rides.
+///
+/// The pool places streams, charges them to a lane and repairs what dies; it
+/// must not care whether the lane is a yamux session over a byte stream or the
+/// datagram carrier's own streams. Anything a carrier-specific handle can do
+/// beyond this stays behind the implementation.
+#[async_trait::async_trait]
+pub(crate) trait PoolLane: Send + Sync {
+    /// The lane's process-unique id: the pin-accounting key and the
+    /// telemetry label.
+    fn id(&self) -> usize;
+    /// The lane's bookkeeping, as the pool and the status API read it.
+    fn counters(&self) -> &std::sync::Arc<TunnelCounters>;
+    /// Whether the driver is still running. The pool polls it: a lane whose
+    /// connection died must leave the pool even if it still holds streams, or
+    /// every later placement lands on a corpse.
+    fn is_alive(&self) -> bool;
+    /// Stop placing anything on this lane: its connection is gone.
+    fn mark_dead(&self);
+    /// Open one stream, charged to this lane.
+    async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError>;
+}
+
 /// One live tunnel of a pool.
 struct PoolEntry {
     /// The carrier this tunnel was established on. Per entry, not per pool: a
@@ -534,15 +558,23 @@ struct PoolEntry {
     carrier: Carrier,
     /// Draining entries keep established streams but receive no new opens.
     phase: TunnelPhase,
-    tunnel: ClientTunnel,
+    tunnel: std::sync::Arc<dyn PoolLane>,
     /// Dropping this ends the driver; the pool holds it for the tunnel's whole
     /// life, so removal actually releases the connection.
     _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// Wrap a yamux-backed tunnel handle as the pool's carrier-neutral lane.
+///
+/// The pool stores `Arc<dyn PoolLane>` so a second carrier can hand it lanes of
+/// its own without the pool knowing what either one is.
+pub(crate) fn as_lane(tunnel: ClientTunnel) -> std::sync::Arc<dyn PoolLane> {
+    std::sync::Arc::new(tunnel)
+}
+
 impl PoolEntry {
     fn load(&self) -> TunnelLoad {
-        self.tunnel.counters.load()
+        self.tunnel.counters().load()
     }
 }
 
@@ -555,12 +587,18 @@ struct Reservation {
     /// (see [`StreamLease::pool`]).
     pool: std::sync::Weak<PoolShared>,
     placement: Placement,
-    tunnel: ClientTunnel,
+    tunnel: std::sync::Arc<dyn PoolLane>,
 }
 
 /// What one pool needs to create a new tunnel: the dialer, plus the shutdown
 /// sender of the driver it started.
-pub type DialResult = Result<(ClientTunnel, tokio::sync::watch::Sender<bool>), String>;
+pub type DialResult = Result<
+    (
+        std::sync::Arc<dyn PoolLane>,
+        tokio::sync::watch::Sender<bool>,
+    ),
+    String,
+>;
 
 /// The pool's way to add a tunnel. `ClientTunnel`s carry no index; the pool
 /// assigns one when it inserts the tunnel.
@@ -856,11 +894,15 @@ struct TunnelPoolInner {
 impl TunnelPool {
     /// Wrap the tunnels an establishment pass already produced, on a pool that
     /// cannot repair (no dialer).
+    #[cfg(test)]
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         carrier: Carrier,
         key: String,
-        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )>,
         tunnels: usize,
     ) -> TunnelPool {
         Self::with_dialer(
@@ -875,10 +917,14 @@ impl TunnelPool {
 
     /// The same, with the dialer a repair uses (`None` on a pool that cannot
     /// replace a dead tunnel) and the client's UDP pin registry.
-    pub fn with_dialer(
+    #[cfg(test)]
+    pub(crate) fn with_dialer(
         carrier: Carrier,
         key: String,
-        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )>,
         tunnels: usize,
         dial: Option<Dialer>,
         pins: std::sync::Arc<PinRegistry>,
@@ -901,10 +947,14 @@ impl TunnelPool {
     /// pinned to the carrier it was born on keeps repairing into a path that has
     /// stopped carrying it, while the client's own carrier choice has already
     /// fallen back.
-    pub fn with_preference(
+    #[cfg(test)]
+    pub(crate) fn with_preference(
         carrier: Carrier,
         key: String,
-        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )>,
         tunnels: usize,
         dial: Option<Dialer>,
         preferred: PreferredCarrier,
@@ -921,10 +971,13 @@ impl TunnelPool {
         clippy::too_many_arguments,
         reason = "the pool constructor is the one seam every caller builds a                   pool through; a params struct would fork the existing call                   sites for one optional the tests pass as None"
     )]
-    pub fn with_choice(
+    pub(crate) fn with_choice(
         carrier: Carrier,
         key: String,
-        initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)>,
+        initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )>,
         tunnels: usize,
         dial: Option<Dialer>,
         preferred: PreferredCarrier,
@@ -1303,18 +1356,18 @@ impl TunnelPool {
             .iter()
             .map(|e| {
                 (
-                    e.tunnel.id,
+                    e.tunnel.id(),
                     // The ARQ pair (both ends summed — the peer's report is what
                     // makes it direction-independent) and the delivery pair: what
                     // this end received off the tunnel against what the peer's
                     // application handed it. The rule judges on the second.
                     {
-                        let arq = e.tunnel.counters.health_counts().unwrap_or((0, 0));
+                        let arq = e.tunnel.counters().health_counts().unwrap_or((0, 0));
                         (
                             arq.0,
                             arq.1,
-                            e.tunnel.counters.received(),
-                            e.tunnel.counters.peer_handed(),
+                            e.tunnel.counters().received(),
+                            e.tunnel.counters().peer_handed(),
                         )
                     },
                 )
@@ -1355,9 +1408,9 @@ impl TunnelPool {
         };
         entry
             .tunnel
-            .counters
+            .counters()
             .note_peer_health(counters, handed, seq);
-        entry.tunnel.counters.health_counts()
+        entry.tunnel.counters().health_counts()
     }
 
     /// Start the rule's probe, or report that one is already running: `true`
@@ -1805,7 +1858,7 @@ impl TunnelPool {
             bytes: state
                 .entries
                 .iter()
-                .map(|e| e.tunnel.counters.bytes())
+                .map(|e| e.tunnel.counters().bytes())
                 .collect(),
             // The rule's own reading — both ends summed — rather than this
             // end's half: an operator watching the line sees what the policy
@@ -1813,7 +1866,7 @@ impl TunnelPool {
             mhd_health: state
                 .entries
                 .iter()
-                .map(|e| e.tunnel.counters.health_counts())
+                .map(|e| e.tunnel.counters().health_counts())
                 .collect(),
             draining: state
                 .entries
@@ -1847,7 +1900,7 @@ impl TunnelPool {
             .lock()
             .entries
             .get(index)
-            .map(|e| e.tunnel.id)
+            .map(|e| e.tunnel.id())
         else {
             return 0;
         };
@@ -2122,7 +2175,7 @@ impl TunnelPool {
         let fallback = chosen.is_none();
         let index = chosen.or(over_budget)?;
         let entry = state.entries.get(index)?;
-        entry.tunnel.counters.reserve();
+        entry.tunnel.counters().reserve();
         let load = entry.load();
         // The worst eligible candidate: what the placement rule gave up by not
         // picking it. S1's spread is `worst - best`.
@@ -2170,7 +2223,7 @@ impl TunnelPool {
             mut placement,
             tunnel,
         } = reservation;
-        let counters = std::sync::Arc::clone(&tunnel.counters);
+        let counters = std::sync::Arc::clone(tunnel.counters());
         match tunnel.open_stream().await {
             Ok(stream) => {
                 counters.charge();
@@ -2223,7 +2276,7 @@ impl TunnelPool {
                     next.placement.fallback = true;
                     match next.tunnel.open_stream().await {
                         Ok(stream) => {
-                            let counters = std::sync::Arc::clone(&next.tunnel.counters);
+                            let counters = std::sync::Arc::clone(next.tunnel.counters());
                             counters.charge();
                             next.placement.chosen_load = counters.load();
                             PlacementStats::record(
@@ -2239,7 +2292,7 @@ impl TunnelPool {
                             });
                         }
                         Err(e) => {
-                            next.tunnel.counters.release();
+                            next.tunnel.counters().release();
                             if matches!(e, crate::mux::ConnectionError::Closed) {
                                 // Another dead tunnel: same as above (D14).
                                 next.tunnel.mark_dead();
@@ -3390,6 +3443,29 @@ impl ClientTunnel {
     }
 }
 
+#[async_trait::async_trait]
+impl PoolLane for ClientTunnel {
+    fn id(&self) -> usize {
+        Self::id(self)
+    }
+
+    fn counters(&self) -> &std::sync::Arc<TunnelCounters> {
+        &self.counters
+    }
+
+    fn is_alive(&self) -> bool {
+        Self::is_alive(self)
+    }
+
+    fn mark_dead(&self) {
+        Self::mark_dead(self);
+    }
+
+    async fn open_stream(&self) -> Result<MuxStream, crate::mux::ConnectionError> {
+        Self::open_stream(self).await
+    }
+}
+
 #[cfg(all(test, feature = "client", feature = "server"))]
 mod tests {
     #![expect(
@@ -3460,7 +3536,7 @@ mod tests {
             state
                 .entries
                 .iter()
-                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .map(|e| std::sync::Arc::clone(e.tunnel.counters()))
                 .collect()
         };
 
@@ -3540,7 +3616,7 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.tunnel.id() == probe_id)
-                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .map(|e| std::sync::Arc::clone(e.tunnel.counters()))
                 .expect("the probe tunnel is held")
         };
         probe_counters
@@ -3590,7 +3666,7 @@ mod tests {
             state
                 .entries
                 .iter()
-                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .map(|e| std::sync::Arc::clone(e.tunnel.counters()))
                 .collect()
         };
         let mut seq = 0u8;
@@ -3649,7 +3725,7 @@ mod tests {
                 .entries
                 .iter()
                 .find(|e| e.tunnel.id() == probe_id)
-                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .map(|e| std::sync::Arc::clone(e.tunnel.counters()))
                 .expect("the probe tunnel is held")
         };
         probe_counters
@@ -3712,7 +3788,7 @@ mod tests {
             state
                 .entries
                 .iter()
-                .map(|e| std::sync::Arc::clone(&e.tunnel.counters))
+                .map(|e| std::sync::Arc::clone(e.tunnel.counters()))
                 .collect()
         };
 
@@ -4209,12 +4285,12 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             std::mem::forget(shutdown_tx);
             tunnels.push((
-                ClientTunnel::start_with_health(
+                as_lane(ClientTunnel::start_with_health(
                     client_io,
                     Some(crate::transport::health::SessionHealth::new()),
                     mux_config(),
                     shutdown_rx,
-                ),
+                )),
                 tokio::sync::watch::channel(false).0,
             ));
             rxs.push(rx);
@@ -4247,12 +4323,12 @@ mod tests {
                 tokio::spawn(run_server_tunnel(server_io, mux_config(), tx));
                 let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 tunnels.push((
-                    ClientTunnel::start_with_health(
+                    as_lane(ClientTunnel::start_with_health(
                         client_io,
                         Some(crate::transport::health::SessionHealth::new()),
                         mux_config(),
                         shutdown_rx,
-                    ),
+                    )),
                     tokio::sync::watch::channel(false).0,
                 ));
                 rxs.push(rx);
@@ -4263,7 +4339,12 @@ mod tests {
             // fixture without one can never produce the tunnel the probe is
             // supposed to measure.
             let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
-                Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
+                Box::pin(async move {
+                    Ok((
+                        as_lane(duplex_tunnel()),
+                        tokio::sync::watch::channel(false).0,
+                    ))
+                })
             });
             (
                 TunnelPool::with_choice(
@@ -4299,10 +4380,23 @@ mod tests {
     /// `count`: every repair dials one more, until the count is reached.
     fn growable_pool(n: usize, count: usize) -> TunnelPool {
         let dial: Dialer = std::sync::Arc::new(|_: Carrier| {
-            Box::pin(async move { Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0)) })
+            Box::pin(async move {
+                Ok((
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                ))
+            })
         });
-        let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
-            .map(|_| (duplex_tunnel(), tokio::sync::watch::channel(false).0))
+        let initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )> = (0..n)
+            .map(|_| {
+                (
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                )
+            })
             .collect();
         TunnelPool::with_dialer(
             Carrier::Tcp,
@@ -4325,11 +4419,22 @@ mod tests {
             let dials = std::sync::Arc::clone(&dials);
             Box::pin(async move {
                 dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+                Ok((
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                ))
             })
         });
-        let initial: Vec<(ClientTunnel, tokio::sync::watch::Sender<bool>)> = (0..n)
-            .map(|_| (duplex_tunnel(), tokio::sync::watch::channel(false).0))
+        let initial: Vec<(
+            std::sync::Arc<dyn PoolLane>,
+            tokio::sync::watch::Sender<bool>,
+        )> = (0..n)
+            .map(|_| {
+                (
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                )
+            })
             .collect();
         TunnelPool::with_dialer(
             Carrier::Tcp,
@@ -4641,7 +4746,10 @@ mod tests {
             let counter = std::sync::Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::Relaxed);
-                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+                Ok((
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                ))
             })
         });
         let pool = TunnelPool::with_dialer(
@@ -4780,7 +4888,7 @@ mod tests {
             let server = tokio::spawn(run_server_tunnel(server_io, mux_config(), inbound_tx));
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             tunnels.push((
-                ClientTunnel::start(client_io, mux_config(), shutdown_rx),
+                as_lane(ClientTunnel::start(client_io, mux_config(), shutdown_rx)),
                 shutdown_tx.clone(),
             ));
             shutdown_senders.push(shutdown_tx);
@@ -4872,7 +4980,7 @@ mod tests {
         let pool = TunnelPool::new(
             Carrier::Tcp,
             "test".to_owned(),
-            vec![(t1, shutdown1.clone()), (t2, shutdown2)],
+            vec![(as_lane(t1), shutdown1.clone()), (as_lane(t2), shutdown2)],
             2,
         );
 
@@ -4935,12 +5043,21 @@ mod tests {
             Box::pin(async move {
                 recorder.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(carrier, Carrier::Tcp);
-                Ok((duplex_tunnel(), tokio::sync::watch::channel(false).0))
+                Ok((
+                    as_lane(duplex_tunnel()),
+                    tokio::sync::watch::channel(false).0,
+                ))
             })
         });
         let initial = vec![
-            (duplex_tunnel(), tokio::sync::watch::channel(false).0),
-            (duplex_tunnel(), tokio::sync::watch::channel(false).0),
+            (
+                as_lane(duplex_tunnel()),
+                tokio::sync::watch::channel(false).0,
+            ),
+            (
+                as_lane(duplex_tunnel()),
+                tokio::sync::watch::channel(false).0,
+            ),
         ];
         let pool = TunnelPool::with_preference(
             Carrier::Mhd,
@@ -5226,14 +5343,14 @@ mod tests {
                 std::mem::forget(server);
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 let tunnel = ClientTunnel::start(client_io, mux_config(), shutdown_rx);
-                Ok((tunnel, shutdown_tx))
+                Ok((as_lane(tunnel), shutdown_tx))
             })
         });
 
         let pool = TunnelPool::with_dialer(
             Carrier::Tcp,
             "test".to_owned(),
-            vec![(t0, shutdown0)],
+            vec![(as_lane(t0), shutdown0)],
             1,
             Some(dialer),
             std::sync::Arc::new(PinRegistry::new()),
