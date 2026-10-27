@@ -86,6 +86,11 @@
     dead_code,
     reason = "the multi-stream engine is built under its own tests; the connection that consumes it lands next"
 )]
+pub(crate) mod recovery;
+#[expect(
+    dead_code,
+    reason = "the multi-stream engine is built under its own tests; the connection that consumes it lands next"
+)]
 pub(crate) mod stream;
 #[expect(
     dead_code,
