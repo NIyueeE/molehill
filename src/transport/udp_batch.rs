@@ -26,13 +26,18 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 
 use nix::sys::socket::{
-    ControlMessage, MsgFlags, MultiHeaders, SockaddrStorage, recvmmsg, sendmmsg, sendmsg,
+    ControlMessage, ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage, recvmsg,
+    sendmmsg, sendmsg,
 };
 
 use crate::mhd::MHD_OVERHEAD;
 use bytes::Bytes;
 
 use super::dgram::{BATCH, Span};
+
+/// Bytes in one receive region: a GRO run coalesces up to this much before the
+/// kernel hands it back.
+pub const GRO_BUF: usize = 64 * 1024;
 
 /// One send descriptor for one datagram: at most a staged header plus an
 /// external payload. `len` shortens the slice to the iovecs the span needs.
@@ -44,16 +49,6 @@ struct OneIov<'a> {
 impl<'a> AsRef<[IoSlice<'a>]> for OneIov<'a> {
     fn as_ref(&self) -> &[IoSlice<'a>] {
         &self.slices[..self.len]
-    }
-}
-
-/// One receive descriptor per datagram. Each borrows a distinct buffer from
-/// `RecvBatch::bufs`; the batch owns them for the whole call.
-struct OneIovMut<'a>(IoSliceMut<'a>);
-
-impl<'a> AsMut<[IoSliceMut<'a>]> for OneIovMut<'a> {
-    fn as_mut(&mut self) -> &mut [IoSliceMut<'a>] {
-        std::slice::from_mut(&mut self.0)
     }
 }
 
@@ -74,70 +69,100 @@ fn socket_addr(storage: &SockaddrStorage) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
 }
 
-/// The receive half's reusable buffers plus the source address and received
-/// length the last call filled.
+/// The receive half: one region big enough for a GRO run, and where each
+/// datagram sits inside it.
+///
+/// With `UDP_GRO` on, one `recvmsg` returns a whole coalesced run rather than one
+/// datagram, so the buffer is sized for a run and the kernel hands back the
+/// segment size it used. Splitting on that size is what keeps the rest of the
+/// carrier unchanged: every consumer still sees individual datagrams.
 pub struct RecvBatch {
-    bufs: Vec<Vec<u8>>,
-    names: Vec<SocketAddr>,
-    lens: Vec<usize>,
+    /// Filled by one recvmsg per call.
+    region: Vec<u8>,
+    /// Each datagram's (offset, length) inside region, after splitting.
+    spans: Vec<(usize, usize)>,
+    /// The run's source address. GRO coalesces one 4-tuple only, so a run has
+    /// one peer.
+    peer: SocketAddr,
+    /// Datagrams the last call produced.
     pub count: usize,
 }
 
 impl RecvBatch {
-    /// `count` datagrams of up to `buf_len` bytes each.
+    /// A batch for `count` datagrams of up to `buf_len` bytes each.
+    ///
+    /// The footprint is unchanged by GRO: the same total is spent on one region
+    /// sized for a coalesced run, because a run is what recvmsg returns.
     pub fn new(count: usize, buf_len: usize) -> Self {
+        let total = count.saturating_mul(buf_len);
         Self {
-            bufs: (0..count).map(|_| vec![0u8; buf_len]).collect(),
-            names: vec![
-                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0));
-                count
-            ],
-            lens: vec![0; count],
+            region: vec![0u8; total.min(GRO_BUF).max(buf_len.max(1))],
+            spans: Vec::with_capacity(BATCH),
+            peer: SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
             count: 0,
         }
     }
 
-    /// Fill the batch from `fd` (non-blocking). Returns the number of
-    /// datagrams received, or `Err(WouldBlock)` when drained. Callers invoke
-    /// this through `UdpSocket::try_io` so the EAGAIN also clears tokio's
-    /// cached readiness.
+    /// Fill the batch from fd (non-blocking): one recvmsg, split into the
+    /// datagrams it carried. Callers invoke this through `UdpSocket::try_io` so
+    /// the EAGAIN also clears tokio's cached readiness.
     pub fn recv(&mut self, fd: RawFd) -> io::Result<usize> {
         self.count = 0;
-        // `MultiHeaders` owns the kernel-facing descriptor array and the
-        // addresses. It is `!Send`, so keeping it in this batch would force
-        // an unsafe `Send`/`Sync` proof; rebuilding it here is what keeps
-        // this module free of `unsafe`.
-        let mut headers = MultiHeaders::<SockaddrStorage>::preallocate(self.bufs.len(), None);
-        let mut iovs: Vec<OneIovMut<'_>> = self
-            .bufs
-            .iter_mut()
-            .map(|buf| OneIovMut(IoSliceMut::new(buf)))
-            .collect();
-        let results = recvmmsg(
-            fd,
-            &mut headers,
-            iovs.iter_mut(),
-            MsgFlags::MSG_DONTWAIT,
-            None,
-        )
-        .map_err(io::Error::from)?;
-        for (index, msg) in results.enumerate() {
-            if index >= self.names.len() {
-                break;
+        self.spans.clear();
+        let mut region = std::mem::take(&mut self.region);
+        let mut space = nix::cmsg_space!(i32);
+        // The region is put back on every path: a socket with nothing queued
+        // answers EAGAIN on most iterations, and losing the buffer to the first
+        // one would leave a batch that can never receive again.
+        let received = {
+            let mut iov = [IoSliceMut::new(&mut region)];
+            recvmsg::<SockaddrStorage>(fd, &mut iov, Some(&mut space), MsgFlags::MSG_DONTWAIT).map(
+                |msg| {
+                    let peer = msg.address.as_ref().map_or_else(
+                        || SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
+                        socket_addr,
+                    );
+                    let segment = msg.cmsgs().ok().and_then(|mut cmsgs| {
+                        cmsgs.find_map(|cmsg| match cmsg {
+                            ControlMessageOwned::UdpGroSegments(size) if size > 0 => {
+                                Some(usize::try_from(size).unwrap_or(0))
+                            }
+                            _ => None,
+                        })
+                    });
+                    (msg.bytes, peer, segment)
+                },
+            )
+        };
+        self.region = region;
+        let (len, peer, segment) = received.map_err(io::Error::from)?;
+        self.peer = peer;
+        // A run with a segment size came from the kernel's GRO; anything else
+        // is one datagram, which is what a socket without GRO hands back.
+        match segment.filter(|size| *size > 0 && *size <= len) {
+            Some(size) => {
+                let mut off = 0;
+                while off < len && self.spans.len() < BATCH {
+                    let take = size.min(len - off);
+                    self.spans.push((off, take));
+                    off += take;
+                }
             }
-            self.names[index] = msg.address.as_ref().map_or_else(
-                || SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0)),
-                socket_addr,
-            );
-            self.lens[index] = msg.bytes;
-            self.count = index + 1;
+            None => {
+                if len > 0 {
+                    self.spans.push((0, len));
+                }
+            }
         }
+        self.count = self.spans.len();
         Ok(self.count)
     }
 
-    /// Iterate the received datagrams as `(source address, bytes)`.
+    /// Iterate the received datagrams as (source address, bytes).
     pub fn iter(&self) -> impl Iterator<Item = (SocketAddr, &[u8])> + '_ {
-        (0..self.count).map(|i| (self.names[i], &self.bufs[i][..self.lens[i]]))
+        self.spans
+            .iter()
+            .map(move |(off, len)| (self.peer, &self.region[*off..*off + *len]))
     }
 }
 
@@ -348,5 +373,53 @@ mod tests {
                 "segment {index} keeps its bytes"
             );
         }
+    }
+
+    /// Two datagrams sent back to back arrive as two, whichever way the kernel
+    /// delivered them: a GRO run is split on the segment size the kernel
+    /// reports, and a plain datagram passes through whole. The boundaries are
+    /// the assertion — coalescing must never merge two datagrams into one
+    /// payload.
+    #[test]
+    fn a_receive_batch_splits_a_gro_run_back_into_datagrams() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let _ = nix::sys::socket::setsockopt(
+            &receiver,
+            nix::sys::socket::sockopt::UdpGroSegment,
+            &true,
+        );
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = receiver.local_addr().unwrap();
+        sender.send_to(b"first", peer).unwrap();
+        sender.send_to(b"second", peer).unwrap();
+
+        let mut batch = RecvBatch::new(4, 2048);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while seen.len() < 2 && std::time::Instant::now() < deadline {
+            match batch.recv(receiver.as_raw_fd()) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(1)),
+                Ok(_) => {
+                    for (_, bytes) in batch.iter() {
+                        seen.push(bytes.to_vec());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => {
+                    eprintln!("unexpected receive error: {e}");
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "both datagrams must arrive, each intact and in order"
+        );
     }
 }

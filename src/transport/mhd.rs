@@ -908,6 +908,12 @@ fn tune_socket_buffers(socket: &UdpSocket) {
     if let Err(e) = s.set_send_buffer_size(MHD_SOCKET_BUF_BYTES) {
         warn!("Failed to raise the mhd socket send buffer: {e}");
     }
+    #[cfg(target_os = "linux")]
+    if let Err(e) = enable_gro(socket) {
+        // Growable receive is an optimisation, not a requirement: a socket
+        // that refuses it keeps one datagram per recvmsg.
+        debug!("The mhd socket refused GRO: {e}");
+    }
 }
 
 /// Milliseconds since `start`, on mhd's wrapping u32 clock.
@@ -1567,6 +1573,19 @@ async fn send_spans(net: &SessionNet, buf: &Bytes, spans: &[Span]) -> std::io::R
             spans,
         )
     })
+}
+
+/// Ask the kernel to coalesce same-flow datagrams on receive.
+///
+/// GRO is the receive half of the same amortisation GSO gives the sender: one
+/// wake, one buffer and one skb for a whole run of datagrams, with the segment
+/// size handed back in a control message so the batch can split the run apart
+/// again. A socket that refuses the option keeps working one datagram at a
+/// time, which is what every non-Linux build does.
+#[cfg(target_os = "linux")]
+fn enable_gro(socket: &tokio::net::UdpSocket) -> std::io::Result<()> {
+    nix::sys::socket::setsockopt(socket, nix::sys::socket::sockopt::UdpGroSegment, &true)
+        .map_err(std::io::Error::from)
 }
 
 /// Whether this socket path takes GSO, learned from the first attempt.
