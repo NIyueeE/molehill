@@ -70,18 +70,39 @@ and it decides how the two carriers meet: a generic serve path, not a common
 trait object. Recorded here because the next attempt should start from that
 decision rather than rediscovering it by compiling.
 
-**The swap that remains (P3a-6), and why it is one commit.** The new engine is
-complete and tested on its own: wire, stream buffers, recovery, connection,
-async seam, pump, lane and listener, each with unit tests, and the lane test runs
-the pool's real call path over a real socket. What is not done is pointing the
-product at it, and that cannot be done in halves: the old adapter speaks KCP's
-wire, so a client on the new engine cannot talk to a server on the old one. The
-swap is therefore: drop the engine module (the KCP state machine, 2096 lines),
-reduce the adapter file to the module root that declares the new ones, make
-MhdTunnelStream hold a boxed carrier stream instead of the KCP stream type, make
-the server's per-stream handler generic over its IO, replace MhdAcceptor with
-MhdListener on both ends, and delete connect_stream. The integration suite then
-exercises the new carrier by default, because the client tries mhd first.
+**Where the swap stands (P3a-6).** The new engine is complete and tested on its
+own: wire, stream buffers, recovery, connection, async seam, pump, lane and
+listener, 2678 lines across six files under src/transport/mhd/, 34 unit tests,
+one of them the pool's real call path over a real socket. The product still runs
+the old KCP adapter (src/transport/mhd.rs, 4146 lines, plus the engine module
+src/mhd.rs, 2098 lines): the swap is atomic because the two speak different
+wires.
+
+Two blockers were found by attempting it and are now resolved in the type
+system rather than worked around:
+
+1. The tunnel stream answered health() by asking the session underneath, and a
+   trait object cannot answer for a carrier. It is now a struct that owns its IO
+   and carries the handle beside it (ba303aa).
+2. The tunnel stream's inner shape was the KCP session type. It now holds the
+   boxed carrier stream the pool already uses, and a boxed stream implements the
+   owned-write trait by delegating — one copy per record, the price of a
+   carrier-neutral stream until the carrier implements the owned path itself
+   (6a584d0).
+
+What remains, in order: make the server serve each stream a lane accepts (the
+per-stream handler is already reachable through the neutral type), point the
+client's mhd tunnel at MhdLane::connect instead of connect_stream, replace
+MhdAcceptor with MhdListener on both ends, delete src/mhd.rs and the adapter body,
+and run the integration suite forced onto mhd. The protocol decision behind it is
+recorded above: a lane is a tunnel, its streams are the channels, and Noise stays
+per stream so data_enable keeps its meaning.
+
+**The P2 gate is runnable after all.** Passwordless sudo works on this host (the
+audit-message warning is not a failure; sudo -n id -u answers 0). An earlier note
+in this file said the bench could not run here; that was wrong, and the gate it
+would have blocked is exactly the one that decides whether the carrier is worth
+shipping: cpu_s_per_gbit for mhd against TCP in one run with --aa.
 
 ### 1.0.0: the KCP carrier becomes `mhd` (branch `feat/v1.0.0`, from tag v0.11.2)
 
