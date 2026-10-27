@@ -47,6 +47,17 @@
 
 ## Where this stands
 
+A second attempt took the other branch (implement the owned-write trait for the
+box, so the tunnel handler could stay concrete) and got further: the boxed
+stream compiles through the Noise wrapper once the box implements the trait. It
+still does not finish, for a reason worth writing down: the tunnel stream type
+also answers health() with a non-optional Arc<SessionHealth>, which is the
+per-tunnel ARQ evidence the carrier rule reads. A trait object cannot answer it,
+so health has to travel beside the stream instead of inside it. Two independent
+signals now say the same thing: **the generic serve path is the design**, and
+the health handle must be passed explicitly to whatever serves a tunnel. Both
+attempts were reverted rather than left half-built; nothing in the tree changed.
+
 **The swap hit a real abstraction seam, and it is not cosmetic.** The first
 attempt was to make MhdTunnelStream hold a boxed carrier stream so the server's
 per-tunnel handler could take either carrier. It does not compile: the Noise
