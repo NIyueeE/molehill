@@ -13,11 +13,30 @@
 //! window for ever.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::recovery::{Expiry, Recovery, SentRange};
 use super::stream::{RecvBuf, SendBuf};
 use super::wire::{self, AckSet, Frame, MAX_STREAM_PAYLOAD, ResetCode};
+use crate::transport::health::SessionHealth;
+
+/// How often an idle connection proves the path still carries it.
+///
+/// The cadence is the NAT one: a mapping that sees no packet for longer than a
+/// couple of minutes is reused by the next flow, and a carrier that goes quiet
+/// between bursts would lose its mapping exactly when a visitor arrives. Two
+/// seconds is what the adapter this replaces used, and it keeps a resumed
+/// laptop's first pass to a single probe (see [`Conn::poll_transmit`]).
+pub(crate) const KEEPALIVE: Duration = Duration::from_secs(2);
+
+/// Silence after which the peer is gone.
+///
+/// Ten keepalive intervals, so a path that stops carrying *anything* is called
+/// dead after ten unanswered probes — the "ten unanswered retransmissions" the
+/// carrier promises — instead of holding a lane that will never carry a byte
+/// again. A single arriving datagram resets the count: liveness is the peer's
+/// own traffic, not an acknowledgement of ours.
+const DEAD_AFTER: Duration = Duration::from_secs(20);
 
 /// The window this end advertises: how many bytes a peer may have in flight.
 ///
@@ -45,6 +64,12 @@ pub(crate) enum Rejected {
 }
 
 /// One stream, as the connection sees it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the four flags are the stream's independent lifecycle facts \
+              (each side finished, either reset it, the handle was dropped); an \
+              enum would tie unrelated transitions together"
+)]
 #[derive(Debug, Default)]
 struct StreamState {
     send: SendBuf,
@@ -55,6 +80,13 @@ struct StreamState {
     peer_fin: bool,
     /// Set when either end reset the stream.
     reset: Option<ResetCode>,
+    /// The local handle was dropped: nothing will read this stream again, and
+    /// it is retired once everything written has been acknowledged.
+    abandoned: bool,
+    /// The finish has been told to the peer. A finish rides the last data frame
+    /// when there is one; otherwise it is the reset frame this flag records, so
+    /// it is queued once and never lost.
+    fin_sent: bool,
 }
 
 /// One open stream the connection is holding.
@@ -89,13 +121,31 @@ pub(crate) struct Conn {
     read: u64,
     /// Streams the peer opened that nothing has taken yet.
     inbound: VecDeque<u32>,
+    /// Control frames waiting for the next pass: a stream one end let go.
+    resets: VecDeque<(u32, ResetCode)>,
     /// Set when the connection ended.
     closed: Option<ResetCode>,
+    /// A close that waits for what is already queued to leave first.
+    ///
+    /// A refusal or a shutdown answer is written and then the lane is told to
+    /// die; closing immediately would drop the answer with the connection and
+    /// leave the peer waiting on a request that was in fact refused.
+    close_after: Option<ResetCode>,
+    /// When the next keepalive is due.
+    keepalive_at: Instant,
+    /// When the peer's last datagram arrived.
+    last_recv: Instant,
+    /// The per-connection counters the status API reads, when a lane owns this
+    /// connection. The engine bumps the re-send count here; the pump counts
+    /// what leaves the socket. `None` in the in-memory tests, which measure
+    /// behaviour rather than telemetry.
+    health: Option<std::sync::Arc<SessionHealth>>,
 }
 
 impl Conn {
     /// A fresh connection. The dialing end opens odd stream ids.
     pub(crate) fn new(id: u32, dialer: bool) -> Self {
+        let now = Instant::now();
         Self {
             id,
             dialer,
@@ -110,13 +160,30 @@ impl Conn {
             advertised: 0,
             read: 0,
             inbound: VecDeque::new(),
+            resets: VecDeque::new(),
             closed: None,
+            close_after: None,
+            keepalive_at: now + KEEPALIVE,
+            last_recv: now,
+            health: None,
         }
     }
 
-    /// The connection id every packet carries.
-    pub(crate) fn id(&self) -> u32 {
-        self.id
+    /// Attach the counters the status API reads.
+    pub(crate) fn with_health(mut self, health: std::sync::Arc<SessionHealth>) -> Self {
+        self.health = Some(health);
+        self
+    }
+
+    fn note_retransmits(&self, count: usize) {
+        if let Some(health) = &self.health
+            && count > 0
+        {
+            health.retransmits.fetch_add(
+                u64::try_from(count).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     /// Open a stream, answering its id.
@@ -162,6 +229,72 @@ impl Conn {
             state.send.finish();
             state.local_fin = true;
         }
+        self.settle(stream);
+    }
+
+    /// Let one stream go: the caller dropped the last handle to it.
+    ///
+    /// Whatever was written still goes out. The stream is retired only after the
+    /// peer has acknowledged all of it and the finish has been said, so dropping
+    /// a channel at the end of a request cannot truncate the response. The reset
+    /// is queued at that point — a peer that never sees one keeps a dead stream
+    /// for the connection's life.
+    pub(crate) fn close_stream(&mut self, stream: u32) {
+        let Some(state) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        state.abandoned = true;
+        // Nothing will read this half again: release what arrived.
+        state.recv = RecvBuf::default();
+        state.send.finish();
+        state.local_fin = true;
+        self.settle(stream);
+    }
+
+    /// Move a finishing stream along: say the finish, retire it when it is done.
+    fn settle(&mut self, stream: u32) {
+        let Some(state) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        if state.local_fin && !state.fin_sent && state.send.unacked() == 0 {
+            state.fin_sent = true;
+            // No byte carries the fin now (everything queued is already
+            // acknowledged): the reset says it, after the data has arrived.
+            self.resets.push_back((stream, ResetCode::Finished));
+        }
+        let done = state.abandoned && state.fin_sent && state.send.unacked() == 0;
+        if done {
+            self.streams.remove(&stream);
+        }
+    }
+
+    /// Settle every finishing stream, after an acknowledgement moved a base.
+    fn settle_finished(&mut self) {
+        let waiting: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, state)| state.local_fin && !state.fin_sent)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in waiting {
+            self.settle(id);
+        }
+    }
+
+    /// Whether that stream is still in the table.
+    pub(crate) fn stream_open(&self, stream: u32) -> bool {
+        self.streams.contains_key(&stream)
+    }
+
+    /// Whether this end may still write to the stream.
+    ///
+    /// A peer's finish closes its read direction, not ours; only an abort ends
+    /// both. Writing into a finished stream is how a half-closed connection
+    /// still answers.
+    pub(crate) fn write_open(&self, stream: u32) -> bool {
+        self.streams
+            .get(&stream)
+            .is_some_and(|state| state.reset.is_none_or(|code| code == ResetCode::Finished))
     }
 
     /// Take bytes a stream has received, answering how many were appended.
@@ -177,9 +310,18 @@ impl Conn {
         taken
     }
 
-    /// Whether the peer finished that stream.
+    /// Whether the peer finished that stream, or the whole connection ended.
     pub(crate) fn peer_finished(&self, stream: u32) -> bool {
-        self.streams.get(&stream).is_some_and(|s| s.peer_fin)
+        if self.closed.is_some() {
+            return true;
+        }
+        self.streams.get(&stream).is_some_and(|s| {
+            // A reset ends the stream wherever it is: the peer aborted it and
+            // whatever is missing will never arrive. A clean finish ends it only
+            // once every byte before the end has been read, or a finish that
+            // overtook a hole would truncate the stream.
+            s.reset.is_some() || (s.peer_fin && s.recv.is_complete())
+        })
     }
 
     /// Why that stream was reset, if it was.
@@ -189,7 +331,29 @@ impl Conn {
 
     /// Whether the connection ended.
     pub(crate) fn closed(&self) -> Option<ResetCode> {
-        self.closed
+        if let Some(code) = self.closed {
+            return Some(code);
+        }
+        // A graceful close is complete once the queue is empty: the pump drains
+        // it, sees this, and marks the connection closed for good.
+        self.close_after.filter(|_| !self.has_queued_transmit())
+    }
+
+    /// End the connection, but only after what is queued has been sent.
+    pub(crate) fn close_gracefully(&mut self, code: ResetCode) {
+        if self.closed.is_none() {
+            self.close_after.get_or_insert(code);
+        }
+    }
+
+    /// Whether anything is still waiting for the wire.
+    fn has_queued_transmit(&self) -> bool {
+        self.ack_pending
+            || !self.resets.is_empty()
+            || self
+                .streams
+                .values()
+                .any(|state| state.send.has_unsent() && state.reset.is_none())
     }
 
     /// End the connection.
@@ -197,16 +361,27 @@ impl Conn {
         self.closed = Some(code);
     }
 
-    /// When the caller should look again, if anything is outstanding.
+    /// When the caller should look again: the recovery timer, or the next
+    /// keepalive, whichever comes first.
+    ///
+    /// An idle connection still has a deadline; without one a lane whose peer
+    /// vanished while nothing was in flight would never learn it.
     pub(crate) fn poll_timeout(&self) -> Option<Instant> {
-        self.recovery.poll_timeout()
+        if self.closed.is_some() {
+            return None;
+        }
+        match self.recovery.poll_timeout() {
+            Some(timer) => Some(timer.min(self.keepalive_at)),
+            None => Some(self.keepalive_at),
+        }
     }
 
     /// Build the next datagram to send, answering its length.
     ///
-    /// A stream with bytes to send goes first, then a credit update the peer has
-    /// not seen, then a bare acknowledgement: an ack that waits behind data is
-    /// an ack that arrives after the sender has already re-sent.
+    /// A stream with bytes to send goes first, then a reset, then a credit
+    /// update the peer has not seen, then a bare acknowledgement, and finally a
+    /// keepalive: an ack that waits behind data is an ack that arrives after the
+    /// sender has already re-sent.
     pub(crate) fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<usize> {
         if self.closed.is_some() {
             return None;
@@ -244,6 +419,19 @@ impl Conn {
             }
             self.advance_cursor();
             self.ack_pending = false;
+            self.keepalive_at = now + KEEPALIVE;
+            return Some(packet_len);
+        }
+        if let Some((id, code)) = self.resets.pop_front() {
+            let packet_len = wire::encode(
+                out,
+                self.id,
+                self.recovery.next_number(),
+                ack,
+                Frame::Reset { id, code },
+            )?;
+            self.ack_pending = false;
+            self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
         }
         if self.recv_credit > self.advertised + WINDOW / 4 {
@@ -259,12 +447,26 @@ impl Conn {
             )?;
             self.advertised = self.recv_credit;
             self.ack_pending = false;
+            self.keepalive_at = now + KEEPALIVE;
             return Some(packet_len);
         }
         if self.ack_pending {
             let packet_len =
                 wire::encode(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
             self.ack_pending = false;
+            self.keepalive_at = now + KEEPALIVE;
+            return Some(packet_len);
+        }
+        if now >= self.keepalive_at {
+            // One probe per due interval, however long the process was asleep:
+            // a resumed laptop must not fire the whole missed schedule at once.
+            self.keepalive_at = now + KEEPALIVE;
+            if now.saturating_duration_since(self.last_recv) > DEAD_AFTER {
+                self.closed = Some(ResetCode::Aborted);
+                return None;
+            }
+            let packet_len =
+                wire::encode(out, self.id, self.recovery.next_number(), ack, Frame::None)?;
             return Some(packet_len);
         }
         None
@@ -280,7 +482,10 @@ impl Conn {
         for step in 0..ids.len() {
             let id = ids[(start + step) % ids.len()];
             let state = self.streams.get(&id)?;
-            if state.reset.is_some() {
+            // `Finished` ends the peer's *write* direction, not the stream: the
+            // other direction is still ours to use (that is what half-close
+            // means). Only an abort or a refusal stops our writes too.
+            if state.reset.is_some_and(|code| code != ResetCode::Finished) {
                 continue;
             }
             if !state.send.has_unsent() {
@@ -310,7 +515,13 @@ impl Conn {
         if packet.id != self.id {
             return Err(Rejected::Malformed);
         }
-        self.acks.insert(packet.number);
+        if self.closed.is_some() {
+            // A closed connection consumes nothing and acknowledges nothing:
+            // the peer will learn it from its own silence, and re-awakening a
+            // dead lane here would let a stale datagram revive it.
+            return Ok(());
+        }
+        self.last_recv = now;
         if let Some(ack) = packet.ack {
             let acked = self.recovery.on_ack(now, ack);
             for sent in acked.newly {
@@ -322,6 +533,7 @@ impl Conn {
             }
             // A loss only rewinds the send point: the bytes are still in the
             // buffer, so the next pass carries them again from the same offset.
+            self.note_retransmits(acked.lost.len());
             for sent in acked.lost {
                 if let Some(range) = sent.range
                     && let Some(state) = self.streams.get_mut(&range.stream)
@@ -329,6 +541,10 @@ impl Conn {
                     state.send.rewind_to(range.offset);
                 }
             }
+            // A stream whose every byte is now acknowledged can say its finish
+            // (see `settle`): the acknowledgement is the proof that the reset
+            // will not overtake the data it follows.
+            self.settle_finished();
         }
         match packet.frame {
             Frame::None => {}
@@ -374,18 +590,32 @@ impl Conn {
                 }
             }
         }
+        // Acknowledged only after the frame was accepted: an acknowledgement is
+        // the promise that makes the sender forget the bytes, so it may not be
+        // sent for a frame this end rejected.
+        self.acks.insert(packet.number);
         Ok(())
     }
 
     /// The timer expired: why, and how many packets it put back in the queue.
     pub(crate) fn on_timeout(&mut self, now: Instant) -> (Expiry, usize) {
+        if self.closed.is_some() {
+            return (Expiry::Loss, 0);
+        }
+        // The keepalive deadline is the other caller of this: when it fires
+        // with nothing in flight there is nothing to recover, and the pump's
+        // next pass emits the probe (see `poll_transmit`).
         let (expiry, lost) = self.recovery.on_timeout(now);
+        self.note_retransmits(lost.len());
         for sent in &lost {
             if let Some(range) = sent.range
                 && let Some(state) = self.streams.get_mut(&range.stream)
             {
                 state.send.rewind_to(range.offset);
             }
+        }
+        if expiry == Expiry::Dead {
+            self.closed = Some(ResetCode::Aborted);
         }
         (expiry, lost.len())
     }

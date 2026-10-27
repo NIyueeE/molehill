@@ -548,6 +548,15 @@ async fn recv_loop<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin>
             }
         }
     }
+    if !pending.is_empty() {
+        // Every stripe ended while frames were still parked behind a missing
+        // sequence number: the destination is about to be truncated at `next`,
+        // and the count says how much the group lost.
+        debug!(
+            "stripe receive ended with {} frames parked behind sequence {next}",
+            pending.len()
+        );
+    }
     dest.shutdown().await?;
     debug!("stripe receive direction finished after {next} frames");
     Ok(())
@@ -633,13 +642,15 @@ where
         while send_res.is_none() || recv_res.is_none() {
             tokio::select! {
                 res = &mut send, if send_res.is_none() => {
-                    if matches!(res, Ok(Err(_))) {
+                    if let Ok(Err(e)) = &res {
+                        debug!("stripe send direction failed: {e:#}");
                         recv.abort();
                     }
                     send_res = Some(res);
                 }
                 res = &mut recv, if recv_res.is_none() => {
-                    if matches!(res, Ok(Err(_))) {
+                    if let Ok(Err(e)) = &res {
+                        debug!("stripe receive direction failed: {e:#}");
                         send.abort();
                     }
                     recv_res = Some(res);
@@ -653,6 +664,7 @@ where
                 };
                 grace = Some(tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    debug!("stripe half-close grace expired; cutting the other direction");
                     other.abort();
                 }));
             }

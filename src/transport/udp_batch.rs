@@ -30,7 +30,7 @@ use nix::sys::socket::{
     sendmmsg, sendmsg,
 };
 
-use crate::mhd::MHD_OVERHEAD;
+use crate::transport::mhd::MHD_OVERHEAD;
 use bytes::Bytes;
 
 use super::dgram::{BATCH, Span};
@@ -229,7 +229,10 @@ impl SendBatch {
     /// `send_spans`.
     ///
     /// The segment size is the first span's length, which is what the engine's
-    /// MTU-sized segments all share; the trailing piece may be shorter.
+    /// MTU-sized segments all share; the trailing piece may be shorter. A run
+    /// with a short piece anywhere but the end is not eligible at all: a partial
+    /// super-packet would silently drop the spans it did not carry, and the
+    /// caller has already marked them sent.
     pub fn send_gso(fd: RawFd, peer: SocketAddr, buf: &Bytes, spans: &[Span]) -> io::Result<usize> {
         let limit = spans.len().min(BATCH);
         let Some(segment) = spans.first().map(Span::len).filter(|n| *n > 0) else {
@@ -244,6 +247,9 @@ impl SendBatch {
         }
         if n < limit {
             // The one shorter piece GSO allows, and only at the end.
+            if n + 1 != limit {
+                return Ok(0);
+            }
             n += 1;
         }
         if n < 2 {

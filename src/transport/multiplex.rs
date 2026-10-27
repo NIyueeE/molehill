@@ -199,7 +199,7 @@ pub(crate) fn stream_cap() -> usize {
 
 /// The next tunnel id: unique per process, so two pools' tunnels can never be
 /// confused in the client's pin accounting.
-fn next_tunnel_id() -> usize {
+pub(crate) fn next_tunnel_id() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -303,8 +303,10 @@ impl TunnelCounters {
     ///
     /// Same bookkeeping, built by the carrier rather than by the yamux driver:
     /// the pool charges streams and bytes to a lane whoever produced them.
-    pub(crate) fn for_lane() -> std::sync::Arc<Self> {
-        Self::with_health(None)
+    pub(crate) fn for_lane_with(
+        health: Option<std::sync::Arc<crate::transport::health::SessionHealth>>,
+    ) -> std::sync::Arc<Self> {
+        Self::with_health(health)
     }
 
     /// Bytes this end delivered off the tunnel to the forwarding code.

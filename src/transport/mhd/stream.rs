@@ -73,6 +73,7 @@ impl SendBuf {
     }
 
     /// Whether the writer finished.
+    #[cfg(test)]
     pub(crate) fn finished(&self) -> bool {
         self.fin_at.is_some()
     }
@@ -128,6 +129,12 @@ pub(crate) struct RecvBuf {
     /// Everything below this offset has been read out.
     read: u64,
     /// Where the peer said the stream ends, once it did.
+    ///
+    /// A finish may arrive on a range whose predecessors are still missing (the
+    /// last packet carries the flag, and UDP does not promise the ones before it
+    /// arrived first). The stream is only complete when this equals `read`: a
+    /// reader that stopped at the flag would truncate the stream at the first
+    /// hole, which is exactly what a bulk transfer under loss produces.
     fin_at: Option<u64>,
 }
 
@@ -189,20 +196,16 @@ impl RecvBuf {
         out.len() - before
     }
 
-    /// The first hole: how many bytes are missing and where the next piece is.
-    pub(crate) fn hole(&self) -> Option<(u64, u64)> {
-        let (offset, _) = self.pieces.iter().next()?;
-        (*offset > self.read).then(|| (*offset - self.read, *offset))
-    }
-
-    /// Whether the stream finished and everything up to the end has been read.
+    /// Whether the finish arrived and every byte before it has been read.
     pub(crate) fn is_complete(&self) -> bool {
         self.fin_at == Some(self.read) && self.pieces.is_empty()
     }
 
-    /// The offset the reader will deliver next.
-    pub(crate) fn read_offset(&self) -> u64 {
-        self.read
+    /// The first hole: how many bytes are missing and where the next piece is.
+    #[cfg(test)]
+    pub(crate) fn hole(&self) -> Option<(u64, u64)> {
+        let (offset, _) = self.pieces.iter().next()?;
+        (*offset > self.read).then(|| (*offset - self.read, *offset))
     }
 }
 

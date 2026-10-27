@@ -13,8 +13,6 @@ mod common;
 mod config;
 mod core;
 pub mod logging;
-#[cfg(feature = "mhd")]
-mod mhd;
 #[cfg(feature = "multiplex")]
 mod mux;
 mod protocol;

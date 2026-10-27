@@ -47,62 +47,76 @@
 
 ## Where this stands
 
-A second attempt took the other branch (implement the owned-write trait for the
-box, so the tunnel handler could stay concrete) and got further: the boxed
-stream compiles through the Noise wrapper once the box implements the trait. It
-still does not finish, for a reason worth writing down: the tunnel stream type
-also answers health() with a non-optional Arc<SessionHealth>, which is the
-per-tunnel ARQ evidence the carrier rule reads. A trait object cannot answer it,
-so health has to travel beside the stream instead of inside it. Two independent
-signals now say the same thing: **the generic serve path is the design**, and
-the health handle must be passed explicitly to whatever serves a tunnel. Both
-attempts were reverted rather than left half-built; nothing in the tree changed.
+**The carrier swap has landed (2026-10-27).** The product now runs `mhd` — the
+new engine under `src/transport/mhd/` — for its UDP data plane, and both KCP
+files are deleted: `src/mhd.rs` (the engine) and the 4,146-line adapter body
+that used to be `src/transport/mhd.rs` (that path is now the new module root).
+The pool holds `Arc<dyn PoolLane>`; a YamuxLane (TCP) and an `MhdLane`
+(`mhd`) implement it, and the server's `mhd` listener serves each stream a lane
+accepts through the same transport-selector + Noise + hello opening a TCP data
+channel uses. Noise is per stream; a validation stream at lane establishment
+makes the server reserve the lane's `max_tunnels` slot before the pool counts
+it.
 
-**The swap hit a real abstraction seam, and it is not cosmetic.** The first
-attempt was to make MhdTunnelStream hold a boxed carrier stream so the server's
-per-tunnel handler could take either carrier. It does not compile: the Noise
-wrapper's initiator/responder take a stream that implements this crate's
-AsyncWriteOwned trait (the owned-buffer path that avoids a copy per write), and a
-boxed dyn stream cannot satisfy it — dyn erases the associated const and the
-owned write. So the tunnel handler must be generic over its stream type, or the
-box must implement AsyncWriteOwned by delegating; the first is the honest one,
-and it decides how the two carriers meet: a generic serve path, not a common
-trait object. Recorded here because the next attempt should start from that
-decision rather than rediscovering it by compiling.
+The swap was not a rename of the adapter: the engine grew the pieces the product
+needs and the integration suite found the defects. Fixed here, each with a test
+where one was possible:
 
-**Where the swap stands (P3a-6).** The new engine is complete and tested on its
-own: wire, stream buffers, recovery, connection, async seam, pump, lane and
-listener, 2678 lines across six files under src/transport/mhd/, 34 unit tests,
-one of them the pool's real call path over a real socket. The product still runs
-the old KCP adapter (src/transport/mhd.rs, 4146 lines, plus the engine module
-src/mhd.rs, 2098 lines): the swap is atomic because the two speak different
-wires.
+- a lost wake-up between a reader's empty read and its park (the stream parked
+  until the pump's next timer — measured as a 450 ms stall per forwarded
+  channel);
+- `on_timeout` being run on every pump wake-up instead of only on the timer
+  (a retransmission of everything in flight on each write, which is a storm);
+- the reordering window collapsing to zero on a loopback RTT (every packet
+  looked lost the moment any ack arrived — now floored at 1 ms);
+- an EOF reported as soon as a FIN arrived, even with a hole before it
+  (a bulk transfer under loss truncated at the first hole);
+- a half-close (`Reset(Finished)`) stopping the *sender's* writes too, which
+  truncated every echo whose reply direction outlived the forward direction;
+- a graceful close that could drop a refusal written just before the lane was
+  marked dead (the valve test's peer waited out its budget);
+- a listener whose dispatchers and admitted lanes kept `SO_REUSEPORT` sockets
+  bound after server shutdown (a restarted server shared the port with a table
+  nobody read);
+- GSO eligibility and partial `sendmmsg` accounting (a run that could not be
+  segmented as one super-packet must fall back whole, and a partial send must
+  resume, never silently drop the rest).
 
-Two blockers were found by attempting it and are now resolved in the type
-system rather than worked around:
+**Verification so far.** `cargo test --lib`: 304 pass (21 in the new engine,
+including a 100-round-trip Noise stream and an 8 MiB stream behind a slow
+reader). `integration_test`: 22/22 pass with `MOLEHILL_DATA_CARRIER=mhd` and
+22/22 with `=tcp` (serial, separate runs). `pool_test` (default carrier),
+`status_api_test`, `log_budget_test`, `session_test`, `startup_failure_test`,
+`noise_keys_test` and `hot_reload_test` are green. `pool_test` under a *forced*
+`tcp` still fails the three tests that use the diagnostic cross-carrier
+handover hatch (the server never binds UDP when the client declares TCP);
+that is a harness/diagnostic interaction, not a data-path failure, and the
+forced modes the release gate names are the integration suite's.
 
-1. The tunnel stream answered health() by asking the session underneath, and a
-   trait object cannot answer for a carrier. It is now a struct that owns its IO
-   and carries the handle beside it (ba303aa).
-2. The tunnel stream's inner shape was the KCP session type. It now holds the
-   boxed carrier stream the pool already uses, and a boxed stream implements the
-   owned-write trait by delegating — one copy per record, the price of a
-   carrier-neutral stream until the carrier implements the owned path itself
-   (6a584d0).
+**Still open, in order:**
 
-What remains, in order: make the server serve each stream a lane accepts (the
-per-stream handler is already reachable through the neutral type), point the
-client's mhd tunnel at MhdLane::connect instead of connect_stream, replace
-MhdAcceptor with MhdListener on both ends, delete src/mhd.rs and the adapter body,
-and run the integration suite forced onto mhd. The protocol decision behind it is
-recorded above: a lane is a tunnel, its streams are the channels, and Noise stays
-per stream so data_enable keeps its meaning.
+1. **The P2/P3 gate has not been measured.** `cpu_s_per_gbit` for `mhd` against
+   TCP in one run with `--aa` is the existential number and it is still
+   unknown; the carrier makes no cost claim anywhere. The run is
+   `sudo -n env MOLEHILL_DATA_CARRIER=tcp just bench --profile screen --aa`
+   then the same with `=mhd`, interleaved on one host.
+2. **P3b/P3c** — the unreliable datagram/L3 frame classes are in the wire but
+   not yet wired into the UDP-forwarding and transparent paths; the header MAC,
+   the unauthenticated-state budget, the PMTU probe, pacing, `SO_REUSEPORT`
+   accounting on the client and the `SessionHealth`/carrier-rule evidence are
+   not done. `mhd` streams currently carry those paths through the reliable
+   stream, which is correct but loses the loss-isolation win.
+3. **P4/P5/P6** — rate-based congestion control, adaptive FEC, bench arms and
+   the bilingual docs sweep are untouched. The docs pages were updated only
+   where the swap made them false (structure, transport's Noise paragraph,
+   internals' definitions); the benchmark numbers and carrier claims still
+   describe the pre-swap method and must be rewritten with the new arms.
 
-**The P2 gate is runnable after all.** Passwordless sudo works on this host (the
-audit-message warning is not a failure; sudo -n id -u answers 0). An earlier note
-in this file said the bench could not run here; that was wrong, and the gate it
-would have blocked is exactly the one that decides whether the carrier is worth
-shipping: cpu_s_per_gbit for mhd against TCP in one run with --aa.
+The two failed attempts that preceded this swap are why the server side is
+generic over `DataChannel` today; the type-level fixes they produced are in the
+commit history (`ba303aa`, `6a584d0`), and the decision they argued for — a
+generic serve path, not one trait object for both carriers — is now the shape of
+the code.
 
 ### 1.0.0: the KCP carrier becomes `mhd` (branch `feat/v1.0.0`, from tag v0.11.2)
 

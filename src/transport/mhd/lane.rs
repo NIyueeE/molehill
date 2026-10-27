@@ -15,6 +15,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::conn::Conn;
+use super::wire::ResetCode;
+use crate::transport::health::SessionHealth;
 
 /// Whoever is waiting on this connection, by reason.
 #[derive(Debug, Default)]
@@ -36,15 +38,31 @@ pub(crate) struct Shared {
     /// between the socket and this, so one signal is all it needs and a wake-up
     /// that arrives between two passes is not lost.
     signal: tokio::sync::Notify,
+    /// Tells a lane's owner that a stream arrived.
+    ///
+    /// Separate from [`Self::signal`] on purpose: one notification with two
+    /// waiters lets the wrong one consume it, and a send that lost its wake-up
+    /// to the accept loop waits for the keepalive timer (measured as a two
+    /// second stall on every forwarded channel).
+    streams: tokio::sync::Notify,
+    /// Tells whoever waits on the connection that it ended: the pump, and the
+    /// lane's server-side loop. A notification, for the same reason.
+    ended: tokio::sync::Notify,
+    /// The per-connection counters the status API reads.
+    pub(crate) health: std::sync::Arc<SessionHealth>,
 }
 
 impl Shared {
     /// Wrap a connection.
-    pub(crate) fn new(conn: Conn) -> Arc<Self> {
+    pub(crate) fn new(conn: Conn, health: std::sync::Arc<SessionHealth>) -> Arc<Self> {
+        let conn = conn.with_health(std::sync::Arc::clone(&health));
         Arc::new(Self {
             conn: Mutex::new(conn),
             wakers: Mutex::new(Wakers::default()),
             signal: tokio::sync::Notify::new(),
+            streams: tokio::sync::Notify::new(),
+            ended: tokio::sync::Notify::new(),
+            health,
         })
     }
 
@@ -54,9 +72,83 @@ impl Shared {
         f(&mut conn)
     }
 
+    /// End the connection: every stream ends, the pump stops after its last
+    /// pass, and whoever waits on the lane is woken.
+    pub(crate) fn close(&self, code: ResetCode) {
+        let already = self.with(|conn| conn.closed());
+        self.with(|conn| conn.close(code));
+        if already.is_none() {
+            tracing::debug!("mhd connection closed: {code:?}");
+        }
+        self.notify_closed();
+    }
+
+    /// Ask for the close, after whatever is already queued has been sent.
+    ///
+    /// A refusal is written and then the lane is told to die; closing at once
+    /// would drop the refusal with the connection and leave the peer waiting on
+    /// a request the server in fact answered.
+    pub(crate) fn begin_close(&self, code: ResetCode) {
+        self.with(|conn| conn.close_gracefully(code));
+        self.wake_pump();
+    }
+
+    /// Complete a graceful close the pump has drained.
+    pub(crate) fn finish_close(&self) {
+        let code = self
+            .with(|conn| conn.closed())
+            .unwrap_or(ResetCode::Aborted);
+        self.with(|conn| conn.close(code));
+        tracing::debug!("mhd connection closed: {code:?}");
+        self.notify_closed();
+    }
+
+    fn notify_closed(&self) {
+        self.ended.notify_waiters();
+        self.wake_readers();
+        self.wake_writers();
+        self.wake_pump();
+    }
+
+    /// Whether the connection ended.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.with(|conn| conn.closed()).is_some()
+    }
+
+    /// Wait until the connection ends.
+    pub(crate) async fn closed(&self) {
+        loop {
+            if self.is_closed() {
+                return;
+            }
+            self.ended.notified().await;
+        }
+    }
+
+    /// Record one datagram leaving the socket (the status API's send count).
+    pub(crate) fn note_sent(&self) {
+        self.health
+            .datagrams_out
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Tell the pump there is something new to send.
     pub(crate) fn wake_pump(&self) {
         self.signal.notify_one();
+    }
+
+    /// Tell the lane's owner that a stream may have arrived.
+    ///
+    /// `notify_one` rather than `notify_waiters`: a wake-up that arrives
+    /// between the owner's check and its wait must be remembered, or a stream
+    /// waits for the next datagram.
+    pub(crate) fn wake_streams(&self) {
+        self.streams.notify_one();
+    }
+
+    /// Wait until a datagram may have opened a stream.
+    pub(crate) async fn stream_added(&self) {
+        self.streams.notified().await;
     }
 
     /// Wait until someone says there is something to send.
@@ -113,11 +205,6 @@ impl StreamIo {
             scratch: Vec::new(),
         }
     }
-
-    /// The stream id every frame names.
-    pub(crate) fn id(&self) -> u32 {
-        self.id
-    }
 }
 
 impl AsyncRead for StreamIo {
@@ -127,13 +214,25 @@ impl AsyncRead for StreamIo {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        // A caller that asked for fewer bytes than had arrived left the rest
+        // here; hand it out before reading the connection again.
+        if !this.scratch.is_empty() {
+            let room = buf.remaining().min(this.scratch.len());
+            buf.put_slice(&this.scratch[..room]);
+            this.scratch.drain(..room);
+            return Poll::Ready(Ok(()));
+        }
         let mut scratch = std::mem::take(&mut this.scratch);
-        scratch.clear();
-        let (taken, ended) = this.shared.with(|conn| {
+        // Register before reading: a datagram that arrives between the read and
+        // the park would otherwise find no waker and be lost, and the reader
+        // would wait for the pump's next timer instead of the bytes.
+        this.shared.park_reader(cx.waker());
+        let (taken, ended, open) = this.shared.with(|conn| {
             let taken = conn.read(this.id, &mut scratch);
             (
                 taken,
                 conn.peer_finished(this.id) || conn.reset_reason(this.id).is_some(),
+                conn.stream_open(this.id),
             )
         });
         if taken > 0 {
@@ -143,17 +242,14 @@ impl AsyncRead for StreamIo {
                 // The caller asked for less than arrived: keep the rest for the
                 // next poll instead of dropping it.
                 scratch.drain(..room);
-            } else {
-                scratch.clear();
+                this.scratch = scratch;
             }
-            this.scratch = scratch;
             return Poll::Ready(Ok(()));
         }
         this.scratch = scratch;
-        if ended {
+        if ended || !open {
             return Poll::Ready(Ok(()));
         }
-        this.shared.park_reader(cx.waker());
         Poll::Pending
     }
 }
@@ -165,15 +261,23 @@ impl AsyncWrite for StreamIo {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if this.shared.is_closed() {
+            return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        }
+        if !this.shared.with(|conn| conn.write_open(this.id)) {
+            return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // Same rule as the read side: parked before the credit is re-read, so a
+        // credit update between the two cannot be missed.
+        this.shared.park_writer(cx.waker());
         let written = this.shared.with(|conn| conn.write(this.id, buf));
         if written > 0 {
             this.shared.wake_pump();
             return Poll::Ready(Ok(written));
         }
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        this.shared.park_writer(cx.waker());
         Poll::Pending
     }
 
@@ -188,6 +292,21 @@ impl AsyncWrite for StreamIo {
         this.shared.with(|conn| conn.finish(this.id));
         this.shared.wake_pump();
         Poll::Ready(Ok(()))
+    }
+}
+
+/// A dropped handle releases its stream.
+///
+/// The pool charges a stream to its lane until the handle dies, and the peer
+/// must be told: without the reset it would keep writing into a stream nothing
+/// reads, and its table would grow by one entry per visitor for the lane's whole
+/// life.
+impl Drop for StreamIo {
+    fn drop(&mut self) {
+        if !self.shared.is_closed() {
+            self.shared.with(|conn| conn.close_stream(self.id));
+            self.shared.wake_pump();
+        }
     }
 }
 
@@ -235,8 +354,14 @@ mod tests {
     /// peer's stream. Nothing here touches a socket.
     #[tokio::test]
     async fn bytes_written_through_the_trait_arrive_on_the_peer() {
-        let dialer = Shared::new(Conn::new(11, true));
-        let acceptor = Shared::new(Conn::new(11, false));
+        let dialer = Shared::new(
+            Conn::new(11, true),
+            crate::transport::health::SessionHealth::new(),
+        );
+        let acceptor = Shared::new(
+            Conn::new(11, false),
+            crate::transport::health::SessionHealth::new(),
+        );
 
         let pump = {
             let dialer = Arc::clone(&dialer);

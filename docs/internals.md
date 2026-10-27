@@ -7,9 +7,9 @@
 - **Client**: the host behind NAT running molehill in client mode; it holds the services to be exposed
 - **Visitor**: someone who connects to a service through the server
 - **Control session**: an authenticated connection between the server and one client endpoint, carrying the control commands of *every* service the client registers there (protocol v5.2). Two services share it when they declare the same endpoint and the same KK key pair — the control channel is always Noise, so a service that overrides `noise` (for another server, or with its own keys) gets a session of its own, while `data_enable` alone never splits one
-- **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, or (with `multiplex`) a yamux stream inside the tunnel. It names the service it carries with a four-byte prologue (a transparent lane adds its lane id, making eight; see "Forwarding")
-- **Tunnel** (`multiplex` feature): an extra connection, upgraded to a yamux session, that belongs to a control session and carries many data channels as streams
-- **Tunnel pool**: the tunnels one control session keeps for its services — one pool per session, keyed by its data endpoint (see "The tunnel pool")
+- **Data channel**: one stream of forwarded traffic between the server and the client — either a dedicated transport connection, a yamux stream inside a TCP tunnel, or one of `mhd`'s own streams inside a lane. It names the service it carries with a four-byte prologue (a transparent lane adds its lane id, making eight; see "Forwarding")
+- **Lane**: one carrier connection of the pool. A TCP lane is a yamux session; an `mhd` lane is a UDP connection with its own packet numbers, acknowledgements and streams, and no multiplexer above it
+- **Tunnel pool**: the lanes one control session keeps for its services — one pool per session, keyed by its data endpoint (see "The tunnel pool")
 - **Stripe group**: a set of `K` data channels that carry one visitor connection together (see "Data-channel striping")
 
 ## Startup and registration
@@ -55,7 +55,7 @@ with one refused connection telling you which side is behind.
 
 ## Forwarding
 
-When a visitor connects to a registered service's endpoint, the server asks the session for one more channel for that service — `CreateDataChannelFor(service_id)`, which names the service because a session carries several. The client opens a data channel back (a fresh connection, or a yamux stream inside a tunnel), and the server marks it with a `StartForwardTcp`/`StartForwardUdp` command; the pair then copies the visitor's bytes bidirectionally.
+When a visitor connects to a registered service's endpoint, the server asks the session for one more channel for that service — `CreateDataChannelFor(service_id)`, which names the service because a session carries several. The client opens a data channel back (a fresh connection, a yamux stream inside a TCP tunnel, or one of `mhd`'s own streams inside a lane), and the server marks it with a `StartForwardTcp`/`StartForwardUdp` command; the pair then copies the visitor's bytes bidirectionally.
 
 **The service prologue.** A data channel opens with the service's four-byte id before anything else: the session nonce identifies the *session*, not a service, so a channel has to say which one it is for. A direct channel writes it right after its hello; a stream of a multiplexed tunnel writes it right after the stream is opened, because a tunnel belongs to the session. Routing is per **stream**: one tunnel may carry streams of several services (which is what a shared pool produces), and each stream's prologue is what decides the queue it lands in. The server reads the prologue before routing, so a stream naming a service that is not registered on that session is dropped on its own, without touching the tunnel or the session.
 
@@ -139,13 +139,15 @@ The **S1 observation** is opt-in and aggregated, so a normal run stays silent an
 ### Multiplexing
 
 With the `multiplex` feature (part of the default feature set), a registered
-**forwarding** service runs over a **fixed pool of tunnels**, established when
-the service activates (each announced with a distinct hello so the server
-upgrades it to a yamux session) and held for its lifetime; a dead one is
-repaired back to the count. The shape is not a key: a forwarding service always
-multiplexes, and a [transparent claim](#transparent-l3-services) never does,
-because a claim's channels *are* its carrier connections. Data-channel opens
-take the least-loaded tunnel, and a dead tunnel is skipped transparently. The
+**forwarding** service runs over a **fixed pool of lanes**, established when
+the service activates and held for its lifetime; a dead one is repaired back to
+the count. A TCP lane is announced with a tunnel hello so the server upgrades it
+to a yamux session; an `mhd` lane is a UDP connection whose first stream's hello
+names the session, and later streams of the same lane reuse it. The shape is not
+a key: a forwarding service always multiplexes, and a
+[transparent claim](#transparent-l3-services) never does, because a claim's
+channels *are* its carrier connections. Data-channel opens
+take the least-loaded lane, and a dead lane is skipped transparently. The
 pool's width is `[client.data].tunnels` and it belongs to the session; both are
 described in "The tunnel pool" below. The
 tunnels dial the service's data endpoint (`[client.services.<name>].remote_addr`
@@ -153,10 +155,11 @@ when set, else `[client.data].default_data_addr`, else the control endpoint) and
 are accepted by the server's data listener — the control listener itself when
 the addresses match, otherwise `[server.data].bind_addr`. From then on:
 
-- `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the tunnel, and the stream's prologue names the service it carries.
+- `CreateDataChannelFor` no longer dials a fresh TCP(+Noise) connection; the client simply opens a new stream on the lane, and the stream's prologue names the service it carries.
+- On an `mhd` lane the stream is the carrier's own: byte offsets, a connection-wide acknowledgement bitmap and credit live in `src/transport/mhd/`, with no yamux and no record layer between the visitor's bytes and the lane's packet scheduler. Noise is per stream, so one stream cannot read another's bytes and a reordering never desynchronises a record counter. On a TCP lane the stream is a yamux stream over the Noise-wrapped connection, as before.
 - The server feeds accepted streams into the same pool/pairing logic used for plain channels.
 - Per-stream framing is identical to the plain path (the service prologue, then the `StartForward*` command), which keeps the stream path and the connection path testable against each other.
-- The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
+- The framing engine is maintained in-repo (`src/mux/`, vendored from rust-yamux 0.14 — wire-identical with the yamux specification; the vendoring rationale and its per-lever outcomes are recorded in HANDOFF.md "What landed" / "Optimization route"). It carries only the TCP carrier; `mhd` has its own stream engine. It is tokio-native (tokio IO traits, no compatibility shim on the data path) and auto-tunes each stream's receive window towards the bandwidth-delay product, avoiding the fixed-small-window throttling known from stock yamux deployments.
 - yamux opens outbound streams lazily (the SYN flag rides on the first outbound frame). Because this protocol is server-speaks-first, the client driver kicks each fresh stream with a zero-length write so a read-only pooled stream is announced immediately.
 - A stream's two users park on the connection's per-stream command channel independently, so each has its own waker slot: a *reader* waiting to queue a window update and a *writer* waiting for send credit would otherwise share one slot, and the later park would erase the earlier one's waker — a writer that then never wakes until an unrelated resize happens to notify, which stalls every visitor on that tunnel. The reader's park lives in its own slot (`Shared::reader_park`) and the connection wakes both when a command leaves the channel.
 

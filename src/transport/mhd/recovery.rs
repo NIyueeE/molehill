@@ -84,8 +84,19 @@ pub(crate) struct Rtt {
     pub(crate) latest: Option<Duration>,
 }
 
+/// The floor under any round-trip sample and the reordering window.
+///
+/// A loopback path answers inside a few microseconds, and a zero estimate makes
+/// `loss delay` zero: every packet still in flight then looks "older than the
+/// window" the moment any acknowledgement arrives, so the connection
+/// retransmits data the peer already has on every pass. One millisecond is the
+/// timer granularity of the hosts this runs on, and it is the same floor TCP
+/// and QUIC use for the same reason.
+const GRANULARITY: Duration = Duration::from_millis(1);
+
 impl Rtt {
     fn sample(&mut self, sample: Duration) {
+        let sample = sample.max(GRANULARITY);
         self.latest = Some(sample);
         match self.smoothed {
             None => {
@@ -98,15 +109,24 @@ impl Rtt {
                 // follow a path that changes.
                 let drift = smoothed.saturating_sub(sample);
                 self.variance = (self.variance * 3 + drift) / 4;
-                self.smoothed = Some((smoothed * 7 + sample) / 8);
+                self.smoothed = Some(((smoothed * 7 + sample) / 8).max(GRANULARITY));
             }
         }
     }
 
     /// The reordering window: nine eighths of the round trip.
     fn loss_delay(&self) -> Duration {
-        let base = self.latest.or(self.smoothed).unwrap_or(INITIAL_RTO);
-        base.saturating_mul(TIME_THRESHOLD_NUM) / TIME_THRESHOLD_DEN
+        // The *larger* of the latest and the smoothed estimate: a fast probe
+        // can sample a millisecond while the bulk data in flight was queued for
+        // ten, and a window built on the probe alone declares every queued
+        // packet lost. The rule is the one QUIC adopted for the same reason.
+        let base = match (self.latest, self.smoothed) {
+            (Some(latest), Some(smoothed)) => latest.max(smoothed),
+            (Some(one), None) | (None, Some(one)) => one,
+            (None, None) => INITIAL_RTO,
+        }
+        .max(GRANULARITY);
+        (base.saturating_mul(TIME_THRESHOLD_NUM) / TIME_THRESHOLD_DEN).max(GRANULARITY)
     }
 
     /// The retransmission timer for the current estimate.
@@ -210,12 +230,18 @@ impl Recovery {
         // A packet that had never been acknowledged and is at or below the
         // largest this block names is the only one that can sample the round
         // trip: sampling every acknowledgement would fold the peer's delayed
-        // ack timer into the estimate.
-        if let Some((_, sent)) = self.in_flight.iter().next_back()
-            && ack.largest >= sent.number
-        {
+        // ack timer into the estimate. The sample is taken from the newest
+        // packet this block covers, not from whatever happens to sit at the end
+        // of the flight (a probe has no useful trip time).
+        let sample = self
+            .in_flight
+            .iter()
+            .filter(|(number, _)| ack.contains(**number))
+            .map(|(number, sent)| (*number, sent.time))
+            .max_by_key(|(number, _)| *number);
+        if let Some((_, time)) = sample {
             result.progress = true;
-            self.rtt.sample(now.saturating_duration_since(sent.time));
+            self.rtt.sample(now.saturating_duration_since(time));
             self.timer = Some(now + self.rtt.rto());
             self.backoff = 0;
             self.silent = 0;
@@ -232,16 +258,24 @@ impl Recovery {
                 result.newly.push(sent);
             }
         }
-        // Lost: three behind the largest, or older than the reordering window.
-        let delay = self.rtt.loss_delay();
+        // Lost: three behind the largest within the acknowledgement window.
+        //
+        // The window is 64 packets wide, so a packet *older* than that is
+        // invisible to this block: a later acknowledgement cannot say whether
+        // it arrived. Declaring it lost would be an inference, and on a bursty
+        // path it is a wrong one — acks can be processed in batches, one of
+        // which jumps hundreds of packet numbers, and every packet below its
+        // window would be declared lost and re-sent. Such packets stay in
+        // flight; the retransmission timer below recovers them, at the cost of
+        // one round trip instead of a retransmission storm.
+        let oldest_visible = ack.largest.saturating_sub(64);
         let lost: Vec<u32> = self
             .in_flight
             .iter()
-            .filter(|(number, sent)| {
-                let three_behind = ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
-                    && **number < ack.largest;
-                let too_old = now.saturating_duration_since(sent.time) > delay;
-                three_behind || too_old
+            .filter(|(number, _)| {
+                **number < ack.largest
+                    && **number >= oldest_visible
+                    && ack.largest.saturating_sub(**number) >= PACKET_THRESHOLD
             })
             .map(|(number, _)| *number)
             .collect();
@@ -298,11 +332,13 @@ impl Recovery {
     }
 
     /// Whether anything is waiting for an acknowledgement.
+    #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.in_flight.len()
     }
 
     /// The round-trip estimate, for the congestion controller and the pacer.
+    #[cfg(test)]
     pub(crate) fn rtt(&self) -> Rtt {
         self.rtt
     }

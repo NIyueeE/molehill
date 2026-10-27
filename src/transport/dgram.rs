@@ -17,7 +17,7 @@
 
 use bytes::Bytes;
 
-use crate::mhd::MHD_OVERHEAD;
+use crate::transport::mhd::MHD_OVERHEAD;
 
 /// Datagrams per syscall. 32 × ~1.5 KiB ≈ 48 KiB per wake; far below
 /// `UIO_MAXIOV`, and a whole burst fits in one call.
@@ -38,6 +38,15 @@ pub enum Span {
     /// A two-iovec datagram: a `MHD_OVERHEAD` header at `hdr_off` inside
     /// the batch buffer, then `payload` by reference. The `Bytes` handle
     /// is an O(1) share of the engine segment's buffer.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the carrier's pump currently stages every packet; this \
+                      is the zero-copy shape the batched send path keeps for \
+                      the owned-write seam, exercised by udp_batch's test"
+        )
+    )]
     Split { hdr_off: usize, payload: Bytes },
 }
 

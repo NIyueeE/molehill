@@ -52,8 +52,20 @@ pub(crate) const RESET: usize = 5;
 /// The most stream bytes a reliable frame can carry.
 pub(crate) const MAX_STREAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - STREAM;
 /// The most bytes an unreliable datagram frame can carry.
+#[expect(
+    dead_code,
+    reason = "the unreliable frame classes are declared by the wire and wired \
+              into the UDP and L3 paths next; the format is one deliberate \
+              step, so its bounds live here with it"
+)]
 pub(crate) const MAX_DATAGRAM_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - DATAGRAM;
 /// The most bytes an L3 frame can carry (one inner IP packet, up to its MTU).
+#[expect(
+    dead_code,
+    reason = "the unreliable frame classes are declared by the wire and wired \
+              into the UDP and L3 paths next; the format is one deliberate \
+              step, so its bounds live here with it"
+)]
 pub(crate) const MAX_L3_PAYLOAD: usize = MAX_DATAGRAM - HEAD - ACK - L3;
 
 /// What a packet is for.
@@ -389,6 +401,11 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         let slice = buf.get(start..start + len).ok_or(Malformed)?;
         Ok(slice)
     };
+    let u16_at = |at: usize| -> Result<u16, Malformed> {
+        let slice = buf.get(at..at + 2).ok_or(Malformed)?;
+        let array: [u8; 2] = slice.try_into().map_err(|_| Malformed)?;
+        Ok(u16::from_le_bytes(array))
+    };
     let frame = match kind {
         Kind::Ack => Frame::None,
         Kind::Stream => {
@@ -396,7 +413,7 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
             let slice = buf.get(at + 4..at + 12).ok_or(Malformed)?;
             let array: [u8; 8] = slice.try_into().map_err(|_| Malformed)?;
             let offset = u64::from_le_bytes(array);
-            let len = u16::from_le_bytes([buf[at + 12], buf[at + 13]]) as usize;
+            let len = usize::from(u16_at(at + 12)?);
             Frame::Stream {
                 id: stream,
                 offset,
@@ -406,14 +423,14 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         }
         Kind::Datagram => {
             let stream = bytes(at..at + 4)?;
-            let len = u16::from_le_bytes([buf[at + 4], buf[at + 5]]) as usize;
+            let len = usize::from(u16_at(at + 4)?);
             Frame::Datagram {
                 id: stream,
                 data: payload(at + DATAGRAM, len)?,
             }
         }
         Kind::L3 => {
-            let len = u16::from_le_bytes([buf[at], buf[at + 1]]) as usize;
+            let len = usize::from(u16_at(at)?);
             Frame::L3 {
                 data: payload(at + L3, len)?,
             }
@@ -427,7 +444,8 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Packet<'_>, Malformed> {
         }
         Kind::Reset => {
             let stream = bytes(at..at + 4)?;
-            let code = ResetCode::from_bits(buf[at + 4]).ok_or(Malformed)?;
+            let code = buf.get(at + 4).copied().ok_or(Malformed)?;
+            let code = ResetCode::from_bits(code).ok_or(Malformed)?;
             Frame::Reset { id: stream, code }
         }
     };

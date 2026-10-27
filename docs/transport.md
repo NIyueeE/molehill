@@ -66,9 +66,10 @@ refuses a plaintext control channel on the connection it arrives on.
 
 The **data channels** follow `data_enable`:
 
-- `true` (the client default) wraps every TCP tunnel, direct channel and
-  mhd session in the same KK record stream. Both ends pay the cipher's CPU per
-  byte, and the path learns nothing about the forwarded payload.
+- `true` (the client default) wraps every data channel — a TCP tunnel, a direct
+  channel, or one `mhd` stream — in the same KK record stream. Both ends pay the
+  cipher's CPU per byte, and the path learns nothing about the forwarded
+  payload.
 - `false` sends the data channels plain. The visitor's own TLS/SSH is the
   end-to-end protection in that deployment, and this hop spends no CPU on a
   second encryption. The control channel stays encrypted either way.

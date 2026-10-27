@@ -40,7 +40,7 @@ use tokio::time;
 use tracing::{Instrument, Span, debug, error, info, info_span, instrument, warn};
 
 #[cfg(feature = "mhd")]
-use crate::transport::mhd::MhdAcceptor;
+use crate::transport::mhd::MhdListener;
 
 type Nonce = protocol::Digest; // Also called `session_key`
 
@@ -513,22 +513,22 @@ struct ServerShared {
 /// registration that declares the `mhd` carrier (client-first), once per
 /// server process.
 ///
-/// The acceptor is held **weakly** here, and the listener task holds the only
-/// strong reference: the UDP socket must close when the server stops, and a mhd
-/// *session* outlives the accept loop (it keeps this shared state to reach the
-/// registry and the valve). A strong reference here would therefore keep the
-/// data port bound for as long as any session drained — which, in-process, is
+/// The listener is held **weakly** here, and the listener task holds the only
+/// strong reference: the UDP sockets must close when the server stops, and a mhd
+/// *connection* outlives the accept loop (it keeps this shared state to reach
+/// the registry and the valve). A strong reference here would therefore keep the
+/// data port bound for as long as any lane drained — which, in-process, is
 /// how a restarted server ends up refused with "address already in use".
 #[cfg(feature = "mhd")]
 struct MhdListenerState {
-    acceptor: tokio::sync::Mutex<Option<std::sync::Weak<MhdAcceptor>>>,
+    listener: tokio::sync::Mutex<Option<std::sync::Weak<tokio::sync::Mutex<MhdListener>>>>,
 }
 
 #[cfg(feature = "mhd")]
 impl Default for MhdListenerState {
     fn default() -> Self {
         Self {
-            acceptor: tokio::sync::Mutex::new(None),
+            listener: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -544,24 +544,33 @@ async fn ensure_mhd_listener(
     registry: Arc<Registry>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
-    let mut guard = shared.mhd.acceptor.lock().await;
+    let mut guard = shared.mhd.listener.lock().await;
     if guard.as_ref().is_some_and(|weak| weak.strong_count() > 0) {
         return Ok(());
     }
-    let acceptor = MhdAcceptor::bind(server_config.data_bind_addr())
+    let addr = tokio::net::lookup_host(server_config.data_bind_addr())
         .await
-        .with_context(|| "Failed to bind the mhd data listener")?;
-    let bound = acceptor.local_addr().with_context(|| {
-        format!(
-            "Failed to read the mhd tunnel socket address at {}",
-            server_config.data_bind_addr()
-        )
-    })?;
+        .with_context(|| {
+            format!(
+                "Failed to resolve the mhd data listener address {}",
+                server_config.data_bind_addr()
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "The mhd data listener address {} resolved to nothing",
+                server_config.data_bind_addr()
+            )
+        })?;
+    let listener = MhdListener::bind(addr)
+        .with_context(|| format!("Failed to bind the mhd data listener at {addr}"))?;
+    let bound = listener.local_addr();
     info!("Listening for mhd tunnels at {bound}");
-    let acceptor = Arc::new(acceptor);
-    *guard = Some(Arc::downgrade(&acceptor));
+    let listener = Arc::new(tokio::sync::Mutex::new(listener));
+    *guard = Some(Arc::downgrade(&listener));
     tokio::spawn(run_mhd_listener(
-        acceptor,
+        listener,
         Arc::clone(&registry),
         Arc::clone(&shared),
         shared.shutdown_tx.subscribe(),
@@ -1529,12 +1538,12 @@ type DataChannel = ServerStream;
 #[cfg(feature = "multiplex")]
 enum DataChannel {
     Raw(ServerStream),
-    /// A direct channel over mhd: no yamux above it, the session's own byte
-    /// stream is the channel. With the data plane's shape derived from the
-    /// service type, this is a transparent claim's lane: an mhd carrier with no
-    /// multiplexer over it.
+    /// A direct channel over mhd: no yamux above it, one stream of the
+    /// carrier's own connection *is* the channel. With the data plane's shape
+    /// derived from the service type, this is also a transparent claim's lane:
+    /// an mhd carrier with no multiplexer over it.
     #[cfg(feature = "mhd")]
-    RawMhd(crate::transport::mhd::MhdTunnelStream),
+    RawMhd(crate::transport::multiplex::CarrierStream),
     Mux(crate::transport::MuxStream),
 }
 
@@ -2142,78 +2151,123 @@ where
     Some(queue)
 }
 
-/// Accept mhd sessions (arm 2 of the transport comparison) and serve whatever
-/// the hello on them turns out to be.
+/// Accept mhd lanes and serve every stream they carry.
 ///
-/// One listener serves both data-plane shapes, exactly as the TCP data
-/// listener does: a **tunnel** hello opens a yamux session (the `multiplex`
-/// mode), a **data channel** hello is a direct channel whose carrier happens to
-/// be mhd. Which one it is, is the client's own declaration — the same
-/// `carrier` it registered the service with — so nothing here needs a
-/// configuration of its own.
-#[cfg(all(feature = "mhd", feature = "multiplex"))]
+/// One **lane** is one carrier connection: the client's pool holds several, and
+/// each carries as many streams as visitors need. A stream is opened by the
+/// client and prepared exactly like a TCP data channel — transport selector,
+/// optional Noise handshake, hello — so the crypto and the service routing keep
+/// their per-channel meaning; everything below that is the carrier's own
+/// multiplexing, with no yamux between the visitor and the wire.
+///
+/// A **tunnel** stream (a pool lane) reserves the lane's slot on its first
+/// hello; a **data channel** stream is a direct channel and takes no slot,
+/// exactly as the old single-session mhd path did.
+#[cfg(feature = "mhd")]
 async fn run_mhd_listener(
-    acceptor: Arc<MhdAcceptor>,
+    listener: Arc<tokio::sync::Mutex<MhdListener>>,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
     mut shutdown_rx: broadcast::Receiver<bool>,
     max_tunnels: usize,
 ) {
     loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => break,
-            session = acceptor.accept() => {
-                let Some(session) = session else { break };
-                let peer = session.peer;
-                let registry = registry.clone();
-                let shared = Arc::clone(&shared);
-                tokio::spawn(
-                    async move {
-                        if let Err(e) = handle_mhd_session(
-                            session,
-                            registry,
-                            shared,
-                            max_tunnels,
-                        )
-                        .await
-                        {
-                            debug!("mhd tunnel session ended: {e:#}");
-                        }
-                    }
-                    .instrument(info_span!("mhd_tunnel", %peer)),
-                );
+        let accepted = {
+            let mut guard = listener.lock().await;
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                lane = guard.accept() => lane,
             }
-        }
+        };
+        let Some(lane) = accepted else { break };
+        let id = lane.id();
+        let registry = Arc::clone(&registry);
+        let shared = Arc::clone(&shared);
+        tokio::spawn(
+            async move {
+                serve_mhd_lane(lane, registry, shared, max_tunnels).await;
+            }
+            .instrument(info_span!("mhd_lane", id)),
+        );
     }
-    debug!("mhd tunnel listener stopped");
+    // Close every admitted connection, so no lane's sender keeps a listening
+    // socket bound after this server stops (and a restarted server cannot share
+    // the port with a connection table nobody reads).
+    listener.lock().await.close_all();
+    debug!("mhd listener stopped");
 }
 
-/// Open one accepted mhd session (transport selector, optional Noise
-/// handshake), read the hello, and hand it to the path its variant names.
-#[cfg(all(feature = "mhd", feature = "multiplex"))]
-async fn handle_mhd_session(
-    mut session: crate::transport::mhd::AcceptedSession,
+/// What one lane's streams share: the session its first tunnel hello named.
+#[cfg(feature = "mhd")]
+#[derive(Default)]
+struct MhdLaneState {
+    registered: tokio::sync::Mutex<Option<MhdLaneRegistration>>,
+}
+
+/// The session one lane belongs to, and the slot it holds in the valve.
+///
+/// The guard lives here for the lane's whole life: a lane that the operator's
+/// `[server.data].max_tunnels` already counted must not release its slot until
+/// the connection ends.
+#[cfg(feature = "mhd")]
+struct MhdLaneRegistration {
+    nonce: Nonce,
+    _session: SessionTunnel,
+}
+
+/// Serve one accepted lane: accept its streams until the connection ends.
+#[cfg(feature = "mhd")]
+async fn serve_mhd_lane(
+    lane: Arc<crate::transport::mhd::MhdLane>,
+    registry: Arc<Registry>,
+    shared: Arc<ServerShared>,
+    max_tunnels: usize,
+) {
+    let state = Arc::new(MhdLaneState::default());
+    while let Some(stream) = lane.wait_stream().await {
+        let registry = Arc::clone(&registry);
+        let shared = Arc::clone(&shared);
+        let state = Arc::clone(&state);
+        let lane = Arc::clone(&lane);
+        tokio::spawn(async move {
+            if let Err(e) =
+                serve_mhd_stream(stream, lane, state, registry, shared, max_tunnels).await
+            {
+                // A stream that ends early is one visitor's channel, or a
+                // probing peer: DEBUG, never the lane's death.
+                debug!("mhd stream ended: {e:#}");
+            }
+        });
+    }
+    debug!("mhd lane ended");
+}
+
+/// Prepare and route one stream the peer opened.
+///
+/// The opening is the same three acts a TCP data channel performs; the only
+/// difference is that the bytes arrive on a fresh stream of an existing
+/// connection rather than on a fresh socket.
+#[cfg(feature = "mhd")]
+async fn serve_mhd_stream(
+    mut stream: crate::transport::mhd::lane::StreamIo,
+    lane: Arc<crate::transport::mhd::MhdLane>,
+    state: Arc<MhdLaneState>,
     registry: Arc<Registry>,
     shared: Arc<ServerShared>,
     max_tunnels: usize,
 ) -> Result<()> {
-    use crate::transport::mhd::MhdTunnelStream;
+    use crate::transport::multiplex::PoolLane;
 
     // Bound the crypto + hello phase: an unresponsive or bogus peer must not
-    // park a session task forever (the same role HANDSHAKE_TIMEOUT plays on
+    // park this stream's task forever (the same role HANDSHAKE_TIMEOUT plays on
     // the TCP accept path).
     let deadline = Duration::from_secs(HANDSHAKE_TIMEOUT * 2);
-
-    // v3 transport selector on the mhd byte stream, same rule as TCP: the
-    // client announces plain or Noise, and the server honors it (the crypto
-    // stack follows the connection, not a config-side type agreement).
-    let selector = tokio::time::timeout(deadline, session.stream.read_u8())
+    let selector = tokio::time::timeout(deadline, stream.read_u8())
         .await
         .with_context(|| "mhd transport selector timed out")??;
-    let health = session.stream.health();
-    let stream: crate::transport::multiplex::CarrierStream = Box::new(session.stream);
-    let mut io = match selector {
-        PLAIN_SELECTOR => MhdTunnelStream::plain(stream, health),
+    let stream: crate::transport::multiplex::CarrierStream = Box::new(stream);
+    let mut io: crate::transport::multiplex::CarrierStream = match selector {
+        PLAIN_SELECTOR => stream,
         NOISE_SELECTOR => {
             #[cfg(feature = "noise")]
             {
@@ -2222,12 +2276,12 @@ async fn handle_mhd_session(
                 })?;
                 let wrapped = tokio::time::timeout(deadline, keys.wrap_responder(stream))
                     .await
-                    .with_context(|| "mhd session noise handshake timed out")??;
-                MhdTunnelStream::noise(Box::new(wrapped), health)
+                    .with_context(|| "mhd stream noise handshake timed out")??;
+                Box::new(wrapped)
             }
             #[cfg(not(feature = "noise"))]
             {
-                let _ = (session, shared);
+                let _ = (stream, shared);
                 bail!(
                     "Client requested Noise, but this binary was built without the `noise` feature"
                 )
@@ -2236,8 +2290,6 @@ async fn handle_mhd_session(
         other => bail!("Unknown transport selector {other:#04x}"),
     };
 
-    // The hello names the shape: a tunnel (multiplex mode, yamux above this
-    // stream) or a direct data channel (the session *is* the channel).
     let (_version, hello) = tokio::time::timeout(deadline, read_hello(&mut io))
         .await
         .with_context(|| "mhd hello timed out")??;
@@ -2247,65 +2299,78 @@ async fn handle_mhd_session(
             do_v4_data_channel(DataChannel::RawMhd(io), registry, nonce, service_id).await
         }
         Hello::DataChannelTunnelHello(_, nonce) => {
-            let owner = tunnel_owner(&registry, nonce, "mhd").await?;
-            serve_mhd_tunnel(io, owner, nonce, registry, max_tunnels).await
+            // Reserve the lane's slot once. Every later stream of the same lane
+            // names the same session; a different one is a client mistake or a
+            // hijack attempt, and either way it is refused.
+            let mut registered = state.registered.lock().await;
+            if let Some(existing) = registered.as_ref() {
+                if existing.nonce != nonce {
+                    bail!("mhd lane carried streams for two different sessions");
+                }
+            } else {
+                match reserve_tunnel(&registry, &nonce, max_tunnels).await {
+                    TunnelSlot::Held(session) => {
+                        *registered = Some(MhdLaneRegistration {
+                            nonce,
+                            _session: session,
+                        });
+                    }
+                    TunnelSlot::NoSession => {
+                        bail!("mhd tunnel hello carried an incorrect nonce");
+                    }
+                    TunnelSlot::OverCap { held } => {
+                        drop(registered);
+                        debug!(
+                            "Refused an mhd lane for session {}: it already holds {held} \
+                             tunnel(s), and `[server.data].max_tunnels` is {max_tunnels}",
+                            hex::encode(nonce)
+                        );
+                        refuse_tunnel(&mut io).await?;
+                        PoolLane::mark_dead(&*lane);
+                        return Ok(());
+                    }
+                }
+            }
+            drop(registered);
+            // The client's open waits for this before it names its service.
+            write_and_flush(&mut io, &postcard::to_stdvec(&Ack::Ok)?).await?;
+            let (service_id, _tunnel) = read_tunnel_prologue(&mut io).await?;
+            debug!(%service_id, "mhd tunnel stream routed");
+            route_mhd_stream(io, &registry, &nonce, service_id).await
         }
         other @ Hello::ControlChannelHello(..) => {
-            bail!("Expected a data-plane hello on the mhd session, got {other:?}")
+            bail!("Expected a data-plane hello on the mhd stream, got {other:?}")
         }
     }
 }
 
-/// Reserve the tunnel's slot on its session and run the shared upgrade.
+/// Hand a prepared tunnel stream to the service its prologue named.
 ///
-/// A mhd tunnel is one of the client's multiplexed tunnels and takes a slot
-/// exactly like a TCP one: the valve must not be bypassable by choosing the
-/// other carrier. Shared by the TCP and mhd accept paths so the two cannot
-/// disagree about the cap.
-#[cfg(all(feature = "mhd", feature = "multiplex"))]
-async fn serve_mhd_tunnel(
-    mut io: crate::transport::mhd::MhdTunnelStream,
-    owner: TunnelOwner,
-    nonce: Nonce,
-    registry: Arc<Registry>,
-    max_tunnels: usize,
+/// A stream naming a service this session does not know is dropped here, never
+/// the lane or the session: the visitor loses one request, not every other
+/// visitor on the same lane.
+#[cfg(feature = "mhd")]
+async fn route_mhd_stream(
+    io: crate::transport::multiplex::CarrierStream,
+    registry: &Registry,
+    nonce: &Nonce,
+    service_id: ServiceId,
 ) -> Result<()> {
-    let session = match reserve_tunnel(&registry, &nonce, max_tunnels).await {
-        TunnelSlot::Held(slot) => Some(slot),
-        TunnelSlot::NoSession => bail!("mhd tunnel hello carried an incorrect nonce"),
-        TunnelSlot::OverCap { held } => {
-            debug!(
-                "Refused an mhd data tunnel for session {}: it already \
-                 holds {held} tunnel(s), and `[server.data].max_tunnels` is \
-                 {max_tunnels}",
-                hex::encode(nonce)
-            );
-            refuse_tunnel(&mut io).await?;
-            return Ok(());
-        }
+    let queue = registry
+        .sessions
+        .read()
+        .await
+        .get(nonce)
+        .and_then(|session| session.services.get(&service_id))
+        .map(|handle| handle.data_channel.clone());
+    let Some(queue) = queue else {
+        report_tunnel_violation(service_id, "no such service on this session");
+        return Ok(());
     };
-
-    let health = io.health();
-    upgrade_to_tunnel(io, owner, session, Some(health)).await
-}
-
-/// Resolve the session a validated tunnel hello names.
-///
-/// A tunnel names its session only; every stream inside it names its own
-/// service (see [`TunnelOwner`]). `arm` is the carrier's name, so a stale nonce
-/// says which listener saw it.
-///
-/// The mhd listener is the only caller: the TCP path builds its owner inline
-/// (it has no arm name to report).
-#[cfg(all(feature = "multiplex", feature = "mhd"))]
-async fn tunnel_owner(registry: &Registry, nonce: Nonce, arm: &str) -> Result<TunnelOwner> {
-    if !registry.sessions.read().await.contains_key(&nonce) {
-        bail!("{arm} tunnel hello carried an incorrect nonce");
-    }
-    Ok(TunnelOwner {
-        sessions: Arc::clone(&registry.sessions),
-        nonce,
-    })
+    queue
+        .send(DataChannel::RawMhd(io))
+        .await
+        .map_err(|_| anyhow!("Data channel for a stale control session"))
 }
 
 /// A live control channel, kept alive by holding the three channel

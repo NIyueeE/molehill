@@ -134,15 +134,70 @@ type Pins = ();
 /// byte: plain TCP, or TCP wrapped in the Noise record stream. The
 /// transport is a per-service decision (see `ClientTransport`).
 ///
-/// A `Mhd` variant is the carrier's own byte stream. A mhd *tunnel* is a yamux
-/// session whose channels are `TunnelStream`s, so this variant exists for the
-/// **direct** data channels, where the carrier's session is the channel.
+/// A `Mhd` variant is the carrier's own stream. A mhd *tunnel* is a lane whose
+/// streams are handed straight to the pool, so this variant exists for the
+/// **direct** data channels, where one stream of a lane is the channel.
 enum ClientStream {
     Plain(TcpStream),
     #[cfg(feature = "noise")]
     Noise(Box<crate::transport::NoiseStream<TcpStream>>),
     #[cfg(feature = "mhd")]
-    Mhd(crate::transport::mhd::MhdTunnelStream),
+    Mhd(MhdChannel),
+}
+
+/// One direct data channel over the carrier: its lane, kept alive by the
+/// channel, and the stream the lane produced.
+///
+/// The lane must outlive the stream: its pump owns the UDP socket, and a
+/// channel that dropped its lane would lose the socket in the middle of a
+/// visitor's request.
+#[cfg(feature = "mhd")]
+struct MhdChannel {
+    _lane: std::sync::Arc<crate::transport::mhd::MhdLane>,
+    stream: crate::transport::multiplex::CarrierStream,
+}
+
+#[cfg(feature = "mhd")]
+impl std::fmt::Debug for MhdChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MhdChannel").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "mhd")]
+impl tokio::io::AsyncRead for MhdChannel {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "mhd")]
+impl tokio::io::AsyncWrite for MhdChannel {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 impl std::fmt::Debug for ClientStream {
@@ -160,9 +215,9 @@ impl std::fmt::Debug for ClientStream {
 impl ClientStream {
     /// Apply socket options to the underlying TCP socket.
     ///
-    /// A mhd stream has no socket of its own: its session's UDP socket is tuned
-    /// where it is created (`transport::mhd::tune_socket_buffers`), and the
-    /// per-connection TCP options have nothing to land on.
+    /// A mhd stream has no socket of its own: its lane's UDP socket is tuned
+    /// where it is created (`transport::mhd::pump`), and the per-connection
+    /// TCP options have nothing to land on.
     fn hint(&self, opts: SocketOpts) {
         match self {
             ClientStream::Plain(s) => opts.apply(s),
@@ -1160,15 +1215,29 @@ async fn connect_direct_channel(args: &RunDataChannelArgs) -> Result<ClientStrea
         let noise = args.noise.as_ref();
         #[cfg(not(feature = "noise"))]
         let noise = None;
-        match tokio::time::timeout(
-            MHD_ATTEMPT_BUDGET,
-            crate::transport::mhd::connect_stream(remote_addr, noise),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
+        let lane_id = crate::transport::multiplex::next_tunnel_id();
+        let attempt = tokio::time::timeout(MHD_ATTEMPT_BUDGET, async {
+            let lane = crate::transport::mhd::MhdLane::dial(
+                remote_addr,
+                lane_id,
+                noise.cloned(),
+                args.session_nonce,
+            )
+            .await?;
+            let stream = lane
+                .open_channel()
+                .await
+                .map_err(|e| anyhow!("the mhd lane refused a stream: {e}"))?;
+            Ok::<_, anyhow::Error>(MhdChannel {
+                _lane: lane,
+                stream,
+            })
+        })
+        .await;
+        match attempt {
+            Ok(Ok(channel)) => {
                 args.carrier.reached_mhd();
-                return Ok(ClientStream::Mhd(stream));
+                return Ok(ClientStream::Mhd(channel));
             }
             Ok(Err(e)) => {
                 if !args.carrier.on_mhd_failure(&format!("{e:#}")) {
@@ -2089,8 +2158,12 @@ impl PoolDial<'_> {
 #[cfg(all(feature = "multiplex", feature = "mhd"))]
 const MHD_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Open one mhd session, optionally wrap it in Noise, exchange the tunnel
-/// hello/ack and start the yamux driver.
+/// Dial one mhd lane and hand it to the pool.
+///
+/// The lane is the pool's unit: one connection, its own UDP socket, its own
+/// packet-number space, and as many streams as visitors need. Establishment is
+/// proved by a throwaway stream — the server reserves the lane's tunnel slot on
+/// the first hello — so a pool never counts a lane the valve refused.
 #[cfg(all(feature = "multiplex", feature = "mhd"))]
 async fn establish_one_mhd_tunnel(
     remote_addr: SocketAddr,
@@ -2098,38 +2171,28 @@ async fn establish_one_mhd_tunnel(
     opts: &DataOpts,
     service_name: &str,
 ) -> Result<(std::sync::Arc<dyn PoolLane>, watch::Sender<bool>)> {
-    // Full Noise handshake + v3 selector byte (the wrapper owns the selector):
-    // mhd tunnels establish once per control session, so a resume attempt has
-    // nothing cached yet and would only add a round trip.
     #[cfg(feature = "noise")]
-    let noise = opts.noise.as_ref();
+    let noise = opts.noise.clone();
     #[cfg(not(feature = "noise"))]
     let noise = None;
-    let mut io = crate::transport::mhd::connect_stream(remote_addr, noise).await?;
-    // The session's ARQ counters travel with the tunnel: the pool reads this
-    // tunnel's retransmit share for the carrier rule (the mhd-side signal; a
-    // TCP tunnel has none, which is why the rule is one-sided by construction).
-    let health = io.health();
+    let id = crate::transport::multiplex::next_tunnel_id();
+    let lane = tokio::time::timeout(
+        MHD_ESTABLISH_TIMEOUT,
+        crate::transport::mhd::MhdLane::connect(remote_addr, id, noise, session_nonce),
+    )
+    .await
+    .with_context(|| format!("Service {service_name}: mhd lane establishment timed out"))??;
 
-    let hello = Hello::DataChannelTunnelHello(CURRENT_PROTO_VERSION, session_nonce);
-    io.write_all(&postcard::to_stdvec(&hello)?).await?;
-    io.flush().await?;
-    match read_ack(&mut io).await? {
-        Ack::Ok => {}
-        v => bail!("Service {service_name}: the server refused the mhd data tunnel: {v}"),
-    }
-
-    let config = crate::transport::multiplex::mux_config();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    Ok((
-        as_lane(ClientTunnel::start_with_health(
-            io,
-            Some(health),
-            config,
-            shutdown_rx,
-        )),
-        shutdown_tx,
-    ))
+    // The pool removes a lane by dropping this sender: closing the connection
+    // is what releases the socket, the peer's state and the pump.
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let ending = std::sync::Arc::clone(&lane);
+    tokio::spawn(async move {
+        let _ = shutdown_rx.changed().await;
+        PoolLane::mark_dead(&*ending);
+    });
+    let lane: std::sync::Arc<dyn PoolLane> = lane;
+    Ok((lane, shutdown_tx))
 }
 
 // Runtime-resolved per-service UDP options. Validation fills the defaults;
