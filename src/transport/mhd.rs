@@ -214,8 +214,14 @@ const MHD_MTU_CEILING: usize = 8000;
 /// Staging capacity of one outbound batch: a full `BATCH` of
 /// maximum-size datagrams (MTU + header) plus one datagram of slack, so
 /// appending never reallocates inside a batch (≈256 KiB at the ceiling).
-const BATCH_STAGE_BYTES: usize =
-    BATCH * (MHD_MTU_CEILING + MHD_OVERHEAD) + MHD_MTU_CEILING + MHD_OVERHEAD;
+/// Staging capacity of one outbound batch at a given datagram size: a full
+/// BATCH of datagrams plus one of slack, so appending never reallocates inside
+/// a batch. The session starts at the engine floor (about 45 KiB) and the
+/// buffer grows if the path ever allows jumbo datagrams — sizing every session
+/// for the 8 KiB ceiling cost five times what a typical one uses.
+fn batch_stage_bytes(mtu: usize) -> usize {
+    BATCH * (mtu + MHD_OVERHEAD) + mtu + MHD_OVERHEAD
+}
 /// Reader-side coalescing target: consecutive segments are batched into
 /// one channel message up to this many bytes (the mux/yamux/Noise reader
 /// above asks for ~24 such segments per frame, so this cuts the
@@ -732,7 +738,7 @@ impl DatagramOut {
     fn new(tx: mpsc::UnboundedSender<DgramBatch>) -> Self {
         DatagramOut {
             tx,
-            staging: BytesMut::with_capacity(BATCH_STAGE_BYTES),
+            staging: BytesMut::with_capacity(batch_stage_bytes(crate::mhd::MHD_MTU_FLOOR)),
             spans: Vec::with_capacity(BATCH),
             health: None,
         }
@@ -746,7 +752,7 @@ impl DatagramOut {
     ) -> Self {
         DatagramOut {
             tx,
-            staging: BytesMut::with_capacity(BATCH_STAGE_BYTES),
+            staging: BytesMut::with_capacity(batch_stage_bytes(crate::mhd::MHD_MTU_FLOOR)),
             spans: Vec::with_capacity(BATCH),
             health: Some(health),
         }
@@ -764,7 +770,7 @@ impl DatagramOut {
         let _ = self.tx.send(DgramBatch {
             buf: std::mem::replace(
                 &mut self.staging,
-                BytesMut::with_capacity(BATCH_STAGE_BYTES),
+                BytesMut::with_capacity(batch_stage_bytes(crate::mhd::MHD_MTU_FLOOR)),
             )
             .freeze(),
             spans: std::mem::replace(&mut self.spans, Vec::with_capacity(BATCH)),
@@ -789,7 +795,7 @@ impl io::Write for DatagramOut {
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
         }
-        if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
+        if self.spans.len() >= BATCH || self.staging.len() >= self.staging.capacity() {
             self.emit();
         }
         Ok(buf.len())
@@ -834,7 +840,7 @@ impl DatagramSink for DatagramOut {
         if let Some(health) = &self.health {
             health.datagrams_out.fetch_add(1, Ordering::Relaxed);
         }
-        if self.spans.len() >= BATCH || self.staging.len() >= BATCH_STAGE_BYTES {
+        if self.spans.len() >= BATCH || self.staging.len() >= self.staging.capacity() {
             self.emit();
         }
         Ok(header.len() + payload.len())
@@ -3322,9 +3328,28 @@ mod path_mtu_tests {
                   the assertions readable"
     )]
     use super::{
-        IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, MHD_MTU_CEILING, datagram_for_path, shrunk_mtu,
-        too_big_for_path,
+        IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, MHD_MTU_CEILING, batch_stage_bytes, datagram_for_path,
+        shrunk_mtu, too_big_for_path,
     };
+
+    /// A session stages its outbound batch for the datagram size it actually
+    /// runs at, not for the ceiling: the ceiling is a probe result most paths
+    /// never reach, and paying for it up front multiplied a pool's memory by
+    /// five.
+    #[test]
+    fn the_staging_buffer_is_sized_for_the_running_datagram() {
+        let floor = batch_stage_bytes(crate::mhd::MHD_MTU_FLOOR);
+        let ceiling = batch_stage_bytes(MHD_MTU_CEILING);
+        assert!(floor < ceiling, "the ceiling must cost more than the floor");
+        assert!(
+            floor < 64 * 1024,
+            "a default session must stage well under 64 KiB, got {floor}"
+        );
+        assert!(
+            ceiling < 512 * 1024,
+            "even the ceiling must stay bounded, got {ceiling}"
+        );
+    }
 
     /// The shrink loop converges on the engine's floor and stops there. This is
     /// the whole path-MTU fallback on a link that drops ICMP: the only input is
