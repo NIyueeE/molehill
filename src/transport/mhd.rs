@@ -908,6 +908,14 @@ fn tune_socket_buffers(socket: &UdpSocket) {
     if let Err(e) = s.set_send_buffer_size(MHD_SOCKET_BUF_BYTES) {
         warn!("Failed to raise the mhd socket send buffer: {e}");
     }
+    // The ICMP-free half of path-MTU discovery lives in the pump: an EMSGSIZE
+    // from a send shrinks the datagram size instead of waiting for a probe.
+    // IPv6 reports it on any oversize datagram by construction (a sender never
+    // fragments v6), which is where the shrink loop earns its keep today; on
+    // IPv4 the kernel reports it once the socket carries an explicit
+    // IP_MTU_DISCOVER, and the handler is already in place for that. Nothing
+    // here sets the option: nix has no binding for it, and reaching past nix
+    // would mean an unsafe block for one setsockopt.
     #[cfg(target_os = "linux")]
     if let Err(e) = enable_gro(socket) {
         // Growable receive is an optimisation, not a requirement: a socket
@@ -1318,6 +1326,10 @@ struct PaceState {
     /// every act of rate control into packet loss.
     parked: std::collections::VecDeque<ParkedBatch>,
     /// Bytes in `parked`.
+    /// Set when the kernel refused a datagram as bigger than the path: the
+    /// next transmit pass shrinks the datagram size instead of waiting out the
+    /// recheck interval.
+    force_shrink: bool,
     parked_bytes: usize,
 }
 
@@ -1356,6 +1368,7 @@ impl PaceState {
             parked: std::collections::VecDeque::new(),
             parked_bytes: 0,
             last_mtu_check: None,
+            force_shrink: false,
         }
     }
 
@@ -1712,6 +1725,13 @@ async fn drain_parked(
                     return;
                 }
             }
+            Err(e) if too_big_for_path(&e) => {
+                // Parking it would retry the same oversize datagram for ever:
+                // shrink, and let the ARQ re-send the bytes at a size that fits.
+                pace.force_shrink = true;
+                debug!("mhd datagram rejected as too big for the path: {e}");
+                return;
+            }
             Err(e) => {
                 debug!("mhd datagram send failed (peer {}): {e}", net.peer);
                 park_front(pace, &buf, take);
@@ -1776,6 +1796,13 @@ async fn drain_batches(
                 if k < allowed.len() {
                     return;
                 }
+            }
+            Err(e) if too_big_for_path(&e) => {
+                // The same shrink as the parked path: re-sending a datagram the
+                // path refuses would loop for ever.
+                pace.force_shrink = true;
+                debug!("mhd datagram rejected as too big for the path: {e}");
+                return;
             }
             Err(e) => {
                 debug!("mhd datagram send failed (peer {}): {e}", net.peer);
@@ -1864,13 +1891,32 @@ fn maybe_path_mtu(
     pace: &mut PaceState,
     datagram_bytes: &AtomicUsize,
 ) {
-    if let Some(last) = pace.last_mtu_check
+    let forced = std::mem::take(&mut pace.force_shrink);
+    if !forced
+        && let Some(last) = pace.last_mtu_check
         && last.elapsed() < PATH_MTU_RECHECK
     {
         return;
     }
     pace.last_mtu_check = Some(Instant::now());
     let local = net.socket.local_addr().ok();
+    // A refusal from the kernel is knowledge the probe cannot get on an
+    // ICMP-blackholed path: the datagram was too big, so halve and retry.
+    if forced {
+        let before = mhd.mtu();
+        let fits = shrunk_mtu(before);
+        if mhd.set_mtu(fits) != before {
+            MHD_DATAGRAM_BYTES.store(mhd.mtu() as u64, Ordering::Relaxed);
+            datagram_bytes.store(mhd.mtu(), Ordering::Relaxed);
+            debug!(
+                peer = %net.peer,
+                datagram_before = before,
+                datagram_after = mhd.mtu(),
+                "mhd datagram size shrunk after the kernel refused one"
+            );
+        }
+        return;
+    }
     let Some(path_mtu) = probe_path_mtu(local, net.peer) else {
         return;
     };
@@ -2303,6 +2349,25 @@ fn ipv6_mtu_of(probe: &std::net::UdpSocket) -> Option<usize> {
 /// The datagram size a path of `path_mtu` deserves: what is left after the IP
 /// and UDP headers this session's family adds, capped at [`MHD_MTU_CEILING`],
 /// or `None` when even an mhd header does not fit.
+/// Whether the kernel refused a datagram because the path will not carry it.
+///
+/// With path-MTU discovery switched on (see `tune_socket_buffers`) the send fails
+/// locally instead of being fragmented somewhere the sender cannot see, and
+/// this is the one error that means smaller, not retry.
+fn too_big_for_path(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(nix::errno::Errno::EMSGSIZE as i32)
+}
+
+/// The next datagram size after the kernel refused one as too big.
+///
+/// Halving converges on any path in a handful of tries and cannot land below
+/// the engine's own floor, which is what makes the loop terminate: this must
+/// not need an ICMP message to know the answer, because the paths that need it
+/// most are the ones that drop ICMP.
+fn shrunk_mtu(current: usize) -> usize {
+    (current / 2).max(crate::mhd::MHD_MTU_FLOOR)
+}
+
 fn datagram_for_path(path_mtu: usize, ipv6: bool) -> Option<usize> {
     let overhead = if ipv6 {
         IPV6_UDP_HEADERS
@@ -3169,7 +3234,39 @@ mod path_mtu_tests {
         reason = "a test's failure path is a panic; the module-level allow keeps \
                   the assertions readable"
     )]
-    use super::{IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, MHD_MTU_CEILING, datagram_for_path};
+    use super::{
+        IPV4_UDP_HEADERS, IPV6_UDP_HEADERS, MHD_MTU_CEILING, datagram_for_path, shrunk_mtu,
+        too_big_for_path,
+    };
+
+    /// The shrink loop converges on the engine's floor and stops there. This is
+    /// the whole path-MTU fallback on a link that drops ICMP: the only input is
+    /// the kernel refusing a datagram, so it must terminate without more.
+    #[test]
+    fn the_datagram_size_halves_to_the_floor_and_stops() {
+        let mut size = MHD_MTU_CEILING;
+        let mut steps = 0;
+        while size > crate::mhd::MHD_MTU_FLOOR {
+            let next = shrunk_mtu(size);
+            assert!(next < size, "every step must shrink: {size} -> {next}");
+            size = next;
+            steps += 1;
+            assert!(steps < 8, "the loop must terminate in a handful of steps");
+        }
+        assert_eq!(size, crate::mhd::MHD_MTU_FLOOR);
+        assert_eq!(shrunk_mtu(size), size, "the floor is a fixed point");
+    }
+
+    /// Only the kernel's too-big answer shrinks the datagram; every other error
+    /// stays a retry, which is what keeps a transient refusal from ratcheting
+    /// the size down.
+    #[test]
+    fn only_an_oversize_refusal_shrinks_the_datagram() {
+        let big = std::io::Error::from_raw_os_error(nix::errno::Errno::EMSGSIZE as i32);
+        assert!(too_big_for_path(&big));
+        let other = std::io::Error::from_raw_os_error(nix::errno::Errno::EPERM as i32);
+        assert!(!too_big_for_path(&other));
+    }
     use crate::mhd::MHD_OVERHEAD;
     #[cfg(target_os = "linux")]
     use crate::transport::mhd::ipv6_mtu_of;

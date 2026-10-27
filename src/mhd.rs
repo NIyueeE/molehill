@@ -90,6 +90,8 @@ const MHD_WND_SND: u16 = 32;
 const MHD_WND_RCV: u16 = 128; // must >= max fragment size
 
 const MHD_MTU_DEF: usize = 1400;
+/// The floor the datagram size may shrink to: the value every session starts at.
+pub(crate) const MHD_MTU_FLOOR: usize = MHD_MTU_DEF;
 
 const MHD_INTERVAL: u32 = 100;
 /// mhd Header size
