@@ -43,6 +43,23 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> C
 
 pub(crate) type CarrierStream = Box<dyn CarrierIo>;
 
+/// A boxed stream takes owned writes through the borrowed path.
+///
+/// The owned-write trait carries an associated constant, so a trait object
+/// cannot implement it; the box can, by delegating. The cost is one copy per
+/// record at the boundary above, which is the price of a carrier-neutral stream
+/// until the carrier implements the owned path on its own type.
+impl crate::common::owned_write::AsyncWriteOwned for CarrierStream {
+    fn poll_write_owned(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: bytes::Bytes,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let inner: &mut dyn CarrierIo = self.get_mut().as_mut();
+        std::pin::Pin::new(inner).poll_write(cx, &buf)
+    }
+}
+
 /// Why a lane refused to open a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneError {

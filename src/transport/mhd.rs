@@ -2870,18 +2870,18 @@ pub struct MhdTunnelStream {
 /// The two shapes one tunnel stream takes.
 enum MhdTunnelIo {
     /// Plain mhd, no record layer.
-    Plain(MhdStream),
+    Plain(crate::transport::multiplex::CarrierStream),
     /// The record layer over the same session. Boxed: the noise state machine
     /// dwarfs the plain variant, and this lives on the stack of every tunnel
     /// task.
     #[cfg(feature = "noise")]
-    Noise(Box<crate::transport::NoiseStream<MhdStream>>),
+    Noise(Box<crate::transport::NoiseStream<crate::transport::multiplex::CarrierStream>>),
 }
 
 impl MhdTunnelStream {
     /// A plain tunnel stream over one session.
     pub(crate) fn plain(
-        stream: MhdStream,
+        stream: crate::transport::multiplex::CarrierStream,
         health: Arc<crate::transport::health::SessionHealth>,
     ) -> Self {
         Self {
@@ -2893,7 +2893,7 @@ impl MhdTunnelStream {
     /// The same, wrapped in the record layer.
     #[cfg(feature = "noise")]
     pub(crate) fn noise(
-        stream: Box<crate::transport::NoiseStream<MhdStream>>,
+        stream: Box<crate::transport::NoiseStream<crate::transport::multiplex::CarrierStream>>,
         health: Arc<crate::transport::health::SessionHealth>,
     ) -> Self {
         Self {
@@ -2912,7 +2912,7 @@ impl MhdTunnelStream {
 impl std::fmt::Debug for MhdTunnelStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.io {
-            MhdTunnelIo::Plain(s) => f.debug_tuple("Plain").field(s).finish(),
+            MhdTunnelIo::Plain(_) => f.debug_tuple("Plain").finish(),
             #[cfg(feature = "noise")]
             MhdTunnelIo::Noise(_) => f.debug_tuple("Noise").finish(),
         }
@@ -2998,8 +2998,9 @@ pub async fn connect_stream(
         .with_context(|| "Failed to generate an mhd conversation id")?;
     let conv = u32::from_le_bytes(conv_bytes);
 
-    let stream = connect(remote, conv).await?;
-    let health = stream.health();
+    let session = connect(remote, conv).await?;
+    let health = session.health();
+    let stream: crate::transport::multiplex::CarrierStream = Box::new(session);
     #[cfg(feature = "noise")]
     if let Some(cfg) = noise {
         let keys = crate::transport::NoiseKeys::from_config(cfg)?;
@@ -3008,7 +3009,7 @@ pub async fn connect_stream(
     }
     let mut stream = stream;
     stream.write_all(&[crate::protocol::PLAIN_SELECTOR]).await?;
-    Ok(MhdTunnelStream::plain(stream, health))
+    Ok(MhdTunnelStream::plain(Box::new(stream), health))
 }
 
 /// Client side: open one mhd session to `remote` under `conv`.
