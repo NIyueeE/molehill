@@ -92,6 +92,14 @@ pub(crate) mod conn;
     reason = "the seam is exercised by its own tests; the socket pump and the pool attach next"
 )]
 pub(crate) mod lane;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the pump is exercised by its own test; the pool attaches next"
+    )
+)]
+pub(crate) mod pump;
 #[expect(
     dead_code,
     reason = "the multi-stream engine is built under its own tests; the connection that consumes it lands next"
